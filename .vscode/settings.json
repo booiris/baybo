@@ -1,0 +1,30 @@
+{
+    "cSpell.words": [
+        "agentic",
+        "AKIA",
+        "bindgen",
+        "chrono",
+        "cloudflared",
+        "embedder",
+        "frontmatter",
+        "ironclaw",
+        "mpsc",
+        "Multimodal",
+        "nearai",
+        "newtypes",
+        "Ollama",
+        "Ratatui",
+        "rusqlite",
+        "Sandboxed",
+        "serde",
+        "sqlx",
+        "subcomponent",
+        "teloxide",
+        "tera",
+        "thiserror",
+        "tiktoken",
+        "Turso",
+        "usize",
+        "wasmtime"
+    ]
+}
