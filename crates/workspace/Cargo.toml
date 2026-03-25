@@ -1,0 +1,12 @@
+[package]
+name = "aura-workspace"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }

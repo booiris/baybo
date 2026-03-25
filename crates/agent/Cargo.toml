@@ -1,0 +1,30 @@
+[package]
+name = "aura-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-core = { workspace = true }
+aura-llm = { workspace = true }
+aura-tools = { workspace = true }
+aura-skills = { workspace = true }
+aura-memory = { workspace = true }
+aura-workspace = { workspace = true }
+aura-context = { workspace = true }
+aura-session = { workspace = true }
+aura-trace = { workspace = true }
+aura-job = { workspace = true }
+aura-security = { workspace = true }
+aura-cost = { workspace = true }
+aura-hook = { workspace = true }
+aura-sandbox = { workspace = true }
+aura-channels = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio-util = { workspace = true }

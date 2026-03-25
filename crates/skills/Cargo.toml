@@ -1,0 +1,16 @@
+[package]
+name = "aura-skills"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

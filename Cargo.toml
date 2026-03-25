@@ -1,0 +1,106 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/channels",
+    "crates/llm",
+    "crates/tools",
+    "crates/registry",
+    "crates/skills",
+    "crates/memory",
+    "crates/workspace",
+    "crates/context",
+    "crates/session",
+    "crates/job",
+    "crates/trace",
+    "crates/security",
+    "crates/cost",
+    "crates/hook",
+    "crates/agent",
+    "crates/sandbox",
+    "crates/storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+aura-core = { path = "crates/core" }
+aura-channels = { path = "crates/channels" }
+aura-llm = { path = "crates/llm" }
+aura-tools = { path = "crates/tools" }
+aura-registry = { path = "crates/registry" }
+aura-skills = { path = "crates/skills" }
+aura-memory = { path = "crates/memory" }
+aura-workspace = { path = "crates/workspace" }
+aura-context = { path = "crates/context" }
+aura-session = { path = "crates/session" }
+aura-job = { path = "crates/job" }
+aura-trace = { path = "crates/trace" }
+aura-security = { path = "crates/security" }
+aura-cost = { path = "crates/cost" }
+aura-hook = { path = "crates/hook" }
+aura-agent = { path = "crates/agent" }
+aura-sandbox = { path = "crates/sandbox" }
+aura-storage = { path = "crates/storage" }
+
+# External dependencies
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+tokio-util = "0.7"
+sha2 = "0.10"
+hex = "0.4"
+aes-gcm = "0.10"
+rand = "0.8"
+wasmtime = "29"
+wat = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+teloxide = { version = "0.13", features = ["macros"] }
+serenity = { version = "0.12", features = ["client", "gateway", "model"] }
+tower = { version = "0.5", features = ["util"] }
+url = "2"
+
+[package]
+name = "aura"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-core = { workspace = true }
+aura-channels = { workspace = true }
+aura-llm = { workspace = true }
+aura-tools = { workspace = true }
+aura-registry = { workspace = true }
+aura-skills = { workspace = true }
+aura-memory = { workspace = true }
+aura-workspace = { workspace = true }
+aura-context = { workspace = true }
+aura-session = { workspace = true }
+aura-job = { workspace = true }
+aura-trace = { workspace = true }
+aura-security = { workspace = true }
+aura-cost = { workspace = true }
+aura-hook = { workspace = true }
+aura-agent = { workspace = true }
+aura-sandbox = { workspace = true }
+aura-storage = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }

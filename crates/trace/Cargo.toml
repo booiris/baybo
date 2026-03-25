@@ -1,0 +1,17 @@
+[package]
+name = "aura-trace"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-core = { workspace = true }
+aura-context = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }

@@ -2,6 +2,8 @@
     "cSpell.words": [
         "agentic",
         "AKIA",
+        "Analyse",
+        "badhash",
         "bindgen",
         "chrono",
         "cloudflared",
@@ -26,5 +28,9 @@
         "Turso",
         "usize",
         "wasmtime"
-    ]
+    ],
+    "files.exclude": {
+        "**/target": true,
+        "Cargo.lock": true,
+    }
 }

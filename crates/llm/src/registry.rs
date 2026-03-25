@@ -1,0 +1,61 @@
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::LlmClient;
+
+/// Configuration for creating an LLM provider client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmProviderConfig {
+    pub provider: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub model: String,
+}
+
+/// A factory that knows how to create an `LlmClient` for a specific provider.
+pub trait LlmProviderFactory: Send + Sync {
+    /// Returns the provider name this factory handles (e.g. `"openai"`, `"anthropic"`).
+    fn provider_name(&self) -> &str;
+
+    /// Creates an `LlmClient` from the given configuration.
+    fn create(&self, config: &LlmProviderConfig) -> aura_core::Result<LlmClient>;
+}
+
+/// A registry of LLM provider factories.
+///
+/// Provider factories are registered by name, and clients are created
+/// by looking up the factory matching the config's `provider` field.
+pub struct LlmProviderRegistry {
+    factories: HashMap<String, Box<dyn LlmProviderFactory>>,
+}
+
+impl LlmProviderRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self {
+            factories: HashMap::new(),
+        }
+    }
+
+    /// Registers a provider factory. If a factory with the same name already
+    /// exists, it is replaced.
+    pub fn register(&mut self, factory: impl LlmProviderFactory + 'static) {
+        self.factories
+            .insert(factory.provider_name().to_string(), Box::new(factory));
+    }
+
+    /// Creates an `LlmClient` using the factory that matches `config.provider`.
+    pub fn create_client(&self, config: &LlmProviderConfig) -> aura_core::Result<LlmClient> {
+        let factory = self.factories.get(&config.provider).ok_or_else(|| {
+            aura_core::AuraError::NotFound(format!("unknown LLM provider: {}", config.provider))
+        })?;
+        factory.create(config)
+    }
+}
+
+impl Default for LlmProviderRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
