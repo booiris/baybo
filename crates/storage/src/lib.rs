@@ -1,16 +1,21 @@
-pub mod memory_backend;
-pub mod sqlite;
+pub mod cost;
+pub mod job;
+pub mod libsql;
+pub mod memory;
+pub mod secret;
+pub mod session;
+pub mod trace;
 
-use aura_cost::CostStore;
-use aura_job::JobStore;
-use aura_memory::MemoryStore;
-use aura_security::SecretStore;
-use aura_session::SessionStore;
-use aura_trace::TraceStore;
+pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+pub use job::JobStore;
+pub use memory::MemoryStore;
+pub use secret::SecretStore;
+pub use session::SessionStore;
+pub use trace::TraceStore;
 
 /// Bundles all store implementations into a single container
 /// for dependency injection by the assembly layer.
-pub struct StorageSet {
+pub struct Store {
     pub session: Box<dyn SessionStore>,
     pub memory: Box<dyn MemoryStore>,
     pub trace: Box<dyn TraceStore>,
@@ -19,16 +24,17 @@ pub struct StorageSet {
     pub job: Box<dyn JobStore>,
 }
 
-impl StorageSet {
-    /// Create a `StorageSet` backed entirely by in-memory stores.
-    pub fn in_memory() -> Self {
-        Self {
-            session: Box::new(memory_backend::InMemorySessionStore::new()),
-            memory: Box::new(memory_backend::InMemoryMemoryStore::new()),
-            trace: Box::new(memory_backend::InMemoryTraceStore::new()),
-            secret: Box::new(memory_backend::InMemorySecretStore::new()),
-            cost: Box::new(memory_backend::InMemoryCostStore::new()),
-            job: Box::new(memory_backend::InMemoryJobStore::new()),
-        }
+impl Store {
+    /// Create a `Store` backed entirely by in-memory libsql stores.
+    pub async fn in_memory() -> anyhow::Result<Self> {
+        let pool = libsql::LibsqlPool::open_in_memory().await?;
+        Ok(Self {
+            session: Box::new(libsql::LibsqlSessionStore::new(pool.clone())),
+            memory: Box::new(libsql::LibsqlMemoryStore::new(pool.clone())),
+            trace: Box::new(libsql::LibsqlTraceStore::new(pool.clone())),
+            secret: Box::new(libsql::LibsqlSecretStore::new(pool.clone())),
+            cost: Box::new(libsql::LibsqlCostStore::new(pool.clone())),
+            job: Box::new(libsql::LibsqlJobStore::new(pool)),
+        })
     }
 }
