@@ -1,17 +1,12 @@
 //! Fork and rollback helper logic.
 
-#[cfg(test)]
 use chrono::Utc;
-#[cfg(test)]
 use uuid::Uuid;
 
-#[cfg(test)]
 use crate::tree::{create_root_node, set_active_leaf};
-#[cfg(test)]
 use crate::{ForkRecord, SessionTrace, TraceNodeId};
 
-#[cfg(test)]
-pub(crate) fn fork_from(
+pub fn fork_from(
     trace: &mut SessionTrace,
     from_node: TraceNodeId,
     reason: &str,

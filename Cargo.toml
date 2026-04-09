@@ -12,7 +12,6 @@ members = [
     "crates/job",
     "crates/trace",
     "crates/security",
-    "crates/cost",
     "crates/hook",
     "crates/agent",
     "crates/sandbox",
@@ -39,7 +38,6 @@ aura-session = { path = "crates/session" }
 aura-job = { path = "crates/job" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
-aura-cost = { path = "crates/cost" }
 aura-hook = { path = "crates/hook" }
 aura-agent = { path = "crates/agent" }
 aura-sandbox = { path = "crates/sandbox" }
@@ -70,7 +68,7 @@ aes-gcm = "0.10"
 rand = "0.10"
 wasmtime = "43"
 wat = "1"
-rusqlite = { version = "0.39", features = ["bundled"] }
+libsql = "0.9"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 teloxide = { version = "0.17", features = ["macros"] }
@@ -98,7 +96,6 @@ aura-session = { workspace = true }
 aura-job = { workspace = true }
 aura-trace = { workspace = true }
 aura-security = { workspace = true }
-aura-cost = { workspace = true }
 aura-hook = { workspace = true }
 aura-agent = { workspace = true }
 aura-sandbox = { workspace = true }

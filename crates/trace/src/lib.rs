@@ -1,4 +1,3 @@
-pub mod collector;
 pub mod error;
 pub mod fork;
 pub mod snapshot;
@@ -7,7 +6,6 @@ pub mod tree;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use aura_context::ContextSnapshot;
 use aura_job::OperationKind;
 use aura_model::{ChatMessage, ContentBlock};
@@ -15,7 +13,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::collector::TraceCollector;
 pub use error::TraceError;
 
 pub type Result<T> = std::result::Result<T, TraceError>;
@@ -145,24 +142,4 @@ pub struct TraceFilter {
     pub session_id: Option<String>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
-}
-
-/// Persistence interface for trace data.
-#[async_trait]
-pub trait TraceStore: Send + Sync {
-    /// Save the entire session trace atomically.
-    async fn save_trace(&self, trace: &SessionTrace) -> crate::Result<()>;
-
-    /// Load the trace tree for a session.
-    async fn load_trace(&self, session_id: &str) -> crate::Result<Option<SessionTrace>>;
-
-    /// Query traces matching the given filter.
-    async fn query_traces(&self, filter: TraceFilter) -> crate::Result<Vec<SessionTrace>>;
-
-    /// Load a single node from a session trace.
-    async fn load_node(
-        &self,
-        session_id: &str,
-        node_id: &TraceNodeId,
-    ) -> crate::Result<Option<TraceNode>>;
 }

@@ -5,8 +5,9 @@ use std::time::Duration;
 use aura_job::OperationKind;
 use aura_registry::TrustLevel;
 use aura_sandbox::{NetworkPolicy, SandboxPolicy};
-use aura_security::SecretVault;
 use aura_session::User;
+
+use crate::security::SecretVault;
 use aura_tools::{
     SecretValue, ToolCapability, ToolContext, ToolManifest, ToolOutput, ToolRegistry,
 };

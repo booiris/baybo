@@ -1,15 +1,11 @@
 //! Snapshot policy and lookup.
 
-#[cfg(test)]
 use aura_context::ContextSnapshot;
 
-#[cfg(test)]
 use crate::tree::ancestor_chain;
-#[cfg(test)]
 use crate::{SessionTrace, TraceNodeId};
 
-#[cfg(test)]
-pub(crate) fn find_nearest_snapshot(
+pub fn find_nearest_snapshot(
     trace: &SessionTrace,
     node_id: &TraceNodeId,
 ) -> crate::Result<ContextSnapshot> {

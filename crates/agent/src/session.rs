@@ -1,7 +1,10 @@
 use chrono::{Duration, Utc};
 use tracing::{debug, warn};
 
-use crate::{ChannelType, Result, Session, SessionError, SessionState, SessionStore, User};
+use aura_session::{ChannelType, Session, SessionError, SessionState, User};
+use aura_storage::SessionStore;
+
+type Result<T> = std::result::Result<T, SessionError>;
 
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
@@ -10,7 +13,6 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    /// Create a new `SessionManager` with the given store and timeout duration.
     pub fn new(store: Box<dyn SessionStore>, session_timeout: Duration) -> Self {
         Self {
             store,
@@ -18,7 +20,6 @@ impl SessionManager {
         }
     }
 
-    /// Create a brand-new session for the given user and channel.
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
         let now = Utc::now();
         let session = Session {
@@ -35,10 +36,6 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// Retrieve an existing session by ID, or create a new one if it does not exist.
-    ///
-    /// If the stored session exists but has expired (last_active older than the timeout),
-    /// it is deleted and a fresh session is created.
     pub async fn get_or_create(
         &self,
         session_id: &str,
@@ -59,12 +56,10 @@ impl SessionManager {
         self.create_session(user, channel).await
     }
 
-    /// Retrieve a session by ID. Returns `None` if it doesn't exist.
     pub async fn get(&self, session_id: &str) -> Result<Option<Session>> {
         self.store.get(session_id).await
     }
 
-    /// Update the `last_active` timestamp of a session to the current time.
     pub async fn touch(&self, session_id: &str) -> Result<()> {
         let session = self.store.get(session_id).await?;
         match session {
@@ -106,11 +101,11 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Duration, Utc};
 
-    use crate::{ChannelType, Result, Session, SessionStore, User};
+    use aura_session::{ChannelType, Session, User};
+    use aura_storage::SessionStore;
 
-    use super::SessionManager;
+    use super::{Result, SessionManager};
 
-    /// Simple in-memory SessionStore for testing.
     struct MemorySessionStore {
         data: Mutex<HashMap<String, Session>>,
     }
@@ -205,7 +200,6 @@ mod tests {
             .await
             .unwrap();
 
-        // A new session is created with a new ID (not "nonexistent")
         assert!(!session.id.is_empty());
         assert_ne!(session.id, "nonexistent");
     }
@@ -221,7 +215,6 @@ mod tests {
             .unwrap();
         let original_active = session.last_active;
 
-        // Small delay to ensure time difference
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         mgr.touch(&session.id).await.unwrap();
@@ -251,13 +244,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait for the session to expire
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let count = mgr.cleanup_expired().await.unwrap();
         assert_eq!(count, 1);
 
-        // Cleanup again should find nothing
         let count = mgr.cleanup_expired().await.unwrap();
         assert_eq!(count, 0);
     }
@@ -280,7 +271,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Expired session should be replaced with a new one
         assert_ne!(new_session.id, old_id);
     }
 }

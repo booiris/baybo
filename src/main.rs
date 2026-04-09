@@ -1,5 +1,6 @@
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::AgentLoop;
+use aura_agent::cost::CostTracker;
 use aura_agent::observability::ObservabilityRecorder;
 use aura_agent::policy::ExecutionPolicy;
 use aura_agent::router::Router;
@@ -7,19 +8,15 @@ use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
+use aura_agent::{JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager, TraceCollector};
 use aura_context::Tokenizer;
 use aura_context::sliding_window::SlidingWindowContext;
-use aura_cost::CostTracker;
 use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
-use aura_job::JobManager;
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
-use aura_memory::MemoryManager;
 use aura_model::{ChatMessage, ContentBlock};
-use aura_security::{EncryptionKey, LeakDetector, SecretVault, SecurityGateway};
-use aura_session::SessionManager;
-use aura_storage::StorageSet;
+use aura_security::{EncryptionKey, LeakDetector};
+use aura_storage::Store;
 use aura_tools::ToolRegistry;
-use aura_trace::TraceCollector;
 use aura_workspace::WorkspaceManager;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -125,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Aura - Intelligent Assistant Framework starting");
 
     // Storage layer (in-memory for Phase 1)
-    let storage = StorageSet::in_memory();
+    let storage = Store::in_memory().await?;
 
     // Session manager
     let session_manager = SessionManager::new(storage.session, chrono::Duration::minutes(30));

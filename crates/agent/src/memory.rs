@@ -1,21 +1,22 @@
 use tracing::{debug, warn};
 
+use aura_memory::{MemoryCategory, MemoryEntry, MemoryError};
 use aura_model::ContentBlock;
 use aura_session::Session;
+use aura_storage::MemoryStore;
 
-use crate::Result;
+type Result<T> = std::result::Result<T, MemoryError>;
 
-use crate::{EmbeddingModel, MemoryCategory, MemoryEntry, MemoryStore};
-
-// ---------------------------------------------------------------------------
-// Configuration constants
-// ---------------------------------------------------------------------------
+/// A minimal embedding model trait for generating vector embeddings from text.
+#[async_trait::async_trait]
+pub(crate) trait EmbeddingModel: Send + Sync {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+}
 
 const DEFAULT_RECALL_LIMIT: usize = 10;
 const SIMILARITY_THRESHOLD: f32 = 0.7;
 const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.85;
 
-/// Keyword-based patterns that hint at user preferences.
 const PREFERENCE_INDICATORS: &[&str] = &[
     "i like",
     "i prefer",
@@ -28,7 +29,6 @@ const PREFERENCE_INDICATORS: &[&str] = &[
     "my favorite",
 ];
 
-/// Keyword-based patterns that hint at key facts.
 const FACT_INDICATORS: &[&str] = &[
     "i am",
     "i work",
@@ -38,10 +38,6 @@ const FACT_INDICATORS: &[&str] = &[
     "my name is",
     "i live",
 ];
-
-// ---------------------------------------------------------------------------
-// MemoryManager
-// ---------------------------------------------------------------------------
 
 pub struct MemoryManager {
     store: Box<dyn MemoryStore>,
@@ -58,13 +54,6 @@ impl MemoryManager {
         }
     }
 
-    // -------------------------------------------------------------------
-    // Public API
-    // -------------------------------------------------------------------
-
-    /// Recall relevant memories for the given user based on the current
-    /// conversation content. When an embedder is available, vector cosine
-    /// similarity is used; otherwise falls back to keyword search.
     pub async fn recall(
         &self,
         user_id: &str,
@@ -82,7 +71,6 @@ impl MemoryManager {
             self.recall_without_embedder(user_id, &text).await?
         };
 
-        // Cap the result count.
         results.truncate(DEFAULT_RECALL_LIMIT);
 
         debug!(
@@ -94,12 +82,9 @@ impl MemoryManager {
         Ok(results)
     }
 
-    /// Analyse the session response and automatically store a memory if the
-    /// content is deemed worth remembering.
     pub async fn maybe_store(&self, session: &Session, response: &str) -> Result<()> {
         let lower = response.to_lowercase();
 
-        // Check preference indicators.
         for pattern in PREFERENCE_INDICATORS {
             if lower.contains(pattern) {
                 let entry = MemoryEntry::new(
@@ -112,7 +97,6 @@ impl MemoryManager {
             }
         }
 
-        // Check fact indicators.
         for pattern in FACT_INDICATORS {
             if lower.contains(pattern) {
                 let entry = MemoryEntry::new(
@@ -128,10 +112,7 @@ impl MemoryManager {
         Ok(())
     }
 
-    /// Persist a memory entry, generating an embedding if an embedder is
-    /// configured and the entry does not already carry one.
     pub async fn store(&self, mut entry: MemoryEntry) -> Result<()> {
-        // Generate embedding when missing.
         if entry.embedding.is_none()
             && let Some(ref embedder) = self.embedder
         {
@@ -148,11 +129,6 @@ impl MemoryManager {
         Ok(())
     }
 
-    // -------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------
-
-    /// Recall using vector cosine similarity.
     async fn recall_with_embedder(
         &self,
         user_id: &str,
@@ -173,7 +149,6 @@ impl MemoryManager {
                     .unwrap_or(0.0);
 
                 if sim >= SIMILARITY_THRESHOLD {
-                    // Blend similarity (70 %) with importance (30 %).
                     let score = sim * 0.7 + entry.importance * 0.3;
                     Some((score, entry))
                 } else {
@@ -182,20 +157,17 @@ impl MemoryManager {
             })
             .collect();
 
-        // Sort descending by blended score.
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(scored.into_iter().map(|(_, entry)| entry).collect())
     }
 
-    /// Recall using keyword / text search provided by the store.
     async fn recall_without_embedder(&self, user_id: &str, text: &str) -> Result<Vec<MemoryEntry>> {
         let mut results = self
             .store
             .search(user_id, text, DEFAULT_RECALL_LIMIT)
             .await?;
 
-        // Sort by importance descending.
         results.sort_by(|a, b| {
             b.importance
                 .partial_cmp(&a.importance)
@@ -205,13 +177,10 @@ impl MemoryManager {
         Ok(results)
     }
 
-    /// Store an entry after checking for duplicates. If a semantically
-    /// similar entry already exists, update it instead of inserting a new one.
     async fn store_with_dedup(&self, entry: MemoryEntry) -> Result<()> {
         let existing = self.store.list_by_user(&entry.user_id).await?;
 
         if let Some(ref embedder) = self.embedder {
-            // Vector-based dedup.
             let query_vec = embedder.embed(&entry.content).await?;
             for existing_entry in &existing {
                 if let Some(ref emb) = existing_entry.embedding {
@@ -227,7 +196,6 @@ impl MemoryManager {
                 }
             }
         } else {
-            // Simple text dedup — exact content match.
             for existing_entry in &existing {
                 if existing_entry.content == entry.content {
                     debug!(
@@ -242,7 +210,6 @@ impl MemoryManager {
         self.store(entry).await
     }
 
-    /// Enforce `max_entries_per_user` by evicting the least valuable entries.
     async fn enforce_user_limit(&self, user_id: &str) -> Result<()> {
         let mut entries = self.store.list_by_user(user_id).await?;
 
@@ -250,8 +217,6 @@ impl MemoryManager {
             return Ok(());
         }
 
-        // Sort by importance ascending, then by last_accessed ascending, so
-        // the least valuable entries come first.
         entries.sort_by(|a, b| {
             a.importance
                 .partial_cmp(&b.importance)
@@ -274,11 +239,6 @@ impl MemoryManager {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Utility functions
-// ---------------------------------------------------------------------------
-
-/// Extract all text from a slice of `ContentBlock`s.
 fn extract_text(content: &[ContentBlock]) -> String {
     content
         .iter()
@@ -290,8 +250,6 @@ fn extract_text(content: &[ContentBlock]) -> String {
         .join(" ")
 }
 
-/// Compute cosine similarity between two vectors. Returns `0.0` when either
-/// vector has zero magnitude or the vectors differ in length.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -315,13 +273,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / denom
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_memory::MemoryCategory;
+    use aura_model::BlobRef;
 
     #[test]
     fn test_cosine_similarity_identical() {
@@ -364,7 +320,6 @@ mod tests {
 
     #[test]
     fn test_extract_text_skips_non_text() {
-        use aura_model::BlobRef;
         let blocks = vec![
             ContentBlock::Text("hello".to_string()),
             ContentBlock::Image {

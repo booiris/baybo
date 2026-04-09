@@ -1,4 +1,4 @@
-use crate::{CostRecord, CostStore};
+use aura_storage::{CostRecord, CostStore};
 
 /// Handles recording and aggregation of cost data.
 ///
@@ -14,7 +14,7 @@ impl CostTracker {
     }
 
     /// Persist a cost record.
-    pub async fn record(&self, record: &CostRecord) -> crate::Result<()> {
+    pub async fn record(&self, record: &CostRecord) -> aura_storage::CostResult<()> {
         self.store.record(record).await
     }
 }

@@ -4,8 +4,9 @@ use aura_channels::OutgoingMessage;
 use aura_context::ContextManager;
 use aura_job::OperationKind;
 use aura_llm::{ChatRequest, LlmClient, LlmResponse, ToolDefinitionForLlm};
-use aura_memory::MemoryManager;
 use aura_model::{ChatMessage, ContentBlock, Role};
+
+use crate::memory::MemoryManager;
 use aura_session::Session;
 use aura_tools::ToolRegistry;
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};

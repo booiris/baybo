@@ -1,42 +1,122 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aura_security::{crypto, EncryptionKey, SecurityError};
+use aura_storage::SecretStore;
+
+type Result<T> = std::result::Result<T, SecurityError>;
+
+// ---------------------------------------------------------------------------
+// SecretValue
+// ---------------------------------------------------------------------------
+
+/// A secret value wrapper that prevents plaintext from appearing in `Debug`
+/// output, logs, or serialized forms.
+#[derive(Clone)]
+pub struct SecretValue {
+    inner: Vec<u8>,
+}
+
+impl SecretValue {
+    pub fn new(value: Vec<u8>) -> Self {
+        Self { inner: value }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.inner
+    }
+
+    pub fn as_str(&self) -> Result<&str> {
+        std::str::from_utf8(&self.inner)
+            .map_err(|e| SecurityError::Encryption(format!("secret is not valid UTF-8: {e}")))
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl std::fmt::Display for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecretVault
+// ---------------------------------------------------------------------------
+
+/// An in-process wrapper that holds a master encryption key and delegates
+/// encrypted persistence to a [`SecretStore`] implementation.
+pub struct SecretVault {
+    master_key: EncryptionKey,
+    store: Arc<dyn SecretStore>,
+}
+
+impl SecretVault {
+    pub fn new(master_key: EncryptionKey, store: Arc<dyn SecretStore>) -> Self {
+        Self { master_key, store }
+    }
+
+    pub async fn store_secret(&self, name: &str, value: &[u8]) -> Result<()> {
+        let encrypted = crypto::encrypt(value, &self.master_key)?;
+        self.store.store(name, &encrypted).await
+    }
+
+    pub async fn get_secret(&self, name: &str) -> Result<Option<SecretValue>> {
+        let encrypted = self.store.retrieve(name).await?;
+        match encrypted {
+            Some(data) => {
+                let plaintext = crypto::decrypt(&data, &self.master_key)?;
+                Ok(Some(SecretValue::new(plaintext)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_secrets_for_tool(
+        &self,
+        _tool_name: &str,
+        declared: &[String],
+    ) -> Result<HashMap<String, SecretValue>> {
+        let mut result = HashMap::new();
+        for name in declared {
+            if let Some(value) = self.get_secret(name).await? {
+                result.insert(name.clone(), value);
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+impl SecretVault {
+    async fn delete_secret(&self, name: &str) -> Result<()> {
+        self.store.delete(name).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecurityGateway
+// ---------------------------------------------------------------------------
+
 use aura_channels::{Message, OutgoingMessage};
 use aura_model::ContentBlock;
+use aura_security::LeakDetector;
 use aura_session::Session;
 
-use crate::Result;
-
-use crate::leak_detector::LeakDetector;
-use crate::vault::SecretVault;
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct NetworkRequest {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NetworkPolicyDecision {
-    Deny(String),
-}
+const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
 
 /// The security boundary through which all messages pass before entering
-/// or leaving the agent. Responsible for sanitizing sensitive data.
+/// or leaving the agent.
 pub struct SecurityGateway {
     leak_detector: LeakDetector,
     secret_vault: Arc<SecretVault>,
 }
 
-/// Key used in `Session.state.extra` to store placeholder-to-secret-name
-/// mappings for the current session.
-const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
-
 impl SecurityGateway {
-    /// Create a new `SecurityGateway`.
     pub fn new(leak_detector: LeakDetector, secret_vault: Arc<SecretVault>) -> Self {
         Self {
             leak_detector,
@@ -44,11 +124,6 @@ impl SecurityGateway {
         }
     }
 
-    /// Scan incoming message content for sensitive data, replace matches
-    /// with placeholders, and record the mapping in the session state.
-    ///
-    /// If any rule triggers a `Block` action the message content is cleared
-    /// and a security error is returned.
     pub async fn sanitize_input(&self, msg: &mut Message, session: &mut Session) -> Result<()> {
         let (scan_result, new_blocks) = self.leak_detector.scan_content_blocks(&msg.content)?;
 
@@ -56,14 +131,13 @@ impl SecurityGateway {
             msg.content = vec![ContentBlock::Text(
                 "[blocked: sensitive data detected]".into(),
             )];
-            return Err(crate::SecurityError::Violation(
+            return Err(SecurityError::Violation(
                 scan_result
                     .block_reason
                     .unwrap_or_else(|| "input blocked by leak detection rule".into()),
             ));
         }
 
-        // Persist placeholder mappings into session state for traceability.
         if !scan_result.replacements.is_empty() {
             let existing = session
                 .state
@@ -74,7 +148,6 @@ impl SecurityGateway {
 
             let mut map = existing;
             for replacement in &scan_result.replacements {
-                // Store placeholder -> rule_name (NOT the original secret).
                 map.insert(
                     replacement.placeholder.clone(),
                     replacement.rule_name.clone(),
@@ -82,14 +155,13 @@ impl SecurityGateway {
             }
 
             let map_value = serde_json::to_value(&map).map_err(|e| {
-                crate::SecurityError::Storage(format!("failed to serialize placeholder map: {e}"))
+                SecurityError::Storage(format!("failed to serialize placeholder map: {e}"))
             })?;
             session
                 .state
                 .extra
                 .insert(SESSION_SECRETS_KEY.to_owned(), map_value);
 
-            // Store detected secrets in the vault for later retrieval.
             for replacement in &scan_result.replacements {
                 self.secret_vault
                     .store_secret(&replacement.placeholder, replacement.original.as_bytes())
@@ -101,8 +173,6 @@ impl SecurityGateway {
         Ok(())
     }
 
-    /// Re-scan an outgoing message to ensure no plaintext secrets leak out.
-    /// Placeholders already present are kept as-is.
     pub async fn sanitize_output(
         &self,
         response: &mut OutgoingMessage,
@@ -115,7 +185,7 @@ impl SecurityGateway {
             response.content = vec![ContentBlock::Text(
                 "[response redacted: sensitive data detected]".into(),
             )];
-            return Err(crate::SecurityError::Violation(
+            return Err(SecurityError::Violation(
                 scan_result
                     .block_reason
                     .unwrap_or_else(|| "output blocked by leak detection rule".into()),
@@ -143,15 +213,31 @@ impl SecurityGateway {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct NetworkRequest {
+    host: String,
+    port: u16,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetworkPolicyDecision {
+    Deny(String),
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SecretStore;
-    use crate::crypto::EncryptionKey;
-    use crate::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
+    use aura_security::leak_detector::{LeakAction, LeakDetectionRule};
     use aura_session::ChannelType;
+    use async_trait::async_trait;
     use chrono::Utc;
     use regex::Regex;
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     struct MemorySecretStore {
@@ -166,46 +252,50 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl SecretStore for MemorySecretStore {
-        async fn store(&self, name: &str, encrypted_value: &[u8]) -> Result<()> {
+        async fn store(&self, name: &str, encrypted_value: &[u8]) -> aura_storage::secret::Result<()> {
             self.data
                 .lock()
-                .map_err(|e| crate::SecurityError::Violation(e.to_string()))?
+                .map_err(|e| SecurityError::Violation(e.to_string()))?
                 .insert(name.to_owned(), encrypted_value.to_vec());
             Ok(())
         }
-        async fn retrieve(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        async fn retrieve(&self, name: &str) -> aura_storage::secret::Result<Option<Vec<u8>>> {
             Ok(self
                 .data
                 .lock()
-                .map_err(|e| crate::SecurityError::Violation(e.to_string()))?
+                .map_err(|e| SecurityError::Violation(e.to_string()))?
                 .get(name)
                 .cloned())
         }
-        async fn delete(&self, name: &str) -> Result<()> {
+        async fn delete(&self, name: &str) -> aura_storage::secret::Result<()> {
             self.data
                 .lock()
-                .map_err(|e| crate::SecurityError::Violation(e.to_string()))?
+                .map_err(|e| SecurityError::Violation(e.to_string()))?
                 .remove(name);
             Ok(())
         }
-        async fn list(&self) -> Result<Vec<String>> {
+        async fn list(&self) -> aura_storage::secret::Result<Vec<String>> {
             Ok(self
                 .data
                 .lock()
-                .map_err(|e| crate::SecurityError::Violation(e.to_string()))?
+                .map_err(|e| SecurityError::Violation(e.to_string()))?
                 .keys()
                 .cloned()
                 .collect())
         }
     }
 
+    fn make_vault() -> SecretVault {
+        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+        let store = Arc::new(MemorySecretStore::new());
+        SecretVault::new(key, store)
+    }
+
     fn make_gateway() -> SecurityGateway {
         let detector = LeakDetector::with_default_rules();
-        let key = EncryptionKey::new(b"test-key-32-bytes-for-testing!!!".to_vec()).unwrap();
-        let store = Arc::new(MemorySecretStore::new());
-        let vault = Arc::new(SecretVault::new(key, store));
+        let vault = Arc::new(make_vault());
         SecurityGateway::with_deny_all_policy(detector, vault)
     }
 
@@ -213,7 +303,7 @@ mod tests {
         Message {
             id: "msg-1".into(),
             session_id: "sess-1".into(),
-            channel: aura_session::ChannelType::Cli,
+            channel: ChannelType::Cli,
             sender: aura_session::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
@@ -234,13 +324,78 @@ mod tests {
                 name: Some("Test".into()),
                 channel: ChannelType::Cli,
             },
-            channel: aura_session::ChannelType::Cli,
+            channel: ChannelType::Cli,
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),
             state: Default::default(),
         }
     }
+
+    // --- vault tests ---
+
+    #[tokio::test]
+    async fn store_and_retrieve_secret() {
+        let vault = make_vault();
+        vault
+            .store_secret("my_api_key", b"super-secret-value")
+            .await
+            .unwrap();
+
+        let secret = vault.get_secret("my_api_key").await.unwrap().unwrap();
+        assert_eq!(secret.as_bytes(), b"super-secret-value");
+    }
+
+    #[tokio::test]
+    async fn missing_secret_returns_none() {
+        let vault = make_vault();
+        let result = vault.get_secret("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_secret() {
+        let vault = make_vault();
+        vault.store_secret("temp", b"temporary").await.unwrap();
+        vault.delete_secret("temp").await.unwrap();
+        assert!(vault.get_secret("temp").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_secrets_for_tool_returns_only_declared() {
+        let vault = make_vault();
+        vault.store_secret("secret_a", b"aaa").await.unwrap();
+        vault.store_secret("secret_b", b"bbb").await.unwrap();
+        vault.store_secret("secret_c", b"ccc").await.unwrap();
+
+        let declared = vec!["secret_a".to_owned(), "secret_c".to_owned()];
+        let result = vault
+            .get_secrets_for_tool("some_tool", &declared)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains_key("secret_a"));
+        assert!(result.contains_key("secret_c"));
+        assert!(!result.contains_key("secret_b"));
+    }
+
+    #[test]
+    fn secret_value_debug_is_redacted() {
+        let sv = SecretValue::new(b"my-password".to_vec());
+        let debug = format!("{sv:?}");
+        assert_eq!(debug, "[REDACTED]");
+        assert!(!debug.contains("my-password"));
+    }
+
+    #[test]
+    fn secret_value_display_is_redacted() {
+        let sv = SecretValue::new(b"my-password".to_vec());
+        let display = format!("{sv}");
+        assert_eq!(display, "[REDACTED]");
+    }
+
+    // --- gateway tests ---
 
     #[tokio::test]
     async fn sanitize_input_replaces_aws_key() {
@@ -257,13 +412,12 @@ mod tests {
             panic!("expected text block");
         }
 
-        // Session should have the placeholder map.
         assert!(session.state.extra.contains_key(SESSION_SECRETS_KEY));
     }
 
     #[tokio::test]
     async fn sanitize_input_blocks_on_block_rule() {
-        let mut detector = LeakDetector::new();
+        let mut detector = aura_security::LeakDetector::new();
         detector.add_rule(LeakDetectionRule {
             name: "block_test".into(),
             pattern: Regex::new(r"TOP_SECRET_\w+").unwrap(),
@@ -289,7 +443,7 @@ mod tests {
 
         let mut response = OutgoingMessage {
             session_id: "sess-1".into(),
-            channel: aura_session::ChannelType::Cli,
+            channel: ChannelType::Cli,
             content: vec![ContentBlock::Text(
                 "Here is the key: AKIAIOSFODNN7EXAMPLE".into(),
             )],

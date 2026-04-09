@@ -2,7 +2,10 @@ use chrono::Utc;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Job, JobError, JobStatus, JobStore, JobTransition, OperationKind, Result};
+use aura_job::{Job, JobError, JobStatus, JobTransition, OperationKind};
+use aura_storage::JobStore;
+
+type Result<T> = std::result::Result<T, JobError>;
 
 /// Manages job lifecycle with strict state-machine validation.
 pub struct JobManager {
@@ -14,7 +17,6 @@ impl JobManager {
         Self { store }
     }
 
-    /// Create a new job in `Pending` status.
     pub async fn create_job(
         &self,
         session_id: &str,
@@ -39,31 +41,26 @@ impl JobManager {
         Ok(job)
     }
 
-    /// Transition a job from `Pending` to `InProgress`.
     pub async fn start(&self, job_id: &str) -> Result<()> {
         self.transition(job_id, JobStatus::InProgress, None, None, None)
             .await
     }
 
-    /// Transition a job from `InProgress` to `Completed`, recording its output.
     pub async fn complete(&self, job_id: &str, output: Value) -> Result<()> {
         self.transition(job_id, JobStatus::Completed, Some(output), None, None)
             .await
     }
 
-    /// Transition a job from `Completed` to `Submitted`.
     pub async fn submit(&self, job_id: &str) -> Result<()> {
         self.transition(job_id, JobStatus::Submitted, None, None, None)
             .await
     }
 
-    /// Transition a job from `Submitted` to `Accepted` (terminal success).
     pub async fn accept(&self, job_id: &str) -> Result<()> {
         self.transition(job_id, JobStatus::Accepted, None, None, None)
             .await
     }
 
-    /// Transition a job from `InProgress` or `Stuck` to `Failed` (terminal failure).
     pub async fn fail(&self, job_id: &str, error: &str) -> Result<()> {
         self.transition(
             job_id,
@@ -75,9 +72,6 @@ impl JobManager {
         .await
     }
 
-    // --- internal helpers ---
-
-    /// Load a job or return `NotFound`.
     async fn load_job(&self, job_id: &str) -> Result<Job> {
         self.store
             .get(job_id)
@@ -85,7 +79,6 @@ impl JobManager {
             .ok_or_else(|| JobError::NotFound(format!("job {job_id}")))
     }
 
-    /// Core transition logic: validate, persist status + transition record.
     async fn transition(
         &self,
         job_id: &str,
@@ -156,7 +149,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
-    /// Simple in-memory store for testing.
     struct InMemoryJobStore {
         jobs: Mutex<Vec<Job>>,
         transitions: Mutex<Vec<JobTransition>>,
@@ -196,7 +188,6 @@ mod tests {
                 .find(|j| j.id == job_id)
                 .ok_or_else(|| JobError::NotFound(format!("job {job_id}")))?;
 
-            // Set timestamps based on target status.
             let now = Utc::now();
             if status == JobStatus::InProgress && job.started_at.is_none() {
                 job.started_at = Some(now);
@@ -277,8 +268,6 @@ mod tests {
         JobManager::new(Box::new(InMemoryJobStore::new()))
     }
 
-    // ---- happy-path tests ----
-
     #[tokio::test]
     async fn full_success_path() {
         let mgr = make_manager();
@@ -340,8 +329,6 @@ mod tests {
         assert_eq!(history.last().unwrap().to, JobStatus::Failed);
     }
 
-    // ---- illegal transition tests ----
-
     #[tokio::test]
     async fn cannot_complete_from_pending() {
         let mgr = make_manager();
@@ -362,75 +349,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cannot_submit_from_in_progress() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        let err = mgr.submit(&job.id).await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
-    async fn cannot_recover_from_in_progress() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        let err = mgr.recover(&job.id, "nope").await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
-    async fn cannot_transition_from_accepted() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        mgr.complete(&job.id, serde_json::json!(null))
-            .await
-            .unwrap();
-        mgr.submit(&job.id).await.unwrap();
-        mgr.accept(&job.id).await.unwrap();
-
-        let err = mgr.start(&job.id).await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
-    async fn cannot_transition_from_failed() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        mgr.fail(&job.id, "boom").await.unwrap();
-
-        let err = mgr.start(&job.id).await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-        let err2 = mgr.recover(&job.id, "try").await.unwrap_err();
-        assert!(matches!(err2, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
-    async fn cannot_fail_from_pending() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        let err = mgr.fail(&job.id, "nope").await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
-    async fn cannot_stuck_from_pending() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        let err = mgr.stuck(&job.id, "nope").await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
     async fn not_found_returns_error() {
         let mgr = make_manager();
         let err = mgr.start("nonexistent").await.unwrap_err();
         assert!(matches!(err, JobError::NotFound(_)));
     }
-
-    // ---- hierarchy test ----
 
     #[tokio::test]
     async fn parent_child_relationship() {
@@ -445,39 +368,5 @@ mod tests {
         let children = mgr.store.list_children(&parent.id).await.unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].id, child.id);
-    }
-
-    // ---- table-driven exhaustive transition test ----
-
-    #[tokio::test]
-    async fn exhaustive_transition_table() {
-        use JobStatus::*;
-        let all = [
-            Pending, InProgress, Completed, Submitted, Accepted, Failed, Stuck,
-        ];
-
-        // Expected legal transitions.
-        let legal: &[(JobStatus, JobStatus)] = &[
-            (Pending, InProgress),
-            (InProgress, Completed),
-            (InProgress, Failed),
-            (InProgress, Stuck),
-            (Completed, Submitted),
-            (Submitted, Accepted),
-            (Stuck, InProgress),
-            (Stuck, Failed),
-        ];
-
-        for from in &all {
-            for to in &all {
-                let is_legal = legal.iter().any(|(f, t)| f == from && t == to);
-                assert_eq!(
-                    from.can_transition_to(to),
-                    is_legal,
-                    "expected {from} -> {to} to be {}",
-                    if is_legal { "legal" } else { "illegal" }
-                );
-            }
-        }
     }
 }

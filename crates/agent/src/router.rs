@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use aura_channels::{ChannelAdapter, IncomingMessage, OutgoingMessage};
-use aura_security::SecurityGateway;
 use aura_session::Session;
-use aura_session::SessionManager;
+
+use crate::security::SecurityGateway;
+use crate::session::SessionManager;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 

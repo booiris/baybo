@@ -1,40 +1,11 @@
 pub mod error;
-pub mod manager;
 
 pub use error::MemoryError;
-pub use manager::MemoryManager;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
-
-// ---------------------------------------------------------------------------
-// MemoryStore trait
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-pub trait MemoryStore: Send + Sync {
-    async fn store(&self, entry: &MemoryEntry) -> Result<()>;
-    async fn retrieve(&self, user_id: &str, key: &str) -> Result<Option<MemoryEntry>>;
-    async fn search(&self, user_id: &str, query: &str, limit: usize) -> Result<Vec<MemoryEntry>>;
-    async fn delete(&self, id: &str) -> Result<()>;
-    async fn list_by_user(&self, user_id: &str) -> Result<Vec<MemoryEntry>>;
-}
-
-// ---------------------------------------------------------------------------
-// EmbeddingModel trait
-// ---------------------------------------------------------------------------
-
-/// A minimal embedding model trait for generating vector embeddings from text.
-///
-/// Implementations are injected by upper layers (e.g. `agent`). This keeps
-/// the `memory` crate free from direct LLM or rig dependencies.
-#[async_trait]
-pub(crate) trait EmbeddingModel: Send + Sync {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
-}
 
 // ---------------------------------------------------------------------------
 // MemoryCategory
