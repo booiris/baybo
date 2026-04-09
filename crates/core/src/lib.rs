@@ -8,8 +8,8 @@ pub mod user;
 pub use error::AuraError;
 pub use governance::{ArtifactSource, TrustLevel};
 pub use message::{
-    BlobRef, ChannelMetadata, ChatMessage, ContentBlock, IncomingMessage, Message, MessageMetadata,
-    MessagePriority, OutgoingMessage, Role,
+    BlobRef, ChatMessage, ContentBlock, IncomingMessage, Message, MessageMetadata, OutgoingMessage,
+    Role,
 };
 pub use operation::OperationKind;
 pub use session::{Session, SessionState};

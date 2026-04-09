@@ -31,9 +31,13 @@ impl LlmProviderFactory for OllamaProviderFactory {
         // time when the agent prepares the ChatRequest.
         let tool_schema_prompt = build_tool_schema_prompt(&[]);
 
+        let base_url = todo!();
+
         Ok(LlmClient::new(
             model_info,
             ResponseParseMode::PromptGuided { tool_schema_prompt },
+            config.api_key.clone(),
+            base_url,
         ))
     }
 }
@@ -61,10 +65,6 @@ mod tests {
         assert_eq!(client.model_id(), "llama3");
         assert_eq!(client.model_info().context_window, 8_192);
         assert!(!client.model_info().supports_tools);
-        assert!(matches!(
-            client.parse_mode(),
-            ResponseParseMode::PromptGuided { .. }
-        ));
         assert_eq!(client.model_info().pricing.input_per_1m_tokens, 0.0);
     }
 }

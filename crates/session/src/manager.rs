@@ -84,29 +84,21 @@ impl SessionManager {
             }
         }
     }
+}
 
-    /// Delete all sessions whose last activity is older than the configured timeout.
-    /// Returns the number of sessions that were cleaned up.
-    pub async fn cleanup_expired(&self) -> Result<usize> {
+#[cfg(test)]
+impl SessionManager {
+    async fn cleanup_expired(&self) -> Result<usize> {
         let cutoff = Utc::now() - self.session_timeout;
         let expired_ids = self.store.list_expired(cutoff).await?;
         let count = expired_ids.len();
-
         for id in &expired_ids {
-            if let Err(e) = self.store.delete(id).await {
-                warn!(session_id = %id, error = %e, "failed to delete expired session");
-            }
+            self.store.delete(id).await?;
         }
-
         if count > 0 {
             debug!(count, "cleaned up expired sessions");
         }
         Ok(count)
-    }
-
-    /// Return the configured session timeout duration.
-    pub fn session_timeout(&self) -> Duration {
-        self.session_timeout
     }
 }
 

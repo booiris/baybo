@@ -5,8 +5,6 @@ members = [
     "crates/channels",
     "crates/llm",
     "crates/tools",
-    "crates/registry",
-    "crates/skills",
     "crates/memory",
     "crates/workspace",
     "crates/context",
@@ -19,6 +17,8 @@ members = [
     "crates/agent",
     "crates/sandbox",
     "crates/storage",
+    "crates/registry",
+    "crates/skills",
 ]
 
 [workspace.package]
@@ -32,8 +32,6 @@ aura-core = { path = "crates/core" }
 aura-channels = { path = "crates/channels" }
 aura-llm = { path = "crates/llm" }
 aura-tools = { path = "crates/tools" }
-aura-registry = { path = "crates/registry" }
-aura-skills = { path = "crates/skills" }
 aura-memory = { path = "crates/memory" }
 aura-workspace = { path = "crates/workspace" }
 aura-context = { path = "crates/context" }
@@ -46,6 +44,8 @@ aura-hook = { path = "crates/hook" }
 aura-agent = { path = "crates/agent" }
 aura-sandbox = { path = "crates/sandbox" }
 aura-storage = { path = "crates/storage" }
+aura-registry = { path = "crates/registry" }
+aura-skills = { path = "crates/skills" }
 
 # External dependencies
 tokio = { version = "1", features = ["full"] }
@@ -56,23 +56,30 @@ anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "json",
+    "registry",
+] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 tokio-util = "0.7"
 sha2 = "0.10"
 hex = "0.4"
 aes-gcm = "0.10"
-rand = "0.8"
-wasmtime = "29"
+rand = "0.10"
+wasmtime = "43"
 wat = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
-teloxide = { version = "0.13", features = ["macros"] }
+teloxide = { version = "0.17", features = ["macros"] }
 serenity = { version = "0.12", features = ["client", "gateway", "model"] }
 tower = { version = "0.5", features = ["util"] }
 url = "2"
+reqwest = { version = "0.12", features = ["json"] }
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+cron = "0.15"
 
 [package]
 name = "aura"
@@ -84,8 +91,6 @@ aura-core = { workspace = true }
 aura-channels = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
-aura-registry = { workspace = true }
-aura-skills = { workspace = true }
 aura-memory = { workspace = true }
 aura-workspace = { workspace = true }
 aura-context = { workspace = true }
@@ -104,3 +109,4 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+async-trait = { workspace = true }

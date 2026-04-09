@@ -20,9 +20,6 @@ pub enum AuraError {
     #[error("invalid state transition: {0}")]
     InvalidTransition(String),
 
-    #[error("limit exceeded: {0}")]
-    LimitExceeded(String),
-
     #[error("security error: {0}")]
     Security(String),
 

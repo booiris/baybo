@@ -5,10 +5,11 @@ use aura_core::{ChatMessage, ContentBlock, OperationKind, OutgoingMessage, Role,
 use aura_llm::{ChatRequest, LlmClient, LlmResponse, ToolDefinitionForLlm};
 use aura_memory::MemoryManager;
 use aura_tools::ToolRegistry;
-use aura_trace::{ExecutionProvenance, SpanInput, SpanResult, TraceNodeId};
+use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::error_recovery::ErrorHandler;
 use crate::observability::ObservabilityRecorder;
 use crate::policy::ExecutionPolicy;
 use crate::soul::Soul;
@@ -23,6 +24,7 @@ pub struct AgentLoop {
     memory_manager: Arc<MemoryManager>,
     policy: ExecutionPolicy,
     soul: Soul,
+    error_handler: ErrorHandler,
 }
 
 impl AgentLoop {
@@ -43,6 +45,7 @@ impl AgentLoop {
             memory_manager,
             policy,
             soul,
+            error_handler: ErrorHandler::default(),
         }
     }
 
@@ -108,43 +111,48 @@ impl AgentLoop {
             }
             iterations += 1;
 
-            // Call LLM
-            let response = self.call_llm(session, recorder, parent_job_id).await?;
+            // Call LLM with retry on transient errors
+            let response = self
+                .call_llm_with_retry(session, recorder, parent_job_id)
+                .await?;
 
             // Auto-snapshot after LLM call if the interval has been reached
             self.maybe_take_snapshot(session, recorder).await;
 
             // If no tool calls, we have the final response
             if response.tool_calls.is_empty() {
-                let final_content = response.content.clone();
+                // Use content_blocks when available, falling back to the text string.
+                let final_blocks = if response.content_blocks.is_empty() {
+                    vec![ContentBlock::Text(response.content.clone())]
+                } else {
+                    response.content_blocks.clone()
+                };
+                let final_text = aura_llm::multimodal::extract_text(&final_blocks);
+
                 info!(
                     iterations,
-                    content_len = final_content.len(),
+                    content_len = final_text.len(),
                     "conversation loop complete"
                 );
 
                 // Append assistant response to context
                 let assistant_msg = ChatMessage {
                     role: Role::Assistant,
-                    content: vec![ContentBlock::Text(final_content.clone())],
+                    content: final_blocks.clone(),
                 };
                 self.context_manager
                     .append(session, Role::Assistant, &assistant_msg)
                     .await?;
 
                 // Maybe store memory
-                if let Err(e) = self
-                    .memory_manager
-                    .maybe_store(session, &final_content)
-                    .await
-                {
+                if let Err(e) = self.memory_manager.maybe_store(session, &final_text).await {
                     warn!(error = %e, "failed to auto-store memory");
                 }
 
                 return Ok(OutgoingMessage {
                     session_id: session.id.clone(),
                     channel: session.channel,
-                    content: vec![ContentBlock::Text(final_content)],
+                    content: final_blocks,
                     reply_to: None,
                     metadata: Default::default(),
                 });
@@ -207,6 +215,35 @@ impl AgentLoop {
             reply_to: None,
             metadata: Default::default(),
         })
+    }
+
+    /// Call the LLM with retry on transient errors using `ErrorHandler`.
+    async fn call_llm_with_retry(
+        &self,
+        session: &Session,
+        recorder: &ObservabilityRecorder,
+        parent_job_id: Option<&str>,
+    ) -> aura_core::Result<LlmResponse> {
+        let mut attempt = 0u32;
+        loop {
+            match self.call_llm(session, recorder, parent_job_id).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    if !self.error_handler.should_retry(attempt, &e) {
+                        return Err(e);
+                    }
+                    let backoff = self.error_handler.backoff_duration(attempt);
+                    warn!(
+                        attempt = attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        "retrying LLM call after transient error"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     /// Call the LLM with the current session context.
@@ -305,22 +342,6 @@ impl AgentLoop {
                 Err(e)
             }
         }
-    }
-
-    /// Roll back the conversation to a previous trace node.
-    ///
-    /// This forks the trace tree from `node_id`, retrieves the nearest context
-    /// snapshot, and restores the session state to that point. Returns the
-    /// fork id for the newly created branch.
-    pub async fn rollback(
-        &self,
-        session: &mut Session,
-        node_id: TraceNodeId,
-        recorder: &ObservabilityRecorder,
-    ) -> aura_core::Result<String> {
-        let (fork_id, snapshot) = recorder.rollback(node_id).await?;
-        self.context_manager.restore_state(session, &snapshot)?;
-        Ok(fork_id)
     }
 
     /// If the trace collector's auto-snapshot interval has been reached,

@@ -87,8 +87,6 @@ mod tests {
     fn sample_blob() -> BlobRef {
         BlobRef {
             blob_id: "blob_123".to_string(),
-            size_bytes: 1024,
-            sha256: "abc123".to_string(),
         }
     }
 

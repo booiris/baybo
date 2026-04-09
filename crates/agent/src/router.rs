@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aura_channels::ChannelAdapter;
-use aura_core::{IncomingMessage, OutgoingMessage};
+use aura_core::{IncomingMessage, OutgoingMessage, Session};
 use aura_security::SecurityGateway;
 use aura_session::SessionManager;
 use tokio::sync::mpsc;
@@ -10,12 +10,21 @@ use tracing::{debug, error, info, warn};
 use crate::actor::AgentMessage;
 use crate::supervisor::AgentSupervisor;
 
+/// A callback that creates and spawns a new AgentActor for a given session.
+///
+/// Returns the mailbox sender for communicating with the spawned actor.
+/// The closure captures all dependencies needed to construct an actor
+/// (AgentLoop, HookManager, ObservabilityRecorder, etc.).
+pub type ActorSpawner =
+    Box<dyn Fn(Session, mpsc::Sender<OutgoingMessage>) -> mpsc::Sender<AgentMessage> + Send + Sync>;
+
 /// Routes incoming messages to the appropriate AgentActor.
 pub struct Router {
     session_manager: SessionManager,
     supervisor: AgentSupervisor,
     channels: Vec<Box<dyn ChannelAdapter>>,
     security_gateway: Arc<SecurityGateway>,
+    actor_spawner: Option<ActorSpawner>,
 }
 
 impl Router {
@@ -30,7 +39,14 @@ impl Router {
             supervisor,
             channels,
             security_gateway,
+            actor_spawner: None,
         }
+    }
+
+    /// Set an actor spawner for on-demand actor creation.
+    pub fn with_actor_spawner(mut self, spawner: ActorSpawner) -> Self {
+        self.actor_spawner = Some(spawner);
+        self
     }
 
     /// Start all channels and begin routing messages.
@@ -99,19 +115,37 @@ impl Router {
         // Update last active time
         self.session_manager.touch(&session_id).await?;
 
-        // Route to actor
+        // Route to actor. If no actor exists and we have a spawner,
+        // create one on-demand and retry.
         let routed = self
             .supervisor
-            .route(&session_id, AgentMessage::UserInput(Box::new(incoming)))
+            .route(
+                &session_id,
+                AgentMessage::UserInput(Box::new(incoming.clone())),
+            )
             .await;
 
         if !routed {
-            debug!(
-                session_id = %session_id,
-                "no actor found, message queued for new actor creation"
-            );
-            // In a full implementation, we would create a new actor here.
-            // For Phase 1, we log and skip.
+            if let Some(ref spawner) = self.actor_spawner {
+                info!(session_id = %session_id, "creating new actor for session");
+                let response_tx = self.supervisor.response_tx().clone();
+                let sender = spawner(session, response_tx);
+                self.supervisor.register(session_id.clone(), sender);
+
+                // Retry routing now that the actor exists.
+                let re_routed = self
+                    .supervisor
+                    .route(&session_id, AgentMessage::UserInput(Box::new(incoming)))
+                    .await;
+                if !re_routed {
+                    warn!(session_id = %session_id, "failed to route after actor creation");
+                }
+            } else {
+                warn!(
+                    session_id = %session_id,
+                    "no actor found and no actor spawner configured"
+                );
+            }
         }
 
         Ok(())
@@ -177,15 +211,5 @@ impl Router {
             channel = %channel_type,
             "no adapter found for channel type"
         );
-    }
-
-    /// Access the supervisor for actor management.
-    pub fn supervisor_mut(&mut self) -> &mut AgentSupervisor {
-        &mut self.supervisor
-    }
-
-    /// Access the session manager.
-    pub fn session_manager(&self) -> &SessionManager {
-        &self.session_manager
     }
 }

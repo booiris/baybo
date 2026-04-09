@@ -1,25 +1,24 @@
 //! Snapshot policy and lookup.
 
+#[cfg(test)]
 use aura_context::ContextSnapshot;
 
+#[cfg(test)]
+use crate::tree::ancestor_chain;
+#[cfg(test)]
 use crate::{SessionTrace, TraceNodeId};
 
-/// Walk from `node_id` up the parent chain and return the first
-/// `ContextSnapshot` found. Returns `NotFound` if no ancestor has a snapshot.
-pub fn find_nearest_snapshot(
+#[cfg(test)]
+pub(crate) fn find_nearest_snapshot(
     trace: &SessionTrace,
     node_id: &TraceNodeId,
 ) -> aura_core::Result<ContextSnapshot> {
-    let mut current = Some(node_id.clone());
-    while let Some(ref id) = current {
-        let node = trace
-            .nodes
-            .get(id)
-            .ok_or_else(|| aura_core::AuraError::NotFound(format!("trace node {id}")))?;
-        if let Some(ref snap) = node.context_snapshot {
+    for id in ancestor_chain(trace, node_id) {
+        if let Some(node) = trace.nodes.get(&id)
+            && let Some(ref snap) = node.context_snapshot
+        {
             return Ok(snap.clone());
         }
-        current = node.parent.clone();
     }
     Err(aura_core::AuraError::NotFound(format!(
         "no context snapshot found in ancestor chain of node {node_id}"

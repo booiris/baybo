@@ -50,7 +50,7 @@ struct MessageResponse {
     content: Vec<ContentBlockJson>,
 }
 
-/// Serialisable representation of a `ContentBlock`.
+/// Serializable representation of a `ContentBlock`.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlockJson {
@@ -99,12 +99,6 @@ impl HttpChannel {
             shutdown: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    /// Override the default response timeout (30 s).
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.response_timeout = timeout;
-        self
     }
 
     fn build_router(&self, sender: mpsc::Sender<IncomingMessage>) -> Router {
@@ -279,6 +273,14 @@ async fn handle_message(
                 Json(serde_json::json!({"error": "response timed out"})),
             )
         }
+    }
+}
+
+#[cfg(test)]
+impl HttpChannel {
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.response_timeout = timeout;
+        self
     }
 }
 

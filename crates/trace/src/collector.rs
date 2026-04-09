@@ -6,8 +6,6 @@ use std::sync::Arc;
 use aura_context::ContextSnapshot;
 use aura_core::OperationKind;
 
-use crate::fork::fork_from as do_fork;
-use crate::snapshot::find_nearest_snapshot;
 use crate::tree::{attach_child, create_root_node, set_active_leaf};
 use crate::{
     ExecutionProvenance, SessionTrace, SpanHandle, SpanInput, SpanResult, TraceNodeId, TraceStore,
@@ -71,6 +69,8 @@ impl TraceCollector {
         // attach_child only fails if the parent is missing, which should not
         // happen here since active_leaf always references a valid node. If it
         // does, we create a detached node under root as a fallback.
+        let input_clone = input.clone();
+        let provenance_clone = provenance.clone();
         let node_id = match attach_child(
             &mut self.session_trace,
             &parent_id,
@@ -88,8 +88,8 @@ impl TraceCollector {
                     &fallback_parent,
                     OperationKind::UserMessageHandling { session_id },
                     job_id,
-                    ExecutionProvenance::default(),
-                    SpanInput::None,
+                    provenance_clone,
+                    input_clone,
                 )
                 // root always exists; fall back to root id as last resort
                 .unwrap_or_else(|_| self.session_trace.root.clone())
@@ -114,19 +114,6 @@ impl TraceCollector {
                 set_active_leaf(&mut self.session_trace, parent_id.clone());
             }
         }
-    }
-
-    /// Create a new branch forking from the specified node.
-    ///
-    /// Returns the fork record id.
-    pub fn fork_from(&mut self, node_id: TraceNodeId) -> aura_core::Result<String> {
-        do_fork(&mut self.session_trace, node_id, "manual fork")
-    }
-
-    /// Walk up the parent chain from `node_id` to find the nearest context
-    /// snapshot.
-    pub fn get_snapshot_at(&self, node_id: TraceNodeId) -> aura_core::Result<ContextSnapshot> {
-        find_nearest_snapshot(&self.session_trace, &node_id)
     }
 
     /// Persist the current session trace to the store.
@@ -156,14 +143,27 @@ impl TraceCollector {
         Ok(())
     }
 
-    /// Get a reference to the underlying session trace.
-    pub fn session_trace(&self) -> &SessionTrace {
-        &self.session_trace
-    }
-
     /// Get the current active leaf node id.
     pub fn active_leaf(&self) -> &TraceNodeId {
         &self.session_trace.active_leaf
+    }
+}
+
+#[cfg(test)]
+impl TraceCollector {
+    fn session_trace(&self) -> &SessionTrace {
+        &self.session_trace
+    }
+
+    fn fork_from(&mut self, from_node: TraceNodeId) -> aura_core::Result<String> {
+        use crate::fork::fork_from as do_fork;
+        let fork_id = do_fork(&mut self.session_trace, from_node, "")?;
+        Ok(fork_id)
+    }
+
+    fn get_snapshot_at(&self, node_id: TraceNodeId) -> aura_core::Result<ContextSnapshot> {
+        use crate::snapshot::find_nearest_snapshot;
+        find_nearest_snapshot(&self.session_trace, &node_id)
     }
 }
 

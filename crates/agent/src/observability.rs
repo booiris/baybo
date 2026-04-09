@@ -5,7 +5,7 @@ use aura_core::OperationKind;
 use aura_cost::{CostRecord, CostTracker};
 use aura_job::JobManager;
 use aura_trace::{
-    ExecutionProvenance, SpanHandle, SpanInput, SpanResult, TraceCollector, TraceNodeId, TraceStore,
+    ExecutionProvenance, SpanHandle, SpanInput, SpanResult, TraceCollector, TraceNodeId,
 };
 use chrono::Utc;
 use tokio::sync::Mutex;
@@ -133,28 +133,6 @@ impl ObservabilityRecorder {
         collector.flush().await
     }
 
-    pub fn trace_collector(&self) -> &Arc<Mutex<TraceCollector>> {
-        &self.trace_collector
-    }
-
-    pub fn job_manager(&self) -> &Arc<JobManager> {
-        &self.job_manager
-    }
-
-    /// Roll back to a previous trace node: retrieve the nearest context
-    /// snapshot and fork the trace tree from that node.
-    ///
-    /// Returns the fork id and the snapshot so the caller can restore context.
-    pub async fn rollback(
-        &self,
-        node_id: TraceNodeId,
-    ) -> aura_core::Result<(String, ContextSnapshot)> {
-        let mut collector = self.trace_collector.lock().await;
-        let snapshot = collector.get_snapshot_at(node_id.clone())?;
-        let fork_id = collector.fork_from(node_id)?;
-        Ok((fork_id, snapshot))
-    }
-
     /// Check whether the auto-snapshot policy says a snapshot should be taken now.
     ///
     /// Returns the active leaf node id when a snapshot is due, so the caller
@@ -176,10 +154,5 @@ impl ObservabilityRecorder {
     ) -> aura_core::Result<()> {
         let mut collector = self.trace_collector.lock().await;
         collector.attach_snapshot(node_id, snapshot)
-    }
-
-    /// Create a new TraceCollector for a session.
-    pub fn create_trace_collector(session_id: &str, store: Arc<dyn TraceStore>) -> TraceCollector {
-        TraceCollector::new(session_id, store, true, 5)
     }
 }

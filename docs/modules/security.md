@@ -122,13 +122,9 @@ pub enum LeakAction {
 }
 ```
 
-### 3.5 NetworkPolicyDecider
+### 3.5 NetworkRequest / NetworkPolicyDecision
 
 ```rust
-pub trait NetworkPolicyDecider: Send + Sync {
-    fn decide(&self, tool: &ToolManifest, request: &NetworkRequest) -> NetworkPolicyDecision;
-}
-
 pub struct NetworkRequest {
     pub host: String,
     pub port: u16,
@@ -139,6 +135,8 @@ pub enum NetworkPolicyDecision {
     Deny(String),
 }
 ```
+
+The current workspace keeps the policy-decider trait internal to the `security` crate and exposes `SecurityGateway::with_deny_all_policy()` as the public construction path.
 
 ---
 

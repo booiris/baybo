@@ -2,7 +2,7 @@
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use rand::RngCore;
+use rand::Rng;
 
 /// AES-256-GCM requires exactly 32 bytes for the key.
 const AES256_KEY_LEN: usize = 32;
@@ -30,13 +30,6 @@ impl EncryptionKey {
         Ok(Self { key })
     }
 
-    /// Generate a random 32-byte encryption key using OS randomness.
-    pub fn generate() -> Self {
-        let mut key = vec![0u8; AES256_KEY_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut key);
-        Self { key }
-    }
-
     /// Return a reference to the raw key bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.key
@@ -53,7 +46,7 @@ pub fn encrypt(plaintext: &[u8], key: &EncryptionKey) -> aura_core::Result<Vec<u
     })?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|e| {
@@ -86,6 +79,16 @@ pub fn decrypt(data: &[u8], key: &EncryptionKey) -> aura_core::Result<Vec<u8>> {
     cipher
         .decrypt(nonce, ciphertext)
         .map_err(|e| aura_core::AuraError::Security(format!("AES-256-GCM decryption failed: {e}")))
+}
+
+#[cfg(test)]
+impl EncryptionKey {
+    fn generate() -> Self {
+        use rand::RngExt;
+        let mut key = vec![0u8; AES256_KEY_LEN];
+        rand::rng().fill(key.as_mut_slice());
+        Self { key }
+    }
 }
 
 #[cfg(test)]

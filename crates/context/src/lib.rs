@@ -1,6 +1,4 @@
-pub mod hybrid;
 pub mod sliding_window;
-pub mod summarize;
 
 use std::time::Duration;
 
@@ -22,16 +20,6 @@ pub trait Tokenizer: Send + Sync {
     /// Count the total tokens in a chat message, including structural overhead
     /// such as role markers and separators.
     fn count_message(&self, msg: &ChatMessage) -> usize;
-}
-
-/// Callback for generating summaries of message batches.
-///
-/// This keeps the `context` crate independent from `llm` -- the agent layer
-/// injects a concrete implementation that calls the LLM.
-#[async_trait]
-pub trait SummarizeCallback: Send + Sync {
-    /// Summarize the given messages into a single condensed text string.
-    async fn summarize(&self, messages: &[ChatMessage]) -> aura_core::Result<String>;
 }
 
 /// Manages session context: appending messages, compression, snapshots.

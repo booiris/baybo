@@ -40,18 +40,6 @@ impl SqlitePool {
         Ok(pool)
     }
 
-    /// Open an in-memory SQLite database (useful for tests).
-    pub fn open_in_memory() -> aura_core::Result<Self> {
-        let conn = Connection::open_in_memory().map_err(|e| {
-            AuraError::Config(format!("failed to open in-memory sqlite database: {e}"))
-        })?;
-        let pool = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        pool.init_db()?;
-        Ok(pool)
-    }
-
     /// Acquire a lock on the underlying connection.
     fn lock(&self) -> aura_core::Result<std::sync::MutexGuard<'_, Connection>> {
         self.conn

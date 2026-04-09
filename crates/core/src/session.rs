@@ -20,8 +20,6 @@ pub struct Session {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
-    pub active_skill: Option<String>,
-    pub compression_count: u32,
     #[serde(default)]
     pub extra: HashMap<String, Value>,
 }

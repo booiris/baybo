@@ -1,8 +1,5 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::user::{ChannelType, User};
 
@@ -39,8 +36,6 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobRef {
     pub blob_id: String,
-    pub size_bytes: u64,
-    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,28 +54,7 @@ pub enum Role {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MessageMetadata {
-    pub channel_specific: Option<ChannelMetadata>,
-    pub priority: Option<MessagePriority>,
-    pub thread_id: Option<String>,
-    #[serde(default)]
-    pub extra: HashMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelMetadata {
-    pub platform_message_id: Option<String>,
-    #[serde(default)]
-    pub extra: HashMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessagePriority {
-    Low,
-    Normal,
-    High,
-}
+pub struct MessageMetadata {}
 
 /// Incoming message from a channel adapter, before security processing.
 #[derive(Debug, Clone)]

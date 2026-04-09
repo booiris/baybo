@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::SandboxError;
 
@@ -61,53 +60,6 @@ impl std::fmt::Debug for WasmRuntime {
 }
 
 impl WasmRuntime {
-    /// Create a new WASM runtime with default limits.
-    pub fn new() -> Result<Self, SandboxError> {
-        Self::with_limits(SandboxLimits::default())
-    }
-
-    /// Create a new WASM runtime with custom limits.
-    pub fn with_limits(limits: SandboxLimits) -> Result<Self, SandboxError> {
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        let engine = wasmtime::Engine::new(&config).map_err(|e| {
-            SandboxError::WasmExecution(format!("failed to create wasmtime engine: {e}"))
-        })?;
-        Ok(Self { engine, limits })
-    }
-
-    /// Load a WASM module from raw bytes with the default name "unnamed".
-    pub fn load_module(&self, wasm_bytes: &[u8]) -> Result<WasmModule, SandboxError> {
-        self.load_module_named("unnamed", wasm_bytes)
-    }
-
-    /// Load a WASM module from raw bytes with a given name.
-    pub fn load_module_named(
-        &self,
-        name: &str,
-        wasm_bytes: &[u8],
-    ) -> Result<WasmModule, SandboxError> {
-        if wasm_bytes.is_empty() {
-            return Err(SandboxError::InvalidModule("empty WASM bytes".to_string()));
-        }
-
-        let artifact_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(wasm_bytes);
-            hex::encode(hasher.finalize())
-        };
-
-        let compiled = wasmtime::Module::new(&self.engine, wasm_bytes).map_err(|e| {
-            SandboxError::InvalidModule(format!("failed to compile WASM module: {e}"))
-        })?;
-
-        Ok(WasmModule {
-            name: name.to_string(),
-            artifact_hash,
-            compiled,
-        })
-    }
-
     /// Execute a loaded WASM module with the given input parameters and secrets.
     ///
     /// The module is expected to export a `run() -> i32` function.
@@ -157,17 +109,19 @@ impl WasmRuntime {
                 |mut caller: wasmtime::Caller<'_, HostState>,
                  ptr: i32,
                  len: i32|
-                 -> anyhow::Result<()> {
+                 -> wasmtime::Result<()> {
                     let input = caller.data().input_json.clone();
                     let copy_len = (len as usize).min(input.len());
                     let memory = caller
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
-                        .ok_or_else(|| anyhow::anyhow!("module has no exported memory"))?;
+                        .ok_or_else(|| wasmtime::Error::msg("module has no exported memory"))?;
                     let data = memory.data_mut(&mut caller);
                     let offset = ptr as usize;
                     if offset + copy_len > data.len() {
-                        return Err(anyhow::anyhow!("read_input: out of bounds memory access"));
+                        return Err(wasmtime::Error::msg(
+                            "read_input: out of bounds memory access",
+                        ));
                     }
                     data[offset..offset + copy_len].copy_from_slice(&input[..copy_len]);
                     Ok(())
@@ -194,17 +148,19 @@ impl WasmRuntime {
                 |mut caller: wasmtime::Caller<'_, HostState>,
                  ptr: i32,
                  len: i32|
-                 -> anyhow::Result<()> {
+                 -> wasmtime::Result<()> {
                     let secrets = caller.data().secrets_json.clone();
                     let copy_len = (len as usize).min(secrets.len());
                     let memory = caller
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
-                        .ok_or_else(|| anyhow::anyhow!("module has no exported memory"))?;
+                        .ok_or_else(|| wasmtime::Error::msg("module has no exported memory"))?;
                     let data = memory.data_mut(&mut caller);
                     let offset = ptr as usize;
                     if offset + copy_len > data.len() {
-                        return Err(anyhow::anyhow!("read_secrets: out of bounds memory access"));
+                        return Err(wasmtime::Error::msg(
+                            "read_secrets: out of bounds memory access",
+                        ));
                     }
                     data[offset..offset + copy_len].copy_from_slice(&secrets[..copy_len]);
                     Ok(())
@@ -222,16 +178,18 @@ impl WasmRuntime {
                 |mut caller: wasmtime::Caller<'_, HostState>,
                  ptr: i32,
                  len: i32|
-                 -> anyhow::Result<()> {
+                 -> wasmtime::Result<()> {
                     let memory = caller
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
-                        .ok_or_else(|| anyhow::anyhow!("module has no exported memory"))?;
+                        .ok_or_else(|| wasmtime::Error::msg("module has no exported memory"))?;
                     let data = memory.data(&caller);
                     let offset = ptr as usize;
                     let length = len as usize;
                     if offset + length > data.len() {
-                        return Err(anyhow::anyhow!("write_output: out of bounds memory access"));
+                        return Err(wasmtime::Error::msg(
+                            "write_output: out of bounds memory access",
+                        ));
                     }
                     let output = data[offset..offset + length].to_vec();
                     caller.data_mut().output_json = output;
@@ -295,6 +253,44 @@ impl WasmRuntime {
 
         serde_json::from_slice(output_bytes).map_err(|e| {
             SandboxError::WasmExecution(format!("failed to parse module output as JSON: {e}"))
+        })
+    }
+}
+
+#[cfg(test)]
+impl WasmRuntime {
+    fn new() -> Result<Self, SandboxError> {
+        Self::with_limits(SandboxLimits::default())
+    }
+
+    fn with_limits(limits: SandboxLimits) -> Result<Self, SandboxError> {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&config).map_err(|e| {
+            SandboxError::WasmExecution(format!("failed to create wasmtime engine: {e}"))
+        })?;
+        Ok(Self { engine, limits })
+    }
+
+    fn load_module(&self, bytes: &[u8]) -> Result<WasmModule, SandboxError> {
+        self.load_module_named("unnamed", bytes)
+    }
+
+    fn load_module_named(&self, name: &str, bytes: &[u8]) -> Result<WasmModule, SandboxError> {
+        use sha2::{Digest as _, Sha256};
+        if bytes.is_empty() {
+            return Err(SandboxError::InvalidModule("empty WASM bytes".to_string()));
+        }
+        let compiled = wasmtime::Module::new(&self.engine, bytes).map_err(|e| {
+            SandboxError::InvalidModule(format!("failed to compile WASM module: {e}"))
+        })?;
+        let mut hasher = Sha256::new();
+        sha2::Digest::update(&mut hasher, bytes);
+        let artifact_hash = hex::encode(sha2::Digest::finalize(hasher));
+        Ok(WasmModule {
+            name: name.to_string(),
+            artifact_hash,
+            compiled,
         })
     }
 }

@@ -3,7 +3,6 @@ pub mod identity;
 
 use std::path::PathBuf;
 
-pub use heartbeat::{HeartbeatSpec, RoutineSchedule, RoutineSpec};
 pub use identity::IdentityFiles;
 
 /// Manages the workspace root directory and its identity/configuration files.
@@ -21,13 +20,17 @@ impl WorkspaceManager {
     pub async fn load_identity_files(&self) -> aura_core::Result<IdentityFiles> {
         identity::load_identity_files(&self.root).await
     }
+}
 
-    /// Parses the HEARTBEAT.md file into a structured spec.
-    /// Returns `Ok(None)` if the file does not exist.
-    pub async fn load_heartbeat_spec(&self) -> aura_core::Result<Option<HeartbeatSpec>> {
-        let files = self.load_identity_files().await?;
-        match files.heartbeat {
-            Some(content) => heartbeat::parse_heartbeat(&content).map(Some),
+#[cfg(test)]
+impl WorkspaceManager {
+    async fn load_heartbeat_spec(&self) -> aura_core::Result<Option<heartbeat::HeartbeatSpec>> {
+        let identity = self.load_identity_files().await?;
+        match identity.heartbeat {
+            Some(content) => {
+                let spec = heartbeat::parse_heartbeat(&content)?;
+                Ok(Some(spec))
+            }
             None => Ok(None),
         }
     }

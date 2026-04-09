@@ -11,13 +11,13 @@ pub enum TrustLevel {
     Untrusted,
 }
 
-/// Where an extension artifact originates.
+/// Where an extension artifact was sourced from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactSource {
-    /// From the local workspace directory.
+    /// Placed directly in the workspace.
     Workspace,
-    /// From a remote registry.
+    /// Downloaded from the extension registry.
     Registry { url: String },
-    /// From a local file path.
-    Local { path: String },
+    /// Provided inline or via configuration.
+    Inline,
 }

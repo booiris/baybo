@@ -49,33 +49,9 @@ impl AgentSupervisor {
         self.actors.insert(session_id, ActorHandle { sender });
     }
 
-    /// Remove an actor handle.
-    pub fn remove(&mut self, session_id: &str) {
-        debug!(session_id, "removing actor");
-        self.actors.remove(session_id);
-    }
-
-    /// Check if an actor exists for a session.
-    pub fn has_actor(&self, session_id: &str) -> bool {
-        self.actors.contains_key(session_id)
-    }
-
     /// Get the response channel sender (for creating new actors).
     pub fn response_tx(&self) -> &mpsc::Sender<OutgoingMessage> {
         &self.response_tx
-    }
-
-    /// Broadcast a message to all active actors.
-    pub async fn broadcast(&self, message: AgentMessage) {
-        for (session_id, handle) in &self.actors {
-            if let Err(e) = handle.sender.send(message.clone()).await {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "failed to broadcast message to actor"
-                );
-            }
-        }
     }
 
     /// Shut down all actors gracefully.

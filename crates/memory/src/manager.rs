@@ -1,4 +1,3 @@
-use chrono::Utc;
 use tracing::{debug, warn};
 
 use aura_core::{ContentBlock, Result, Session};
@@ -48,26 +47,12 @@ pub struct MemoryManager {
 }
 
 impl MemoryManager {
-    pub fn new(store: Box<dyn MemoryStore>, embedder: Box<dyn EmbeddingModel>) -> Self {
-        Self {
-            store,
-            embedder: Some(embedder),
-            max_entries_per_user: 1000,
-        }
-    }
-
     pub fn without_embedder(store: Box<dyn MemoryStore>) -> Self {
         Self {
             store,
             embedder: None,
             max_entries_per_user: 1000,
         }
-    }
-
-    /// Set the maximum number of memory entries allowed per user.
-    pub fn with_max_entries_per_user(mut self, max: usize) -> Self {
-        self.max_entries_per_user = max;
-        self
     }
 
     // -------------------------------------------------------------------
@@ -158,52 +143,6 @@ impl MemoryManager {
         self.store.store(&entry).await?;
         self.enforce_user_limit(&entry.user_id).await?;
         Ok(())
-    }
-
-    /// Remove all expired memory entries across all users. Returns the count
-    /// of entries removed.
-    pub async fn forget_expired(&self) -> Result<usize> {
-        // We cannot push expiration logic into a single store call without a
-        // richer trait method, so we iterate known users. In practice, the
-        // storage layer should implement a bulk delete; for now we do
-        // client-side filtering to keep the trait simple.
-        //
-        // A future optimization would add a `delete_expired` method to
-        // `MemoryStore`.
-
-        // There is no `list_all_users` on the store, so we rely on the
-        // caller to scope this per-user if needed. As a practical
-        // middle-ground we return 0 and log a warning when no user scope is
-        // available.  The more common path is `forget_expired_for_user`.
-        warn!("forget_expired without user scope is a no-op; use forget_expired_for_user");
-        Ok(0)
-    }
-
-    /// Remove expired memory entries for a specific user. Returns the count
-    /// of entries removed.
-    pub async fn forget_expired_for_user(&self, user_id: &str) -> Result<usize> {
-        let entries = self.store.list_by_user(user_id).await?;
-        let now = Utc::now();
-        let mut removed = 0usize;
-
-        for entry in &entries {
-            if let Some(expires_at) = entry.expires_at
-                && expires_at < now
-            {
-                self.store.delete(&entry.id).await?;
-                removed += 1;
-            }
-        }
-
-        if removed > 0 {
-            debug!(
-                user_id = user_id,
-                removed = removed,
-                "expired memories removed"
-            );
-        }
-
-        Ok(removed)
     }
 
     // -------------------------------------------------------------------
@@ -428,8 +367,6 @@ mod tests {
             ContentBlock::Image {
                 blob: BlobRef {
                     blob_id: "x".into(),
-                    size_bytes: 0,
-                    sha256: "x".into(),
                 },
                 mime_type: "image/png".into(),
             },

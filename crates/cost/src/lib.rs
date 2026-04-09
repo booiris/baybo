@@ -1,7 +1,5 @@
-pub mod guard;
 pub mod tracker;
 
-pub use guard::CostGuard;
 pub use tracker::CostTracker;
 
 use async_trait::async_trait;

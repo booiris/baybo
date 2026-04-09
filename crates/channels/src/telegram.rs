@@ -1,6 +1,4 @@
 #[cfg(feature = "telegram")]
-use std::collections::HashMap;
-#[cfg(feature = "telegram")]
 use std::sync::Arc;
 #[cfg(feature = "telegram")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,13 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 #[cfg(feature = "telegram")]
 use aura_core::{
-    ChannelMetadata, ChannelType, ContentBlock, IncomingMessage, Message, MessageMetadata,
-    OutgoingMessage, User,
+    ChannelType, ContentBlock, IncomingMessage, Message, MessageMetadata, OutgoingMessage, User,
 };
+#[cfg(feature = "telegram")]
+use teloxide::net::Download;
 #[cfg(feature = "telegram")]
 use teloxide::prelude::*;
 #[cfg(feature = "telegram")]
-use teloxide::types::InputFile;
+use teloxide::types::{FileId, InputFile};
 #[cfg(feature = "telegram")]
 use tokio::sync::mpsc;
 
@@ -28,7 +27,7 @@ pub struct TelegramChannel {
     bot_token: String,
     shutdown: Arc<AtomicBool>,
     /// Maps session_id (`tg_{chat_id}`) → `ChatId` for outbound routing.
-    chat_ids: Arc<tokio::sync::RwLock<HashMap<String, ChatId>>>,
+    chat_ids: Arc<tokio::sync::RwLock<std::collections::HashMap<String, ChatId>>>,
 }
 
 #[cfg(feature = "telegram")]
@@ -37,12 +36,16 @@ impl TelegramChannel {
         Self {
             bot_token,
             shutdown: Arc::new(AtomicBool::new(false)),
-            chat_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            chat_ids: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
     /// Convert a teloxide `Message` into an `IncomingMessage`.
-    fn convert_message(msg: &teloxide::types::Message) -> Option<IncomingMessage> {
+    ///
+    /// Handles text, photo, audio, voice, and document messages.
+    /// For media messages, downloads the file via the Telegram Bot API
+    /// and produces the appropriate `ContentBlock`.
+    async fn convert_message(msg: &teloxide::types::Message, bot: &Bot) -> Option<IncomingMessage> {
         let chat_id = msg.chat.id;
         let from = msg.from.as_ref()?;
 
@@ -55,21 +58,92 @@ impl TelegramChannel {
             channel: ChannelType::Telegram,
         };
 
-        let content = if let Some(text) = &msg.text() {
+        let content = if let Some(text) = msg.text() {
             vec![ContentBlock::Text(text.to_string())]
+        } else if let Some(photos) = msg.photo() {
+            // Pick the largest resolution photo
+            if let Some(photo) = photos.last() {
+                match Self::download_file(bot, &photo.file.id).await {
+                    Ok((blob, _data)) => vec![ContentBlock::Image {
+                        blob,
+                        mime_type: "image/jpeg".to_string(),
+                    }],
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to download telegram photo");
+                        vec![ContentBlock::Text("[photo: download failed]".to_string())]
+                    }
+                }
+            } else {
+                vec![ContentBlock::Text("[empty photo]".to_string())]
+            }
+        } else if let Some(audio) = msg.audio() {
+            match Self::download_file(bot, &audio.file.id).await {
+                Ok((blob, _data)) => {
+                    let mime = audio
+                        .mime_type
+                        .as_ref()
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "audio/mpeg".to_string());
+                    vec![ContentBlock::Audio {
+                        blob,
+                        mime_type: mime,
+                    }]
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to download telegram audio");
+                    vec![ContentBlock::Text("[audio: download failed]".to_string())]
+                }
+            }
+        } else if let Some(voice) = msg.voice() {
+            match Self::download_file(bot, &voice.file.id).await {
+                Ok((blob, _data)) => {
+                    let mime = voice
+                        .mime_type
+                        .as_ref()
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "audio/ogg".to_string());
+                    vec![ContentBlock::Audio {
+                        blob,
+                        mime_type: mime,
+                    }]
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to download telegram voice");
+                    vec![ContentBlock::Text("[voice: download failed]".to_string())]
+                }
+            }
+        } else if let Some(doc) = msg.document() {
+            match Self::download_file(bot, &doc.file.id).await {
+                Ok((blob, _data)) => {
+                    let filename = doc
+                        .file_name
+                        .clone()
+                        .unwrap_or_else(|| "document".to_string());
+                    let mime = doc
+                        .mime_type
+                        .as_ref()
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    vec![ContentBlock::File {
+                        blob,
+                        filename,
+                        mime_type: mime,
+                    }]
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to download telegram document");
+                    vec![ContentBlock::Text(
+                        "[document: download failed]".to_string(),
+                    )]
+                }
+            }
         } else {
-            // For non-text messages (photo, audio, document) we create a
-            // placeholder text block. Full media download is left for a future
-            // iteration since it requires network calls to Telegram's file API.
-            vec![ContentBlock::Text("[unsupported media]".to_string())]
-        };
-
-        let metadata = MessageMetadata {
-            channel_specific: Some(ChannelMetadata {
-                platform_message_id: Some(message_id.clone()),
-                extra: HashMap::new(),
-            }),
-            ..Default::default()
+            // Stickers, contacts, locations, etc.
+            let caption = msg
+                .caption()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "[unsupported media]".to_string());
+            vec![ContentBlock::Text(caption)]
         };
 
         Some(IncomingMessage {
@@ -81,9 +155,28 @@ impl TelegramChannel {
                 content,
                 timestamp: chrono::Utc::now(),
                 reply_to: msg.reply_to_message().map(|r| format!("tg_{}", r.id.0)),
-                metadata,
+                metadata: MessageMetadata::default(),
             },
         })
+    }
+
+    /// Download a file from the Telegram Bot API by file_id.
+    ///
+    /// Returns a `BlobRef` containing the file_id plus the raw bytes.
+    async fn download_file(
+        bot: &Bot,
+        file_id: &FileId,
+    ) -> Result<(aura_core::BlobRef, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+        let file = bot.get_file(file_id.clone()).await?;
+        let mut data = Vec::new();
+        bot.download_file(&file.path, &mut data).await?;
+
+        Ok((
+            aura_core::BlobRef {
+                blob_id: file_id.0.clone(),
+            },
+            data,
+        ))
     }
 }
 
@@ -104,7 +197,7 @@ impl ChannelAdapter for TelegramChannel {
 
         tokio::spawn(async move {
             let handler = Update::filter_message().endpoint(
-                move |msg: teloxide::types::Message, _bot: Bot| {
+                move |msg: teloxide::types::Message, bot: Bot| {
                     let sender = sender.clone();
                     let chat_ids = chat_ids.clone();
                     async move {
@@ -114,7 +207,7 @@ impl ChannelAdapter for TelegramChannel {
                         // Remember chat_id for outbound routing.
                         chat_ids.write().await.insert(session_id, chat_id);
 
-                        if let Some(incoming) = TelegramChannel::convert_message(&msg)
+                        if let Some(incoming) = TelegramChannel::convert_message(&msg, &bot).await
                             && let Err(e) = sender.send(incoming).await
                         {
                             tracing::error!("failed to forward telegram message: {}", e);

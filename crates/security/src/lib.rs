@@ -7,9 +7,7 @@ use aura_core::Result;
 
 // Re-exports for convenient access.
 pub use crate::crypto::EncryptionKey;
-pub use crate::gateway::{
-    DenyAllPolicy, NetworkPolicyDecider, NetworkPolicyDecision, NetworkRequest, SecurityGateway,
-};
+pub use crate::gateway::SecurityGateway;
 pub use crate::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
 pub use crate::vault::{SecretValue, SecretVault};
 

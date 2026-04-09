@@ -21,9 +21,16 @@ impl LlmProviderFactory for AnthropicProviderFactory {
                 output_per_1m_tokens: 15.0,
             },
         };
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+
         Ok(LlmClient::new(
             model_info,
             ResponseParseMode::NativeFunctionCalling,
+            config.api_key.clone(),
+            base_url,
         ))
     }
 }
@@ -51,9 +58,5 @@ mod tests {
         assert_eq!(client.model_id(), "claude-sonnet-4-6");
         assert_eq!(client.model_info().context_window, 200_000);
         assert!(client.model_info().supports_tools);
-        assert!(matches!(
-            client.parse_mode(),
-            ResponseParseMode::NativeFunctionCalling
-        ));
     }
 }

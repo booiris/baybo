@@ -1,3 +1,4 @@
+use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::AgentLoop;
 use aura_agent::observability::ObservabilityRecorder;
 use aura_agent::policy::ExecutionPolicy;
@@ -10,9 +11,9 @@ use aura_context::Tokenizer;
 use aura_context::sliding_window::SlidingWindowContext;
 use aura_core::{ChatMessage, ContentBlock};
 use aura_cost::CostTracker;
-use aura_hook::HookManager;
+use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
 use aura_job::JobManager;
-use aura_llm::{LlmClient, ModelInfo, ModelPricing, ResponseParseMode};
+use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_memory::MemoryManager;
 use aura_security::{EncryptionKey, LeakDetector, SecretVault, SecurityGateway};
 use aura_session::SessionManager;
@@ -25,6 +26,23 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+struct NoopHook;
+
+#[async_trait::async_trait]
+impl Hook for NoopHook {
+    fn name(&self) -> &str {
+        "noop"
+    }
+
+    fn hook_point(&self) -> HookPoint {
+        HookPoint::PreMessage
+    }
+
+    async fn execute(&self, _ctx: &mut HookContext) -> aura_core::Result<HookAction> {
+        Ok(HookAction::Continue)
+    }
+}
 
 fn init_tracing() {
     let env_filter =
@@ -72,6 +90,34 @@ impl Tokenizer for SimpleTokenizer {
     }
 }
 
+fn build_llm_client_from_env() -> anyhow::Result<LlmClient> {
+    let provider = std::env::var("AURA_LLM_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
+    let model = std::env::var("AURA_LLM_MODEL").unwrap_or_else(|_| match provider.as_str() {
+        "openai" => "gpt-4o-mini".to_string(),
+        "anthropic" => "claude-3-5-sonnet-latest".to_string(),
+        _ => "llama3".to_string(),
+    });
+    let api_key = std::env::var("AURA_LLM_API_KEY")
+        .ok()
+        .or_else(|| match provider.as_str() {
+            "openai" => std::env::var("OPENAI_API_KEY").ok(),
+            "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
+            _ => None,
+        });
+    let base_url = std::env::var("AURA_LLM_BASE_URL").ok();
+
+    let registry = LlmProviderRegistry::with_default_providers();
+
+    registry
+        .create_client(&LlmProviderConfig {
+            provider,
+            api_key,
+            base_url,
+            model,
+        })
+        .map_err(|e| anyhow::anyhow!("failed to build LLM client from environment: {e}"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -100,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Observability recorder
-    let _recorder = Arc::new(ObservabilityRecorder::new(
+    let recorder = Arc::new(ObservabilityRecorder::new(
         job_manager,
         trace_collector,
         cost_tracker,
@@ -110,9 +156,8 @@ async fn main() -> anyhow::Result<()> {
     let master_key = EncryptionKey::new(b"aura-dev-master-key-32-bytes-ok!".to_vec())?;
     let secret_vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
 
-    // WASM runtime + Tool registry
-    let wasm_runtime = Arc::new(aura_sandbox::WasmRuntime::new()?);
-    let tool_registry = Arc::new(ToolRegistry::new(wasm_runtime));
+    // Tool registry
+    let tool_registry = Arc::new(ToolRegistry::new());
 
     // Tool executor
     let tool_executor = Arc::new(ToolExecutor::new(
@@ -124,26 +169,15 @@ async fn main() -> anyhow::Result<()> {
     // Memory manager (without embedder for Phase 1)
     let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
 
-    // LLM client (stub for Phase 1)
-    let llm_client = Arc::new(LlmClient::new(
-        ModelInfo {
-            id: "stub".to_string(),
-            provider: "none".to_string(),
-            context_window: 128_000,
-            supports_tools: true,
-            supports_vision: true,
-            pricing: ModelPricing {
-                input_per_1m_tokens: 0.0,
-                output_per_1m_tokens: 0.0,
-            },
-        },
-        ResponseParseMode::NativeFunctionCalling,
-    ));
+    let llm_client = Arc::new(build_llm_client_from_env()?);
+    info!(
+        provider = %llm_client.model_info().provider,
+        model = %llm_client.model_id(),
+        "configured LLM client"
+    );
 
     // Context manager (sliding window)
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(SimpleTokenizer);
-    let context_manager = Box::new(SlidingWindowContext::new(Arc::clone(&tokenizer), 100));
-
     // Workspace and Soul
     let workspace = WorkspaceManager::new(PathBuf::from("."));
     let soul = Soul::from_workspace(&workspace)
@@ -154,18 +188,9 @@ async fn main() -> anyhow::Result<()> {
     let policy = ExecutionPolicy::default();
 
     // Hook manager (empty)
-    let _hook_manager = Arc::new(HookManager::new());
-
-    // Agent loop
-    let _agent_loop = AgentLoop::new(
-        llm_client,
-        tool_registry,
-        tool_executor,
-        context_manager,
-        memory_manager,
-        policy,
-        soul,
-    );
+    let mut hook_manager = HookManager::new();
+    hook_manager.register(NoopHook);
+    let hook_manager = Arc::new(hook_manager);
 
     // Message channels
     let (incoming_tx, incoming_rx) = mpsc::channel(256);
@@ -173,14 +198,47 @@ async fn main() -> anyhow::Result<()> {
 
     // Security gateway
     let leak_detector = LeakDetector::with_default_rules();
-    let security_gateway = Arc::new(SecurityGateway::with_deny_all_policy(
+    let security_gateway = Arc::new(SecurityGateway::new(
         leak_detector,
         Arc::clone(&secret_vault),
     ));
 
     // Supervisor and Router
     let supervisor = AgentSupervisor::new(response_tx);
-    let router = Router::new(session_manager, supervisor, vec![], security_gateway);
+    let actor_llm_client = Arc::clone(&llm_client);
+    let actor_tool_registry = Arc::clone(&tool_registry);
+    let actor_tool_executor = Arc::clone(&tool_executor);
+    let actor_memory_manager = Arc::clone(&memory_manager);
+    let actor_policy = policy.clone();
+    let actor_system_prompt = soul.system_prompt().to_string();
+    let actor_tokenizer = Arc::clone(&tokenizer);
+    let actor_hooks = Arc::clone(&hook_manager);
+    let actor_recorder = Arc::clone(&recorder);
+
+    let router = Router::new(session_manager, supervisor, vec![], security_gateway)
+        .with_actor_spawner(Box::new(move |session, response_tx| {
+            let agent_loop = AgentLoop::new(
+                Arc::clone(&actor_llm_client),
+                Arc::clone(&actor_tool_registry),
+                Arc::clone(&actor_tool_executor),
+                Box::new(SlidingWindowContext::new(Arc::clone(&actor_tokenizer), 100)),
+                Arc::clone(&actor_memory_manager),
+                actor_policy.clone(),
+                Soul::custom(actor_system_prompt.clone()),
+            );
+            let actor = AgentActor::new(
+                session,
+                agent_loop,
+                response_tx,
+                Arc::clone(&actor_hooks),
+                Arc::clone(&actor_recorder),
+            );
+            let (sender, mailbox) = mpsc::channel(256);
+            tokio::spawn(async move {
+                actor.run(mailbox).await;
+            });
+            sender
+        }));
 
     // Shutdown coordination
     let shutdown = ShutdownSignal::new();

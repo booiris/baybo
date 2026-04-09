@@ -130,6 +130,8 @@ Design notes:
 - `count_message` should account for structural overhead such as roles and separators
 - Different providers may use different counting rules, especially for images
 
+`SummarizeCallback` and the hybrid summarization strategy are internal implementation details in the current workspace. The crate's public interface only exposes the stable `ContextManager` abstraction plus the sliding-window implementation.
+
 ---
 
 ## 4. Implementation Details

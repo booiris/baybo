@@ -1,8 +1,6 @@
 pub mod actor;
 pub mod agent_loop;
-pub mod cron;
 pub mod error_recovery;
-pub mod heartbeat;
 pub mod observability;
 pub mod policy;
 pub mod router;
@@ -11,13 +9,10 @@ pub mod soul;
 pub mod supervisor;
 pub mod tool_executor;
 
-pub use actor::{AgentActor, AgentMessage};
 pub use agent_loop::AgentLoop;
-pub use cron::CronScheduler;
-pub use heartbeat::{HeartbeatRunner, RoutineScheduler};
 pub use observability::ObservabilityRecorder;
 pub use policy::ExecutionPolicy;
-pub use router::Router;
+pub use router::{ActorSpawner, Router};
 pub use service::{ShutdownSignal, TaskTracker};
 pub use supervisor::AgentSupervisor;
 pub use tool_executor::ToolExecutor;

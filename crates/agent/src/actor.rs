@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_core::{IncomingMessage, OutgoingMessage, Session};
+use aura_core::{ContentBlock, IncomingMessage, OutgoingMessage, Session};
 use aura_hook::{HookContext, HookManager, HookPoint};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -14,11 +14,11 @@ pub enum AgentMessage {
     /// A user sent a message.
     UserInput(Box<IncomingMessage>),
     /// A cron job fired.
-    CronTrigger { job_id: String },
+    CronTrigger { job_id: String, prompt: String },
     /// A heartbeat tick arrived.
     HeartbeatTick,
     /// A routine fired.
-    RoutineTrigger { routine_id: String },
+    RoutineTrigger { routine_id: String, prompt: String },
     /// Gracefully shut down this actor.
     Shutdown,
 }
@@ -64,17 +64,37 @@ impl AgentActor {
                         );
                     }
                 }
-                AgentMessage::CronTrigger { job_id } => {
+                AgentMessage::CronTrigger { job_id, prompt } => {
                     debug!(session_id = %self.session.id, job_id = %job_id, "received cron trigger");
-                    // TODO: dispatch cron job prompt through agent loop
+                    if let Err(e) = self.dispatch_prompt(&prompt, "cron", &job_id).await {
+                        error!(
+                            session_id = %self.session.id,
+                            job_id = %job_id,
+                            error = %e,
+                            "failed to handle cron trigger"
+                        );
+                    }
                 }
                 AgentMessage::HeartbeatTick => {
                     debug!(session_id = %self.session.id, "received heartbeat tick");
-                    // TODO: process heartbeat (e.g. flush state, check health)
+                    if let Err(e) = self.recorder.flush().await {
+                        warn!(
+                            session_id = %self.session.id,
+                            error = %e,
+                            "heartbeat: failed to flush observability data"
+                        );
+                    }
                 }
-                AgentMessage::RoutineTrigger { routine_id } => {
+                AgentMessage::RoutineTrigger { routine_id, prompt } => {
                     debug!(session_id = %self.session.id, routine_id = %routine_id, "received routine trigger");
-                    // TODO: dispatch routine prompt through agent loop
+                    if let Err(e) = self.dispatch_prompt(&prompt, "routine", &routine_id).await {
+                        error!(
+                            session_id = %self.session.id,
+                            routine_id = %routine_id,
+                            error = %e,
+                            "failed to handle routine trigger"
+                        );
+                    }
                 }
                 AgentMessage::Shutdown => {
                     debug!(session_id = %self.session.id, "actor shutting down");
@@ -89,6 +109,28 @@ impl AgentActor {
         }
 
         info!(session_id = %self.session.id, "agent actor stopped");
+    }
+
+    /// Dispatch a system-generated prompt (cron or routine) through the agent loop
+    /// and send the response to the output channel.
+    async fn dispatch_prompt(
+        &mut self,
+        prompt: &str,
+        source: &str,
+        source_id: &str,
+    ) -> aura_core::Result<()> {
+        let content = vec![ContentBlock::Text(format!(
+            "[{source}:{source_id}] {prompt}"
+        ))];
+        let response = self
+            .agent_loop
+            .run(&mut self.session, content, &self.recorder, None)
+            .await?;
+
+        if let Err(e) = self.response_tx.send(response).await {
+            warn!(error = %e, "failed to send {source} response to channel");
+        }
+        Ok(())
     }
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> aura_core::Result<()> {

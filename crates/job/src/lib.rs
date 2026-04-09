@@ -1,8 +1,6 @@
 pub mod manager;
-pub mod monitor;
 
 pub use manager::JobManager;
-pub use monitor::{StuckJobConfig, StuckJobMonitor};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

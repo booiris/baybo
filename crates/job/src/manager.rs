@@ -77,35 +77,6 @@ impl JobManager {
         .await
     }
 
-    /// Transition a job from `InProgress` to `Stuck`.
-    pub async fn stuck(&self, job_id: &str, reason: &str) -> aura_core::Result<()> {
-        self.transition(
-            job_id,
-            JobStatus::Stuck,
-            None,
-            None,
-            Some(reason.to_owned()),
-        )
-        .await
-    }
-
-    /// Recover a `Stuck` job back to `InProgress`.
-    pub async fn recover(&self, job_id: &str, reason: &str) -> aura_core::Result<()> {
-        self.transition(
-            job_id,
-            JobStatus::InProgress,
-            None,
-            None,
-            Some(reason.to_owned()),
-        )
-        .await
-    }
-
-    /// Return the full transition history for a job.
-    pub async fn get_history(&self, job_id: &str) -> aura_core::Result<Vec<JobTransition>> {
-        self.store.get_transitions(job_id).await
-    }
-
     // --- internal helpers ---
 
     /// Load a job or return `NotFound`.
@@ -148,6 +119,35 @@ impl JobManager {
         self.store.record_transition(&transition).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl JobManager {
+    async fn stuck(&self, job_id: &str, reason: &str) -> aura_core::Result<()> {
+        self.transition(
+            job_id,
+            JobStatus::Stuck,
+            None,
+            None,
+            Some(reason.to_owned()),
+        )
+        .await
+    }
+
+    async fn recover(&self, job_id: &str, reason: &str) -> aura_core::Result<()> {
+        self.transition(
+            job_id,
+            JobStatus::InProgress,
+            None,
+            None,
+            Some(reason.to_owned()),
+        )
+        .await
+    }
+
+    async fn get_history(&self, job_id: &str) -> aura_core::Result<Vec<JobTransition>> {
+        self.store.get_transitions(job_id).await
     }
 }
 

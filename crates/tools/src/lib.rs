@@ -67,7 +67,6 @@ pub enum ToolOutput {
     Text(String),
     Json(Value),
     Error(String),
-    LargeText { content: String, truncated: bool },
 }
 
 /// Definition visible to the LLM for function calling.
@@ -83,22 +82,10 @@ pub struct ToolDefinition {
 pub struct ToolManifest {
     pub name: String,
     pub description: String,
-    pub version: String,
-    pub artifact_hash: String,
-    pub source: aura_core::ArtifactSource,
     pub trust_level: aura_core::TrustLevel,
     pub parameters_schema: Value,
     pub required_secrets: Vec<String>,
     pub capabilities: Vec<ToolCapability>,
-    pub preferred_runtime: ToolRuntimeProfile,
-}
-
-/// Preferred execution runtime for a tool (advisory, not final).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolRuntimeProfile {
-    Wasm,
-    Container,
 }
 
 /// Hard capability declarations for a tool.

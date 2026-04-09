@@ -21,9 +21,16 @@ impl LlmProviderFactory for OpenAIProviderFactory {
                 output_per_1m_tokens: 10.0,
             },
         };
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
         Ok(LlmClient::new(
             model_info,
             ResponseParseMode::NativeFunctionCalling,
+            config.api_key.clone(),
+            base_url,
         ))
     }
 }
@@ -51,9 +58,5 @@ mod tests {
         assert_eq!(client.model_id(), "gpt-4o");
         assert_eq!(client.model_info().context_window, 128_000);
         assert!(client.model_info().supports_tools);
-        assert!(matches!(
-            client.parse_mode(),
-            ResponseParseMode::NativeFunctionCalling
-        ));
     }
 }

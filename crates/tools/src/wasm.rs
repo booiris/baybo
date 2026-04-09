@@ -15,16 +15,6 @@ pub struct WasmTool {
     module: Arc<WasmModule>,
 }
 
-impl WasmTool {
-    pub fn new(manifest: ToolManifest, runtime: Arc<WasmRuntime>, module: Arc<WasmModule>) -> Self {
-        Self {
-            manifest,
-            runtime,
-            module,
-        }
-    }
-}
-
 #[async_trait]
 impl Tool for WasmTool {
     fn name(&self) -> &str {

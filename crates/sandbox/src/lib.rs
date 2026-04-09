@@ -1,9 +1,7 @@
-mod container;
 mod network;
 mod wasm;
 
-pub use container::{ContainerJob, ContainerResult, ContainerSandbox};
-pub use network::{NetworkPolicy, NetworkProxy};
+pub use network::NetworkPolicy;
 pub use wasm::{SandboxLimits, WasmModule, WasmRuntime};
 
 use serde::{Deserialize, Serialize};

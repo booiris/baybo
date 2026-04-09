@@ -30,7 +30,7 @@ pub trait MemoryStore: Send + Sync {
 /// Implementations are injected by upper layers (e.g. `agent`). This keeps
 /// the `memory` crate free from direct LLM or rig dependencies.
 #[async_trait]
-pub trait EmbeddingModel: Send + Sync {
+pub(crate) trait EmbeddingModel: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
 }
 
@@ -43,8 +43,6 @@ pub trait EmbeddingModel: Send + Sync {
 pub enum MemoryCategory {
     UserPreference,
     KeyFact,
-    InteractionSummary,
-    Custom(String),
 }
 
 // ---------------------------------------------------------------------------

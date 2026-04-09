@@ -143,14 +143,11 @@ Construction:
 
 ```rust
 impl MemoryManager {
-    pub fn new(
-        store: Box<dyn MemoryStore>,
-        embedder: Box<dyn rig::embeddings::EmbeddingModel>,
-    ) -> Self;
-
     pub fn without_embedder(store: Box<dyn MemoryStore>) -> Self;
 }
 ```
+
+The optional embedder integration is currently an internal implementation detail. The public API keeps `without_embedder()` as the stable constructor used by the workspace today.
 
 Public methods:
 

@@ -33,11 +33,6 @@ impl SecretValue {
         &self.inner
     }
 
-    /// Consume and return the plaintext bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.inner
-    }
-
     /// Attempt to interpret the value as a UTF-8 string.
     pub fn as_str(&self) -> Result<&str> {
         std::str::from_utf8(&self.inner)
@@ -82,16 +77,6 @@ impl SecretVault {
         }
     }
 
-    /// Delete a secret by name.
-    pub async fn delete_secret(&self, name: &str) -> Result<()> {
-        self.store.delete(name).await
-    }
-
-    /// List all stored secret names.
-    pub async fn list_secrets(&self) -> Result<Vec<String>> {
-        self.store.list().await
-    }
-
     /// Retrieve only the secrets that a tool has explicitly declared as
     /// required. Returns a map of secret name to decrypted `SecretValue`.
     ///
@@ -109,6 +94,13 @@ impl SecretVault {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+impl SecretVault {
+    async fn delete_secret(&self, name: &str) -> Result<()> {
+        self.store.delete(name).await
     }
 }
 

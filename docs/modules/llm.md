@@ -6,7 +6,7 @@ The `llm` crate is Aura's infrastructure layer for large language model calls. I
 
 - **Wrap the rig framework**: encapsulate rig's underlying APIs such as `rig::completion::Chat` and the Agent builder into Aura's unified `LlmClient` interface, hiding provider differences
 - **Provide a unified invocation interface**: upper layers such as `agent::AgentLoop` only call `LlmClient::chat()` without caring whether the backend is OpenAI, Anthropic, or Ollama
-- **Enable registry-style extension**: implement the open-closed principle through `LlmProviderRegistry` and the `LlmProviderFactory` trait, so adding a provider only requires implementing and registering a new factory
+- **Enable registry-style extension**: keep provider construction behind `LlmProviderRegistry`, with built-in providers registered by the crate itself so the external API does not need to expose an extra factory trait
 - **Support dual-mode response parsing**: support both native function calling (`NativeFunctionCalling`) and prompt-guided JSON extraction (`PromptGuided`) so that local models without native function calling can still participate in tool use
 
 **Design constraint**: this crate is pure infrastructure. It contains no business logic and does not depend on business crates such as `security`, `tools`, or `skills`.
@@ -72,49 +72,26 @@ Core methods:
 
 Construction:
 
-`LlmClient` is created through `LlmProviderFactory::create()` rather than directly by users.
+`LlmClient` is created through `LlmProviderRegistry::create_client()` rather than directly by users.
 
 - `new(model, model_info)`: for models with native function calling support, using `NativeFunctionCalling`
 - `new_prompt_guided(model, model_info, tool_schema_prompt, json_extractor)`: for models without native function calling, using `PromptGuided`
 
-### 3.2 LlmProviderFactory Trait
-
-```rust
-pub trait LlmProviderFactory: Send + Sync {
-    fn provider_name(&self) -> &str;
-    fn create(&self, config: &LlmProviderConfig) -> Result<LlmClient>;
-}
-```
-
-Why use a trait instead of a function pointer:
-
-1. **Type safety**: traits provide compile-time interface guarantees
-2. **Stateful implementations**: a trait implementation may carry state such as default config or shared clients
-3. **Testability**: traits are naturally mockable
-4. **Rust convention**: `Send + Sync` makes factories safe to use across threads in async runtimes
-
-### 3.3 LlmProviderRegistry
+### 3.2 LlmProviderRegistry
 
 ```rust
 pub struct LlmProviderRegistry {
-    factories: HashMap<String, Box<dyn LlmProviderFactory>>,
+    factories: HashMap<String, _>,
 }
 
 impl LlmProviderRegistry {
     pub fn new() -> Self { ... }
-
-    pub fn register(&mut self, factory: impl LlmProviderFactory + 'static) {
-        self.factories.insert(
-            factory.provider_name().to_string(),
-            Box::new(factory),
-        );
-    }
+    pub fn with_default_providers() -> Self { ... }
 
     pub fn create_client(&self, config: &LlmProviderConfig) -> Result<LlmClient> {
         self.factories
             .get(&config.provider)
-            .ok_or_else(|| anyhow!("Unknown provider: {}", config.provider))?
-            .create(config)
+            .ok_or_else(|| anyhow!("Unknown provider: {}", config.provider))?(config)
     }
 }
 ```
@@ -122,11 +99,7 @@ impl LlmProviderRegistry {
 Initialization flow:
 
 ```text
-LlmProviderRegistry::new()
-    │
-    ├── register(OpenAIProviderFactory)
-    ├── register(AnthropicProviderFactory)
-    └── register(OllamaProviderFactory)
+LlmProviderRegistry::with_default_providers()
     │
     ▼
 registry.create_client(&config)
@@ -322,7 +295,7 @@ crates/llm/src/
 │   ├── anthropic.rs
 │   └── ollama.rs
 ├── rig_adapter.rs
-└── prompt_guided.rs
+└── tool_call_extractor.rs
 ```
 
 ---

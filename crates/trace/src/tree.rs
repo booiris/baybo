@@ -74,9 +74,8 @@ pub fn set_active_leaf(trace: &mut SessionTrace, node_id: TraceNodeId) {
     trace.active_leaf = node_id;
 }
 
-/// Collect the ancestor chain from a node up to (and including) the root.
-/// Returns node ids ordered from the given node toward the root.
-pub fn ancestor_chain(trace: &SessionTrace, node_id: &TraceNodeId) -> Vec<TraceNodeId> {
+#[cfg(test)]
+pub(crate) fn ancestor_chain(trace: &SessionTrace, node_id: &TraceNodeId) -> Vec<TraceNodeId> {
     let mut chain = Vec::new();
     let mut current = Some(node_id.clone());
     while let Some(ref id) = current {

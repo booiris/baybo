@@ -6,44 +6,25 @@ use aura_core::{ContentBlock, Message, OutgoingMessage, Result, Session};
 use crate::leak_detector::LeakDetector;
 use crate::vault::SecretVault;
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct NetworkRequest {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetworkPolicyDecision {
+    Deny(String),
+}
+
 /// The security boundary through which all messages pass before entering
 /// or leaving the agent. Responsible for sanitizing sensitive data.
 pub struct SecurityGateway {
     leak_detector: LeakDetector,
     secret_vault: Arc<SecretVault>,
-    policy_decider: Arc<dyn NetworkPolicyDecider>,
-}
-
-/// A network request descriptor used for policy decisions.
-#[derive(Debug, Clone)]
-pub struct NetworkRequest {
-    pub host: String,
-    pub port: u16,
-}
-
-/// The outcome of a network policy decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetworkPolicyDecision {
-    Allow,
-    Deny(String),
-}
-
-/// Trait for deciding whether a given network request from a tool should be
-/// allowed or denied. Implementations live in the `agent` or `sandbox` crate;
-/// `security` only defines the interface.
-pub trait NetworkPolicyDecider: Send + Sync {
-    /// Decide whether `request` issued by a tool with the given name is
-    /// permitted.
-    fn decide(&self, tool_name: &str, request: &NetworkRequest) -> NetworkPolicyDecision;
-}
-
-/// A default policy decider that denies all requests.
-pub struct DenyAllPolicy;
-
-impl NetworkPolicyDecider for DenyAllPolicy {
-    fn decide(&self, _tool_name: &str, _request: &NetworkRequest) -> NetworkPolicyDecision {
-        NetworkPolicyDecision::Deny("deny-by-default policy".into())
-    }
 }
 
 /// Key used in `Session.state.extra` to store placeholder-to-secret-name
@@ -52,39 +33,11 @@ const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
 
 impl SecurityGateway {
     /// Create a new `SecurityGateway`.
-    pub fn new(
-        leak_detector: LeakDetector,
-        secret_vault: Arc<SecretVault>,
-        policy_decider: Arc<dyn NetworkPolicyDecider>,
-    ) -> Self {
+    pub fn new(leak_detector: LeakDetector, secret_vault: Arc<SecretVault>) -> Self {
         Self {
             leak_detector,
             secret_vault,
-            policy_decider,
         }
-    }
-
-    /// Convenience constructor using the deny-all network policy.
-    pub fn with_deny_all_policy(
-        leak_detector: LeakDetector,
-        secret_vault: Arc<SecretVault>,
-    ) -> Self {
-        Self::new(leak_detector, secret_vault, Arc::new(DenyAllPolicy))
-    }
-
-    /// Return a reference to the leak detector.
-    pub fn leak_detector(&self) -> &LeakDetector {
-        &self.leak_detector
-    }
-
-    /// Return a reference to the secret vault.
-    pub fn secret_vault(&self) -> &Arc<SecretVault> {
-        &self.secret_vault
-    }
-
-    /// Return a reference to the network policy decider.
-    pub fn policy_decider(&self) -> &Arc<dyn NetworkPolicyDecider> {
-        &self.policy_decider
     }
 
     /// Scan incoming message content for sensitive data, replace matches
@@ -170,14 +123,20 @@ impl SecurityGateway {
         response.content = new_blocks;
         Ok(())
     }
+}
 
-    /// Delegate a network policy decision to the configured decider.
-    pub fn check_network_access(
+#[cfg(test)]
+impl SecurityGateway {
+    fn with_deny_all_policy(leak_detector: LeakDetector, secret_vault: Arc<SecretVault>) -> Self {
+        Self::new(leak_detector, secret_vault)
+    }
+
+    fn check_network_access(
         &self,
-        tool_name: &str,
-        request: &NetworkRequest,
+        _tool_name: &str,
+        _request: &NetworkRequest,
     ) -> NetworkPolicyDecision {
-        self.policy_decider.decide(tool_name, request)
+        NetworkPolicyDecision::Deny("deny-by-default policy".into())
     }
 }
 

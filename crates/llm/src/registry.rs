@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::LlmClient;
+use crate::providers::{
+    anthropic::AnthropicProviderFactory, ollama::OllamaProviderFactory,
+    openai::OpenAIProviderFactory,
+};
 
 /// Configuration for creating an LLM provider client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,9 +42,18 @@ impl LlmProviderRegistry {
         }
     }
 
+    /// Creates a registry preloaded with the built-in providers.
+    pub fn with_default_providers() -> Self {
+        let mut registry = Self::new();
+        registry.register(OpenAIProviderFactory);
+        registry.register(AnthropicProviderFactory);
+        registry.register(OllamaProviderFactory);
+        registry
+    }
+
     /// Registers a provider factory. If a factory with the same name already
     /// exists, it is replaced.
-    pub fn register(&mut self, factory: impl LlmProviderFactory + 'static) {
+    pub(crate) fn register(&mut self, factory: impl LlmProviderFactory + 'static) {
         self.factories
             .insert(factory.provider_name().to_string(), Box::new(factory));
     }
