@@ -1,8 +1,10 @@
-# job - Job Management System
+# job - Job Types and State Machine
 
 ## Overview
 
-The `job` crate uniformly manages the lifecycle state of all asynchronous operations: user message handling, LLM calls, tool execution, skill execution, context compression, memory operations, and cron tasks.
+The `job` crate defines domain types for job lifecycle management (`Job`, `JobStatus`, `JobTransition`, `OperationKind`) and the `JobError` error type. `JobStatus` implements the fixed state machine with strict transition validation.
+
+Business logic (`JobManager` — create, transition, load) lives in `agent::job`. The `JobStore` trait is defined in `storage::job`.
 
 Job answers **"what step is this operation at"**, not "what exactly did it do." Detailed input/output is recorded by `trace`.
 
@@ -51,7 +53,7 @@ Jobs support parent-child relationships via `parent_job_id`. Child success/failu
 
 ## Constraints
 
-- Depends only on `core`
+- Pure types crate — no business logic, no storage interfaces
 - `input/output` store sanitized JSON only — sensitive values must already be placeholders
 - `update_status()` and `record_transition()` should run in the same transaction
 - Does not depend on `trace`, `llm`, `tools`, or `agent`
@@ -60,7 +62,7 @@ Jobs support parent-child relationships via `parent_job_id`. Child success/failu
 
 | Module | Role |
 |--------|------|
-| `agent` | `ObservabilityRecorder` creates and transitions Jobs |
+| `agent` | `agent::job::JobManager` owns lifecycle logic; `ObservabilityRecorder` creates and transitions Jobs |
 | `trace` | Linked via `trace_span_id` for content details |
 | `hook` | `JobStatusChanged` fires after state changes |
-| `storage` | Provides `JobStore` implementations |
+| `storage` | Defines `JobStore` trait using job types; provides libsql implementation |

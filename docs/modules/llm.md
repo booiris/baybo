@@ -37,7 +37,7 @@ Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` thr
 
 ## Constraints
 
-- Depends only on `core` (plus `rig`, `serde`, `async-trait`)
+- Depends only on `model` (plus `rig`, `serde`, `async-trait`)
 - Does not depend on `cost` — instead, `cost` consumes `TokenUsage` produced by `llm`, assembled by `agent`
 - API keys should use environment-variable placeholders and must not be stored directly in config files
 

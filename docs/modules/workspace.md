@@ -33,7 +33,7 @@ They complement each other without overlapping.
 
 ## Constraints
 
-- Depends only on `core`
+- No workspace crate dependencies
 - Does not record message-level Trace or Job data
 - Missing identity files should degrade gracefully, not block startup
 - Identity file changes should carry a version stamp or content hash for Trace provenance

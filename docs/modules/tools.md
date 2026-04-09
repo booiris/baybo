@@ -43,7 +43,7 @@ Tool output should prefer structured `Json`, use `LargeText` for long text with 
 
 ## Constraints
 
-- Depends on `core` and `sandbox`
+- Depends on `model`, `session`, `registry`, and `sandbox`
 - Does not install third-party artifacts (that's `registry`)
 - Does not approve network/filesystem permissions — only consumes already-decided policies
 - `artifact_hash` must be recorded in `trace::ExecutionProvenance`

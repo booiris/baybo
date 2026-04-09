@@ -1,50 +1,69 @@
-# storage - Unified Storage Implementation Layer
+# storage - Unified Storage Trait and Implementation Layer
 
 ## Overview
 
-The `storage` crate implements the Store traits exposed by other modules (`SessionStore`, `TraceStore`, `SecretStore`, `JobStore`, `MemoryStore`, `CostStore`).
+The `storage` crate is the single source of truth for all persistence interfaces and implementations. It defines **all** Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`) and implements them via **libsql** as the sole backend.
 
-Its job is not domain modeling, but:
+Its job is:
 
-- Provide a unified backend factory (`StorageFactory`)
-- Offer separate persistence implementations per domain
-- Isolate SQLite and in-memory implementation details
+- Define all Store traits (each in its own submodule: `session`, `memory`, `trace`, `secret`, `job`, `cost`)
+- Implement all Store traits via libsql
+- Provide `Store` for dependency injection
+- Manage database schema initialization
+
+Domain crates (`session`, `memory`, `trace`, `security`, `job`) provide only **types and error definitions**. Business logic (managers, collectors, gateways) lives in `agent`.
 
 ## Design Decisions
 
+### All Store traits defined in storage
+
+Every Store trait lives in `storage`, not in the domain crate. This avoids circular dependencies: domain crates define types → `storage` depends on those types to define traits → `agent` depends on both to wire business logic. Each trait module re-exports the domain error type as a local `Result<T>` alias for ergonomic use.
+
+```
+session.rs  → SessionStore  (uses aura_session types)
+memory.rs   → MemoryStore   (uses aura_memory types)
+trace.rs    → TraceStore    (uses aura_trace types)
+secret.rs   → SecretStore   (uses aura_security types)
+job.rs      → JobStore      (uses aura_job types)
+cost.rs     → CostStore     (defines its own types: CostRecord, CostSummary, TimeRange)
+```
+
+`CostStore` is unique in that it also defines its own data types, because cost has no separate domain crate.
+
+### Single backend: libsql
+
+All store implementations use libsql (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend — `Store::in_memory()` uses libsql with `:memory:` mode. `LibsqlPool` wraps a shared `libsql::Connection` behind `Arc` for cheap cloning across async tasks.
+
 ### One struct per trait
 
-Each domain has an independent Store implementation (e.g. `SqliteSessionStore`, `SqliteTraceStore`). They can share one `SqlitePool` while preserving domain isolation. No giant struct implementing every interface.
+Each domain has an independent Store implementation (`LibsqlSessionStore`, `LibsqlCostStore`, etc.). All share one `LibsqlPool` while preserving domain isolation. No giant struct implementing every interface.
 
-### StorageFactory solves initialization, not abstraction
+### Store solves initialization, not abstraction
 
-At startup: `StorageFactory::create(&config)` → `StorageSet` (container holding all Store implementations). The `agent` layer injects individual stores into corresponding modules.
+At startup: `Store::in_memory()` or a file-backed variant creates a `LibsqlPool` and wires all store implementations. The `agent` layer injects individual stores into corresponding managers.
 
-### Each Store manages its own tables
+### Each Store manages its own queries
 
-No cross-domain aggregate tables. Each Store manages its own schema, keeping domain boundaries clean.
+Table schemas are created centrally in `LibsqlPool::init_db()`, but each Store struct owns its own query logic. No cross-domain aggregate tables.
 
 ### JSON field strategy
 
 Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`, `TraceSpan.input/result`) are stored as JSON. The security requirement still applies: these values must already be sanitized.
 
-### In-memory backend
-
-For unit tests, local development, and temporary runs. Does not promise data retention across restarts or full transaction semantics.
-
 ### Transaction boundaries
 
-Use transactions for: `JobStore.update_status()` writing both `jobs` and `job_transitions`, `TraceStore.save_trace()` writing trace root and nodes, `SecretStore.store()` when replacing old values.
+Use transactions for: `TraceStore.save_trace()` writing trace root and nodes atomically.
 
 ## Constraints
 
-- Depends on all crates defining Store traits (`session`, `memory`, `trace`, `security`, `cost`, `job`) plus `core`
-- Exposes trait objects externally, not concrete SQLite types
+- Depends on domain crates for types only (`session`, `memory`, `trace`, `security`, `job`)
+- Exposes trait objects externally, not concrete backend types
 - Assumes upper layers have already sanitized data before persistence
 
 ## Collaboration
 
-| Module | Role |
-|--------|------|
-| `session` / `memory` / `trace` / `security` / `cost` / `job` | Define Store traits that `storage` implements |
-| `agent` | Injects all implementations through `StorageSet` |
+| Module                                               | Role                                                                                         |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `storage` (self)                                     | Defines all Store traits; provides all libsql implementations; defines cost types             |
+| `session` / `memory` / `trace` / `security` / `job`  | Provide domain types and error definitions consumed by Store traits                           |
+| `agent`                                              | Injects stores into managers; owns all business logic (SessionManager, MemoryManager, etc.)   |

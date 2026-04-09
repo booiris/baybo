@@ -1,18 +1,12 @@
-# memory - Long-Term Memory System
+# memory - Long-Term Memory Types
 
 ## Overview
 
-The `memory` crate manages the full lifecycle of long-term user memory: storage, retrieval, semantic search, and expiration cleanup.
+The `memory` crate defines domain types for long-term user memory (`MemoryEntry`, `MemoryCategory`) and the `MemoryError` error type.
 
-Core responsibilities:
+Business logic (`MemoryManager`, `EmbeddingModel` trait, recall/store/dedup) lives in `agent::memory`. The `MemoryStore` trait is defined in `storage::memory`.
 
-- Store important memories (preferences, facts, summaries) produced during interaction
-- Recall relevant historical memories and inject as context enhancement
-- Support vector-embedding semantic search (fallback to keyword matching without embedder)
-- Decide automatically whether to store, avoiding redundancy
-- Enforce expiration cleanup and per-user memory-count limits
-
-**Position**: used by `agent::AgentLoop`. Each turn, Agent Loop calls `recall()` before building context and `maybe_store()` after producing the reply.
+**Position**: `agent::memory::MemoryManager` is used by `AgentLoop`. Each turn, Agent Loop calls `recall()` before building context and `maybe_store()` after producing the reply.
 
 ## Design Decisions
 
@@ -50,16 +44,15 @@ Integrated through `rig::embeddings::EmbeddingModel`, injected by the `agent` as
 
 ## Constraints
 
-- Depends only on `core` (plus `rig` for embeddings)
+- Pure types crate — no business logic, no storage interfaces
 - Does **not** depend on `llm`, `agent`, `storage`, or `workspace`
-- `MemoryStore` trait defined here; implementations live in `storage`
 - Memory context is positioned after System Prompt/Soul and before Compressed Summary in the context window
 
 ## Collaboration
 
 | Module | Role |
 |--------|------|
-| `agent` | `AgentLoop` calls `recall()` and `maybe_store()`, injects embedder |
-| `storage` | Provides `MemoryStore` implementations (SQLite, in-memory) |
+| `agent` | `agent::memory::MemoryManager` owns recall/store/dedup logic; `AgentLoop` calls it; `EmbeddingModel` trait defined here |
+| `storage` | Defines `MemoryStore` trait using memory types; provides libsql implementation |
 | `workspace` | Complements with identity/strategy files (no overlap) |
 | `context` | Memory context is injected into the context window by `agent` |

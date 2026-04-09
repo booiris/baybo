@@ -1,10 +1,10 @@
-# session - Session Management
+# session - Session Types and Identity
 
 ## Overview
 
-The `session` crate manages session lifecycle: creation, retrieval, update, expiration cleanup, and `SessionStore` trait definition.
+The `session` crate defines session-related domain types (`Session`, `SessionState`, `User`, `ChannelType`) and the `SessionError` error type.
 
-**Design principle**: traits are defined in their own crate. `SessionStore` is defined in `session`; concrete implementations (e.g. `SqliteSessionStore`) live in `storage`. Dependency direction: `storage` → `session`, not the reverse.
+**Design principle**: domain types live in their own crate; Store traits live in `storage`; business logic lives in `agent`. `SessionStore` is defined in `storage::session`; `SessionManager` lives in `agent::session`.
 
 ## Design Decisions
 
@@ -31,14 +31,13 @@ Aura uses one Actor per session. All messages targeting the same session (user i
 
 ## Constraints
 
-- Depends only on `core`
-- Contains no storage implementation logic
+- Pure types crate — no business logic, no storage interfaces
 - Session IDs use UUID v4 (random, no ordering needed)
 
 ## Collaboration
 
 | Module | Role |
 |--------|------|
-| `agent` | Router calls `SessionManager`; `AgentActor` holds and mutates the `Session` instance |
-| `storage` | Provides `SessionStore` implementations |
+| `agent` | `agent::session::SessionManager` owns session lifecycle logic; Router calls it; `AgentActor` holds the `Session` instance |
+| `storage` | Defines `SessionStore` trait using session types; provides libsql implementation |
 | `hook` | `SessionCreated` / `SessionDestroyed` hook points for welcome messages, audit, cleanup |

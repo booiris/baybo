@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `context` crate manages Aura's session context window, a core component inside Agent Loop.
+The `context` crate manages Aura's session context window, a central component inside Agent Loop.
 
 Core responsibilities:
 

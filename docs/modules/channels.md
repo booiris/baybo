@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `channels` crate provides a unified way to receive messages from multiple platforms (Telegram, Discord, HTTP API, CLI) and convert them into `core::IncomingMessage`, then convert `core::OutgoingMessage` back into platform-native formats for delivery.
+The `channels` crate provides a unified way to receive messages from multiple platforms (Telegram, Discord, HTTP API, CLI) and convert them into `IncomingMessage`, then convert `OutgoingMessage` back into platform-native formats for delivery.
 
 **Design pattern**: Adapter pattern. Each channel implements the `ChannelAdapter` trait, hiding platform details so upper layers don't need to understand channel differences.
 
@@ -16,7 +16,7 @@ Core responsibilities:
 
 ### No business logic
 
-Channels contain no routing, rate limiting, or security logic. They depend only on `core`. Business logic belongs to `agent` and `security`.
+Channels contain no routing, rate limiting, or security logic. They depend only on `model` and `session`. Business logic belongs to `agent` and `security`.
 
 ### No streaming output
 
@@ -45,6 +45,7 @@ Router calls `stop()` on all channels, each exits its background loop and releas
 
 | Module | Role |
 |--------|------|
-| `core` | Provides `Message`, `IncomingMessage`, `OutgoingMessage`, `ChannelType` |
+| `model` | Provides `ContentBlock`, `ChatMessage`, and other content primitives |
+| `session` | Provides `ChannelType`, `User` |
 | `agent` | Router registers adapters and dispatches outgoing messages by `ChannelType` |
 | `security` | Input messages go to `SecurityGateway` first after entering the system |

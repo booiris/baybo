@@ -47,7 +47,7 @@ Critical hook failure aborts the main flow; non-critical hook failure is logged 
 
 ## Constraints
 
-- Depends only on `core`
+- Depends only on `channels`
 - `HookContext.extra` must not contain sensitive plaintext
 - Hook execution should have timeout protection to prevent external extensions from blocking the main flow
 

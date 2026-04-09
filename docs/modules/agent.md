@@ -8,11 +8,13 @@ Core responsibilities:
 
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
+- **Business logic managers**: `SessionManager`, `MemoryManager`, `TraceCollector`, `JobManager`, `SecretVault`, `SecurityGateway` — all domain managers live here
 - **Long-running execution**: heartbeat, routine, cron, background notifications
 - **Unified observability**: wrapping Job, Trace, and Cost through `ObservabilityRecorder`
+- **Cost management**: `CostTracker` for recording, `CostGuard` for spending limits (in `agent::cost`)
 - **Runtime logic**: error recovery, timeout control, rollback
 
-It does not own low-level storage or backend implementation — it consumes them through dependency injection.
+It does not own low-level storage or backend implementation — it consumes Store traits from `storage` through dependency injection. Domain types and errors come from their respective crates (`session`, `memory`, `trace`, `security`, `job`).
 
 ## Design Decisions
 
@@ -64,10 +66,13 @@ Before a message enters an actor, Router completes: session identification/creat
 | `llm` | `AgentLoop` initiates model calls |
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
-| `memory` | Recall before input, decide store after output |
+| `memory` | Provides domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager` |
 | `workspace` | Identity files, heartbeat config, routine definitions |
 | `context` | Conversation window and compression |
-| `job` / `trace` / `cost` | Recorded through `ObservabilityRecorder` |
-| `security` | `ToolExecutor` obtains secrets and consumes network-policy decisions |
+| `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager` |
+| `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |
+| `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
+| `security` | Provides crypto primitives (`EncryptionKey`, `LeakDetector`) used by `agent::security::{SecretVault, SecurityGateway}` |
+| `storage` | Provides all Store traits and libsql implementations; injected into managers |
 | `sandbox` | WASM or container isolated execution |
 | `hook` | `AgentActor` triggers hooks at lifecycle points |

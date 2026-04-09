@@ -1,18 +1,22 @@
-# security - Security Gateway and Secret Management
+# security - Security Primitives
 
 ## Overview
 
-The `security` crate is the security boundary both before external input enters Agent and before responses leave the system.
+The `security` crate provides low-level security primitives: cryptographic operations (`EncryptionKey`, `encrypt`/`decrypt`), leak detection (`LeakDetector`, `LeakDetectionRule`), and the `SecurityError` error type.
 
-Core responsibilities:
+Business logic (`SecretVault`, `SecretValue`, `SecurityGateway`) lives in `agent::security`. The `SecretStore` trait is defined in `storage::secret`.
 
-- **Input leak detection**: identify API keys, passwords, tokens in messages
+Core responsibilities of the primitives in this crate:
+
+- **Leak detection**: identify API keys, passwords, tokens in content blocks via regex rules
 - **Placeholder replacement**: replace sensitive plaintext with `{{SECRET_xxx}}`
-- **Secret vault**: encrypt and store real secrets, inject with least privilege per tool declarations
-- **Output re-sanitization**: keep only placeholders and sanitized summaries in responses, logs, Trace, and Job
-- **Network policy decisions**: provide allow/deny decisions for the execution layer
+- **AES-256-GCM encryption**: encrypt/decrypt secret values with a master key
 
-`security` does not execute tools, launch containers, or open network access. Those belong to `agent` and `sandbox`.
+Business logic in `agent::security` builds on these primitives:
+
+- **SecretVault**: encrypt and store real secrets, inject with least privilege per tool declarations
+- **SecurityGateway**: input sanitization, output re-sanitization, session placeholder mapping
+- **SecretValue**: redacted wrapper preventing plaintext in Debug/Display
 
 ## Design Decisions
 
@@ -38,7 +42,7 @@ Security only decides allow/deny. It does not execute network access. The chain 
 
 ## Constraints
 
-- Depends only on `core`
+- Primitives crate — no session/channel/storage dependencies
 - Trace records only sanitized `SpanInput` and `SpanResult`
 - Job `input/output` stores sanitized versions only
 - Structured logs must not print `SecretValue` directly
@@ -48,8 +52,8 @@ Security only decides allow/deny. It does not execute network access. The chain 
 
 | Module | Role |
 |--------|------|
-| `channels` | Input messages go to `SecurityGateway` first |
-| `agent` | `ToolExecutor` retrieves secrets from `SecretVault` and injects into tools |
+| `channels` | Input messages go to `agent::security::SecurityGateway` first |
+| `agent` | `agent::security::SecurityGateway` and `SecretVault` own business logic; `ToolExecutor` retrieves secrets and injects into tools |
 | `sandbox` | Consumes allow/deny decisions from `NetworkPolicyDecider` |
 | `trace` / `job` | Receive only sanitized payloads and placeholders |
-| `storage` | Provides `SecretStore` implementations |
+| `storage` | Defines `SecretStore` trait; provides libsql implementation |

@@ -12,7 +12,7 @@ Contents:
 
 ### Minimal scope
 
-Previous `core` crate was split: session/user types moved to `session`, message types to `channels`, operation types to `job`, governance types to `registry`, and per-module error types replaced the shared `AuraError`. `model` retains only the content primitives that are genuinely used by both the channel layer and the LLM layer and cannot naturally belong to either.
+`model` retains only the content primitives that are genuinely used by both the channel layer and the LLM layer and cannot naturally belong to either. Session/user types live in `session`, message types in `channels`, operation types in `job`, governance types in `registry`, and per-module error types replace any shared error enum.
 
 ### Media by reference, not inline
 

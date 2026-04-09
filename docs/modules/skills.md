@@ -43,7 +43,7 @@ Skills declare `allowed_tools`, but this is only one input to the upper bound. B
 
 ## Constraints
 
-- Depends only on `core`
+- Depends only on `registry`
 - Does not call `llm` or execute tools directly
 - Does not install extensions (that's `registry`)
 - Every skill execution must record `skill_name`, `skill_version`, `source`, `trust_level` in Trace

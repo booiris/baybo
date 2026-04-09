@@ -30,7 +30,7 @@ Installation flow: catalog index → `ExtensionManifest` → download → hash/s
 
 ## Constraints
 
-- Depends only on `core`
+- No workspace crate dependencies
 - Hash verification is mandatory; signature verification can be optional initially
 - Registry download failures should not block already-installed extensions
 

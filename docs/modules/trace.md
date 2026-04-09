@@ -1,8 +1,10 @@
-# trace - Call Chain Tracing
+# trace - Call Chain Tracing Types and Utilities
 
 ## Overview
 
-The `trace` crate records the tree of all key operations during session processing: user input handling, LLM calls, tool execution, skill execution, context compression, memory operations, and rollback/branching.
+The `trace` crate defines domain types for call-chain tracing (`SessionTrace`, `TraceNode`, `TraceSpan`, `SpanHandle`, `SpanInput`, `SpanResult`, `ExecutionProvenance`, `ForkRecord`, `TraceFilter`) and provides tree, fork, and snapshot utility functions.
+
+Business logic (`TraceCollector` — span lifecycle management and persistence) lives in `agent::trace`. The `TraceStore` trait is defined in `storage::trace`.
 
 Trace answers **"what exactly did this operation do"** by recording sanitized inputs, results, latency, and execution provenance. Its difference from `job` is: **Job manages state, Trace manages content.**
 
@@ -42,8 +44,9 @@ Branching creates a new branch below the target node without overwriting the ori
 
 ## Constraints
 
-- Depends on `core` and `context` (for `ContextSnapshot`)
-- `TraceCollector` should lock only for short critical sections, never across `await`
+- Types crate with tree/fork/snapshot utilities — no collector logic
+- Depends on `context` (for `ContextSnapshot`) and `job` (for `OperationKind`)
+- `TraceCollector` (in `agent::trace`) should lock only for short critical sections, never across `await`
 - Apply uniform sanitization to `SpanResult::Error` to prevent sensitive data leaking through exception paths
 - `save_trace()` should save the whole tree in one transaction
 
@@ -53,5 +56,5 @@ Branching creates a new branch below the target node without overwriting the ori
 |--------|------|
 | `context` | Provides `ContextSnapshot` for rollback restoration |
 | `job` | Job manages state, Trace manages content; linked via `job_id` and `trace_span_id` |
-| `agent` | `ObservabilityRecorder` creates Job and Trace records together |
-| `storage` | Provides `TraceStore` implementations |
+| `agent` | `agent::trace::TraceCollector` owns span lifecycle; `ObservabilityRecorder` creates Job and Trace records together |
+| `storage` | Defines `TraceStore` trait using trace types; provides libsql implementation |
