@@ -20,9 +20,9 @@ impl EncryptionKey {
     /// Create a new encryption key from raw bytes.
     ///
     /// Returns an error if the key is not exactly 32 bytes.
-    pub fn new(key: Vec<u8>) -> aura_core::Result<Self> {
+    pub fn new(key: Vec<u8>) -> crate::Result<Self> {
         if key.len() != AES256_KEY_LEN {
-            return Err(aura_core::AuraError::Security(format!(
+            return Err(crate::SecurityError::Encryption(format!(
                 "encryption key must be exactly {AES256_KEY_LEN} bytes, got {}",
                 key.len()
             )));
@@ -40,9 +40,9 @@ impl EncryptionKey {
 ///
 /// Output format: `nonce(12 bytes) || ciphertext || tag`
 /// (the `aes-gcm` crate appends the 16-byte authentication tag to the ciphertext).
-pub fn encrypt(plaintext: &[u8], key: &EncryptionKey) -> aura_core::Result<Vec<u8>> {
+pub fn encrypt(plaintext: &[u8], key: &EncryptionKey) -> crate::Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|e| {
-        aura_core::AuraError::Security(format!("failed to create AES-256-GCM cipher: {e}"))
+        crate::SecurityError::Encryption(format!("failed to create AES-256-GCM cipher: {e}"))
     })?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -50,7 +50,7 @@ pub fn encrypt(plaintext: &[u8], key: &EncryptionKey) -> aura_core::Result<Vec<u
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|e| {
-        aura_core::AuraError::Security(format!("AES-256-GCM encryption failed: {e}"))
+        crate::SecurityError::Encryption(format!("AES-256-GCM encryption failed: {e}"))
     })?;
 
     let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -62,9 +62,9 @@ pub fn encrypt(plaintext: &[u8], key: &EncryptionKey) -> aura_core::Result<Vec<u
 /// Decrypt data produced by [`encrypt`].
 ///
 /// Expects the format: `nonce(12 bytes) || ciphertext || tag`.
-pub fn decrypt(data: &[u8], key: &EncryptionKey) -> aura_core::Result<Vec<u8>> {
+pub fn decrypt(data: &[u8], key: &EncryptionKey) -> crate::Result<Vec<u8>> {
     if data.len() < NONCE_LEN {
-        return Err(aura_core::AuraError::Security(
+        return Err(crate::SecurityError::Encryption(
             "encrypted data is too short to contain nonce".into(),
         ));
     }
@@ -73,12 +73,12 @@ pub fn decrypt(data: &[u8], key: &EncryptionKey) -> aura_core::Result<Vec<u8>> {
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|e| {
-        aura_core::AuraError::Security(format!("failed to create AES-256-GCM cipher: {e}"))
+        crate::SecurityError::Encryption(format!("failed to create AES-256-GCM cipher: {e}"))
     })?;
 
-    cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| aura_core::AuraError::Security(format!("AES-256-GCM decryption failed: {e}")))
+    cipher.decrypt(nonce, ciphertext).map_err(|e| {
+        crate::SecurityError::Encryption(format!("AES-256-GCM decryption failed: {e}"))
+    })
 }
 
 #[cfg(test)]

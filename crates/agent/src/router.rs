@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use aura_channels::ChannelAdapter;
-use aura_core::{IncomingMessage, OutgoingMessage, Session};
+use aura_channels::{ChannelAdapter, IncomingMessage, OutgoingMessage};
 use aura_security::SecurityGateway;
+use aura_session::Session;
 use aura_session::SessionManager;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -77,7 +77,7 @@ impl Router {
         self.supervisor.shutdown_all().await;
     }
 
-    async fn handle_incoming(&mut self, mut incoming: IncomingMessage) -> aura_core::Result<()> {
+    async fn handle_incoming(&mut self, mut incoming: IncomingMessage) -> anyhow::Result<()> {
         let span = tracing::info_span!(
             "handle_incoming",
             session_id = %incoming.message.session_id,
@@ -109,7 +109,7 @@ impl Router {
                 error = %e,
                 "security gateway blocked or modified incoming message"
             );
-            return Err(e);
+            return Err(e.into());
         }
 
         // Update last active time

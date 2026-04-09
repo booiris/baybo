@@ -1,4 +1,4 @@
-use aura_core::{ArtifactSource, TrustLevel};
+use aura_registry::{ArtifactSource, TrustLevel};
 use serde::{Deserialize, Serialize};
 
 /// A declarative skill definition.

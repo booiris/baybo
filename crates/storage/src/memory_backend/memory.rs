@@ -4,8 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use aura_core::Result;
-use aura_memory::{MemoryEntry, MemoryStore};
+use aura_memory::{MemoryEntry, MemoryStore, Result};
 
 /// In-memory implementation of [`MemoryStore`].
 ///

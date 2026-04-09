@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use aura_core::OutgoingMessage;
+use aura_channels::OutgoingMessage;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 

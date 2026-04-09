@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_core::{ContentBlock, Message, OutgoingMessage, Result, Session};
+use aura_channels::{Message, OutgoingMessage};
+use aura_model::ContentBlock;
+use aura_session::Session;
+
+use crate::Result;
 
 use crate::leak_detector::LeakDetector;
 use crate::vault::SecretVault;
@@ -52,7 +56,7 @@ impl SecurityGateway {
             msg.content = vec![ContentBlock::Text(
                 "[blocked: sensitive data detected]".into(),
             )];
-            return Err(aura_core::AuraError::Security(
+            return Err(crate::SecurityError::Violation(
                 scan_result
                     .block_reason
                     .unwrap_or_else(|| "input blocked by leak detection rule".into()),
@@ -78,9 +82,7 @@ impl SecurityGateway {
             }
 
             let map_value = serde_json::to_value(&map).map_err(|e| {
-                aura_core::AuraError::Serialization(format!(
-                    "failed to serialize placeholder map: {e}"
-                ))
+                crate::SecurityError::Storage(format!("failed to serialize placeholder map: {e}"))
             })?;
             session
                 .state
@@ -113,7 +115,7 @@ impl SecurityGateway {
             response.content = vec![ContentBlock::Text(
                 "[response redacted: sensitive data detected]".into(),
             )];
-            return Err(aura_core::AuraError::Security(
+            return Err(crate::SecurityError::Violation(
                 scan_result
                     .block_reason
                     .unwrap_or_else(|| "output blocked by leak detection rule".into()),
@@ -146,7 +148,7 @@ mod tests {
     use crate::SecretStore;
     use crate::crypto::EncryptionKey;
     use crate::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
-    use aura_core::ChannelType;
+    use aura_session::ChannelType;
     use chrono::Utc;
     use regex::Regex;
     use std::collections::HashMap;
@@ -169,7 +171,7 @@ mod tests {
         async fn store(&self, name: &str, encrypted_value: &[u8]) -> Result<()> {
             self.data
                 .lock()
-                .map_err(|e| aura_core::AuraError::Security(e.to_string()))?
+                .map_err(|e| crate::SecurityError::Violation(e.to_string()))?
                 .insert(name.to_owned(), encrypted_value.to_vec());
             Ok(())
         }
@@ -177,14 +179,14 @@ mod tests {
             Ok(self
                 .data
                 .lock()
-                .map_err(|e| aura_core::AuraError::Security(e.to_string()))?
+                .map_err(|e| crate::SecurityError::Violation(e.to_string()))?
                 .get(name)
                 .cloned())
         }
         async fn delete(&self, name: &str) -> Result<()> {
             self.data
                 .lock()
-                .map_err(|e| aura_core::AuraError::Security(e.to_string()))?
+                .map_err(|e| crate::SecurityError::Violation(e.to_string()))?
                 .remove(name);
             Ok(())
         }
@@ -192,7 +194,7 @@ mod tests {
             Ok(self
                 .data
                 .lock()
-                .map_err(|e| aura_core::AuraError::Security(e.to_string()))?
+                .map_err(|e| crate::SecurityError::Violation(e.to_string()))?
                 .keys()
                 .cloned()
                 .collect())
@@ -211,8 +213,8 @@ mod tests {
         Message {
             id: "msg-1".into(),
             session_id: "sess-1".into(),
-            channel: aura_core::ChannelType::Cli,
-            sender: aura_core::User {
+            channel: aura_session::ChannelType::Cli,
+            sender: aura_session::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
                 channel: ChannelType::Cli,
@@ -227,12 +229,12 @@ mod tests {
     fn make_session() -> Session {
         Session {
             id: "sess-1".into(),
-            user: aura_core::User {
+            user: aura_session::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
                 channel: ChannelType::Cli,
             },
-            channel: aura_core::ChannelType::Cli,
+            channel: aura_session::ChannelType::Cli,
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),
@@ -287,7 +289,7 @@ mod tests {
 
         let mut response = OutgoingMessage {
             session_id: "sess-1".into(),
-            channel: aura_core::ChannelType::Cli,
+            channel: aura_session::ChannelType::Cli,
             content: vec![ContentBlock::Text(
                 "Here is the key: AKIAIOSFODNN7EXAMPLE".into(),
             )],

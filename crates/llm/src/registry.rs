@@ -23,7 +23,7 @@ pub trait LlmProviderFactory: Send + Sync {
     fn provider_name(&self) -> &str;
 
     /// Creates an `LlmClient` from the given configuration.
-    fn create(&self, config: &LlmProviderConfig) -> aura_core::Result<LlmClient>;
+    fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient>;
 }
 
 /// A registry of LLM provider factories.
@@ -59,9 +59,9 @@ impl LlmProviderRegistry {
     }
 
     /// Creates an `LlmClient` using the factory that matches `config.provider`.
-    pub fn create_client(&self, config: &LlmProviderConfig) -> aura_core::Result<LlmClient> {
+    pub fn create_client(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let factory = self.factories.get(&config.provider).ok_or_else(|| {
-            aura_core::AuraError::NotFound(format!("unknown LLM provider: {}", config.provider))
+            crate::LlmError::ModelNotFound(format!("unknown LLM provider: {}", config.provider))
         })?;
         factory.create(config)
     }

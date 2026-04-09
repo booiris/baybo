@@ -9,7 +9,7 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         "anthropic"
     }
 
-    fn create(&self, config: &LlmProviderConfig) -> aura_core::Result<LlmClient> {
+    fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let model_info = ModelInfo {
             id: config.model.clone(),
             provider: "anthropic".to_string(),

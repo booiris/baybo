@@ -6,8 +6,7 @@ use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use aura_core::{AuraError, Result};
-use aura_job::{Job, JobStatus, JobStore, JobTransition};
+use aura_job::{Job, JobError, JobStatus, JobStore, JobTransition, Result};
 
 /// In-memory implementation of [`JobStore`].
 pub struct InMemoryJobStore {
@@ -53,10 +52,10 @@ impl JobStore for InMemoryJobStore {
         let mut guard = self.jobs.write().await;
         let job = guard
             .get_mut(job_id)
-            .ok_or_else(|| AuraError::NotFound(format!("job not found: {job_id}")))?;
+            .ok_or_else(|| JobError::NotFound(format!("job not found: {job_id}")))?;
 
         if !job.status.can_transition_to(&status) {
-            return Err(AuraError::InvalidTransition(format!(
+            return Err(JobError::InvalidTransition(format!(
                 "cannot transition job {} from {} to {}",
                 job_id, job.status, status
             )));

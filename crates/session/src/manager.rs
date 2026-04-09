@@ -1,9 +1,7 @@
 use chrono::{Duration, Utc};
 use tracing::{debug, warn};
 
-use aura_core::{ChannelType, Result, Session, SessionState, User};
-
-use crate::SessionStore;
+use crate::{ChannelType, Result, Session, SessionError, SessionState, SessionStore, User};
 
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
@@ -78,9 +76,7 @@ impl SessionManager {
             }
             None => {
                 warn!(session_id, "attempted to touch non-existent session");
-                Err(aura_core::AuraError::NotFound(format!(
-                    "session {session_id}"
-                )))
+                Err(SessionError::NotFound(format!("session {session_id}")))
             }
         }
     }
@@ -110,9 +106,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Duration, Utc};
 
-    use aura_core::{ChannelType, Result, Session, User};
-
-    use crate::SessionStore;
+    use crate::{ChannelType, Result, Session, SessionStore, User};
 
     use super::SessionManager;
 

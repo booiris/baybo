@@ -14,7 +14,7 @@ impl LlmProviderFactory for OllamaProviderFactory {
         "ollama"
     }
 
-    fn create(&self, config: &LlmProviderConfig) -> aura_core::Result<LlmClient> {
+    fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let model_info = ModelInfo {
             id: config.model.clone(),
             provider: "ollama".to_string(),

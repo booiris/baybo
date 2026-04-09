@@ -1,3 +1,4 @@
+pub mod error;
 pub mod registry;
 pub mod wasm;
 
@@ -5,10 +6,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_core::User;
 use aura_sandbox::{NetworkPolicy, SandboxPolicy};
+use aura_session::User;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub use error::ToolError;
+
+pub type Result<T> = std::result::Result<T, ToolError>;
 
 /// Tool trait — the unified interface for all tool implementations.
 ///
@@ -25,7 +30,7 @@ pub trait Tool: Send + Sync {
         vec![]
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_core::Result<ToolOutput>;
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput>;
 }
 
 /// Context injected into tool execution by the agent layer.
@@ -82,7 +87,7 @@ pub struct ToolDefinition {
 pub struct ToolManifest {
     pub name: String,
     pub description: String,
-    pub trust_level: aura_core::TrustLevel,
+    pub trust_level: aura_registry::TrustLevel,
     pub parameters_schema: Value,
     pub required_secrets: Vec<String>,
     pub capabilities: Vec<ToolCapability>,

@@ -54,11 +54,11 @@ enum RawSchedule {
 }
 
 #[cfg(test)]
-pub(crate) fn parse_heartbeat(content: &str) -> aura_core::Result<HeartbeatSpec> {
+pub(crate) fn parse_heartbeat(content: &str) -> anyhow::Result<HeartbeatSpec> {
     let json_str = extract_json_block(content).unwrap_or(content);
 
     let raw: RawHeartbeatSpec = serde_json::from_str(json_str)
-        .map_err(|e| aura_core::AuraError::Config(format!("failed to parse HEARTBEAT.md: {e}")))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse HEARTBEAT.md: {e}"))?;
 
     let routines = raw
         .routines

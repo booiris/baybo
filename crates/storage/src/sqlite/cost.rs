@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_core::AuraError;
+use aura_cost::CostError;
 use aura_cost::{CostRecord, CostStore, CostSummary, TimeRange};
 use chrono::{DateTime, Utc};
 
@@ -17,7 +17,7 @@ impl SqliteCostStore {
 
 #[async_trait]
 impl CostStore for SqliteCostStore {
-    async fn record(&self, record: &CostRecord) -> aura_core::Result<()> {
+    async fn record(&self, record: &CostRecord) -> aura_cost::Result<()> {
         let pool = self.pool.clone();
         let user_id = record.user_id.clone();
         let session_id = record.session_id.clone();
@@ -34,18 +34,18 @@ impl CostStore for SqliteCostStore {
                 "INSERT INTO cost_records (user_id, session_id, job_id, trace_span_id, model, input_tokens, output_tokens, cost_usd, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![user_id, session_id, job_id, trace_span_id, model, input_tokens, output_tokens, cost_usd, timestamp],
             )
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite insert error: {e}")))?;
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("sqlite insert error: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| CostError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
     async fn query_user(
         &self,
         user_id: &str,
         range: TimeRange,
-    ) -> aura_core::Result<Vec<CostRecord>> {
+    ) -> aura_cost::Result<Vec<CostRecord>> {
         let pool = self.pool.clone();
         let user_id = user_id.to_string();
         let from = range.from.to_rfc3339();
@@ -56,7 +56,7 @@ impl CostStore for SqliteCostStore {
                 .prepare(
                     "SELECT user_id, session_id, job_id, trace_span_id, model, input_tokens, output_tokens, cost_usd, timestamp FROM cost_records WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
                 )
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| CostError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let rows = stmt
                 .query_map(rusqlite::params![user_id, from, to], |row| {
                     Ok(CostRecordRow {
@@ -71,22 +71,22 @@ impl CostStore for SqliteCostStore {
                         timestamp: row.get::<_, String>(8)?,
                     })
                 })
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| CostError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
 
             let mut records = Vec::new();
             for row in rows {
                 let r = row.map_err(|e| {
-                    AuraError::Internal(anyhow::anyhow!("sqlite row error: {e}"))
+                    CostError::Internal(anyhow::anyhow!("sqlite row error: {e}"))
                 })?;
                 records.push(r.into_cost_record()?);
             }
             Ok(records)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| CostError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn query_global(&self, range: TimeRange) -> aura_core::Result<CostSummary> {
+    async fn query_global(&self, range: TimeRange) -> aura_cost::Result<CostSummary> {
         let pool = self.pool.clone();
         let from = range.from.to_rfc3339();
         let to = range.to.to_rfc3339();
@@ -96,7 +96,7 @@ impl CostStore for SqliteCostStore {
                 .prepare(
                     "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*) FROM cost_records WHERE timestamp >= ?1 AND timestamp < ?2",
                 )
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| CostError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let summary = stmt
                 .query_row(rusqlite::params![from, to], |row| {
                     Ok(CostSummary {
@@ -106,14 +106,14 @@ impl CostStore for SqliteCostStore {
                         record_count: row.get::<_, i64>(3)? as usize,
                     })
                 })
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| CostError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             Ok(summary)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| CostError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn sum_user(&self, user_id: &str, range: TimeRange) -> aura_core::Result<f64> {
+    async fn sum_user(&self, user_id: &str, range: TimeRange) -> aura_cost::Result<f64> {
         let pool = self.pool.clone();
         let user_id = user_id.to_string();
         let from = range.from.to_rfc3339();
@@ -124,14 +124,14 @@ impl CostStore for SqliteCostStore {
                 .prepare(
                     "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
                 )
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| CostError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let sum: f64 = stmt
                 .query_row(rusqlite::params![user_id, from, to], |row| row.get(0))
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| CostError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             Ok(sum)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| CostError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 }
 
@@ -149,11 +149,11 @@ struct CostRecordRow {
 }
 
 impl CostRecordRow {
-    fn into_cost_record(self) -> aura_core::Result<CostRecord> {
+    fn into_cost_record(self) -> aura_cost::Result<CostRecord> {
         let timestamp: DateTime<Utc> = self
             .timestamp
             .parse()
-            .map_err(|e| AuraError::Serialization(format!("invalid timestamp: {e}")))?;
+            .map_err(|e| CostError::Storage(format!("invalid timestamp: {e}")))?;
         Ok(CostRecord {
             user_id: self.user_id,
             session_id: self.session_id,

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/core",
+    "crates/model",
     "crates/channels",
     "crates/llm",
     "crates/tools",
@@ -28,7 +28,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
-aura-core = { path = "crates/core" }
+aura-model = { path = "crates/model" }
 aura-channels = { path = "crates/channels" }
 aura-llm = { path = "crates/llm" }
 aura-tools = { path = "crates/tools" }
@@ -87,7 +87,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aura-core = { workspace = true }
+aura-model = { workspace = true }
 aura-channels = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }

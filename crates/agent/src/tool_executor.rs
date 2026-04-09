@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_core::{AuraError, OperationKind, TrustLevel, User};
+use aura_job::OperationKind;
+use aura_registry::TrustLevel;
 use aura_sandbox::{NetworkPolicy, SandboxPolicy};
 use aura_security::SecretVault;
+use aura_session::User;
 use aura_tools::{
     SecretValue, ToolCapability, ToolContext, ToolManifest, ToolOutput, ToolRegistry,
 };
@@ -102,30 +104,30 @@ impl ToolExecutor {
     ///
     /// - Untrusted tools are never auto-executed.
     /// - Installed tools cannot use WriteWorkspace or SpawnProcess.
-    fn validate_trust(&self, tool_name: &str, manifest: &ToolManifest) -> aura_core::Result<()> {
+    fn validate_trust(&self, tool_name: &str, manifest: &ToolManifest) -> anyhow::Result<()> {
         match manifest.trust_level {
             TrustLevel::Untrusted => {
-                return Err(AuraError::Security(format!(
-                    "tool '{}' has Untrusted trust level and cannot be auto-executed",
+                anyhow::bail!(
+                    "security: tool '{}' has Untrusted trust level and cannot be auto-executed",
                     tool_name
-                )));
+                );
             }
             TrustLevel::Installed => {
                 for cap in &manifest.capabilities {
                     match cap {
                         ToolCapability::WriteWorkspace => {
-                            return Err(AuraError::Security(format!(
-                                "tool '{}' is Installed but declares WriteWorkspace capability; \
+                            anyhow::bail!(
+                                "security: tool '{}' is Installed but declares WriteWorkspace capability; \
                                  requires Trusted level",
                                 tool_name
-                            )));
+                            );
                         }
                         ToolCapability::SpawnProcess => {
-                            return Err(AuraError::Security(format!(
-                                "tool '{}' is Installed but declares SpawnProcess capability; \
+                            anyhow::bail!(
+                                "security: tool '{}' is Installed but declares SpawnProcess capability; \
                                  requires Trusted level",
                                 tool_name
-                            )));
+                            );
                         }
                         _ => {}
                     }
@@ -147,7 +149,7 @@ impl ToolExecutor {
         user: &User,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
-    ) -> aura_core::Result<ToolOutput> {
+    ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
         // Validate trust level for WASM tools before any execution
@@ -219,16 +221,16 @@ impl ToolExecutor {
             Ok(Err(e)) => {
                 let error_msg = e.to_string();
                 recorder.fail(handle, &error_msg).await?;
-                Err(e)
+                Err(e.into())
             }
             Err(_) => {
                 let error_msg =
                     format!("tool '{}' exceeded timeout ({:?})", tool_name, ctx.timeout);
                 recorder.fail(handle, &error_msg).await?;
-                Err(AuraError::Timeout(format!(
-                    "tool '{}' exceeded timeout",
+                Err(anyhow::anyhow!(
+                    "timeout: tool '{}' exceeded timeout",
                     tool_name
-                )))
+                ))
             }
         }
     }
@@ -236,7 +238,7 @@ impl ToolExecutor {
     async fn inject_secrets(
         &self,
         tool_name: &str,
-    ) -> aura_core::Result<HashMap<String, SecretValue>> {
+    ) -> anyhow::Result<HashMap<String, SecretValue>> {
         let tool = self.tool_registry.get(tool_name);
         let required = tool.map(|t| t.required_secrets()).unwrap_or_default();
         if required.is_empty() {

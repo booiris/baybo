@@ -9,7 +9,7 @@ pub struct Soul {
 
 impl Soul {
     /// Build a Soul from workspace identity files.
-    pub async fn from_workspace(workspace: &WorkspaceManager) -> aura_core::Result<Self> {
+    pub async fn from_workspace(workspace: &WorkspaceManager) -> anyhow::Result<Self> {
         let identity = workspace.load_identity_files().await?;
         let mut parts = Vec::new();
 

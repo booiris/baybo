@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use aura_core::{AuraError, Result, Session};
-use aura_session::SessionStore;
+use aura_session::{Result, Session, SessionError, SessionStore};
 
 use crate::sqlite::SqlitePool;
 
@@ -26,32 +25,31 @@ impl SessionStore for SqliteSessionStore {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM sessions WHERE id = ?1")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
+                .map_err(|e| SessionError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
             let result = stmt
                 .query_row(rusqlite::params![session_id], |row| {
                     let data: String = row.get(0)?;
                     Ok(data)
                 })
                 .optional()
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
+                .map_err(|e| SessionError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
             match result {
                 Some(data) => {
-                    let session: Session = serde_json::from_str(&data).map_err(|e| {
-                        AuraError::Serialization(format!("deserialize session: {e}"))
-                    })?;
+                    let session: Session = serde_json::from_str(&data)
+                        .map_err(|e| SessionError::Storage(format!("deserialize session: {e}")))?;
                     Ok(Some(session))
                 }
                 None => Ok(None),
             }
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
+        .map_err(|e| SessionError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
     }
 
     async fn save(&self, session: &Session) -> Result<()> {
         let pool = self.pool.clone();
         let data = serde_json::to_string(session)
-            .map_err(|e| AuraError::Serialization(format!("serialize session: {e}")))?;
+            .map_err(|e| SessionError::Storage(format!("serialize session: {e}")))?;
         let id = session.id.clone();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
@@ -59,11 +57,11 @@ impl SessionStore for SqliteSessionStore {
                 "INSERT OR REPLACE INTO sessions (id, data) VALUES (?1, ?2)",
                 rusqlite::params![id, data],
             )
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite insert session: {e}")))?;
+            .map_err(|e| SessionError::Internal(anyhow::anyhow!("sqlite insert session: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
+        .map_err(|e| SessionError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
     }
 
     async fn delete(&self, session_id: &str) -> Result<()> {
@@ -75,11 +73,11 @@ impl SessionStore for SqliteSessionStore {
                 "DELETE FROM sessions WHERE id = ?1",
                 rusqlite::params![session_id],
             )
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite delete session: {e}")))?;
+            .map_err(|e| SessionError::Internal(anyhow::anyhow!("sqlite delete session: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
+        .map_err(|e| SessionError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
     }
 
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<String>> {
@@ -88,19 +86,19 @@ impl SessionStore for SqliteSessionStore {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT id, data FROM sessions")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
+                .map_err(|e| SessionError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
             let rows = stmt
                 .query_map([], |row| {
                     let id: String = row.get(0)?;
                     let data: String = row.get(1)?;
                     Ok((id, data))
                 })
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
+                .map_err(|e| SessionError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
 
             let mut expired = Vec::new();
             for row in rows {
                 let (id, data) =
-                    row.map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite row: {e}")))?;
+                    row.map_err(|e| SessionError::Internal(anyhow::anyhow!("sqlite row: {e}")))?;
                 if let Ok(session) = serde_json::from_str::<Session>(&data)
                     && session.last_active < before
                 {
@@ -110,7 +108,7 @@ impl SessionStore for SqliteSessionStore {
             Ok(expired)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
+        .map_err(|e| SessionError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
     }
 }
 
@@ -132,7 +130,7 @@ impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_core::{ChannelType, SessionState, User};
+    use aura_session::{ChannelType, SessionState, User};
     use chrono::Utc;
 
     fn make_session(id: &str) -> Session {

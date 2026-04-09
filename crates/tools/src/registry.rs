@@ -62,10 +62,10 @@ impl ToolRegistry {
         name: &str,
         params: Value,
         ctx: &ToolContext,
-    ) -> aura_core::Result<ToolOutput> {
+    ) -> crate::Result<ToolOutput> {
         let tool = self
             .get(name)
-            .ok_or_else(|| aura_core::AuraError::NotFound(format!("tool not found: {name}")))?;
+            .ok_or_else(|| crate::ToolError::NotFound(format!("tool not found: {name}")))?;
         tool.execute(params, ctx).await
     }
 

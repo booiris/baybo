@@ -4,10 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_core::{
-    AuraError, ChannelType, ContentBlock, IncomingMessage, Message, MessageMetadata,
-    OutgoingMessage, User,
-};
+use aura_model::{ContentBlock, MessageMetadata};
+use aura_session::{ChannelType, User};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -16,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tower_http::cors::CorsLayer;
 
-use crate::ChannelAdapter;
+use crate::{ChannelAdapter, ChannelError, IncomingMessage, Message, OutgoingMessage, Result};
 
 /// HTTP channel adapter that exposes a REST API via axum.
 ///
@@ -128,21 +126,20 @@ impl ChannelAdapter for HttpChannel {
         ChannelType::Http
     }
 
-    async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> aura_core::Result<()> {
+    async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
         let router = self.build_router(sender);
         let shutdown = Arc::clone(&self.shutdown);
         let bind_addr = self.bind_addr.clone();
 
         let listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
-            .map_err(|e| AuraError::Config(format!("failed to bind to {bind_addr}: {e}")))?;
+            .map_err(|e| ChannelError::Config(format!("failed to bind to {bind_addr}: {e}")))?;
 
         tracing::info!("HTTP channel listening on {bind_addr}");
 
         tokio::spawn(async move {
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
-                    // Poll the shutdown flag; a small tick interval is fine for graceful shutdown.
                     loop {
                         if shutdown.load(Ordering::Relaxed) {
                             break;
@@ -160,9 +157,9 @@ impl ChannelAdapter for HttpChannel {
         Ok(())
     }
 
-    async fn send_response(&self, response: OutgoingMessage) -> aura_core::Result<()> {
+    async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
         let reply_id = response.reply_to.as_deref().ok_or_else(|| {
-            AuraError::NotFound("send_response missing reply_to message id".into())
+            ChannelError::Send("send_response missing reply_to message id".into())
         })?;
 
         let tx = {
@@ -178,14 +175,14 @@ impl ChannelAdapter for HttpChannel {
             }
             None => {
                 tracing::warn!("no pending request for message_id={reply_id}");
-                Err(AuraError::NotFound(format!(
+                Err(ChannelError::Send(format!(
                     "no pending HTTP request for message_id={reply_id}"
                 )))
             }
         }
     }
 
-    async fn stop(&self) -> aura_core::Result<()> {
+    async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::Relaxed);
         tracing::info!("HTTP channel stopped");
         Ok(())

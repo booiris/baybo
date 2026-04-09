@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aura_context::ContextSnapshot;
-use aura_core::OperationKind;
+use aura_job::OperationKind;
 
 use crate::tree::{attach_child, create_root_node, set_active_leaf};
 use crate::{
@@ -117,7 +117,7 @@ impl TraceCollector {
     }
 
     /// Persist the current session trace to the store.
-    pub async fn flush(&self) -> aura_core::Result<()> {
+    pub async fn flush(&self) -> crate::Result<()> {
         self.store.save_trace(&self.session_trace).await
     }
 
@@ -132,12 +132,12 @@ impl TraceCollector {
         &mut self,
         node_id: &TraceNodeId,
         snapshot: ContextSnapshot,
-    ) -> aura_core::Result<()> {
+    ) -> crate::Result<()> {
         let node = self
             .session_trace
             .nodes
             .get_mut(node_id)
-            .ok_or_else(|| aura_core::AuraError::NotFound(format!("trace node {node_id}")))?;
+            .ok_or_else(|| crate::TraceError::NotFound(format!("trace node {node_id}")))?;
         node.context_snapshot = Some(snapshot);
         self.spans_since_snapshot = 0;
         Ok(())
@@ -155,13 +155,13 @@ impl TraceCollector {
         &self.session_trace
     }
 
-    fn fork_from(&mut self, from_node: TraceNodeId) -> aura_core::Result<String> {
+    fn fork_from(&mut self, from_node: TraceNodeId) -> crate::Result<String> {
         use crate::fork::fork_from as do_fork;
         let fork_id = do_fork(&mut self.session_trace, from_node, "")?;
         Ok(fork_id)
     }
 
-    fn get_snapshot_at(&self, node_id: TraceNodeId) -> aura_core::Result<ContextSnapshot> {
+    fn get_snapshot_at(&self, node_id: TraceNodeId) -> crate::Result<ContextSnapshot> {
         use crate::snapshot::find_nearest_snapshot;
         find_nearest_snapshot(&self.session_trace, &node_id)
     }
@@ -189,28 +189,28 @@ mod tests {
 
     #[async_trait]
     impl TraceStore for MemoryTraceStore {
-        async fn save_trace(&self, trace: &SessionTrace) -> aura_core::Result<()> {
+        async fn save_trace(&self, trace: &SessionTrace) -> crate::Result<()> {
             let mut map = self
                 .traces
                 .lock()
-                .map_err(|e| aura_core::AuraError::Internal(anyhow::anyhow!("{e}")))?;
+                .map_err(|e| crate::TraceError::Storage(e.to_string()))?;
             map.insert(trace.session_id.clone(), trace.clone());
             Ok(())
         }
 
-        async fn load_trace(&self, session_id: &str) -> aura_core::Result<Option<SessionTrace>> {
+        async fn load_trace(&self, session_id: &str) -> crate::Result<Option<SessionTrace>> {
             let map = self
                 .traces
                 .lock()
-                .map_err(|e| aura_core::AuraError::Internal(anyhow::anyhow!("{e}")))?;
+                .map_err(|e| crate::TraceError::Storage(e.to_string()))?;
             Ok(map.get(session_id).cloned())
         }
 
-        async fn query_traces(&self, _filter: TraceFilter) -> aura_core::Result<Vec<SessionTrace>> {
+        async fn query_traces(&self, _filter: TraceFilter) -> crate::Result<Vec<SessionTrace>> {
             let map = self
                 .traces
                 .lock()
-                .map_err(|e| aura_core::AuraError::Internal(anyhow::anyhow!("{e}")))?;
+                .map_err(|e| crate::TraceError::Storage(e.to_string()))?;
             Ok(map.values().cloned().collect())
         }
 
@@ -218,11 +218,11 @@ mod tests {
             &self,
             session_id: &str,
             node_id: &TraceNodeId,
-        ) -> aura_core::Result<Option<TraceNode>> {
+        ) -> crate::Result<Option<TraceNode>> {
             let map = self
                 .traces
                 .lock()
-                .map_err(|e| aura_core::AuraError::Internal(anyhow::anyhow!("{e}")))?;
+                .map_err(|e| crate::TraceError::Storage(e.to_string()))?;
             Ok(map
                 .get(session_id)
                 .and_then(|t| t.nodes.get(node_id).cloned()))

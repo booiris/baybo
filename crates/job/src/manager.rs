@@ -2,9 +2,7 @@ use chrono::Utc;
 use serde_json::Value;
 use uuid::Uuid;
 
-use aura_core::{AuraError, OperationKind};
-
-use crate::{Job, JobStatus, JobStore, JobTransition};
+use crate::{Job, JobError, JobStatus, JobStore, JobTransition, OperationKind, Result};
 
 /// Manages job lifecycle with strict state-machine validation.
 pub struct JobManager {
@@ -22,7 +20,7 @@ impl JobManager {
         session_id: &str,
         kind: OperationKind,
         parent: Option<&str>,
-    ) -> aura_core::Result<Job> {
+    ) -> Result<Job> {
         let job = Job {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_owned(),
@@ -42,31 +40,31 @@ impl JobManager {
     }
 
     /// Transition a job from `Pending` to `InProgress`.
-    pub async fn start(&self, job_id: &str) -> aura_core::Result<()> {
+    pub async fn start(&self, job_id: &str) -> Result<()> {
         self.transition(job_id, JobStatus::InProgress, None, None, None)
             .await
     }
 
     /// Transition a job from `InProgress` to `Completed`, recording its output.
-    pub async fn complete(&self, job_id: &str, output: Value) -> aura_core::Result<()> {
+    pub async fn complete(&self, job_id: &str, output: Value) -> Result<()> {
         self.transition(job_id, JobStatus::Completed, Some(output), None, None)
             .await
     }
 
     /// Transition a job from `Completed` to `Submitted`.
-    pub async fn submit(&self, job_id: &str) -> aura_core::Result<()> {
+    pub async fn submit(&self, job_id: &str) -> Result<()> {
         self.transition(job_id, JobStatus::Submitted, None, None, None)
             .await
     }
 
     /// Transition a job from `Submitted` to `Accepted` (terminal success).
-    pub async fn accept(&self, job_id: &str) -> aura_core::Result<()> {
+    pub async fn accept(&self, job_id: &str) -> Result<()> {
         self.transition(job_id, JobStatus::Accepted, None, None, None)
             .await
     }
 
     /// Transition a job from `InProgress` or `Stuck` to `Failed` (terminal failure).
-    pub async fn fail(&self, job_id: &str, error: &str) -> aura_core::Result<()> {
+    pub async fn fail(&self, job_id: &str, error: &str) -> Result<()> {
         self.transition(
             job_id,
             JobStatus::Failed,
@@ -80,11 +78,11 @@ impl JobManager {
     // --- internal helpers ---
 
     /// Load a job or return `NotFound`.
-    async fn load_job(&self, job_id: &str) -> aura_core::Result<Job> {
+    async fn load_job(&self, job_id: &str) -> Result<Job> {
         self.store
             .get(job_id)
             .await?
-            .ok_or_else(|| AuraError::NotFound(format!("job {job_id}")))
+            .ok_or_else(|| JobError::NotFound(format!("job {job_id}")))
     }
 
     /// Core transition logic: validate, persist status + transition record.
@@ -95,11 +93,11 @@ impl JobManager {
         output: Option<Value>,
         error: Option<String>,
         reason: Option<String>,
-    ) -> aura_core::Result<()> {
+    ) -> Result<()> {
         let job = self.load_job(job_id).await?;
 
         if !job.status.can_transition_to(&target) {
-            return Err(AuraError::InvalidTransition(format!(
+            return Err(JobError::InvalidTransition(format!(
                 "{} -> {} (job {})",
                 job.status, target, job_id
             )));
@@ -124,7 +122,7 @@ impl JobManager {
 
 #[cfg(test)]
 impl JobManager {
-    async fn stuck(&self, job_id: &str, reason: &str) -> aura_core::Result<()> {
+    async fn stuck(&self, job_id: &str, reason: &str) -> Result<()> {
         self.transition(
             job_id,
             JobStatus::Stuck,
@@ -135,7 +133,7 @@ impl JobManager {
         .await
     }
 
-    async fn recover(&self, job_id: &str, reason: &str) -> aura_core::Result<()> {
+    async fn recover(&self, job_id: &str, reason: &str) -> Result<()> {
         self.transition(
             job_id,
             JobStatus::InProgress,
@@ -146,7 +144,7 @@ impl JobManager {
         .await
     }
 
-    async fn get_history(&self, job_id: &str) -> aura_core::Result<Vec<JobTransition>> {
+    async fn get_history(&self, job_id: &str) -> Result<Vec<JobTransition>> {
         self.store.get_transitions(job_id).await
     }
 }
@@ -175,12 +173,12 @@ mod tests {
 
     #[async_trait]
     impl JobStore for InMemoryJobStore {
-        async fn create(&self, job: &Job) -> aura_core::Result<()> {
+        async fn create(&self, job: &Job) -> Result<()> {
             self.jobs.lock().map_err(lock_err)?.push(job.clone());
             Ok(())
         }
 
-        async fn get(&self, job_id: &str) -> aura_core::Result<Option<Job>> {
+        async fn get(&self, job_id: &str) -> Result<Option<Job>> {
             let jobs = self.jobs.lock().map_err(lock_err)?;
             Ok(jobs.iter().find(|j| j.id == job_id).cloned())
         }
@@ -191,12 +189,12 @@ mod tests {
             status: JobStatus,
             output: Option<Value>,
             error: Option<String>,
-        ) -> aura_core::Result<()> {
+        ) -> Result<()> {
             let mut jobs = self.jobs.lock().map_err(lock_err)?;
             let job = jobs
                 .iter_mut()
                 .find(|j| j.id == job_id)
-                .ok_or_else(|| AuraError::NotFound(format!("job {job_id}")))?;
+                .ok_or_else(|| JobError::NotFound(format!("job {job_id}")))?;
 
             // Set timestamps based on target status.
             let now = Utc::now();
@@ -220,7 +218,7 @@ mod tests {
             Ok(())
         }
 
-        async fn list_by_session(&self, session_id: &str) -> aura_core::Result<Vec<Job>> {
+        async fn list_by_session(&self, session_id: &str) -> Result<Vec<Job>> {
             let jobs = self.jobs.lock().map_err(lock_err)?;
             Ok(jobs
                 .iter()
@@ -229,7 +227,7 @@ mod tests {
                 .collect())
         }
 
-        async fn list_by_status(&self, status: JobStatus) -> aura_core::Result<Vec<Job>> {
+        async fn list_by_status(&self, status: JobStatus) -> Result<Vec<Job>> {
             let jobs = self.jobs.lock().map_err(lock_err)?;
             Ok(jobs
                 .iter()
@@ -238,7 +236,7 @@ mod tests {
                 .collect())
         }
 
-        async fn list_children(&self, parent_job_id: &str) -> aura_core::Result<Vec<Job>> {
+        async fn list_children(&self, parent_job_id: &str) -> Result<Vec<Job>> {
             let jobs = self.jobs.lock().map_err(lock_err)?;
             Ok(jobs
                 .iter()
@@ -247,7 +245,7 @@ mod tests {
                 .collect())
         }
 
-        async fn record_transition(&self, transition: &JobTransition) -> aura_core::Result<()> {
+        async fn record_transition(&self, transition: &JobTransition) -> Result<()> {
             self.transitions
                 .lock()
                 .map_err(lock_err)?
@@ -255,7 +253,7 @@ mod tests {
             Ok(())
         }
 
-        async fn get_transitions(&self, job_id: &str) -> aura_core::Result<Vec<JobTransition>> {
+        async fn get_transitions(&self, job_id: &str) -> Result<Vec<JobTransition>> {
             let transitions = self.transitions.lock().map_err(lock_err)?;
             Ok(transitions
                 .iter()
@@ -265,8 +263,8 @@ mod tests {
         }
     }
 
-    fn lock_err<T>(_: T) -> AuraError {
-        AuraError::Internal(anyhow::anyhow!("lock poisoned"))
+    fn lock_err<T>(_: T) -> JobError {
+        JobError::Internal(anyhow::anyhow!("lock poisoned"))
     }
 
     fn test_kind() -> OperationKind {
@@ -320,7 +318,6 @@ mod tests {
         mgr.start(&job.id).await.unwrap();
         mgr.stuck(&job.id, "no response").await.unwrap();
         mgr.recover(&job.id, "retrying").await.unwrap();
-        // After recovery we should be back at InProgress and can complete normally.
         mgr.complete(&job.id, serde_json::json!(null))
             .await
             .unwrap();
@@ -328,8 +325,6 @@ mod tests {
         mgr.accept(&job.id).await.unwrap();
 
         let history = mgr.get_history(&job.id).await.unwrap();
-        // Pending→InProgress, InProgress→Stuck, Stuck→InProgress,
-        // InProgress→Completed, Completed→Submitted, Submitted→Accepted = 6
         assert_eq!(history.len(), 6);
     }
 
@@ -355,7 +350,7 @@ mod tests {
             .complete(&job.id, serde_json::json!(null))
             .await
             .unwrap_err();
-        assert!(matches!(err, AuraError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
     #[tokio::test]
@@ -363,7 +358,7 @@ mod tests {
         let mgr = make_manager();
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         let err = mgr.accept(&job.id).await.unwrap_err();
-        assert!(matches!(err, AuraError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
     #[tokio::test]
@@ -372,7 +367,7 @@ mod tests {
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         mgr.start(&job.id).await.unwrap();
         let err = mgr.submit(&job.id).await.unwrap_err();
-        assert!(matches!(err, AuraError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
     #[tokio::test]
@@ -381,7 +376,7 @@ mod tests {
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         mgr.start(&job.id).await.unwrap();
         let err = mgr.recover(&job.id, "nope").await.unwrap_err();
-        assert!(matches!(err, AuraError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
     #[tokio::test]
@@ -396,7 +391,7 @@ mod tests {
         mgr.accept(&job.id).await.unwrap();
 
         let err = mgr.start(&job.id).await.unwrap_err();
-        assert!(matches!(err, AuraError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
     #[tokio::test]
@@ -407,9 +402,9 @@ mod tests {
         mgr.fail(&job.id, "boom").await.unwrap();
 
         let err = mgr.start(&job.id).await.unwrap_err();
-        assert!(matches!(err, AuraError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::InvalidTransition(_)));
         let err2 = mgr.recover(&job.id, "try").await.unwrap_err();
-        assert!(matches!(err2, AuraError::InvalidTransition(_)));
+        assert!(matches!(err2, JobError::InvalidTransition(_)));
     }
 
     #[tokio::test]
@@ -417,7 +412,7 @@ mod tests {
         let mgr = make_manager();
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         let err = mgr.fail(&job.id, "nope").await.unwrap_err();
-        assert!(matches!(err, AuraError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
     #[tokio::test]
@@ -425,14 +420,14 @@ mod tests {
         let mgr = make_manager();
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         let err = mgr.stuck(&job.id, "nope").await.unwrap_err();
-        assert!(matches!(err, AuraError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
     #[tokio::test]
     async fn not_found_returns_error() {
         let mgr = make_manager();
         let err = mgr.start("nonexistent").await.unwrap_err();
-        assert!(matches!(err, AuraError::NotFound(_)));
+        assert!(matches!(err, JobError::NotFound(_)));
     }
 
     // ---- hierarchy test ----

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_core::Result;
+use crate::Result;
 
 use crate::SecretStore;
 use crate::crypto::{self, EncryptionKey};
@@ -35,8 +35,9 @@ impl SecretValue {
 
     /// Attempt to interpret the value as a UTF-8 string.
     pub fn as_str(&self) -> Result<&str> {
-        std::str::from_utf8(&self.inner)
-            .map_err(|e| aura_core::AuraError::Security(format!("secret is not valid UTF-8: {e}")))
+        std::str::from_utf8(&self.inner).map_err(|e| {
+            crate::SecurityError::Encryption(format!("secret is not valid UTF-8: {e}"))
+        })
     }
 }
 
@@ -129,7 +130,7 @@ mod tests {
         async fn store(&self, name: &str, encrypted_value: &[u8]) -> Result<()> {
             self.data
                 .lock()
-                .map_err(|e| aura_core::AuraError::Security(e.to_string()))?
+                .map_err(|e| crate::SecurityError::Storage(e.to_string()))?
                 .insert(name.to_owned(), encrypted_value.to_vec());
             Ok(())
         }
@@ -138,7 +139,7 @@ mod tests {
             Ok(self
                 .data
                 .lock()
-                .map_err(|e| aura_core::AuraError::Security(e.to_string()))?
+                .map_err(|e| crate::SecurityError::Storage(e.to_string()))?
                 .get(name)
                 .cloned())
         }
@@ -146,7 +147,7 @@ mod tests {
         async fn delete(&self, name: &str) -> Result<()> {
             self.data
                 .lock()
-                .map_err(|e| aura_core::AuraError::Security(e.to_string()))?
+                .map_err(|e| crate::SecurityError::Storage(e.to_string()))?
                 .remove(name);
             Ok(())
         }
@@ -155,7 +156,7 @@ mod tests {
             Ok(self
                 .data
                 .lock()
-                .map_err(|e| aura_core::AuraError::Security(e.to_string()))?
+                .map_err(|e| crate::SecurityError::Storage(e.to_string()))?
                 .keys()
                 .cloned()
                 .collect())

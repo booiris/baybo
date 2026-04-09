@@ -1,13 +1,17 @@
+mod error;
 pub mod manager;
+mod operation;
 
+pub use error::JobError;
 pub use manager::JobManager;
+pub use operation::OperationKind;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use aura_core::OperationKind;
+pub type Result<T> = std::result::Result<T, JobError>;
 
 /// Job lifecycle status with a fixed state machine.
 ///
@@ -93,18 +97,18 @@ pub struct JobTransition {
 /// Persistence layer for jobs and their transitions.
 #[async_trait]
 pub trait JobStore: Send + Sync {
-    async fn create(&self, job: &Job) -> aura_core::Result<()>;
-    async fn get(&self, job_id: &str) -> aura_core::Result<Option<Job>>;
+    async fn create(&self, job: &Job) -> Result<()>;
+    async fn get(&self, job_id: &str) -> Result<Option<Job>>;
     async fn update_status(
         &self,
         job_id: &str,
         status: JobStatus,
         output: Option<Value>,
         error: Option<String>,
-    ) -> aura_core::Result<()>;
-    async fn list_by_session(&self, session_id: &str) -> aura_core::Result<Vec<Job>>;
-    async fn list_by_status(&self, status: JobStatus) -> aura_core::Result<Vec<Job>>;
-    async fn list_children(&self, parent_job_id: &str) -> aura_core::Result<Vec<Job>>;
-    async fn record_transition(&self, transition: &JobTransition) -> aura_core::Result<()>;
-    async fn get_transitions(&self, job_id: &str) -> aura_core::Result<Vec<JobTransition>>;
+    ) -> Result<()>;
+    async fn list_by_session(&self, session_id: &str) -> Result<Vec<Job>>;
+    async fn list_by_status(&self, status: JobStatus) -> Result<Vec<Job>>;
+    async fn list_children(&self, parent_job_id: &str) -> Result<Vec<Job>>;
+    async fn record_transition(&self, transition: &JobTransition) -> Result<()>;
+    async fn get_transitions(&self, job_id: &str) -> Result<Vec<JobTransition>>;
 }

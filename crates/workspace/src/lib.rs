@@ -17,14 +17,14 @@ impl WorkspaceManager {
 
     /// Loads all identity files from the workspace root.
     /// Missing files are represented as `None` rather than causing errors.
-    pub async fn load_identity_files(&self) -> aura_core::Result<IdentityFiles> {
+    pub async fn load_identity_files(&self) -> anyhow::Result<IdentityFiles> {
         identity::load_identity_files(&self.root).await
     }
 }
 
 #[cfg(test)]
 impl WorkspaceManager {
-    async fn load_heartbeat_spec(&self) -> aura_core::Result<Option<heartbeat::HeartbeatSpec>> {
+    async fn load_heartbeat_spec(&self) -> anyhow::Result<Option<heartbeat::HeartbeatSpec>> {
         let identity = self.load_identity_files().await?;
         match identity.heartbeat {
             Some(content) => {

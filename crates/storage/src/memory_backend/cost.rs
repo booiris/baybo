@@ -3,8 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use aura_core::Result;
-use aura_cost::{CostRecord, CostStore, CostSummary, TimeRange};
+use aura_cost::{CostRecord, CostStore, CostSummary, Result, TimeRange};
 
 /// In-memory implementation of [`CostStore`].
 pub struct InMemoryCostStore {

@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aura-core = { workspace = true }
+aura-model = { workspace = true }
+aura-channels = { workspace = true }
+aura-registry = { workspace = true }
 aura-session = { workspace = true }
 aura-memory = { workspace = true }
 aura-trace = { workspace = true }

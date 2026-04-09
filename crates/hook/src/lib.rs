@@ -1,3 +1,4 @@
+pub mod error;
 pub mod manager;
 
 use std::collections::HashMap;
@@ -5,9 +6,12 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use aura_core::{Message, OutgoingMessage, Result};
+use aura_channels::{Message, OutgoingMessage};
 
+pub use error::HookError;
 pub use manager::HookManager;
+
+pub type Result<T> = std::result::Result<T, HookError>;
 
 /// Lifecycle points where hooks can be attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

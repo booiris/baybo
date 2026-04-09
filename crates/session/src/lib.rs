@@ -1,11 +1,15 @@
+mod error;
 mod manager;
+mod types;
 
+pub use error::SessionError;
 pub use manager::SessionManager;
+pub use types::{ChannelType, Session, SessionState, User};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use aura_core::{Result, Session};
+pub type Result<T> = std::result::Result<T, SessionError>;
 
 /// Abstract interface for session persistence.
 ///

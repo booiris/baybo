@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
+use aura_channels::OutgoingMessage;
 use aura_context::ContextManager;
-use aura_core::{ChatMessage, ContentBlock, OperationKind, OutgoingMessage, Role, Session};
+use aura_job::OperationKind;
 use aura_llm::{ChatRequest, LlmClient, LlmResponse, ToolDefinitionForLlm};
 use aura_memory::MemoryManager;
+use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_session::Session;
 use aura_tools::ToolRegistry;
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
@@ -56,7 +59,7 @@ impl AgentLoop {
         user_content: Vec<ContentBlock>,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
-    ) -> aura_core::Result<OutgoingMessage> {
+    ) -> anyhow::Result<OutgoingMessage> {
         // Ensure system prompt is present
         self.ensure_system_prompt(session);
 
@@ -223,7 +226,7 @@ impl AgentLoop {
         session: &Session,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
-    ) -> aura_core::Result<LlmResponse> {
+    ) -> anyhow::Result<LlmResponse> {
         let mut attempt = 0u32;
         loop {
             match self.call_llm(session, recorder, parent_job_id).await {
@@ -252,7 +255,7 @@ impl AgentLoop {
         session: &Session,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
-    ) -> aura_core::Result<LlmResponse> {
+    ) -> anyhow::Result<LlmResponse> {
         let model_id = self.llm_client.model_id().to_string();
 
         let handle = recorder
@@ -339,7 +342,7 @@ impl AgentLoop {
             Err(e) => {
                 let error_msg = e.to_string();
                 recorder.fail(handle, &error_msg).await?;
-                Err(e)
+                Err(e.into())
             }
         }
     }

@@ -33,7 +33,7 @@ impl Tool for WasmTool {
         self.manifest.required_secrets.clone()
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_core::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         // Collect secrets into a plain HashMap<String, String> for the WASM ABI
         let mut secrets = HashMap::new();
         for (k, v) in &ctx.secrets {
@@ -44,7 +44,7 @@ impl Tool for WasmTool {
             .runtime
             .execute(&self.module, params, secrets)
             .await
-            .map_err(|e| aura_core::AuraError::Internal(anyhow::anyhow!("{e}")))?;
+            .map_err(|e| crate::ToolError::Wasm(e.to_string()))?;
 
         match result {
             Value::Null => Ok(ToolOutput::Text(String::new())),

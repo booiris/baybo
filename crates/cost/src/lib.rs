@@ -1,6 +1,10 @@
+pub mod error;
 pub mod tracker;
 
+pub use error::CostError;
 pub use tracker::CostTracker;
+
+pub type Result<T> = std::result::Result<T, CostError>;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -44,18 +48,14 @@ pub struct CostSummary {
 #[async_trait]
 pub trait CostStore: Send + Sync {
     /// Persist a single cost record.
-    async fn record(&self, record: &CostRecord) -> aura_core::Result<()>;
+    async fn record(&self, record: &CostRecord) -> crate::Result<()>;
 
     /// Return all records for a user within the given time range.
-    async fn query_user(
-        &self,
-        user_id: &str,
-        range: TimeRange,
-    ) -> aura_core::Result<Vec<CostRecord>>;
+    async fn query_user(&self, user_id: &str, range: TimeRange) -> crate::Result<Vec<CostRecord>>;
 
     /// Return an aggregated summary of all records within the given time range.
-    async fn query_global(&self, range: TimeRange) -> aura_core::Result<CostSummary>;
+    async fn query_global(&self, range: TimeRange) -> crate::Result<CostSummary>;
 
     /// Return the sum of `cost_usd` for a user within the given time range.
-    async fn sum_user(&self, user_id: &str, range: TimeRange) -> aura_core::Result<f64>;
+    async fn sum_user(&self, user_id: &str, range: TimeRange) -> crate::Result<f64>;
 }

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use aura_core::{ContentBlock, IncomingMessage, OutgoingMessage, Session};
+use aura_channels::{IncomingMessage, OutgoingMessage};
 use aura_hook::{HookContext, HookManager, HookPoint};
+use aura_model::ContentBlock;
+use aura_session::Session;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -118,7 +120,7 @@ impl AgentActor {
         prompt: &str,
         source: &str,
         source_id: &str,
-    ) -> aura_core::Result<()> {
+    ) -> anyhow::Result<()> {
         let content = vec![ContentBlock::Text(format!(
             "[{source}:{source_id}] {prompt}"
         ))];
@@ -133,7 +135,7 @@ impl AgentActor {
         Ok(())
     }
 
-    async fn handle_user_input(&mut self, incoming: IncomingMessage) -> aura_core::Result<()> {
+    async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
         let message_clone = incoming.message.clone();
         let content = incoming.message.content;
 

@@ -1,6 +1,6 @@
 //! Tree operations and active_leaf maintenance.
 
-use aura_core::OperationKind;
+use aura_job::OperationKind;
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -39,7 +39,7 @@ pub fn attach_child(
     job_id: Option<&str>,
     provenance: ExecutionProvenance,
     input: SpanInput,
-) -> aura_core::Result<TraceNodeId> {
+) -> crate::Result<TraceNodeId> {
     let child_id = Uuid::new_v4().to_string();
     let child = TraceNode {
         id: child_id.clone(),
@@ -63,7 +63,7 @@ pub fn attach_child(
     let parent = trace
         .nodes
         .get_mut(parent_id)
-        .ok_or_else(|| aura_core::AuraError::NotFound(format!("parent node {parent_id}")))?;
+        .ok_or_else(|| crate::TraceError::NotFound(format!("parent node {parent_id}")))?;
     parent.children.push(child_id.clone());
 
     Ok(child_id)

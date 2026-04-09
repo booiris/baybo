@@ -34,18 +34,29 @@ impl ErrorHandler {
     }
 
     /// Determine whether a retry should be attempted.
-    pub fn should_retry(&self, attempt: u32, error: &aura_core::AuraError) -> bool {
+    ///
+    /// Since the agent uses `anyhow::Error`, we inspect the error message
+    /// to classify transient vs non-retryable errors. Errors containing
+    /// "timeout" or "io error" are considered transient and retryable.
+    /// Security-related errors are not retried.
+    pub fn should_retry(&self, attempt: u32, error: &anyhow::Error) -> bool {
         if attempt >= self.max_retries {
             return false;
         }
-        // Only retry transient errors, not configuration or security errors.
-        match error {
-            aura_core::AuraError::Internal(_) | aura_core::AuraError::Timeout(_) => true,
-            aura_core::AuraError::Io(_) => true,
-            _ => {
-                warn!(attempt, error = %error, "non-retryable error");
-                false
-            }
+        let msg = error.to_string().to_lowercase();
+        if msg.contains("security") {
+            warn!(attempt, error = %error, "non-retryable security error");
+            return false;
         }
+        // Retry transient errors (timeout, io, internal)
+        if msg.contains("timeout") || msg.contains("io error") {
+            return true;
+        }
+        // Also retry if the error chain contains a known transient module error
+        if error.downcast_ref::<aura_llm::LlmError>().is_some() {
+            return true;
+        }
+        warn!(attempt, error = %error, "non-retryable error");
+        false
     }
 }

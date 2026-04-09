@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 
-use aura_core::{AuraError, Result};
-use aura_trace::{SessionTrace, TraceFilter, TraceNode, TraceNodeId, TraceStore};
+use aura_trace::{
+    Result, SessionTrace, TraceError, TraceFilter, TraceNode, TraceNodeId, TraceStore,
+};
 
 use crate::sqlite::SqlitePool;
 
@@ -25,7 +26,7 @@ impl TraceStore for SqliteTraceStore {
         let pool = self.pool.clone();
         let session_id = trace.session_id.clone();
         let trace_data = serde_json::to_string(trace)
-            .map_err(|e| AuraError::Serialization(format!("serialize session trace: {e}")))?;
+            .map_err(|e| TraceError::Storage(format!("serialize session trace: {e}")))?;
 
         // Pre-serialize all nodes before entering the blocking closure.
         let node_rows: Vec<(String, String, String)> = trace
@@ -33,7 +34,7 @@ impl TraceStore for SqliteTraceStore {
             .iter()
             .map(|(node_id, node)| {
                 let node_data = serde_json::to_string(node)
-                    .map_err(|e| AuraError::Serialization(format!("serialize trace node: {e}")))?;
+                    .map_err(|e| TraceError::Storage(format!("serialize trace node: {e}")))?;
                 Ok((node_id.clone(), session_id.clone(), node_data))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -41,7 +42,7 @@ impl TraceStore for SqliteTraceStore {
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.lock()?;
             let tx = conn.transaction().map_err(|e| {
-                AuraError::Internal(anyhow::anyhow!("sqlite begin transaction: {e}"))
+                TraceError::Internal(anyhow::anyhow!("sqlite begin transaction: {e}"))
             })?;
 
             // Upsert the session trace.
@@ -50,7 +51,7 @@ impl TraceStore for SqliteTraceStore {
                 rusqlite::params![session_id, trace_data],
             )
             .map_err(|e| {
-                AuraError::Internal(anyhow::anyhow!("sqlite insert session_trace: {e}"))
+                TraceError::Internal(anyhow::anyhow!("sqlite insert session_trace: {e}"))
             })?;
 
             // Remove old nodes for this session, then insert the current set.
@@ -59,7 +60,7 @@ impl TraceStore for SqliteTraceStore {
                 rusqlite::params![session_id],
             )
             .map_err(|e| {
-                AuraError::Internal(anyhow::anyhow!("sqlite delete old trace_nodes: {e}"))
+                TraceError::Internal(anyhow::anyhow!("sqlite delete old trace_nodes: {e}"))
             })?;
 
             for (node_id, sid, node_data) in &node_rows {
@@ -68,17 +69,17 @@ impl TraceStore for SqliteTraceStore {
                     rusqlite::params![node_id, sid, node_data],
                 )
                 .map_err(|e| {
-                    AuraError::Internal(anyhow::anyhow!("sqlite insert trace_node: {e}"))
+                    TraceError::Internal(anyhow::anyhow!("sqlite insert trace_node: {e}"))
                 })?;
             }
 
             tx.commit().map_err(|e| {
-                AuraError::Internal(anyhow::anyhow!("sqlite commit transaction: {e}"))
+                TraceError::Internal(anyhow::anyhow!("sqlite commit transaction: {e}"))
             })?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
+        .map_err(|e| TraceError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
     }
 
     async fn load_trace(&self, session_id: &str) -> Result<Option<SessionTrace>> {
@@ -88,18 +89,18 @@ impl TraceStore for SqliteTraceStore {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM session_traces WHERE session_id = ?1")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
             let result = stmt
                 .query_row(rusqlite::params![session_id], |row| {
                     let data: String = row.get(0)?;
                     Ok(data)
                 })
                 .optional()
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
             match result {
                 Some(data) => {
                     let trace: SessionTrace = serde_json::from_str(&data).map_err(|e| {
-                        AuraError::Serialization(format!("deserialize session trace: {e}"))
+                        TraceError::Storage(format!("deserialize session trace: {e}"))
                     })?;
                     Ok(Some(trace))
                 }
@@ -107,7 +108,7 @@ impl TraceStore for SqliteTraceStore {
             }
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
+        .map_err(|e| TraceError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
     }
 
     async fn query_traces(&self, filter: TraceFilter) -> Result<Vec<SessionTrace>> {
@@ -126,7 +127,7 @@ impl TraceStore for SqliteTraceStore {
 
             let mut stmt = conn
                 .prepare(&sql)
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
 
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|p| p.as_ref()).collect();
@@ -136,15 +137,14 @@ impl TraceStore for SqliteTraceStore {
                     let data: String = row.get(0)?;
                     Ok(data)
                 })
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
 
             let mut traces = Vec::new();
             for row in rows {
                 let data =
-                    row.map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite row: {e}")))?;
-                let trace: SessionTrace = serde_json::from_str(&data).map_err(|e| {
-                    AuraError::Serialization(format!("deserialize session trace: {e}"))
-                })?;
+                    row.map_err(|e| TraceError::Internal(anyhow::anyhow!("sqlite row: {e}")))?;
+                let trace: SessionTrace = serde_json::from_str(&data)
+                    .map_err(|e| TraceError::Storage(format!("deserialize session trace: {e}")))?;
 
                 // Apply time-range filtering in-memory since the data is JSON.
                 if let Some(ref from) = filter.from {
@@ -166,7 +166,7 @@ impl TraceStore for SqliteTraceStore {
             Ok(traces)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
+        .map_err(|e| TraceError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
     }
 
     async fn load_node(
@@ -181,26 +181,25 @@ impl TraceStore for SqliteTraceStore {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM trace_nodes WHERE session_id = ?1 AND id = ?2")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("sqlite prepare: {e}")))?;
             let result = stmt
                 .query_row(rusqlite::params![session_id, node_id], |row| {
                     let data: String = row.get(0)?;
                     Ok(data)
                 })
                 .optional()
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("sqlite query: {e}")))?;
             match result {
                 Some(data) => {
-                    let node: TraceNode = serde_json::from_str(&data).map_err(|e| {
-                        AuraError::Serialization(format!("deserialize trace node: {e}"))
-                    })?;
+                    let node: TraceNode = serde_json::from_str(&data)
+                        .map_err(|e| TraceError::Storage(format!("deserialize trace node: {e}")))?;
                     Ok(Some(node))
                 }
                 None => Ok(None),
             }
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
+        .map_err(|e| TraceError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?
     }
 }
 
@@ -222,7 +221,7 @@ impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_core::OperationKind;
+    use aura_job::OperationKind;
     use aura_trace::{ExecutionProvenance, SpanInput, TraceSpan};
     use chrono::Utc;
     use std::collections::HashMap;

@@ -15,10 +15,10 @@ pub(crate) fn fork_from(
     trace: &mut SessionTrace,
     from_node: TraceNodeId,
     reason: &str,
-) -> aura_core::Result<String> {
+) -> crate::Result<String> {
     // Verify the source node exists.
     if !trace.nodes.contains_key(&from_node) {
-        return Err(aura_core::AuraError::NotFound(format!(
+        return Err(crate::TraceError::NotFound(format!(
             "trace node {from_node}"
         )));
     }

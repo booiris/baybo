@@ -14,7 +14,7 @@ impl CostTracker {
     }
 
     /// Persist a cost record.
-    pub async fn record(&self, record: &CostRecord) -> aura_core::Result<()> {
+    pub async fn record(&self, record: &CostRecord) -> crate::Result<()> {
         self.store.record(record).await
     }
 }

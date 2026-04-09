@@ -4,5 +4,4 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aura-core = { workspace = true }
 serde = { workspace = true }

@@ -1,7 +1,5 @@
 use std::path::Path;
 
-use aura_core::AuraError;
-
 /// Contents of the workspace identity files.
 #[derive(Debug, Clone, Default)]
 pub struct IdentityFiles {
@@ -19,16 +17,16 @@ pub struct IdentityFiles {
 
 /// Reads a file if it exists, returning `None` for missing files.
 /// Only propagates genuine I/O errors (permissions, etc.), not "not found".
-async fn read_optional_file(path: &Path) -> aura_core::Result<Option<String>> {
+async fn read_optional_file(path: &Path) -> anyhow::Result<Option<String>> {
     match tokio::fs::read_to_string(path).await {
         Ok(content) => Ok(Some(content)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(AuraError::Io(e)),
+        Err(e) => Err(e.into()),
     }
 }
 
 /// Loads all identity files from the given workspace root directory.
-pub async fn load_identity_files(root: &Path) -> aura_core::Result<IdentityFiles> {
+pub async fn load_identity_files(root: &Path) -> anyhow::Result<IdentityFiles> {
     let agents_path = root.join("AGENTS.md");
     let soul_path = root.join("SOUL.md");
     let user_path = root.join("USER.md");

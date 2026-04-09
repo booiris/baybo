@@ -2,13 +2,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use aura_core::{
-    ChannelType, ContentBlock, IncomingMessage, Message, MessageMetadata, OutgoingMessage, User,
-};
+use aura_model::{ContentBlock, MessageMetadata};
+use aura_session::{ChannelType, User};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::ChannelAdapter;
+use crate::{ChannelAdapter, IncomingMessage, Message, OutgoingMessage, Result};
 
 /// CLI channel for local development and debugging.
 ///
@@ -38,7 +37,7 @@ impl ChannelAdapter for CliChannel {
         ChannelType::Cli
     }
 
-    async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> aura_core::Result<()> {
+    async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
         let shutdown = Arc::clone(&self.shutdown);
 
         tokio::spawn(async move {
@@ -104,7 +103,7 @@ impl ChannelAdapter for CliChannel {
         Ok(())
     }
 
-    async fn send_response(&self, response: OutgoingMessage) -> aura_core::Result<()> {
+    async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
         for block in &response.content {
             match block {
                 ContentBlock::Text(text) => {
@@ -128,7 +127,7 @@ impl ChannelAdapter for CliChannel {
         Ok(())
     }
 
-    async fn stop(&self) -> aura_core::Result<()> {
+    async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::Relaxed);
         tracing::info!("CLI channel stopped");
         Ok(())

@@ -14,7 +14,6 @@ pub use trace::SqliteTraceStore;
 
 use std::sync::{Arc, Mutex};
 
-use aura_core::AuraError;
 use rusqlite::Connection;
 
 /// A shared handle to a SQLite connection, safe for use across async tasks.
@@ -29,10 +28,21 @@ pub struct SqlitePool {
 
 impl SqlitePool {
     /// Open (or create) a SQLite database at the given path and initialise the schema.
-    pub fn open(path: &str) -> aura_core::Result<Self> {
-        let conn = Connection::open(path).map_err(|e| {
-            AuraError::Config(format!("failed to open sqlite database at {path}: {e}"))
-        })?;
+    pub fn open(path: &str) -> anyhow::Result<Self> {
+        let conn = Connection::open(path)
+            .map_err(|e| anyhow::anyhow!("failed to open sqlite database at {path}: {e}"))?;
+        let pool = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        pool.init_db()?;
+        Ok(pool)
+    }
+
+    /// Open an in-memory SQLite database for testing.
+    #[cfg(test)]
+    pub fn open_in_memory() -> anyhow::Result<Self> {
+        let conn = Connection::open_in_memory()
+            .map_err(|e| anyhow::anyhow!("failed to open in-memory sqlite database: {e}"))?;
         let pool = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -41,14 +51,14 @@ impl SqlitePool {
     }
 
     /// Acquire a lock on the underlying connection.
-    fn lock(&self) -> aura_core::Result<std::sync::MutexGuard<'_, Connection>> {
+    fn lock(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
         self.conn
             .lock()
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite mutex poisoned: {e}")))
+            .map_err(|e| anyhow::anyhow!("sqlite mutex poisoned: {e}"))
     }
 
     /// Create all required tables if they do not already exist.
-    fn init_db(&self) -> aura_core::Result<()> {
+    fn init_db(&self) -> anyhow::Result<()> {
         let conn = self.lock()?;
         conn.execute_batch(
             "
@@ -110,9 +120,7 @@ impl SqlitePool {
             CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);
             ",
         )
-        .map_err(|e| {
-            AuraError::Internal(anyhow::anyhow!("failed to initialise sqlite schema: {e}"))
-        })?;
+        .map_err(|e| anyhow::anyhow!("failed to initialise sqlite schema: {e}"))?;
         Ok(())
     }
 }

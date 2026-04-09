@@ -4,6 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aura-core = { workspace = true }
+aura-registry = { workspace = true }
 serde = { workspace = true }
 regex = { workspace = true }

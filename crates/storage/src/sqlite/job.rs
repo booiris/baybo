@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_core::AuraError;
+use aura_job::JobError;
 use aura_job::{Job, JobStatus, JobStore, JobTransition};
 use serde_json::Value;
 
@@ -17,40 +17,40 @@ impl SqliteJobStore {
 
 #[async_trait]
 impl JobStore for SqliteJobStore {
-    async fn create(&self, job: &Job) -> aura_core::Result<()> {
+    async fn create(&self, job: &Job) -> aura_job::Result<()> {
         let pool = self.pool.clone();
         let id = job.id.clone();
         let data = serde_json::to_string(job)
-            .map_err(|e| AuraError::Serialization(format!("failed to serialize job: {e}")))?;
+            .map_err(|e| JobError::Storage(format!("failed to serialize job: {e}")))?;
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             conn.execute(
                 "INSERT INTO jobs (id, data) VALUES (?1, ?2)",
                 rusqlite::params![id, data],
             )
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite insert error: {e}")))?;
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite insert error: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn get(&self, job_id: &str) -> aura_core::Result<Option<Job>> {
+    async fn get(&self, job_id: &str) -> aura_job::Result<Option<Job>> {
         let pool = self.pool.clone();
         let job_id = job_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM jobs WHERE id = ?1")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let result: Option<String> = stmt
                 .query_row(rusqlite::params![job_id], |row| row.get(0))
                 .optional()
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             match result {
                 Some(data) => {
                     let job: Job = serde_json::from_str(&data).map_err(|e| {
-                        AuraError::Serialization(format!("failed to deserialize job: {e}"))
+                        JobError::Storage(format!("failed to deserialize job: {e}"))
                     })?;
                     Ok(Some(job))
                 }
@@ -58,7 +58,7 @@ impl JobStore for SqliteJobStore {
             }
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
     async fn update_status(
@@ -67,19 +67,19 @@ impl JobStore for SqliteJobStore {
         status: JobStatus,
         output: Option<Value>,
         error: Option<String>,
-    ) -> aura_core::Result<()> {
+    ) -> aura_job::Result<()> {
         let pool = self.pool.clone();
         let job_id = job_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM jobs WHERE id = ?1")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let data: String = stmt
                 .query_row(rusqlite::params![job_id], |row| row.get(0))
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("job not found: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("job not found: {e}")))?;
             let mut job: Job = serde_json::from_str(&data)
-                .map_err(|e| AuraError::Serialization(format!("failed to deserialize job: {e}")))?;
+                .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
             job.status = status;
             if let Some(out) = output {
                 job.output = Some(out);
@@ -88,36 +88,35 @@ impl JobStore for SqliteJobStore {
                 job.error = Some(err);
             }
             let updated = serde_json::to_string(&job)
-                .map_err(|e| AuraError::Serialization(format!("failed to serialize job: {e}")))?;
+                .map_err(|e| JobError::Storage(format!("failed to serialize job: {e}")))?;
             conn.execute(
                 "UPDATE jobs SET data = ?1 WHERE id = ?2",
                 rusqlite::params![updated, job_id],
             )
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite update error: {e}")))?;
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite update error: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn list_by_session(&self, session_id: &str) -> aura_core::Result<Vec<Job>> {
+    async fn list_by_session(&self, session_id: &str) -> aura_job::Result<Vec<Job>> {
         let pool = self.pool.clone();
         let session_id = session_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM jobs")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let mut jobs = Vec::new();
             for row in rows {
                 let data =
-                    row.map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?;
-                let job: Job = serde_json::from_str(&data).map_err(|e| {
-                    AuraError::Serialization(format!("failed to deserialize job: {e}"))
-                })?;
+                    row.map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?;
+                let job: Job = serde_json::from_str(&data)
+                    .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
                 if job.session_id == session_id {
                     jobs.push(job);
                 }
@@ -125,26 +124,25 @@ impl JobStore for SqliteJobStore {
             Ok(jobs)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn list_by_status(&self, status: JobStatus) -> aura_core::Result<Vec<Job>> {
+    async fn list_by_status(&self, status: JobStatus) -> aura_job::Result<Vec<Job>> {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM jobs")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let mut jobs = Vec::new();
             for row in rows {
                 let data =
-                    row.map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?;
-                let job: Job = serde_json::from_str(&data).map_err(|e| {
-                    AuraError::Serialization(format!("failed to deserialize job: {e}"))
-                })?;
+                    row.map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?;
+                let job: Job = serde_json::from_str(&data)
+                    .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
                 if job.status == status {
                     jobs.push(job);
                 }
@@ -152,27 +150,26 @@ impl JobStore for SqliteJobStore {
             Ok(jobs)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn list_children(&self, parent_job_id: &str) -> aura_core::Result<Vec<Job>> {
+    async fn list_children(&self, parent_job_id: &str) -> aura_job::Result<Vec<Job>> {
         let pool = self.pool.clone();
         let parent_id = parent_job_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM jobs")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let mut jobs = Vec::new();
             for row in rows {
                 let data =
-                    row.map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?;
-                let job: Job = serde_json::from_str(&data).map_err(|e| {
-                    AuraError::Serialization(format!("failed to deserialize job: {e}"))
-                })?;
+                    row.map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?;
+                let job: Job = serde_json::from_str(&data)
+                    .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
                 if job.parent_job_id.as_deref() == Some(&parent_id) {
                     jobs.push(job);
                 }
@@ -180,52 +177,51 @@ impl JobStore for SqliteJobStore {
             Ok(jobs)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn record_transition(&self, transition: &JobTransition) -> aura_core::Result<()> {
+    async fn record_transition(&self, transition: &JobTransition) -> aura_job::Result<()> {
         let pool = self.pool.clone();
         let job_id = transition.job_id.clone();
-        let data = serde_json::to_string(transition).map_err(|e| {
-            AuraError::Serialization(format!("failed to serialize transition: {e}"))
-        })?;
+        let data = serde_json::to_string(transition)
+            .map_err(|e| JobError::Storage(format!("failed to serialize transition: {e}")))?;
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             conn.execute(
                 "INSERT INTO job_transitions (job_id, data) VALUES (?1, ?2)",
                 rusqlite::params![job_id, data],
             )
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite insert error: {e}")))?;
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite insert error: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn get_transitions(&self, job_id: &str) -> aura_core::Result<Vec<JobTransition>> {
+    async fn get_transitions(&self, job_id: &str) -> aura_job::Result<Vec<JobTransition>> {
         let pool = self.pool.clone();
         let job_id = job_id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT data FROM job_transitions WHERE job_id = ?1")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let rows = stmt
                 .query_map(rusqlite::params![job_id], |row| row.get::<_, String>(0))
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let mut transitions = Vec::new();
             for row in rows {
                 let data =
-                    row.map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?;
+                    row.map_err(|e| JobError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?;
                 let transition: JobTransition = serde_json::from_str(&data).map_err(|e| {
-                    AuraError::Serialization(format!("failed to deserialize transition: {e}"))
+                    JobError::Storage(format!("failed to deserialize transition: {e}"))
                 })?;
                 transitions.push(transition);
             }
             Ok(transitions)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 }
 
@@ -246,7 +242,7 @@ impl<T> OptionalExt<T> for Result<T, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_core::OperationKind;
+    use aura_job::OperationKind;
     use chrono::Utc;
 
     fn test_job(id: &str) -> Job {

@@ -12,7 +12,7 @@ use crate::{SessionTrace, TraceNodeId};
 pub(crate) fn find_nearest_snapshot(
     trace: &SessionTrace,
     node_id: &TraceNodeId,
-) -> aura_core::Result<ContextSnapshot> {
+) -> crate::Result<ContextSnapshot> {
     for id in ancestor_chain(trace, node_id) {
         if let Some(node) = trace.nodes.get(&id)
             && let Some(ref snap) = node.context_snapshot
@@ -20,7 +20,7 @@ pub(crate) fn find_nearest_snapshot(
             return Ok(snap.clone());
         }
     }
-    Err(aura_core::AuraError::NotFound(format!(
+    Err(crate::TraceError::NotFound(format!(
         "no context snapshot found in ancestor chain of node {node_id}"
     )))
 }

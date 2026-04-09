@@ -3,15 +3,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use aura_core::{
-    AuraError, ChannelType, ContentBlock, IncomingMessage, Message, MessageMetadata,
-    OutgoingMessage, User,
-};
+use aura_model::{ContentBlock, MessageMetadata};
+use aura_session::{ChannelType, User};
 use serenity::all::{ChannelId, Context, CreateMessage, EventHandler, GatewayIntents, Ready};
 use serenity::http::Http;
 use tokio::sync::{RwLock, mpsc};
 
-use crate::ChannelAdapter;
+use crate::{ChannelAdapter, ChannelError, IncomingMessage, Message, OutgoingMessage, Result};
 
 type ChannelMap = Arc<RwLock<HashMap<String, (ChannelId, Arc<Http>)>>>;
 
@@ -110,7 +108,7 @@ impl ChannelAdapter for DiscordChannel {
         ChannelType::Discord
     }
 
-    async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> aura_core::Result<()> {
+    async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
         let intents = GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::DIRECT_MESSAGES
             | GatewayIntents::MESSAGE_CONTENT;
@@ -123,7 +121,7 @@ impl ChannelAdapter for DiscordChannel {
         let mut client = serenity::Client::builder(&self.bot_token, intents)
             .event_handler(handler)
             .await
-            .map_err(|e| AuraError::Config(format!("failed to create Discord client: {e}")))?;
+            .map_err(|e| ChannelError::Config(format!("failed to create Discord client: {e}")))?;
 
         let shutdown = Arc::clone(&self.shutdown);
         let shard_manager = Arc::clone(&client.shard_manager);
@@ -149,10 +147,10 @@ impl ChannelAdapter for DiscordChannel {
         Ok(())
     }
 
-    async fn send_response(&self, response: OutgoingMessage) -> aura_core::Result<()> {
+    async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
         let map = self.channel_map.read().await;
         let (channel_id, http) = map.get(&response.session_id).ok_or_else(|| {
-            AuraError::NotFound(format!(
+            ChannelError::Send(format!(
                 "no Discord channel mapping for session {}",
                 response.session_id
             ))
@@ -193,7 +191,7 @@ impl ChannelAdapter for DiscordChannel {
                 .send_message(&**http, builder)
                 .await
                 .map_err(|e| {
-                    AuraError::Internal(anyhow::anyhow!(
+                    ChannelError::Internal(anyhow::anyhow!(
                         "failed to send Discord message to {}: {e}",
                         channel_id
                     ))
@@ -203,7 +201,7 @@ impl ChannelAdapter for DiscordChannel {
         Ok(())
     }
 
-    async fn stop(&self) -> aura_core::Result<()> {
+    async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::Relaxed);
         tracing::info!("Discord channel stopped");
         Ok(())

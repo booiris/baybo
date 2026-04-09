@@ -1,7 +1,9 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use aura_core::{ContentBlock, Result};
+use aura_model::ContentBlock;
+
+use crate::Result;
 
 /// Action to take when a leak detection rule matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

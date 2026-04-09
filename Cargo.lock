@@ -146,12 +146,12 @@ dependencies = [
  "aura-agent",
  "aura-channels",
  "aura-context",
- "aura-core",
  "aura-cost",
  "aura-hook",
  "aura-job",
  "aura-llm",
  "aura-memory",
+ "aura-model",
  "aura-sandbox",
  "aura-security",
  "aura-session",
@@ -174,12 +174,13 @@ dependencies = [
  "async-trait",
  "aura-channels",
  "aura-context",
- "aura-core",
  "aura-cost",
  "aura-hook",
  "aura-job",
  "aura-llm",
  "aura-memory",
+ "aura-model",
+ "aura-registry",
  "aura-sandbox",
  "aura-security",
  "aura-session",
@@ -202,7 +203,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-core",
+ "aura-model",
+ "aura-session",
  "axum",
  "chrono",
  "hex",
@@ -211,6 +213,7 @@ dependencies = [
  "serenity",
  "sha2",
  "teloxide",
+ "thiserror 2.0.18",
  "tokio",
  "tower",
  "tower-http",
@@ -223,35 +226,28 @@ dependencies = [
 name = "aura-context"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "aura-core",
- "chrono",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "aura-core"
-version = "0.1.0"
-dependencies = [
  "anyhow",
+ "async-trait",
+ "aura-model",
+ "aura-session",
  "chrono",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "aura-cost"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
- "aura-core",
  "chrono",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -260,8 +256,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-core",
+ "aura-channels",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -272,10 +269,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-core",
  "chrono",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -287,7 +284,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-core",
+ "aura-model",
  "regex",
  "reqwest",
  "serde",
@@ -300,20 +297,29 @@ dependencies = [
 name = "aura-memory"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
- "aura-core",
+ "aura-model",
+ "aura-session",
  "chrono",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aura-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
 name = "aura-registry"
 version = "0.1.0"
 dependencies = [
- "aura-core",
  "serde",
 ]
 
@@ -339,13 +345,17 @@ name = "aura-security"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "async-trait",
- "aura-core",
+ "aura-channels",
+ "aura-model",
+ "aura-session",
  "chrono",
  "rand 0.10.0",
  "regex",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
 ]
@@ -356,8 +366,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-core",
+ "aura-model",
  "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -367,7 +380,7 @@ dependencies = [
 name = "aura-skills"
 version = "0.1.0"
 dependencies = [
- "aura-core",
+ "aura-registry",
  "regex",
  "serde",
 ]
@@ -378,10 +391,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-core",
+ "aura-channels",
  "aura-cost",
  "aura-job",
  "aura-memory",
+ "aura-model",
+ "aura-registry",
  "aura-security",
  "aura-session",
  "aura-trace",
@@ -399,10 +414,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-core",
+ "aura-model",
+ "aura-registry",
  "aura-sandbox",
+ "aura-session",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -415,10 +433,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-context",
- "aura-core",
+ "aura-job",
+ "aura-model",
  "chrono",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
 ]
@@ -428,7 +448,6 @@ name = "aura-workspace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aura-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

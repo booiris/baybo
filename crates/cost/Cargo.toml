@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aura-core = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

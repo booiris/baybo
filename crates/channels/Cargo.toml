@@ -9,10 +9,12 @@ telegram = ["teloxide", "url", "sha2", "hex"]
 discord = ["serenity"]
 
 [dependencies]
-aura-core = { workspace = true }
+aura-model = { workspace = true }
+aura-session = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

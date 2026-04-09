@@ -4,8 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use aura_core::Result;
-use aura_security::SecretStore;
+use aura_security::{Result, SecretStore};
 
 /// In-memory implementation of [`SecretStore`].
 pub struct InMemorySecretStore {

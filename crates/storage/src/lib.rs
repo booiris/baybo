@@ -1,4 +1,5 @@
 pub mod memory_backend;
+pub mod sqlite;
 
 use aura_cost::CostStore;
 use aura_job::JobStore;

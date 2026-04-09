@@ -1,4 +1,4 @@
-use aura_core::ContentBlock;
+use aura_model::ContentBlock;
 use serde_json::Value;
 
 /// Convert a list of ContentBlocks to the OpenAI messages content array format.
@@ -82,7 +82,7 @@ pub fn extract_text(blocks: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_core::BlobRef;
+    use aura_model::BlobRef;
 
     fn sample_blob() -> BlobRef {
         BlobRef {

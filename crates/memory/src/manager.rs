@@ -1,6 +1,9 @@
 use tracing::{debug, warn};
 
-use aura_core::{ContentBlock, Result, Session};
+use aura_model::ContentBlock;
+use aura_session::Session;
+
+use crate::Result;
 
 use crate::{EmbeddingModel, MemoryCategory, MemoryEntry, MemoryStore};
 
@@ -361,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_extract_text_skips_non_text() {
-        use aura_core::BlobRef;
+        use aura_model::BlobRef;
         let blocks = vec![
             ContentBlock::Text("hello".to_string()),
             ContentBlock::Image {

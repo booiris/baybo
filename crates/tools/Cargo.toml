@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aura-core = { workspace = true }
+aura-model = { workspace = true }
+aura-session = { workspace = true }
+aura-registry = { workspace = true }
+thiserror = { workspace = true }
 aura-sandbox = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

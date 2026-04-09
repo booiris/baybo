@@ -9,12 +9,12 @@ use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_context::Tokenizer;
 use aura_context::sliding_window::SlidingWindowContext;
-use aura_core::{ChatMessage, ContentBlock};
 use aura_cost::CostTracker;
 use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
 use aura_job::JobManager;
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_memory::MemoryManager;
+use aura_model::{ChatMessage, ContentBlock};
 use aura_security::{EncryptionKey, LeakDetector, SecretVault, SecurityGateway};
 use aura_session::SessionManager;
 use aura_storage::StorageSet;
@@ -39,7 +39,7 @@ impl Hook for NoopHook {
         HookPoint::PreMessage
     }
 
-    async fn execute(&self, _ctx: &mut HookContext) -> aura_core::Result<HookAction> {
+    async fn execute(&self, _ctx: &mut HookContext) -> aura_hook::Result<HookAction> {
         Ok(HookAction::Continue)
     }
 }

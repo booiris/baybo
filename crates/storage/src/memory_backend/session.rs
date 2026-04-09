@@ -5,8 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
-use aura_core::{Result, Session};
-use aura_session::SessionStore;
+use aura_session::{Result, Session, SessionStore};
 
 /// In-memory implementation of [`SessionStore`].
 pub struct InMemorySessionStore {

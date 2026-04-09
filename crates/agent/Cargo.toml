@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aura-core = { workspace = true }
+aura-model = { workspace = true }
+aura-registry = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
 aura-memory = { workspace = true }

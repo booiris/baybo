@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "telegram")]
 use async_trait::async_trait;
 #[cfg(feature = "telegram")]
-use aura_core::{
-    ChannelType, ContentBlock, IncomingMessage, Message, MessageMetadata, OutgoingMessage, User,
-};
+use aura_model::{BlobRef, ContentBlock, MessageMetadata};
+#[cfg(feature = "telegram")]
+use aura_session::{ChannelType, User};
 #[cfg(feature = "telegram")]
 use teloxide::net::Download;
 #[cfg(feature = "telegram")]
@@ -19,7 +19,7 @@ use teloxide::types::{FileId, InputFile};
 use tokio::sync::mpsc;
 
 #[cfg(feature = "telegram")]
-use crate::ChannelAdapter;
+use crate::{ChannelAdapter, ChannelError, IncomingMessage, Message, OutgoingMessage, Result};
 
 /// Telegram channel adapter backed by `teloxide` with long polling.
 #[cfg(feature = "telegram")]
@@ -166,13 +166,13 @@ impl TelegramChannel {
     async fn download_file(
         bot: &Bot,
         file_id: &FileId,
-    ) -> Result<(aura_core::BlobRef, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> std::result::Result<(BlobRef, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
         let file = bot.get_file(file_id.clone()).await?;
         let mut data = Vec::new();
         bot.download_file(&file.path, &mut data).await?;
 
         Ok((
-            aura_core::BlobRef {
+            BlobRef {
                 blob_id: file_id.0.clone(),
             },
             data,
@@ -187,7 +187,7 @@ impl ChannelAdapter for TelegramChannel {
         ChannelType::Telegram
     }
 
-    async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> aura_core::Result<()> {
+    async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
         let bot = Bot::new(&self.bot_token);
         let shutdown = Arc::clone(&self.shutdown);
         let chat_ids = Arc::clone(&self.chat_ids);
@@ -229,14 +229,14 @@ impl ChannelAdapter for TelegramChannel {
         Ok(())
     }
 
-    async fn send_response(&self, response: OutgoingMessage) -> aura_core::Result<()> {
+    async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
         let chat_id = {
             let map = self.chat_ids.read().await;
             map.get(&response.session_id).copied()
         };
 
         let chat_id = chat_id.ok_or_else(|| {
-            aura_core::AuraError::NotFound(format!(
+            ChannelError::Send(format!(
                 "no chat_id mapped for session {}",
                 response.session_id
             ))
@@ -248,34 +248,28 @@ impl ChannelAdapter for TelegramChannel {
             match block {
                 ContentBlock::Text(text) => {
                     bot.send_message(chat_id, text).await.map_err(|e| {
-                        aura_core::AuraError::Config(format!("telegram send_message failed: {e}"))
+                        ChannelError::Send(format!("telegram send_message failed: {e}"))
                     })?;
                 }
                 ContentBlock::Image { blob, mime_type: _ } => {
-                    // Use blob_id as the file-id / URL. Full blob resolution
-                    // would require integration with a storage layer.
                     bot.send_photo(
                         chat_id,
                         InputFile::url(blob.blob_id.parse().map_err(|e: url::ParseError| {
-                            aura_core::AuraError::Config(format!("invalid image url: {e}"))
+                            ChannelError::Send(format!("invalid image url: {e}"))
                         })?),
                     )
                     .await
-                    .map_err(|e| {
-                        aura_core::AuraError::Config(format!("telegram send_photo failed: {e}"))
-                    })?;
+                    .map_err(|e| ChannelError::Send(format!("telegram send_photo failed: {e}")))?;
                 }
                 ContentBlock::Audio { blob, mime_type: _ } => {
                     bot.send_audio(
                         chat_id,
                         InputFile::url(blob.blob_id.parse().map_err(|e: url::ParseError| {
-                            aura_core::AuraError::Config(format!("invalid audio url: {e}"))
+                            ChannelError::Send(format!("invalid audio url: {e}"))
                         })?),
                     )
                     .await
-                    .map_err(|e| {
-                        aura_core::AuraError::Config(format!("telegram send_audio failed: {e}"))
-                    })?;
+                    .map_err(|e| ChannelError::Send(format!("telegram send_audio failed: {e}")))?;
                 }
                 ContentBlock::File {
                     blob,
@@ -284,12 +278,12 @@ impl ChannelAdapter for TelegramChannel {
                 } => {
                     let input =
                         InputFile::url(blob.blob_id.parse().map_err(|e: url::ParseError| {
-                            aura_core::AuraError::Config(format!("invalid file url: {e}"))
+                            ChannelError::Send(format!("invalid file url: {e}"))
                         })?)
                         .file_name(filename.clone());
 
                     bot.send_document(chat_id, input).await.map_err(|e| {
-                        aura_core::AuraError::Config(format!("telegram send_document failed: {e}"))
+                        ChannelError::Send(format!("telegram send_document failed: {e}"))
                     })?;
                 }
             }
@@ -298,7 +292,7 @@ impl ChannelAdapter for TelegramChannel {
         Ok(())
     }
 
-    async fn stop(&self) -> aura_core::Result<()> {
+    async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
         tracing::info!("telegram channel stop requested");
         Ok(())

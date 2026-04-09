@@ -1,9 +1,12 @@
 pub mod crypto;
+pub mod error;
 pub mod gateway;
 pub mod leak_detector;
 pub mod vault;
 
-use aura_core::Result;
+pub use error::SecurityError;
+
+pub type Result<T> = std::result::Result<T, SecurityError>;
 
 // Re-exports for convenient access.
 pub use crate::crypto::EncryptionKey;
@@ -18,14 +21,14 @@ pub use crate::vault::{SecretValue, SecretVault};
 #[async_trait::async_trait]
 pub trait SecretStore: Send + Sync {
     /// Persist an encrypted secret under the given name.
-    async fn store(&self, name: &str, encrypted_value: &[u8]) -> Result<()>;
+    async fn store(&self, name: &str, encrypted_value: &[u8]) -> crate::Result<()>;
 
     /// Retrieve the encrypted bytes for a secret, or `None` if not found.
-    async fn retrieve(&self, name: &str) -> Result<Option<Vec<u8>>>;
+    async fn retrieve(&self, name: &str) -> crate::Result<Option<Vec<u8>>>;
 
     /// Delete a secret by name.
-    async fn delete(&self, name: &str) -> Result<()>;
+    async fn delete(&self, name: &str) -> crate::Result<()>;
 
     /// List all stored secret names.
-    async fn list(&self) -> Result<Vec<String>>;
+    async fn list(&self) -> crate::Result<Vec<String>>;
 }

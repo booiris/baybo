@@ -1,4 +1,7 @@
-use aura_core::TrustLevel;
+mod governance;
+
+pub use governance::{ArtifactSource, TrustLevel};
+
 use serde::{Deserialize, Serialize};
 
 /// Manifest describing an extension artifact for installation.

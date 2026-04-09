@@ -4,8 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use aura_core::Result;
-use aura_trace::{SessionTrace, TraceFilter, TraceNode, TraceNodeId, TraceStore};
+use aura_trace::{Result, SessionTrace, TraceFilter, TraceNode, TraceNodeId, TraceStore};
 
 /// In-memory implementation of [`TraceStore`].
 pub struct InMemoryTraceStore {

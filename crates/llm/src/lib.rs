@@ -1,3 +1,4 @@
+mod error;
 pub mod multimodal;
 mod providers;
 pub mod registry;
@@ -7,8 +8,11 @@ pub mod tool_call_extractor;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+pub use crate::error::LlmError;
 pub use crate::registry::{LlmProviderConfig, LlmProviderRegistry};
 pub use crate::tool_call_extractor::JsonExtractor;
+
+pub type Result<T> = std::result::Result<T, LlmError>;
 
 /// Metadata describing a model's capabilities and pricing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +36,7 @@ pub struct ModelPricing {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub content: String,
-    pub content_blocks: Vec<aura_core::ContentBlock>,
+    pub content_blocks: Vec<aura_model::ContentBlock>,
     pub tool_calls: Vec<ToolCallInfo>,
     pub usage: TokenUsage,
     pub thinking: Option<String>,
@@ -56,7 +60,7 @@ pub struct TokenUsage {
 /// A chat request to be sent to an LLM provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
-    pub messages: Vec<aura_core::ChatMessage>,
+    pub messages: Vec<aura_model::ChatMessage>,
     pub temperature: Option<f32>,
     pub tools: Vec<ToolDefinitionForLlm>,
 }
@@ -105,7 +109,7 @@ impl LlmClient {
     }
 
     /// Sends a chat request to the provider and returns a unified response.
-    pub async fn chat(&self, request: &ChatRequest) -> aura_core::Result<LlmResponse> {
+    pub async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {
         let body = self.build_provider_request_body(request);
         let provider = self.model_info.provider.as_str();
 
@@ -135,7 +139,7 @@ impl LlmClient {
         &self,
         provider: &str,
         body: &serde_json::Value,
-    ) -> aura_core::Result<serde_json::Value> {
+    ) -> crate::Result<serde_json::Value> {
         let (url, mut req_builder) = match provider {
             "anthropic" => {
                 let url = format!("{}/v1/messages", self.base_url);
@@ -169,24 +173,25 @@ impl LlmClient {
 
         req_builder = req_builder.json(body);
 
-        let resp = req_builder.send().await.map_err(|e| {
-            aura_core::AuraError::Internal(anyhow::anyhow!("HTTP request to {url} failed: {e}"))
-        })?;
+        let resp = req_builder
+            .send()
+            .await
+            .map_err(|e| LlmError::Provider(format!("HTTP request to {url} failed: {e}")))?;
 
         let status = resp.status();
-        let resp_body = resp.text().await.map_err(|e| {
-            aura_core::AuraError::Internal(anyhow::anyhow!("failed to read response body: {e}"))
-        })?;
+        let resp_body = resp
+            .text()
+            .await
+            .map_err(|e| LlmError::Provider(format!("failed to read response body: {e}")))?;
 
         if !status.is_success() {
-            return Err(aura_core::AuraError::Internal(anyhow::anyhow!(
+            return Err(LlmError::Provider(format!(
                 "LLM API returned {status}: {resp_body}"
             )));
         }
 
-        serde_json::from_str(&resp_body).map_err(|e| {
-            aura_core::AuraError::Internal(anyhow::anyhow!("failed to parse response JSON: {e}"))
-        })
+        serde_json::from_str(&resp_body)
+            .map_err(|e| LlmError::ParseError(format!("failed to parse response JSON: {e}")))
     }
 
     /// Parse an OpenAI-format response.
@@ -194,7 +199,7 @@ impl LlmClient {
         &self,
         json: &serde_json::Value,
         _request: &ChatRequest,
-    ) -> aura_core::Result<LlmResponse> {
+    ) -> crate::Result<LlmResponse> {
         let choice = json
             .get("choices")
             .and_then(|c| c.get(0))
@@ -209,7 +214,7 @@ impl LlmClient {
         let content_blocks = if content.is_empty() {
             vec![]
         } else {
-            vec![aura_core::ContentBlock::Text(content.clone())]
+            vec![aura_model::ContentBlock::Text(content.clone())]
         };
 
         // Extract tool calls
@@ -268,7 +273,7 @@ impl LlmClient {
         &self,
         json: &serde_json::Value,
         _request: &ChatRequest,
-    ) -> aura_core::Result<LlmResponse> {
+    ) -> crate::Result<LlmResponse> {
         let mut content = String::new();
         let mut content_blocks = Vec::new();
         let mut tool_calls = Vec::new();
@@ -287,7 +292,7 @@ impl LlmClient {
                             content.push('\n');
                         }
                         content.push_str(text);
-                        content_blocks.push(aura_core::ContentBlock::Text(text.to_string()));
+                        content_blocks.push(aura_model::ContentBlock::Text(text.to_string()));
                     }
                     "tool_use" => {
                         let id = block
@@ -336,7 +341,7 @@ impl LlmClient {
         &self,
         json: &serde_json::Value,
         _request: &ChatRequest,
-    ) -> aura_core::Result<LlmResponse> {
+    ) -> crate::Result<LlmResponse> {
         let content = json
             .get("message")
             .and_then(|m| m.get("content"))
@@ -347,7 +352,7 @@ impl LlmClient {
         let content_blocks = if content.is_empty() {
             vec![]
         } else {
-            vec![aura_core::ContentBlock::Text(content.clone())]
+            vec![aura_model::ContentBlock::Text(content.clone())]
         };
 
         // Ollama doesn't natively support tool calls; use prompt-guided extraction
@@ -420,10 +425,10 @@ impl LlmClient {
             .iter()
             .map(|msg| {
                 let role_str = match msg.role {
-                    aura_core::Role::System => "system",
-                    aura_core::Role::User => "user",
-                    aura_core::Role::Assistant => "assistant",
-                    aura_core::Role::Tool => "tool",
+                    aura_model::Role::System => "system",
+                    aura_model::Role::User => "user",
+                    aura_model::Role::Assistant => "assistant",
+                    aura_model::Role::Tool => "tool",
                 };
                 let content = serde_json::to_value(multimodal::to_openai_content(&msg.content))
                     .unwrap_or_default();
@@ -454,7 +459,7 @@ impl LlmClient {
             .messages
             .iter()
             .filter_map(|msg| {
-                if msg.role == aura_core::Role::System {
+                if msg.role == aura_model::Role::System {
                     let text = multimodal::extract_text(&msg.content);
                     if !system_prompt.is_empty() {
                         system_prompt.push('\n');
@@ -463,10 +468,10 @@ impl LlmClient {
                     return None;
                 }
                 let role_str = match msg.role {
-                    aura_core::Role::User => "user",
-                    aura_core::Role::Assistant => "assistant",
-                    aura_core::Role::Tool => "user", // Anthropic maps tool results as user
-                    aura_core::Role::System => unreachable!(),
+                    aura_model::Role::User => "user",
+                    aura_model::Role::Assistant => "assistant",
+                    aura_model::Role::Tool => "user", // Anthropic maps tool results as user
+                    aura_model::Role::System => unreachable!(),
                 };
                 let content = serde_json::to_value(multimodal::to_anthropic_content(&msg.content))
                     .unwrap_or_default();
@@ -513,14 +518,15 @@ impl LlmClient {
             .enumerate()
             .map(|(i, msg)| {
                 let role_str = match msg.role {
-                    aura_core::Role::System => "system",
-                    aura_core::Role::User => "user",
-                    aura_core::Role::Assistant => "assistant",
-                    aura_core::Role::Tool => "user",
+                    aura_model::Role::System => "system",
+                    aura_model::Role::User => "user",
+                    aura_model::Role::Assistant => "assistant",
+                    aura_model::Role::Tool => "user",
                 };
                 let mut text = multimodal::extract_text(&msg.content);
                 // Append tool schema to first system message
-                if i == 0 && msg.role == aura_core::Role::System && !tool_schema_prompt.is_empty() {
+                if i == 0 && msg.role == aura_model::Role::System && !tool_schema_prompt.is_empty()
+                {
                     text.push_str("\n\n");
                     text.push_str(&tool_schema_prompt);
                 }

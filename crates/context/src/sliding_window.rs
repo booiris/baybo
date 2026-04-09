@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use aura_core::{ChatMessage, Role, Session};
+use aura_model::{ChatMessage, Role};
+use aura_session::Session;
 
 use crate::{CompressResult, ContextManager, ContextSnapshot, Tokenizer};
 
@@ -45,7 +46,7 @@ impl ContextManager for SlidingWindowContext {
         session: &mut Session,
         role: Role,
         msg: &ChatMessage,
-    ) -> aura_core::Result<()> {
+    ) -> crate::Result<()> {
         let appended = ChatMessage {
             role,
             content: msg.content.clone(),
@@ -54,7 +55,7 @@ impl ContextManager for SlidingWindowContext {
         Ok(())
     }
 
-    async fn maybe_compress(&self, session: &mut Session) -> aura_core::Result<CompressResult> {
+    async fn maybe_compress(&self, session: &mut Session) -> crate::Result<CompressResult> {
         let start = Instant::now();
         let before_tokens = self.count_tokens(&session.messages)?;
 
@@ -90,7 +91,7 @@ impl ContextManager for SlidingWindowContext {
         })
     }
 
-    fn count_tokens(&self, messages: &[ChatMessage]) -> aura_core::Result<usize> {
+    fn count_tokens(&self, messages: &[ChatMessage]) -> crate::Result<usize> {
         let total = messages
             .iter()
             .map(|m| self.tokenizer.count_message(m))
@@ -111,7 +112,7 @@ impl ContextManager for SlidingWindowContext {
         &self,
         session: &mut Session,
         snapshot: &ContextSnapshot,
-    ) -> aura_core::Result<()> {
+    ) -> crate::Result<()> {
         session.messages = snapshot.messages.clone();
         Ok(())
     }
@@ -120,7 +121,7 @@ impl ContextManager for SlidingWindowContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_core::ContentBlock;
+    use aura_model::ContentBlock;
 
     struct SimpleTokenizer;
 
@@ -157,12 +158,12 @@ mod tests {
     fn make_session(messages: Vec<ChatMessage>) -> Session {
         Session {
             id: "test-session".to_string(),
-            user: aura_core::User {
+            user: aura_session::User {
                 id: "user-1".to_string(),
                 name: None,
-                channel: aura_core::ChannelType::Cli,
+                channel: aura_session::ChannelType::Cli,
             },
-            channel: aura_core::ChannelType::Cli,
+            channel: aura_session::ChannelType::Cli,
             messages,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),

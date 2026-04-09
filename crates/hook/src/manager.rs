@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use aura_core::Result;
+use crate::Result;
 use tracing::{debug, warn};
 
 use crate::{Hook, HookAction, HookContext, HookPoint};
@@ -199,9 +199,7 @@ mod tests {
             self.is_critical
         }
         async fn execute(&self, _ctx: &mut HookContext) -> Result<HookAction> {
-            Err(aura_core::AuraError::Internal(anyhow::anyhow!(
-                "hook failed"
-            )))
+            Err(crate::HookError::Execution("hook failed".into()))
         }
     }
 

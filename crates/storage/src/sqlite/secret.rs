@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use aura_core::AuraError;
 use aura_security::SecretStore;
+use aura_security::SecurityError;
 
 use super::SqlitePool;
 
@@ -16,7 +16,7 @@ impl SqliteSecretStore {
 
 #[async_trait]
 impl SecretStore for SqliteSecretStore {
-    async fn store(&self, name: &str, encrypted_value: &[u8]) -> aura_core::Result<()> {
+    async fn store(&self, name: &str, encrypted_value: &[u8]) -> aura_security::Result<()> {
         let pool = self.pool.clone();
         let name = name.to_string();
         let value = encrypted_value.to_vec();
@@ -26,32 +26,32 @@ impl SecretStore for SqliteSecretStore {
                 "INSERT OR REPLACE INTO secrets (name, encrypted_value) VALUES (?1, ?2)",
                 rusqlite::params![name, value],
             )
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite insert error: {e}")))?;
+            .map_err(|e| SecurityError::Internal(anyhow::anyhow!("sqlite insert error: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| SecurityError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn retrieve(&self, name: &str) -> aura_core::Result<Option<Vec<u8>>> {
+    async fn retrieve(&self, name: &str) -> aura_security::Result<Option<Vec<u8>>> {
         let pool = self.pool.clone();
         let name = name.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT encrypted_value FROM secrets WHERE name = ?1")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| SecurityError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let result: Option<Vec<u8>> = stmt
                 .query_row(rusqlite::params![name], |row| row.get(0))
                 .optional()
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| SecurityError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             Ok(result)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| SecurityError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn delete(&self, name: &str) -> aura_core::Result<()> {
+    async fn delete(&self, name: &str) -> aura_security::Result<()> {
         let pool = self.pool.clone();
         let name = name.to_string();
         tokio::task::spawn_blocking(move || {
@@ -60,33 +60,33 @@ impl SecretStore for SqliteSecretStore {
                 "DELETE FROM secrets WHERE name = ?1",
                 rusqlite::params![name],
             )
-            .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite delete error: {e}")))?;
+            .map_err(|e| SecurityError::Internal(anyhow::anyhow!("sqlite delete error: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| SecurityError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 
-    async fn list(&self) -> aura_core::Result<Vec<String>> {
+    async fn list(&self) -> aura_security::Result<Vec<String>> {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
             let conn = pool.lock()?;
             let mut stmt = conn
                 .prepare("SELECT name FROM secrets")
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| SecurityError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
+                .map_err(|e| SecurityError::Internal(anyhow::anyhow!("sqlite query error: {e}")))?;
             let mut names = Vec::new();
             for row in rows {
-                names.push(
-                    row.map_err(|e| AuraError::Internal(anyhow::anyhow!("sqlite row error: {e}")))?,
-                );
+                names.push(row.map_err(|e| {
+                    SecurityError::Internal(anyhow::anyhow!("sqlite row error: {e}"))
+                })?);
             }
             Ok(names)
         })
         .await
-        .map_err(|e| AuraError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        .map_err(|e| SecurityError::Internal(anyhow::anyhow!("spawn_blocking join error: {e}")))?
     }
 }
 

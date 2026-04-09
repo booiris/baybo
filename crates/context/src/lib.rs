@@ -1,9 +1,14 @@
+pub mod error;
 pub mod sliding_window;
+
+pub use error::ContextError;
+pub type Result<T> = std::result::Result<T, ContextError>;
 
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_core::{ChatMessage, Role, Session};
+use aura_model::{ChatMessage, Role};
+use aura_session::Session;
 use serde::{Deserialize, Serialize};
 
 /// Trait for counting tokens in text and multimodal content.
@@ -31,23 +36,20 @@ pub trait ContextManager: Send + Sync {
         session: &mut Session,
         role: Role,
         msg: &ChatMessage,
-    ) -> aura_core::Result<()>;
+    ) -> crate::Result<()>;
 
     /// Check whether compression is needed and perform it if so.
-    async fn maybe_compress(&self, session: &mut Session) -> aura_core::Result<CompressResult>;
+    async fn maybe_compress(&self, session: &mut Session) -> crate::Result<CompressResult>;
 
     /// Count the total tokens across a slice of messages.
-    fn count_tokens(&self, messages: &[ChatMessage]) -> aura_core::Result<usize>;
+    fn count_tokens(&self, messages: &[ChatMessage]) -> crate::Result<usize>;
 
     /// Create a snapshot of the current session context.
     fn snapshot(&self, session: &Session) -> ContextSnapshot;
 
     /// Restore the session context from a previously captured snapshot.
-    fn restore_state(
-        &self,
-        session: &mut Session,
-        snapshot: &ContextSnapshot,
-    ) -> aura_core::Result<()>;
+    fn restore_state(&self, session: &mut Session, snapshot: &ContextSnapshot)
+    -> crate::Result<()>;
 }
 
 /// Result of a compression attempt.

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use aura_context::ContextSnapshot;
-use aura_core::OperationKind;
 use aura_cost::{CostRecord, CostTracker};
 use aura_job::JobManager;
+use aura_job::OperationKind;
 use aura_trace::{
     ExecutionProvenance, SpanHandle, SpanInput, SpanResult, TraceCollector, TraceNodeId,
 };
@@ -48,7 +48,7 @@ impl ObservabilityRecorder {
         parent_job: Option<&str>,
         provenance: ExecutionProvenance,
         input: SpanInput,
-    ) -> aura_core::Result<OperationHandle> {
+    ) -> anyhow::Result<OperationHandle> {
         let job = self
             .job_manager
             .create_job(session_id, kind.clone(), parent_job)
@@ -72,7 +72,7 @@ impl ObservabilityRecorder {
         handle: OperationHandle,
         output: serde_json::Value,
         result: SpanResult,
-    ) -> aura_core::Result<()> {
+    ) -> anyhow::Result<()> {
         {
             let mut collector = self.trace_collector.lock().await;
             collector.end_span(handle.span_handle, result);
@@ -84,7 +84,7 @@ impl ObservabilityRecorder {
     }
 
     /// Record a failure.
-    pub async fn fail(&self, handle: OperationHandle, error: &str) -> aura_core::Result<()> {
+    pub async fn fail(&self, handle: OperationHandle, error: &str) -> anyhow::Result<()> {
         {
             let mut collector = self.trace_collector.lock().await;
             collector.end_span(
@@ -128,9 +128,9 @@ impl ObservabilityRecorder {
     }
 
     /// Flush trace data to the store.
-    pub async fn flush(&self) -> aura_core::Result<()> {
+    pub async fn flush(&self) -> anyhow::Result<()> {
         let collector = self.trace_collector.lock().await;
-        collector.flush().await
+        Ok(collector.flush().await?)
     }
 
     /// Check whether the auto-snapshot policy says a snapshot should be taken now.
@@ -151,8 +151,8 @@ impl ObservabilityRecorder {
         &self,
         node_id: &TraceNodeId,
         snapshot: ContextSnapshot,
-    ) -> aura_core::Result<()> {
+    ) -> anyhow::Result<()> {
         let mut collector = self.trace_collector.lock().await;
-        collector.attach_snapshot(node_id, snapshot)
+        Ok(collector.attach_snapshot(node_id, snapshot)?)
     }
 }
