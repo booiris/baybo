@@ -1,356 +1,50 @@
-# llm - LLM Client Layer (Based on rig)
+# llm - LLM Client Layer
 
-## 1. Module Overview
+## Overview
 
-The `llm` crate is Aura's infrastructure layer for large language model calls. Its core responsibilities are:
+The `llm` crate is Aura's infrastructure layer for LLM calls, wrapping the **rig** framework into a unified `LlmClient` interface.
 
-- **Wrap the rig framework**: encapsulate rig's underlying APIs such as `rig::completion::Chat` and the Agent builder into Aura's unified `LlmClient` interface, hiding provider differences
-- **Provide a unified invocation interface**: upper layers such as `agent::AgentLoop` only call `LlmClient::chat()` without caring whether the backend is OpenAI, Anthropic, or Ollama
-- **Enable registry-style extension**: keep provider construction behind `LlmProviderRegistry`, with built-in providers registered by the crate itself so the external API does not need to expose an extra factory trait
-- **Support dual-mode response parsing**: support both native function calling (`NativeFunctionCalling`) and prompt-guided JSON extraction (`PromptGuided`) so that local models without native function calling can still participate in tool use
+Core responsibilities:
 
-**Design constraint**: this crate is pure infrastructure. It contains no business logic and does not depend on business crates such as `security`, `tools`, or `skills`.
+- Provide a unified invocation interface — upper layers call `LlmClient::chat()` without caring about the backend provider
+- Hide provider differences behind registry-style extension via `LlmProviderRegistry`
+- Support dual-mode response parsing: native function calling and prompt-guided JSON extraction (for local models without tool-use support)
 
----
+**Design constraint**: this crate is pure infrastructure with no business logic. It does not depend on `security`, `tools`, or `skills`.
 
-## 2. Dependencies
+## Design Decisions
 
-### 2.1 Internal Dependencies
+### Dual response parsing modes
 
-| Dependency Crate | Usage |
-|-----------|---------|
-| `core` | `Message`, `OperationKind::LlmCall`, `AuraError` |
+- **NativeFunctionCalling**: for providers with built-in tool support (OpenAI, Anthropic). Tool definitions are included in the request; structured tool calls are extracted from the response.
+- **PromptGuided**: for models without native function calling (e.g. Ollama). Tool schemas are appended to the system prompt, and a `JsonExtractor` pulls tool-call JSON from free text. If extraction fails, the response is treated as plain text.
 
-The `llm` crate sits near the bottom of the dependency tree, alongside `channels`, `tools`, `skills`, and `memory`, and depends only on `core`.
+### Provider registry pattern
 
-### 2.2 External Dependencies
+`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI, Anthropic, Ollama) are registered by the crate itself. New providers are added by implementing a factory and registering it — no external factory trait needed.
 
-| Dependency | Purpose |
-|------|------|
-| `rig` | Core dependency providing `rig::completion::Chat`, provider clients such as OpenAI and Anthropic, and the Agent builder |
-| `serde` / `serde_json` | Config deserialization, JSON schema handling, and response parsing |
-| `anyhow` | Error propagation |
-| `async-trait` | Async trait support |
+### rig integration
 
-### 2.3 Dependency Direction Diagram
+`LlmClient` internally holds `Box<dyn rig::completion::Chat>`, using dynamic dispatch to uniformly call different providers. A `rig_adapter` module converts Aura's tool-definition schema into rig's format without depending on the `tools` crate.
 
-```text
-core
-  │
-  ▼
-llm ───► rig
-  │
-  ▼
-cost   (consumes TokenUsage)
-```
+### Observability constraints
 
-Note: `llm` does not depend on `cost`; instead, `cost` consumes `TokenUsage` produced by `llm`, and `agent` assembles the two.
+`LlmResponse` may carry provider reasoning/thinking, but upper layers decide whether it is recorded. Trace records only `output_preview`, token usage, and `reasoning_redacted` — full reasoning is not persisted by default in production.
 
----
+### Error handling
 
-## 3. Public Interfaces
+Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Job monitoring can mark long-running calls as `Stuck`.
 
-### 3.1 LlmClient
+## Constraints
 
-`LlmClient` is the main outward-facing type of this crate. It wraps one rig model instance together with its metadata.
+- Depends only on `core` (plus `rig`, `serde`, `async-trait`)
+- Does not depend on `cost` — instead, `cost` consumes `TokenUsage` produced by `llm`, assembled by `agent`
+- API keys should use environment-variable placeholders and must not be stored directly in config files
 
-```rust
-pub struct LlmClient {
-    model: Box<dyn rig::completion::Chat>,
-    model_info: ModelInfo,
-    parse_mode: ResponseParseMode,
-}
-```
+## Collaboration
 
-Core methods:
-
-| Method | Signature | Description |
-|------|------|------|
-| `chat` | `async fn chat(&self, request: &ChatRequest) -> Result<LlmResponse>` | Sends a chat request and returns a unified response structure. Internally, request construction and response parsing depend on `parse_mode` |
-| `model_id` | `fn model_id(&self) -> &str` | Returns the model identifier such as `"claude-sonnet-4-6"` or `"gpt-4o"` |
-| `model_info` | `fn model_info(&self) -> &ModelInfo` | Returns full model metadata |
-
-Construction:
-
-`LlmClient` is created through `LlmProviderRegistry::create_client()` rather than directly by users.
-
-- `new(model, model_info)`: for models with native function calling support, using `NativeFunctionCalling`
-- `new_prompt_guided(model, model_info, tool_schema_prompt, json_extractor)`: for models without native function calling, using `PromptGuided`
-
-### 3.2 LlmProviderRegistry
-
-```rust
-pub struct LlmProviderRegistry {
-    factories: HashMap<String, _>,
-}
-
-impl LlmProviderRegistry {
-    pub fn new() -> Self { ... }
-    pub fn with_default_providers() -> Self { ... }
-
-    pub fn create_client(&self, config: &LlmProviderConfig) -> Result<LlmClient> {
-        self.factories
-            .get(&config.provider)
-            .ok_or_else(|| anyhow!("Unknown provider: {}", config.provider))?(config)
-    }
-}
-```
-
-Initialization flow:
-
-```text
-LlmProviderRegistry::with_default_providers()
-    │
-    ▼
-registry.create_client(&config)
-```
-
-### 3.4 Data Types
-
-#### ModelInfo
-
-```rust
-pub struct ModelInfo {
-    pub id: String,
-    pub provider: String,
-    pub context_window: usize,
-    pub supports_tools: bool,
-    pub supports_vision: bool,
-    pub pricing: ModelPricing,
-}
-```
-
-#### ModelPricing
-
-```rust
-pub struct ModelPricing {
-    pub input_per_1m_tokens: f64,
-    pub output_per_1m_tokens: f64,
-}
-```
-
-`CostTracker` uses `ModelPricing` together with `TokenUsage` to calculate per-call cost.
-
-#### LlmResponse
-
-```rust
-pub struct LlmResponse {
-    pub content: String,
-    pub tool_calls: Vec<ToolCallInfo>,
-    pub usage: TokenUsage,
-    pub thinking: Option<String>,
-}
-```
-
-`AgentLoop` decides based on whether `tool_calls` is empty:
-
-- Empty: treat as final text reply
-- Non-empty: enter the tool-execution branch
-
-#### TokenUsage
-
-```rust
-pub struct TokenUsage {
-    pub input_tokens: usize,
-    pub output_tokens: usize,
-}
-```
-
-#### ResponseParseMode
-
-```rust
-pub enum ResponseParseMode {
-    NativeFunctionCalling,
-    PromptGuided {
-        tool_schema_prompt: String,
-        json_extractor: JsonExtractor,
-    },
-}
-```
-
-#### ChatRequest
-
-`ChatRequest` is built by `AgentLoop::build_request()` and passed into `LlmClient::chat()`. It includes:
-
-- `messages: Vec<ChatMessage>`: the current conversation context after ContextManager compression
-- `temperature: Option<f32>`
-- tool definitions in native function-calling mode
-
----
-
-## 4. Implementation Details
-
-### 4.1 rig Integration
-
-`LlmClient` internally holds `Box<dyn rig::completion::Chat>`, using dynamic dispatch to uniformly call different providers.
-
-```text
-LlmClient::chat(&ChatRequest)
-    │
-    ├── NativeFunctionCalling
-    │   ├── convert ChatRequest to rig request
-    │   ├── convert tool definitions through rig_adapter
-    │   ├── call model.chat(...).await
-    │   └── extract content + tool_calls + usage
-    │
-    └── PromptGuided
-        ├── append tool schema prompt to the system prompt
-        ├── call model.chat(...).await without tools
-        └── extract tool_calls from free text via JsonExtractor
-```
-
-`rig_adapter.rs` converts Aura's tool-definition schema into the format expected by rig without directly depending on the `tools` crate.
-
-### 4.2 Provider Implementations
-
-#### OpenAIProviderFactory
-
-- `provider_name`: `"openai"`
-- Reads API key from `LlmProviderConfig.api_key`
-- Supports `base_url` override for OpenAI-compatible endpoints
-- Uses `NativeFunctionCalling`
-- Fills `ModelInfo` with context window, tool support, vision support, and pricing
-
-#### AnthropicProviderFactory
-
-- `provider_name`: `"anthropic"`
-- Handles Claude-specific output such as `thinking`
-- Adapts Anthropic's tool-use response format
-- Uses `NativeFunctionCalling`
-
-#### OllamaProviderFactory
-
-- `provider_name`: `"ollama"`
-- Connects to the local Ollama instance through `config.base_url`, defaulting to `http://localhost:11434`
-- Does not require an API key
-- Uses `PromptGuided`
-- Sets `supports_tools: false` in `ModelInfo`
-
-### 4.3 ResponseParseMode
-
-#### NativeFunctionCalling
-
-For models that natively support function calling, such as OpenAI and Anthropic:
-
-1. Convert Aura tool definitions to rig tool definitions
-2. Include tools in the rig request
-3. Map structured tool calls directly into `Vec<ToolCallInfo>`
-
-#### PromptGuided
-
-For models without native function calling, such as many Ollama models:
-
-1. Append `tool_schema_prompt` to the system prompt
-2. Instruct the model to emit structured JSON when it needs a tool
-3. Receive free-form text
-4. Use `JsonExtractor` to pull out tool-call JSON
-
-If extraction fails, treat the response as plain text and leave `tool_calls` empty.
-
-#### JsonExtractor Strategy
-
-`JsonExtractor` should support:
-
-1. Tag-based extraction, such as `<tool_call>...</tool_call>`
-2. Detection of likely JSON blocks in free text
-3. Tolerance for common formatting issues, such as trailing commas
-
-### 4.4 Observability Constraints
-
-The `llm` module may expose provider reasoning or thinking through `LlmResponse.thinking`, but upper layers decide whether it is recorded. The architecture requires:
-
-- `thinking` may exist in memory
-- `trace::SpanResult::LLMResponse` records only `output_preview`, token usage, and `reasoning_redacted`
-- Full reasoning is not persisted by default in production
-
-### 4.5 Error Handling
-
-Possible error classes returned by `LlmClient::chat()` include:
-
-- Network failures
-- Authentication failures
-- Unknown or unavailable models
-- Request over context-window limits
-- Response parsing failures
-
-All errors are propagated through `anyhow::Error` and handled uniformly by the upper-layer `ErrorHandler`.
-
-Rate-limit retries are not implemented in `llm` itself. They are handled by `AgentLoop` through retry logic in `ErrorHandler`.
-
-Timeout handling:
-
-- The underlying HTTP client can be configured with request-level timeouts
-- Upper-layer Job monitoring can mark a long-running `LlmCall` as `Stuck`
-
----
-
-## 5. File Structure
-
-```text
-crates/llm/src/
-├── lib.rs
-├── registry.rs
-├── providers/
-│   ├── openai.rs
-│   ├── anthropic.rs
-│   └── ollama.rs
-├── rig_adapter.rs
-└── tool_call_extractor.rs
-```
-
----
-
-## 6. Configuration
-
-Example `llm` section in the Aura config:
-
-```json
-{
-  "llm": {
-    "providers": {
-      "claude": {
-        "provider": "anthropic",
-        "api_key": "${CLAUDE_API_KEY}",
-        "model": "claude-sonnet-4-6"
-      },
-      "openai": {
-        "provider": "openai",
-        "api_key": "${OPENAI_API_KEY}",
-        "base_url": "https://api.openai.com/v1",
-        "model": "gpt-4o"
-      },
-      "ollama": {
-        "provider": "ollama",
-        "base_url": "http://localhost:11434",
-        "model": "llama3"
-      }
-    }
-  }
-}
-```
-
-Field notes:
-
-| Field | Type | Required | Description |
-|------|------|------|------|
-| `providers` | `Map<String, LlmProviderConfig>` | Yes | Keys are user-defined names, values are provider configs |
-| `provider` | `String` | Yes | Must match `LlmProviderFactory::provider_name()` |
-| `api_key` | `String` | Provider-specific | Supports `${ENV_VAR}` placeholders; may be omitted for Ollama |
-| `base_url` | `String` | No | Custom API endpoint |
-| `model` | `String` | Yes | Model ID |
-
-Security note: API keys should use environment-variable placeholders and must not be stored directly in config files.
-
----
-
-## 7. Extension Guide
-
-To add a new provider:
-
-1. Implement `LlmProviderFactory`
-2. Decide the correct `ResponseParseMode`
-3. Fill out accurate `ModelInfo`, especially `context_window`
-4. Handle the provider's authentication model
-5. Adapt special response formats if necessary
-6. Register it in `LlmProviderRegistry`
-7. Add config examples and integration tests
+| Module | Role |
+|--------|------|
+| `agent` | `AgentLoop` calls `LlmClient::chat()` and handles retries |
+| `cost` | Consumes `TokenUsage` and `ModelPricing` to calculate per-call cost |
+| `context` | Provides compressed message history for `ChatRequest` |

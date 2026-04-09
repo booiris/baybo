@@ -1,129 +1,44 @@
 # registry - Extension Registry and Installation Governance
 
-## 1. Module Overview
+## Overview
 
-The `registry` crate is responsible for discovery, download, verification, installation, and upgrade of Skill and Tool extensions. It does not execute extensions. Its role is to turn an "external artifact" into a "governable artifact."
+The `registry` crate discovers, downloads, verifies, installs, and upgrades Skill and Tool extensions. It does not execute extensions — its role is to turn an "external artifact" into a "governable artifact."
 
 Core responsibilities:
 
 - Maintain the registry index
-- Download and verify extension artifacts
+- Download and verify extension artifacts (hash + optional signature)
 - Record source, version, hash, signature, and trust level
 - Install artifacts into a local directory for `tools` and `skills` to consume
 
----
+## Design Decisions
 
-## 2. Dependencies
+### Governance entry point
 
-### 2.1 Internal Dependencies
+Installation flow: catalog index → `ExtensionManifest` → download → hash/signature verify → install to `install_root` → consumed by tools and skills.
 
-| Dependency Crate | Purpose |
-|-----------|------|
-| `core` | Error types and foundational metadata |
+### Source of trust levels
 
-### 2.2 External Dependencies
+`registry` maps external sources into governance fields: `source_url`, `artifact_hash`, `signature`, `trust_level`. `skills` and `tools` consume these fields directly rather than inferring trustworthiness on their own.
 
-| Dependency | Purpose |
-|------|------|
-| `serde` / `serde_json` | Registry index and manifest parsing |
-| `reqwest` or equivalent HTTP client | Downloading registries and artifacts |
-| `sha2` / signature libraries | Hash and signature verification |
+### Installation constraints
 
----
+- Failed verification → artifact must not be written executably
+- Install directory must be separate from user-authored workspace directories
+- Upgrades preserve old version metadata for Trace replay and troubleshooting
+- Successful installation does not imply auto-execution privileges
 
-## 3. Public Interfaces
+## Constraints
 
-```rust
-pub struct ExtensionManifest {
-    pub name: String,
-    pub version: String,
-    pub artifact_hash: String,
-    pub signature: Option<String>,
-    pub source_url: String,
-    pub kind: ExtensionKind,
-    pub trust_level: TrustLevel,
-}
+- Depends only on `core`
+- Hash verification is mandatory; signature verification can be optional initially
+- Registry download failures should not block already-installed extensions
 
-pub enum ExtensionKind {
-    Skill,
-    Tool,
-}
+## Collaboration
 
-pub struct RegistryInstaller {
-    verifier: SignatureVerifier,
-    install_root: PathBuf,
-}
-```
-
-Recommended additional interfaces:
-
-```rust
-impl RegistryInstaller {
-    pub async fn install(&self, manifest: &ExtensionManifest) -> Result<InstalledArtifact>;
-    pub async fn upgrade(&self, name: &str, target_version: &str) -> Result<InstalledArtifact>;
-    pub fn verify(&self, manifest: &ExtensionManifest, bytes: &[u8]) -> Result<()>;
-}
-```
-
----
-
-## 4. Implementation Details
-
-### 4.1 Governance Entry Point
-
-Installation flow:
-
-```text
-catalog index
-    │
-    ▼
-ExtensionManifest
-    │
-    ▼
-download
-    │
-    ▼
-hash / signature verify
-    │
-    ▼
-install_root
-    │
-    ├── consumed by tools
-    └── consumed by skills
-```
-
-### 4.2 Source of Trust Levels
-
-`registry` is responsible for mapping external sources into governance fields:
-
-- `source_url`
-- `artifact_hash`
-- `signature`
-- `trust_level`
-
-`skills` and `tools` should consume these fields directly rather than inferring trustworthiness on their own.
-
-### 4.3 Installation Constraints
-
-- Artifacts that fail verification must not be written to disk in an executable state
-- The installation directory must be separated from user-authored workspace directories
-- Upgrades should preserve metadata for old versions to support Trace replay and troubleshooting
-
----
-
-## 5. Collaboration with Other Modules
-
-| Module | Collaboration |
-|------|---------|
+| Module | Role |
+|--------|------|
 | `skills` | Provides source, version, and trust level for installed skills |
 | `tools` | Provides source, version, and artifact hash for installed tools |
 | `trace` | Needs registry metadata for provenance during execution |
-| `workspace` | Local workspace extensions and registry install directories should be separate |
-
----
-
-## 6. Implementation Recommendations
-
-- Separate "installable" from "allowed to auto-execute"; successful installation does not imply high privileges
-- Registry download failures should not block already installed extensions from being used
-- Signature verification can be optional at first, but hash verification should be mandatory
+| `workspace` | Local workspace extensions and registry directories should be separate |

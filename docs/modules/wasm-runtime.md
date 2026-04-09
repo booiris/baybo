@@ -1,140 +1,52 @@
-# wasm-runtime - The WASM Sub-Runtime Inside sandbox
+# wasm-runtime - WASM Sub-Runtime Inside sandbox
 
-## 1. Module Positioning
+## Overview
 
-This document describes only the `WasmRuntime` subcomponent inside the `sandbox` crate. For system-level execution isolation design, use [sandbox.md](docs/modules/sandbox.md) as the primary reference.
+This document describes the `WasmRuntime` subcomponent inside `sandbox`. For system-level isolation design, see [sandbox.md](sandbox.md).
 
 `WasmRuntime` is responsible for:
 
-- Loading WASM bytecode and compiling it into executable modules
-- Instantiating modules under a restricted host ABI
+- Loading WASM bytecode and compiling into executable modules
+- Instantiating under a restricted host ABI
 - Injecting parameters and the minimum required secrets
 - Controlling fuel, memory, and timeout
 
 It is not the full isolation governance layer. High-risk tasks must be upgraded to the container execution surface.
 
----
+## Design Decisions
 
-## 2. Public Interfaces
+### Module loading flow
 
-```rust
-pub struct WasmRuntime {
-    engine: wasmtime::Engine,
-}
+Validate bytecode format → compute artifact hash → compile via wasmtime → return `WasmModule`.
 
-impl WasmRuntime {
-    pub fn load_module(&self, wasm_bytes: &[u8]) -> Result<WasmModule>;
+### Execution flow
 
-    pub async fn execute(
-        &self,
-        module: &WasmModule,
-        params: Value,
-        secrets: HashMap<String, SecretValue>,
-    ) -> Result<Value>;
-}
-```
+Create Store/Linker/Instance → inject controlled host functions → inject serialized params and secrets → set fuel/memory/timeout → call the agreed export function (e.g. `run`) → parse returned JSON.
 
-Suggested additional types:
+### Sandbox boundary
 
-```rust
-pub struct WasmModule {
-    pub name: String,
-    pub artifact_hash: String,
-    compiled: wasmtime::Module,
-}
+By default, the WASM sub-runtime must **not** have: arbitrary filesystem access, arbitrary network access, host environment variable reading, or arbitrary host function calls. If higher privileges are needed, escalate at the `sandbox` layer — never quietly loosen restrictions inside `WasmRuntime`.
 
-pub struct SandboxLimits {
-    pub timeout_ms: u64,
-    pub max_memory_bytes: usize,
-    pub max_fuel: u64,
-}
-```
+### Secret injection
 
----
+Secrets passed to `execute()` contain only the minimum set declared by the current tool. The runtime exposes them only to the current instance, never writes them into logs, and releases memory promptly after execution.
 
-## 3. Implementation Details
+### Error model
 
-### 3.1 Module Loading Flow
+Distinguish among: module load failure, missing export function, parameter deserialization failure, execution timeout, fuel/memory limit exceeded, and tool-level execution error.
 
-```text
-load_module(wasm_bytes)
-    │
-    ├── validate bytecode format
-    ├── compute artifact hash
-    ├── wasmtime::Module::new(engine, bytes)
-    └── return WasmModule
-```
+## Constraints
 
-### 3.2 Execution Flow
-
-```text
-execute(module, params, secrets)
-    │
-    ├── create Store / Linker / Instance
-    ├── inject controlled host functions
-    ├── inject serialized params and secrets
-    ├── set fuel / memory / timeout
-    ├── call the agreed export function (such as run)
-    └── parse the returned JSON Value
-```
-
-### 3.3 Sandbox Boundary
-
-By default, the WASM sub-runtime must not have:
-
-- Arbitrary filesystem read/write access
-- Arbitrary network access
-- Permission to read host environment variables
-- Arbitrary host function call capability
-
-If higher privileges are required, upgrade policy at the `sandbox` layer instead of quietly loosening restrictions inside `WasmRuntime`.
-
-### 3.4 Secret Injection Strategy
-
-The `secrets` passed to `execute()` should contain only the minimum set declared by the current tool. Internally, the runtime should:
-
-- Expose those secrets only to the current instance
-- Never write secrets into logs
-- Release the corresponding memory objects promptly after execution
-
-### 3.5 Error Model
-
-It is recommended to distinguish among:
-
-- Module load failure
-- Missing export function
-- Parameter deserialization failure
-- Execution timeout
-- Fuel or memory limit exceeded
-- Tool-level execution error
-
-```rust
-pub enum WasmRuntimeError {
-    InvalidModule(String),
-    MissingExport(String),
-    Timeout,
-    ResourceLimitExceeded(String),
-    Execution(String),
-}
-```
-
----
-
-## 4. Collaboration with Other Modules
-
-| Module     | Collaboration                                                              |
-| ---------- | -------------------------------------------------------------------------- |
-| `sandbox`  | Invoked as the default execution subcomponent                              |
-| `tools`    | `WasmTool` holds `Arc<WasmRuntime>` and calls `execute()`                  |
-| `security` | Upper layers pass already decrypted and minimized secrets in as parameters |
-| `trace`    | Artifact hash and execution result are written into provenance and result  |
-| `agent`    | `ToolExecutor` wraps the WASM tool execution lifecycle                     |
-
----
-
-## 5. Implementation Recommendations
-
+- Always put a timeout on `execute()` — do not rely on tools to exit voluntarily
 - Use precompiled caches to reduce repeated load overhead
-- Always put a timeout on `execute()`; do not rely on tools to exit voluntarily
-- Cover malicious cases in tests, such as infinite loops, oversized memory allocations, and invalid return values
-- If a tool requires capabilities beyond what WASM can support, return an explicit "requires container execution surface" error rather than failing implicitly
+- If a tool requires capabilities beyond WASM, return an explicit "requires container" error
+
+## Collaboration
+
+| Module | Role |
+|--------|------|
+| `sandbox` | `WasmRuntime` is the default execution subcomponent |
+| `tools` | `WasmTool` holds `Arc<WasmRuntime>` and calls `execute()` |
+| `security` | Upper layers pass already-decrypted, minimized secrets |
+| `trace` | Artifact hash and execution result recorded in provenance |
+| `agent` | `ToolExecutor` wraps the WASM tool execution lifecycle |
