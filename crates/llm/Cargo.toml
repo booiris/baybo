@@ -5,11 +5,11 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
+rig-core = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-regex = { workspace = true }
 tracing = { workspace = true }
-reqwest = { workspace = true }

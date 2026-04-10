@@ -2,15 +2,24 @@ mod error;
 pub mod multimodal;
 mod providers;
 pub mod registry;
-pub mod rig_adapter;
-pub mod tool_call_extractor;
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures::stream::{Stream, StreamExt};
+use rig::OneOrMany;
+use rig::completion::{
+    self, AssistantContent, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
+    ToolDefinition,
+};
+use rig::message::{Message, Text, UserContent};
+use rig::providers::{anthropic, openai};
+use rig::streaming::{self, StreamedAssistantContent};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 pub use crate::error::LlmError;
 pub use crate::registry::{LlmProviderConfig, LlmProviderRegistry};
-pub use crate::tool_call_extractor::JsonExtractor;
 
 pub type Result<T> = std::result::Result<T, LlmError>;
 
@@ -73,472 +82,336 @@ pub struct ToolDefinitionForLlm {
     pub parameters_schema: serde_json::Value,
 }
 
-/// Controls how tool calls are extracted from LLM responses.
+/// Events emitted during LLM streaming.
 #[derive(Debug, Clone)]
-pub enum ResponseParseMode {
-    /// The model natively supports function calling.
-    NativeFunctionCalling,
-    /// The model requires prompt-guided JSON extraction for tool calls.
-    PromptGuided { tool_schema_prompt: String },
+pub enum StreamEvent {
+    /// A text chunk from the model.
+    Text(String),
+    /// A complete tool call.
+    ToolCall(ToolCallInfo),
+    /// A reasoning/thinking text chunk.
+    Reasoning(String),
+    /// Token usage statistics (emitted at stream end).
+    Usage(TokenUsage),
 }
 
-/// The main LLM client type wrapping a model instance and its metadata.
+/// A type-erased streaming response from an LLM provider.
+pub struct LlmStream {
+    inner: Pin<Box<dyn Stream<Item = crate::Result<StreamEvent>> + Send>>,
+}
+
+impl Stream for LlmStream {
+    type Item = crate::Result<StreamEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl LlmStream {
+    /// Wraps a rig `StreamingCompletionResponse` into our type-erased `LlmStream`,
+    /// converting provider-specific events into `StreamEvent`.
+    fn from_rig_stream<R>(rig_stream: streaming::StreamingCompletionResponse<R>) -> Self
+    where
+        R: Clone + Unpin + Send + Sync + GetTokenUsage + serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        let mapped = rig_stream.filter_map(|result| {
+            futures::future::ready(match result {
+                Err(e) => Some(Err(LlmError::Provider(e.to_string()))),
+                Ok(event) => convert_stream_event(event),
+            })
+        });
+        Self {
+            inner: Box::pin(mapped),
+        }
+    }
+}
+
+fn convert_stream_event<R: GetTokenUsage>(
+    event: StreamedAssistantContent<R>,
+) -> Option<crate::Result<StreamEvent>> {
+    match event {
+        StreamedAssistantContent::Text(t) => Some(Ok(StreamEvent::Text(t.text))),
+        StreamedAssistantContent::ToolCall { tool_call, .. } => {
+            Some(Ok(StreamEvent::ToolCall(ToolCallInfo {
+                id: tool_call.id,
+                name: tool_call.function.name,
+                arguments: tool_call.function.arguments,
+            })))
+        }
+        StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+            Some(Ok(StreamEvent::Reasoning(reasoning)))
+        }
+        StreamedAssistantContent::Final(r) => r.token_usage().map(|usage| {
+            Ok(StreamEvent::Usage(TokenUsage {
+                input_tokens: usage.input_tokens as usize,
+                output_tokens: usage.output_tokens as usize,
+            }))
+        }),
+        // ToolCallDelta and full Reasoning blocks are skipped;
+        // we emit ReasoningDelta for incremental text and ToolCall for complete calls.
+        _ => None,
+    }
+}
+
+/// Enum-dispatched completion model supporting multiple providers.
+pub(crate) enum AnyCompletionModel {
+    OpenAI(openai::completion::CompletionModel),
+    Anthropic(anthropic::completion::CompletionModel),
+}
+
+impl AnyCompletionModel {
+    async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> std::result::Result<completion::CompletionResponse<()>, CompletionError> {
+        match self {
+            Self::OpenAI(m) => {
+                let resp = m.completion(request).await?;
+                Ok(completion::CompletionResponse {
+                    choice: resp.choice,
+                    usage: resp.usage,
+                    raw_response: (),
+                    message_id: resp.message_id,
+                })
+            }
+            Self::Anthropic(m) => {
+                let resp = m.completion(request).await?;
+                Ok(completion::CompletionResponse {
+                    choice: resp.choice,
+                    usage: resp.usage,
+                    raw_response: (),
+                    message_id: resp.message_id,
+                })
+            }
+        }
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> std::result::Result<LlmStream, CompletionError> {
+        match self {
+            Self::OpenAI(m) => {
+                let stream = m.stream(request).await?;
+                Ok(LlmStream::from_rig_stream(stream))
+            }
+            Self::Anthropic(m) => {
+                let stream = m.stream(request).await?;
+                Ok(LlmStream::from_rig_stream(stream))
+            }
+        }
+    }
+}
+
+/// The main LLM client type wrapping a rig completion model.
 pub struct LlmClient {
     model_info: ModelInfo,
-    parse_mode: ResponseParseMode,
-    http_client: reqwest::Client,
-    api_key: Option<String>,
-    base_url: String,
+    model: AnyCompletionModel,
 }
 
 impl LlmClient {
-    /// Creates a new `LlmClient` with the given model info, parse mode, and connection details.
-    pub fn new(
-        model_info: ModelInfo,
-        parse_mode: ResponseParseMode,
-        api_key: Option<String>,
-        base_url: String,
-    ) -> Self {
-        Self {
-            model_info,
-            parse_mode,
-            http_client: reqwest::Client::new(),
-            api_key,
-            base_url,
-        }
+    /// Creates a new `LlmClient` from a provider-specific completion model.
+    pub(crate) fn new(model_info: ModelInfo, model: AnyCompletionModel) -> Self {
+        Self { model_info, model }
     }
 
     /// Sends a chat request to the provider and returns a unified response.
     pub async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {
-        let body = self.build_provider_request_body(request);
-        let provider = self.model_info.provider.as_str();
+        debug!(
+            provider = %self.model_info.provider,
+            model = %self.model_info.id,
+            "sending chat request"
+        );
 
-        debug!(provider, model = %self.model_info.id, "sending chat request");
+        let rig_request = self.build_completion_request(request);
 
-        let response_json = self.send_request(provider, &body).await?;
+        let response = self
+            .model
+            .completion(rig_request)
+            .await
+            .map_err(|e| LlmError::Provider(e.to_string()))?;
 
-        let response = match provider {
-            "anthropic" => self.parse_anthropic_response(&response_json, request),
-            "ollama" => self.parse_ollama_response(&response_json, request),
-            _ => self.parse_openai_response(&response_json, request),
-        }?;
+        let llm_response = Self::convert_response(response);
 
         debug!(
-            content_len = response.content.len(),
-            tool_calls = response.tool_calls.len(),
-            input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens,
+            content_len = llm_response.content.len(),
+            tool_calls = llm_response.tool_calls.len(),
+            input_tokens = llm_response.usage.input_tokens,
+            output_tokens = llm_response.usage.output_tokens,
             "received LLM response"
         );
 
-        Ok(response)
+        Ok(llm_response)
     }
 
-    /// Send the HTTP request to the appropriate provider endpoint.
-    async fn send_request(
-        &self,
-        provider: &str,
-        body: &serde_json::Value,
-    ) -> crate::Result<serde_json::Value> {
-        let (url, mut req_builder) = match provider {
-            "anthropic" => {
-                let url = format!("{}/v1/messages", self.base_url);
-                let builder = self
-                    .http_client
-                    .post(&url)
-                    .header("x-api-key", self.api_key.as_deref().unwrap_or_default())
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json");
-                (url, builder)
-            }
-            "ollama" => {
-                let url = format!("{}/api/chat", self.base_url);
-                let builder = self
-                    .http_client
-                    .post(&url)
-                    .header("content-type", "application/json");
-                (url, builder)
-            }
-            _ => {
-                // OpenAI and OpenAI-compatible
-                let url = format!("{}/chat/completions", self.base_url);
-                let builder = self
-                    .http_client
-                    .post(&url)
-                    .header("content-type", "application/json")
-                    .bearer_auth(self.api_key.as_deref().unwrap_or_default());
-                (url, builder)
-            }
-        };
+    /// Sends a chat request and returns a streaming response.
+    pub async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
+        debug!(
+            provider = %self.model_info.provider,
+            model = %self.model_info.id,
+            "sending streaming chat request"
+        );
 
-        req_builder = req_builder.json(body);
+        let rig_request = self.build_completion_request(request);
 
-        let resp = req_builder
-            .send()
+        self.model
+            .stream(rig_request)
             .await
-            .map_err(|e| LlmError::Provider(format!("HTTP request to {url} failed: {e}")))?;
+            .map_err(|e| LlmError::Provider(e.to_string()))
+    }
 
-        let status = resp.status();
-        let resp_body = resp
-            .text()
-            .await
-            .map_err(|e| LlmError::Provider(format!("failed to read response body: {e}")))?;
+    /// Build a rig `CompletionRequest` from our `ChatRequest`.
+    fn build_completion_request(&self, request: &ChatRequest) -> CompletionRequest {
+        let mut system_parts = Vec::new();
+        let mut chat_messages: Vec<Message> = Vec::new();
 
-        if !status.is_success() {
-            return Err(LlmError::Provider(format!(
-                "LLM API returned {status}: {resp_body}"
-            )));
+        for msg in &request.messages {
+            match msg.role {
+                aura_model::Role::System => {
+                    system_parts.push(multimodal::extract_text(&msg.content));
+                }
+                aura_model::Role::User => {
+                    let content: Vec<UserContent> = msg
+                        .content
+                        .iter()
+                        .map(|block| match block {
+                            aura_model::ContentBlock::Text(t) => {
+                                UserContent::Text(Text { text: t.clone() })
+                            }
+                            other => UserContent::Text(Text {
+                                text: multimodal::content_block_to_text(other),
+                            }),
+                        })
+                        .collect();
+                    if let Some(first) = content.into_iter().next() {
+                        chat_messages.push(Message::User {
+                            content: OneOrMany::one(first),
+                        });
+                    }
+                }
+                aura_model::Role::Assistant => {
+                    let text = multimodal::extract_text(&msg.content);
+                    if !text.is_empty() {
+                        chat_messages.push(Message::Assistant {
+                            id: None,
+                            content: OneOrMany::one(AssistantContent::Text(Text { text })),
+                        });
+                    }
+                }
+                aura_model::Role::Tool => {
+                    // Tool results are sent as user messages for simplicity
+                    let text = multimodal::extract_text(&msg.content);
+                    chat_messages.push(Message::User {
+                        content: OneOrMany::one(UserContent::Text(Text { text })),
+                    });
+                }
+            }
         }
 
-        serde_json::from_str(&resp_body)
-            .map_err(|e| LlmError::ParseError(format!("failed to parse response JSON: {e}")))
-    }
+        let tools: Vec<ToolDefinition> = request
+            .tools
+            .iter()
+            .map(|t| ToolDefinition {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: t.parameters_schema.clone(),
+            })
+            .collect();
 
-    /// Parse an OpenAI-format response.
-    fn parse_openai_response(
-        &self,
-        json: &serde_json::Value,
-        _request: &ChatRequest,
-    ) -> crate::Result<LlmResponse> {
-        let choice = json
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"));
-
-        let content = choice
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let content_blocks = if content.is_empty() {
-            vec![]
+        let preamble = if system_parts.is_empty() {
+            None
         } else {
-            vec![aura_model::ContentBlock::Text(content.clone())]
+            Some(system_parts.join("\n"))
         };
 
-        // Extract tool calls
-        let mut tool_calls = Vec::new();
-        if let Some(calls) = choice
-            .and_then(|m| m.get("tool_calls"))
-            .and_then(|t| t.as_array())
-        {
-            for call in calls {
-                let id = call
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let name = call
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let arguments = call
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                tool_calls.push(ToolCallInfo {
-                    id,
-                    name,
-                    arguments,
-                });
-            }
+        // Ensure at least one message for OneOrMany.
+        if chat_messages.is_empty() {
+            chat_messages.push(Message::User {
+                content: OneOrMany::one(UserContent::Text(Text {
+                    text: String::new(),
+                })),
+            });
         }
 
-        // If no native tool calls found, try prompt-guided extraction
-        if tool_calls.is_empty()
-            && matches!(&self.parse_mode, ResponseParseMode::PromptGuided { .. })
-        {
-            let extractor = tool_call_extractor::JsonExtractor::new();
-            tool_calls = extractor.extract(&content);
+        let first = chat_messages.remove(0);
+        let mut chat_history = OneOrMany::one(first);
+        for msg in chat_messages {
+            chat_history.push(msg);
         }
 
-        let usage = Self::extract_usage(json);
-
-        Ok(LlmResponse {
-            content,
-            content_blocks,
-            tool_calls,
-            usage,
-            thinking: None,
-        })
+        CompletionRequest {
+            model: None,
+            preamble,
+            chat_history,
+            documents: Vec::new(),
+            tools,
+            temperature: request.temperature.map(|t| t as f64),
+            max_tokens: Some(4096),
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        }
     }
 
-    /// Parse an Anthropic-format response.
-    fn parse_anthropic_response(
-        &self,
-        json: &serde_json::Value,
-        _request: &ChatRequest,
-    ) -> crate::Result<LlmResponse> {
+    /// Convert a rig `CompletionResponse` into our `LlmResponse`.
+    fn convert_response(response: completion::CompletionResponse<()>) -> LlmResponse {
         let mut content = String::new();
         let mut content_blocks = Vec::new();
         let mut tool_calls = Vec::new();
         let mut thinking = None;
 
-        if let Some(blocks) = json.get("content").and_then(|c| c.as_array()) {
-            for block in blocks {
-                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                match block_type {
-                    "text" => {
-                        let text = block
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or_default();
-                        if !content.is_empty() {
-                            content.push('\n');
-                        }
-                        content.push_str(text);
-                        content_blocks.push(aura_model::ContentBlock::Text(text.to_string()));
+        for item in response.choice.into_iter() {
+            match item {
+                AssistantContent::Text(text) => {
+                    if !content.is_empty() {
+                        content.push('\n');
                     }
-                    "tool_use" => {
-                        let id = block
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let name = block
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let arguments = block
-                            .get("input")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Object(Default::default()));
-                        tool_calls.push(ToolCallInfo {
-                            id,
-                            name,
-                            arguments,
-                        });
-                    }
-                    "thinking" => {
-                        if let Some(text) = block.get("thinking").and_then(|t| t.as_str()) {
-                            thinking = Some(text.to_string());
-                        }
-                    }
-                    _ => {}
+                    content.push_str(&text.text);
+                    content_blocks.push(aura_model::ContentBlock::Text(text.text));
                 }
+                AssistantContent::ToolCall(tc) => {
+                    tool_calls.push(ToolCallInfo {
+                        id: tc.id,
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
+                    });
+                }
+                AssistantContent::Reasoning(r) => {
+                    let reasoning_text: String = r
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            rig::completion::message::ReasoningContent::Text { text, .. } => {
+                                Some(text.as_str())
+                            }
+                            rig::completion::message::ReasoningContent::Summary(s) => {
+                                Some(s.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !reasoning_text.is_empty() {
+                        thinking = Some(reasoning_text);
+                    }
+                }
+                AssistantContent::Image(_) => {}
             }
         }
 
-        let usage = Self::extract_usage(json);
+        let usage = TokenUsage {
+            input_tokens: response.usage.input_tokens as usize,
+            output_tokens: response.usage.output_tokens as usize,
+        };
 
-        Ok(LlmResponse {
+        LlmResponse {
             content,
             content_blocks,
             tool_calls,
             usage,
             thinking,
-        })
-    }
-
-    /// Parse an Ollama-format response.
-    fn parse_ollama_response(
-        &self,
-        json: &serde_json::Value,
-        _request: &ChatRequest,
-    ) -> crate::Result<LlmResponse> {
-        let content = json
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let content_blocks = if content.is_empty() {
-            vec![]
-        } else {
-            vec![aura_model::ContentBlock::Text(content.clone())]
-        };
-
-        // Ollama doesn't natively support tool calls; use prompt-guided extraction
-        let tool_calls = if let ResponseParseMode::PromptGuided { .. } = &self.parse_mode {
-            let extractor = tool_call_extractor::JsonExtractor::new();
-            extractor.extract(&content)
-        } else {
-            Vec::new()
-        };
-
-        // Ollama provides eval_count / prompt_eval_count
-        let input_tokens = json
-            .get("prompt_eval_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let output_tokens = json.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-        Ok(LlmResponse {
-            content,
-            content_blocks,
-            tool_calls,
-            usage: TokenUsage {
-                input_tokens,
-                output_tokens,
-            },
-            thinking: None,
-        })
-    }
-
-    /// Extract token usage from a response JSON (OpenAI / Anthropic format).
-    fn extract_usage(json: &serde_json::Value) -> TokenUsage {
-        let usage = json.get("usage");
-        let input_tokens = usage
-            .and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens")))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let output_tokens = usage
-            .and_then(|u| {
-                u.get("output_tokens")
-                    .or_else(|| u.get("completion_tokens"))
-            })
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        TokenUsage {
-            input_tokens,
-            output_tokens,
         }
-    }
-
-    /// Build a provider-specific request body from a generic `ChatRequest`.
-    ///
-    /// This converts tool definitions and message content blocks into the JSON
-    /// format expected by the target provider (OpenAI, Anthropic, etc.).
-    pub fn build_provider_request_body(&self, request: &ChatRequest) -> serde_json::Value {
-        let provider = &self.model_info.provider;
-
-        match provider.as_str() {
-            "anthropic" => self.build_anthropic_request_body(request),
-            "ollama" => self.build_ollama_request_body(request),
-            _ => self.build_openai_request_body(request),
-        }
-    }
-
-    fn build_openai_request_body(&self, request: &ChatRequest) -> serde_json::Value {
-        let tools_json =
-            serde_json::to_value(rig_adapter::to_openai_tools(&request.tools)).unwrap_or_default();
-
-        let messages_json: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .map(|msg| {
-                let role_str = match msg.role {
-                    aura_model::Role::System => "system",
-                    aura_model::Role::User => "user",
-                    aura_model::Role::Assistant => "assistant",
-                    aura_model::Role::Tool => "tool",
-                };
-                let content = serde_json::to_value(multimodal::to_openai_content(&msg.content))
-                    .unwrap_or_default();
-                serde_json::json!({ "role": role_str, "content": content })
-            })
-            .collect();
-
-        let mut body = serde_json::json!({
-            "model": self.model_info.id,
-            "messages": messages_json,
-        });
-        if !request.tools.is_empty() {
-            body["tools"] = tools_json;
-        }
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        body
-    }
-
-    fn build_anthropic_request_body(&self, request: &ChatRequest) -> serde_json::Value {
-        let tools_json = serde_json::to_value(rig_adapter::to_anthropic_tools(&request.tools))
-            .unwrap_or_default();
-
-        // Anthropic requires system prompt separate from messages
-        let mut system_prompt = String::new();
-        let messages_json: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .filter_map(|msg| {
-                if msg.role == aura_model::Role::System {
-                    let text = multimodal::extract_text(&msg.content);
-                    if !system_prompt.is_empty() {
-                        system_prompt.push('\n');
-                    }
-                    system_prompt.push_str(&text);
-                    return None;
-                }
-                let role_str = match msg.role {
-                    aura_model::Role::User => "user",
-                    aura_model::Role::Assistant => "assistant",
-                    aura_model::Role::Tool => "user", // Anthropic maps tool results as user
-                    aura_model::Role::System => unreachable!(),
-                };
-                let content = serde_json::to_value(multimodal::to_anthropic_content(&msg.content))
-                    .unwrap_or_default();
-                Some(serde_json::json!({ "role": role_str, "content": content }))
-            })
-            .collect();
-
-        let mut body = serde_json::json!({
-            "model": self.model_info.id,
-            "messages": messages_json,
-            "max_tokens": 4096,
-        });
-        if !system_prompt.is_empty() {
-            body["system"] = serde_json::json!(system_prompt);
-        }
-        if !request.tools.is_empty() {
-            body["tools"] = tools_json;
-        }
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        body
-    }
-
-    fn build_ollama_request_body(&self, request: &ChatRequest) -> serde_json::Value {
-        // For prompt-guided mode, inject tool schema into system prompt
-        let tool_schema_prompt = if let ResponseParseMode::PromptGuided {
-            tool_schema_prompt, ..
-        } = &self.parse_mode
-        {
-            if !request.tools.is_empty() {
-                // Rebuild with actual tools
-                rig_adapter::build_tool_schema_prompt(&request.tools)
-            } else {
-                tool_schema_prompt.clone()
-            }
-        } else {
-            String::new()
-        };
-
-        let messages_json: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(i, msg)| {
-                let role_str = match msg.role {
-                    aura_model::Role::System => "system",
-                    aura_model::Role::User => "user",
-                    aura_model::Role::Assistant => "assistant",
-                    aura_model::Role::Tool => "user",
-                };
-                let mut text = multimodal::extract_text(&msg.content);
-                // Append tool schema to first system message
-                if i == 0 && msg.role == aura_model::Role::System && !tool_schema_prompt.is_empty()
-                {
-                    text.push_str("\n\n");
-                    text.push_str(&tool_schema_prompt);
-                }
-                serde_json::json!({ "role": role_str, "content": text })
-            })
-            .collect();
-
-        serde_json::json!({
-            "model": self.model_info.id,
-            "messages": messages_json,
-            "stream": false,
-        })
     }
 
     /// Returns the model identifier (e.g. `"claude-sonnet-4-6"`).

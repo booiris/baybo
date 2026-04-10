@@ -88,11 +88,10 @@ impl Tokenizer for SimpleTokenizer {
 }
 
 fn build_llm_client_from_env() -> anyhow::Result<LlmClient> {
-    let provider = std::env::var("AURA_LLM_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
+    let provider = std::env::var("AURA_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_string());
     let model = std::env::var("AURA_LLM_MODEL").unwrap_or_else(|_| match provider.as_str() {
-        "openai" => "gpt-4o-mini".to_string(),
-        "anthropic" => "claude-3-5-sonnet-latest".to_string(),
-        _ => "llama3".to_string(),
+        "anthropic" => "claude-sonnet-4-6".to_string(),
+        _ => "gpt-4o-mini".to_string(),
     });
     let api_key = std::env::var("AURA_LLM_API_KEY")
         .ok()

@@ -8,9 +8,6 @@ pub enum LlmError {
     #[error("LLM configuration error: {0}")]
     Config(String),
 
-    #[error("response parse error: {0}")]
-    ParseError(String),
-
     #[error("model not found: {0}")]
     ModelNotFound(String),
 

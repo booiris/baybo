@@ -8,24 +8,23 @@ Core responsibilities:
 
 - Provide a unified invocation interface — upper layers call `LlmClient::chat()` without caring about the backend provider
 - Hide provider differences behind registry-style extension via `LlmProviderRegistry`
-- Support dual-mode response parsing: native function calling and prompt-guided JSON extraction (for local models without tool-use support)
+- Leverage rig's native function calling for structured tool-use responses
 
 **Design constraint**: this crate is pure infrastructure with no business logic. It does not depend on `security`, `tools`, or `skills`.
 
 ## Design Decisions
 
-### Dual response parsing modes
+### rig-based completion
 
-- **NativeFunctionCalling**: for providers with built-in tool support (OpenAI, Anthropic). Tool definitions are included in the request; structured tool calls are extracted from the response.
-- **PromptGuided**: for models without native function calling (e.g. Ollama). Tool schemas are appended to the system prompt, and a `JsonExtractor` pulls tool-call JSON from free text. If extraction fails, the response is treated as plain text.
+`LlmClient` wraps `Arc<dyn CompletionModelDyn>` from rig, using dynamic dispatch to uniformly call any provider. Provider factories create rig-native completion models (OpenAI, Anthropic) and hand them to `LlmClient::new()`.
 
 ### Provider registry pattern
 
-`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI, Anthropic, Ollama) are registered by the crate itself. New providers are added by implementing a factory and registering it — no external factory trait needed.
+`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI, Anthropic) are registered by the crate itself. New providers are added by implementing `LlmProviderFactory` and registering it.
 
-### rig integration
+### Multimodal support
 
-`LlmClient` internally holds `Box<dyn rig::completion::Chat>`, using dynamic dispatch to uniformly call different providers. A `rig_adapter` module converts Aura's tool-definition schema into rig's format without depending on the `tools` crate.
+A `multimodal` module converts Aura's `ContentBlock` types into text representations for the LLM. Non-text blocks (images, audio, files) are rendered as descriptive placeholders. `extract_text` joins text blocks for system/assistant message conversion.
 
 ### Observability constraints
 
@@ -37,7 +36,7 @@ Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` thr
 
 ## Constraints
 
-- Depends only on `model` (plus `rig`, `serde`, `async-trait`)
+- Depends only on `model` (plus `rig-core`, `serde`, `async-trait`)
 - Does not depend on `cost` — instead, `cost` consumes `TokenUsage` produced by `llm`, assembled by `agent`
 - API keys should use environment-variable placeholders and must not be stored directly in config files
 
