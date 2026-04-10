@@ -14,7 +14,7 @@ Core responsibilities:
 - **Cost management**: `CostTracker` for recording, `CostGuard` for spending limits (in `agent::cost`)
 - **Runtime logic**: error recovery, timeout control, rollback
 
-It does not own low-level storage or backend implementation — it consumes Store traits from `storage` through dependency injection. Domain types and errors come from their respective crates (`session`, `memory`, `trace`, `security`, `job`).
+It does not own low-level storage or backend implementation — it consumes Store traits from `storage` through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
 
 ## Design Decisions
 
@@ -66,7 +66,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `llm` | `AgentLoop` initiates model calls |
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
-| `memory` | Provides domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager` |
+| `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager` |
 | `workspace` | Identity files, heartbeat config, routine definitions |
 | `context` | Conversation window and compression |
 | `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager` |

@@ -183,7 +183,6 @@ dependencies = [
  "aura-hook",
  "aura-job",
  "aura-llm",
- "aura-memory",
  "aura-model",
  "aura-sandbox",
  "aura-security",
@@ -210,7 +209,6 @@ dependencies = [
  "aura-hook",
  "aura-job",
  "aura-llm",
- "aura-memory",
  "aura-model",
  "aura-registry",
  "aura-sandbox",
@@ -225,6 +223,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -316,26 +315,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-memory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-model",
- "aura-session",
- "chrono",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "aura-model"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -414,7 +399,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-job",
- "aura-memory",
+ "aura-model",
  "aura-security",
  "aura-session",
  "aura-trace",

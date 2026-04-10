@@ -1,4 +1,5 @@
 pub mod cost;
+pub mod error;
 pub mod job;
 pub mod libsql;
 pub mod memory;
@@ -7,6 +8,7 @@ pub mod session;
 pub mod trace;
 
 pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+pub use error::StorageError;
 pub use job::JobStore;
 pub use memory::MemoryStore;
 pub use secret::SecretStore;

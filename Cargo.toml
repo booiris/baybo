@@ -5,7 +5,6 @@ members = [
     "crates/channels",
     "crates/llm",
     "crates/tools",
-    "crates/memory",
     "crates/workspace",
     "crates/context",
     "crates/session",
@@ -31,7 +30,6 @@ aura-model = { path = "crates/model" }
 aura-channels = { path = "crates/channels" }
 aura-llm = { path = "crates/llm" }
 aura-tools = { path = "crates/tools" }
-aura-memory = { path = "crates/memory" }
 aura-workspace = { path = "crates/workspace" }
 aura-context = { path = "crates/context" }
 aura-session = { path = "crates/session" }
@@ -89,7 +87,6 @@ aura-model = { workspace = true }
 aura-channels = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
-aura-memory = { workspace = true }
 aura-workspace = { workspace = true }
 aura-context = { workspace = true }
 aura-session = { workspace = true }

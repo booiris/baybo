@@ -1,7 +1,9 @@
 use async_trait::async_trait;
-use aura_memory::{MemoryEntry, MemoryError};
+use aura_model::MemoryEntry;
 
-pub type Result<T> = std::result::Result<T, MemoryError>;
+use crate::error::StorageError;
+
+pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Abstract interface for memory persistence.
 #[async_trait]

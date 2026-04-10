@@ -8,7 +8,6 @@ aura-model = { workspace = true }
 aura-registry = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
-aura-memory = { workspace = true }
 aura-workspace = { workspace = true }
 aura-context = { workspace = true }
 aura-session = { workspace = true }
@@ -25,6 +24,7 @@ async-trait = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }

@@ -11,17 +11,17 @@ Its job is:
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Domain crates (`session`, `memory`, `trace`, `security`, `job`) provide only **types and error definitions**. Business logic (managers, collectors, gateways) lives in `agent`.
+Domain crates (`model`, `session`, `trace`, `security`, `job`) provide only **types**. Business logic (managers, collectors, gateways) lives in `agent`.
 
 ## Design Decisions
 
 ### All Store traits defined in storage
 
-Every Store trait lives in `storage`, not in the domain crate. This avoids circular dependencies: domain crates define types → `storage` depends on those types to define traits → `agent` depends on both to wire business logic. Each trait module re-exports the domain error type as a local `Result<T>` alias for ergonomic use.
+Every Store trait lives in `storage`, not in the domain crate. This avoids circular dependencies: domain crates define types → `storage` depends on those types to define traits → `agent` depends on both to wire business logic. All Store traits use `StorageError` as their error type — domain-specific error types do not leak into storage.
 
 ```
 session.rs  → SessionStore  (uses aura_session types)
-memory.rs   → MemoryStore   (uses aura_memory types)
+memory.rs   → MemoryStore   (uses aura_model memory types)
 trace.rs    → TraceStore    (uses aura_trace types)
 secret.rs   → SecretStore   (uses aura_security types)
 job.rs      → JobStore      (uses aura_job types)
@@ -56,7 +56,7 @@ Use transactions for: `TraceStore.save_trace()` writing trace root and nodes ato
 
 ## Constraints
 
-- Depends on domain crates for types only (`session`, `memory`, `trace`, `security`, `job`)
+- Depends on domain crates for types only (`model`, `session`, `trace`, `security`, `job`)
 - Exposes trait objects externally, not concrete backend types
 - Assumes upper layers have already sanitized data before persistence
 
@@ -65,5 +65,5 @@ Use transactions for: `TraceStore.save_trace()` writing trace root and nodes ato
 | Module                                               | Role                                                                                         |
 | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `storage` (self)                                     | Defines all Store traits; provides all libsql implementations; defines cost types             |
-| `session` / `memory` / `trace` / `security` / `job`  | Provide domain types and error definitions consumed by Store traits                           |
+| `model` / `session` / `trace` / `security` / `job`   | Provide domain types consumed by Store traits                                                 |
 | `agent`                                              | Injects stores into managers; owns all business logic (SessionManager, MemoryManager, etc.)   |

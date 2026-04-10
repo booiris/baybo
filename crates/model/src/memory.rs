@@ -1,15 +1,5 @@
-pub mod error;
-
-pub use error::MemoryError;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-pub type Result<T> = std::result::Result<T, MemoryError>;
-
-// ---------------------------------------------------------------------------
-// MemoryCategory
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
@@ -17,10 +7,6 @@ pub enum MemoryCategory {
     UserPreference,
     KeyFact,
 }
-
-// ---------------------------------------------------------------------------
-// MemoryEntry
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -37,7 +23,6 @@ pub struct MemoryEntry {
 }
 
 impl MemoryEntry {
-    /// Create a new `MemoryEntry` with a generated UUID and current timestamps.
     pub fn new(
         user_id: String,
         content: String,

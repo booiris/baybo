@@ -1,16 +1,25 @@
+use thiserror::Error;
 use tracing::{debug, warn};
 
-use aura_memory::{MemoryCategory, MemoryEntry, MemoryError};
-use aura_model::ContentBlock;
+use aura_model::{ContentBlock, MemoryCategory, MemoryEntry};
 use aura_session::Session;
-use aura_storage::MemoryStore;
+use aura_storage::{MemoryStore, StorageError};
 
-type Result<T> = std::result::Result<T, MemoryError>;
+#[derive(Debug, Error)]
+pub enum MemoryManagerError {
+    #[error("embedding error: {0}")]
+    Embedding(String),
+
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+pub type Result<T> = std::result::Result<T, MemoryManagerError>;
 
 /// A minimal embedding model trait for generating vector embeddings from text.
 #[async_trait::async_trait]
 pub(crate) trait EmbeddingModel: Send + Sync {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    async fn embed(&self, text: &str) -> std::result::Result<Vec<f32>, MemoryManagerError>;
 }
 
 const DEFAULT_RECALL_LIMIT: usize = 10;
@@ -276,7 +285,6 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_memory::MemoryCategory;
     use aura_model::BlobRef;
 
     #[test]
