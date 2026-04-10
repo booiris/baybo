@@ -106,7 +106,10 @@ impl TraceCollector {
 
     pub fn should_auto_snapshot(&self) -> bool {
         self.auto_snapshot
-            && aura_trace::snapshot::should_snapshot(self.spans_since_snapshot, self.snapshot_interval)
+            && aura_trace::snapshot::should_snapshot(
+                self.spans_since_snapshot,
+                self.snapshot_interval,
+            )
     }
 
     pub fn attach_snapshot(
@@ -148,8 +151,8 @@ impl TraceCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_trace::{SpanResult, TraceFilter, TraceNode};
     use async_trait::async_trait;
+    use aura_trace::{SpanResult, TraceFilter, TraceNode};
     use std::sync::Mutex;
 
     struct MemoryTraceStore {
@@ -307,7 +310,6 @@ mod tests {
 
         let snap = ContextSnapshot {
             messages: Vec::new(),
-            compressed_summary: None,
             token_count: 42,
         };
         collector.attach_snapshot(&root_id, snap.clone()).unwrap();

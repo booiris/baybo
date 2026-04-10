@@ -24,7 +24,7 @@ pub struct AgentLoop {
     llm_client: Arc<LlmClient>,
     tool_registry: Arc<ToolRegistry>,
     tool_executor: Arc<ToolExecutor>,
-    context_manager: Box<dyn ContextManager>,
+    context_manager: ContextManager,
     memory_manager: Arc<MemoryManager>,
     policy: ExecutionPolicy,
     soul: Soul,
@@ -36,7 +36,7 @@ impl AgentLoop {
         llm_client: Arc<LlmClient>,
         tool_registry: Arc<ToolRegistry>,
         tool_executor: Arc<ToolExecutor>,
-        context_manager: Box<dyn ContextManager>,
+        context_manager: ContextManager,
         memory_manager: Arc<MemoryManager>,
         policy: ExecutionPolicy,
         soul: Soul,
@@ -82,29 +82,15 @@ impl AgentLoop {
                     "[Memory Context]\n{memory_text}"
                 ))],
             };
-            self.context_manager
-                .append(session, Role::System, &memory_msg)
-                .await?;
+            self.context_manager.append(session, &memory_msg).await?;
         }
 
-        // Append user message
+        // Append user message (auto-compresses if over token budget)
         let user_msg = ChatMessage {
             role: Role::User,
             content: user_content,
         };
-        self.context_manager
-            .append(session, Role::User, &user_msg)
-            .await?;
-
-        // Maybe compress context
-        let compress_result = self.context_manager.maybe_compress(session).await?;
-        if compress_result.compressed {
-            debug!(
-                before = compress_result.before_tokens,
-                after = compress_result.after_tokens,
-                "context compressed"
-            );
-        }
+        self.context_manager.append(session, &user_msg).await?;
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -144,9 +130,7 @@ impl AgentLoop {
                     role: Role::Assistant,
                     content: final_blocks.clone(),
                 };
-                self.context_manager
-                    .append(session, Role::Assistant, &assistant_msg)
-                    .await?;
+                self.context_manager.append(session, &assistant_msg).await?;
 
                 // Maybe store memory
                 if let Err(e) = self.memory_manager.maybe_store(session, &final_text).await {
@@ -167,9 +151,7 @@ impl AgentLoop {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text(response.content.clone())],
             };
-            self.context_manager
-                .append(session, Role::Assistant, &assistant_msg)
-                .await?;
+            self.context_manager.append(session, &assistant_msg).await?;
 
             // Execute tool calls
             for tool_call in &response.tool_calls {
@@ -195,14 +177,12 @@ impl AgentLoop {
                     Err(e) => format!("Error: {e}"),
                 };
 
-                // Append tool result to context
+                // Append tool result to context (auto-compresses if needed)
                 let tool_msg = ChatMessage {
                     role: Role::Tool,
                     content: vec![ContentBlock::Text(result_text)],
                 };
-                self.context_manager
-                    .append(session, Role::Tool, &tool_msg)
-                    .await?;
+                self.context_manager.append(session, &tool_msg).await?;
 
                 // Auto-snapshot after tool execution if the interval has been reached
                 self.maybe_take_snapshot(session, recorder).await;

@@ -8,9 +8,10 @@ use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
-use aura_agent::{JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager, TraceCollector};
-use aura_context::Tokenizer;
-use aura_context::sliding_window::SlidingWindowContext;
+use aura_agent::{
+    JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager, TraceCollector,
+};
+use aura_context::{ContextManager, TokenBudget, Tokenizer, Truncate};
 use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_model::{ChatMessage, ContentBlock};
@@ -217,7 +218,11 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&actor_llm_client),
                 Arc::clone(&actor_tool_registry),
                 Arc::clone(&actor_tool_executor),
-                Box::new(SlidingWindowContext::new(Arc::clone(&actor_tokenizer), 100)),
+                ContextManager::new(
+                    Arc::clone(&actor_tokenizer),
+                    Box::new(Truncate::new(100)),
+                    TokenBudget::new(120_000, 0.75),
+                ),
                 Arc::clone(&actor_memory_manager),
                 actor_policy.clone(),
                 Soul::custom(actor_system_prompt.clone()),
