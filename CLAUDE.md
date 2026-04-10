@@ -23,12 +23,6 @@ RUST_LOG=aura=debug cargo run                                  # run with loggin
 - Comments for non-obvious logic only
 - Avoid exporting unnecessary item, prefer `pub(crate)` for functions and structs; use `pub` only when necessary
 
-## Maintainability
-
-- Keep visibility minimal. If an item is not used outside its module or crate, prefer private visibility or `pub(crate)` over `pub`.
-- Regularly check for exported dead code with `scripts/check-unused-pub.sh`, which installs or updates `cargo-workspace-unused-pub` and detects `pub` items that are not actually used anywhere in the workspace.
-- Treat unused `pub` items as maintainability debt: remove them when obsolete, or reduce their visibility if external exposure is unnecessary.
-
 ## Architecture
 
 Prefer generic/extensible architectures over hardcoding specific integrations. Ask clarifying questions about the desired abstraction level before implementing.
