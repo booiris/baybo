@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_security::{crypto, EncryptionKey, SecurityError};
+use aura_security::{EncryptionKey, SecurityError, crypto};
 use aura_storage::SecretStore;
 
 type Result<T> = std::result::Result<T, SecurityError>;
@@ -233,9 +233,9 @@ enum NetworkPolicyDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule};
     use aura_session::ChannelType;
-    use async_trait::async_trait;
     use chrono::Utc;
     use regex::Regex;
     use std::sync::Mutex;
@@ -254,7 +254,11 @@ mod tests {
 
     #[async_trait]
     impl SecretStore for MemorySecretStore {
-        async fn store(&self, name: &str, encrypted_value: &[u8]) -> aura_storage::secret::Result<()> {
+        async fn store(
+            &self,
+            name: &str,
+            encrypted_value: &[u8],
+        ) -> aura_storage::secret::Result<()> {
             self.data
                 .lock()
                 .map_err(|e| SecurityError::Violation(e.to_string()))?

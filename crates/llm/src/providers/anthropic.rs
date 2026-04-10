@@ -25,9 +25,7 @@ impl LlmProviderFactory for AnthropicProviderFactory {
                 .build(),
             None => anthropic::Client::new(api_key),
         }
-        .map_err(|e| {
-            crate::LlmError::Config(format!("failed to create Anthropic client: {e}"))
-        })?;
+        .map_err(|e| crate::LlmError::Config(format!("failed to create Anthropic client: {e}")))?;
 
         let model = client.completion_model(&config.model);
 

@@ -113,7 +113,14 @@ impl LlmStream {
     /// converting provider-specific events into `StreamEvent`.
     fn from_rig_stream<R>(rig_stream: streaming::StreamingCompletionResponse<R>) -> Self
     where
-        R: Clone + Unpin + Send + Sync + GetTokenUsage + serde::Serialize + serde::de::DeserializeOwned + 'static,
+        R: Clone
+            + Unpin
+            + Send
+            + Sync
+            + GetTokenUsage
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let mapped = rig_stream.filter_map(|result| {
             futures::future::ready(match result {

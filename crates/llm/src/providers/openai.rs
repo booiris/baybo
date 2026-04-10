@@ -41,7 +41,10 @@ impl LlmProviderFactory for OpenAIProviderFactory {
             },
         };
 
-        Ok(LlmClient::new(model_info, AnyCompletionModel::OpenAI(model)))
+        Ok(LlmClient::new(
+            model_info,
+            AnyCompletionModel::OpenAI(model),
+        ))
     }
 }
 
