@@ -231,9 +231,9 @@ Built-in factories:
 - `AnthropicProviderFactory`
 - `OllamaProviderFactory`
 
-### 4.4 tools (Tool System, WASM Sandbox)
+### 4.4 tools (Tool System, WASM Sandbox, MCP Client)
 
-Traits are defined in this crate and secrets are injected by `agent`.
+Traits are defined in this crate and secrets are injected by `agent`. Supports three tool types: built-in Rust, WASM, and MCP (Model Context Protocol).
 
 ```rust
 #[async_trait]
@@ -241,8 +241,14 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> Value;
-    fn required_secrets(&self) -> Vec<String> { vec![] }
+    fn secret_requirements(&self) -> Vec<SecretRequirement> { vec![] }
     async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput>;
+}
+
+pub struct SecretRequirement {
+    pub key: String,
+    pub access: SecretAccess,    // ReadOnly | ReadWrite
+    pub required: bool,
 }
 
 pub struct ToolContext {
@@ -251,14 +257,18 @@ pub struct ToolContext {
     pub timeout: Duration,
     pub cancellation_token: CancellationToken,
     pub secrets: HashMap<String, SecretValue>,
+    pub secret_accessor: Option<Arc<dyn SecretAccessor>>,
     pub sandbox_policy: SandboxPolicy,
     pub network_policy: NetworkPolicy,
 }
 ```
 
+MCP client support: `McpToolProvider` connects to external MCP servers via stdio or HTTP transports (using the `rmcp` SDK), discovers tools, and produces `McpTool` instances for registration in `ToolRegistry`. MCP tool names are namespaced as `{server_name}/{tool_name}`.
+
 Execution-isolation layers:
 
 - WASM by default for pure computation and restricted I/O
+- MCP tools delegate execution to the remote MCP server
 - escalate to the `sandbox` crate for high-risk tools such as browser automation, shell, package managers, file writes, and long-running work
 - `ToolManifest.capabilities` is a hard declaration, not advisory metadata
 

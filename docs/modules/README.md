@@ -29,7 +29,7 @@ Bottom-up along the dependency graph:
 
 - **llm** — LLM provider wrapping and response parsing.
 - **sandbox** — Execution isolation (WASM + container), including WasmRuntime subcomponent.
-- **tools** — Tool abstraction, registration, capability declarations, runtime routing.
+- **tools** — Tool abstraction, registration, capability declarations, runtime routing. MCP client support via `rmcp`.
 - **registry** — Extension artifact verification and installation governance. Owns TrustLevel, ArtifactSource.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.
 - **workspace** — Identity files, heartbeat, and routine configuration.
@@ -56,7 +56,7 @@ model
   ├── security ──► model, session, channels
   ├── hook ──► channels
   ├── trace ──► model, context, job
-  ├── tools ──► model, session, registry, sandbox
+  ├── tools ──► model, session, registry, sandbox, rmcp
   ├── skills ──► registry
   └── job (no internal deps)
   └── registry (no internal deps)

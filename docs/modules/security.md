@@ -34,7 +34,9 @@ Secrets are encrypted with AES-256-GCM (random nonce + ciphertext + tag). The ma
 
 ### Least-privilege injection
 
-`get_secrets_for_tool()` returns only secrets explicitly declared by the tool via `required_secrets()`. Security does not understand tool business logic — it only returns the minimal set based on declarations.
+`get_secrets_for_tool()` returns only secrets explicitly declared by the tool via `secret_requirements()`. Security does not understand tool business logic — it only returns the minimal set based on declarations.
+
+`ScopedSecretAccessor` (in `agent::security`) enforces per-tool permissions at runtime: tools can only `get()` keys they declared, and can only `set()` keys declared with `ReadWrite` access. Read-only keys reject write attempts with `ReadOnlyViolation`.
 
 ### Network decision boundary
 
