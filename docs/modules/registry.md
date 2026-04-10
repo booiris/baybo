@@ -36,9 +36,9 @@ Installation flow: catalog index → `ExtensionManifest` → download → hash/s
 
 ## Collaboration
 
-| Module | Role |
-|--------|------|
-| `skills` | Provides source, version, and trust level for installed skills |
-| `tools` | Provides source, version, and artifact hash for installed tools |
-| `trace` | Needs registry metadata for provenance during execution |
+| Module      | Role                                                                   |
+| ----------- | ---------------------------------------------------------------------- |
+| `skills`    | Provides source, version, and trust level for installed skills         |
+| `tools`     | Provides source, version, and artifact hash for installed tools        |
+| `trace`     | Needs registry metadata for provenance during execution                |
 | `workspace` | Local workspace extensions and registry directories should be separate |

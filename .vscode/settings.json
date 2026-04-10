@@ -13,6 +13,7 @@
         "dedup",
         "docstrings",
         "embedder",
+        "executably",
         "expirable",
         "frontmatter",
         "ironclaw",
