@@ -129,8 +129,14 @@ async fn main() -> anyhow::Result<()> {
     // Session manager
     let session_manager = SessionManager::new(storage.session, chrono::Duration::minutes(30));
 
-    // Job manager
-    let job_manager = Arc::new(JobManager::new(storage.job));
+    // Job manager — recover any jobs interrupted by a prior shutdown
+    let job_manager = JobManager::new(storage.job);
+    match job_manager.recover_interrupted().await {
+        Ok(0) => {}
+        Ok(n) => info!(count = n, "recovered interrupted jobs from prior run"),
+        Err(e) => tracing::warn!(error = %e, "failed to recover interrupted jobs"),
+    }
+    let job_manager = Arc::new(job_manager);
 
     // Cost tracker
     let cost_tracker = Arc::new(CostTracker::new(storage.cost));

@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use serde_json::Value;
 
 use super::LibsqlPool;
 use crate::job::JobStore;
@@ -58,52 +57,22 @@ impl JobStore for LibsqlJobStore {
         }
     }
 
-    async fn update_status(
-        &self,
-        job_id: &str,
-        status: JobStatus,
-        output: Option<Value>,
-        error: Option<String>,
-    ) -> aura_job::Result<()> {
+    async fn save(&self, job: &Job) -> aura_job::Result<()> {
         let conn = self.pool.conn();
-
-        let mut rows = conn
-            .query(
-                "SELECT data FROM jobs WHERE id = ?1",
-                libsql::params![job_id.to_string()],
-            )
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-            .ok_or_else(|| JobError::NotFound(job_id.to_string()))?;
-
-        let data: String = row
-            .get(0)
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-        drop(rows);
-
-        let mut job: Job = serde_json::from_str(&data)
-            .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
-        job.status = status;
-        if let Some(out) = output {
-            job.output = Some(out);
-        }
-        if let Some(err) = error {
-            job.error = Some(err);
-        }
-        let updated = serde_json::to_string(&job)
+        let data = serde_json::to_string(job)
             .map_err(|e| JobError::Storage(format!("failed to serialize job: {e}")))?;
 
-        conn.execute(
-            "UPDATE jobs SET data = ?1 WHERE id = ?2",
-            libsql::params![updated, job_id.to_string()],
-        )
-        .await
-        .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql update error: {e}")))?;
+        let rows_affected = conn
+            .execute(
+                "UPDATE jobs SET data = ?1 WHERE id = ?2",
+                libsql::params![data, job.id.clone()],
+            )
+            .await
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql update error: {e}")))?;
+
+        if rows_affected == 0 {
+            return Err(JobError::NotFound(job.id.clone()));
+        }
         Ok(())
     }
 
@@ -226,25 +195,17 @@ impl JobStore for LibsqlJobStore {
 mod tests {
     use super::*;
     use aura_job::OperationKind;
-    use chrono::Utc;
 
     fn test_job(id: &str) -> Job {
-        Job {
-            id: id.to_string(),
-            session_id: "sess-1".to_string(),
-            parent_job_id: None,
-            kind: OperationKind::LlmCall {
+        let mut job = Job::new(
+            "sess-1",
+            OperationKind::LlmCall {
                 model: "gpt-4".to_string(),
             },
-            status: JobStatus::Pending,
-            input: None,
-            output: None,
-            error: None,
-            trace_span_id: None,
-            created_at: Utc::now(),
-            started_at: None,
-            completed_at: None,
-        }
+            None,
+        );
+        job.id = id.to_string();
+        job
     }
 
     #[tokio::test]
@@ -258,16 +219,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_status() {
+    async fn save_updates_job() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
-        store.create(&test_job("j2")).await.unwrap();
-        store
-            .update_status("j2", JobStatus::InProgress, None, None)
-            .await
-            .unwrap();
-        let job = store.get("j2").await.unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::InProgress);
+        let mut job = test_job("j2");
+        store.create(&job).await.unwrap();
+
+        job.start().unwrap();
+        store.save(&job).await.unwrap();
+
+        let loaded = store.get("j2").await.unwrap().unwrap();
+        assert_eq!(loaded.status, JobStatus::InProgress);
+        assert!(loaded.started_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn save_nonexistent_returns_not_found() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlJobStore::new(pool);
+        let job = test_job("nonexistent");
+        let err = store.save(&job).await.unwrap_err();
+        assert!(matches!(err, JobError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -289,7 +261,7 @@ mod tests {
             from: JobStatus::Pending,
             to: JobStatus::InProgress,
             reason: Some("started".to_string()),
-            timestamp: Utc::now(),
+            timestamp: chrono::Utc::now(),
         };
         store.record_transition(&transition).await.unwrap();
         let transitions = store.get_transitions("j5").await.unwrap();
