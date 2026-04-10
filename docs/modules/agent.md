@@ -48,6 +48,10 @@ Heartbeat, routine, and cron all flow through the Actor model and observability 
 
 `Rollback` message → read snapshot from `TraceCollector` → `fork_from(target_node)` → restore session messages and context state from snapshot.
 
+### Startup recovery
+
+On system startup, before accepting any messages, `JobManager::recover_interrupted()` scans all non-terminal jobs left over from a prior run. `InProgress` jobs are moved to `Stuck` (their executing context was lost); other non-terminal states are left unchanged. This is called once in `main()` after constructing the `JobManager`.
+
 ### Router's upstream responsibilities
 
 Before a message enters an actor, Router completes: session identification/creation, user-level rate limiting, quota check via `CostGuard`, select/create target `AgentActor`.
@@ -69,7 +73,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager` |
 | `workspace` | Identity files, heartbeat config, routine definitions |
 | `context` | Conversation window and compression |
-| `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager` |
+| `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager`; startup recovery via `recover_interrupted()` |
 | `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |
 | `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
 | `security` | Provides crypto primitives (`EncryptionKey`, `LeakDetector`) used by `agent::security::{SecretVault, SecurityGateway}` |
