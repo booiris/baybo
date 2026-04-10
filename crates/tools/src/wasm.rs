@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use aura_sandbox::{WasmModule, WasmRuntime};
 
-use crate::{Tool, ToolContext, ToolManifest, ToolOutput};
+use crate::{SecretRequirement, Tool, ToolContext, ToolManifest, ToolOutput};
 
 /// A WASM tool loaded from a manifest and compiled module.
 pub struct WasmTool {
@@ -29,8 +29,8 @@ impl Tool for WasmTool {
         self.manifest.parameters_schema.clone()
     }
 
-    fn required_secrets(&self) -> Vec<String> {
-        self.manifest.required_secrets.clone()
+    fn secret_requirements(&self) -> Vec<SecretRequirement> {
+        self.manifest.secret_requirements.clone()
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {

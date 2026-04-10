@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use aura_security::{EncryptionKey, SecurityError, crypto};
 use aura_storage::SecretStore;
+use aura_tools::{SecretAccess, SecretAccessError, SecretAccessor, SecretRequirement};
 
 type Result<T> = std::result::Result<T, SecurityError>;
 
@@ -88,6 +90,81 @@ impl SecretVault {
             }
         }
         Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ScopedSecretAccessor
+// ---------------------------------------------------------------------------
+
+/// Scoped secret accessor that enforces per-tool permission declarations.
+///
+/// Each tool gets its own `ScopedSecretAccessor` with only the keys it declared.
+/// Read-only keys cannot be written; undeclared keys cannot be accessed at all.
+pub(crate) struct ScopedSecretAccessor {
+    declarations: HashMap<String, SecretAccess>,
+    vault: Arc<SecretVault>,
+}
+
+impl ScopedSecretAccessor {
+    pub(crate) fn new(requirements: &[SecretRequirement], vault: Arc<SecretVault>) -> Self {
+        let declarations = requirements
+            .iter()
+            .map(|r| (r.key.clone(), r.access))
+            .collect();
+        Self {
+            declarations,
+            vault,
+        }
+    }
+}
+
+#[async_trait]
+impl SecretAccessor for ScopedSecretAccessor {
+    async fn get(
+        &self,
+        key: &str,
+    ) -> std::result::Result<aura_tools::SecretValue, SecretAccessError> {
+        if !self.declarations.contains_key(key) {
+            return Err(SecretAccessError::Undeclared {
+                key: key.to_string(),
+            });
+        }
+
+        let vault_secret = self
+            .vault
+            .get_secret(key)
+            .await
+            .map_err(|e| SecretAccessError::Internal(e.to_string()))?;
+
+        match vault_secret {
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(v.as_bytes()).to_string());
+                Ok(aura_tools::SecretValue::new(s))
+            }
+            None => Err(SecretAccessError::NotFound {
+                key: key.to_string(),
+            }),
+        }
+    }
+
+    async fn set(&self, key: &str, value: &[u8]) -> std::result::Result<(), SecretAccessError> {
+        match self.declarations.get(key) {
+            None => Err(SecretAccessError::Undeclared {
+                key: key.to_string(),
+            }),
+            Some(SecretAccess::ReadOnly) => Err(SecretAccessError::ReadOnlyViolation {
+                key: key.to_string(),
+            }),
+            Some(SecretAccess::ReadWrite) => self
+                .vault
+                .store_secret(key, value)
+                .await
+                .map_err(|e| SecretAccessError::Internal(e.to_string())),
+        }
     }
 }
 

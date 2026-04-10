@@ -14,6 +14,12 @@ pub enum ToolError {
     #[error("WASM error: {0}")]
     Wasm(String),
 
+    #[error("MCP error: {0}")]
+    Mcp(String),
+
+    #[error("secret access error: {0}")]
+    SecretAccess(String),
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }

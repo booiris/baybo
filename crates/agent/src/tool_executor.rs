@@ -7,9 +7,10 @@ use aura_registry::TrustLevel;
 use aura_sandbox::{NetworkPolicy, SandboxPolicy};
 use aura_session::User;
 
-use crate::security::SecretVault;
+use crate::security::{ScopedSecretAccessor, SecretVault};
 use aura_tools::{
-    SecretValue, ToolCapability, ToolContext, ToolManifest, ToolOutput, ToolRegistry,
+    SecretAccessor, SecretValue, ToolCapability, ToolContext, ToolManifest, ToolOutput,
+    ToolRegistry,
 };
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
@@ -174,7 +175,7 @@ impl ToolExecutor {
             .await?;
 
         // Inject secrets
-        let secrets = self.inject_secrets(tool_name).await?;
+        let (secrets, secret_accessor) = self.inject_secrets(tool_name).await?;
 
         // Resolve capability-based sandbox and network policies
         let (sandbox_policy, network_policy) = self.resolve_policy(tool_name);
@@ -194,6 +195,7 @@ impl ToolExecutor {
             timeout: self.default_timeout,
             cancellation_token: CancellationToken::new(),
             secrets,
+            secret_accessor,
             sandbox_policy,
             network_policy,
         };
@@ -239,26 +241,38 @@ impl ToolExecutor {
     async fn inject_secrets(
         &self,
         tool_name: &str,
-    ) -> anyhow::Result<HashMap<String, SecretValue>> {
+    ) -> anyhow::Result<(
+        HashMap<String, SecretValue>,
+        Option<Arc<dyn SecretAccessor>>,
+    )> {
         let tool = self.tool_registry.get(tool_name);
-        let required = tool.map(|t| t.required_secrets()).unwrap_or_default();
-        if required.is_empty() {
-            return Ok(HashMap::new());
+        let requirements = tool.map(|t| t.secret_requirements()).unwrap_or_default();
+        if requirements.is_empty() {
+            return Ok((HashMap::new(), None));
         }
 
+        // Build the static secrets map (for WASM backward compat)
+        let keys: Vec<String> = requirements.iter().map(|r| r.key.clone()).collect();
         let vault_secrets = self
             .secret_vault
-            .get_secrets_for_tool(tool_name, &required)
+            .get_secrets_for_tool(tool_name, &keys)
             .await?;
 
-        let mut result = HashMap::new();
+        let mut static_secrets = HashMap::new();
         for (k, v) in vault_secrets {
             let s = v
                 .as_str()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|_| String::from_utf8_lossy(v.as_bytes()).to_string());
-            result.insert(k, SecretValue::new(s));
+            static_secrets.insert(k, SecretValue::new(s));
         }
-        Ok(result)
+
+        // Build the runtime accessor with permission enforcement
+        let accessor: Arc<dyn SecretAccessor> = Arc::new(ScopedSecretAccessor::new(
+            &requirements,
+            Arc::clone(&self.secret_vault),
+        ));
+
+        Ok((static_secrets, Some(accessor)))
     }
 }
