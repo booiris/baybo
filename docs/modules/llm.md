@@ -6,7 +6,7 @@ The `llm` crate is Aura's infrastructure layer for LLM calls, wrapping the **rig
 
 Core responsibilities:
 
-- Provide a unified invocation interface — upper layers call `LlmClient::chat()` without caring about the backend provider
+- Provide a unified invocation interface — upper layers call `LlmClient::chat()` or `chat_stream()` without caring about the backend provider
 - Hide provider differences behind registry-style extension via `LlmProviderRegistry`
 - Leverage rig's native function calling for structured tool-use responses
 
@@ -14,9 +14,13 @@ Core responsibilities:
 
 ## Design Decisions
 
-### rig-based completion
+### rig-based completion with enum dispatch
 
-`LlmClient` wraps `Arc<dyn CompletionModelDyn>` from rig, using dynamic dispatch to uniformly call any provider. Provider factories create rig-native completion models (OpenAI, Anthropic) and hand them to `LlmClient::new()`.
+`LlmClient` wraps `AnyCompletionModel`, an enum that holds provider-specific rig completion models (OpenAI, Anthropic). This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
+
+### Streaming
+
+`LlmClient::chat_stream()` returns `LlmStream`, a type-erased `futures::Stream<Item = Result<StreamEvent>>`. `StreamEvent` emits `Text`, `ToolCall`, `Reasoning`, and `Usage` events. The stream maps rig's `StreamedAssistantContent` to these unified events, hiding provider-specific response types.
 
 ### Provider registry pattern
 
@@ -36,7 +40,7 @@ Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` thr
 
 ## Constraints
 
-- Depends only on `model` (plus `rig-core`, `serde`, `async-trait`)
+- Depends only on `model` (plus `rig-core`, `futures`, `serde`)
 - Does not depend on `cost` — instead, `cost` consumes `TokenUsage` produced by `llm`, assembled by `agent`
 - API keys should use environment-variable placeholders and must not be stored directly in config files
 
@@ -44,6 +48,6 @@ Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` thr
 
 | Module | Role |
 |--------|------|
-| `agent` | `AgentLoop` calls `LlmClient::chat()` and handles retries |
+| `agent` | `AgentLoop` calls `LlmClient::chat()` / `chat_stream()` and handles retries |
 | `cost` | Consumes `TokenUsage` and `ModelPricing` to calculate per-call cost |
 | `context` | Provides compressed message history for `ChatRequest` |
