@@ -45,6 +45,19 @@ pub struct Session {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
+    /// Currently active skill during multi-turn flows.
+    /// Set when a skill begins, cleared on completion.
+    /// `AgentLoop` uses this to route to the correct skill handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_skill: Option<String>,
+
+    /// Number of context compressions performed in this session.
+    /// Incremented after each compression pass; useful for monitoring
+    /// or switching compression strategies.
+    #[serde(default)]
+    pub compression_count: u32,
+
+    /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,
 }

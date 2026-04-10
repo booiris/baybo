@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use crate::session::{Result, SessionStore};
-use aura_session::{Session, SessionError};
+use aura_session::store::Result;
+use aura_session::{Session, SessionError, SessionStore};
 
 pub struct LibsqlSessionStore {
     pool: LibsqlPool,

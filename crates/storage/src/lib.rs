@@ -4,15 +4,15 @@ pub mod job;
 pub mod libsql;
 pub mod memory;
 pub mod secret;
-pub mod session;
 pub mod trace;
+
+use aura_session::SessionStore;
 
 pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 pub use error::StorageError;
 pub use job::JobStore;
 pub use memory::MemoryStore;
 pub use secret::SecretStore;
-pub use session::SessionStore;
 pub use trace::TraceStore;
 
 /// Bundles all store implementations into a single container

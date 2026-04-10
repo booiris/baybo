@@ -1,10 +1,10 @@
-# session - Session Types and Identity
+# session - Session Types, Store Trait, and Manager
 
 ## Overview
 
-The `session` crate defines session-related domain types (`Session`, `SessionState`, `User`, `ChannelType`) and the `SessionError` error type.
+The `session` crate owns session-related domain types (`Session`, `SessionState`, `User`, `ChannelType`), the `SessionStore` persistence trait, and the `SessionManager` that implements session lifecycle logic.
 
-**Design principle**: domain types live in their own crate; Store traits live in `storage`; business logic lives in `agent`. `SessionStore` is defined in `storage::session`; `SessionManager` lives in `agent::session`.
+**Design principle**: session is a self-contained module — types, store interface, and business logic live together. Concrete storage implementations (e.g. libsql) live in `storage`; higher-level orchestration (Router, Actor) lives in `agent`.
 
 ## Design Decisions
 
@@ -31,13 +31,14 @@ Aura uses one Actor per session. All messages targeting the same session (user i
 
 ## Constraints
 
-- Pure types crate — no business logic, no storage interfaces
 - Session IDs use UUID v4 (random, no ordering needed)
+- `SessionStore` trait lives in this crate; concrete implementations live in `storage`
+- `SessionManager` owns lifecycle logic; `agent` re-exports it for convenience
 
 ## Collaboration
 
-| Module | Role |
-|--------|------|
-| `agent` | `agent::session::SessionManager` owns session lifecycle logic; Router calls it; `AgentActor` holds the `Session` instance |
-| `storage` | Defines `SessionStore` trait using session types; provides libsql implementation |
-| `hook` | `SessionCreated` / `SessionDestroyed` hook points for welcome messages, audit, cleanup |
+| Module    | Role                                                                                    |
+| --------- | --------------------------------------------------------------------------------------- |
+| `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance |
+| `storage` | Provides concrete `SessionStore` implementations (e.g. `LibsqlSessionStore`)            |
+| `hook`    | `SessionCreated` / `SessionDestroyed` hook points for welcome messages, audit, cleanup  |

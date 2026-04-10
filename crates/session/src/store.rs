@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use aura_session::{Session, SessionError};
 use chrono::{DateTime, Utc};
+
+use crate::{Session, SessionError};
 
 pub type Result<T> = std::result::Result<T, SessionError>;
 
