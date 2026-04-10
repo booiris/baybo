@@ -17,6 +17,12 @@ pub enum ChannelError {
     #[error("channel configuration error: {0}")]
     Config(String),
 
+    #[error("channel {0} already registered")]
+    DuplicateChannel(String),
+
+    #[error("channel {0} not found")]
+    NotFound(String),
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }

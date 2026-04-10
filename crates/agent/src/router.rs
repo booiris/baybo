@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_channels::{ChannelAdapter, IncomingMessage, OutgoingMessage};
+use aura_channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
 use aura_session::Session;
 
 use crate::security::SecurityGateway;
@@ -23,7 +23,7 @@ pub type ActorSpawner =
 pub struct Router {
     session_manager: SessionManager,
     supervisor: AgentSupervisor,
-    channels: Vec<Box<dyn ChannelAdapter>>,
+    channels: ChannelRegistry,
     security_gateway: Arc<SecurityGateway>,
     actor_spawner: Option<ActorSpawner>,
 }
@@ -32,7 +32,7 @@ impl Router {
     pub fn new(
         session_manager: SessionManager,
         supervisor: AgentSupervisor,
-        channels: Vec<Box<dyn ChannelAdapter>>,
+        channels: ChannelRegistry,
         security_gateway: Arc<SecurityGateway>,
     ) -> Self {
         Self {
@@ -196,21 +196,22 @@ impl Router {
 
     async fn send_to_channel(&self, outgoing: OutgoingMessage) {
         let channel_type = outgoing.channel;
-        for adapter in &self.channels {
-            if adapter.channel_type() == channel_type {
-                if let Err(e) = adapter.send_response(outgoing.clone()).await {
+        match self.channels.get(channel_type) {
+            Some(adapter) => {
+                if let Err(e) = adapter.send_response(outgoing).await {
                     error!(
                         channel = %channel_type,
                         error = %e,
                         "failed to send response through channel"
                     );
                 }
-                return;
+            }
+            None => {
+                error!(
+                    channel = %channel_type,
+                    "no adapter found for channel type"
+                );
             }
         }
-        error!(
-            channel = %channel_type,
-            "no adapter found for channel type"
-        );
     }
 }

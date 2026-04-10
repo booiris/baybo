@@ -11,6 +11,7 @@ use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
     JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager, TraceCollector,
 };
+use aura_channels::ChannelRegistry;
 use aura_context::{ContextManager, TokenBudget, Tokenizer, Truncate};
 use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
@@ -212,34 +213,39 @@ async fn main() -> anyhow::Result<()> {
     let actor_hooks = Arc::clone(&hook_manager);
     let actor_recorder = Arc::clone(&recorder);
 
-    let router = Router::new(session_manager, supervisor, vec![], security_gateway)
-        .with_actor_spawner(Box::new(move |session, response_tx| {
-            let agent_loop = AgentLoop::new(
-                Arc::clone(&actor_llm_client),
-                Arc::clone(&actor_tool_registry),
-                Arc::clone(&actor_tool_executor),
-                ContextManager::new(
-                    Arc::clone(&actor_tokenizer),
-                    Box::new(Truncate::new(100)),
-                    TokenBudget::new(120_000, 0.75),
-                ),
-                Arc::clone(&actor_memory_manager),
-                actor_policy.clone(),
-                Soul::custom(actor_system_prompt.clone()),
-            );
-            let actor = AgentActor::new(
-                session,
-                agent_loop,
-                response_tx,
-                Arc::clone(&actor_hooks),
-                Arc::clone(&actor_recorder),
-            );
-            let (sender, mailbox) = mpsc::channel(256);
-            tokio::spawn(async move {
-                actor.run(mailbox).await;
-            });
-            sender
-        }));
+    let router = Router::new(
+        session_manager,
+        supervisor,
+        ChannelRegistry::new(),
+        security_gateway,
+    )
+    .with_actor_spawner(Box::new(move |session, response_tx| {
+        let agent_loop = AgentLoop::new(
+            Arc::clone(&actor_llm_client),
+            Arc::clone(&actor_tool_registry),
+            Arc::clone(&actor_tool_executor),
+            ContextManager::new(
+                Arc::clone(&actor_tokenizer),
+                Box::new(Truncate::new(100)),
+                TokenBudget::new(120_000, 0.75),
+            ),
+            Arc::clone(&actor_memory_manager),
+            actor_policy.clone(),
+            Soul::custom(actor_system_prompt.clone()),
+        );
+        let actor = AgentActor::new(
+            session,
+            agent_loop,
+            response_tx,
+            Arc::clone(&actor_hooks),
+            Arc::clone(&actor_recorder),
+        );
+        let (sender, mailbox) = mpsc::channel(256);
+        tokio::spawn(async move {
+            actor.run(mailbox).await;
+        });
+        sender
+    }));
 
     // Shutdown coordination
     let shutdown = ShutdownSignal::new();

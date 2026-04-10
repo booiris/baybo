@@ -30,3 +30,16 @@ pub struct OutgoingMessage {
     pub reply_to: Option<String>,
     pub metadata: MessageMetadata,
 }
+
+/// Lifecycle status of a registered channel adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelStatus {
+    /// Registered but not yet started.
+    Registered,
+    /// Actively listening for messages.
+    Running,
+    /// Gracefully stopped.
+    Stopped,
+    /// Encountered an error during start or runtime.
+    Error(String),
+}
