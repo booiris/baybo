@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aura_channels::{IncomingMessage, OutgoingMessage};
-use aura_hook::{HookContext, HookManager, HookPoint};
+use aura_hook::{HookContext, HookEventData, HookManager, HookPoint};
 use aura_model::ContentBlock;
 use aura_session::Session;
 use tokio::sync::mpsc;
@@ -143,6 +143,7 @@ impl AgentActor {
         let mut hook_ctx = HookContext {
             session_id: self.session.id.clone(),
             user_id: Some(self.session.user.id.clone()),
+            event_data: HookEventData::PreMessage,
             message: Some(message_clone),
             response: None,
             job_id: None,
@@ -163,6 +164,7 @@ impl AgentActor {
         let mut hook_ctx = HookContext {
             session_id: self.session.id.clone(),
             user_id: Some(self.session.user.id.clone()),
+            event_data: HookEventData::PreResponse,
             message: None,
             response: Some(response.clone()),
             job_id: None,

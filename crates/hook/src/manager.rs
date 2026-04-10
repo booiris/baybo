@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use crate::Result;
 use tracing::{debug, warn};
 
-use crate::{Hook, HookAction, HookContext, HookPoint};
+use crate::{Hook, HookAction, HookContext, HookPoint, Result};
 
 /// Stores registered hooks and triggers them at the appropriate lifecycle points.
 ///
 /// Hooks for the same `HookPoint` are executed serially in registration order.
+/// Decision precedence: `Abort` > `Block` > `ContinueWith` > `Continue`.
 pub struct HookManager {
     hooks: HashMap<HookPoint, Vec<RegisteredHook>>,
 }
@@ -37,19 +37,41 @@ impl HookManager {
 
     /// Trigger all hooks registered for the given point, in order.
     ///
-    /// Returns the final `HookAction`:
-    /// - `Continue` if all hooks returned `Continue` or `ContinueWith`
-    /// - `Abort` if any hook aborted the chain
+    /// Decision precedence across all hooks:
+    /// - `Abort` stops execution immediately; no further hooks run.
+    /// - `Block` records the block but remaining hooks still fire (for observability).
+    /// - `ContinueWith` modifications are applied as they arrive.
+    /// - `Continue` has no effect.
     ///
-    /// `ContinueWith` modifications are applied to `ctx` as they arrive,
-    /// so later hooks see changes made by earlier ones.
+    /// Returns the most restrictive action seen across all hooks.
     pub async fn trigger(&self, point: HookPoint, ctx: &mut HookContext) -> Result<HookAction> {
         let Some(hooks) = self.hooks.get(&point) else {
             return Ok(HookAction::Continue);
         };
 
+        let matcher_target = ctx.event_data.matcher_target().map(|s| s.to_string());
+        let mut final_block: Option<String> = None;
+
         for registered in hooks {
             let hook_name = registered.hook.name();
+
+            // Evaluate matcher: skip this hook if the matcher doesn't match.
+            if let Some(matcher) = registered.hook.matcher() {
+                match &matcher_target {
+                    Some(target) => {
+                        if !matcher.matches(target) {
+                            continue;
+                        }
+                    }
+                    // Event has no matcher target — only All matchers fire.
+                    None => {
+                        if !matcher.matches("") {
+                            continue;
+                        }
+                    }
+                }
+            }
+
             debug!("Executing hook '{}' at {:?}", hook_name, point);
 
             let result = registered.hook.execute(ctx).await;
@@ -58,6 +80,20 @@ impl HookManager {
                 Ok(HookAction::Continue) => {}
                 Ok(HookAction::ContinueWith(modification)) => {
                     ctx.apply(*modification);
+                }
+                Ok(HookAction::Block(reason)) => {
+                    if point.supports_block() {
+                        debug!("Hook '{}' blocked: {}", hook_name, reason);
+                        // Record the first block reason; remaining hooks still fire.
+                        if final_block.is_none() {
+                            final_block = Some(reason);
+                        }
+                    } else {
+                        warn!(
+                            "Hook '{}' returned Block at {:?} which does not support blocking, treating as Continue",
+                            hook_name, point
+                        );
+                    }
                 }
                 Ok(HookAction::Abort(reason)) => {
                     debug!("Hook '{}' aborted: {}", hook_name, reason);
@@ -76,7 +112,10 @@ impl HookManager {
             }
         }
 
-        Ok(HookAction::Continue)
+        match final_block {
+            Some(reason) => Ok(HookAction::Block(reason)),
+            None => Ok(HookAction::Continue),
+        }
     }
 }
 
@@ -96,6 +135,8 @@ mod tests {
 
     use super::*;
     use crate::HookModification;
+    use crate::event::HookEventData;
+    use crate::matcher::HookMatcher;
 
     // -- helpers --
 
@@ -161,6 +202,25 @@ mod tests {
         }
     }
 
+    struct BlockHook {
+        hook_name: &'static str,
+        point: HookPoint,
+        reason: String,
+    }
+
+    #[async_trait]
+    impl Hook for BlockHook {
+        fn name(&self) -> &str {
+            self.hook_name
+        }
+        fn hook_point(&self) -> HookPoint {
+            self.point
+        }
+        async fn execute(&self, _ctx: &mut HookContext) -> Result<HookAction> {
+            Ok(HookAction::Block(self.reason.clone()))
+        }
+    }
+
     struct CountingHook {
         hook_name: &'static str,
         point: HookPoint,
@@ -203,10 +263,52 @@ mod tests {
         }
     }
 
+    struct MatchedHook {
+        hook_name: &'static str,
+        point: HookPoint,
+        hook_matcher: HookMatcher,
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Hook for MatchedHook {
+        fn name(&self) -> &str {
+            self.hook_name
+        }
+        fn hook_point(&self) -> HookPoint {
+            self.point
+        }
+        fn matcher(&self) -> Option<&HookMatcher> {
+            Some(&self.hook_matcher)
+        }
+        async fn execute(&self, _ctx: &mut HookContext) -> Result<HookAction> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(HookAction::Continue)
+        }
+    }
+
     fn make_ctx() -> HookContext {
         HookContext {
             session_id: "sess-1".into(),
             user_id: None,
+            event_data: HookEventData::PreMessage,
+            message: None,
+            response: None,
+            job_id: None,
+            trace_span_id: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    fn make_tool_ctx(tool_name: &str) -> HookContext {
+        HookContext {
+            session_id: "sess-1".into(),
+            user_id: None,
+            event_data: HookEventData::PreToolUse {
+                tool_name: tool_name.to_string(),
+                tool_input: serde_json::Value::Null,
+                tool_use_id: "tu-1".into(),
+            },
             message: None,
             response: None,
             job_id: None,
@@ -296,6 +398,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_does_not_stop_chain() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut manager = HookManager::new();
+
+        // PreToolUse supports blocking
+        manager.register(BlockHook {
+            hook_name: "blocker",
+            point: HookPoint::PreToolUse,
+            reason: "unsafe".into(),
+        });
+        manager.register(CountingHook {
+            hook_name: "observer",
+            point: HookPoint::PreToolUse,
+            counter: counter.clone(),
+        });
+
+        let mut ctx = make_tool_ctx("bash");
+        let action = manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+
+        // Block is returned as final action...
+        assert!(matches!(action, HookAction::Block(ref r) if r == "unsafe"));
+        // ...but the remaining hook still fired.
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn block_on_non_blocking_point_treated_as_continue() {
+        let mut manager = HookManager::new();
+
+        // PostMessage does NOT support blocking
+        manager.register(BlockHook {
+            hook_name: "blocker",
+            point: HookPoint::PostMessage,
+            reason: "nope".into(),
+        });
+
+        let mut ctx = HookContext {
+            session_id: "sess-1".into(),
+            user_id: None,
+            event_data: HookEventData::PostMessage,
+            message: None,
+            response: None,
+            job_id: None,
+            trace_span_id: None,
+            extra: HashMap::new(),
+        };
+        let action = manager
+            .trigger(HookPoint::PostMessage, &mut ctx)
+            .await
+            .unwrap();
+
+        // Treated as Continue because PostMessage doesn't support blocking
+        assert!(matches!(action, HookAction::Continue));
+    }
+
+    #[tokio::test]
+    async fn abort_takes_precedence_over_block() {
+        let mut manager = HookManager::new();
+
+        manager.register(BlockHook {
+            hook_name: "blocker",
+            point: HookPoint::PreToolUse,
+            reason: "blocked".into(),
+        });
+        manager.register(AbortHook {
+            hook_name: "aborter",
+            point: HookPoint::PreToolUse,
+            reason: "fatal".into(),
+        });
+
+        let mut ctx = make_tool_ctx("bash");
+        let action = manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+
+        // Abort wins over Block
+        assert!(matches!(action, HookAction::Abort(ref r) if r == "fatal"));
+    }
+
+    #[tokio::test]
     async fn hooks_execute_in_registration_order() {
         let counter = Arc::new(AtomicUsize::new(0));
         let mut manager = HookManager::new();
@@ -309,7 +495,16 @@ mod tests {
             });
         }
 
-        let mut ctx = make_ctx();
+        let mut ctx = HookContext {
+            session_id: "sess-1".into(),
+            user_id: None,
+            event_data: HookEventData::PostMessage,
+            message: None,
+            response: None,
+            job_id: None,
+            trace_span_id: None,
+            extra: HashMap::new(),
+        };
         manager
             .trigger(HookPoint::PostMessage, &mut ctx)
             .await
@@ -388,5 +583,155 @@ mod tests {
 
         assert_eq!(counter_a.load(Ordering::SeqCst), 1);
         assert_eq!(counter_b.load(Ordering::SeqCst), 0);
+    }
+
+    // -- Matcher tests --
+
+    #[tokio::test]
+    async fn matcher_exact_filters_tool_name() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut manager = HookManager::new();
+
+        manager.register(MatchedHook {
+            hook_name: "bash-only",
+            point: HookPoint::PreToolUse,
+            hook_matcher: HookMatcher::parse("bash").unwrap(),
+            counter: counter.clone(),
+        });
+
+        // Matching tool name
+        let mut ctx = make_tool_ctx("bash");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Non-matching tool name
+        let mut ctx = make_tool_ctx("edit");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1); // still 1
+    }
+
+    #[tokio::test]
+    async fn matcher_one_of_filters_tool_name() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut manager = HookManager::new();
+
+        manager.register(MatchedHook {
+            hook_name: "write-hooks",
+            point: HookPoint::PreToolUse,
+            hook_matcher: HookMatcher::parse("edit|write").unwrap(),
+            counter: counter.clone(),
+        });
+
+        let mut ctx = make_tool_ctx("edit");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let mut ctx = make_tool_ctx("write");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let mut ctx = make_tool_ctx("bash");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2); // not incremented
+    }
+
+    #[tokio::test]
+    async fn matcher_regex_filters_tool_name() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut manager = HookManager::new();
+
+        manager.register(MatchedHook {
+            hook_name: "wasm-hooks",
+            point: HookPoint::PreToolUse,
+            hook_matcher: HookMatcher::parse("^wasm__.*").unwrap(),
+            counter: counter.clone(),
+        });
+
+        let mut ctx = make_tool_ctx("wasm__memory__create");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let mut ctx = make_tool_ctx("builtin__bash");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1); // not incremented
+    }
+
+    #[tokio::test]
+    async fn no_matcher_fires_on_all() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut manager = HookManager::new();
+
+        // Hook without matcher (returns None) should fire on all tool names
+        manager.register(CountingHook {
+            hook_name: "catch-all",
+            point: HookPoint::PreToolUse,
+            counter: counter.clone(),
+        });
+
+        let mut ctx = make_tool_ctx("bash");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let mut ctx = make_tool_ctx("anything");
+        manager
+            .trigger(HookPoint::PreToolUse, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn matcher_on_event_without_target_only_all_fires() {
+        let counter_all = Arc::new(AtomicUsize::new(0));
+        let counter_exact = Arc::new(AtomicUsize::new(0));
+        let mut manager = HookManager::new();
+
+        // All matcher (no matcher = match all)
+        manager.register(CountingHook {
+            hook_name: "all",
+            point: HookPoint::PreMessage,
+            counter: counter_all.clone(),
+        });
+
+        // Exact matcher on an event with no matcher target
+        manager.register(MatchedHook {
+            hook_name: "exact",
+            point: HookPoint::PreMessage,
+            hook_matcher: HookMatcher::parse("something").unwrap(),
+            counter: counter_exact.clone(),
+        });
+
+        let mut ctx = make_ctx(); // PreMessage has no matcher target
+        manager
+            .trigger(HookPoint::PreMessage, &mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(counter_all.load(Ordering::SeqCst), 1); // fires
+        assert_eq!(counter_exact.load(Ordering::SeqCst), 0); // skipped
     }
 }

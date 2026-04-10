@@ -8,7 +8,9 @@ aura-channels = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
