@@ -17,6 +17,7 @@ pub mod tool_executor;
 pub mod trace;
 
 pub use agent_loop::AgentLoop;
+pub use cost::{CostGuard, CostGuardError, SpendingLimits};
 pub use cron::{CronScheduler, CronTriggerEvent};
 pub use job::JobManager;
 pub use memory::MemoryManager;

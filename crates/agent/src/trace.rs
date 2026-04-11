@@ -130,21 +130,30 @@ impl TraceCollector {
     pub fn active_leaf(&self) -> &TraceNodeId {
         &self.session_trace.active_leaf
     }
+
+    /// Fork the trace tree from the specified node, creating a new branch.
+    ///
+    /// Used by the rollback mechanism: `AgentActor` reads the snapshot
+    /// attached to (or nearest to) `from_node`, then forks the trace so
+    /// subsequent spans are recorded on the new branch.
+    pub fn fork_from(&mut self, from_node: TraceNodeId) -> Result<String> {
+        let fork_id = aura_trace::fork::fork_from(&mut self.session_trace, from_node, "")?;
+        Ok(fork_id)
+    }
+
+    /// Find the nearest context snapshot at or above the given node.
+    ///
+    /// Walks the parent chain until a node with an attached `ContextSnapshot`
+    /// is found. Used by the rollback mechanism to restore session state.
+    pub fn find_snapshot_at(&self, node_id: &TraceNodeId) -> Result<ContextSnapshot> {
+        aura_trace::snapshot::find_nearest_snapshot(&self.session_trace, node_id)
+    }
 }
 
 #[cfg(test)]
 impl TraceCollector {
     fn session_trace(&self) -> &SessionTrace {
         &self.session_trace
-    }
-
-    fn fork_from(&mut self, from_node: TraceNodeId) -> Result<String> {
-        let fork_id = aura_trace::fork::fork_from(&mut self.session_trace, from_node, "")?;
-        Ok(fork_id)
-    }
-
-    fn get_snapshot_at(&self, node_id: TraceNodeId) -> Result<ContextSnapshot> {
-        aura_trace::snapshot::find_nearest_snapshot(&self.session_trace, &node_id)
     }
 }
 
@@ -330,7 +339,7 @@ mod tests {
             },
         );
 
-        let found = collector.get_snapshot_at(child_id).unwrap();
+        let found = collector.find_snapshot_at(&child_id).unwrap();
         assert_eq!(found.token_count, 42);
     }
 }

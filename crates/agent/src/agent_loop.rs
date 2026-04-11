@@ -9,7 +9,8 @@ use aura_model::{ChatMessage, ContentBlock, Role};
 use crate::memory::MemoryManager;
 use aura_session::Session;
 use aura_tools::ToolRegistry;
-use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
+use aura_skills::SkillRegistry;
+use aura_trace::{ExecutionProvenance, SpanInput, SpanResult, TraceNodeId};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -23,6 +24,7 @@ use crate::tool_executor::ToolExecutor;
 pub struct AgentLoop {
     llm_client: Arc<LlmClient>,
     tool_registry: Arc<ToolRegistry>,
+    skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
     context_manager: ContextManager,
     memory_manager: Arc<MemoryManager>,
@@ -32,9 +34,11 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         llm_client: Arc<LlmClient>,
         tool_registry: Arc<ToolRegistry>,
+        skill_registry: Arc<SkillRegistry>,
         tool_executor: Arc<ToolExecutor>,
         context_manager: ContextManager,
         memory_manager: Arc<MemoryManager>,
@@ -44,6 +48,7 @@ impl AgentLoop {
         Self {
             llm_client,
             tool_registry,
+            skill_registry,
             tool_executor,
             context_manager,
             memory_manager,
@@ -88,9 +93,38 @@ impl AgentLoop {
         // Append user message (auto-compresses if over token budget)
         let user_msg = ChatMessage {
             role: Role::User,
-            content: user_content,
+            content: user_content.clone(),
         };
         self.context_manager.append(session, &user_msg).await?;
+
+        // Skill selection: check if a skill matches the user message.
+        // If a command/pattern skill matches, inject its prompt template so
+        // the LLM operates within the skill's declared constraints.
+        let user_text = aura_llm::multimodal::extract_text(&user_content);
+        let skill_candidates = self.skill_registry.select(&user_text);
+        let active_skill = skill_candidates.first().filter(|c| c.score >= 0.8);
+        let allowed_tools: Option<Vec<String>> = active_skill.map(|c| {
+            debug!(
+                skill = %c.skill.name,
+                score = c.score,
+                "skill selected"
+            );
+            session.state.active_skill = Some(c.skill.name.clone());
+
+            // Inject the skill prompt template into the context.
+            let skill_msg = ChatMessage {
+                role: Role::System,
+                content: vec![ContentBlock::Text(format!(
+                    "[Skill: {}]\n{}",
+                    c.skill.name, c.skill.prompt_template
+                ))],
+            };
+            // Append synchronously is fine here — we already appended above.
+            // We'll handle the Result at the top of the loop.
+            session.messages.push(skill_msg);
+
+            c.skill.allowed_tools.clone()
+        });
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -101,9 +135,18 @@ impl AgentLoop {
             }
             iterations += 1;
 
+            // Proactive compression before building the ChatRequest
+            if let Some(stats) = self.context_manager.maybe_compress(session).await? {
+                debug!(
+                    before = stats.before_tokens,
+                    after = stats.after_tokens,
+                    "compressed context before LLM call"
+                );
+            }
+
             // Call LLM with retry on transient errors
             let response = self
-                .call_llm_with_retry(session, recorder, parent_job_id)
+                .call_llm_with_retry(session, recorder, parent_job_id, allowed_tools.as_deref())
                 .await?;
 
             // Auto-snapshot after LLM call if the interval has been reached
@@ -207,10 +250,14 @@ impl AgentLoop {
         session: &Session,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
+        allowed_tools: Option<&[String]>,
     ) -> anyhow::Result<LlmResponse> {
         let mut attempt = 0u32;
         loop {
-            match self.call_llm(session, recorder, parent_job_id).await {
+            match self
+                .call_llm(session, recorder, parent_job_id, allowed_tools)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if !self.error_handler.should_retry(attempt, &e) {
@@ -231,11 +278,16 @@ impl AgentLoop {
     }
 
     /// Call the LLM with the current session context.
+    ///
+    /// When `allowed_tools` is `Some`, only tools whose names appear in the
+    /// list are sent to the model. This is used by the skill system to
+    /// restrict tool access according to the skill's `allowed_tools` field.
     async fn call_llm(
         &self,
         session: &Session,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
+        allowed_tools: Option<&[String]>,
     ) -> anyhow::Result<LlmResponse> {
         let model_id = self.llm_client.model_id().to_string();
 
@@ -262,6 +314,13 @@ impl AgentLoop {
             .tool_registry
             .tool_definitions()
             .into_iter()
+            .filter(|td| {
+                // When a skill restricts tools, only include those in the allowlist.
+                match allowed_tools {
+                    Some(list) => list.iter().any(|name| name == &td.name),
+                    None => true,
+                }
+            })
             .map(|td| ToolDefinitionForLlm {
                 name: td.name,
                 description: td.description,
@@ -355,5 +414,26 @@ impl AgentLoop {
                 },
             );
         }
+    }
+
+    /// Roll back the session to a previous trace node.
+    ///
+    /// Reads the snapshot from `ObservabilityRecorder`, forks the trace tree,
+    /// and restores the session messages and context budget from the snapshot.
+    pub async fn rollback(
+        &mut self,
+        session: &mut Session,
+        recorder: &ObservabilityRecorder,
+        target_node: TraceNodeId,
+    ) -> anyhow::Result<()> {
+        let snapshot = recorder.rollback_to(&target_node).await?;
+        self.context_manager.restore(session, &snapshot)?;
+        info!(
+            target = %target_node,
+            restored_messages = snapshot.messages.len(),
+            restored_tokens = snapshot.token_count,
+            "session rolled back"
+        );
+        Ok(())
     }
 }

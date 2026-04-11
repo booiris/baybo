@@ -155,4 +155,19 @@ impl ObservabilityRecorder {
         let mut collector = self.trace_collector.lock().await;
         Ok(collector.attach_snapshot(node_id, snapshot)?)
     }
+
+    /// Find the nearest context snapshot at or above `target_node`, then fork
+    /// the trace tree so subsequent spans are recorded on a new branch.
+    ///
+    /// Returns the snapshot that was found.  The caller uses it to restore
+    /// the session's message history and context budget.
+    pub async fn rollback_to(
+        &self,
+        target_node: &TraceNodeId,
+    ) -> anyhow::Result<ContextSnapshot> {
+        let mut collector = self.trace_collector.lock().await;
+        let snapshot = collector.find_snapshot_at(target_node)?;
+        collector.fork_from(target_node.clone())?;
+        Ok(snapshot)
+    }
 }

@@ -117,6 +117,62 @@ impl ContextManager {
         Ok(Some(stats))
     }
 
+    /// Check the token budget and compress if the threshold is exceeded.
+    ///
+    /// Unlike `append()` which auto-compresses after adding a message, this
+    /// method is designed for the top of the agent loop to proactively compress
+    /// before building the next `ChatRequest`.
+    pub async fn maybe_compress(
+        &mut self,
+        session: &mut Session,
+    ) -> crate::Result<Option<CompressStats>> {
+        self.budget.update(self.count_tokens(&session.messages));
+
+        if !self.budget.needs_compression() {
+            return Ok(None);
+        }
+
+        let start = Instant::now();
+        let before_tokens = self.budget.current();
+        let before_len = session.messages.len();
+
+        let output = self
+            .strategy
+            .compress(&session.messages, &*self.tokenizer)
+            .await?;
+
+        session.messages = output.messages;
+        let after_tokens = self.count_tokens(&session.messages);
+        self.budget.update(after_tokens);
+
+        if session.messages.len() >= before_len {
+            return Ok(None);
+        }
+
+        if after_tokens > self.budget.max_tokens() {
+            warn!(
+                after_tokens,
+                max_tokens = self.budget.max_tokens(),
+                "token count still exceeds max_tokens after proactive compression"
+            );
+        }
+
+        let stats = CompressStats {
+            before_tokens,
+            after_tokens,
+            latency: start.elapsed(),
+        };
+
+        debug!(
+            before = stats.before_tokens,
+            after = stats.after_tokens,
+            latency_ms = stats.latency.as_millis() as u64,
+            "proactive context compression"
+        );
+
+        Ok(Some(stats))
+    }
+
     /// Read-only access to the token budget.
     pub fn budget(&self) -> &TokenBudget {
         &self.budget

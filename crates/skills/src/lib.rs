@@ -1,3 +1,7 @@
+pub mod registry;
+
+pub use registry::{SkillCandidate, SkillRegistry};
+
 use aura_registry::{ArtifactSource, TrustLevel};
 use serde::{Deserialize, Serialize};
 

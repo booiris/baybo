@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use aura_channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
 use aura_session::{Session, User};
 
+use crate::cost::CostGuard;
 use crate::cron::CronTriggerEvent;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
@@ -11,6 +14,45 @@ use tracing::{debug, error, info, warn};
 
 use crate::actor::AgentMessage;
 use crate::supervisor::AgentSupervisor;
+
+/// Per-user sliding-window rate limiter.
+///
+/// Tracks timestamps of recent requests per user and rejects requests that
+/// exceed the configured limit within the window.
+pub(crate) struct RateLimiter {
+    /// Maximum requests allowed within the window.
+    max_requests: usize,
+    /// Sliding window duration.
+    window: std::time::Duration,
+    /// Per-user request timestamps.
+    requests: HashMap<String, Vec<Instant>>,
+}
+
+impl RateLimiter {
+    pub(crate) fn new(max_requests: usize, window: std::time::Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            requests: HashMap::new(),
+        }
+    }
+
+    /// Returns `true` if the request is allowed, `false` if rate-limited.
+    pub(crate) fn check(&mut self, user_id: &str) -> bool {
+        let now = Instant::now();
+        let timestamps = self.requests.entry(user_id.to_string()).or_default();
+
+        // Evict entries outside the window.
+        timestamps.retain(|&t| now.duration_since(t) < self.window);
+
+        if timestamps.len() >= self.max_requests {
+            return false;
+        }
+
+        timestamps.push(now);
+        true
+    }
+}
 
 /// A callback that creates and spawns a new AgentActor for a given session.
 ///
@@ -26,9 +68,15 @@ pub struct Router {
     supervisor: AgentSupervisor,
     channels: ChannelRegistry,
     security_gateway: Arc<SecurityGateway>,
+    cost_guard: Option<Arc<CostGuard>>,
+    rate_limiter: RateLimiter,
     actor_spawner: Option<ActorSpawner>,
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
 }
+
+/// Default rate limit: 30 requests per 60 seconds per user.
+const DEFAULT_RATE_LIMIT_REQUESTS: usize = 30;
+const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 impl Router {
     pub fn new(
@@ -42,9 +90,26 @@ impl Router {
             supervisor,
             channels,
             security_gateway,
+            cost_guard: None,
+            rate_limiter: RateLimiter::new(
+                DEFAULT_RATE_LIMIT_REQUESTS,
+                std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
+            ),
             actor_spawner: None,
             cron_trigger_rx: None,
         }
+    }
+
+    /// Set a `CostGuard` for quota checks before routing messages.
+    pub fn with_cost_guard(mut self, guard: Arc<CostGuard>) -> Self {
+        self.cost_guard = Some(guard);
+        self
+    }
+
+    /// Override the default rate limiter settings.
+    pub fn with_rate_limit(mut self, max_requests: usize, window: std::time::Duration) -> Self {
+        self.rate_limiter = RateLimiter::new(max_requests, window);
+        self
     }
 
     /// Set an actor spawner for on-demand actor creation.
@@ -164,6 +229,29 @@ impl Router {
         let channel = incoming.message.channel;
 
         debug!(session_id = %session_id, user_id = %user.id, "routing message");
+
+        // User-level rate limiting
+        if !self.rate_limiter.check(&user.id) {
+            warn!(
+                user_id = %user.id,
+                session_id = %session_id,
+                "user rate-limited"
+            );
+            anyhow::bail!("rate limit exceeded for user '{}'", user.id);
+        }
+
+        // Quota check via CostGuard
+        if let Some(ref guard) = self.cost_guard {
+            guard.check_quota(&user.id).await.map_err(|e| {
+                warn!(
+                    user_id = %user.id,
+                    session_id = %session_id,
+                    error = %e,
+                    "cost guard rejected request"
+                );
+                anyhow::anyhow!(e)
+            })?;
+        }
 
         // Get or create session
         let mut session = self

@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::AgentLoop;
 use crate::observability::ObservabilityRecorder;
+use aura_trace::TraceNodeId;
 
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
@@ -17,6 +18,11 @@ pub enum AgentMessage {
     UserInput(Box<IncomingMessage>),
     /// A cron job fired.
     CronTrigger { job_id: String, prompt: String },
+    /// Roll back the session to a previous trace node.
+    ///
+    /// Reads the nearest snapshot from `TraceCollector`, forks the trace tree,
+    /// and restores the session messages and context state from the snapshot.
+    Rollback { target_node: TraceNodeId },
     /// Gracefully shut down this actor.
     Shutdown,
 }
@@ -73,6 +79,20 @@ impl AgentActor {
                         );
                     }
                 }
+                AgentMessage::Rollback { target_node } => {
+                    debug!(
+                        session_id = %self.session.id,
+                        target = %target_node,
+                        "received rollback request"
+                    );
+                    if let Err(e) = self.handle_rollback(target_node).await {
+                        error!(
+                            session_id = %self.session.id,
+                            error = %e,
+                            "failed to handle rollback"
+                        );
+                    }
+                }
                 AgentMessage::Shutdown => {
                     debug!(session_id = %self.session.id, "actor shutting down");
                     break;
@@ -108,6 +128,12 @@ impl AgentActor {
             warn!(error = %e, "failed to send {source} response to channel");
         }
         Ok(())
+    }
+
+    async fn handle_rollback(&mut self, target_node: TraceNodeId) -> anyhow::Result<()> {
+        self.agent_loop
+            .rollback(&mut self.session, &self.recorder, target_node)
+            .await
     }
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {

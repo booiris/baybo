@@ -7,3 +7,4 @@ edition.workspace = true
 aura-registry = { workspace = true }
 serde = { workspace = true }
 regex = { workspace = true }
+tracing = { workspace = true }
