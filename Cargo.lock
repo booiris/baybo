@@ -161,6 +161,7 @@ dependencies = [
  "aura-sandbox",
  "aura-security",
  "aura-session",
+ "aura-skills",
  "aura-storage",
  "aura-tools",
  "aura-trace",
@@ -189,6 +190,7 @@ dependencies = [
  "aura-sandbox",
  "aura-security",
  "aura-session",
+ "aura-skills",
  "aura-storage",
  "aura-tools",
  "aura-trace",
@@ -219,6 +221,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -370,6 +373,7 @@ dependencies = [
  "aura-registry",
  "regex",
  "serde",
+ "tracing",
 ]
 
 [[package]]

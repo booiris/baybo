@@ -101,6 +101,7 @@ aura-hook = { workspace = true }
 aura-agent = { workspace = true }
 aura-sandbox = { workspace = true }
 aura-storage = { workspace = true }
+aura-skills = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

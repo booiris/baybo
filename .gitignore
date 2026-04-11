@@ -3,3 +3,4 @@ temp
 **/target
 index.scip
 .codex
+.env

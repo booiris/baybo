@@ -1,7 +1,9 @@
+pub mod cli;
 mod error;
 mod registry;
 mod types;
 
+pub use cli::CliAdapter;
 pub use error::ChannelError;
 pub use registry::ChannelRegistry;
 pub use types::{ChannelStatus, IncomingMessage, Message, OutgoingMessage};

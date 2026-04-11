@@ -12,7 +12,7 @@ use aura_agent::{
     CronScheduler, JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager,
     TraceCollector,
 };
-use aura_channels::ChannelRegistry;
+use aura_channels::{ChannelRegistry, CliAdapter};
 use aura_context::{ContextManager, TokenBudget, Tokenizer, Truncate};
 use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
 
@@ -20,6 +20,7 @@ use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_model::{ChatMessage, ContentBlock};
 use aura_security::{EncryptionKey, LeakDetector};
 use aura_storage::Store;
+use aura_skills::SkillRegistry;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 use std::path::PathBuf;
@@ -209,10 +210,22 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&secret_vault),
     ));
 
+    // Channel registry — register the CLI adapter
+    let mut channels = ChannelRegistry::new();
+    channels
+        .register(Box::new(CliAdapter::new()))
+        .expect("failed to register CLI adapter");
+    channels
+        .start_all(incoming_tx)
+        .await
+        .expect("failed to start channels");
+
     // Supervisor and Router
     let supervisor = AgentSupervisor::new(response_tx);
+    let skill_registry = Arc::new(SkillRegistry::new());
     let actor_llm_client = Arc::clone(&llm_client);
     let actor_tool_registry = Arc::clone(&tool_registry);
+    let actor_skill_registry = Arc::clone(&skill_registry);
     let actor_tool_executor = Arc::clone(&tool_executor);
     let actor_memory_manager = Arc::clone(&memory_manager);
     let actor_policy = policy.clone();
@@ -224,13 +237,14 @@ async fn main() -> anyhow::Result<()> {
     let router = Router::new(
         session_manager,
         supervisor,
-        ChannelRegistry::new(),
+        channels,
         security_gateway,
     )
     .with_actor_spawner(Box::new(move |session, response_tx| {
         let agent_loop = AgentLoop::new(
             Arc::clone(&actor_llm_client),
             Arc::clone(&actor_tool_registry),
+            Arc::clone(&actor_skill_registry),
             Arc::clone(&actor_tool_executor),
             ContextManager::new(
                 Arc::clone(&actor_tokenizer),
@@ -293,11 +307,10 @@ async fn main() -> anyhow::Result<()> {
 
     let router = router.with_cron_triggers(cron_trigger_rx);
 
-    // Drop the incoming sender so the router can detect shutdown
-    // In a real deployment, channels would hold these senders
-    drop(incoming_tx);
-
     // Run router with shutdown awareness
+    // The CLI adapter's background task holds a clone of the incoming sender.
+    // When the user types /quit or the adapter is stopped, the sender is
+    // dropped and the router's incoming channel closes naturally.
     let router_shutdown = shutdown.clone();
     tokio::select! {
         _ = router.run(incoming_rx, response_rx) => {}
