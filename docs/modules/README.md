@@ -7,7 +7,7 @@ Each document covers: module responsibilities, design decisions, key constraints
 Bottom-up along the dependency graph:
 
 1. [model.md](model.md) → [session.md](session.md) → [channels.md](channels.md)
-2. [job.md](job.md) → [registry.md](registry.md) → [skills.md](skills.md)
+2. [job.md](job.md) → [cron.md](cron.md) → [registry.md](registry.md) → [skills.md](skills.md)
 3. [llm.md](llm.md) → [security.md](security.md) → [sandbox.md](sandbox.md)
 4. [tools.md](tools.md) → [workspace.md](workspace.md) → [context.md](context.md)
 5. [trace.md](trace.md) → [hook.md](hook.md)
@@ -32,7 +32,8 @@ Bottom-up along the dependency graph:
 - **tools** — Tool abstraction, registration, capability declarations, runtime routing. MCP client support via `rmcp`.
 - **registry** — Extension artifact verification and installation governance. Owns TrustLevel, ArtifactSource.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.
-- **workspace** — Identity files, heartbeat, and routine configuration.
+- **workspace** — Identity files and long-running configuration.
+- **cron** — Cron job domain types (`CronJob`, `CronExecution`, `CronStatus`, `CronRunMode`, `CronError`). Standard cron syntax.
 - **context** — Context appending, compression, snapshots, restoration.
 
 ### Runtime and Observability Layer
@@ -43,8 +44,8 @@ Bottom-up along the dependency graph:
 
 ### Infrastructure and Assembly Layer
 
-- **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`); implements all via libsql (single backend).
-- **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, ObservabilityRecorder, cost management (CostTracker, CostGuard), plus all domain managers (SessionManager, MemoryManager, TraceCollector, JobManager, SecretVault, SecurityGateway).
+- **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate.
+- **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, ObservabilityRecorder, cost management (CostTracker, CostGuard), plus all domain managers (SessionManager, MemoryManager, TraceCollector, JobManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
 ## Dependency Overview
 
 ```
@@ -63,8 +64,8 @@ model
   └── workspace (no internal deps)
   └── sandbox (no internal deps)
 
-storage ──► model, session, trace, security, job (defines all Store traits; sole backend: libsql)
-agent   ──► model, llm, tools, workspace, context, session, trace, job, security, storage, hook, sandbox, channels, registry
+storage ──► model, session, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
+agent   ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, sandbox, channels, registry
 ```
 
 ## Key Constraints
@@ -77,4 +78,4 @@ agent   ──► model, llm, tools, workspace, context, session, trace, job, se
 - The Job state machine is fixed: `Pending → InProgress → Completed → Submitted → Accepted` (with `Failed` and `Stuck` branches)
 - Multimedia passed by reference — no raw binary in sessions, snapshots, or Trace
 - Hot reload, tool updates, identity changes, and config changes must leave provenance records in Trace
-- Heartbeat, routine, cron, and background execution must all enter Job and Trace
+- Cron and background execution must all enter Job and Trace

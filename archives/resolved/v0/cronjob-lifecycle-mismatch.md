@@ -1,4 +1,9 @@
-# CronJob Lifecycle Mismatch: Bind to User, Not Session
+# [RESOLVED] CronJob Lifecycle Mismatch: Bind to User, Not Session
+
+> **Resolved**: Implemented in `aura-cron` crate and `agent::cron::CronScheduler`.
+> CronJob is now bound to `user_id + channel`. Session is resolved dynamically
+> at trigger time via `Router::handle_cron_trigger()` using stable session ID
+> `cron-{user_id}-{channel}`. Persistence via `CronStore` / `LibsqlCronStore`.
 
 ## Problem
 

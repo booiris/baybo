@@ -49,7 +49,7 @@ Two dimensions:
 - **Time-based**: `expires_at` computed from `auto_forget_days`; `forget_expired()` removes expired entries
 - **Count-based**: `max_entries_per_user` limit; evict by lowest importance, then oldest `last_accessed`
 
-Cleanup is triggered externally (cron, heartbeat); memory exposes methods but does not own a scheduler.
+Cleanup is triggered externally (cron); memory exposes methods but does not own a scheduler.
 
 #### Memory categories
 

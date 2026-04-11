@@ -30,6 +30,7 @@
         "reqwest",
         "rfind",
         "rmcp",
+        "rsproxy",
         "rusqlite",
         "Sandboxed",
         "sanitizable",

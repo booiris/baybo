@@ -9,18 +9,18 @@ Core responsibilities:
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
 - **Business logic managers**: `SessionManager`, `MemoryManager`, `TraceCollector`, `JobManager`, `SecretVault`, `SecurityGateway` — all domain managers live here
-- **Long-running execution**: heartbeat, routine, cron, background notifications
+- **Long-running execution**: cron scheduling, background notifications
 - **Unified observability**: wrapping Job, Trace, and Cost through `ObservabilityRecorder`
 - **Cost management**: `CostTracker` for recording, `CostGuard` for spending limits (in `agent::cost`)
 - **Runtime logic**: error recovery, timeout control, rollback
 
-It does not own low-level storage or backend implementation — it consumes Store traits from `storage` through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
+It does not own low-level storage or backend implementation — it consumes Store traits from `storage` through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
 
 ## Design Decisions
 
 ### Actor isolation model
 
-One Actor per session: natural serialization within a session (no context races), natural concurrency across sessions. All control messages (rollback, timeout, cron, heartbeat, routine) route to the same actor.
+One Actor per session: natural serialization within a session (no context races), natural concurrency across sessions. All control messages (rollback, timeout, cron) route to the same actor.
 
 ### Main execution path (AgentLoop)
 
@@ -42,7 +42,7 @@ ToolExecutor: lookup tool → read declared secrets → determine sandbox/networ
 
 ### Long-running model
 
-Heartbeat, routine, and cron all flow through the Actor model and observability chain: `HeartbeatRunner/RoutineScheduler` → `AgentSupervisor` → `AgentMessage` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation.
+Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentSupervisor` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; sessions are resolved dynamically at trigger time.
 
 ### Rollback mechanism
 
@@ -71,7 +71,8 @@ Before a message enters an actor, Router completes: session identification/creat
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
 | `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager` |
-| `workspace` | Identity files, heartbeat config, routine definitions |
+| `workspace` | Identity files for system prompt |
+| `cron` | Provides `CronJob`, `CronExecution` domain types; `CronScheduler` in agent manages lifecycle, converts between domain and storage row types |
 | `context` | Conversation window and compression |
 | `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager`; startup recovery via `recover_interrupted()` |
 | `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |

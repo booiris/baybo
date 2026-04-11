@@ -36,7 +36,7 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 - **Observable**: Full call-chain tracing; Job system manages all async operation states; supports session replay, trace forking and rollback; logs/traces record only sanitized placeholders and summaries
 - **Reliable**: Built-in error recovery, retry, and degradation strategies
 - **Actor model**: Message events decoupled from execution via Actor-based concurrency
-- **Long-running**: Supports heartbeat, background routines, workspace identity files, and daemon-style operation
+- **Long-running**: Supports cron scheduling, workspace identity files, and daemon-style operation
 
 All I/O is async with tokio. Use `Arc<T>` for shared state, `RwLock` for concurrent access.
 

@@ -4,9 +4,9 @@
 
 The `workspace` crate manages Aura's persistent workspace and long-running configuration. It stores "identity and strategy," not ordinary conversation memory.
 
-Identity files: `AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`.
+Identity files: `AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`.
 
-It provides `agent` with long-term personality, identity injection, and the configuration source for heartbeat and routines.
+It provides `agent` with long-term personality and identity injection.
 
 ## Design Decisions
 
@@ -16,13 +16,8 @@ It provides `agent` with long-term personality, identity injection, and the conf
 - **SOUL.md**: personality, tone, and preferences
 - **USER.md**: long-term user profile
 - **IDENTITY.md**: system or instance identity description
-- **HEARTBEAT.md**: long-running plans and recurring tasks
 
 Identity file changes usually affect the system prompt; memory changes usually affect recall.
-
-### Workspace provides config, agent executes
-
-`workspace` only defines heartbeat/routine configuration. It does not schedule or execute anything. The execution chain: `HEARTBEAT.md` → `WorkspaceManager::load_heartbeat_spec()` → `agent::HeartbeatRunner / RoutineScheduler`.
 
 ### Boundary with memory
 
@@ -42,7 +37,7 @@ They complement each other without overlapping.
 
 | Module | Role |
 |--------|------|
-| `agent` | Reads identity files for system prompt and loads heartbeat/routine config |
+| `agent` | Reads identity files for system prompt |
 | `skills` | Provides trusted local skill directories |
 | `trace` | Identity file version changes are recorded in provenance |
 | `memory` | Complements without overlapping responsibility |
