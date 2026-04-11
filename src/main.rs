@@ -9,7 +9,8 @@ use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
-    JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager, TraceCollector,
+    CronScheduler, JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager,
+    TraceCollector,
 };
 use aura_channels::ChannelRegistry;
 use aura_context::{ContextManager, TokenBudget, Tokenizer, Truncate};
@@ -280,6 +281,17 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     info!("all components initialized, starting router");
+
+    // Cron scheduler
+    let (cron_trigger_tx, cron_trigger_rx) = mpsc::channel(64);
+    let cron_scheduler = CronScheduler::new(storage.cron, cron_trigger_tx, shutdown.clone());
+    let cron_scheduler = std::sync::Arc::new(cron_scheduler);
+    let cron_handle = std::sync::Arc::clone(&cron_scheduler);
+    task_tracker.track(tokio::spawn(async move {
+        cron_handle.run().await;
+    }));
+
+    let router = router.with_cron_triggers(cron_trigger_rx);
 
     // Drop the incoming sender so the router can detect shutdown
     // In a real deployment, channels would hold these senders

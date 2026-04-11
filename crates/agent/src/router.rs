@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use aura_channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
-use aura_session::Session;
+use aura_session::{Session, User};
 
+use crate::cron::CronTriggerEvent;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
 use tokio::sync::mpsc;
@@ -26,6 +27,7 @@ pub struct Router {
     channels: ChannelRegistry,
     security_gateway: Arc<SecurityGateway>,
     actor_spawner: Option<ActorSpawner>,
+    cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
 }
 
 impl Router {
@@ -41,12 +43,19 @@ impl Router {
             channels,
             security_gateway,
             actor_spawner: None,
+            cron_trigger_rx: None,
         }
     }
 
     /// Set an actor spawner for on-demand actor creation.
     pub fn with_actor_spawner(mut self, spawner: ActorSpawner) -> Self {
         self.actor_spawner = Some(spawner);
+        self
+    }
+
+    /// Set a receiver for cron trigger events.
+    pub fn with_cron_triggers(mut self, rx: mpsc::Receiver<CronTriggerEvent>) -> Self {
+        self.cron_trigger_rx = Some(rx);
         self
     }
 
@@ -58,6 +67,8 @@ impl Router {
     ) {
         info!(channel_count = self.channels.len(), "router starting");
 
+        let mut cron_rx = self.cron_trigger_rx.take();
+
         loop {
             tokio::select! {
                 Some(incoming) = incoming_rx.recv() => {
@@ -68,6 +79,16 @@ impl Router {
                 Some(outgoing) = response_rx.recv() => {
                     self.handle_outgoing(outgoing).await;
                 }
+                Some(event) = async {
+                    match cron_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Err(e) = self.handle_cron_trigger(event).await {
+                        error!(error = %e, "failed to handle cron trigger");
+                    }
+                }
                 else => {
                     info!("router channels closed, shutting down");
                     break;
@@ -76,6 +97,57 @@ impl Router {
         }
 
         self.supervisor.shutdown_all().await;
+    }
+
+    /// Handle a cron trigger by resolving (or creating) a session for the
+    /// target user+channel combination and routing a `CronTrigger` message.
+    async fn handle_cron_trigger(&mut self, event: CronTriggerEvent) -> anyhow::Result<()> {
+        // Stable session ID derived from user+channel so repeated cron
+        // triggers reuse a single session for conversational continuity.
+        let session_id = format!("cron-{}-{}", event.user_id, event.channel);
+
+        let user = User {
+            id: event.user_id.clone(),
+            name: None,
+            channel: event.channel,
+        };
+
+        debug!(
+            session_id = %session_id,
+            job_id = %event.job_id,
+            "routing cron trigger"
+        );
+
+        let session = self
+            .session_manager
+            .get_or_create(&session_id, user, event.channel)
+            .await?;
+
+        self.session_manager.touch(&session_id).await?;
+
+        let message = AgentMessage::CronTrigger {
+            job_id: event.job_id.clone(),
+            prompt: event.prompt,
+        };
+
+        let routed = self.supervisor.route(&session_id, message.clone()).await;
+
+        if !routed {
+            if let Some(ref spawner) = self.actor_spawner {
+                info!(session_id = %session_id, "creating new actor for cron session");
+                let response_tx = self.supervisor.response_tx().clone();
+                let sender = spawner(session, response_tx);
+                self.supervisor.register(session_id.clone(), sender);
+
+                if !self.supervisor.route(&session_id, message).await {
+                    warn!(session_id = %session_id, "failed to route cron trigger after actor creation");
+                }
+            } else {
+                warn!(session_id = %session_id, "no actor spawner configured for cron trigger");
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_incoming(&mut self, mut incoming: IncomingMessage) -> anyhow::Result<()> {

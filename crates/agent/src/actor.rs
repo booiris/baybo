@@ -17,10 +17,6 @@ pub enum AgentMessage {
     UserInput(Box<IncomingMessage>),
     /// A cron job fired.
     CronTrigger { job_id: String, prompt: String },
-    /// A heartbeat tick arrived.
-    HeartbeatTick,
-    /// A routine fired.
-    RoutineTrigger { routine_id: String, prompt: String },
     /// Gracefully shut down this actor.
     Shutdown,
 }
@@ -74,27 +70,6 @@ impl AgentActor {
                             job_id = %job_id,
                             error = %e,
                             "failed to handle cron trigger"
-                        );
-                    }
-                }
-                AgentMessage::HeartbeatTick => {
-                    debug!(session_id = %self.session.id, "received heartbeat tick");
-                    if let Err(e) = self.recorder.flush().await {
-                        warn!(
-                            session_id = %self.session.id,
-                            error = %e,
-                            "heartbeat: failed to flush observability data"
-                        );
-                    }
-                }
-                AgentMessage::RoutineTrigger { routine_id, prompt } => {
-                    debug!(session_id = %self.session.id, routine_id = %routine_id, "received routine trigger");
-                    if let Err(e) = self.dispatch_prompt(&prompt, "routine", &routine_id).await {
-                        error!(
-                            session_id = %self.session.id,
-                            routine_id = %routine_id,
-                            error = %e,
-                            "failed to handle routine trigger"
                         );
                     }
                 }

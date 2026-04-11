@@ -1,4 +1,5 @@
 pub mod cost;
+pub mod cron;
 pub mod error;
 pub mod job;
 pub mod libsql;
@@ -9,6 +10,7 @@ pub mod trace;
 use aura_session::SessionStore;
 
 pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+pub use cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 pub use error::StorageError;
 pub use job::JobStore;
 pub use memory::MemoryStore;
@@ -24,6 +26,7 @@ pub struct Store {
     pub secret: Box<dyn SecretStore>,
     pub cost: Box<dyn CostStore>,
     pub job: Box<dyn JobStore>,
+    pub cron: Box<dyn CronStore>,
 }
 
 impl Store {
@@ -36,7 +39,8 @@ impl Store {
             trace: Box::new(libsql::LibsqlTraceStore::new(pool.clone())),
             secret: Box::new(libsql::LibsqlSecretStore::new(pool.clone())),
             cost: Box::new(libsql::LibsqlCostStore::new(pool.clone())),
-            job: Box::new(libsql::LibsqlJobStore::new(pool)),
+            job: Box::new(libsql::LibsqlJobStore::new(pool.clone())),
+            cron: Box::new(libsql::LibsqlCronStore::new(pool)),
         })
     }
 }

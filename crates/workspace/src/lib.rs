@@ -1,4 +1,3 @@
-pub mod heartbeat;
 pub mod identity;
 
 use std::path::PathBuf;
@@ -23,20 +22,6 @@ impl WorkspaceManager {
 }
 
 #[cfg(test)]
-impl WorkspaceManager {
-    async fn load_heartbeat_spec(&self) -> anyhow::Result<Option<heartbeat::HeartbeatSpec>> {
-        let identity = self.load_identity_files().await?;
-        match identity.heartbeat {
-            Some(content) => {
-                let spec = heartbeat::parse_heartbeat(&content)?;
-                Ok(Some(spec))
-            }
-            None => Ok(None),
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -48,13 +33,5 @@ mod tests {
         assert!(files.soul.is_none());
         assert!(files.user.is_none());
         assert!(files.identity.is_none());
-        assert!(files.heartbeat.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_missing_heartbeat() {
-        let mgr = WorkspaceManager::new(PathBuf::from("/nonexistent/path"));
-        let spec = mgr.load_heartbeat_spec().await.unwrap();
-        assert!(spec.is_none());
     }
 }

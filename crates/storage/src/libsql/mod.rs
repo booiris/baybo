@@ -1,4 +1,5 @@
 mod cost;
+mod cron;
 mod job;
 mod memory;
 mod secret;
@@ -6,6 +7,7 @@ mod session;
 mod trace;
 
 pub use cost::LibsqlCostStore;
+pub use cron::LibsqlCronStore;
 pub use job::LibsqlJobStore;
 pub use memory::LibsqlMemoryStore;
 pub use secret::LibsqlSecretStore;
@@ -120,7 +122,31 @@ impl LibsqlPool {
                     job_id TEXT NOT NULL,
                     data   TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);",
+                CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);
+
+                CREATE TABLE IF NOT EXISTS cron_jobs (
+                    id              TEXT PRIMARY KEY,
+                    user_id         TEXT NOT NULL,
+                    status          TEXT NOT NULL,
+                    next_trigger_at TEXT NOT NULL DEFAULT '',
+                    data            TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
+                CREATE INDEX IF NOT EXISTS idx_cron_jobs_due ON cron_jobs(status, next_trigger_at);
+
+                CREATE TABLE IF NOT EXISTS cron_executions (
+                    id                  TEXT PRIMARY KEY,
+                    job_id              TEXT NOT NULL,
+                    user_id             TEXT NOT NULL,
+                    scheduled_fire_time TEXT NOT NULL DEFAULT '',
+                    triggered_at        TEXT NOT NULL,
+                    status              TEXT NOT NULL DEFAULT 'pending',
+                    data                TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_cron_executions_job_id ON cron_executions(job_id);
+                CREATE INDEX IF NOT EXISTS idx_cron_executions_user_id ON cron_executions(user_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_executions_dedup ON cron_executions(job_id, scheduled_fire_time);
+                CREATE INDEX IF NOT EXISTS idx_cron_executions_status ON cron_executions(status);",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;

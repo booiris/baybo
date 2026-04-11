@@ -11,8 +11,6 @@ pub struct IdentityFiles {
     pub user: Option<String>,
     /// IDENTITY.md - system or instance identity description.
     pub identity: Option<String>,
-    /// HEARTBEAT.md - long-running plans and recurring tasks.
-    pub heartbeat: Option<String>,
 }
 
 /// Reads a file if it exists, returning `None` for missing files.
@@ -31,14 +29,12 @@ pub async fn load_identity_files(root: &Path) -> anyhow::Result<IdentityFiles> {
     let soul_path = root.join("SOUL.md");
     let user_path = root.join("USER.md");
     let identity_path = root.join("IDENTITY.md");
-    let heartbeat_path = root.join("HEARTBEAT.md");
 
-    let (agents, soul, user, identity, heartbeat) = tokio::try_join!(
+    let (agents, soul, user, identity) = tokio::try_join!(
         read_optional_file(&agents_path),
         read_optional_file(&soul_path),
         read_optional_file(&user_path),
         read_optional_file(&identity_path),
-        read_optional_file(&heartbeat_path),
     )?;
 
     Ok(IdentityFiles {
@@ -46,7 +42,6 @@ pub async fn load_identity_files(root: &Path) -> anyhow::Result<IdentityFiles> {
         soul,
         user,
         identity,
-        heartbeat,
     })
 }
 

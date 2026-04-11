@@ -180,6 +180,7 @@ dependencies = [
  "async-trait",
  "aura-channels",
  "aura-context",
+ "aura-cron",
  "aura-hook",
  "aura-job",
  "aura-llm",
@@ -234,6 +235,18 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aura-cron"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aura-session",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -419,9 +432,6 @@ name = "aura-workspace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
  "tokio",
 ]
 

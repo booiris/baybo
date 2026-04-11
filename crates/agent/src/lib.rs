@@ -1,6 +1,7 @@
 pub mod actor;
 pub mod agent_loop;
 pub mod cost;
+pub mod cron;
 pub mod error_recovery;
 pub mod job;
 pub mod memory;
@@ -16,6 +17,7 @@ pub mod tool_executor;
 pub mod trace;
 
 pub use agent_loop::AgentLoop;
+pub use cron::{CronScheduler, CronTriggerEvent};
 pub use job::JobManager;
 pub use memory::MemoryManager;
 pub use observability::ObservabilityRecorder;
