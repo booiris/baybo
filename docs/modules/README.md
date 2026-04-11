@@ -22,7 +22,7 @@ Bottom-up along the dependency graph:
 ### Ingress and Security Boundary Layer
 
 - **session** — Session domain types (User, ChannelType, Session, SessionState) and error definitions.
-- **channels** — Channel adapter trait and shared message types (Message, IncomingMessage, OutgoingMessage). Concrete adapters are WASM modules under `channels/`.
+- **channels** — Channel adapter trait, shared message types (Message, IncomingMessage, OutgoingMessage), and `ChannelRegistry`. Includes built-in adapters (e.g. `CliAdapter`); additional adapters can be WASM modules loaded at runtime.
 - **security** — Cryptographic primitives (EncryptionKey, encrypt/decrypt), leak detection (LeakDetector), error types.
 
 ### Capability and Governance Layer

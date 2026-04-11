@@ -4,7 +4,7 @@
 
 The `channels` crate defines the **trait interface** for receiving messages from multiple platforms and converting them into a unified `IncomingMessage`, then converting `OutgoingMessage` back into platform-native formats for delivery.
 
-**Design pattern**: Adapter pattern. The crate provides the `ChannelAdapter` trait and shared message types. Concrete implementations (Telegram, Discord, HTTP, CLI, etc.) live **outside** this crate in the top-level `channels/` directory as independent WASM modules, loaded at runtime via the WASM extension mechanism in `sandbox`.
+**Design pattern**: Adapter pattern. The crate provides the `ChannelAdapter` trait, shared message types, and `ChannelRegistry`. Built-in adapters (e.g. `CliAdapter` for stdin/stdout) are implemented directly in this crate. Additional platform adapters (Telegram, Discord, HTTP, etc.) can be built as WASM modules and loaded at runtime via the `sandbox` extension mechanism.
 
 Core responsibilities of this crate:
 
@@ -15,9 +15,9 @@ Core responsibilities of this crate:
 
 ## Design Decisions
 
-### Trait-only crate
+### Built-in and extensible adapters
 
-This crate contains **no concrete implementations**. All platform adapters are built as WASM modules under the top-level `channels/` directory, keeping platform SDK dependencies out of the main workspace and enabling hot-reload and sandboxed execution.
+This crate contains the `ChannelAdapter` trait and built-in adapters that require no external dependencies (e.g. `CliAdapter`). Platform-specific adapters that bring SDK dependencies (Telegram, Discord, etc.) are built as WASM modules under the top-level `channels/` directory, keeping those dependencies out of the main workspace and enabling hot-reload and sandboxed execution.
 
 ### No business logic
 
@@ -40,18 +40,18 @@ All platforms map to the same `IncomingMessage` structure via consistent ID pref
 
 Router calls `stop()` on all channels, each exits its background loop and releases resources, with a global timeout for forced exit.
 
-## WASM Channel Implementations
+## Channel Implementations
 
-Concrete channel adapters are built as WASM modules under `channels/` at the project root. Each module implements the `ChannelAdapter` trait and is loaded at runtime through the `sandbox` crate's WASM runtime.
+Built-in adapters are implemented directly in this crate. Platform-specific adapters are built as WASM modules under `channels/` at the project root, implementing the `ChannelAdapter` trait and loaded at runtime through the `sandbox` crate's WASM runtime.
 
-Expected adapters:
+Current and planned adapters:
 
 | Adapter  | ID prefix | Transport         |
 | -------- | --------- | ----------------- |
-| CLI      | `cli_`    | stdin/stdout      |
-| HTTP     | `http_`   | REST API (axum)   |
-| Telegram | `tg_`     | Long polling      |
-| Discord  | `dc_`     | WebSocket Gateway |
+| CLI (built-in) | `cli_`    | stdin/stdout      |
+| HTTP           | `http_`   | REST API (axum)   |
+| Telegram       | `tg_`     | Long polling      |
+| Discord        | `dc_`     | WebSocket Gateway |
 
 Each adapter must:
 
@@ -97,9 +97,9 @@ Design rules:
 
 ## Constraints
 
-- `channels` (the crate) stays independent of `agent`, `llm`, `tools`, `session`, and all other business crates
+- `channels` (the crate) stays independent of `agent`, `llm`, `tools`, and all other business crates (depends only on `model` and `session`)
 - Each adapter must be `Send + Sync + 'static` for safe use across tokio tasks
-- Platform SDK dependencies belong in the WASM modules, not in this crate
+- Platform SDK dependencies belong in the WASM modules, not in this crate; built-in adapters must have no external dependencies
 
 ## Collaboration
 

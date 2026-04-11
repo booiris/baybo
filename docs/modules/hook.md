@@ -384,15 +384,15 @@ Higher-priority sources can override or disable lower-priority hooks. Admin poli
 
 ## Collaboration
 
-| Module | Role |
-|--------|------|
-| `agent` | `AgentActor` / `AgentLoop` trigger session, turn, LLM, tool, response, subagent, and task hooks |
-| `agent` | `ToolExecutor` triggers `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`, `PermissionDenied` |
-| `agent` | `Router` triggers `UserPromptSubmit` before message enters actor |
-| `context` | `ContextManager` triggers `PreCompact` / `PostCompact` around compression |
-| `job` | `JobManager` triggers `JobStatusChanged` after state transitions |
-| `cost` | `CostGuard` triggers `CostLimitReached` on spending limit hits |
-| `channels` | `ChannelRegistry` triggers `ChannelStatusChanged` on adapter status changes; channel delivery triggers `PreResponse` / `PostResponse` |
-| `skills` | `SkillRegistry` triggers `SkillReloaded` on hot reload |
-| `workspace` | `WorkspaceManager` triggers `InstructionsLoaded` on identity file load |
-| `sandbox` | Provides WASM runtime for WASM hook handlers |
+| Module | Role | Status |
+|--------|------|--------|
+| `agent` | `AgentActor` triggers `PreMessage` and `PreResponse` hooks | Implemented |
+| `agent` | `ToolExecutor` triggers `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`, `PermissionDenied` | Hook points defined, not yet triggered in code |
+| `agent` | `Router` triggers `UserPromptSubmit` before message enters actor | Hook point defined, not yet triggered in code |
+| `context` | `ContextManager` triggers `PreCompact` / `PostCompact` around compression | Hook points defined, not yet triggered in code |
+| `job` | `JobManager` triggers `JobStatusChanged` after state transitions | Hook point defined, not yet triggered in code |
+| `cost` | `CostGuard` triggers `CostLimitReached` on spending limit hits | Hook point defined, not yet triggered in code |
+| `channels` | `ChannelRegistry` triggers `ChannelStatusChanged` on adapter status changes; channel delivery triggers `PreResponse` / `PostResponse` | Hook points defined, not yet triggered in code |
+| `skills` | `SkillRegistry` triggers `SkillReloaded` on hot reload | Hook point defined, not yet triggered in code |
+| `workspace` | `WorkspaceManager` triggers `InstructionsLoaded` on identity file load | Hook point defined, not yet triggered in code |
+| `sandbox` | Provides WASM runtime for WASM hook handlers | — |

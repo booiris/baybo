@@ -24,13 +24,13 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### Main execution path (AgentLoop)
 
-1. Create top-level Job and Trace span
-2. Build system prompt, Soul, identity injection from `workspace`
-3. Recall long-term memory
-4. Append current user message to Context
+1. Build system prompt, Soul, identity injection from `workspace`
+2. Recall long-term memory
+3. Append current user message to Context
+4. Skill selection: match user input against `SkillRegistry`, inject prompt template and tool filter if a skill matches
 5. Loop: `maybe_compress()` → build `ChatRequest` → call `LlmClient` → parse response → dispatch tool/skill execution
 6. Produce final `OutgoingMessage`
-7. Persist final Job, Trace, and Cost state
+7. Persist Job, Trace, and Cost state
 
 ### ObservabilityRecorder lock strategy
 
@@ -78,6 +78,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |
 | `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
 | `security` | Provides crypto primitives (`EncryptionKey`, `LeakDetector`) used by `agent::security::{SecretVault, SecurityGateway}` |
+| `channels` | `ChannelRegistry` and adapters (e.g. `CliAdapter`); Router owns the registry for dispatch |
 | `storage` | Provides all Store traits and libsql implementations; injected into managers |
 | `sandbox` | WASM or container isolated execution |
-| `hook` | `AgentActor` triggers hooks at lifecycle points |
+| `hook` | `AgentActor` triggers `PreMessage` and `PreResponse` hooks at lifecycle points |
