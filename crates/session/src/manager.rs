@@ -198,7 +198,7 @@ mod tests {
         User {
             id: "user-1".to_string(),
             name: Some("Alice".to_string()),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
         }
     }
 
@@ -208,13 +208,13 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
-            .create_session(test_user(), ChannelType::Cli)
+            .create_session(test_user(), ChannelType::Tui)
             .await
             .unwrap();
 
         assert!(!session.id.is_empty());
         assert_eq!(session.user.id, "user-1");
-        assert_eq!(session.channel, ChannelType::Cli);
+        assert_eq!(session.channel, ChannelType::Tui);
         assert!(session.messages.is_empty());
     }
 
@@ -224,13 +224,13 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
-            .create_session(test_user(), ChannelType::Cli)
+            .create_session(test_user(), ChannelType::Tui)
             .await
             .unwrap();
         let session_id = session.id.clone();
 
         let retrieved = mgr
-            .get_or_create(&session_id, test_user(), ChannelType::Cli)
+            .get_or_create(&session_id, test_user(), ChannelType::Tui)
             .await
             .unwrap();
         assert_eq!(retrieved.id, session_id);
@@ -242,7 +242,7 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
-            .get_or_create("cli-abc", test_user(), ChannelType::Cli)
+            .get_or_create("cli-abc", test_user(), ChannelType::Tui)
             .await
             .unwrap();
 
@@ -257,7 +257,7 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
-            .create_session(test_user(), ChannelType::Cli)
+            .create_session(test_user(), ChannelType::Tui)
             .await
             .unwrap();
         let original_active = session.last_active;
@@ -267,7 +267,7 @@ mod tests {
         mgr.touch(&session.id).await.unwrap();
 
         let updated = mgr
-            .get_or_create(&session.id, test_user(), ChannelType::Cli)
+            .get_or_create(&session.id, test_user(), ChannelType::Tui)
             .await
             .unwrap();
         assert!(updated.last_active >= original_active);
@@ -287,7 +287,7 @@ mod tests {
         let store = Box::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::seconds(1));
 
-        mgr.create_session(test_user(), ChannelType::Cli)
+        mgr.create_session(test_user(), ChannelType::Tui)
             .await
             .unwrap();
 
@@ -306,7 +306,7 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let first = mgr
-            .create_session(test_user(), ChannelType::Cli)
+            .create_session(test_user(), ChannelType::Tui)
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -327,7 +327,7 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
-            .create_session(test_user(), ChannelType::Cli)
+            .create_session(test_user(), ChannelType::Tui)
             .await
             .unwrap();
 
@@ -350,7 +350,7 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
-            .create_session(test_user(), ChannelType::Cli)
+            .create_session(test_user(), ChannelType::Tui)
             .await
             .unwrap();
 
@@ -373,7 +373,7 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::seconds(1));
 
         let session = mgr
-            .create_session(test_user(), ChannelType::Cli)
+            .create_session(test_user(), ChannelType::Tui)
             .await
             .unwrap();
         let old_id = session.id.clone();
@@ -382,7 +382,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let new_session = mgr
-            .get_or_create(&old_id, test_user(), ChannelType::Cli)
+            .get_or_create(&old_id, test_user(), ChannelType::Tui)
             .await
             .unwrap();
 

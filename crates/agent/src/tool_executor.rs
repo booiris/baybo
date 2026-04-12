@@ -252,7 +252,7 @@ impl ToolExecutor {
         let user = User {
             id: "cli-operator".into(),
             name: Some("operator".into()),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
         };
         self.execute(tool_name, params, &session_id, &user, recorder, None)
             .await

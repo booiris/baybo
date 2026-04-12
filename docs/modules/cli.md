@@ -94,7 +94,7 @@ Listed so future contributors see the gap explicitly. Each one waits for its sub
 
 - **Service lifecycle**: `gateway`, `daemon` — Aura currently runs as a single foreground process; no install/start/stop/restart surface yet.
 - **Device and node fabric**: `nodes`, `devices`, `pairing` — no paired-peer concept in Aura today.
-- **IDE / external bridges**: `acp`, `mcp serve`, `dashboard`, `tui` — out of scope until the corresponding subsystems exist.
+- **IDE / external bridges**: `acp`, `mcp serve`, `dashboard` — out of scope until the corresponding subsystems exist. (`tui` has landed as the built-in `TuiAdapter`; see [`channels.md`](./channels.md) and [`tui.md`](./tui.md).)
 - **Rich media**: `browser`, inference over image/audio/video/tts — no Aura counterpart.
 - **Plugin distribution & installer**: `plugins`, `backup`, `update`, `uninstall`, `setup`, `onboard`, `reset` — release-engineering concerns, not runtime.
 - **Auxiliary directories**: `directory`, `wiki`, `webhooks`, `dns`, `hooks install/update` — deferred until each subsystem lands.
@@ -105,7 +105,11 @@ Each family is added under the same naming scheme when its subsystem ships.
 
 ### Wiring
 
-`src/main.rs`, after `CommandContext` is assembled, constructs `aura_cli::CliSlashHandler::new(ctx)` and passes it to `CliAdapter::builder().with_slash_handler(...)`. Other adapters (HTTP/Telegram/Discord) accept the same `Arc<dyn SlashHandler>` when they land.
+`src/main.rs`, after `CommandContext` is assembled, constructs `aura_cli::CliSlashHandler::new(ctx)` and `aura_cli::CliDashboardProvider::new(ctx)`, then passes both to `TuiAdapter::new().with_slash_handler(...).with_dashboard_provider(...)`. Other adapters (HTTP/Telegram/Discord) accept the same `Arc<dyn SlashHandler>` when they land; `DashboardProvider` is only consumed by adapters that can render interactive views (i.e. TUI).
+
+### Dashboard shortcut
+
+Bare dashboard commands — `/skills`, `/tools`, `/jobs`, `/sessions`, `/memory` with no further tokens — bypass the clap path and return `SlashOutcome::OpenView(ViewKind::_)`. Interactive adapters swap into a table view backed by `DashboardProvider::snapshot(kind)`; line-mode adapters treat the outcome as a no-op. Commands with arguments (e.g. `/skills info foo`) still go through clap as `SlashOutcome::Handled`.
 
 ### Output rendering over channels
 
@@ -132,7 +136,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 | `bootstrap` (`src/main.rs`, `src/boot.rs`)                                                                          | Checks argv first: if a subcommand is present, runs `aura_cli::run_argv` and exits; otherwise boots the full router and injects `CliSlashHandler` into adapters. |
 | `config`                                                                                                            | `config` family directly reads/writes `AuraConfig`; `doctor` calls `validate`.                                                                                   |
 | `agent`                                                                                                             | Supplies all manager `Arc`s; `agent send` reuses the `Router` path.                                                                                              |
-| `channels`                                                                                                          | Owns `SlashHandler` and `SlashOutcome`; `CliAdapter` is the first consumer.                                                                                      |
+| `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |
 | `trace` / `job` / `cron` / `skills` / `tools` / `session` / `memory` / `security` / `workspace` / `llm` / `sandbox` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
 
 ## Verification

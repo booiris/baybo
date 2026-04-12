@@ -166,16 +166,16 @@ mod tests {
     #[test]
     fn register_and_get() {
         let mut reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Cli)).unwrap();
-        assert!(reg.get(ChannelType::Cli).is_some());
+        reg.register(fake(ChannelType::Tui)).unwrap();
+        assert!(reg.get(ChannelType::Tui).is_some());
         assert!(reg.get(ChannelType::Http).is_none());
     }
 
     #[test]
     fn duplicate_register_fails() {
         let mut reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Cli)).unwrap();
-        let err = reg.register(fake(ChannelType::Cli)).unwrap_err();
+        reg.register(fake(ChannelType::Tui)).unwrap();
+        let err = reg.register(fake(ChannelType::Tui)).unwrap_err();
         assert!(matches!(err, ChannelError::DuplicateChannel(_)));
     }
 
@@ -191,14 +191,14 @@ mod tests {
     #[tokio::test]
     async fn unregister_not_found() {
         let mut reg = ChannelRegistry::new();
-        let err = reg.unregister(ChannelType::Cli).await.unwrap_err();
+        let err = reg.unregister(ChannelType::Tui).await.unwrap_err();
         assert!(matches!(err, ChannelError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn start_all_and_stop_all() {
         let mut reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Cli)).unwrap();
+        reg.register(fake(ChannelType::Tui)).unwrap();
         reg.register(fake(ChannelType::Http)).unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn list_returns_all_registered() {
         let mut reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Cli)).unwrap();
+        reg.register(fake(ChannelType::Tui)).unwrap();
         reg.register(fake(ChannelType::Http)).unwrap();
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.list().len(), 2);

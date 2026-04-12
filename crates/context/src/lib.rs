@@ -245,9 +245,9 @@ mod tests {
             user: aura_session::User {
                 id: "user-1".to_string(),
                 name: None,
-                channel: aura_session::ChannelType::Cli,
+                channel: aura_session::ChannelType::Tui,
             },
-            channel: aura_session::ChannelType::Cli,
+            channel: aura_session::ChannelType::Tui,
             messages,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),

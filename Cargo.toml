@@ -62,6 +62,7 @@ tracing-subscriber = { version = "0.3", features = [
     "json",
     "registry",
 ] }
+tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 tokio-util = "0.7"
@@ -82,6 +83,8 @@ reqwest = { version = "0.12", features = ["json"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 cron = "0.15"
 futures = "0.3"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 rig-core = { version = "0.34", features = ["derive"] }
 rmcp = { version = "1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
@@ -115,6 +118,7 @@ aura-cli = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }

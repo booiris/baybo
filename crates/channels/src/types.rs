@@ -31,6 +31,25 @@ pub struct OutgoingMessage {
     pub metadata: MessageMetadata,
 }
 
+/// Protocol between agent actors and the router.
+///
+/// Actors emit streaming deltas as they receive text from the LLM, then a
+/// final `Message` once the full turn is assembled. The router forwards
+/// each variant to the appropriate `ChannelAdapter` call site — channels
+/// without a partial surface ignore deltas and only act on the final
+/// message.
+#[derive(Debug, Clone)]
+pub enum AgentOutput {
+    /// Incremental text chunk for the in-flight response on a session.
+    Delta {
+        session_id: String,
+        channel: ChannelType,
+        text: String,
+    },
+    /// Final, canonical assistant response for the turn.
+    Message(OutgoingMessage),
+}
+
 /// Lifecycle status of a registered channel adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelStatus {

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_channels::{SlashHandler, SlashOutcome};
+use aura_channels::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
 use aura_model::ContentBlock;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use crate::cli::Cli;
 use crate::context::{CommandContext, Invocation};
@@ -76,7 +76,35 @@ impl CliSlashHandler {
 
 #[async_trait]
 impl SlashHandler for CliSlashHandler {
+    fn commands(&self) -> Vec<SlashCommand> {
+        let mut out = Vec::new();
+        let cmd = Cli::command();
+        for sub in cmd.get_subcommands() {
+            if sub.is_hide_set() {
+                continue;
+            }
+            let name = sub.get_name();
+            if name == "help" || name == "completion" {
+                continue;
+            }
+            let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
+            out.push(SlashCommand::new(format!("/{name}"), about));
+        }
+        // TUI-adapter built-ins that never reach the clap tree.
+        out.push(SlashCommand::new("/clear", "Clear the chat scrollback."));
+        out.push(SlashCommand::new("/quit", "Exit the chat session."));
+        out.push(SlashCommand::new("/exit", "Exit the chat session."));
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     async fn handle(&self, raw: &str) -> SlashOutcome {
+        // Bare `/skills`, `/tools`, `/jobs`, `/sessions`, `/memory` (no args)
+        // open the corresponding dashboard view in TUI-capable adapters;
+        // adapters that don't support views treat this as a no-op.
+        if let Some(kind) = dashboard_shortcut(raw) {
+            return SlashOutcome::OpenView(kind);
+        }
         match self.try_dispatch(raw).await {
             Ok(out) => {
                 let format = if out.data.is_some() && raw.contains("--json") {
@@ -94,6 +122,24 @@ impl SlashHandler for CliSlashHandler {
                 SlashOutcome::Handled(vec![ContentBlock::Text(format!("error: {e}"))])
             }
         }
+    }
+}
+
+/// Match bare dashboard commands (`/skills`, `/tools`, ...) with no arguments.
+/// Anything with arguments or unknown names falls through to the clap path.
+fn dashboard_shortcut(raw: &str) -> Option<ViewKind> {
+    let without_slash = raw.trim().strip_prefix('/')?;
+    let tokens = shell_words::split(without_slash).ok()?;
+    let [cmd] = tokens.as_slice() else {
+        return None;
+    };
+    match cmd.as_str() {
+        "skills" => Some(ViewKind::Skills),
+        "tools" => Some(ViewKind::Tools),
+        "jobs" => Some(ViewKind::Jobs),
+        "sessions" => Some(ViewKind::Sessions),
+        "memory" => Some(ViewKind::Memory),
+        _ => None,
     }
 }
 

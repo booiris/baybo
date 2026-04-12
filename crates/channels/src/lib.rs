@@ -1,14 +1,17 @@
-pub mod cli;
 mod error;
 mod registry;
 mod slash;
+mod tui;
 mod types;
 
-pub use cli::CliAdapter;
 pub use error::ChannelError;
 pub use registry::ChannelRegistry;
-pub use slash::{SlashHandler, SlashOutcome};
-pub use types::{ChannelStatus, IncomingMessage, Message, OutgoingMessage};
+pub use slash::{
+    DashboardProvider, DashboardSnapshot, SlashCommand, SlashHandler, SlashOutcome, ViewKind,
+};
+pub use tui::event::{LogLevel, LogRecord, TuiLogSink};
+pub use tui::{OnExit, TuiAdapter};
+pub use types::{AgentOutput, ChannelStatus, IncomingMessage, Message, OutgoingMessage};
 
 use async_trait::async_trait;
 use aura_session::ChannelType;
@@ -36,6 +39,20 @@ pub trait ChannelAdapter: Send + Sync + 'static {
 
     /// Converts an outgoing message into the platform-native format and sends it.
     async fn send_response(&self, response: OutgoingMessage) -> Result<()>;
+
+    /// Deliver an incremental text chunk for an in-flight assistant response.
+    ///
+    /// Channels that can render partial output (e.g. the TUI) accumulate
+    /// chunks and redraw; channels without a partial surface (e.g. HTTP
+    /// one-shot) may drop deltas and render only the final `send_response`.
+    /// The default implementation is a no-op for that reason.
+    ///
+    /// Delivery ordering per `session_id` is the caller's responsibility —
+    /// channels assume chunks arrive in the order the LLM emitted them.
+    async fn send_stream_delta(&self, session_id: &str, delta: &str) -> Result<()> {
+        let _ = (session_id, delta);
+        Ok(())
+    }
 
     /// Gracefully shuts down the channel. Idempotent.
     async fn stop(&self) -> Result<()>;

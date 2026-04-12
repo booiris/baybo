@@ -78,7 +78,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |
 | `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
 | `security` | Provides crypto primitives (`EncryptionKey`, `LeakDetector`) used by `agent::security::{SecretVault, SecurityGateway}` |
-| `channels` | `ChannelRegistry` and adapters (e.g. `CliAdapter`); Router owns the registry for dispatch |
+| `channels` | `ChannelRegistry` and adapters (e.g. `TuiAdapter`); Router owns the registry for dispatch |
 | `storage` | Provides all Store traits and libsql implementations; injected into managers |
 | `sandbox` | WASM or container isolated execution |
 | `hook` | `AgentActor` triggers `PreMessage` and `PreResponse` hooks at lifecycle points |

@@ -92,7 +92,7 @@ mod tests {
         let job = CronJob {
             id: "cj-1".to_string(),
             user_id: "u-1".to_string(),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             schedule: "0 9 * * *".to_string(),
             prompt: "push news".to_string(),
             status: CronStatus::Enabled,
@@ -141,7 +141,7 @@ mod tests {
             id: "ce-1".to_string(),
             job_id: "cj-1".to_string(),
             user_id: "u-1".to_string(),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             schedule: "0 9 * * *".to_string(),
             prompt: "push news".to_string(),
             run_mode: CronRunMode::OneShot,

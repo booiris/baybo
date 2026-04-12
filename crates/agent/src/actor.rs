@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_channels::{IncomingMessage, OutgoingMessage};
+use aura_channels::{AgentOutput, IncomingMessage};
 use aura_hook::{HookContext, HookEventData, HookManager, HookPoint};
 use aura_model::ContentBlock;
 use aura_session::Session;
@@ -31,7 +31,7 @@ pub enum AgentMessage {
 pub struct AgentActor {
     session: Session,
     agent_loop: AgentLoop,
-    response_tx: mpsc::Sender<OutgoingMessage>,
+    response_tx: mpsc::Sender<AgentOutput>,
     hooks: Arc<HookManager>,
     recorder: Arc<ObservabilityRecorder>,
 }
@@ -40,7 +40,7 @@ impl AgentActor {
     pub fn new(
         session: Session,
         agent_loop: AgentLoop,
-        response_tx: mpsc::Sender<OutgoingMessage>,
+        response_tx: mpsc::Sender<AgentOutput>,
         hooks: Arc<HookManager>,
         recorder: Arc<ObservabilityRecorder>,
     ) -> Self {
@@ -121,10 +121,10 @@ impl AgentActor {
         ))];
         let response = self
             .agent_loop
-            .run(&mut self.session, content, &self.recorder, None)
+            .run(&mut self.session, content, &self.recorder, None, None)
             .await?;
 
-        if let Err(e) = self.response_tx.send(response).await {
+        if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send {source} response to channel");
         }
         Ok(())
@@ -155,10 +155,18 @@ impl AgentActor {
             .trigger(HookPoint::PreMessage, &mut hook_ctx)
             .await?;
 
-        // Run the agent loop
+        // Run the agent loop. Pass a clone of the response channel so the
+        // loop can stream text deltas as `AgentOutput::Delta` while the
+        // final assembled message still flows through the normal path.
         let response = self
             .agent_loop
-            .run(&mut self.session, content, &self.recorder, None)
+            .run(
+                &mut self.session,
+                content,
+                &self.recorder,
+                None,
+                Some(self.response_tx.clone()),
+            )
             .await?;
 
         // PreResponse hook
@@ -177,7 +185,7 @@ impl AgentActor {
             .await?;
 
         // Send response
-        if let Err(e) = self.response_tx.send(response).await {
+        if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send response to channel");
         }
 

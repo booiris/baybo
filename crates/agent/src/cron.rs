@@ -691,7 +691,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "0 9 * * *",
                 "morning news",
                 CronRunMode::Recurring,
@@ -710,7 +710,7 @@ mod tests {
         let err = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "not a cron",
                 "test",
                 CronRunMode::Recurring,
@@ -726,7 +726,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "0 9 * * *",
                 "test",
                 CronRunMode::Recurring,
@@ -753,7 +753,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "* * * * *",
                 "every minute",
                 CronRunMode::Recurring,
@@ -796,7 +796,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "* * * * *",
                 "test",
                 CronRunMode::Recurring,
@@ -822,7 +822,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "0 9 * * *",
                 "test",
                 CronRunMode::Recurring,
@@ -842,7 +842,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "* * * * *",
                 "run once",
                 CronRunMode::OneShot,
@@ -879,7 +879,7 @@ mod tests {
         let job = CronJob {
             id: "cj-rt".to_string(),
             user_id: "u1".to_string(),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             schedule: "0 9 * * *".to_string(),
             prompt: "test".to_string(),
             status: CronStatus::Enabled,
@@ -906,7 +906,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "* * * * *",
                 "dedup test",
                 CronRunMode::Recurring,
@@ -953,7 +953,7 @@ mod tests {
             id: "ce-pending".to_string(),
             job_id: "cj-1".to_string(),
             user_id: "u1".to_string(),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             schedule: "* * * * *".to_string(),
             prompt: "recover me".to_string(),
             run_mode: CronRunMode::Recurring,
@@ -996,7 +996,7 @@ mod tests {
         scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "0 9 * * *",
                 "alice",
                 CronRunMode::Recurring,
@@ -1006,7 +1006,7 @@ mod tests {
         scheduler
             .create_job(
                 "u2",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "0 10 * * *",
                 "bob",
                 CronRunMode::Recurring,
@@ -1030,7 +1030,7 @@ mod tests {
         let created = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "0 9 * * *",
                 "fetch me",
                 CronRunMode::Recurring,
@@ -1049,7 +1049,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Cli,
+                ChannelType::Tui,
                 "0 9 * * *",
                 "manual fire",
                 CronRunMode::Recurring,
@@ -1090,7 +1090,7 @@ mod tests {
             id: "ce-rt".to_string(),
             job_id: "cj-1".to_string(),
             user_id: "u1".to_string(),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             schedule: "0 9 * * *".to_string(),
             prompt: "test".to_string(),
             run_mode: CronRunMode::Recurring,

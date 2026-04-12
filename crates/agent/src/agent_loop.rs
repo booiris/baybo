@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
-use aura_channels::OutgoingMessage;
+use aura_channels::{AgentOutput, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::OperationKind;
-use aura_llm::{ChatRequest, LlmClient, LlmResponse, ToolDefinitionForLlm};
+use aura_llm::{
+    ChatRequest, LlmClient, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
+};
 use aura_model::{ChatMessage, ContentBlock, Role};
+use futures::StreamExt;
+use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
 use aura_session::Session;
@@ -59,12 +63,20 @@ impl AgentLoop {
     }
 
     /// Run the main conversation loop for a single user message.
+    ///
+    /// When `delta_tx` is `Some`, each text chunk emitted by the LLM is
+    /// forwarded as `AgentOutput::Delta` so adapters that support partial
+    /// rendering (e.g. the TUI) can show incremental output. The final
+    /// `OutgoingMessage` returned here should still be dispatched by the
+    /// caller as `AgentOutput::Message` so non-streaming adapters receive
+    /// the canonical response.
     pub async fn run(
         &mut self,
         session: &mut Session,
         user_content: Vec<ContentBlock>,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
+        delta_tx: Option<mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<OutgoingMessage> {
         // Ensure system prompt is present
         self.ensure_system_prompt(session);
@@ -144,9 +156,23 @@ impl AgentLoop {
                 );
             }
 
-            // Call LLM with retry on transient errors
+            // Call LLM with retry on transient errors. Deltas are only
+            // streamed on the first iteration of the loop — subsequent
+            // iterations are post-tool-call continuations that should be
+            // rendered as a single block once complete.
+            let iter_delta_tx = if iterations == 1 {
+                delta_tx.as_ref()
+            } else {
+                None
+            };
             let response = self
-                .call_llm_with_retry(session, recorder, parent_job_id, allowed_tools.as_deref())
+                .call_llm_with_retry(
+                    session,
+                    recorder,
+                    parent_job_id,
+                    allowed_tools.as_deref(),
+                    iter_delta_tx,
+                )
                 .await?;
 
             // Auto-snapshot after LLM call if the interval has been reached
@@ -251,11 +277,12 @@ impl AgentLoop {
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
         allowed_tools: Option<&[String]>,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<LlmResponse> {
         let mut attempt = 0u32;
         loop {
             match self
-                .call_llm(session, recorder, parent_job_id, allowed_tools)
+                .call_llm(session, recorder, parent_job_id, allowed_tools, delta_tx)
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -288,6 +315,7 @@ impl AgentLoop {
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
         allowed_tools: Option<&[String]>,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<LlmResponse> {
         let model_id = self.llm_client.model_id().to_string();
 
@@ -334,10 +362,19 @@ impl AgentLoop {
             tools: tool_defs,
         };
 
-        match self.llm_client.chat(&request).await {
+        let llm_result = match delta_tx {
+            Some(tx) => self.chat_streaming(&request, session, tx).await,
+            None => self.llm_client.chat(&request).await,
+        };
+
+        match llm_result {
             Ok(response) => {
                 let output_preview = if response.content.len() > 200 {
-                    format!("{}...", &response.content[..200])
+                    let mut end = 200;
+                    while !response.content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &response.content[..end])
                 } else {
                     response.content.clone()
                 };
@@ -385,6 +422,63 @@ impl AgentLoop {
                 Err(e.into())
             }
         }
+    }
+
+    /// Run a streaming chat request, forwarding each text chunk through
+    /// `delta_tx` while accumulating the full response to return.
+    async fn chat_streaming(
+        &self,
+        request: &ChatRequest,
+        session: &Session,
+        delta_tx: &mpsc::Sender<AgentOutput>,
+    ) -> aura_llm::Result<LlmResponse> {
+        let mut stream = self.llm_client.chat_stream(request).await?;
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = TokenUsage::default();
+        let mut thinking = String::new();
+
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::Text(chunk) => {
+                    content.push_str(&chunk);
+                    if delta_tx
+                        .send(AgentOutput::Delta {
+                            session_id: session.id.clone(),
+                            channel: session.channel,
+                            text: chunk,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        // Receiver gone; keep draining the LLM stream so the
+                        // provider connection closes cleanly.
+                        debug!("delta receiver dropped, continuing without forwarding");
+                    }
+                }
+                StreamEvent::ToolCall(info) => tool_calls.push(info),
+                StreamEvent::Reasoning(r) => thinking.push_str(&r),
+                StreamEvent::Usage(u) => usage = u,
+            }
+        }
+
+        let content_blocks = if content.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text(content.clone())]
+        };
+
+        Ok(LlmResponse {
+            content,
+            content_blocks,
+            tool_calls,
+            usage,
+            thinking: if thinking.is_empty() {
+                None
+            } else {
+                Some(thinking)
+            },
+        })
     }
 
     /// If the trace collector's auto-snapshot interval has been reached,

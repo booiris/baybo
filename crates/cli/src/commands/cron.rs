@@ -29,12 +29,12 @@ pub async fn handle(ctx: &CommandContext, cmd: CronCmd) -> Result<CommandOutput>
 
 fn parse_channel(raw: &str) -> Result<ChannelType> {
     match raw.to_ascii_lowercase().as_str() {
-        "cli" => Ok(ChannelType::Cli),
+        "tui" | "cli" => Ok(ChannelType::Tui),
         "telegram" => Ok(ChannelType::Telegram),
         "discord" => Ok(ChannelType::Discord),
         "http" => Ok(ChannelType::Http),
         other => Err(CliError::Manager(format!(
-            "unknown channel '{other}'; expected one of cli, telegram, discord, http"
+            "unknown channel '{other}'; expected one of tui, telegram, discord, http"
         ))),
     }
 }

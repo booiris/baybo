@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aura_channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
+use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use aura_session::{Session, User};
 
 use crate::cost::CostGuard;
@@ -60,7 +60,7 @@ impl RateLimiter {
 /// The closure captures all dependencies needed to construct an actor
 /// (AgentLoop, HookManager, ObservabilityRecorder, etc.).
 pub type ActorSpawner =
-    Box<dyn Fn(Session, mpsc::Sender<OutgoingMessage>) -> mpsc::Sender<AgentMessage> + Send + Sync>;
+    Box<dyn Fn(Session, mpsc::Sender<AgentOutput>) -> mpsc::Sender<AgentMessage> + Send + Sync>;
 
 /// Routes incoming messages to the appropriate AgentActor.
 pub struct Router {
@@ -128,7 +128,7 @@ impl Router {
     pub async fn run(
         mut self,
         mut incoming_rx: mpsc::Receiver<IncomingMessage>,
-        mut response_rx: mpsc::Receiver<OutgoingMessage>,
+        mut response_rx: mpsc::Receiver<AgentOutput>,
     ) {
         let channel_count = self.channels.read().await.len();
         info!(channel_count, "router starting");
@@ -142,8 +142,8 @@ impl Router {
                         error!(error = %e, "failed to handle incoming message");
                     }
                 }
-                Some(outgoing) = response_rx.recv() => {
-                    self.handle_outgoing(outgoing).await;
+                Some(output) = response_rx.recv() => {
+                    self.handle_agent_output(output).await;
                 }
                 Some(event) = async {
                     match cron_rx.as_mut() {
@@ -311,6 +311,37 @@ impl Router {
         }
 
         Ok(())
+    }
+
+    async fn handle_agent_output(&self, output: AgentOutput) {
+        match output {
+            AgentOutput::Delta {
+                session_id,
+                channel,
+                text,
+            } => {
+                let channels = self.channels.read().await;
+                match channels.get(channel) {
+                    Some(adapter) => {
+                        if let Err(e) = adapter.send_stream_delta(&session_id, &text).await {
+                            error!(
+                                channel = %channel,
+                                session_id = %session_id,
+                                error = %e,
+                                "failed to forward stream delta"
+                            );
+                        }
+                    }
+                    None => {
+                        debug!(
+                            channel = %channel,
+                            "no adapter registered for streaming delta"
+                        );
+                    }
+                }
+            }
+            AgentOutput::Message(outgoing) => self.handle_outgoing(outgoing).await,
+        }
     }
 
     async fn handle_outgoing(&self, mut outgoing: OutgoingMessage) {

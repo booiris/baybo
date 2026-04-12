@@ -111,6 +111,8 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: AgentCmd,
     },
+    /// Launch the interactive Ratatui chat session.
+    Tui,
     /// One-shot summary of current runtime state.
     Status,
     /// Run health checks against config, storage, and env.

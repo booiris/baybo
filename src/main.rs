@@ -1,5 +1,6 @@
 mod boot;
 mod singleton;
+mod tui_log;
 
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::AgentLoop;
@@ -14,11 +15,13 @@ use aura_agent::{
     CronScheduler, JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager,
     TraceCollector,
 };
-use aura_channels::{ChannelRegistry, CliAdapter};
+use aura_channels::{ChannelRegistry, TuiAdapter, TuiLogSink};
 use aura_cli::cli::ShellKind;
 use aura_cli::{
-    Cli, CliSlashHandler, Commands, ContextBuilder, Invocation, OutputFormat, dispatch,
+    Cli, CliDashboardProvider, CliSlashHandler, Commands, ContextBuilder, Invocation, OutputFormat,
+    dispatch,
 };
+use clap::CommandFactory;
 use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
 use aura_hook::HookManager;
 use aura_security::EncryptionKey;
@@ -27,13 +30,16 @@ use aura_storage::Store;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 use clap::Parser;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::tui_log::TuiLogLayer;
 
 struct SecondPrecisionTimer;
 
@@ -43,36 +49,82 @@ impl FormatTime for SecondPrecisionTimer {
     }
 }
 
-fn init_tracing() {
+enum TracingMode<'a> {
+    /// argv / one-shot command path: everything to stdout, no TUI echo.
+    Stdout,
+    /// Chat path: fmt layer writes rolling file under `<log_dir>/aura.log`,
+    /// plus a warn/error echo layer feeding the TUI scrollback via the
+    /// returned `OnceLock<TuiLogSink>`.
+    Chat { log_dir: &'a Path },
+}
+
+struct ChatTracing {
+    _file_guard: WorkerGuard,
+    tui_sink: Arc<OnceLock<TuiLogSink>>,
+}
+
+fn init_tracing(mode: TracingMode<'_>) -> Option<ChatTracing> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aura=info"));
+    let json = std::env::var("AURA_LOG_FORMAT").unwrap_or_default() == "json";
 
-    let log_format = std::env::var("AURA_LOG_FORMAT").unwrap_or_default();
-
-    if log_format == "json" {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                fmt::layer()
-                    .json()
-                    .with_timer(SecondPrecisionTimer)
-                    .with_target(true)
-                    .with_file(true)
-                    .with_line_number(true)
-                    .with_span_list(true),
-            )
-            .init();
-    } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                fmt::layer()
-                    .with_timer(SecondPrecisionTimer)
-                    .with_target(true)
-                    .with_file(true)
-                    .with_line_number(true),
-            )
-            .init();
+    match mode {
+        TracingMode::Stdout => {
+            let fmt_layer = fmt::layer()
+                .with_timer(SecondPrecisionTimer)
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true);
+            if json {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer.json().with_span_list(true))
+                    .init();
+            } else {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer)
+                    .init();
+            }
+            None
+        }
+        TracingMode::Chat { log_dir } => {
+            if let Err(e) = std::fs::create_dir_all(log_dir) {
+                eprintln!(
+                    "warning: could not create log dir {}: {e}. Falling back to stdout logging.",
+                    log_dir.display()
+                );
+                return init_tracing(TracingMode::Stdout);
+            }
+            let appender = tracing_appender::rolling::daily(log_dir, "aura.log");
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            let tui_sink: Arc<OnceLock<TuiLogSink>> = Arc::new(OnceLock::new());
+            let tui_layer = TuiLogLayer::new(Arc::clone(&tui_sink));
+            let fmt_layer = fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_timer(SecondPrecisionTimer)
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true);
+            if json {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer.json().with_span_list(true))
+                    .with(tui_layer)
+                    .init();
+            } else {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer)
+                    .with(tui_layer)
+                    .init();
+            }
+            Some(ChatTracing {
+                _file_guard: guard,
+                tui_sink,
+            })
+        }
     }
 }
 
@@ -96,15 +148,31 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    init_tracing();
+    // Bare `aura` (no subcommand) prints help and exits. The interactive
+    // chat loop is reached via the explicit `aura tui` subcommand so the
+    // default invocation doesn't surprise users with a full-screen app.
+    if cli.command.is_none() {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
 
     let cli_format = pick_format(&cli);
-
-    info!("Aura - Intelligent Assistant Framework starting");
 
     let config = boot::load_config().await?;
     let config = Arc::new(config);
     let buffer = config.channels.message_buffer_size;
+
+    let chat_mode = matches!(cli.command, Some(Commands::Tui));
+    let workspace_root = PathBuf::from(&config.workspace.path);
+    let log_dir = workspace_root.join("logs");
+    let chat_tracing = if chat_mode {
+        init_tracing(TracingMode::Chat { log_dir: &log_dir })
+    } else {
+        init_tracing(TracingMode::Stdout)
+    };
+
+    info!("Aura - Intelligent Assistant Framework starting");
 
     // --- minimal services required by both argv and chat modes ---
 
@@ -134,7 +202,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ---------------- argv dispatch (one-shot command + exit) ----------------
 
-    if let Some(cmd) = cli.command {
+    // `Tui` falls through to the chat-loop boot below instead of running
+    // through `dispatch::run` — it's an interactive session, not a one-shot.
+    if let Some(cmd) = cli.command.filter(|c| !matches!(c, Commands::Tui)) {
         let mut builder = ContextBuilder::new(Arc::clone(&config))
             .config_path(resolve_config_path())
             .skills(Arc::clone(&skill_registry))
@@ -313,18 +383,24 @@ async fn main() -> anyhow::Result<()> {
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),
     );
-    let slash_handler = Arc::new(CliSlashHandler::new(slash_ctx));
+    let slash_handler = Arc::new(CliSlashHandler::new(Arc::clone(&slash_ctx)));
+    let dashboard_provider = Arc::new(CliDashboardProvider::new(Arc::clone(&slash_ctx)));
 
-    // Register and start the CLI adapter with the slash handler attached.
+    // Register and start the TUI adapter with slash + dashboard wiring
+    // attached. Wire the log sink so warn/error tracing events echo into the
+    // chat scrollback without corrupting raw-mode output.
     {
+        let tui_shutdown = shutdown.clone();
+        let tui = TuiAdapter::new()
+            .with_slash_handler(slash_handler)
+            .with_dashboard_provider(dashboard_provider)
+            .with_on_exit(Arc::new(move || tui_shutdown.trigger()));
+        if let Some(tracing) = chat_tracing.as_ref() {
+            let _ = tracing.tui_sink.set(tui.log_sink());
+        }
         let mut reg = channels_registry.write().await;
-        reg.register(Box::new(
-            CliAdapter::new().with_slash_handler(slash_handler),
-        ))
-        .expect("failed to register CLI adapter");
-        reg.start_all(incoming_tx)
-            .await
-            .expect("failed to start channels");
+        reg.register(Box::new(tui))?;
+        reg.start_all(incoming_tx).await?;
     }
 
     // Supervisor and Router

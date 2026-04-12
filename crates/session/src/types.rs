@@ -18,7 +18,8 @@ pub enum ChannelType {
     Telegram,
     Discord,
     Http,
-    Cli,
+    #[serde(alias = "cli")]
+    Tui,
 }
 
 impl std::fmt::Display for ChannelType {
@@ -27,7 +28,7 @@ impl std::fmt::Display for ChannelType {
             Self::Telegram => write!(f, "telegram"),
             Self::Discord => write!(f, "discord"),
             Self::Http => write!(f, "http"),
-            Self::Cli => write!(f, "cli"),
+            Self::Tui => write!(f, "tui"),
         }
     }
 }
@@ -60,4 +61,23 @@ pub struct SessionState {
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_type_tui_round_trip() {
+        let s = serde_json::to_string(&ChannelType::Tui).unwrap();
+        assert_eq!(s, "\"tui\"");
+        let back: ChannelType = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ChannelType::Tui);
+    }
+
+    #[test]
+    fn channel_type_deserialises_legacy_cli_alias() {
+        let back: ChannelType = serde_json::from_str("\"cli\"").unwrap();
+        assert_eq!(back, ChannelType::Tui);
+    }
 }

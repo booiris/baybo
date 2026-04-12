@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use aura_channels::OutgoingMessage;
+use aura_channels::AgentOutput;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -14,11 +14,11 @@ pub struct ActorHandle {
 /// Manages AgentActor instances, one per active session.
 pub struct AgentSupervisor {
     actors: HashMap<String, ActorHandle>,
-    response_tx: mpsc::Sender<OutgoingMessage>,
+    response_tx: mpsc::Sender<AgentOutput>,
 }
 
 impl AgentSupervisor {
-    pub fn new(response_tx: mpsc::Sender<OutgoingMessage>) -> Self {
+    pub fn new(response_tx: mpsc::Sender<AgentOutput>) -> Self {
         Self {
             actors: HashMap::new(),
             response_tx,
@@ -50,7 +50,7 @@ impl AgentSupervisor {
     }
 
     /// Get the response channel sender (for creating new actors).
-    pub fn response_tx(&self) -> &mpsc::Sender<OutgoingMessage> {
+    pub fn response_tx(&self) -> &mpsc::Sender<AgentOutput> {
         &self.response_tx
     }
 

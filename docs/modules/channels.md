@@ -4,7 +4,7 @@
 
 The `channels` crate defines the **trait interface** for receiving messages from multiple platforms and converting them into a unified `IncomingMessage`, then converting `OutgoingMessage` back into platform-native formats for delivery.
 
-**Design pattern**: Adapter pattern. The crate provides the `ChannelAdapter` trait, shared message types, and `ChannelRegistry`. Built-in adapters (e.g. `CliAdapter` for stdin/stdout) are implemented directly in this crate. Additional platform adapters (Telegram, Discord, HTTP, etc.) can be built as WASM modules and loaded at runtime via the `sandbox` extension mechanism.
+**Design pattern**: Adapter pattern. The crate provides the `ChannelAdapter` trait, shared message types, and `ChannelRegistry`. Built-in adapters (e.g. `TuiAdapter` — a Ratatui-based terminal UI that is the default interactive channel) are implemented directly in this crate. Additional platform adapters (Telegram, Discord, HTTP, etc.) can be built as WASM modules and loaded at runtime via the `sandbox` extension mechanism.
 
 Core responsibilities of this crate:
 
@@ -17,15 +17,22 @@ Core responsibilities of this crate:
 
 ### Built-in and extensible adapters
 
-This crate contains the `ChannelAdapter` trait and built-in adapters that require no external dependencies (e.g. `CliAdapter`). Platform-specific adapters that bring SDK dependencies (Telegram, Discord, etc.) are built as WASM modules under the top-level `channels/` directory, keeping those dependencies out of the main workspace and enabling hot-reload and sandboxed execution.
+This crate contains the `ChannelAdapter` trait and built-in adapters that require only pure-Rust dependencies (e.g. `TuiAdapter`, which pulls in `ratatui` + `crossterm`). Platform-specific adapters that bring SDK dependencies (Telegram, Discord, etc.) are built as WASM modules under the top-level `channels/` directory, keeping those dependencies out of the main workspace and enabling hot-reload and sandboxed execution.
 
 ### No business logic
 
 Channels contain no routing, rate limiting, or security logic. They depend only on `model` and `session`. Business logic belongs to `agent` and `security`.
 
-### No streaming output
+### Optional streaming output
 
-Every channel sends only once the full response is ready. This simplifies the adapter interface and avoids partial-delivery complexity.
+Adapters may opt into incremental rendering by overriding `send_stream_delta`.
+The default implementation is a no-op, so channels that only support one-shot
+delivery (HTTP responses, webhook posts) ignore deltas and wait for the final
+`send_response` call. Adapters that can paint partial output — the built-in
+`TuiAdapter`, for instance — accumulate deltas as they arrive and reconcile
+against the canonical `OutgoingMessage` when the turn finishes. Delivery
+ordering per `session_id` is the caller's responsibility; adapters assume
+chunks arrive in the order the LLM emitted them.
 
 ### Unified message mapping
 
@@ -48,10 +55,16 @@ Current and planned adapters:
 
 | Adapter  | ID prefix | Transport         |
 | -------- | --------- | ----------------- |
-| CLI (built-in) | `cli_`    | stdin/stdout      |
+| TUI (built-in) | `tui_`    | Terminal (Ratatui) |
 | HTTP           | `http_`   | REST API (axum)   |
 | Telegram       | `tg_`     | Long polling      |
 | Discord        | `dc_`     | WebSocket Gateway |
+
+The built-in `TuiAdapter` is the default interactive channel when `aura` is
+launched with no subcommand. It renders a Ratatui chat scrollback plus an
+input box, and opens dashboard views for bare dashboard-style slash commands
+(`/skills`, `/tools`, `/jobs`, `/sessions`, `/memory`). See
+[`tui.md`](./tui.md) for the full contract.
 
 Each adapter must:
 

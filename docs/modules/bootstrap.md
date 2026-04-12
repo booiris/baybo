@@ -65,7 +65,7 @@ ToolRegistry / ToolExecutor / MemoryManager / LlmClient
 WorkspaceManager / Soul / ExecutionPolicy / HookManager / LeakDetector / SecurityGateway
   │
   ▼
-ChannelRegistry.register(CliAdapter).start_all()
+ChannelRegistry.register(TuiAdapter).start_all()
   │
   ▼
 Router::new(…).with_actor_spawner(closure).with_cron_triggers(…)

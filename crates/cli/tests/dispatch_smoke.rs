@@ -104,9 +104,9 @@ fn seeded_session_manager(ids: &[&str]) -> (Arc<SessionManager>, Vec<String>) {
             user: User {
                 id: "user-1".to_string(),
                 name: Some("Alice".to_string()),
-                channel: ChannelType::Cli,
+                channel: ChannelType::Tui,
             },
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),
@@ -1063,7 +1063,7 @@ async fn cron_list_returns_all_scheduled_jobs() {
     sched
         .create_job(
             "alice",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 9 * * *",
             "morning",
             CronRunMode::Recurring,
@@ -1073,7 +1073,7 @@ async fn cron_list_returns_all_scheduled_jobs() {
     sched
         .create_job(
             "bob",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 18 * * *",
             "evening",
             CronRunMode::Recurring,
@@ -1108,7 +1108,7 @@ async fn cron_show_returns_metadata_for_known_id() {
     let job = sched
         .create_job(
             "alice",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 9 * * *",
             "hello",
             CronRunMode::Recurring,
@@ -1135,7 +1135,7 @@ async fn cron_rm_requires_yes_in_slash_mode() {
     let job = sched
         .create_job(
             "alice",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 9 * * *",
             "test",
             CronRunMode::Recurring,
@@ -1163,7 +1163,7 @@ async fn cron_rm_with_yes_deletes() {
     let job = sched
         .create_job(
             "alice",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 9 * * *",
             "test",
             CronRunMode::Recurring,
@@ -1192,7 +1192,7 @@ async fn cron_enable_disable_round_trip() {
     let job = sched
         .create_job(
             "alice",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 9 * * *",
             "test",
             CronRunMode::Recurring,
@@ -1243,7 +1243,7 @@ async fn cron_run_requires_yes_in_slash_mode() {
     let job = sched
         .create_job(
             "alice",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 9 * * *",
             "fire",
             CronRunMode::Recurring,
@@ -1271,7 +1271,7 @@ async fn cron_run_dispatches_and_records_execution() {
     let job = sched
         .create_job(
             "alice",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 9 * * *",
             "fire",
             CronRunMode::Recurring,
@@ -1303,7 +1303,7 @@ async fn cron_runs_returns_empty_for_unfired_job() {
     let job = sched
         .create_job(
             "alice",
-            ChannelType::Cli,
+            ChannelType::Tui,
             "0 9 * * *",
             "fresh",
             CronRunMode::Recurring,

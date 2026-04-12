@@ -458,11 +458,11 @@ mod tests {
         Message {
             id: "msg-1".into(),
             session_id: "sess-1".into(),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             sender: aura_session::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
-                channel: ChannelType::Cli,
+                channel: ChannelType::Tui,
             },
             content: vec![ContentBlock::Text(text.into())],
             timestamp: Utc::now(),
@@ -477,9 +477,9 @@ mod tests {
             user: aura_session::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
-                channel: ChannelType::Cli,
+                channel: ChannelType::Tui,
             },
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),
@@ -598,7 +598,7 @@ mod tests {
 
         let mut response = OutgoingMessage {
             session_id: "sess-1".into(),
-            channel: ChannelType::Cli,
+            channel: ChannelType::Tui,
             content: vec![ContentBlock::Text(
                 "Here is the key: AKIAIOSFODNN7EXAMPLE".into(),
             )],
