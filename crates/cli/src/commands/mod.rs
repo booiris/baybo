@@ -1,0 +1,9 @@
+pub mod channels;
+pub mod completion;
+pub mod config;
+pub mod doctor;
+pub mod llm;
+pub mod skills;
+pub mod status;
+pub mod tools;
+pub mod workspace;

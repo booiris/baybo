@@ -9,7 +9,7 @@ use crate::cost::CostGuard;
 use crate::cron::CronTriggerEvent;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::actor::AgentMessage;
@@ -66,7 +66,7 @@ pub type ActorSpawner =
 pub struct Router {
     session_manager: SessionManager,
     supervisor: AgentSupervisor,
-    channels: ChannelRegistry,
+    channels: Arc<RwLock<ChannelRegistry>>,
     security_gateway: Arc<SecurityGateway>,
     cost_guard: Option<Arc<CostGuard>>,
     rate_limiter: RateLimiter,
@@ -82,7 +82,7 @@ impl Router {
     pub fn new(
         session_manager: SessionManager,
         supervisor: AgentSupervisor,
-        channels: ChannelRegistry,
+        channels: Arc<RwLock<ChannelRegistry>>,
         security_gateway: Arc<SecurityGateway>,
     ) -> Self {
         Self {
@@ -130,7 +130,8 @@ impl Router {
         mut incoming_rx: mpsc::Receiver<IncomingMessage>,
         mut response_rx: mpsc::Receiver<OutgoingMessage>,
     ) {
-        info!(channel_count = self.channels.len(), "router starting");
+        let channel_count = self.channels.read().await.len();
+        info!(channel_count, "router starting");
 
         let mut cron_rx = self.cron_trigger_rx.take();
 
@@ -356,7 +357,8 @@ impl Router {
 
     async fn send_to_channel(&self, outgoing: OutgoingMessage) {
         let channel_type = outgoing.channel;
-        match self.channels.get(channel_type) {
+        let channels = self.channels.read().await;
+        match channels.get(channel_type) {
             Some(adapter) => {
                 if let Err(e) = adapter.send_response(outgoing).await {
                     error!(

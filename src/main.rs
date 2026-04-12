@@ -14,6 +14,10 @@ use aura_agent::{
     TraceCollector,
 };
 use aura_channels::{ChannelRegistry, CliAdapter};
+use aura_cli::cli::ShellKind;
+use aura_cli::{
+    Cli, CliSlashHandler, Commands, ContextBuilder, Invocation, OutputFormat, dispatch,
+};
 use aura_context::{ContextManager, Tokenizer, Truncate};
 use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
 use aura_model::{ChatMessage, ContentBlock};
@@ -22,9 +26,10 @@ use aura_skills::SkillRegistry;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
+use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -91,14 +96,105 @@ impl Tokenizer for SimpleTokenizer {
     }
 }
 
+/// Resolve the effective aura.json path, if any, for display in diagnostics.
+fn resolve_config_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("AURA_CONFIG_PATH") {
+        return Some(PathBuf::from(explicit));
+    }
+    let default = PathBuf::from("aura.json");
+    default.exists().then_some(default)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // `completion` is the only subcommand that must work without loading
+    // config or initialising tracing — it is pure stdout output.
+    if let Some(Commands::Completion { shell }) = cli.command {
+        print_completion(shell)?;
+        return Ok(());
+    }
+
     init_tracing();
+
+    let cli_format = pick_format(&cli);
 
     info!("Aura - Intelligent Assistant Framework starting");
 
     let config = boot::load_config().await?;
+    let config = Arc::new(config);
     let buffer = config.channels.message_buffer_size;
+
+    // --- minimal services required by both argv and chat modes ---
+
+    let skill_registry = Arc::new(SkillRegistry::new());
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let workspace = Arc::new(WorkspaceManager::new(PathBuf::from(
+        &config.agent.workspace_path,
+    )));
+    let channels_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
+
+    // LLM client is required for the chat loop but optional for argv commands
+    // that only inspect state. Argv mode logs and continues; chat mode errors.
+    let llm_client = match boot::build_llm_client(&config.llm) {
+        Ok(c) => {
+            let client = Arc::new(c);
+            info!(
+                provider = %client.model_info().provider,
+                model = %client.model_id(),
+                "configured LLM client"
+            );
+            Some(client)
+        }
+        Err(e) if cli.command.is_some() => {
+            tracing::warn!(error = %e, "LLM client unavailable for this command");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    // ---------------- argv dispatch (one-shot command + exit) ----------------
+
+    if let Some(cmd) = cli.command {
+        let mut builder = ContextBuilder::new(Arc::clone(&config))
+            .config_path(resolve_config_path())
+            .skills(Arc::clone(&skill_registry))
+            .tools(Arc::clone(&tool_registry))
+            .channels(Arc::clone(&channels_registry))
+            .workspace(Arc::clone(&workspace));
+        if let Some(ref client) = llm_client {
+            builder = builder.llm(Arc::clone(client));
+        }
+        let ctx = builder
+            .build()
+            .with_format(cli_format)
+            .with_invocation(Invocation::Argv);
+
+        match dispatch::run(&ctx, cmd).await {
+            Ok(out) => {
+                let rendered = out.render(cli_format);
+                if !rendered.is_empty() {
+                    println!("{rendered}");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // ---------------- chat-loop boot (no subcommand provided) ----------------
+
+    // By construction: the chat loop is only reached when `cli.command` is
+    // `None`, and in that branch `build_llm_client` must have succeeded or we
+    // already returned an error. Unwrap defensively to avoid a panic.
+    let llm_client = match llm_client {
+        Some(c) => c,
+        None => return Err(anyhow::anyhow!("LLM client is required for chat loop")),
+    };
 
     // Storage layer (in-memory for Phase 1)
     let storage = Store::in_memory().await?;
@@ -159,9 +255,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let secret_vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
 
-    // Tool registry
-    let tool_registry = Arc::new(ToolRegistry::new());
-
     // Tool executor
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
@@ -172,18 +265,10 @@ async fn main() -> anyhow::Result<()> {
     // Memory manager (without embedder for Phase 1)
     let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
 
-    let llm_client = Arc::new(boot::build_llm_client(&config.llm)?);
-    info!(
-        provider = %llm_client.model_info().provider,
-        model = %llm_client.model_id(),
-        "configured LLM client"
-    );
-
     // Context manager (sliding window)
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(SimpleTokenizer);
 
-    // Workspace and Soul
-    let workspace = WorkspaceManager::new(PathBuf::from(&config.agent.workspace_path));
+    // Soul derived from workspace identity files
     let soul = Soul::from_workspace(&workspace)
         .await
         .unwrap_or_else(|_| Soul::custom("You are Aura, an intelligent assistant.".to_string()));
@@ -206,19 +291,35 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&secret_vault),
     ));
 
-    // Channel registry — register the CLI adapter
-    let mut channels = ChannelRegistry::new();
-    channels
-        .register(Box::new(CliAdapter::new()))
+    // Build the slash-handler context once everything above is wired.
+    let slash_ctx = Arc::new(
+        ContextBuilder::new(Arc::clone(&config))
+            .config_path(resolve_config_path())
+            .skills(Arc::clone(&skill_registry))
+            .tools(Arc::clone(&tool_registry))
+            .channels(Arc::clone(&channels_registry))
+            .llm(Arc::clone(&llm_client))
+            .workspace(Arc::clone(&workspace))
+            .build()
+            .with_invocation(Invocation::Slash)
+            .with_format(OutputFormat::Plain),
+    );
+    let slash_handler = Arc::new(CliSlashHandler::new(slash_ctx));
+
+    // Register and start the CLI adapter with the slash handler attached.
+    {
+        let mut reg = channels_registry.write().await;
+        reg.register(Box::new(
+            CliAdapter::new().with_slash_handler(slash_handler),
+        ))
         .expect("failed to register CLI adapter");
-    channels
-        .start_all(incoming_tx)
-        .await
-        .expect("failed to start channels");
+        reg.start_all(incoming_tx)
+            .await
+            .expect("failed to start channels");
+    }
 
     // Supervisor and Router
     let supervisor = AgentSupervisor::new(response_tx);
-    let skill_registry = Arc::new(SkillRegistry::new());
     let actor_llm_client = Arc::clone(&llm_client);
     let actor_tool_registry = Arc::clone(&tool_registry);
     let actor_skill_registry = Arc::clone(&skill_registry);
@@ -233,35 +334,40 @@ async fn main() -> anyhow::Result<()> {
     let actor_keep_recent = config.agent.context.keep_recent;
     let actor_buffer = buffer;
 
-    let router = Router::new(session_manager, supervisor, channels, security_gateway)
-        .with_actor_spawner(Box::new(move |session, response_tx| {
-            let agent_loop = AgentLoop::new(
-                Arc::clone(&actor_llm_client),
-                Arc::clone(&actor_tool_registry),
-                Arc::clone(&actor_skill_registry),
-                Arc::clone(&actor_tool_executor),
-                ContextManager::new(
-                    Arc::clone(&actor_tokenizer),
-                    Box::new(Truncate::new(actor_keep_recent)),
-                    actor_token_budget.clone(),
-                ),
-                Arc::clone(&actor_memory_manager),
-                actor_policy.clone(),
-                Soul::custom(actor_system_prompt.clone()),
-            );
-            let actor = AgentActor::new(
-                session,
-                agent_loop,
-                response_tx,
-                Arc::clone(&actor_hooks),
-                Arc::clone(&actor_recorder),
-            );
-            let (sender, mailbox) = mpsc::channel(actor_buffer);
-            tokio::spawn(async move {
-                actor.run(mailbox).await;
-            });
-            sender
-        }));
+    let router = Router::new(
+        session_manager,
+        supervisor,
+        Arc::clone(&channels_registry),
+        security_gateway,
+    )
+    .with_actor_spawner(Box::new(move |session, response_tx| {
+        let agent_loop = AgentLoop::new(
+            Arc::clone(&actor_llm_client),
+            Arc::clone(&actor_tool_registry),
+            Arc::clone(&actor_skill_registry),
+            Arc::clone(&actor_tool_executor),
+            ContextManager::new(
+                Arc::clone(&actor_tokenizer),
+                Box::new(Truncate::new(actor_keep_recent)),
+                actor_token_budget.clone(),
+            ),
+            Arc::clone(&actor_memory_manager),
+            actor_policy.clone(),
+            Soul::custom(actor_system_prompt.clone()),
+        );
+        let actor = AgentActor::new(
+            session,
+            agent_loop,
+            response_tx,
+            Arc::clone(&actor_hooks),
+            Arc::clone(&actor_recorder),
+        );
+        let (sender, mailbox) = mpsc::channel(actor_buffer);
+        tokio::spawn(async move {
+            actor.run(mailbox).await;
+        });
+        sender
+    }));
 
     // Shutdown coordination
     let shutdown = ShutdownSignal::new();
@@ -316,5 +422,23 @@ async fn main() -> anyhow::Result<()> {
     // Cleanup
     task_tracker.shutdown().await;
     info!("Aura shutdown complete");
+    Ok(())
+}
+
+fn pick_format(cli: &Cli) -> OutputFormat {
+    if cli.global.json {
+        OutputFormat::Json
+    } else if cli.global.plain {
+        OutputFormat::Plain
+    } else {
+        OutputFormat::Human
+    }
+}
+
+/// Emit a shell completion script without running the rest of the boot chain.
+fn print_completion(shell: ShellKind) -> anyhow::Result<()> {
+    let out = aura_cli::completion_script(shell).map_err(|e| anyhow::anyhow!(e))?;
+    let rendered = out.render(OutputFormat::Plain);
+    print!("{rendered}");
     Ok(())
 }

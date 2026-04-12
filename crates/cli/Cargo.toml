@@ -1,0 +1,26 @@
+[package]
+name = "aura-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-model = { workspace = true }
+aura-channels = { workspace = true }
+aura-config = { workspace = true }
+aura-session = { workspace = true }
+aura-skills = { workspace = true }
+aura-tools = { workspace = true }
+aura-llm = { workspace = true }
+aura-workspace = { workspace = true }
+
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+clap = { workspace = true }
+clap_complete = { workspace = true }
+shell-words = { workspace = true }

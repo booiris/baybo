@@ -19,6 +19,7 @@ members = [
     "crates/skills",
     "crates/cron",
     "crates/config",
+    "crates/cli",
 ]
 
 [workspace.package]
@@ -46,6 +47,7 @@ aura-registry = { path = "crates/registry" }
 aura-skills = { path = "crates/skills" }
 aura-cron = { path = "crates/cron" }
 aura-config = { path = "crates/config" }
+aura-cli = { path = "crates/cli" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -82,6 +84,9 @@ cron = "0.15"
 futures = "0.3"
 rig-core = { version = "0.34", features = ["derive"] }
 rmcp = { version = "1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4"
+shell-words = "1"
 
 [package]
 name = "aura"
@@ -105,6 +110,7 @@ aura-sandbox = { workspace = true }
 aura-storage = { workspace = true }
 aura-skills = { workspace = true }
 aura-config = { workspace = true }
+aura-cli = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -113,3 +119,4 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
+clap = { workspace = true }
