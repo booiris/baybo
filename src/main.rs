@@ -25,7 +25,7 @@ use aura_workspace::WorkspaceManager;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 struct NoopHook;
@@ -139,7 +139,21 @@ async fn main() -> anyhow::Result<()> {
     let master_key = match boot::load_encryption_key(&config.security) {
         Ok(k) => k,
         Err(e) => {
-            warn!(error = %e, "falling back to dev-only encryption key; DO NOT use in production");
+            let allow_dev = std::env::var("AURA_ALLOW_DEV_ENCRYPTION_KEY")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            if !allow_dev {
+                return Err(anyhow::anyhow!(
+                    "failed to load encryption key: {e}. To run with an insecure dev-only key, \
+                     set AURA_ALLOW_DEV_ENCRYPTION_KEY=1 (NOT for production — secrets would be \
+                     encrypted with a publicly-known key)"
+                ));
+            }
+            error!(
+                error = %e,
+                "AURA_ALLOW_DEV_ENCRYPTION_KEY=1 — running with dev-only encryption key; \
+                 secrets are NOT confidential, DO NOT use in production"
+            );
             EncryptionKey::new(b"aura-dev-master-key-32-bytes-ok!".to_vec())?
         }
     };

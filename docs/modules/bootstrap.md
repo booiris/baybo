@@ -55,7 +55,7 @@ Store::in_memory()                           ── storage layer (Phase 1: in-m
 SessionManager / JobManager / CostTracker / TraceCollector / ObservabilityRecorder
   │
   ▼
-boot::load_encryption_key  →  SecretVault    ── warn + dev-only fallback on error
+boot::load_encryption_key  →  SecretVault    ── dev-only fallback gated on AURA_ALLOW_DEV_ENCRYPTION_KEY=1
   │
   ▼
 ToolRegistry / ToolExecutor / MemoryManager / LlmClient
@@ -82,11 +82,11 @@ The closure passed to `with_actor_spawner` captures clones of all `Arc`-shared s
 | `AURA_CONFIG_PATH` set but file missing | `bail!` — startup aborts. |
 | `aura.json` missing with no env | `info!` + `AuraConfig::default()`. |
 | `load_from_file` parse/validate error | `bail!` with full `ConfigError::Validation` list. |
-| `load_encryption_key` failure | `warn!` + dev-only `b"aura-dev-master-key-32-bytes-ok!"` fallback. Must not ship to production. |
+| `load_encryption_key` failure | `bail!` unless `AURA_ALLOW_DEV_ENCRYPTION_KEY=1` is set. With the flag, `error!` + dev-only `b"aura-dev-master-key-32-bytes-ok!"` fallback. Must not ship to production. |
 | `build_llm_client` failure | `bail!` — unrecoverable, there's no sensible default. |
 | Any other `?` at boot | Propagates up, process exits non-zero. |
 
-The dev fallback for the encryption key is intentional: it lets `cargo run` succeed on a fresh checkout without a pre-provisioned secret. The warning fires on every use to prevent it from being mistaken for a working setup.
+The dev fallback for the encryption key is intentional but explicit: a fresh checkout runs with `AURA_ALLOW_DEV_ENCRYPTION_KEY=1 cargo run`. Without the flag, a missing or mistyped key source aborts startup rather than silently encrypting secrets with a publicly-known key. When the flag is honoured, an `error!` line fires on every boot so it cannot be mistaken for a working setup.
 
 ## What boot does NOT do
 
