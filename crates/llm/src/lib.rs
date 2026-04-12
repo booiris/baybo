@@ -13,7 +13,7 @@ use rig::completion::{
     ToolDefinition,
 };
 use rig::message::{Message, Text, UserContent};
-use rig::providers::{anthropic, openai};
+use rig::providers::{anthropic, gemini, openai};
 use rig::streaming::{self, StreamedAssistantContent};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -165,6 +165,7 @@ fn convert_stream_event<R: GetTokenUsage>(
 pub(crate) enum AnyCompletionModel {
     OpenAI(openai::completion::CompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
+    Gemini(gemini::completion::CompletionModel),
 }
 
 impl AnyCompletionModel {
@@ -191,6 +192,15 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
+            Self::Gemini(m) => {
+                let resp = m.completion(request).await?;
+                Ok(completion::CompletionResponse {
+                    choice: resp.choice,
+                    usage: resp.usage,
+                    raw_response: (),
+                    message_id: resp.message_id,
+                })
+            }
         }
     }
 
@@ -204,6 +214,10 @@ impl AnyCompletionModel {
                 Ok(LlmStream::from_rig_stream(stream))
             }
             Self::Anthropic(m) => {
+                let stream = m.stream(request).await?;
+                Ok(LlmStream::from_rig_stream(stream))
+            }
+            Self::Gemini(m) => {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_rig_stream(stream))
             }

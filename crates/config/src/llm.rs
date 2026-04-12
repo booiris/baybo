@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// Provider identifier, e.g. `"openai"` or `"anthropic"`.
+    /// Provider identifier, e.g. `"openai"`, `"anthropic"`, or `"gemini"`.
     pub provider: String,
     /// Primary model identifier, e.g. `"gpt-4o-mini"`.
     pub model: String,

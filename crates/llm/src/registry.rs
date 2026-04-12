@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::LlmClient;
-use crate::providers::{anthropic::AnthropicProviderFactory, openai::OpenAIProviderFactory};
+use crate::providers::{
+    anthropic::AnthropicProviderFactory, gemini::GeminiProviderFactory,
+    openai::OpenAIProviderFactory,
+};
 
 /// Configuration for creating an LLM provider client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +63,7 @@ impl LlmProviderRegistry {
         let mut registry = Self::new();
         registry.register(OpenAIProviderFactory);
         registry.register(AnthropicProviderFactory);
+        registry.register(GeminiProviderFactory);
         registry
     }
 
