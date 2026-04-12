@@ -58,7 +58,7 @@ The trait that lets a channel adapter intercept `/` input is defined in `aura-ch
 **Global flags** (apply to every command in both modes):
 `--config <path>` · `--profile <name>` · `--json` · `--plain` · `--no-color` · `-v/--verbose` · `-V/--version`
 
-"Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs are tracked in `docs/todo/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
+"Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs are tracked in the per-subsystem follow-up todos (`docs/todo/cli-agent-send-argv.md`, `docs/todo/cli-sandbox-registry.md`) — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
 
 | Family       | Subcommands                                                                                               | Backing module                                                               | Mutation                                                                                           | Status                                            |
 | ------------ | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
@@ -141,7 +141,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 1. `docs/modules/cli.md` exists with the seven sections above.
 2. `docs/modules/README.md` lists `cli` in its module groups and Reading Order.
-3. Every command family in the table maps to a manager already present in `src/main.rs`; the "deferred" rows cite only subsystems whose backing APIs are tracked in `docs/todo/cli-write-commands.md`.
+3. Every command family in the table maps to a manager already present in `src/main.rs`; the remaining "deferred" rows (`agent send` argv, `sandbox list/info`) are tracked in their own follow-up todos under `docs/todo/`.
 
 **Phase 2a — read-only commands** — complete.
 
@@ -151,7 +151,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 - `aura completion zsh > /tmp/_aura && zsh -c 'source /tmp/_aura'` loads without error.
 - `aura doctor` reports a warning when `AURA_ALLOW_DEV_ENCRYPTION_KEY=1` and an error when no LLM client is configured.
 
-**Phase 2b — write-mutating commands** — pending. Tracked in `docs/todo/cli-write-commands.md`; each shipped family will add the following before landing:
+**Phase 2b — write-mutating commands** — complete. Tracked in `docs/todo/archives/cli-write-commands.md` (archived; two subsystem-level follow-ups — `cli-agent-send-argv.md`, `cli-sandbox-registry.md` — carry the remaining deferred work). Each shipped family landed with the following:
 
 - Parser snapshot test in `crates/cli/tests/parser.rs`.
 - Dispatch smoke test in `crates/cli/tests/dispatch_smoke.rs`.

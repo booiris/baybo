@@ -43,4 +43,4 @@ When the real wiring lands, the third test flips from asserting the deferred-err
 - `crates/agent/src/router.rs` — today's long-running loop
 - `crates/agent/src/agent_loop.rs` — message-driven entry point
 - `crates/agent/src/supervisor*` — session ownership bookkeeping
-- `docs/todo/cli-write-commands.md` — parent todo; this one carries the design work that item 11 punted on
+- `docs/todo/archives/cli-write-commands.md` — archived parent todo; this one carries the design work item 11 punted on

@@ -1,5 +1,11 @@
 # CLI Write-Mutating Commands
 
+> **Archived 2026-04-12.** Phase 2b shipped for every subsystem that had a
+> backing API. Two items landed with a deferred tail and moved to their
+> own follow-ups: `agent send` argv mode in `docs/todo/cli-agent-send-argv.md`,
+> and `sandbox list/info` in `docs/todo/cli-sandbox-registry.md`.
+> Kept here for history; do not reopen.
+
 ## Problem
 
 `docs/modules/cli.md` defines a full command taxonomy, but Phase 2 only shipped the **read-only** families: `config show/file/schema/validate`, `skills list/info`, `tools list/info`, `channels list`, `llm status`, `workspace show`, `status`, `doctor`, `completion`.

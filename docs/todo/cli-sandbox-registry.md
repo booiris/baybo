@@ -87,4 +87,4 @@ Once the registry exists:
 - `crates/sandbox/src/lib.rs:11-20` — today's bare enum
 - `crates/tools/src` — `ToolExecutor`, the eventual consumer of policies
 - `docs/todo/config-wire-remaining-sections.md` — config integration
-- `docs/todo/cli-write-commands.md` — parent todo; this one carries the design work that item 12 punted on
+- `docs/todo/archives/cli-write-commands.md` — archived parent todo; this one carries the design work item 12 punted on
