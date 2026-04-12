@@ -1,0 +1,69 @@
+{
+  "llm": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "fallback_model": "gpt-4o",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": null
+  },
+  "agent": {
+    "max_iterations": 20,
+    "default_tool_timeout_ms": 30000,
+    "context": {
+      "max_tokens": 120000,
+      "compression_threshold": 0.75,
+      "keep_recent": 100
+    }
+  },
+  "session": {
+    "timeout_minutes": 30,
+    "cleanup_interval_minutes": 0
+  },
+  "channels": {
+    "cli": {
+      "enabled": true
+    },
+    "message_buffer_size": 256
+  },
+  "sandbox": {
+    "wasm": {
+      "timeout_ms": 30000,
+      "max_memory_bytes": 67108864,
+      "max_fuel": 1000000000
+    },
+    "network": {
+      "allowed_domains": [
+        "api.openai.com",
+        "api.anthropic.com"
+      ],
+      "allow_loopback": false
+    }
+  },
+  "security": {
+    "encryption_key_file": null,
+    "encryption_key_env": "AURA_ENCRYPTION_KEY",
+    "leak_detection_enabled": true
+  },
+  "tools": {
+    "mcp_servers": [],
+    "default_timeout_ms": 30000
+  },
+  "trace": {
+    "auto_snapshot": true,
+    "snapshot_interval": 5
+  },
+  "cost": {
+    "spending_limits": {
+      "user_daily_usd": null,
+      "user_monthly_usd": null,
+      "global_daily_usd": null
+    },
+    "rate_limit": {
+      "max_requests": 30,
+      "window_secs": 60
+    }
+  },
+  "workspace": {
+    "path": "./.aura"
+  }
+}
