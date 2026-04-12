@@ -66,6 +66,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: ChannelsCmd,
     },
+    /// Security audit and leak scanning.
+    Security {
+        #[command(subcommand)]
+        cmd: SecurityCmd,
+    },
     /// LLM provider and model status.
     Llm {
         #[command(subcommand)]
@@ -195,6 +200,27 @@ pub enum ToolsCmd {
 pub enum ChannelsCmd {
     /// List registered channel adapters and their current status.
     List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecurityCmd {
+    /// Print a structured view of the gateway's active posture
+    /// (leak rules, secret vault presence).
+    Audit,
+    /// Leak-detector operations.
+    Leaks {
+        #[command(subcommand)]
+        cmd: LeaksCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LeaksCmd {
+    /// Scan a file on disk for known secret patterns.
+    Check {
+        /// Path to the file to scan.
+        path: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

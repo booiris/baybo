@@ -11,8 +11,8 @@ use std::sync::Arc;
 use aura_agent::{CronScheduler, JobManager, MemoryManager, ShutdownSignal};
 use aura_channels::ChannelRegistry;
 use aura_cli::cli::{
-    ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd, SessionCmd,
-    SkillsCmd, ToolsCmd, TraceCmd, WorkspaceCmd,
+    ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LeaksCmd, LlmCmd, MemoryCmd,
+    SecurityCmd, SessionCmd, SkillsCmd, ToolsCmd, TraceCmd, WorkspaceCmd,
 };
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
@@ -2251,4 +2251,157 @@ async fn tools_test_unknown_tool_errors_in_argv_mode() {
     .await
     .expect_err("unknown tool should error");
     assert!(err.to_string().contains("does.not.exist"));
+}
+
+// --- security ---
+
+struct MemSecretStore {
+    data: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl MemSecretStore {
+    fn new() -> Self {
+        Self {
+            data: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl aura_storage::SecretStore for MemSecretStore {
+    async fn store(&self, name: &str, encrypted_value: &[u8]) -> aura_storage::secret::Result<()> {
+        self.data
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), encrypted_value.to_vec());
+        Ok(())
+    }
+    async fn retrieve(&self, name: &str) -> aura_storage::secret::Result<Option<Vec<u8>>> {
+        Ok(self.data.lock().unwrap().get(name).cloned())
+    }
+    async fn delete(&self, name: &str) -> aura_storage::secret::Result<()> {
+        self.data.lock().unwrap().remove(name);
+        Ok(())
+    }
+    async fn list(&self) -> aura_storage::secret::Result<Vec<String>> {
+        Ok(self.data.lock().unwrap().keys().cloned().collect())
+    }
+}
+
+fn context_with_security() -> aura_cli::CommandContext {
+    use aura_agent::{SecretVault, SecurityGateway};
+    use aura_security::{EncryptionKey, LeakDetector};
+
+    let detector = Arc::new(LeakDetector::with_default_rules());
+    let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+    let vault = Arc::new(SecretVault::new(key, Arc::new(MemSecretStore::new())));
+    let gateway = Arc::new(SecurityGateway::new(Arc::clone(&detector), vault));
+
+    let config = Arc::new(AuraConfig::default());
+    ContextBuilder::new(config)
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .security(gateway)
+        .leak_detector(detector)
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain)
+}
+
+#[tokio::test]
+async fn security_audit_without_gateway_errors() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Security {
+            cmd: SecurityCmd::Audit,
+        },
+    )
+    .await
+    .expect_err("audit without gateway");
+    assert!(err.to_string().contains("security gateway"));
+}
+
+#[tokio::test]
+async fn security_audit_reports_rules_and_vault_flag() {
+    let ctx = context_with_security();
+    let out = dispatch::run(
+        &ctx,
+        Commands::Security {
+            cmd: SecurityCmd::Audit,
+        },
+    )
+    .await
+    .expect("security audit");
+    let data = out.data.expect("structured payload");
+    let total = data["leak_rules"]["total"].as_u64().expect("total");
+    assert!(total > 0, "default rule set should be non-empty");
+    assert_eq!(data["secret_vault"]["master_key_configured"], true);
+}
+
+#[tokio::test]
+async fn security_leaks_check_without_detector_errors() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Security {
+            cmd: SecurityCmd::Leaks {
+                cmd: LeaksCmd::Check {
+                    path: "/nonexistent".into(),
+                },
+            },
+        },
+    )
+    .await
+    .expect_err("leaks check without detector");
+    assert!(err.to_string().contains("leak detector"));
+}
+
+#[tokio::test]
+async fn security_leaks_check_flags_github_token() {
+    let ctx = context_with_security();
+    let dir = std::env::temp_dir().join(format!("aura-leaks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("tokens.txt");
+    // Fabricated token that matches the `github_token` default rule.
+    let fake = "ghp_0123456789abcdefghijABCDEFGHIJ0123456789".to_string();
+    std::fs::write(&file, &fake).unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Security {
+            cmd: SecurityCmd::Leaks {
+                cmd: LeaksCmd::Check {
+                    path: file.to_string_lossy().into_owned(),
+                },
+            },
+        },
+    )
+    .await
+    .expect("leaks check");
+    let data = out.data.expect("payload");
+    assert_eq!(data["blocked"], false);
+    let hit_count = data["hit_count"].as_u64().expect("hit_count");
+    assert!(hit_count >= 1, "expected a github_token hit");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn security_leaks_check_missing_file_errors() {
+    let ctx = context_with_security();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Security {
+            cmd: SecurityCmd::Leaks {
+                cmd: LeaksCmd::Check {
+                    path: "/definitely/does/not/exist/aura-leak-test".into(),
+                },
+            },
+        },
+    )
+    .await
+    .expect_err("missing file");
+    assert!(err.to_string().contains("aura-leak-test"));
 }

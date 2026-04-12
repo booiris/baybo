@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_security::{EncryptionKey, SecurityError, crypto};
+use aura_security::{EncryptionKey, LeakAction, SecurityError, crypto};
 use aura_storage::SecretStore;
 use aura_tools::{SecretAccess, SecretAccessError, SecretAccessor, SecretRequirement};
+use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, SecurityError>;
 
@@ -189,16 +190,23 @@ const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
 /// The security boundary through which all messages pass before entering
 /// or leaving the agent.
 pub struct SecurityGateway {
-    leak_detector: LeakDetector,
+    leak_detector: Arc<LeakDetector>,
     secret_vault: Arc<SecretVault>,
 }
 
 impl SecurityGateway {
-    pub fn new(leak_detector: LeakDetector, secret_vault: Arc<SecretVault>) -> Self {
+    pub fn new(leak_detector: Arc<LeakDetector>, secret_vault: Arc<SecretVault>) -> Self {
         Self {
             leak_detector,
             secret_vault,
         }
+    }
+
+    /// Return a handle to the underlying leak detector, for operator tools
+    /// (e.g. `aura security leaks check`) that need to reuse the same rule
+    /// set configured on the gateway.
+    pub fn leak_detector(&self) -> Arc<LeakDetector> {
+        Arc::clone(&self.leak_detector)
     }
 
     pub async fn sanitize_input(&self, msg: &mut Message, session: &mut Session) -> Result<()> {
@@ -250,6 +258,41 @@ impl SecurityGateway {
         Ok(())
     }
 
+    /// Produce a structured audit report of the gateway's current posture.
+    ///
+    /// Intended for operator use (`aura security audit`). Reads only
+    /// metadata — never the secret values themselves.
+    pub fn audit(&self) -> SecurityAuditReport {
+        let rules: Vec<LeakRuleSummary> = self
+            .leak_detector
+            .rules()
+            .iter()
+            .map(|r| LeakRuleSummary {
+                name: r.name.clone(),
+                action: r.action.clone(),
+            })
+            .collect();
+
+        let block_rules = rules
+            .iter()
+            .filter(|r| r.action == LeakAction::Block)
+            .count();
+        let replace_rules = rules
+            .iter()
+            .filter(|r| r.action == LeakAction::Replace)
+            .count();
+
+        SecurityAuditReport {
+            total_rules: rules.len(),
+            block_rules,
+            replace_rules,
+            rules,
+            secret_vault: SecretVaultSummary {
+                master_key_configured: true,
+            },
+        }
+    }
+
     pub async fn sanitize_output(
         &self,
         response: &mut OutgoingMessage,
@@ -274,9 +317,40 @@ impl SecurityGateway {
     }
 }
 
+/// Structured audit view of the security gateway.
+///
+/// Metadata only — never contains secret material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityAuditReport {
+    pub total_rules: usize,
+    pub block_rules: usize,
+    pub replace_rules: usize,
+    pub rules: Vec<LeakRuleSummary>,
+    pub secret_vault: SecretVaultSummary,
+}
+
+/// Metadata for a single active leak rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeakRuleSummary {
+    pub name: String,
+    pub action: LeakAction,
+}
+
+/// Metadata for the secret vault backing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretVaultSummary {
+    /// Whether a master encryption key is configured. `true` whenever a
+    /// `SecretVault` exists in the gateway — construction of the vault
+    /// requires a key.
+    pub master_key_configured: bool,
+}
+
 #[cfg(test)]
 impl SecurityGateway {
-    fn with_deny_all_policy(leak_detector: LeakDetector, secret_vault: Arc<SecretVault>) -> Self {
+    fn with_deny_all_policy(
+        leak_detector: Arc<LeakDetector>,
+        secret_vault: Arc<SecretVault>,
+    ) -> Self {
         Self::new(leak_detector, secret_vault)
     }
 
@@ -375,7 +449,7 @@ mod tests {
     }
 
     fn make_gateway() -> SecurityGateway {
-        let detector = LeakDetector::with_default_rules();
+        let detector = Arc::new(LeakDetector::with_default_rules());
         let vault = Arc::new(make_vault());
         SecurityGateway::with_deny_all_policy(detector, vault)
     }
@@ -508,7 +582,7 @@ mod tests {
         let key = EncryptionKey::new(b"test-key-32-bytes-for-testing!!!".to_vec()).unwrap();
         let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
         let vault = Arc::new(SecretVault::new(key, store));
-        let gw = SecurityGateway::with_deny_all_policy(detector, vault);
+        let gw = SecurityGateway::with_deny_all_policy(Arc::new(detector), vault);
 
         let mut msg = make_message("Here is TOP_SECRET_DATA for you");
         let mut session = make_session();

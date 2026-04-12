@@ -287,9 +287,11 @@ async fn main() -> anyhow::Result<()> {
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
-    // Security gateway
+    // Security gateway. The leak detector is shared (`Arc`) so the slash
+    // context can expose the same rule set to `aura security leaks check`.
+    let leak_detector = Arc::new(boot::build_leak_detector(&config.security));
     let security_gateway = Arc::new(SecurityGateway::new(
-        boot::build_leak_detector(&config.security),
+        Arc::clone(&leak_detector),
         Arc::clone(&secret_vault),
     ));
 
@@ -323,6 +325,8 @@ async fn main() -> anyhow::Result<()> {
             .trace(Arc::clone(&trace_store))
             .tool_executor(Arc::clone(&tool_executor))
             .recorder(Arc::clone(&recorder))
+            .security(Arc::clone(&security_gateway))
+            .leak_detector(Arc::clone(&leak_detector))
             .build()
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),

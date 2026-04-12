@@ -24,7 +24,9 @@ pub use memory::MemoryManager;
 pub use observability::ObservabilityRecorder;
 pub use policy::ExecutionPolicy;
 pub use router::{ActorSpawner, Router};
-pub use security::{SecretVault, SecurityGateway};
+pub use security::{
+    LeakRuleSummary, SecretVault, SecretVaultSummary, SecurityAuditReport, SecurityGateway,
+};
 pub use service::{ShutdownSignal, TaskTracker};
 pub use session::SessionManager;
 pub use supervisor::AgentSupervisor;

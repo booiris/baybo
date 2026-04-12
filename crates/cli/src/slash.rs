@@ -62,6 +62,8 @@ impl CliSlashHandler {
             trace: self.ctx.trace.clone(),
             tool_executor: self.ctx.tool_executor.clone(),
             recorder: self.ctx.recorder.clone(),
+            security: self.ctx.security.clone(),
+            leak_detector: self.ctx.leak_detector.clone(),
             format,
             invocation: Invocation::Slash,
             confirmed: false,

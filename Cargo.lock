@@ -291,6 +291,7 @@ dependencies = [
  "aura-job",
  "aura-llm",
  "aura-model",
+ "aura-security",
  "aura-session",
  "aura-skills",
  "aura-storage",

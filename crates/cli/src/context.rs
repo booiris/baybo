@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, JobManager, MemoryManager, ObservabilityRecorder, ToolExecutor};
+use aura_agent::{
+    CronScheduler, JobManager, MemoryManager, ObservabilityRecorder, SecurityGateway, ToolExecutor,
+};
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
+use aura_security::LeakDetector;
 use aura_session::SessionManager;
 use aura_skills::SkillRegistry;
 use aura_storage::TraceStore;
@@ -42,6 +45,8 @@ pub struct CommandContext {
     pub trace: Option<Arc<dyn TraceStore>>,
     pub tool_executor: Option<Arc<ToolExecutor>>,
     pub recorder: Option<Arc<ObservabilityRecorder>>,
+    pub security: Option<Arc<SecurityGateway>>,
+    pub leak_detector: Option<Arc<LeakDetector>>,
     pub format: OutputFormat,
     pub invocation: Invocation,
     pub confirmed: bool,
@@ -83,6 +88,8 @@ pub struct ContextBuilder {
     trace: Option<Arc<dyn TraceStore>>,
     tool_executor: Option<Arc<ToolExecutor>>,
     recorder: Option<Arc<ObservabilityRecorder>>,
+    security: Option<Arc<SecurityGateway>>,
+    leak_detector: Option<Arc<LeakDetector>>,
 }
 
 impl ContextBuilder {
@@ -102,6 +109,8 @@ impl ContextBuilder {
             trace: None,
             tool_executor: None,
             recorder: None,
+            security: None,
+            leak_detector: None,
         }
     }
 
@@ -170,6 +179,16 @@ impl ContextBuilder {
         self
     }
 
+    pub fn security(mut self, security: Arc<SecurityGateway>) -> Self {
+        self.security = Some(security);
+        self
+    }
+
+    pub fn leak_detector(mut self, detector: Arc<LeakDetector>) -> Self {
+        self.leak_detector = Some(detector);
+        self
+    }
+
     pub fn build(self) -> CommandContext {
         CommandContext {
             config: self.config,
@@ -192,6 +211,8 @@ impl ContextBuilder {
             trace: self.trace,
             tool_executor: self.tool_executor,
             recorder: self.recorder,
+            security: self.security,
+            leak_detector: self.leak_detector,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,
             confirmed: false,

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +100,28 @@ impl LeakDetector {
             blocked,
             block_reason,
         }
+    }
+
+    /// Scan a file on disk. Returns the scan result for the file's contents.
+    ///
+    /// I/O errors (missing file, permissions) are returned via `std::io::Error`;
+    /// non-UTF-8 content is handled with a lossy conversion so binary blobs
+    /// can still be surfaced if the operator asks for them.
+    pub fn check_file(&self, path: &Path) -> std::io::Result<LeakScanResult> {
+        let bytes = std::fs::read(path)?;
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+        };
+        Ok(self.scan_text(&text))
+    }
+
+    /// Public read-only view of this detector's rules.
+    ///
+    /// Exposed for auditing — `SecurityGateway::audit` and `aura security audit`
+    /// need to describe which rules are active without touching the regex internals.
+    pub fn rules(&self) -> &[LeakDetectionRule] {
+        &self.rules
     }
 
     /// Scan a slice of `ContentBlock`s. Returns the scan result and, if not

@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd,
-    SessionCmd, ShellKind, SkillsCmd, ToolsCmd, TraceCmd, WorkspaceCmd,
+    ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LeaksCmd, LlmCmd,
+    MemoryCmd, SecurityCmd, SessionCmd, ShellKind, SkillsCmd, ToolsCmd, TraceCmd, WorkspaceCmd,
 };
 use clap::Parser;
 
@@ -699,6 +699,31 @@ fn tools_test_requires_name_and_accepts_args() {
             assert_eq!(args, r#"{"url":"https://example.com"}"#);
             assert!(yes);
         }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn security_audit_parses() {
+    let cli = parse(&["security", "audit"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Security {
+            cmd: SecurityCmd::Audit
+        })
+    ));
+}
+
+#[test]
+fn security_leaks_check_requires_path() {
+    assert!(Cli::try_parse_from(["aura", "security", "leaks", "check"]).is_err());
+    let cli = parse(&["security", "leaks", "check", "/tmp/secrets.txt"]);
+    match cli.command {
+        Some(Commands::Security {
+            cmd: SecurityCmd::Leaks {
+                cmd: LeaksCmd::Check { path },
+            },
+        }) => assert_eq!(path, "/tmp/secrets.txt"),
         other => panic!("unexpected: {other:?}"),
     }
 }
