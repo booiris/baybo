@@ -2,7 +2,7 @@
 //!
 //! The chat loop owns the workspace's storage, job manager, and cron queue.
 //! Running two chat loops against the same workspace would race on those
-//! resources (libsql writes, cron tick loops, job recovery), so we serialise
+//! resources (libsql writes, cron tick loops, job recovery), so we serialize
 //! with an advisory `flock` on `<workspace>/aura.lock`. The lock is held by
 //! an open `File` and released when the process exits — even on crash,
 //! since the kernel drops the lock with the fd.
