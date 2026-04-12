@@ -690,6 +690,35 @@ fn trace_show_requires_id() {
 }
 
 #[test]
+fn trace_snapshot_requires_id_and_parses_flags() {
+    assert!(Cli::try_parse_from(["aura", "trace", "snapshot"]).is_err());
+
+    let cli = parse(&["trace", "snapshot", "sess-1"]);
+    match cli.command {
+        Some(Commands::Trace {
+            cmd: TraceCmd::Snapshot { id, node, full },
+        }) => {
+            assert_eq!(id, "sess-1");
+            assert!(node.is_none());
+            assert!(!full);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["trace", "snapshot", "sess-2", "--node", "n-42", "--full"]);
+    match cli.command {
+        Some(Commands::Trace {
+            cmd: TraceCmd::Snapshot { id, node, full },
+        }) => {
+            assert_eq!(id, "sess-2");
+            assert_eq!(node.as_deref(), Some("n-42"));
+            assert!(full);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
 fn trace_export_accepts_out_and_yes() {
     let cli = parse(&["trace", "export", "sess-1"]);
     match cli.command {

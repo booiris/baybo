@@ -2154,6 +2154,194 @@ async fn trace_export_slash_stdout_does_not_require_yes() {
     assert!(out.human.contains("sess-ss"));
 }
 
+fn make_trace_with_snapshot(
+    session: &str,
+    tokens: usize,
+    messages: Vec<aura_model::ChatMessage>,
+) -> SessionTrace {
+    let root_id: TraceNodeId = format!("{session}-root");
+    let child_id: TraceNodeId = format!("{session}-leaf");
+    let started_at = Utc::now();
+
+    let root = TraceNode {
+        id: root_id.clone(),
+        parent: None,
+        children: vec![child_id.clone()],
+        span: TraceSpan {
+            kind: OperationKind::LlmCall {
+                model: "gpt-5".into(),
+            },
+            job_id: None,
+            provenance: ExecutionProvenance::default(),
+            input: SpanInput::None,
+            started_at,
+            ended_at: None,
+            result: None,
+        },
+        context_snapshot: Some(aura_context::ContextSnapshot {
+            messages,
+            token_count: tokens,
+        }),
+    };
+    let child = TraceNode {
+        id: child_id.clone(),
+        parent: Some(root_id.clone()),
+        children: vec![],
+        span: TraceSpan {
+            kind: OperationKind::LlmCall {
+                model: "gpt-5".into(),
+            },
+            job_id: None,
+            provenance: ExecutionProvenance::default(),
+            input: SpanInput::None,
+            started_at,
+            ended_at: None,
+            result: None,
+        },
+        context_snapshot: None,
+    };
+
+    let mut nodes = HashMap::new();
+    nodes.insert(root_id.clone(), root);
+    nodes.insert(child_id.clone(), child);
+    SessionTrace {
+        session_id: session.into(),
+        root: root_id,
+        nodes,
+        forks: vec![],
+        active_leaf: child_id,
+    }
+}
+
+fn sample_user_msg(text: &str) -> aura_model::ChatMessage {
+    aura_model::ChatMessage {
+        role: aura_model::Role::User,
+        content: vec![aura_model::ContentBlock::Text(text.into())],
+    }
+}
+
+#[tokio::test]
+async fn trace_snapshot_walks_ancestors_from_active_leaf() {
+    let (ctx, store) = context_with_trace();
+    let trace = make_trace_with_snapshot(
+        "sess-snap",
+        123,
+        vec![sample_user_msg("hi"), sample_user_msg("again")],
+    );
+    store.save_trace(&trace).await.unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Snapshot {
+                id: "sess-snap".into(),
+                node: None,
+                full: false,
+            },
+        },
+    )
+    .await
+    .expect("snapshot lookup");
+    let data = out.data.expect("payload");
+    assert_eq!(data["session"], "sess-snap");
+    assert_eq!(data["token_count"], 123);
+    assert_eq!(data["message_count"], 2);
+    assert!(
+        data.get("messages_full").is_none(),
+        "summary mode hides bodies"
+    );
+    assert!(out.human.contains("tokens:       123"));
+}
+
+#[tokio::test]
+async fn trace_snapshot_full_includes_message_bodies() {
+    let (ctx, store) = context_with_trace();
+    let trace = make_trace_with_snapshot("sess-full", 7, vec![sample_user_msg("payload text")]);
+    store.save_trace(&trace).await.unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Snapshot {
+                id: "sess-full".into(),
+                node: None,
+                full: true,
+            },
+        },
+    )
+    .await
+    .expect("snapshot full");
+    let data = out.data.expect("payload");
+    let full = data["messages_full"].as_array().expect("full bodies");
+    assert_eq!(full.len(), 1);
+    assert_eq!(full[0]["role"], "user");
+}
+
+#[tokio::test]
+async fn trace_snapshot_errors_when_ancestor_chain_has_no_snapshot() {
+    let (ctx, store) = context_with_trace();
+    store
+        .save_trace(&make_trace("sess-bare", Utc::now()))
+        .await
+        .unwrap();
+
+    let err = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Snapshot {
+                id: "sess-bare".into(),
+                node: None,
+                full: false,
+            },
+        },
+    )
+    .await
+    .expect_err("no snapshots in chain");
+    assert!(
+        err.to_string().contains("snapshot"),
+        "expected snapshot-not-found: {err}"
+    );
+}
+
+#[tokio::test]
+async fn trace_snapshot_rejects_unknown_node() {
+    let (ctx, store) = context_with_trace();
+    let trace = make_trace_with_snapshot("sess-unk", 1, vec![]);
+    store.save_trace(&trace).await.unwrap();
+
+    let err = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Snapshot {
+                id: "sess-unk".into(),
+                node: Some("not-a-real-node".into()),
+                full: false,
+            },
+        },
+    )
+    .await
+    .expect_err("bad node id");
+    assert!(err.to_string().contains("not-a-real-node"));
+}
+
+#[tokio::test]
+async fn trace_snapshot_unknown_session_errors() {
+    let (ctx, _store) = context_with_trace();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Snapshot {
+                id: "ghost".into(),
+                node: None,
+                full: false,
+            },
+        },
+    )
+    .await
+    .expect_err("unknown session");
+    assert!(err.to_string().contains("ghost"));
+}
+
 // ----------------------- config get/set/unset --------------------------------
 
 fn tmp_config_path(label: &str) -> PathBuf {

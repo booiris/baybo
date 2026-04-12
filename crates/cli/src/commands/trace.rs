@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aura_model::{ContentBlock, Role};
 use aura_storage::TraceStore;
-use aura_trace::{SessionTrace, TraceFilter};
+use aura_trace::{SessionTrace, TraceFilter, snapshot::find_nearest_snapshot};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tokio::fs;
@@ -16,6 +17,7 @@ pub async fn handle(ctx: &CommandContext, cmd: TraceCmd) -> Result<CommandOutput
     match cmd {
         TraceCmd::List { session, limit } => list(ctx, session.as_deref(), limit).await,
         TraceCmd::Show { id } => show(ctx, &id).await,
+        TraceCmd::Snapshot { id, node, full } => snapshot(ctx, &id, node.as_deref(), full).await,
         TraceCmd::Export { id, out, yes } => export(ctx, &id, out.as_deref(), yes).await,
     }
 }
@@ -141,6 +143,86 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     Ok(CommandOutput {
         human,
         data: Some(value),
+    })
+}
+
+async fn snapshot(
+    ctx: &CommandContext,
+    id: &str,
+    node: Option<&str>,
+    full: bool,
+) -> Result<CommandOutput> {
+    let st = store(ctx)?;
+    let trace = st
+        .load_trace(id)
+        .await
+        .map_err(|e| CliError::Manager(format!("load trace: {e}")))?
+        .ok_or_else(|| CliError::Manager(format!("no trace recorded for session {id}")))?;
+
+    let start_node = node.unwrap_or(&trace.active_leaf).to_string();
+    if !trace.nodes.contains_key(&start_node) {
+        return Err(CliError::Manager(format!(
+            "trace node {start_node} is not part of session {id}"
+        )));
+    }
+    let snap = find_nearest_snapshot(&trace, &start_node)
+        .map_err(|e| CliError::Manager(format!("find snapshot: {e}")))?;
+
+    let messages_preview: Vec<Value> = snap
+        .messages
+        .iter()
+        .map(|m| {
+            json!({
+                "role": role_label(&m.role),
+                "blocks": m.content.len(),
+                "text_preview": first_text_preview(&m.content, 80),
+            })
+        })
+        .collect();
+
+    let mut payload = json!({
+        "session": trace.session_id,
+        "start_node": start_node,
+        "token_count": snap.token_count,
+        "message_count": snap.messages.len(),
+        "messages": messages_preview,
+    });
+    if full {
+        payload["messages_full"] = serde_json::to_value(&snap.messages).unwrap_or(Value::Null);
+    }
+
+    let human = format!(
+        "session:      {}\nstart node:   {}\ntokens:       {}\nmessages:     {}",
+        trace.session_id,
+        start_node,
+        snap.token_count,
+        snap.messages.len(),
+    );
+    Ok(CommandOutput {
+        human,
+        data: Some(payload),
+    })
+}
+
+fn role_label(r: &Role) -> &'static str {
+    match r {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+fn first_text_preview(blocks: &[ContentBlock], max: usize) -> Option<String> {
+    blocks.iter().find_map(|b| match b {
+        ContentBlock::Text(t) => Some(if t.chars().count() > max {
+            let mut s: String = t.chars().take(max).collect();
+            s.push('…');
+            s
+        } else {
+            t.clone()
+        }),
+        _ => None,
     })
 }
 
