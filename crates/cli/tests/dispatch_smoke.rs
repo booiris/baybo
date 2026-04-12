@@ -579,6 +579,113 @@ async fn llm_status_errors_when_client_missing() {
     assert!(format!("{err}").to_lowercase().contains("llm"));
 }
 
+fn tmp_workspace_dir(label: &str) -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("aura-cli-workspace-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn context_with_workspace(root: PathBuf) -> aura_cli::CommandContext {
+    ContextBuilder::new(Arc::new(AuraConfig::default()))
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(root)))
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain)
+}
+
+#[tokio::test]
+async fn workspace_set_identity_slash_requires_yes() {
+    let dir = tmp_workspace_dir("slash-yes");
+    let ctx = context_with_workspace(dir.clone()).with_invocation(Invocation::Slash);
+    let err = dispatch::run(
+        &ctx,
+        Commands::Workspace {
+            cmd: WorkspaceCmd::SetIdentity {
+                name: "soul".into(),
+                file: None,
+                content: Some("hi".into()),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("slash without --yes");
+    assert!(err.to_string().contains("--yes"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn workspace_set_identity_rejects_unknown_name() {
+    let dir = tmp_workspace_dir("unknown");
+    let ctx = context_with_workspace(dir.clone());
+    let err = dispatch::run(
+        &ctx,
+        Commands::Workspace {
+            cmd: WorkspaceCmd::SetIdentity {
+                name: "claude".into(),
+                file: None,
+                content: Some("hi".into()),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("unknown identity name");
+    assert!(err.to_string().contains("unknown identity"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn workspace_set_identity_writes_file_in_argv_mode() {
+    let dir = tmp_workspace_dir("argv-write");
+    let ctx = context_with_workspace(dir.clone());
+    let out = dispatch::run(
+        &ctx,
+        Commands::Workspace {
+            cmd: WorkspaceCmd::SetIdentity {
+                name: "soul".into(),
+                file: None,
+                content: Some("You are helpful.".into()),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("set-identity soul");
+
+    let data = out.data.expect("payload");
+    assert_eq!(data.get("kind").and_then(|v| v.as_str()), Some("SOUL.md"));
+    let on_disk = std::fs::read_to_string(dir.join("SOUL.md")).unwrap();
+    assert_eq!(on_disk, "You are helpful.");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn workspace_set_identity_requires_file_or_content() {
+    let dir = tmp_workspace_dir("missing-source");
+    let ctx = context_with_workspace(dir.clone());
+    let err = dispatch::run(
+        &ctx,
+        Commands::Workspace {
+            cmd: WorkspaceCmd::SetIdentity {
+                name: "soul".into(),
+                file: None,
+                content: None,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("no source");
+    assert!(err.to_string().contains("--file") || err.to_string().contains("--content"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn workspace_show_reports_identity_flags() {
     let ctx = context();

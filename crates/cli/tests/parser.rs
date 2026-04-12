@@ -135,6 +135,66 @@ fn workspace_show_parses() {
 }
 
 #[test]
+fn workspace_set_identity_accepts_file_or_content_exclusively() {
+    assert!(Cli::try_parse_from(["aura", "workspace", "set-identity"]).is_err());
+
+    let cli = parse(&["workspace", "set-identity", "soul", "--content", "hello"]);
+    match cli.command {
+        Some(Commands::Workspace {
+            cmd:
+                WorkspaceCmd::SetIdentity {
+                    name,
+                    file,
+                    content,
+                    yes,
+                },
+        }) => {
+            assert_eq!(name, "soul");
+            assert!(file.is_none());
+            assert_eq!(content.as_deref(), Some("hello"));
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&[
+        "workspace",
+        "set-identity",
+        "agents",
+        "--file",
+        "/tmp/a.md",
+        "-y",
+    ]);
+    match cli.command {
+        Some(Commands::Workspace {
+            cmd: WorkspaceCmd::SetIdentity {
+                name, file, yes, ..
+            },
+        }) => {
+            assert_eq!(name, "agents");
+            assert_eq!(file.as_deref(), Some("/tmp/a.md"));
+            assert!(yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // --file and --content are mutually exclusive.
+    assert!(
+        Cli::try_parse_from([
+            "aura",
+            "workspace",
+            "set-identity",
+            "soul",
+            "--file",
+            "x.md",
+            "--content",
+            "hi",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn completion_requires_shell_kind() {
     assert!(Cli::try_parse_from(["aura", "completion"]).is_err());
     for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
