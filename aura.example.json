@@ -64,6 +64,6 @@
     }
   },
   "workspace": {
-    "path": "./.aura"
+    "path": "~/.aura"
   }
 }
