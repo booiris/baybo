@@ -5,8 +5,10 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
+aura-agent = { workspace = true }
 aura-channels = { workspace = true }
 aura-config = { workspace = true }
+aura-job = { workspace = true }
 aura-session = { workspace = true }
 aura-skills = { workspace = true }
 aura-tools = { workspace = true }
@@ -26,4 +28,5 @@ clap_complete = { workspace = true }
 shell-words = { workspace = true }
 
 [dev-dependencies]
+aura-storage = { workspace = true }
 chrono = { workspace = true }

@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    ChannelsCmd, Cli, Commands, ConfigCmd, LlmCmd, SessionCmd, ShellKind, SkillsCmd, ToolsCmd,
-    WorkspaceCmd,
+    ChannelsCmd, Cli, Commands, ConfigCmd, JobCmd, JobStatusArg, LlmCmd, SessionCmd, ShellKind,
+    SkillsCmd, ToolsCmd, WorkspaceCmd,
 };
 use clap::Parser;
 
@@ -226,6 +226,75 @@ fn session_kill_accepts_yes_flag() {
     match cli.command {
         Some(Commands::Session {
             cmd: SessionCmd::Kill { yes, .. },
+        }) => assert!(yes),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn job_list_parses_without_filter() {
+    let cli = parse(&["job", "list"]);
+    match cli.command {
+        Some(Commands::Job {
+            cmd: JobCmd::List { status },
+        }) => assert!(status.is_none()),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn job_list_accepts_status_filter() {
+    let cli = parse(&["job", "list", "--status", "in-progress"]);
+    match cli.command {
+        Some(Commands::Job {
+            cmd: JobCmd::List { status },
+        }) => assert!(matches!(status, Some(JobStatusArg::InProgress))),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn job_list_rejects_unknown_status() {
+    assert!(Cli::try_parse_from(["aura", "job", "list", "--status", "bogus"]).is_err());
+}
+
+#[test]
+fn job_show_requires_id() {
+    assert!(Cli::try_parse_from(["aura", "job", "show"]).is_err());
+    let cli = parse(&["job", "show", "jid-1"]);
+    match cli.command {
+        Some(Commands::Job {
+            cmd: JobCmd::Show { id },
+        }) => assert_eq!(id, "jid-1"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn job_cancel_accepts_yes_flag() {
+    let cli = parse(&["job", "cancel", "jid"]);
+    match cli.command {
+        Some(Commands::Job {
+            cmd: JobCmd::Cancel { id, yes },
+        }) => {
+            assert_eq!(id, "jid");
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["job", "cancel", "jid", "--yes"]);
+    match cli.command {
+        Some(Commands::Job {
+            cmd: JobCmd::Cancel { yes, .. },
+        }) => assert!(yes),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["job", "cancel", "jid", "-y"]);
+    match cli.command {
+        Some(Commands::Job {
+            cmd: JobCmd::Cancel { yes, .. },
         }) => assert!(yes),
         other => panic!("unexpected: {other:?}"),
     }

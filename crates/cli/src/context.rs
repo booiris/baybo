@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aura_agent::JobManager;
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
@@ -34,6 +35,7 @@ pub struct CommandContext {
     pub llm: Option<Arc<LlmClient>>,
     pub workspace: Arc<WorkspaceManager>,
     pub session: Option<Arc<SessionManager>>,
+    pub job: Option<Arc<JobManager>>,
     pub format: OutputFormat,
     pub invocation: Invocation,
     pub confirmed: bool,
@@ -69,6 +71,7 @@ pub struct ContextBuilder {
     llm: Option<Arc<LlmClient>>,
     workspace: Option<Arc<WorkspaceManager>>,
     session: Option<Arc<SessionManager>>,
+    job: Option<Arc<JobManager>>,
 }
 
 impl ContextBuilder {
@@ -82,6 +85,7 @@ impl ContextBuilder {
             llm: None,
             workspace: None,
             session: None,
+            job: None,
         }
     }
 
@@ -120,6 +124,11 @@ impl ContextBuilder {
         self
     }
 
+    pub fn job(mut self, job: Arc<JobManager>) -> Self {
+        self.job = Some(job);
+        self
+    }
+
     pub fn build(self) -> CommandContext {
         CommandContext {
             config: self.config,
@@ -136,6 +145,7 @@ impl ContextBuilder {
                 .workspace
                 .unwrap_or_else(|| Arc::new(WorkspaceManager::new(PathBuf::from(".")))),
             session: self.session,
+            job: self.job,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,
             confirmed: false,

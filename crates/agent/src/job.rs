@@ -52,6 +52,50 @@ impl JobManager {
         self.persist(job, transition).await
     }
 
+    /// Look up a job by id.
+    pub async fn get(&self, job_id: &str) -> Result<Option<Job>> {
+        self.store.get(job_id).await
+    }
+
+    /// List jobs, optionally filtered by status. When `status` is `None`
+    /// every persisted job is returned; otherwise only those matching.
+    /// Ordering: newest `created_at` first.
+    pub async fn list(&self, status: Option<JobStatus>) -> Result<Vec<Job>> {
+        let mut jobs = match status {
+            Some(s) => self.store.list_by_status(s).await?,
+            None => self.store.list_all().await?,
+        };
+        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(jobs)
+    }
+
+    /// Cancel a job. Transitions the job to `Failed` with a cancellation
+    /// reason. `Pending` jobs are first started, then failed (the state
+    /// machine does not allow `Pending -> Failed` directly). Terminal jobs
+    /// (`Accepted`, `Failed`) and already-settled jobs (`Completed`,
+    /// `Submitted`) are rejected as no-ops so the operator gets a clear
+    /// error rather than silently losing audit trail for work that has
+    /// already produced output.
+    pub async fn cancel(&self, job_id: &str) -> Result<Job> {
+        let job = self.load_job(job_id).await?;
+        let reason = "cancelled by operator";
+        match job.status {
+            JobStatus::Pending => {
+                self.start(job_id).await?;
+                self.fail(job_id, reason).await?;
+            }
+            JobStatus::InProgress | JobStatus::Stuck => {
+                self.fail(job_id, reason).await?;
+            }
+            other => {
+                return Err(JobError::InvalidTransition(format!(
+                    "cannot cancel job {job_id} in status {other}"
+                )));
+            }
+        }
+        self.load_job(job_id).await
+    }
+
     /// Recover jobs that were interrupted by a system restart.
     ///
     /// Scans all non-terminal jobs and calls `mark_interrupted()` on each.
@@ -189,6 +233,11 @@ mod tests {
                 .filter(|j| j.parent_job_id.as_deref() == Some(parent_job_id))
                 .cloned()
                 .collect())
+        }
+
+        async fn list_all(&self) -> Result<Vec<Job>> {
+            let jobs = self.jobs.lock().map_err(lock_err)?;
+            Ok(jobs.clone())
         }
 
         async fn record_transition(&self, transition: &JobTransition) -> Result<()> {
@@ -365,6 +414,105 @@ mod tests {
         let mgr = make_manager();
         let count = mgr.recover_interrupted().await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn list_returns_all_jobs_when_status_is_none() {
+        let mgr = make_manager();
+        mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.create_job("s2", test_kind(), None).await.unwrap();
+
+        let all = mgr.list(None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_status() {
+        let mgr = make_manager();
+        let pending = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        let running = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.start(&running.id).await.unwrap();
+
+        let pendings = mgr.list(Some(JobStatus::Pending)).await.unwrap();
+        assert_eq!(pendings.len(), 1);
+        assert_eq!(pendings[0].id, pending.id);
+
+        let runnings = mgr.list(Some(JobStatus::InProgress)).await.unwrap();
+        assert_eq!(runnings.len(), 1);
+        assert_eq!(runnings[0].id, running.id);
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_missing() {
+        let mgr = make_manager();
+        assert!(mgr.get("missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_job_transitions_through_in_progress() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+
+        let out = mgr.cancel(&job.id).await.unwrap();
+        assert_eq!(out.status, JobStatus::Failed);
+        assert_eq!(out.error.as_deref(), Some("cancelled by operator"));
+
+        let history = mgr.get_history(&job.id).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].to, JobStatus::InProgress);
+        assert_eq!(history[1].to, JobStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn cancel_in_progress_job_fails_directly() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.start(&job.id).await.unwrap();
+
+        let out = mgr.cancel(&job.id).await.unwrap();
+        assert_eq!(out.status, JobStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn cancel_stuck_job_fails() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.start(&job.id).await.unwrap();
+        mgr.stuck(&job.id, "hung").await.unwrap();
+
+        let out = mgr.cancel(&job.id).await.unwrap();
+        assert_eq!(out.status, JobStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn cancel_terminal_job_errors() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.start(&job.id).await.unwrap();
+        mgr.fail(&job.id, "nope").await.unwrap();
+
+        let err = mgr.cancel(&job.id).await.unwrap_err();
+        assert!(matches!(err, JobError::InvalidTransition(_)));
+    }
+
+    #[tokio::test]
+    async fn cancel_completed_job_errors() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.start(&job.id).await.unwrap();
+        mgr.complete(&job.id, serde_json::json!(null))
+            .await
+            .unwrap();
+
+        let err = mgr.cancel(&job.id).await.unwrap_err();
+        assert!(matches!(err, JobError::InvalidTransition(_)));
+    }
+
+    #[tokio::test]
+    async fn cancel_missing_job_errors() {
+        let mgr = make_manager();
+        let err = mgr.cancel("nonexistent").await.unwrap_err();
+        assert!(matches!(err, JobError::NotFound(_)));
     }
 
     #[tokio::test]

@@ -81,6 +81,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// Inspect and cancel tracked jobs.
+    Job {
+        #[command(subcommand)]
+        cmd: JobCmd,
+    },
     /// One-shot summary of current runtime state.
     Status,
     /// Run health checks against config, storage, and env.
@@ -173,6 +178,43 @@ pub enum SessionCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobCmd {
+    /// List tracked jobs, optionally filtered by status.
+    List {
+        /// Filter by status: pending, in-progress, completed, submitted,
+        /// accepted, failed, stuck.
+        #[arg(long)]
+        status: Option<JobStatusArg>,
+    },
+    /// Show a job's metadata.
+    Show {
+        /// Job id.
+        id: String,
+    },
+    /// Cancel a running or pending job. Requires `--yes` in slash mode.
+    Cancel {
+        /// Job id.
+        id: String,
+        /// Confirm the destructive action (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// Status filter accepted by `aura job list --status`.
+#[derive(Debug, Copy, Clone, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum JobStatusArg {
+    Pending,
+    InProgress,
+    Completed,
+    Submitted,
+    Accepted,
+    Failed,
+    Stuck,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]

@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Observability recorder
     let recorder = Arc::new(ObservabilityRecorder::new(
-        job_manager,
+        Arc::clone(&job_manager),
         trace_collector,
         cost_tracker,
     ));
@@ -303,6 +303,7 @@ async fn main() -> anyhow::Result<()> {
             .llm(Arc::clone(&llm_client))
             .workspace(Arc::clone(&workspace))
             .session(Arc::clone(&session_manager))
+            .job(Arc::clone(&job_manager))
             .build()
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),

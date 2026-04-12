@@ -151,6 +151,29 @@ impl JobStore for LibsqlJobStore {
         Ok(jobs)
     }
 
+    async fn list_all(&self) -> aura_job::Result<Vec<Job>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query("SELECT data FROM jobs", ())
+            .await
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+
+        let mut jobs = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let job: Job = serde_json::from_str(&data)
+                .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
+            jobs.push(job);
+        }
+        Ok(jobs)
+    }
+
     async fn record_transition(&self, transition: &JobTransition) -> aura_job::Result<()> {
         let conn = self.pool.conn();
         let data = serde_json::to_string(transition)

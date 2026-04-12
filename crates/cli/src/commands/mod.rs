@@ -2,6 +2,7 @@ pub mod channels;
 pub mod completion;
 pub mod config;
 pub mod doctor;
+pub mod job;
 pub mod llm;
 pub mod session;
 pub mod skills;
