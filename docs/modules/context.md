@@ -18,7 +18,8 @@ Core responsibilities:
 ```
 ContextManager (struct)
 ├── TokenBudget       — pure state: max_tokens, threshold, current usage
-├── Tokenizer         — trait, counts tokens (implemented externally)
+├── Tokenizer         — trait, counts tokens
+│   └── TiktokenTokenizer — BPE impl via `tiktoken-rs` (cl100k_base / o200k_base)
 └── CompressionStrategy — trait, the only extension point
     ├── Truncate          — keep system + last N messages
     └── Summarize             — truncate + LLM summarization
@@ -47,7 +48,7 @@ self.context_manager.append(session, &user_msg).await?;
 | Token budget (how much room is left) | `TokenBudget`            | Pure state; agent can query `budget().remaining()` for other decisions |
 | When to compress                     | `ContextManager::append` | Auto-triggered on threshold; impossible to forget                      |
 | How to compress                      | `CompressionStrategy`    | Only variation point; swapped via constructor injection                |
-| Token counting                       | `Tokenizer` trait        | Defined here, implemented externally (e.g. by `llm`)                   |
+| Token counting                       | `Tokenizer` trait        | Trait and `TiktokenTokenizer` impl both live here; no LLM-SDK coupling |
 | Snapshots                            | `ContextManager`         | Needs token count and budget state for consistency                     |
 
 ### Two compression strategies
@@ -67,7 +68,7 @@ The context sent to the LLM is organized in descending priority:
 
 ### Dependency boundaries
 
-- Does **not** depend on `llm` (Tokenizer and SummarizeCallback traits defined locally)
+- Does **not** depend on `llm` (SummarizeCallback trait defined locally; `TiktokenTokenizer` depends only on `tiktoken-rs`, a pure BPE algorithm crate — not an LLM provider SDK)
 - Does **not** depend on `memory` (memory context injected by `agent`)
 - Does **not** depend on `trace` (snapshots are consumed by `trace`, not the reverse)
 

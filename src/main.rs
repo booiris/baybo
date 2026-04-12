@@ -18,9 +18,8 @@ use aura_cli::cli::ShellKind;
 use aura_cli::{
     Cli, CliSlashHandler, Commands, ContextBuilder, Invocation, OutputFormat, dispatch,
 };
-use aura_context::{ContextManager, Tokenizer, Truncate};
-use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
-use aura_model::{ChatMessage, ContentBlock};
+use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
+use aura_hook::HookManager;
 use aura_security::EncryptionKey;
 use aura_skills::SkillRegistry;
 use aura_storage::Store;
@@ -32,23 +31,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-
-struct NoopHook;
-
-#[async_trait::async_trait]
-impl Hook for NoopHook {
-    fn name(&self) -> &str {
-        "noop"
-    }
-
-    fn hook_point(&self) -> HookPoint {
-        HookPoint::PreMessage
-    }
-
-    async fn execute(&self, _ctx: &mut HookContext) -> aura_hook::Result<HookAction> {
-        Ok(HookAction::Continue)
-    }
-}
 
 fn init_tracing() {
     let env_filter =
@@ -66,33 +48,6 @@ fn init_tracing() {
             .with(env_filter)
             .with(fmt::layer().with_target(true))
             .init();
-    }
-}
-
-/// Simple character-based tokenizer for Phase 1.
-/// Estimates ~4 characters per token (rough English average).
-struct SimpleTokenizer;
-
-impl Tokenizer for SimpleTokenizer {
-    fn count_text(&self, text: &str) -> usize {
-        text.len() / 4 + 1
-    }
-
-    fn count_image(&self, _width: u32, _height: u32) -> usize {
-        85 // fixed token estimate for images
-    }
-
-    fn count_message(&self, msg: &ChatMessage) -> usize {
-        let mut tokens = 4; // structural overhead
-        for block in &msg.content {
-            match block {
-                ContentBlock::Text(t) => tokens += self.count_text(t.as_str()),
-                ContentBlock::Image { .. } => tokens += self.count_image(0, 0),
-                ContentBlock::Audio { .. } => tokens += 100,
-                ContentBlock::File { .. } => tokens += 50,
-            }
-        }
-        tokens
     }
 }
 
@@ -191,10 +146,8 @@ async fn main() -> anyhow::Result<()> {
     // By construction: the chat loop is only reached when `cli.command` is
     // `None`, and in that branch `build_llm_client` must have succeeded or we
     // already returned an error. Unwrap defensively to avoid a panic.
-    let llm_client = match llm_client {
-        Some(c) => c,
-        None => return Err(anyhow::anyhow!("LLM client is required for chat loop")),
-    };
+    let llm_client =
+        llm_client.ok_or_else(|| anyhow::anyhow!("LLM client is required for chat loop"))?;
 
     // Storage layer (in-memory for Phase 1)
     let storage = Store::in_memory().await?;
@@ -267,8 +220,11 @@ async fn main() -> anyhow::Result<()> {
     // Memory manager (without embedder for Phase 1)
     let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
 
-    // Context manager (sliding window)
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(SimpleTokenizer);
+    // Context manager (sliding window). Tokenizer picks an encoding based
+    // on the configured model; Anthropic and other non-OpenAI models fall
+    // back to cl100k_base as a close approximation.
+    let tokenizer: Arc<dyn Tokenizer> =
+        Arc::new(TiktokenTokenizer::for_model(llm_client.model_id()));
 
     // Soul derived from workspace identity files
     let soul = Soul::from_workspace(&workspace)
@@ -278,10 +234,8 @@ async fn main() -> anyhow::Result<()> {
     // Execution policy
     let policy = boot::to_execution_policy(&config.agent);
 
-    // Hook manager (empty)
-    let mut hook_manager = HookManager::new();
-    hook_manager.register(NoopHook);
-    let hook_manager = Arc::new(hook_manager);
+    // Hook manager (empty by default; hooks are loaded from config in later phases)
+    let hook_manager = Arc::new(HookManager::new());
 
     // Message channels
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
@@ -359,7 +313,6 @@ async fn main() -> anyhow::Result<()> {
     let actor_recorder = Arc::clone(&recorder);
     let actor_token_budget = boot::to_token_budget(&config.agent.context);
     let actor_keep_recent = config.agent.context.keep_recent;
-    let actor_buffer = buffer;
 
     let router = Router::new(
         Arc::clone(&session_manager),
@@ -389,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&actor_hooks),
             Arc::clone(&actor_recorder),
         );
-        let (sender, mailbox) = mpsc::channel(actor_buffer);
+        let (sender, mailbox) = mpsc::channel(buffer);
         tokio::spawn(async move {
             actor.run(mailbox).await;
         });

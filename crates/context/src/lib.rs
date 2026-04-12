@@ -11,7 +11,7 @@ pub use strategy::CompressionStrategy;
 pub use strategy::SummarizeCallback;
 pub use strategy::summarize::Summarize;
 pub use strategy::truncate::Truncate;
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 
 pub type Result<T> = std::result::Result<T, ContextError>;
 

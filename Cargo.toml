@@ -87,6 +87,7 @@ rmcp = { version = "1", features = ["client", "transport-child-process", "transp
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4"
 shell-words = "1"
+tiktoken-rs = "0.11"
 
 [package]
 name = "aura"
