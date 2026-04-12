@@ -11,7 +11,7 @@ Bottom-up along the dependency graph:
 3. [llm.md](llm.md) → [security.md](security.md) → [sandbox.md](sandbox.md)
 4. [tools.md](tools.md) → [workspace.md](workspace.md) → [context.md](context.md)
 5. [trace.md](trace.md) → [hook.md](hook.md)
-6. [storage.md](storage.md) → [agent.md](agent.md) → [bootstrap.md](bootstrap.md)
+6. [storage.md](storage.md) → [agent.md](agent.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md)
 
 ## Module Groups
 
@@ -48,6 +48,7 @@ Bottom-up along the dependency graph:
 - **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate.
 - **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, ObservabilityRecorder, cost management (CostTracker, CostGuard), plus all domain managers (SessionManager, MemoryManager, TraceCollector, JobManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
 - **bootstrap** — Binary entry point (`src/main.rs`) and `boot` submodule. Loads `AuraConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
+- **cli** — Operator-facing command layer (`aura-cli`). One `clap` tree drives both argv-mode commands (`aura config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input never enters the agent's context.
 
 ## Dependency Overview
 
