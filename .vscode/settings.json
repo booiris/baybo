@@ -41,6 +41,7 @@
         "scip",
         "serde",
         "sess",
+        "spammy",
         "sqlx",
         "streamable",
         "stringly",
