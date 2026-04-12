@@ -319,6 +319,7 @@ async fn main() -> anyhow::Result<()> {
             .session(Arc::clone(&session_manager))
             .job(Arc::clone(&job_manager))
             .cron(Arc::clone(&cron_scheduler))
+            .memory(Arc::clone(&memory_manager))
             .build()
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),

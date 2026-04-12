@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, JobManager};
+use aura_agent::{CronScheduler, JobManager, MemoryManager};
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
@@ -37,6 +37,7 @@ pub struct CommandContext {
     pub session: Option<Arc<SessionManager>>,
     pub job: Option<Arc<JobManager>>,
     pub cron: Option<Arc<CronScheduler>>,
+    pub memory: Option<Arc<MemoryManager>>,
     pub format: OutputFormat,
     pub invocation: Invocation,
     pub confirmed: bool,
@@ -74,6 +75,7 @@ pub struct ContextBuilder {
     session: Option<Arc<SessionManager>>,
     job: Option<Arc<JobManager>>,
     cron: Option<Arc<CronScheduler>>,
+    memory: Option<Arc<MemoryManager>>,
 }
 
 impl ContextBuilder {
@@ -89,6 +91,7 @@ impl ContextBuilder {
             session: None,
             job: None,
             cron: None,
+            memory: None,
         }
     }
 
@@ -137,6 +140,11 @@ impl ContextBuilder {
         self
     }
 
+    pub fn memory(mut self, memory: Arc<MemoryManager>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
     pub fn build(self) -> CommandContext {
         CommandContext {
             config: self.config,
@@ -155,6 +163,7 @@ impl ContextBuilder {
             session: self.session,
             job: self.job,
             cron: self.cron,
+            memory: self.memory,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,
             confirmed: false,

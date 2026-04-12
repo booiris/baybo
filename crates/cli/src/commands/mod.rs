@@ -5,6 +5,7 @@ pub mod cron;
 pub mod doctor;
 pub mod job;
 pub mod llm;
+pub mod memory;
 pub mod session;
 pub mod skills;
 pub mod status;

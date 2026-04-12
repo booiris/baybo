@@ -8,21 +8,23 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, JobManager, ShutdownSignal};
+use aura_agent::{CronScheduler, JobManager, MemoryManager, ShutdownSignal};
 use aura_channels::ChannelRegistry;
 use aura_cli::cli::{
-    ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, SessionCmd, SkillsCmd,
-    ToolsCmd, WorkspaceCmd,
+    ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd, SessionCmd,
+    SkillsCmd, ToolsCmd, WorkspaceCmd,
 };
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
 use aura_cron::CronRunMode;
 use aura_job::{Job, JobError, JobStatus, JobTransition, OperationKind};
+use aura_model::{MemoryCategory, MemoryEntry};
 use aura_session::store::SessionStore;
 use aura_session::{ChannelType, Session, SessionError, SessionManager, SessionState, User};
 use aura_skills::SkillRegistry;
 use aura_storage::{
-    CronExecutionRow, CronJobRow, CronStore, CronStoreError, JobStore, cron::Result as CronResult,
+    CronExecutionRow, CronJobRow, CronStore, CronStoreError, JobStore, MemoryStore,
+    cron::Result as CronResult, memory::Result as MemoryResult,
 };
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
@@ -1208,4 +1210,367 @@ async fn cron_runs_returns_empty_for_unfired_job() {
     .expect("runs");
     assert!(out.human.contains("no executions"));
     assert!(out.data.unwrap()["runs"].as_array().unwrap().is_empty());
+}
+
+// ----------------------- memory family --------------------------------------
+
+struct MemoryMemStore {
+    entries: Mutex<Vec<MemoryEntry>>,
+}
+
+impl MemoryMemStore {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MemoryStore for MemoryMemStore {
+    async fn store(&self, entry: &MemoryEntry) -> MemoryResult<()> {
+        let mut lock = self.entries.lock().unwrap();
+        if let Some(slot) = lock.iter_mut().find(|e| e.id == entry.id) {
+            *slot = entry.clone();
+        } else {
+            lock.push(entry.clone());
+        }
+        Ok(())
+    }
+
+    async fn retrieve(&self, user_id: &str, key: &str) -> MemoryResult<Option<MemoryEntry>> {
+        let lock = self.entries.lock().unwrap();
+        Ok(lock
+            .iter()
+            .find(|e| e.user_id == user_id && e.id == key)
+            .cloned())
+    }
+
+    async fn search(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> MemoryResult<Vec<MemoryEntry>> {
+        let needle = query.to_lowercase();
+        let lock = self.entries.lock().unwrap();
+        let mut out: Vec<MemoryEntry> = lock
+            .iter()
+            .filter(|e| e.user_id == user_id && e.content.to_lowercase().contains(&needle))
+            .cloned()
+            .collect();
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn delete(&self, id: &str) -> MemoryResult<()> {
+        let mut lock = self.entries.lock().unwrap();
+        lock.retain(|e| e.id != id);
+        Ok(())
+    }
+
+    async fn list_by_user(&self, user_id: &str) -> MemoryResult<Vec<MemoryEntry>> {
+        let lock = self.entries.lock().unwrap();
+        Ok(lock
+            .iter()
+            .filter(|e| e.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all(&self) -> MemoryResult<Vec<MemoryEntry>> {
+        Ok(self.entries.lock().unwrap().clone())
+    }
+
+    async fn get_by_id(&self, id: &str) -> MemoryResult<Option<MemoryEntry>> {
+        let lock = self.entries.lock().unwrap();
+        Ok(lock.iter().find(|e| e.id == id).cloned())
+    }
+}
+
+fn context_with_memory() -> (aura_cli::CommandContext, Arc<MemoryManager>) {
+    let store = Box::new(MemoryMemStore::new());
+    let mgr = Arc::new(MemoryManager::without_embedder(store));
+    let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .memory(Arc::clone(&mgr))
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain);
+    (ctx, mgr)
+}
+
+async fn seed_entry(
+    mgr: &MemoryManager,
+    user: &str,
+    content: &str,
+    session: Option<&str>,
+    importance: f32,
+) -> String {
+    let mut entry = MemoryEntry::new(
+        user.into(),
+        content.into(),
+        MemoryCategory::KeyFact,
+        importance,
+    );
+    entry.source_session_id = session.map(str::to_string);
+    let id = entry.id.clone();
+    mgr.store(entry).await.unwrap();
+    id
+}
+
+#[tokio::test]
+async fn memory_list_without_manager_reports_unavailable() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::List {
+                user: None,
+                limit: 10,
+            },
+        },
+    )
+    .await
+    .expect_err("expected error");
+    assert!(err.to_string().contains("not available"));
+}
+
+#[tokio::test]
+async fn memory_list_reports_empty_when_none_stored() {
+    let (ctx, _mgr) = context_with_memory();
+    let out = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::List {
+                user: None,
+                limit: 10,
+            },
+        },
+    )
+    .await
+    .expect("list");
+    assert!(out.human.contains("no memories"));
+    assert!(
+        out.data
+            .unwrap()
+            .get("entries")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn memory_list_scopes_to_user_when_provided() {
+    let (ctx, mgr) = context_with_memory();
+    seed_entry(&mgr, "u1", "alpha", None, 0.9).await;
+    seed_entry(&mgr, "u2", "beta", None, 0.5).await;
+    seed_entry(&mgr, "u1", "gamma", None, 0.3).await;
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::List {
+                user: Some("u1".into()),
+                limit: 10,
+            },
+        },
+    )
+    .await
+    .expect("list");
+    let entries = out.data.unwrap();
+    let arr = entries["entries"].as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr.iter().all(|v| v["user"] == "u1"));
+}
+
+#[tokio::test]
+async fn memory_list_respects_limit() {
+    let (ctx, mgr) = context_with_memory();
+    for i in 0..5 {
+        seed_entry(&mgr, "u1", &format!("entry {i}"), None, 0.5).await;
+    }
+    let out = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::List {
+                user: None,
+                limit: 2,
+            },
+        },
+    )
+    .await
+    .expect("list");
+    let arr = out.data.unwrap()["entries"].as_array().unwrap().clone();
+    assert_eq!(arr.len(), 2);
+}
+
+#[tokio::test]
+async fn memory_search_returns_only_matching_rows() {
+    let (ctx, mgr) = context_with_memory();
+    seed_entry(&mgr, "u1", "likes Rust programming", None, 0.7).await;
+    seed_entry(&mgr, "u1", "dislikes broccoli", None, 0.4).await;
+    seed_entry(&mgr, "u2", "writes Rust macros", None, 0.5).await;
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::Search {
+                query: "rust".into(),
+                user: None,
+                limit: 10,
+            },
+        },
+    )
+    .await
+    .expect("search");
+    let arr = out.data.unwrap()["entries"].as_array().unwrap().clone();
+    assert_eq!(arr.len(), 2);
+}
+
+#[tokio::test]
+async fn memory_show_errors_for_missing_id() {
+    let (ctx, _mgr) = context_with_memory();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::Show {
+                id: "missing".into(),
+            },
+        },
+    )
+    .await
+    .expect_err("expected not-found");
+    assert!(err.to_string().contains("not found"));
+}
+
+#[tokio::test]
+async fn memory_show_returns_metadata_for_known_id() {
+    let (ctx, mgr) = context_with_memory();
+    let id = seed_entry(&mgr, "u1", "hello", Some("s1"), 0.6).await;
+    let out = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::Show { id: id.clone() },
+        },
+    )
+    .await
+    .expect("show");
+    assert!(out.human.contains(&id));
+    let data = out.data.unwrap();
+    assert_eq!(data["user"], "u1");
+    assert_eq!(data["source_session_id"], "s1");
+}
+
+#[tokio::test]
+async fn memory_promote_requires_yes_in_slash_mode() {
+    let (ctx, mgr) = context_with_memory();
+    let id = seed_entry(&mgr, "u1", "x", None, 0.4).await;
+    let slash_ctx = ContextBuilder::new(Arc::clone(&ctx.config))
+        .skills(Arc::clone(&ctx.skills))
+        .tools(Arc::clone(&ctx.tools))
+        .channels(Arc::clone(&ctx.channels))
+        .workspace(Arc::clone(&ctx.workspace))
+        .memory(Arc::clone(&mgr))
+        .build()
+        .with_invocation(Invocation::Slash)
+        .with_format(OutputFormat::Plain);
+    let err = dispatch::run(
+        &slash_ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::Promote {
+                id: id.clone(),
+                to: 1.0,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("expected confirmation required");
+    assert!(err.to_string().contains("--yes"));
+}
+
+#[tokio::test]
+async fn memory_promote_clamps_and_persists() {
+    let (ctx, mgr) = context_with_memory();
+    let id = seed_entry(&mgr, "u1", "anchor", None, 0.2).await;
+    let out = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::Promote {
+                id: id.clone(),
+                to: 5.0,
+                yes: true,
+            },
+        },
+    )
+    .await
+    .expect("promote");
+    let data = out.data.unwrap();
+    assert!((data["importance"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    let reloaded = mgr.get(&id).await.unwrap().unwrap();
+    assert!((reloaded.importance - 1.0).abs() < f32::EPSILON);
+}
+
+#[tokio::test]
+async fn memory_clear_requires_yes_in_slash_mode() {
+    let (_ctx, mgr) = context_with_memory();
+    seed_entry(&mgr, "u1", "x", Some("s1"), 0.5).await;
+    let slash_ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .memory(Arc::clone(&mgr))
+        .build()
+        .with_invocation(Invocation::Slash)
+        .with_format(OutputFormat::Plain);
+    let err = dispatch::run(
+        &slash_ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::Clear {
+                session: "s1".into(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("expected confirmation required");
+    assert!(err.to_string().contains("--yes"));
+}
+
+#[tokio::test]
+async fn memory_clear_removes_only_matching_session() {
+    let (ctx, mgr) = context_with_memory();
+    seed_entry(&mgr, "u1", "keep me", None, 0.5).await;
+    seed_entry(&mgr, "u1", "from s1 one", Some("s1"), 0.5).await;
+    seed_entry(&mgr, "u2", "from s1 two", Some("s1"), 0.5).await;
+    seed_entry(&mgr, "u1", "different session", Some("s2"), 0.5).await;
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Memory {
+            cmd: MemoryCmd::Clear {
+                session: "s1".into(),
+                yes: true,
+            },
+        },
+    )
+    .await
+    .expect("clear");
+    let data = out.data.unwrap();
+    assert_eq!(data["cleared"].as_u64().unwrap(), 2);
+
+    let remaining = mgr.list(None).await.unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining
+            .iter()
+            .all(|e| e.source_session_id.as_deref() != Some("s1"))
+    );
 }

@@ -126,6 +126,57 @@ impl MemoryStore for LibsqlMemoryStore {
         }
         Ok(entries)
     }
+
+    async fn list_all(&self) -> Result<Vec<MemoryEntry>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query("SELECT data FROM memories", ())
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let entry: MemoryEntry = serde_json::from_str(&data)
+                .map_err(|e| StorageError::Storage(format!("deserialize memory entry: {e}")))?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<MemoryEntry>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT data FROM memories WHERE id = ?1",
+                libsql::params![id.to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
+
+        match row {
+            Some(row) => {
+                let data: String = row
+                    .get(0)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let entry: MemoryEntry = serde_json::from_str(&data)
+                    .map_err(|e| StorageError::Storage(format!("deserialize memory entry: {e}")))?;
+                Ok(Some(entry))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]

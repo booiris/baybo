@@ -91,6 +91,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: CronCmd,
     },
+    /// Inspect and manage stored user memories.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// One-shot summary of current runtime state.
     Status,
     /// Run health checks against config, storage, and env.
@@ -263,6 +268,56 @@ pub enum CronCmd {
         /// Cron job id whose runs to list.
         #[arg(long)]
         id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemoryCmd {
+    /// List stored memories. Omit `--user` for an operator-wide view.
+    List {
+        /// Scope results to a specific user.
+        #[arg(long, short = 'u')]
+        user: Option<String>,
+        /// Cap the number of entries returned (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Substring-search memory contents. Omit `--user` for a global scan.
+    Search {
+        /// Query string matched against content (case-insensitive substring).
+        query: String,
+        /// Scope results to a specific user.
+        #[arg(long, short = 'u')]
+        user: Option<String>,
+        /// Cap the number of hits returned (default: 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show a memory entry by id.
+    Show {
+        /// Memory entry id.
+        id: String,
+    },
+    /// Raise a memory entry's importance. Requires `--yes` in slash mode.
+    Promote {
+        /// Memory entry id.
+        id: String,
+        /// New importance in `[0.0, 1.0]`. Defaults to 1.0 (pin).
+        #[arg(long, default_value_t = 1.0)]
+        to: f32,
+        /// Confirm the write (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Delete every memory entry recorded from a given session. Requires
+    /// `--yes` in slash mode.
+    Clear {
+        /// Session id whose memories should be purged.
+        #[arg(long)]
+        session: String,
+        /// Confirm the destructive action (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 

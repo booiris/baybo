@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, SessionCmd,
-    ShellKind, SkillsCmd, ToolsCmd, WorkspaceCmd,
+    ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd,
+    SessionCmd, ShellKind, SkillsCmd, ToolsCmd, WorkspaceCmd,
 };
 use clap::Parser;
 
@@ -362,6 +362,101 @@ fn cron_runs_requires_id_flag() {
         Some(Commands::Cron {
             cmd: CronCmd::Runs { id },
         }) => assert_eq!(id, "c1"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn memory_list_accepts_optional_user_and_limit() {
+    let cli = parse(&["memory", "list"]);
+    match cli.command {
+        Some(Commands::Memory {
+            cmd: MemoryCmd::List { user, limit },
+        }) => {
+            assert!(user.is_none());
+            assert_eq!(limit, 50);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["memory", "list", "--user", "u1", "--limit", "5"]);
+    match cli.command {
+        Some(Commands::Memory {
+            cmd: MemoryCmd::List { user, limit },
+        }) => {
+            assert_eq!(user.as_deref(), Some("u1"));
+            assert_eq!(limit, 5);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn memory_search_requires_query() {
+    assert!(Cli::try_parse_from(["aura", "memory", "search"]).is_err());
+    let cli = parse(&["memory", "search", "rust"]);
+    match cli.command {
+        Some(Commands::Memory {
+            cmd: MemoryCmd::Search { query, user, limit },
+        }) => {
+            assert_eq!(query, "rust");
+            assert!(user.is_none());
+            assert_eq!(limit, 20);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn memory_show_requires_id() {
+    assert!(Cli::try_parse_from(["aura", "memory", "show"]).is_err());
+    let cli = parse(&["memory", "show", "mid"]);
+    match cli.command {
+        Some(Commands::Memory {
+            cmd: MemoryCmd::Show { id },
+        }) => assert_eq!(id, "mid"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn memory_promote_defaults_to_pin() {
+    let cli = parse(&["memory", "promote", "mid"]);
+    match cli.command {
+        Some(Commands::Memory {
+            cmd: MemoryCmd::Promote { id, to, yes },
+        }) => {
+            assert_eq!(id, "mid");
+            assert!((to - 1.0).abs() < f32::EPSILON);
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["memory", "promote", "mid", "--to", "0.75", "-y"]);
+    match cli.command {
+        Some(Commands::Memory {
+            cmd: MemoryCmd::Promote { to, yes, .. },
+        }) => {
+            assert!((to - 0.75).abs() < f32::EPSILON);
+            assert!(yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn memory_clear_requires_session_flag() {
+    assert!(Cli::try_parse_from(["aura", "memory", "clear"]).is_err());
+    assert!(Cli::try_parse_from(["aura", "memory", "clear", "sid"]).is_err());
+    let cli = parse(&["memory", "clear", "--session", "sid"]);
+    match cli.command {
+        Some(Commands::Memory {
+            cmd: MemoryCmd::Clear { session, yes },
+        }) => {
+            assert_eq!(session, "sid");
+            assert!(!yes);
+        }
         other => panic!("unexpected: {other:?}"),
     }
 }
