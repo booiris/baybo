@@ -59,7 +59,7 @@ JSON is the sole supported format. It has the widest tooling support, round-trip
 
 ### Unknown fields
 
-`serde`'s default tolerance applies: unknown keys are silently ignored. This is permissive by design so a newer JSON file (with fields an older binary does not yet know about) does not hard-fail at load. The cost is that typos in field names are also silent — `"session.timout_minutes": 10` parses fine and the real `timeout_minutes` stays at its default.
+`serde`'s default tolerance applies: unknown keys are silently ignored. This is permissive by design so a newer JSON file (with fields an older binary does not yet know about) does not hard-fail at load. The cost is that typos in field names are also silent — `"session.timeout_minutes": 10` parses fine and the real `timeout_minutes` stays at its default.
 
 Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security`, `tools.mcp_servers[]`, `sandbox`) may opt into `#[serde(deny_unknown_fields)]` individually. The root `AuraConfig` intentionally keeps permissive semantics.
 
