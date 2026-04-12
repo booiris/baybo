@@ -104,6 +104,7 @@ aura-agent = { workspace = true }
 aura-sandbox = { workspace = true }
 aura-storage = { workspace = true }
 aura-skills = { workspace = true }
+aura-config = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -111,3 +112,4 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+hex = { workspace = true }

@@ -1,8 +1,9 @@
+mod boot;
+
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::AgentLoop;
 use aura_agent::cost::CostTracker;
 use aura_agent::observability::ObservabilityRecorder;
-use aura_agent::policy::ExecutionPolicy;
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::soul::Soul;
@@ -13,20 +14,18 @@ use aura_agent::{
     TraceCollector,
 };
 use aura_channels::{ChannelRegistry, CliAdapter};
-use aura_context::{ContextManager, TokenBudget, Tokenizer, Truncate};
+use aura_context::{ContextManager, Tokenizer, Truncate};
 use aura_hook::{Hook, HookAction, HookContext, HookManager, HookPoint};
-
-use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_model::{ChatMessage, ContentBlock};
-use aura_security::{EncryptionKey, LeakDetector};
-use aura_storage::Store;
+use aura_security::EncryptionKey;
 use aura_skills::SkillRegistry;
+use aura_storage::Store;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 struct NoopHook;
@@ -92,44 +91,21 @@ impl Tokenizer for SimpleTokenizer {
     }
 }
 
-fn build_llm_client_from_env() -> anyhow::Result<LlmClient> {
-    let provider = std::env::var("AURA_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_string());
-    let model = std::env::var("AURA_LLM_MODEL").unwrap_or_else(|_| match provider.as_str() {
-        "anthropic" => "claude-sonnet-4-6".to_string(),
-        _ => "gpt-4o-mini".to_string(),
-    });
-    let api_key = std::env::var("AURA_LLM_API_KEY")
-        .ok()
-        .or_else(|| match provider.as_str() {
-            "openai" => std::env::var("OPENAI_API_KEY").ok(),
-            "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
-            _ => None,
-        });
-    let base_url = std::env::var("AURA_LLM_BASE_URL").ok();
-
-    let registry = LlmProviderRegistry::with_default_providers();
-
-    registry
-        .create_client(&LlmProviderConfig {
-            provider,
-            api_key,
-            base_url,
-            model,
-        })
-        .map_err(|e| anyhow::anyhow!("failed to build LLM client from environment: {e}"))
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     info!("Aura - Intelligent Assistant Framework starting");
 
+    let config = boot::load_config().await?;
+    let buffer = config.channels.message_buffer_size;
+
     // Storage layer (in-memory for Phase 1)
     let storage = Store::in_memory().await?;
 
     // Session manager
-    let session_manager = SessionManager::new(storage.session, chrono::Duration::minutes(30));
+    let session_manager =
+        SessionManager::new(storage.session, boot::to_session_timeout(&config.session));
 
     // Job manager — recover any jobs interrupted by a prior shutdown
     let job_manager = JobManager::new(storage.job);
@@ -148,8 +124,8 @@ async fn main() -> anyhow::Result<()> {
     let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
         "global",
         trace_store,
-        true,
-        5,
+        config.trace.auto_snapshot,
+        config.trace.snapshot_interval,
     )));
 
     // Observability recorder
@@ -160,7 +136,13 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Secret vault
-    let master_key = EncryptionKey::new(b"aura-dev-master-key-32-bytes-ok!".to_vec())?;
+    let master_key = match boot::load_encryption_key(&config.security) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(error = %e, "falling back to dev-only encryption key; DO NOT use in production");
+            EncryptionKey::new(b"aura-dev-master-key-32-bytes-ok!".to_vec())?
+        }
+    };
     let secret_vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
 
     // Tool registry
@@ -170,13 +152,13 @@ async fn main() -> anyhow::Result<()> {
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         Arc::clone(&secret_vault),
-        std::time::Duration::from_secs(30),
+        boot::to_tool_timeout(&config.tools),
     ));
 
     // Memory manager (without embedder for Phase 1)
     let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
 
-    let llm_client = Arc::new(build_llm_client_from_env()?);
+    let llm_client = Arc::new(boot::build_llm_client(&config.llm)?);
     info!(
         provider = %llm_client.model_info().provider,
         model = %llm_client.model_id(),
@@ -185,14 +167,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Context manager (sliding window)
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(SimpleTokenizer);
+
     // Workspace and Soul
-    let workspace = WorkspaceManager::new(PathBuf::from("."));
+    let workspace = WorkspaceManager::new(PathBuf::from(&config.agent.workspace_path));
     let soul = Soul::from_workspace(&workspace)
         .await
         .unwrap_or_else(|_| Soul::custom("You are Aura, an intelligent assistant.".to_string()));
 
     // Execution policy
-    let policy = ExecutionPolicy::default();
+    let policy = boot::to_execution_policy(&config.agent);
 
     // Hook manager (empty)
     let mut hook_manager = HookManager::new();
@@ -200,13 +183,12 @@ async fn main() -> anyhow::Result<()> {
     let hook_manager = Arc::new(hook_manager);
 
     // Message channels
-    let (incoming_tx, incoming_rx) = mpsc::channel(256);
-    let (response_tx, response_rx) = mpsc::channel(256);
+    let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
+    let (response_tx, response_rx) = mpsc::channel(buffer);
 
     // Security gateway
-    let leak_detector = LeakDetector::with_default_rules();
     let security_gateway = Arc::new(SecurityGateway::new(
-        leak_detector,
+        boot::build_leak_detector(&config.security),
         Arc::clone(&secret_vault),
     ));
 
@@ -233,41 +215,39 @@ async fn main() -> anyhow::Result<()> {
     let actor_tokenizer = Arc::clone(&tokenizer);
     let actor_hooks = Arc::clone(&hook_manager);
     let actor_recorder = Arc::clone(&recorder);
+    let actor_token_budget = boot::to_token_budget(&config.agent.context);
+    let actor_keep_recent = config.agent.context.keep_recent;
+    let actor_buffer = buffer;
 
-    let router = Router::new(
-        session_manager,
-        supervisor,
-        channels,
-        security_gateway,
-    )
-    .with_actor_spawner(Box::new(move |session, response_tx| {
-        let agent_loop = AgentLoop::new(
-            Arc::clone(&actor_llm_client),
-            Arc::clone(&actor_tool_registry),
-            Arc::clone(&actor_skill_registry),
-            Arc::clone(&actor_tool_executor),
-            ContextManager::new(
-                Arc::clone(&actor_tokenizer),
-                Box::new(Truncate::new(100)),
-                TokenBudget::new(120_000, 0.75),
-            ),
-            Arc::clone(&actor_memory_manager),
-            actor_policy.clone(),
-            Soul::custom(actor_system_prompt.clone()),
-        );
-        let actor = AgentActor::new(
-            session,
-            agent_loop,
-            response_tx,
-            Arc::clone(&actor_hooks),
-            Arc::clone(&actor_recorder),
-        );
-        let (sender, mailbox) = mpsc::channel(256);
-        tokio::spawn(async move {
-            actor.run(mailbox).await;
-        });
-        sender
-    }));
+    let router = Router::new(session_manager, supervisor, channels, security_gateway)
+        .with_actor_spawner(Box::new(move |session, response_tx| {
+            let agent_loop = AgentLoop::new(
+                Arc::clone(&actor_llm_client),
+                Arc::clone(&actor_tool_registry),
+                Arc::clone(&actor_skill_registry),
+                Arc::clone(&actor_tool_executor),
+                ContextManager::new(
+                    Arc::clone(&actor_tokenizer),
+                    Box::new(Truncate::new(actor_keep_recent)),
+                    actor_token_budget.clone(),
+                ),
+                Arc::clone(&actor_memory_manager),
+                actor_policy.clone(),
+                Soul::custom(actor_system_prompt.clone()),
+            );
+            let actor = AgentActor::new(
+                session,
+                agent_loop,
+                response_tx,
+                Arc::clone(&actor_hooks),
+                Arc::clone(&actor_recorder),
+            );
+            let (sender, mailbox) = mpsc::channel(actor_buffer);
+            tokio::spawn(async move {
+                actor.run(mailbox).await;
+            });
+            sender
+        }));
 
     // Shutdown coordination
     let shutdown = ShutdownSignal::new();
