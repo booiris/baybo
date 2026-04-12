@@ -11,8 +11,8 @@ use std::sync::Arc;
 use aura_agent::{CronScheduler, JobManager, MemoryManager, ShutdownSignal};
 use aura_channels::ChannelRegistry;
 use aura_cli::cli::{
-    ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LeaksCmd, LlmCmd, MemoryCmd,
-    SecurityCmd, SessionCmd, SkillsCmd, ToolsCmd, TraceCmd, WorkspaceCmd,
+    AgentCmd, ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LeaksCmd, LlmCmd,
+    MemoryCmd, SecurityCmd, SessionCmd, SkillsCmd, ToolsCmd, TraceCmd, WorkspaceCmd,
 };
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
@@ -2537,4 +2537,50 @@ async fn skills_check_unknown_skill_errors() {
     .await
     .expect_err("missing skill");
     assert!(err.to_string().contains("ghost"));
+}
+
+// --- agent ---
+
+#[tokio::test]
+async fn agent_send_slash_mode_is_forbidden() {
+    let ctx = context().with_invocation(Invocation::Slash);
+    let err = dispatch::run(
+        &ctx,
+        Commands::Agent {
+            cmd: AgentCmd::Send {
+                session: "s-1".into(),
+                message: "hi".into(),
+                yes: true,
+            },
+        },
+    )
+    .await
+    .expect_err("slash agent send forbidden");
+    assert!(
+        matches!(err, aura_cli::CliError::AgentSendForbiddenInSlash(_)),
+        "expected AgentSendForbiddenInSlash, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn agent_send_argv_mode_reports_deferred() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Agent {
+            cmd: AgentCmd::Send {
+                session: "s-2".into(),
+                message: "hello world".into(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("argv deferred");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not yet available"),
+        "expected deferred notice, got: {msg}"
+    );
+    assert!(msg.contains("s-2"), "session id surfaced: {msg}");
 }

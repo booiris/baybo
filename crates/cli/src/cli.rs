@@ -106,6 +106,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: TraceCmd,
     },
+    /// Send a one-shot message to the agent.
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
     /// One-shot summary of current runtime state.
     Status,
     /// Run health checks against config, storage, and env.
@@ -453,6 +458,25 @@ pub enum TraceCmd {
         out: Option<String>,
         /// Confirm the file write (required in slash mode when `--out` is
         /// set).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCmd {
+    /// Send a one-shot message to a session's agent loop. Forbidden inside
+    /// a chat session (returns `AgentSendForbiddenInSlash`). In argv mode
+    /// this requires the agent runtime to expose a synchronous one-shot
+    /// entry point, which is still deferred pending daemon/RPC work.
+    Send {
+        /// Session id the message should be appended to.
+        #[arg(long)]
+        session: String,
+        /// Literal message content sent as a user turn.
+        #[arg(long)]
+        message: String,
+        /// Confirm the mutation. Slash mode rejects before this is read.
         #[arg(long, short = 'y')]
         yes: bool,
     },
