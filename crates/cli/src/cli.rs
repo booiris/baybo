@@ -170,6 +170,19 @@ pub enum SkillsCmd {
         /// Skill name.
         name: String,
     },
+    /// Case-insensitive substring search over name, description, and
+    /// command triggers. Omit `query` to return every skill.
+    Search {
+        /// Substring to match.
+        query: Option<String>,
+    },
+    /// Validate skills against their declared requirements
+    /// (required binaries on `$PATH`, required env vars set, declarative
+    /// shape). With `name`, check one skill; without, check all.
+    Check {
+        /// Optional skill name. Omit to check every skill.
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

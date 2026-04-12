@@ -2405,3 +2405,136 @@ async fn security_leaks_check_missing_file_errors() {
     .expect_err("missing file");
     assert!(err.to_string().contains("aura-leak-test"));
 }
+
+// --- skills ---
+
+fn context_with_skills(registry: SkillRegistry) -> aura_cli::CommandContext {
+    let config = Arc::new(AuraConfig::default());
+    ContextBuilder::new(config)
+        .skills(Arc::new(registry))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain)
+}
+
+fn sample_skill(name: &str, description: &str) -> aura_skills::SkillDefinition {
+    aura_skills::SkillDefinition {
+        name: name.into(),
+        version: "0.1.0".into(),
+        description: description.into(),
+        trigger: aura_skills::SkillTrigger::AgentDecision,
+        prompt_template: "be helpful".into(),
+        allowed_tools: vec![],
+        post_processing: None,
+        source: aura_registry::ArtifactSource::Workspace,
+        trust_level: aura_registry::TrustLevel::Trusted,
+        requirements: aura_skills::SkillRequirements::default(),
+        token_budget_hint: 1024,
+    }
+}
+
+#[tokio::test]
+async fn skills_search_returns_hits_for_substring() {
+    let mut registry = SkillRegistry::new();
+    registry.register(sample_skill("summarize", "condense long text"));
+    registry.register(sample_skill("translate", "convert between languages"));
+    let ctx = context_with_skills(registry);
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Skills {
+            cmd: SkillsCmd::Search {
+                query: Some("LANG".into()),
+            },
+        },
+    )
+    .await
+    .expect("skills search");
+    let data = out.data.expect("payload");
+    assert_eq!(data["hit_count"], 1);
+    assert_eq!(data["hits"][0]["name"], "translate");
+}
+
+#[tokio::test]
+async fn skills_search_empty_query_returns_everything() {
+    let mut registry = SkillRegistry::new();
+    registry.register(sample_skill("a", "x"));
+    registry.register(sample_skill("b", "y"));
+    let ctx = context_with_skills(registry);
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Skills {
+            cmd: SkillsCmd::Search { query: None },
+        },
+    )
+    .await
+    .expect("skills search");
+    assert_eq!(out.data.expect("payload")["hit_count"], 2);
+}
+
+#[tokio::test]
+async fn skills_check_reports_ok_for_clean_skill() {
+    let mut registry = SkillRegistry::new();
+    registry.register(sample_skill("clean", "no external reqs"));
+    let ctx = context_with_skills(registry);
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Skills {
+            cmd: SkillsCmd::Check { name: None },
+        },
+    )
+    .await
+    .expect("skills check");
+    let data = out.data.expect("payload");
+    assert_eq!(data["total"], 1);
+    assert_eq!(data["ok"], 1);
+    assert_eq!(data["failing"], 0);
+}
+
+#[tokio::test]
+async fn skills_check_flags_missing_binary() {
+    let mut skill = sample_skill("needs-bin", "requires a missing binary");
+    skill.requirements.required_bins = vec!["aura_not_a_binary_xyz_98765".into()];
+    let mut registry = SkillRegistry::new();
+    registry.register(skill);
+    let ctx = context_with_skills(registry);
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Skills {
+            cmd: SkillsCmd::Check {
+                name: Some("needs-bin".into()),
+            },
+        },
+    )
+    .await
+    .expect("skills check single");
+    let data = out.data.expect("payload");
+    assert_eq!(data["total"], 1);
+    assert_eq!(data["failing"], 1);
+    let issue_kind = data["reports"][0]["issues"][0]["kind"]
+        .as_str()
+        .expect("issue kind");
+    assert_eq!(issue_kind, "missing_binary");
+}
+
+#[tokio::test]
+async fn skills_check_unknown_skill_errors() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Skills {
+            cmd: SkillsCmd::Check {
+                name: Some("ghost".into()),
+            },
+        },
+    )
+    .await
+    .expect_err("missing skill");
+    assert!(err.to_string().contains("ghost"));
+}

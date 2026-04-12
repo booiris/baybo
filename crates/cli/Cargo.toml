@@ -33,3 +33,4 @@ clap_complete = { workspace = true }
 shell-words = { workspace = true }
 
 [dev-dependencies]
+aura-registry = { workspace = true }

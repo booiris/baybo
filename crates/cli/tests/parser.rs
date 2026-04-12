@@ -704,6 +704,44 @@ fn tools_test_requires_name_and_accepts_args() {
 }
 
 #[test]
+fn skills_search_accepts_optional_query() {
+    let cli = parse(&["skills", "search"]);
+    match cli.command {
+        Some(Commands::Skills {
+            cmd: SkillsCmd::Search { query },
+        }) => assert!(query.is_none()),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["skills", "search", "translate"]);
+    match cli.command {
+        Some(Commands::Skills {
+            cmd: SkillsCmd::Search { query },
+        }) => assert_eq!(query.as_deref(), Some("translate")),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn skills_check_accepts_optional_name() {
+    let cli = parse(&["skills", "check"]);
+    match cli.command {
+        Some(Commands::Skills {
+            cmd: SkillsCmd::Check { name },
+        }) => assert!(name.is_none()),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["skills", "check", "summarize"]);
+    match cli.command {
+        Some(Commands::Skills {
+            cmd: SkillsCmd::Check { name },
+        }) => assert_eq!(name.as_deref(), Some("summarize")),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
 fn security_audit_parses() {
     let cli = parse(&["security", "audit"]);
     assert!(matches!(
