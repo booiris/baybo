@@ -1,4 +1,5 @@
-use aura_cron::{CronJob, CronStatus};
+use aura_cron::{CronJob, CronRunMode, CronStatus};
+use aura_session::ChannelType;
 use serde_json::{Value, json};
 
 use crate::cli::CronCmd;
@@ -8,6 +9,14 @@ use crate::format::CommandOutput;
 
 pub async fn handle(ctx: &CommandContext, cmd: CronCmd) -> Result<CommandOutput> {
     match cmd {
+        CronCmd::Add {
+            user,
+            channel,
+            schedule,
+            prompt,
+            one_shot,
+            yes,
+        } => add(ctx, &user, &channel, &schedule, &prompt, one_shot, yes).await,
         CronCmd::List => list(ctx).await,
         CronCmd::Show { id } => show(ctx, &id).await,
         CronCmd::Rm { id, yes } => rm(ctx, &id, yes).await,
@@ -18,10 +27,85 @@ pub async fn handle(ctx: &CommandContext, cmd: CronCmd) -> Result<CommandOutput>
     }
 }
 
+fn parse_channel(raw: &str) -> Result<ChannelType> {
+    match raw.to_ascii_lowercase().as_str() {
+        "cli" => Ok(ChannelType::Cli),
+        "telegram" => Ok(ChannelType::Telegram),
+        "discord" => Ok(ChannelType::Discord),
+        "http" => Ok(ChannelType::Http),
+        other => Err(CliError::Manager(format!(
+            "unknown channel '{other}'; expected one of cli, telegram, discord, http"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn add(
+    ctx: &CommandContext,
+    user: &str,
+    channel: &str,
+    schedule: &str,
+    prompt: &str,
+    one_shot: bool,
+    yes: bool,
+) -> Result<CommandOutput> {
+    if ctx.invocation == Invocation::Slash && !yes {
+        return Err(CliError::ConfirmationRequired(format!(
+            "would schedule cron job for user {user} on {channel} \
+             ({schedule:?}); re-run with --yes to confirm"
+        )));
+    }
+    let channel_ty = parse_channel(channel)?;
+    let run_mode = if one_shot {
+        CronRunMode::OneShot
+    } else {
+        CronRunMode::Recurring
+    };
+
+    let mgr = cron(ctx)?;
+    let job = mgr
+        .create_job(user, channel_ty, schedule, prompt, run_mode)
+        .await
+        .map_err(|e| CliError::Manager(format!("create cron job: {e}")))?;
+
+    let human = format!(
+        "scheduled cron job {id} for user {user} on {ch} ({sched})\nnext trigger: {next}",
+        id = job.id,
+        user = job.user_id,
+        ch = job.channel,
+        sched = job.schedule,
+        next = job
+            .next_trigger_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "(disabled)".into()),
+    );
+    Ok(CommandOutput {
+        human,
+        data: Some(json!({
+            "id": job.id,
+            "user": job.user_id,
+            "channel": format!("{}", job.channel),
+            "schedule": job.schedule,
+            "prompt": job.prompt,
+            "run_mode": run_mode_label(&job.run_mode),
+            "status": status_label(&job.status),
+            "next_trigger_at": job.next_trigger_at.map(|t| t.to_rfc3339()),
+            "created_at": job.created_at.to_rfc3339(),
+        })),
+    })
+}
+
 fn cron(ctx: &CommandContext) -> Result<&aura_agent::CronScheduler> {
     ctx.cron.as_deref().ok_or_else(|| {
         CliError::Manager("cron scheduler is not available in this invocation".into())
     })
+}
+
+fn run_mode_label(m: &CronRunMode) -> &'static str {
+    match m {
+        CronRunMode::Recurring => "recurring",
+        CronRunMode::OneShot => "one_shot",
+    }
 }
 
 fn status_label(s: &CronStatus) -> &'static str {

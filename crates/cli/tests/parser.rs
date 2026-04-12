@@ -357,6 +357,90 @@ fn cron_list_parses() {
 }
 
 #[test]
+fn cron_add_requires_user_schedule_and_prompt() {
+    assert!(Cli::try_parse_from(["aura", "cron", "add"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "aura",
+            "cron",
+            "add",
+            "--user",
+            "alice",
+            "--schedule",
+            "* * * * *"
+        ])
+        .is_err(),
+        "missing --prompt must fail"
+    );
+
+    let cli = parse(&[
+        "cron",
+        "add",
+        "--user",
+        "alice",
+        "--schedule",
+        "0 9 * * *",
+        "--prompt",
+        "morning report",
+    ]);
+    match cli.command {
+        Some(Commands::Cron {
+            cmd:
+                CronCmd::Add {
+                    user,
+                    channel,
+                    schedule,
+                    prompt,
+                    one_shot,
+                    yes,
+                },
+        }) => {
+            assert_eq!(user, "alice");
+            assert_eq!(channel, "cli", "defaults to cli channel");
+            assert_eq!(schedule, "0 9 * * *");
+            assert_eq!(prompt, "morning report");
+            assert!(!one_shot);
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn cron_add_accepts_one_shot_and_channel_and_yes() {
+    let cli = parse(&[
+        "cron",
+        "add",
+        "--user",
+        "bob",
+        "--channel",
+        "telegram",
+        "--schedule",
+        "*/5 * * * *",
+        "--prompt",
+        "ping",
+        "--one-shot",
+        "--yes",
+    ]);
+    match cli.command {
+        Some(Commands::Cron {
+            cmd:
+                CronCmd::Add {
+                    channel,
+                    one_shot,
+                    yes,
+                    ..
+                },
+        }) => {
+            assert_eq!(channel, "telegram");
+            assert!(one_shot);
+            assert!(yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
 fn cron_show_requires_id() {
     assert!(Cli::try_parse_from(["aura", "cron", "show"]).is_err());
     let cli = parse(&["cron", "show", "cron-1"]);

@@ -338,6 +338,34 @@ pub enum JobStatusArg {
 
 #[derive(Debug, Subcommand)]
 pub enum CronCmd {
+    /// Create a new cron job bound to a `(user, channel)` pair. Requires
+    /// `--yes` in slash mode. `--one-shot` flips the run mode from
+    /// recurring to one-shot (the job is deleted after its first fire,
+    /// the execution record stays for audit).
+    Add {
+        /// Owning user id. Cron jobs are keyed on `(user, channel)`, not
+        /// on any session id, so they survive session expiration.
+        #[arg(long, short = 'u')]
+        user: String,
+        /// Channel the job fires into when it triggers. Accepts the same
+        /// snake_case names as `ChannelType` (`cli`, `telegram`,
+        /// `discord`, `http`).
+        #[arg(long, short = 'c', default_value = "cli")]
+        channel: String,
+        /// Standard cron expression, e.g. `"0 9 * * *"`. Validated before
+        /// the job is persisted.
+        #[arg(long, short = 's')]
+        schedule: String,
+        /// Prompt text fired into the channel on each trigger.
+        #[arg(long, short = 'p')]
+        prompt: String,
+        /// Use one-shot mode instead of the default recurring mode.
+        #[arg(long)]
+        one_shot: bool,
+        /// Confirm the write (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// List scheduled cron jobs across every user. Operator view.
     List,
     /// Show a cron job's metadata.

@@ -1322,6 +1322,134 @@ async fn cron_runs_returns_empty_for_unfired_job() {
     assert!(out.data.unwrap()["runs"].as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn cron_add_persists_job_and_round_trips_through_list() {
+    let (ctx, _rx, _sched) = context_with_cron().await;
+    let out = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Add {
+                user: "alice".into(),
+                channel: "cli".into(),
+                schedule: "0 9 * * *".into(),
+                prompt: "morning report".into(),
+                one_shot: false,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("cron add");
+    let data = out.data.expect("payload");
+    let new_id = data["id"].as_str().expect("id").to_string();
+    assert_eq!(data["user"], "alice");
+    assert_eq!(data["run_mode"], "recurring");
+    assert!(data["next_trigger_at"].is_string(), "enabled by default");
+
+    let list = dispatch::run(&ctx, Commands::Cron { cmd: CronCmd::List })
+        .await
+        .expect("cron list");
+    let rows = list.data.expect("payload")["jobs"].clone();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == new_id.as_str()),
+        "added job should surface in list"
+    );
+}
+
+#[tokio::test]
+async fn cron_add_one_shot_flag_flips_run_mode() {
+    let (ctx, _rx, _sched) = context_with_cron().await;
+    let out = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Add {
+                user: "bob".into(),
+                channel: "cli".into(),
+                schedule: "*/5 * * * *".into(),
+                prompt: "ping".into(),
+                one_shot: true,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("cron add one-shot");
+    assert_eq!(out.data.expect("payload")["run_mode"], "one_shot");
+}
+
+#[tokio::test]
+async fn cron_add_rejects_bad_channel() {
+    let (ctx, _rx, _sched) = context_with_cron().await;
+    let err = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Add {
+                user: "alice".into(),
+                channel: "mars".into(),
+                schedule: "0 9 * * *".into(),
+                prompt: "hi".into(),
+                one_shot: false,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("unknown channel");
+    assert!(err.to_string().contains("mars"));
+}
+
+#[tokio::test]
+async fn cron_add_rejects_invalid_schedule() {
+    let (ctx, _rx, _sched) = context_with_cron().await;
+    let err = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Add {
+                user: "alice".into(),
+                channel: "cli".into(),
+                schedule: "not-a-cron".into(),
+                prompt: "hi".into(),
+                one_shot: false,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("invalid cron expression");
+    assert!(
+        err.to_string().to_lowercase().contains("cron"),
+        "error should mention cron: {err}"
+    );
+}
+
+#[tokio::test]
+async fn cron_add_slash_mode_requires_yes() {
+    let (ctx, _rx, _sched) = context_with_cron().await;
+    let slash_ctx = ctx.with_invocation(Invocation::Slash);
+    let err = dispatch::run(
+        &slash_ctx,
+        Commands::Cron {
+            cmd: CronCmd::Add {
+                user: "alice".into(),
+                channel: "cli".into(),
+                schedule: "0 9 * * *".into(),
+                prompt: "hi".into(),
+                one_shot: false,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("slash without --yes");
+    assert!(
+        matches!(err, aura_cli::CliError::ConfirmationRequired(_)),
+        "expected ConfirmationRequired, got: {err:?}"
+    );
+}
+
 // ----------------------- memory family --------------------------------------
 
 struct MemoryMemStore {
