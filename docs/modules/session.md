@@ -10,7 +10,9 @@ The `session` crate owns session-related domain types (`Session`, `SessionState`
 
 ### Session isolation policy
 
-The same `User` has independent sessions on different channels. Each `(user_id, channel)` pair maps to an independent session. `get_or_create` must consider both user and channel.
+The same `User` has independent sessions on different channels. Sessions are keyed purely by `session_id` (string); `user` and `channel` are persisted on new sessions but are not part of the lookup key. Callers are responsible for constructing a `session_id` that encodes the desired isolation — e.g. CLI uses `cli-<uuid>` (one id per process), cron uses `cron-<user>-<channel>` (stable across triggers).
+
+**Invariant**: when `get_or_create` needs to insert a new session (either the id was missing or the prior session expired), it must persist it under the caller-supplied `session_id`. Callers rely on the id staying stable so that subsequent `touch` / `route` calls resolve the same session.
 
 ### Actor model serialization
 
@@ -31,7 +33,7 @@ Aura uses one Actor per session. All messages targeting the same session (user i
 
 ## Constraints
 
-- Session IDs use UUID v4 (random, no ordering needed)
+- Session IDs are caller-supplied opaque strings; typical producers prefix a UUID v4 to namespace by channel (e.g. `cli-<uuid>`, `cron-<user>-<channel>`). `SessionManager::create_session` generates a bare UUID v4 only when no id is requested.
 - `SessionStore` trait lives in this crate; concrete implementations live in `storage`
 - `SessionManager` owns lifecycle logic; `agent` re-exports it for convenience
 

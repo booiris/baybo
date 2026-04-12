@@ -22,9 +22,19 @@ impl SessionManager {
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
+        self.create_session_with_id(uuid::Uuid::new_v4().to_string(), user, channel)
+            .await
+    }
+
+    async fn create_session_with_id(
+        &self,
+        id: String,
+        user: User,
+        channel: ChannelType,
+    ) -> Result<Session> {
         let now = Utc::now();
         let session = Session {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             user,
             channel,
             messages: Vec::new(),
@@ -48,13 +58,16 @@ impl SessionManager {
             if session.last_active < cutoff {
                 debug!(session_id, "session expired, replacing with new session");
                 self.store.delete(session_id).await?;
-                return self.create_session(user, channel).await;
+                return self
+                    .create_session_with_id(session_id.to_string(), user, channel)
+                    .await;
             }
             debug!(session_id, "returning existing session");
             return Ok(session);
         }
         debug!(session_id, "session not found, creating new session");
-        self.create_session(user, channel).await
+        self.create_session_with_id(session_id.to_string(), user, channel)
+            .await
     }
 
     pub async fn get(&self, session_id: &str) -> Result<Option<Session>> {
@@ -229,12 +242,13 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
-            .get_or_create("nonexistent", test_user(), ChannelType::Cli)
+            .get_or_create("cli-abc", test_user(), ChannelType::Cli)
             .await
             .unwrap();
 
-        assert!(!session.id.is_empty());
-        assert_ne!(session.id, "nonexistent");
+        assert_eq!(session.id, "cli-abc");
+        let reloaded = mgr.get("cli-abc").await.unwrap();
+        assert!(reloaded.is_some());
     }
 
     #[tokio::test]
@@ -363,6 +377,7 @@ mod tests {
             .await
             .unwrap();
         let old_id = session.id.clone();
+        let old_created = session.created_at;
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -371,6 +386,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ne!(new_session.id, old_id);
+        assert_eq!(new_session.id, old_id);
+        assert!(new_session.created_at > old_created);
+        assert!(new_session.messages.is_empty());
     }
 }
