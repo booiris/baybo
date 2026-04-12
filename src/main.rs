@@ -321,6 +321,8 @@ async fn main() -> anyhow::Result<()> {
             .cron(Arc::clone(&cron_scheduler))
             .memory(Arc::clone(&memory_manager))
             .trace(Arc::clone(&trace_store))
+            .tool_executor(Arc::clone(&tool_executor))
+            .recorder(Arc::clone(&recorder))
             .build()
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),

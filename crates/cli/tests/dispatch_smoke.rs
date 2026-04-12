@@ -2076,3 +2076,39 @@ async fn config_unset_persists_and_resets() {
     assert_eq!(loaded.llm.model, AuraConfig::default().llm.model);
     std::fs::remove_file(&tmp).ok();
 }
+
+#[tokio::test]
+async fn tools_test_slash_requires_yes_confirmation() {
+    let ctx = context().with_invocation(Invocation::Slash);
+    let err = dispatch::run(
+        &ctx,
+        Commands::Tools {
+            cmd: ToolsCmd::Test {
+                name: "web.fetch".into(),
+                args: "{}".into(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("slash-mode tools test without --yes should error");
+    assert!(err.to_string().contains("--yes"));
+}
+
+#[tokio::test]
+async fn tools_test_unknown_tool_errors_in_argv_mode() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Tools {
+            cmd: ToolsCmd::Test {
+                name: "does.not.exist".into(),
+                args: "{}".into(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("unknown tool should error");
+    assert!(err.to_string().contains("does.not.exist"));
+}

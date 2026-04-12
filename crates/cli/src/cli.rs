@@ -176,6 +176,19 @@ pub enum ToolsCmd {
         /// Tool name.
         name: String,
     },
+    /// Execute a tool outside an agent turn, for operator testing. The attempt
+    /// is recorded in trace + cost + job ledgers like a real call. Requires
+    /// `--yes` under slash mode.
+    Test {
+        /// Tool name.
+        name: String,
+        /// JSON object passed as tool parameters (default: `{}`).
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Confirm the execution (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

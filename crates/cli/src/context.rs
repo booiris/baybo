@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, JobManager, MemoryManager};
+use aura_agent::{CronScheduler, JobManager, MemoryManager, ObservabilityRecorder, ToolExecutor};
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
@@ -40,6 +40,8 @@ pub struct CommandContext {
     pub cron: Option<Arc<CronScheduler>>,
     pub memory: Option<Arc<MemoryManager>>,
     pub trace: Option<Arc<dyn TraceStore>>,
+    pub tool_executor: Option<Arc<ToolExecutor>>,
+    pub recorder: Option<Arc<ObservabilityRecorder>>,
     pub format: OutputFormat,
     pub invocation: Invocation,
     pub confirmed: bool,
@@ -79,6 +81,8 @@ pub struct ContextBuilder {
     cron: Option<Arc<CronScheduler>>,
     memory: Option<Arc<MemoryManager>>,
     trace: Option<Arc<dyn TraceStore>>,
+    tool_executor: Option<Arc<ToolExecutor>>,
+    recorder: Option<Arc<ObservabilityRecorder>>,
 }
 
 impl ContextBuilder {
@@ -96,6 +100,8 @@ impl ContextBuilder {
             cron: None,
             memory: None,
             trace: None,
+            tool_executor: None,
+            recorder: None,
         }
     }
 
@@ -154,6 +160,16 @@ impl ContextBuilder {
         self
     }
 
+    pub fn tool_executor(mut self, exec: Arc<ToolExecutor>) -> Self {
+        self.tool_executor = Some(exec);
+        self
+    }
+
+    pub fn recorder(mut self, recorder: Arc<ObservabilityRecorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
     pub fn build(self) -> CommandContext {
         CommandContext {
             config: self.config,
@@ -174,6 +190,8 @@ impl ContextBuilder {
             cron: self.cron,
             memory: self.memory,
             trace: self.trace,
+            tool_executor: self.tool_executor,
+            recorder: self.recorder,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,
             confirmed: false,

@@ -5,7 +5,7 @@ use std::time::Duration;
 use aura_job::OperationKind;
 use aura_registry::TrustLevel;
 use aura_sandbox::{NetworkPolicy, SandboxPolicy};
-use aura_session::User;
+use aura_session::{ChannelType, User};
 
 use crate::security::{ScopedSecretAccessor, SecretVault};
 use aura_tools::{
@@ -236,6 +236,26 @@ impl ToolExecutor {
                 ))
             }
         }
+    }
+
+    /// Run a tool outside an agent turn, for operator-driven testing via
+    /// `aura tools test`. Routes through the same observability path as a live
+    /// turn so the attempt shows up in trace and cost records; the session id
+    /// is synthetic so the execution does not attach to any real chat session.
+    pub async fn test_execute(
+        &self,
+        tool_name: &str,
+        params: Value,
+        recorder: &ObservabilityRecorder,
+    ) -> anyhow::Result<ToolOutput> {
+        let session_id = format!("cli-test-{}", uuid::Uuid::new_v4());
+        let user = User {
+            id: "cli-operator".into(),
+            name: Some("operator".into()),
+            channel: ChannelType::Cli,
+        };
+        self.execute(tool_name, params, &session_id, &user, recorder, None)
+            .await
     }
 
     async fn inject_secrets(
