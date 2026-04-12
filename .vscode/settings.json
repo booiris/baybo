@@ -27,6 +27,7 @@
         "Ollama",
         "oneline",
         "oneshot",
+        "RAII",
         "Ratatui",
         "Reloadable",
         "replayability",

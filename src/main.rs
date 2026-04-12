@@ -1,4 +1,5 @@
 mod boot;
+mod singleton;
 
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::AgentLoop;
@@ -140,6 +141,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---------------- chat-loop boot (no subcommand provided) ----------------
+
+    // Per-workspace singleton: the chat loop owns libsql, the job recovery
+    // pass, and cron ticks — two instances against the same workspace would
+    // race. Held for the lifetime of `main`; released by `Drop` on exit.
+    let _workspace_lock = singleton::acquire(workspace.root.as_path())?;
 
     // By construction: the chat loop is only reached when `cli.command` is
     // `None`, and in that branch `build_llm_client` must have succeeded or we
