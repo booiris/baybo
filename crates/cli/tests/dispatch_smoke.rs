@@ -2096,6 +2096,39 @@ async fn tools_test_slash_requires_yes_confirmation() {
 }
 
 #[tokio::test]
+async fn llm_models_lists_default_providers() {
+    let ctx = context();
+    let out = dispatch::run(
+        &ctx,
+        Commands::Llm {
+            cmd: LlmCmd::Models,
+        },
+    )
+    .await
+    .expect("llm models");
+    let data = out.data.expect("json payload");
+    let providers = data
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .expect("providers array");
+    let names: Vec<_> = providers
+        .iter()
+        .filter_map(|p| p.get("provider").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"openai"));
+    assert!(names.contains(&"anthropic"));
+}
+
+#[tokio::test]
+async fn llm_probe_without_client_reports_unavailable() {
+    let ctx = context();
+    let err = dispatch::run(&ctx, Commands::Llm { cmd: LlmCmd::Probe })
+        .await
+        .expect_err("no client configured");
+    assert!(err.to_string().contains("llm client"));
+}
+
+#[tokio::test]
 async fn tools_test_unknown_tool_errors_in_argv_mode() {
     let ctx = context();
     let err = dispatch::run(

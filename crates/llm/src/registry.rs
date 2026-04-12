@@ -21,6 +21,22 @@ pub trait LlmProviderFactory: Send + Sync {
 
     /// Creates an `LlmClient` from the given configuration.
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient>;
+
+    /// Model ids this provider can accept as `config.model`.
+    ///
+    /// Advisory only — used by operator tooling (`aura llm models`) to show
+    /// the choice set. Providers that cannot enumerate their catalog return
+    /// an empty slice.
+    fn known_models(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+/// One entry in the `list_models()` aggregate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModels {
+    pub provider: String,
+    pub models: Vec<String>,
 }
 
 /// A registry of LLM provider factories.
@@ -52,6 +68,22 @@ impl LlmProviderRegistry {
     pub(crate) fn register(&mut self, factory: impl LlmProviderFactory + 'static) {
         self.factories
             .insert(factory.provider_name().to_string(), Box::new(factory));
+    }
+
+    /// Return the catalog advertised by each registered factory.
+    ///
+    /// Output is sorted by provider name for stable display.
+    pub fn list_models(&self) -> Vec<ProviderModels> {
+        let mut out: Vec<ProviderModels> = self
+            .factories
+            .values()
+            .map(|f| ProviderModels {
+                provider: f.provider_name().to_string(),
+                models: f.known_models().iter().map(|s| (*s).to_string()).collect(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.provider.cmp(&b.provider));
+        out
     }
 
     /// Creates an `LlmClient` using the factory that matches `config.provider`.

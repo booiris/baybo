@@ -12,6 +12,16 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         "anthropic"
     }
 
+    fn known_models(&self) -> &'static [&'static str] {
+        &[
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4",
+            "claude-sonnet-4",
+        ]
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key

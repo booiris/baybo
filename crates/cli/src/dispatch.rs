@@ -11,7 +11,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Skills { cmd } => commands::skills::handle(ctx, cmd),
         Commands::Tools { cmd } => commands::tools::handle(ctx, cmd).await,
         Commands::Channels { cmd } => commands::channels::handle(ctx, cmd).await,
-        Commands::Llm { cmd } => commands::llm::handle(ctx, cmd),
+        Commands::Llm { cmd } => commands::llm::handle(ctx, cmd).await,
         Commands::Workspace { cmd } => commands::workspace::handle(ctx, cmd).await,
         Commands::Session { cmd } => commands::session::handle(ctx, cmd).await,
         Commands::Job { cmd } => commands::job::handle(ctx, cmd).await,

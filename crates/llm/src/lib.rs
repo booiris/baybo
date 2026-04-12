@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 pub use crate::error::LlmError;
-pub use crate::registry::{LlmProviderConfig, LlmProviderRegistry};
+pub use crate::registry::{LlmProviderConfig, LlmProviderRegistry, ProviderModels};
 
 pub type Result<T> = std::result::Result<T, LlmError>;
 
@@ -430,4 +430,36 @@ impl LlmClient {
     pub fn model_info(&self) -> &ModelInfo {
         &self.model_info
     }
+
+    /// Issue a minimal chat request to verify provider connectivity and auth.
+    ///
+    /// Used by `aura llm probe` and `aura doctor`. The request is deliberately
+    /// tiny (one-token prompt, no tools) so it is cheap to run repeatedly.
+    pub async fn probe(&self) -> crate::Result<ProbeReport> {
+        let req = ChatRequest {
+            messages: vec![aura_model::ChatMessage {
+                role: aura_model::Role::User,
+                content: vec![aura_model::ContentBlock::Text("ping".to_string())],
+            }],
+            temperature: Some(0.0),
+            tools: vec![],
+        };
+        let start = std::time::Instant::now();
+        let response = self.chat(&req).await?;
+        Ok(ProbeReport {
+            provider: self.model_info.provider.clone(),
+            model: self.model_info.id.clone(),
+            latency_ms: start.elapsed().as_millis() as u64,
+            tokens: response.usage,
+        })
+    }
+}
+
+/// Result of a successful `LlmClient::probe()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeReport {
+    pub provider: String,
+    pub model: String,
+    pub latency_ms: u64,
+    pub tokens: TokenUsage,
 }

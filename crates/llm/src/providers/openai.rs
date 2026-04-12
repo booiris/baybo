@@ -12,6 +12,17 @@ impl LlmProviderFactory for OpenAIProviderFactory {
         "openai"
     }
 
+    fn known_models(&self) -> &'static [&'static str] {
+        &[
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4o",
+            "gpt-4o-mini",
+        ]
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key

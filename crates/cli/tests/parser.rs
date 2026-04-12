@@ -108,6 +108,22 @@ fn llm_status_parses() {
 }
 
 #[test]
+fn llm_models_and_probe_parse() {
+    let cli = parse(&["llm", "models"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Llm {
+            cmd: LlmCmd::Models
+        })
+    ));
+    let cli = parse(&["llm", "probe"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Llm { cmd: LlmCmd::Probe })
+    ));
+}
+
+#[test]
 fn workspace_show_parses() {
     let cli = parse(&["workspace", "show"]);
     assert!(matches!(

@@ -201,6 +201,11 @@ pub enum ChannelsCmd {
 pub enum LlmCmd {
     /// Show the configured LLM provider, model id, and capabilities.
     Status,
+    /// List the model catalog each registered provider advertises.
+    Models,
+    /// Send a one-token chat request to the configured provider to verify
+    /// connectivity and auth. Feeds `aura doctor`.
+    Probe,
 }
 
 #[derive(Debug, Subcommand)]
