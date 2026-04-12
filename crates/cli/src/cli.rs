@@ -129,6 +129,31 @@ pub enum ConfigCmd {
     File,
     /// Print a JSON snapshot of the default config as a schema reference.
     Schema,
+    /// Print a single config value by path (e.g. `llm.model` or `/llm/model`).
+    Get {
+        /// Dotted or JSON-pointer path.
+        path: String,
+    },
+    /// Write a new value at `path` and persist the config. Requires `--yes` in
+    /// slash mode. Reload requires restart until hot-reload ships.
+    Set {
+        /// Dotted or JSON-pointer path.
+        path: String,
+        /// JSON literal. Unquoted strings (not valid JSON) are accepted verbatim.
+        value: String,
+        /// Confirm the write (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Remove the value at `path` (resets to default) and persist the config.
+    /// Requires `--yes` in slash mode.
+    Unset {
+        /// Dotted or JSON-pointer path.
+        path: String,
+        /// Confirm the write (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

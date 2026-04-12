@@ -471,3 +471,77 @@ fn aggregates_multiple_errors() {
     assert!(has_field(&errors, "llm.model"));
     assert!(has_field(&errors, "session.timeout_minutes"));
 }
+
+#[test]
+fn set_at_path_updates_primitive() {
+    let cfg = AuraConfig::default();
+    let new = cfg
+        .set_at_path("llm.model", serde_json::json!("gpt-5"))
+        .expect("set");
+    assert_eq!(new.llm.model, "gpt-5");
+}
+
+#[test]
+fn set_at_path_accepts_slash_pointer() {
+    let cfg = AuraConfig::default();
+    let new = cfg
+        .set_at_path("/llm/model", serde_json::json!("gpt-5"))
+        .expect("set");
+    assert_eq!(new.llm.model, "gpt-5");
+}
+
+#[test]
+fn set_at_path_rejects_empty_path() {
+    let cfg = AuraConfig::default();
+    let err = cfg
+        .set_at_path("", serde_json::json!("x"))
+        .expect_err("empty should fail");
+    assert!(matches!(err, ConfigError::InvalidPath { .. }));
+}
+
+#[test]
+fn set_at_path_rejects_value_that_fails_validation() {
+    let cfg = AuraConfig::default();
+    let err = cfg
+        .set_at_path("llm.provider", serde_json::json!(""))
+        .expect_err("empty provider invalid");
+    assert!(matches!(err, ConfigError::Validation(_)));
+}
+
+#[test]
+fn unset_at_path_resets_to_default() {
+    let cfg = AuraConfig::default()
+        .set_at_path("llm.model", serde_json::json!("gpt-5"))
+        .expect("seed");
+    let reset = cfg.unset_at_path("llm.model").expect("unset");
+    assert_eq!(reset.llm.model, AuraConfig::default().llm.model);
+}
+
+#[test]
+fn unset_at_path_rejects_empty() {
+    let cfg = AuraConfig::default();
+    let err = cfg.unset_at_path("").expect_err("empty should fail");
+    assert!(matches!(err, ConfigError::InvalidPath { .. }));
+}
+
+#[test]
+fn write_to_file_round_trips_through_load() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let tmp = std::env::temp_dir().join(format!(
+        "aura-config-write-{}.json",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cfg = AuraConfig::default()
+        .set_at_path("llm.model", serde_json::json!("gpt-5"))
+        .expect("seed");
+    rt.block_on(cfg.write_to_file(&tmp)).expect("write");
+    let loaded = rt.block_on(AuraConfig::load_from_file(&tmp)).expect("load");
+    assert_eq!(loaded.llm.model, "gpt-5");
+    std::fs::remove_file(&tmp).ok();
+}

@@ -26,7 +26,7 @@ One row per subsystem. Signatures are indicative; the real shape is whatever kee
 | `ToolExecutor`         | `test_execute(name, args)` that runs a tool outside an agent turn and records the attempt in trace                                                                                                                                                   | `tools test`                                                          |
 | `SkillRegistry`        | `search(query)`, `validate_all()`                                                                                                                                                                                                                    | `skills search/check`                                                 |
 | `Router` / `AgentLoop` | `send_message(session_id, blocks)` for a one-shot agent turn (must remain disabled inside slash mode — see `cli.md` §"Explicit mutation confirmation in slash mode" and `AgentSendForbiddenInSlash`)                                                 | `agent send`                                                          |
-| `AuraConfig`           | `set_at_path(path, value)`, `unset_at_path(path)`, and an async `write_to_file`. Hot-reload is a separate concern tracked in `docs/todo/config-hot-reload.md`; `config set/unset` only needs the on-disk mutation — restart picks up the new values. | `config get/set/unset`                                                |
+| ~~`AuraConfig`~~       | ~~`set_at_path(path, value)`, `unset_at_path(path)`, and an async `write_to_file`~~ — shipped. Hot-reload still tracked in `docs/todo/config-hot-reload.md`; today `config set/unset` persists on-disk and the running process requires restart to observe the change.                                                                                                    | ~~`config get/set/unset`~~ — shipped                                  |
 
 ## Proposed Direction
 
@@ -39,7 +39,7 @@ Suggested order:
 3. ~~**`cron`** — the user-facing scheduling surface already exists (`list_jobs/create/enable/disable/delete`); the gaps are small. `list` needs to accept "all users" semantics for operator mode.~~ — shipped
 4. ~~**`memory`** — requires defining `MemoryEntry` identity (id vs session+hash) before list/search can return stable handles.~~ — shipped (identity resolved by reusing the existing UUID `MemoryEntry.id`)
 5. ~~**`trace`** — touches file I/O for `export`; snapshot is a write through an existing hook.~~ — shipped for list/show/export (reuses `TraceStore::query_traces` + `load_trace`). `snapshot` still deferred — needs per-session live context the CLI does not hold.
-6. **`config set/unset`** — requires a JSON-pointer-style path setter on `AuraConfig`. Coordinate with `docs/todo/config-hot-reload.md` so the reload path can consume whatever shape `set` produces.
+6. ~~**`config set/unset`** — requires a JSON-pointer-style path setter on `AuraConfig`. Coordinate with `docs/todo/config-hot-reload.md` so the reload path can consume whatever shape `set` produces.~~ — shipped (dotted or JSON-pointer path, round-trips through `serde_json::Value`; `write_to_file` is a tmpfile-and-rename). Hot-reload still pending.
 7. **`tools test`** — has to route through `ToolExecutor` so trace + cost records fire. Slash mode must require `--yes`.
 8. **`llm models/probe`** — needed by `doctor`; probe is a minimal chat request.
 9. **`workspace set-identity`** — small; fits after `workspace show`.

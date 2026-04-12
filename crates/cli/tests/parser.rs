@@ -554,3 +554,55 @@ fn trace_export_accepts_out_and_yes() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+#[test]
+fn config_get_requires_path() {
+    assert!(Cli::try_parse_from(["aura", "config", "get"]).is_err());
+    let cli = parse(&["config", "get", "llm.model"]);
+    match cli.command {
+        Some(Commands::Config {
+            cmd: ConfigCmd::Get { path },
+        }) => assert_eq!(path, "llm.model"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn config_set_requires_path_and_value() {
+    assert!(Cli::try_parse_from(["aura", "config", "set"]).is_err());
+    assert!(Cli::try_parse_from(["aura", "config", "set", "llm.model"]).is_err());
+    let cli = parse(&["config", "set", "llm.model", "gpt-5"]);
+    match cli.command {
+        Some(Commands::Config {
+            cmd: ConfigCmd::Set { path, value, yes },
+        }) => {
+            assert_eq!(path, "llm.model");
+            assert_eq!(value, "gpt-5");
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["config", "set", "llm.model", "gpt-5", "-y"]);
+    match cli.command {
+        Some(Commands::Config {
+            cmd: ConfigCmd::Set { yes, .. },
+        }) => assert!(yes),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn config_unset_requires_path() {
+    assert!(Cli::try_parse_from(["aura", "config", "unset"]).is_err());
+    let cli = parse(&["config", "unset", "llm.model", "--yes"]);
+    match cli.command {
+        Some(Commands::Config {
+            cmd: ConfigCmd::Unset { path, yes },
+        }) => {
+            assert_eq!(path, "llm.model");
+            assert!(yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}

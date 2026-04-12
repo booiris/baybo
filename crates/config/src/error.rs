@@ -14,6 +14,12 @@ pub enum ConfigError {
 
     #[error("unsupported variant for {ty}: '{variant}'")]
     UnsupportedVariant { ty: String, variant: String },
+
+    #[error("invalid config path '{path}': {reason}")]
+    InvalidPath { path: String, reason: String },
+
+    #[error("failed to write config file '{path}': {reason}")]
+    FileWrite { path: String, reason: String },
 }
 
 /// A single validation failure, identifying the offending field and the reason.

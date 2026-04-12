@@ -1918,3 +1918,161 @@ async fn trace_export_slash_stdout_does_not_require_yes() {
     .expect("stdout export");
     assert!(out.human.contains("sess-ss"));
 }
+
+// ----------------------- config get/set/unset --------------------------------
+
+fn tmp_config_path(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "aura-cli-cfg-{}-{}.json",
+        label,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+fn context_with_config_path(path: PathBuf) -> aura_cli::CommandContext {
+    ContextBuilder::new(Arc::new(AuraConfig::default()))
+        .config_path(Some(path))
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain)
+}
+
+#[tokio::test]
+async fn config_get_returns_known_field() {
+    let ctx = context();
+    let out = dispatch::run(
+        &ctx,
+        Commands::Config {
+            cmd: ConfigCmd::Get {
+                path: "llm.model".into(),
+            },
+        },
+    )
+    .await
+    .expect("get");
+    let data = out.data.unwrap();
+    assert_eq!(data, serde_json::to_value(&ctx.config.llm.model).unwrap());
+}
+
+#[tokio::test]
+async fn config_get_missing_path_errors() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Config {
+            cmd: ConfigCmd::Get {
+                path: "not.a.path".into(),
+            },
+        },
+    )
+    .await
+    .expect_err("expected missing path error");
+    assert!(err.to_string().contains("no such path"));
+}
+
+#[tokio::test]
+async fn config_set_persists_value_to_resolved_path() {
+    let tmp = tmp_config_path("set-ok");
+    let ctx = context_with_config_path(tmp.clone());
+    let out = dispatch::run(
+        &ctx,
+        Commands::Config {
+            cmd: ConfigCmd::Set {
+                path: "llm.model".into(),
+                value: "gpt-5".into(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("set");
+    assert!(out.human.contains("gpt-5"));
+    assert!(out.human.contains("restart"));
+
+    let on_disk = std::fs::read_to_string(&tmp).expect("file exists");
+    let reparsed: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+    assert_eq!(reparsed["llm"]["model"].as_str().unwrap(), "gpt-5");
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[tokio::test]
+async fn config_set_slash_requires_yes() {
+    let tmp = tmp_config_path("slash-yes");
+    let ctx = context_with_config_path(tmp.clone()).with_invocation(Invocation::Slash);
+    let err = dispatch::run(
+        &ctx,
+        Commands::Config {
+            cmd: ConfigCmd::Set {
+                path: "llm.model".into(),
+                value: "gpt-5".into(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("expected confirmation required");
+    assert!(err.to_string().contains("--yes"));
+    assert!(!tmp.exists());
+}
+
+#[tokio::test]
+async fn config_set_rejects_invalid_value() {
+    let tmp = tmp_config_path("set-bad");
+    let ctx = context_with_config_path(tmp.clone());
+    let err = dispatch::run(
+        &ctx,
+        Commands::Config {
+            cmd: ConfigCmd::Set {
+                path: "llm.provider".into(),
+                value: "\"\"".into(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("empty provider invalid");
+    assert!(err.to_string().contains("validation failed"));
+    assert!(!tmp.exists());
+}
+
+#[tokio::test]
+async fn config_unset_persists_and_resets() {
+    let tmp = tmp_config_path("unset-ok");
+    let seeded = AuraConfig::default()
+        .set_at_path("llm.model", serde_json::json!("gpt-5"))
+        .unwrap();
+    seeded.write_to_file(&tmp).await.unwrap();
+
+    let ctx = ContextBuilder::new(Arc::new(seeded))
+        .config_path(Some(tmp.clone()))
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain);
+
+    dispatch::run(
+        &ctx,
+        Commands::Config {
+            cmd: ConfigCmd::Unset {
+                path: "llm.model".into(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("unset");
+
+    let loaded = AuraConfig::load_from_file(&tmp).await.unwrap();
+    assert_eq!(loaded.llm.model, AuraConfig::default().llm.model);
+    std::fs::remove_file(&tmp).ok();
+}
