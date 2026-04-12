@@ -31,7 +31,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+struct SecondPrecisionTimer;
+
+impl FormatTime for SecondPrecisionTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"))
+    }
+}
 
 fn init_tracing() {
     let env_filter =
@@ -42,12 +52,26 @@ fn init_tracing() {
     if log_format == "json" {
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(fmt::layer().json().with_target(true).with_span_list(true))
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_timer(SecondPrecisionTimer)
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_span_list(true),
+            )
             .init();
     } else {
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(fmt::layer().with_target(true))
+            .with(
+                fmt::layer()
+                    .with_timer(SecondPrecisionTimer)
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true),
+            )
             .init();
     }
 }
