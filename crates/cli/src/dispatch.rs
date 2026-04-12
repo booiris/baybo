@@ -17,6 +17,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Job { cmd } => commands::job::handle(ctx, cmd).await,
         Commands::Cron { cmd } => commands::cron::handle(ctx, cmd).await,
         Commands::Memory { cmd } => commands::memory::handle(ctx, cmd).await,
+        Commands::Trace { cmd } => commands::trace::handle(ctx, cmd).await,
         Commands::Status => commands::status::handle(ctx).await,
         Commands::Doctor => commands::doctor::handle(ctx).await,
         Commands::Completion { shell } => commands::completion::handle(shell),

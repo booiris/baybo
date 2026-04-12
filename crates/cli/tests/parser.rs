@@ -6,7 +6,7 @@
 
 use aura_cli::cli::{
     ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd,
-    SessionCmd, ShellKind, SkillsCmd, ToolsCmd, WorkspaceCmd,
+    SessionCmd, ShellKind, SkillsCmd, ToolsCmd, TraceCmd, WorkspaceCmd,
 };
 use clap::Parser;
 
@@ -487,6 +487,70 @@ fn job_cancel_accepts_yes_flag() {
         Some(Commands::Job {
             cmd: JobCmd::Cancel { yes, .. },
         }) => assert!(yes),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn trace_list_defaults_and_session_flag() {
+    let cli = parse(&["trace", "list"]);
+    match cli.command {
+        Some(Commands::Trace {
+            cmd: TraceCmd::List { session, limit },
+        }) => {
+            assert!(session.is_none());
+            assert_eq!(limit, 50);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["trace", "list", "--session", "sid-7", "--limit", "10"]);
+    match cli.command {
+        Some(Commands::Trace {
+            cmd: TraceCmd::List { session, limit },
+        }) => {
+            assert_eq!(session.as_deref(), Some("sid-7"));
+            assert_eq!(limit, 10);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn trace_show_requires_id() {
+    assert!(Cli::try_parse_from(["aura", "trace", "show"]).is_err());
+    let cli = parse(&["trace", "show", "sess-1"]);
+    match cli.command {
+        Some(Commands::Trace {
+            cmd: TraceCmd::Show { id },
+        }) => assert_eq!(id, "sess-1"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn trace_export_accepts_out_and_yes() {
+    let cli = parse(&["trace", "export", "sess-1"]);
+    match cli.command {
+        Some(Commands::Trace {
+            cmd: TraceCmd::Export { id, out, yes },
+        }) => {
+            assert_eq!(id, "sess-1");
+            assert!(out.is_none());
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["trace", "export", "sess-2", "--out", "/tmp/t.json", "--yes"]);
+    match cli.command {
+        Some(Commands::Trace {
+            cmd: TraceCmd::Export { id, out, yes },
+        }) => {
+            assert_eq!(id, "sess-2");
+            assert_eq!(out.as_deref(), Some("/tmp/t.json"));
+            assert!(yes);
+        }
         other => panic!("unexpected: {other:?}"),
     }
 }

@@ -96,6 +96,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Inspect session traces.
+    Trace {
+        #[command(subcommand)]
+        cmd: TraceCmd,
+    },
     /// One-shot summary of current runtime state.
     Status,
     /// Run health checks against config, storage, and env.
@@ -316,6 +321,39 @@ pub enum MemoryCmd {
         #[arg(long)]
         session: String,
         /// Confirm the destructive action (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TraceCmd {
+    /// List stored session traces (newest first).
+    List {
+        /// Scope to a specific session id.
+        #[arg(long)]
+        session: Option<String>,
+        /// Cap the number of rows returned (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Show a session's trace tree summary.
+    Show {
+        /// Session id whose trace to inspect.
+        id: String,
+    },
+    /// Export a session's trace as pretty JSON. Prints to stdout unless
+    /// `--out <path>` is given, which writes the file in argv mode. Requires
+    /// `--yes` under slash mode because the write path is operator-controlled.
+    Export {
+        /// Session id whose trace to export.
+        id: String,
+        /// Optional output file path. Without it, JSON is returned in the
+        /// command output.
+        #[arg(long)]
+        out: Option<String>,
+        /// Confirm the file write (required in slash mode when `--out` is
+        /// set).
         #[arg(long, short = 'y')]
         yes: bool,
     },

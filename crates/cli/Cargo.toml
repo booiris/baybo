@@ -12,11 +12,14 @@ aura-cron = { workspace = true }
 aura-job = { workspace = true }
 aura-session = { workspace = true }
 aura-skills = { workspace = true }
+aura-storage = { workspace = true }
 aura-tools = { workspace = true }
+aura-trace = { workspace = true }
 aura-llm = { workspace = true }
 aura-workspace = { workspace = true }
 
 async-trait = { workspace = true }
+chrono = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,5 +32,3 @@ clap_complete = { workspace = true }
 shell-words = { workspace = true }
 
 [dev-dependencies]
-aura-storage = { workspace = true }
-chrono = { workspace = true }

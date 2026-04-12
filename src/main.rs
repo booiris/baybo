@@ -218,10 +218,10 @@ async fn main() -> anyhow::Result<()> {
     let cost_tracker = Arc::new(CostTracker::new(storage.cost));
 
     // Trace collector
-    let trace_store = Arc::from(storage.trace);
+    let trace_store: Arc<dyn aura_storage::TraceStore> = Arc::from(storage.trace);
     let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
         "global",
-        trace_store,
+        Arc::clone(&trace_store),
         config.trace.auto_snapshot,
         config.trace.snapshot_interval,
     )));
@@ -320,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
             .job(Arc::clone(&job_manager))
             .cron(Arc::clone(&cron_scheduler))
             .memory(Arc::clone(&memory_manager))
+            .trace(Arc::clone(&trace_store))
             .build()
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),

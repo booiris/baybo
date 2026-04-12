@@ -7,6 +7,7 @@ use aura_config::AuraConfig;
 use aura_llm::LlmClient;
 use aura_session::SessionManager;
 use aura_skills::SkillRegistry;
+use aura_storage::TraceStore;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 use tokio::sync::RwLock;
@@ -38,6 +39,7 @@ pub struct CommandContext {
     pub job: Option<Arc<JobManager>>,
     pub cron: Option<Arc<CronScheduler>>,
     pub memory: Option<Arc<MemoryManager>>,
+    pub trace: Option<Arc<dyn TraceStore>>,
     pub format: OutputFormat,
     pub invocation: Invocation,
     pub confirmed: bool,
@@ -76,6 +78,7 @@ pub struct ContextBuilder {
     job: Option<Arc<JobManager>>,
     cron: Option<Arc<CronScheduler>>,
     memory: Option<Arc<MemoryManager>>,
+    trace: Option<Arc<dyn TraceStore>>,
 }
 
 impl ContextBuilder {
@@ -92,6 +95,7 @@ impl ContextBuilder {
             job: None,
             cron: None,
             memory: None,
+            trace: None,
         }
     }
 
@@ -145,6 +149,11 @@ impl ContextBuilder {
         self
     }
 
+    pub fn trace(mut self, trace: Arc<dyn TraceStore>) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     pub fn build(self) -> CommandContext {
         CommandContext {
             config: self.config,
@@ -164,6 +173,7 @@ impl ContextBuilder {
             job: self.job,
             cron: self.cron,
             memory: self.memory,
+            trace: self.trace,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,
             confirmed: false,

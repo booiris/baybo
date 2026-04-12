@@ -12,7 +12,7 @@ use aura_agent::{CronScheduler, JobManager, MemoryManager, ShutdownSignal};
 use aura_channels::ChannelRegistry;
 use aura_cli::cli::{
     ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd, SessionCmd,
-    SkillsCmd, ToolsCmd, WorkspaceCmd,
+    SkillsCmd, ToolsCmd, TraceCmd, WorkspaceCmd,
 };
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
@@ -23,10 +23,13 @@ use aura_session::store::SessionStore;
 use aura_session::{ChannelType, Session, SessionError, SessionManager, SessionState, User};
 use aura_skills::SkillRegistry;
 use aura_storage::{
-    CronExecutionRow, CronJobRow, CronStore, CronStoreError, JobStore, MemoryStore,
-    cron::Result as CronResult, memory::Result as MemoryResult,
+    CronExecutionRow, CronJobRow, CronStore, CronStoreError, JobStore, MemoryStore, TraceStore,
+    cron::Result as CronResult, memory::Result as MemoryResult, trace::Result as TraceResult,
 };
 use aura_tools::ToolRegistry;
+use aura_trace::{
+    ExecutionProvenance, SessionTrace, SpanInput, TraceFilter, TraceNode, TraceNodeId, TraceSpan,
+};
 use aura_workspace::WorkspaceManager;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
@@ -1573,4 +1576,345 @@ async fn memory_clear_removes_only_matching_session() {
             .iter()
             .all(|e| e.source_session_id.as_deref() != Some("s1"))
     );
+}
+
+// ----------------------- trace family ---------------------------------------
+
+struct TraceMemStore {
+    traces: Mutex<HashMap<String, SessionTrace>>,
+}
+
+impl TraceMemStore {
+    fn new() -> Self {
+        Self {
+            traces: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TraceStore for TraceMemStore {
+    async fn save_trace(&self, trace: &SessionTrace) -> TraceResult<()> {
+        self.traces
+            .lock()
+            .unwrap()
+            .insert(trace.session_id.clone(), trace.clone());
+        Ok(())
+    }
+
+    async fn load_trace(&self, session_id: &str) -> TraceResult<Option<SessionTrace>> {
+        Ok(self.traces.lock().unwrap().get(session_id).cloned())
+    }
+
+    async fn query_traces(&self, filter: TraceFilter) -> TraceResult<Vec<SessionTrace>> {
+        let lock = self.traces.lock().unwrap();
+        let values: Vec<SessionTrace> = match filter.session_id {
+            Some(sid) => lock.get(&sid).cloned().into_iter().collect(),
+            None => lock.values().cloned().collect(),
+        };
+        Ok(values)
+    }
+
+    async fn load_node(
+        &self,
+        session_id: &str,
+        node_id: &TraceNodeId,
+    ) -> TraceResult<Option<TraceNode>> {
+        let lock = self.traces.lock().unwrap();
+        Ok(lock
+            .get(session_id)
+            .and_then(|t| t.nodes.get(node_id).cloned()))
+    }
+}
+
+fn make_trace(session: &str, started_at: DateTime<Utc>) -> SessionTrace {
+    let node_id: TraceNodeId = format!("{session}-root");
+    let node = TraceNode {
+        id: node_id.clone(),
+        parent: None,
+        children: vec![],
+        span: TraceSpan {
+            kind: OperationKind::LlmCall {
+                model: "gpt-5".into(),
+            },
+            job_id: None,
+            provenance: ExecutionProvenance::default(),
+            input: SpanInput::None,
+            started_at,
+            ended_at: None,
+            result: None,
+        },
+        context_snapshot: None,
+    };
+    let mut nodes = HashMap::new();
+    nodes.insert(node_id.clone(), node);
+    SessionTrace {
+        session_id: session.into(),
+        root: node_id.clone(),
+        nodes,
+        forks: vec![],
+        active_leaf: node_id,
+    }
+}
+
+fn context_with_trace() -> (aura_cli::CommandContext, Arc<TraceMemStore>) {
+    let store = Arc::new(TraceMemStore::new());
+    let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .trace(Arc::clone(&store) as Arc<dyn TraceStore>)
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain);
+    (ctx, store)
+}
+
+#[tokio::test]
+async fn trace_list_without_store_reports_unavailable() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::List {
+                session: None,
+                limit: 10,
+            },
+        },
+    )
+    .await
+    .expect_err("expected error");
+    assert!(err.to_string().contains("not available"));
+}
+
+#[tokio::test]
+async fn trace_list_returns_newest_first_and_respects_limit() {
+    let (ctx, store) = context_with_trace();
+    let t0 = Utc::now();
+    let older = make_trace("sess-old", t0 - Duration::minutes(30));
+    let newer = make_trace("sess-new", t0);
+    store.save_trace(&older).await.unwrap();
+    store.save_trace(&newer).await.unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::List {
+                session: None,
+                limit: 10,
+            },
+        },
+    )
+    .await
+    .expect("list");
+    let data = out.data.unwrap();
+    let rows = data["traces"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["session"].as_str().unwrap(), "sess-new");
+    assert_eq!(rows[1]["session"].as_str().unwrap(), "sess-old");
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::List {
+                session: None,
+                limit: 1,
+            },
+        },
+    )
+    .await
+    .expect("list limit");
+    assert_eq!(out.data.unwrap()["traces"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn trace_list_filters_by_session() {
+    let (ctx, store) = context_with_trace();
+    store
+        .save_trace(&make_trace("s-a", Utc::now()))
+        .await
+        .unwrap();
+    store
+        .save_trace(&make_trace("s-b", Utc::now()))
+        .await
+        .unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::List {
+                session: Some("s-a".into()),
+                limit: 50,
+            },
+        },
+    )
+    .await
+    .expect("list filter");
+    let rows = out.data.unwrap();
+    let rows = rows["traces"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["session"].as_str().unwrap(), "s-a");
+}
+
+#[tokio::test]
+async fn trace_list_empty_returns_friendly_text() {
+    let (ctx, _store) = context_with_trace();
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::List {
+                session: None,
+                limit: 10,
+            },
+        },
+    )
+    .await
+    .expect("list empty");
+    assert!(out.human.contains("no session traces"));
+    assert!(out.data.unwrap()["traces"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn trace_show_returns_summary() {
+    let (ctx, store) = context_with_trace();
+    store
+        .save_trace(&make_trace("sess-x", Utc::now()))
+        .await
+        .unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Show {
+                id: "sess-x".into(),
+            },
+        },
+    )
+    .await
+    .expect("show");
+    let data = out.data.unwrap();
+    assert_eq!(data["session"].as_str().unwrap(), "sess-x");
+    assert_eq!(data["nodes"].as_u64().unwrap(), 1);
+    assert!(out.human.contains("sess-x"));
+}
+
+#[tokio::test]
+async fn trace_show_missing_reports_error() {
+    let (ctx, _store) = context_with_trace();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Show { id: "nope".into() },
+        },
+    )
+    .await
+    .expect_err("expected missing");
+    assert!(err.to_string().contains("no trace recorded"));
+}
+
+#[tokio::test]
+async fn trace_export_to_stdout_returns_pretty_json() {
+    let (ctx, store) = context_with_trace();
+    store
+        .save_trace(&make_trace("sess-e", Utc::now()))
+        .await
+        .unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Export {
+                id: "sess-e".into(),
+                out: None,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("export");
+    assert!(out.human.contains("\"session_id\": \"sess-e\""));
+    let data = out.data.unwrap();
+    assert_eq!(data["session_id"].as_str().unwrap(), "sess-e");
+}
+
+#[tokio::test]
+async fn trace_export_writes_file_in_argv_mode() {
+    let (ctx, store) = context_with_trace();
+    store
+        .save_trace(&make_trace("sess-w", Utc::now()))
+        .await
+        .unwrap();
+
+    let tmp = std::env::temp_dir().join(format!(
+        "aura-cli-trace-{}.json",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let tmp_str = tmp.to_string_lossy().into_owned();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Export {
+                id: "sess-w".into(),
+                out: Some(tmp_str.clone()),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("export to file");
+    assert!(out.human.contains(&tmp_str));
+
+    let written = std::fs::read_to_string(&tmp).expect("file written");
+    assert!(written.contains("\"session_id\": \"sess-w\""));
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn trace_export_slash_requires_yes_when_out_set() {
+    let (ctx, store) = context_with_trace();
+    store
+        .save_trace(&make_trace("sess-s", Utc::now()))
+        .await
+        .unwrap();
+    let ctx = ctx.with_invocation(Invocation::Slash);
+
+    let err = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Export {
+                id: "sess-s".into(),
+                out: Some("/tmp/should-not-write.json".into()),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("expected confirmation");
+    assert!(err.to_string().contains("--yes"));
+}
+
+#[tokio::test]
+async fn trace_export_slash_stdout_does_not_require_yes() {
+    let (ctx, store) = context_with_trace();
+    store
+        .save_trace(&make_trace("sess-ss", Utc::now()))
+        .await
+        .unwrap();
+    let ctx = ctx.with_invocation(Invocation::Slash);
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Trace {
+            cmd: TraceCmd::Export {
+                id: "sess-ss".into(),
+                out: None,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("stdout export");
+    assert!(out.human.contains("sess-ss"));
 }

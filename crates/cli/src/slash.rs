@@ -59,6 +59,7 @@ impl CliSlashHandler {
             job: self.ctx.job.clone(),
             cron: self.ctx.cron.clone(),
             memory: self.ctx.memory.clone(),
+            trace: self.ctx.trace.clone(),
             format,
             invocation: Invocation::Slash,
             confirmed: false,

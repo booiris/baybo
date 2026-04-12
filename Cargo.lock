@@ -295,6 +295,7 @@ dependencies = [
  "aura-skills",
  "aura-storage",
  "aura-tools",
+ "aura-trace",
  "aura-workspace",
  "chrono",
  "clap",
