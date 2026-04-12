@@ -119,10 +119,11 @@ pub fn to_execution_policy(cfg: &AgentConfig) -> ExecutionPolicy {
 }
 
 /// Path to the libsql database file, derived from the project root
-/// (`workspace.path`). Storage always lives at `<root>/.aura/storage.db`;
-/// there is no separate configuration knob for the database location.
+/// (`workspace.path`). Storage always lives at `<root>/storage.db`; the
+/// workspace root is itself the aura data directory (defaults to
+/// `~/.aura` in release, `./.aura` in debug).
 pub fn storage_db_path(cfg: &WorkspaceConfig) -> PathBuf {
-    PathBuf::from(&cfg.path).join(".aura").join("storage.db")
+    PathBuf::from(&cfg.path).join("storage.db")
 }
 
 pub fn to_token_budget(cfg: &aura_config::ContextConfig) -> TokenBudget {
@@ -199,7 +200,7 @@ mod tests {
         };
         assert_eq!(
             storage_db_path(&cfg),
-            std::path::PathBuf::from("/tmp/project/.aura/storage.db"),
+            std::path::PathBuf::from("/tmp/project/storage.db"),
         );
     }
 
