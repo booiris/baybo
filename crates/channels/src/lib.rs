@@ -1,11 +1,13 @@
 pub mod cli;
 mod error;
 mod registry;
+mod slash;
 mod types;
 
 pub use cli::CliAdapter;
 pub use error::ChannelError;
 pub use registry::ChannelRegistry;
+pub use slash::{SlashHandler, SlashOutcome};
 pub use types::{ChannelStatus, IncomingMessage, Message, OutgoingMessage};
 
 use async_trait::async_trait;

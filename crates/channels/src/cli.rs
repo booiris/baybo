@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
-use crate::{IncomingMessage, Message, OutgoingMessage, Result};
+use crate::{IncomingMessage, Message, OutgoingMessage, Result, SlashHandler, SlashOutcome};
 
 /// CLI channel adapter that reads from stdin and writes to stdout.
 ///
@@ -16,10 +16,15 @@ use crate::{IncomingMessage, Message, OutgoingMessage, Result};
 /// wraps each line as an `IncomingMessage`, and pushes it into the
 /// router's incoming channel.  `send_response()` formats the content
 /// blocks and writes them to stdout.
+///
+/// A [`SlashHandler`] may be attached via [`CliAdapter::with_slash_handler`]
+/// to intercept `/`-prefixed input. Reserved tokens `/quit`, `/exit`, and
+/// `/clear` are handled by the adapter itself and never reach the handler.
 pub struct CliAdapter {
     session_id: String,
     user: User,
     shutdown: Arc<Notify>,
+    slash_handler: Option<Arc<dyn SlashHandler>>,
 }
 
 impl Default for CliAdapter {
@@ -41,8 +46,59 @@ impl CliAdapter {
                 channel: ChannelType::Cli,
             },
             shutdown: Arc::new(Notify::new()),
+            slash_handler: None,
         }
     }
+
+    /// Attach a slash-command handler. Returns `self` for builder-style chaining.
+    pub fn with_slash_handler(mut self, handler: Arc<dyn SlashHandler>) -> Self {
+        self.slash_handler = Some(handler);
+        self
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+async fn write_prompt() {
+    let mut stdout = tokio::io::stdout();
+    let _ = stdout.write_all(b"aura> ").await;
+    let _ = stdout.flush().await;
+}
+
+async fn write_blocks(blocks: &[ContentBlock]) {
+    let mut stdout = tokio::io::stdout();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text) => {
+                let _ = stdout.write_all(b"\n").await;
+                let _ = stdout.write_all(text.as_bytes()).await;
+                let _ = stdout.write_all(b"\n").await;
+            }
+            ContentBlock::Image { mime_type, .. } => {
+                let _ = stdout
+                    .write_all(format!("\n[Image: {mime_type}]\n").as_bytes())
+                    .await;
+            }
+            ContentBlock::Audio { mime_type, .. } => {
+                let _ = stdout
+                    .write_all(format!("\n[Audio: {mime_type}]\n").as_bytes())
+                    .await;
+            }
+            ContentBlock::File {
+                filename,
+                mime_type,
+                ..
+            } => {
+                let _ = stdout
+                    .write_all(format!("\n[File: {filename} ({mime_type})]\n").as_bytes())
+                    .await;
+            }
+        }
+    }
+    let _ = stdout.write_all(b"aura> ").await;
+    let _ = stdout.flush().await;
 }
 
 #[async_trait]
@@ -55,12 +111,13 @@ impl crate::ChannelAdapter for CliAdapter {
         let session_id = self.session_id.clone();
         let user = self.user.clone();
         let shutdown = Arc::clone(&self.shutdown);
+        let slash_handler = self.slash_handler.clone();
 
         tokio::spawn(async move {
             let stdin = tokio::io::stdin();
             let mut reader = BufReader::new(stdin).lines();
 
-            // Print prompt for the first line.
+            // Initial prompt for the first line.
             {
                 let mut stdout = tokio::io::stdout();
                 let _ = stdout.write_all(b"\naura> ").await;
@@ -74,14 +131,35 @@ impl crate::ChannelAdapter for CliAdapter {
                             Ok(Some(text)) => {
                                 let text = text.trim().to_string();
                                 if text.is_empty() {
-                                    let mut stdout = tokio::io::stdout();
-                                    let _ = stdout.write_all(b"aura> ").await;
-                                    let _ = stdout.flush().await;
+                                    write_prompt().await;
                                     continue;
                                 }
+                                // Adapter-local reserved tokens.
                                 if text == "/quit" || text == "/exit" {
                                     break;
                                 }
+                                if text == "/clear" {
+                                    let mut stdout = tokio::io::stdout();
+                                    let _ = stdout.write_all(b"\x1b[2J\x1b[H").await;
+                                    let _ = stdout.flush().await;
+                                    write_prompt().await;
+                                    continue;
+                                }
+
+                                // Slash dispatch.
+                                if text.starts_with('/')
+                                    && let Some(handler) = slash_handler.as_ref()
+                                {
+                                    match handler.handle(&text).await {
+                                        SlashOutcome::Handled(blocks) => {
+                                            write_blocks(&blocks).await;
+                                            continue;
+                                        }
+                                        SlashOutcome::Exit => break,
+                                        SlashOutcome::PassThrough => {}
+                                    }
+                                }
+
                                 let msg = IncomingMessage {
                                     message: Message {
                                         id: Uuid::new_v4().to_string(),
@@ -113,37 +191,7 @@ impl crate::ChannelAdapter for CliAdapter {
     }
 
     async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
-        let mut stdout = tokio::io::stdout();
-        for block in &response.content {
-            match block {
-                ContentBlock::Text(text) => {
-                    let _ = stdout.write_all(b"\n").await;
-                    let _ = stdout.write_all(text.as_bytes()).await;
-                    let _ = stdout.write_all(b"\n").await;
-                }
-                ContentBlock::Image { mime_type, .. } => {
-                    let _ = stdout
-                        .write_all(format!("\n[Image: {mime_type}]\n").as_bytes())
-                        .await;
-                }
-                ContentBlock::Audio { mime_type, .. } => {
-                    let _ = stdout
-                        .write_all(format!("\n[Audio: {mime_type}]\n").as_bytes())
-                        .await;
-                }
-                ContentBlock::File {
-                    filename,
-                    mime_type,
-                    ..
-                } => {
-                    let _ = stdout
-                        .write_all(format!("\n[File: {filename} ({mime_type})]\n").as_bytes())
-                        .await;
-                }
-            }
-        }
-        let _ = stdout.write_all(b"aura> ").await;
-        let _ = stdout.flush().await;
+        write_blocks(&response.content).await;
         Ok(())
     }
 
