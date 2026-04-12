@@ -18,7 +18,7 @@ Bottom-up along the dependency graph:
 ### Foundational Types Layer
 
 - **model** — Shared content primitives (ChatMessage, ContentBlock, Role, BlobRef, MessageMetadata) and memory domain types (MemoryEntry, MemoryCategory). No business traits.
-- **config** — Root `AuraConfig` with JSON loading and `validate()`. Nine sections (llm, agent, session, channels, sandbox, security, tools, trace, cost). Uses mirror structs to stay decoupled from domain crates.
+- **config** — Root `AuraConfig` with JSON loading and `validate()`. Ten sections (llm, agent, session, channels, sandbox, security, tools, trace, cost, workspace). Uses mirror structs to stay decoupled from domain crates.
 
 ### Ingress and Security Boundary Layer
 

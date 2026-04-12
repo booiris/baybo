@@ -9,6 +9,7 @@ use crate::sandbox::SandboxConfig;
 use crate::session::SessionConfig;
 use crate::tools::{CapabilityConfig, McpTransportConfig, ToolsConfig, TrustLevelConfig};
 use crate::trace::TraceConfig;
+use crate::workspace::WorkspaceConfig;
 
 impl AuraConfig {
     /// Validate the config, collecting every violation. Returns `Ok(())` when
@@ -24,6 +25,7 @@ impl AuraConfig {
         validate_tools(&self.tools, &mut errors);
         validate_trace(&self.trace, &mut errors);
         validate_cost(&self.cost, &mut errors);
+        validate_workspace(&self.workspace, &mut errors);
         validate_cross_section(self, &mut errors);
         if errors.is_empty() {
             Ok(())
@@ -74,13 +76,6 @@ fn validate_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
             "must be >= 100",
         ));
     }
-    if agent.workspace_path.trim().is_empty() {
-        errors.push(ValidationError::new(
-            "agent.workspace_path",
-            "must be non-empty",
-        ));
-    }
-
     let ctx = &agent.context;
     if ctx.max_tokens == 0 {
         errors.push(ValidationError::new(
@@ -281,6 +276,12 @@ fn validate_cost(cost: &CostConfig, errors: &mut Vec<ValidationError>) {
             "cost.rate_limit.window_secs",
             "must be >= 1",
         ));
+    }
+}
+
+fn validate_workspace(workspace: &WorkspaceConfig, errors: &mut Vec<ValidationError>) {
+    if workspace.path.trim().is_empty() {
+        errors.push(ValidationError::new("workspace.path", "must be non-empty"));
     }
 }
 

@@ -6,7 +6,9 @@ The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `val
 
 A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consumers (`main.rs` and `aura-agent`) map each section into the corresponding domain type.
 
-Top-level sections: `llm`, `agent`, `session`, `channels`, `sandbox`, `security`, `tools`, `trace`, `cost`.
+Top-level sections: `llm`, `agent`, `session`, `channels`, `sandbox`, `security`, `tools`, `trace`, `cost`, `workspace`.
+
+There is no `storage` section. Storage paths are **derived** from the project root (`workspace.path`) — operators choose a project root, not individual data-file locations.
 
 ## Current status
 
@@ -85,8 +87,9 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 | `tools`    | `McpServerConfig` list + `ToolExecutor` default timeout     |                                                                                                                                                                                                      |
 | `trace`    | `TraceCollector` auto-snapshot and interval                 |                                                                                                                                                                                                      |
 | `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
+| `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/.aura/storage.db`).                                                                |
 
-`workspace`, `registry`, `skills`, and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
+`registry`, `skills`, and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
 
 ### Channel enablement model
 
@@ -96,7 +99,6 @@ Each optional channel (`telegram`, `discord`, `http`) is wrapped in `Option<_>`:
 
 The following modules do not (yet) have sections in the root config. This is a deliberate phased decision, not an oversight. Each has a planned placement:
 
-- **workspace** — currently borrows `agent.workspace_path`. Target: a `workspace` section (`workspace.path`, identity-file overrides). Move `agent.workspace_path` → `workspace.path` when `WorkspaceManager` grows additional knobs.
 - **skills** — hot-reload switch, skill directories, trust tiers. Today the defaults are hardcoded in `SkillRegistry::new()`.
 - **registry** — artifact source allowlist, signature verification policy, trust ceilings. Today the defaults are baked into the registry constructors.
 - **cron** — scheduler poll interval, max concurrent runs, missed-run policy. Today `CronScheduler` uses compile-time defaults.
@@ -138,10 +140,10 @@ Until reload is implemented, `ConfigChange` fires exactly once at startup (for p
 | `llm.fallback_model`                  | if set, non-empty                                    |
 | `agent.max_iterations`                | in `1..=1000`                                        |
 | `agent.default_tool_timeout_ms`       | ≥ 100                                                |
-| `agent.workspace_path`                | non-empty                                            |
 | `agent.context.max_tokens`            | ≥ 1                                                  |
 | `agent.context.compression_threshold` | in `(0.0, 1.0]`, finite                              |
 | `agent.context.keep_recent`           | ≥ 1                                                  |
+| `workspace.path`                      | non-empty                                            |
 | `session.timeout_minutes`             | ≥ 1                                                  |
 | `session.cleanup_interval_minutes`    | no constraint; `0` disables cleanup                  |
 | `channels.message_buffer_size`        | in `1..=65536`                                       |

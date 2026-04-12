@@ -8,6 +8,20 @@ Identity files: `AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`.
 
 It provides `agent` with long-term personality and identity injection.
 
+## Configuration
+
+The workspace root is the single **project root** for the entire runtime: every subsystem that needs a persistent path (workspace identity files, libsql storage, etc.) derives its location from it. There is no separate knob for storage or data paths.
+
+| Field            | Default | Role                                        |
+| ---------------- | ------- | ------------------------------------------- |
+| `workspace.path` | `"."`   | Project root directory (validated non-empty)|
+
+Convention for derived paths:
+
+| Subsystem | Path                                 |
+| --------- | ------------------------------------ |
+| storage   | `<workspace.path>/.aura/storage.db`  |
+
 ## Design Decisions
 
 ### Identity file responsibilities

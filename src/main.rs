@@ -85,9 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let skill_registry = Arc::new(SkillRegistry::new());
     let tool_registry = Arc::new(ToolRegistry::new());
-    let workspace = Arc::new(WorkspaceManager::new(PathBuf::from(
-        &config.agent.workspace_path,
-    )));
+    let workspace = Arc::new(WorkspaceManager::new(PathBuf::from(&config.workspace.path)));
     let channels_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
 
     // LLM client is required for the chat loop but optional for argv commands
@@ -149,8 +147,8 @@ async fn main() -> anyhow::Result<()> {
     let llm_client =
         llm_client.ok_or_else(|| anyhow::anyhow!("LLM client is required for chat loop"))?;
 
-    // Storage layer (in-memory for Phase 1)
-    let storage = Store::in_memory().await?;
+    // Storage layer — persistent libsql under the project root (`workspace.path`).
+    let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
 
     // Session manager
     let session_manager = Arc::new(SessionManager::new(

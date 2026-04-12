@@ -24,6 +24,7 @@ pub mod session;
 pub mod tools;
 pub mod trace;
 mod validate;
+pub mod workspace;
 
 use std::path::Path;
 
@@ -45,6 +46,7 @@ pub use crate::tools::{
     SecretRequirementConfig, ToolsConfig, TrustLevelConfig,
 };
 pub use crate::trace::TraceConfig;
+pub use crate::workspace::WorkspaceConfig;
 
 /// Root configuration object for Aura.
 ///
@@ -62,6 +64,7 @@ pub struct AuraConfig {
     pub tools: ToolsConfig,
     pub trace: TraceConfig,
     pub cost: CostConfig,
+    pub workspace: WorkspaceConfig,
 }
 
 impl AuraConfig {

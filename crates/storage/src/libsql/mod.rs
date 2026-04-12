@@ -27,11 +27,14 @@ pub struct LibsqlPool {
 
 impl LibsqlPool {
     /// Open (or create) a local libsql database at the given path.
-    pub async fn open(path: &str) -> anyhow::Result<Self> {
+    pub async fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
         let db = libsql::Builder::new_local(path)
             .build()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to open libsql database at {path}: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("failed to open libsql database at {}: {e}", path.display())
+            })?;
         let conn = db
             .connect()
             .map_err(|e| anyhow::anyhow!("failed to get libsql connection: {e}"))?;

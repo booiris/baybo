@@ -30,9 +30,21 @@ pub struct Store {
 }
 
 impl Store {
-    /// Create a `Store` backed entirely by in-memory libsql stores.
-    pub async fn in_memory() -> anyhow::Result<Self> {
-        let pool = libsql::LibsqlPool::open_in_memory().await?;
+    /// Open (or create) a `Store` backed by a libsql database at `path`.
+    /// Parent directories are created if missing.
+    pub async fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to create storage directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        let pool = libsql::LibsqlPool::open(path).await?;
         Ok(Self {
             session: Box::new(libsql::LibsqlSessionStore::new(pool.clone())),
             memory: Box::new(libsql::LibsqlMemoryStore::new(pool.clone())),

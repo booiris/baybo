@@ -32,7 +32,9 @@ cost.rs     → CostStore     (defines its own types: CostRecord, CostSummary, T
 
 ### Single backend: libsql
 
-All store implementations use libsql (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend — `Store::in_memory()` uses libsql with `:memory:` mode. `LibsqlPool` wraps a shared `libsql::Connection` behind `Arc` for cheap cloning across async tasks.
+All store implementations use libsql (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed libsql database (creating parent directories if missing); `LibsqlPool::open_in_memory()` is still available for tests. `LibsqlPool` wraps a shared `libsql::Connection` behind `Arc` for cheap cloning across async tasks.
+
+The database file path is not a user-facing config knob. Bootstrap composes it from the project root via `boot::storage_db_path()` — storage always lives at `<workspace.path>/.aura/storage.db`. Operators pick the project root; the storage layout underneath it is fixed by convention.
 
 ### One struct per trait
 
@@ -40,7 +42,7 @@ Each domain has an independent Store implementation (`LibsqlSessionStore`, `Libs
 
 ### Store solves initialization, not abstraction
 
-At startup: `Store::in_memory()` or a file-backed variant creates a `LibsqlPool` and wires all store implementations. The `agent` layer injects individual stores into corresponding managers.
+At startup: `Store::open(path)` creates a `LibsqlPool` and wires all store implementations. The `agent` layer injects individual stores into corresponding managers.
 
 ### Each Store manages its own queries
 

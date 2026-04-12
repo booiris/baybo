@@ -26,6 +26,7 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 | `to_session_timeout` | `SessionConfig` → `chrono::Duration` |
 | `to_tool_timeout` | `ToolsConfig` → `std::time::Duration` |
 | `build_leak_detector` | `SecurityConfig` → `aura_security::LeakDetector` |
+| `storage_db_path` | `WorkspaceConfig` → `PathBuf` at `<workspace.path>/.aura/storage.db` |
 
 Each has a unit test in `boot::tests` that pins the mapping. These act as drift detectors: if a config field is renamed or a domain constructor's signature changes, the test fails at compile time.
 
@@ -49,7 +50,7 @@ init_tracing()
 boot::load_config()                          ── AURA_CONFIG_PATH / aura.json / default
   │
   ▼
-Store::in_memory()                           ── storage layer (Phase 1: in-memory)
+Store::open(boot::storage_db_path(…))        ── persistent libsql at <workspace>/.aura/storage.db
   │
   ▼
 SessionManager / JobManager / CostTracker / TraceCollector / ObservabilityRecorder

@@ -11,7 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use aura_agent::policy::ExecutionPolicy;
-use aura_config::{AgentConfig, AuraConfig, LlmConfig, SecurityConfig, SessionConfig, ToolsConfig};
+use aura_config::{
+    AgentConfig, AuraConfig, LlmConfig, SecurityConfig, SessionConfig, ToolsConfig, WorkspaceConfig,
+};
 use aura_context::TokenBudget;
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
@@ -116,6 +118,13 @@ pub fn to_execution_policy(cfg: &AgentConfig) -> ExecutionPolicy {
     }
 }
 
+/// Path to the libsql database file, derived from the project root
+/// (`workspace.path`). Storage always lives at `<root>/.aura/storage.db`;
+/// there is no separate configuration knob for the database location.
+pub fn storage_db_path(cfg: &WorkspaceConfig) -> PathBuf {
+    PathBuf::from(&cfg.path).join(".aura").join("storage.db")
+}
+
 pub fn to_token_budget(cfg: &aura_config::ContextConfig) -> TokenBudget {
     TokenBudget::new(cfg.max_tokens, cfg.compression_threshold)
 }
@@ -139,7 +148,9 @@ pub fn build_leak_detector(cfg: &SecurityConfig) -> LeakDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_config::{AgentConfig, ContextConfig, SecurityConfig, SessionConfig, ToolsConfig};
+    use aura_config::{
+        AgentConfig, ContextConfig, SecurityConfig, SessionConfig, ToolsConfig, WorkspaceConfig,
+    };
 
     #[test]
     fn execution_policy_maps_both_fields() {
@@ -179,6 +190,17 @@ mod tests {
             keep_recent: 10,
         };
         assert_eq!(to_token_budget(&cfg).max_tokens(), 50_000);
+    }
+
+    #[test]
+    fn storage_db_path_is_under_workspace_root() {
+        let cfg = WorkspaceConfig {
+            path: "/tmp/project".into(),
+        };
+        assert_eq!(
+            storage_db_path(&cfg),
+            std::path::PathBuf::from("/tmp/project/.aura/storage.db"),
+        );
     }
 
     #[test]

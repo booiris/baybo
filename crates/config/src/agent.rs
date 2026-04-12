@@ -10,8 +10,6 @@ pub struct AgentConfig {
     pub default_tool_timeout_ms: u64,
     /// Context window configuration.
     pub context: ContextConfig,
-    /// Path to the workspace root directory.
-    pub workspace_path: String,
 }
 
 impl Default for AgentConfig {
@@ -20,7 +18,6 @@ impl Default for AgentConfig {
             max_iterations: 20,
             default_tool_timeout_ms: 30_000,
             context: ContextConfig::default(),
-            workspace_path: ".".to_string(),
         }
     }
 }
