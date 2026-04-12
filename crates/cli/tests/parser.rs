@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    ChannelsCmd, Cli, Commands, ConfigCmd, JobCmd, JobStatusArg, LlmCmd, SessionCmd, ShellKind,
-    SkillsCmd, ToolsCmd, WorkspaceCmd,
+    ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, SessionCmd,
+    ShellKind, SkillsCmd, ToolsCmd, WorkspaceCmd,
 };
 use clap::Parser;
 
@@ -266,6 +266,102 @@ fn job_show_requires_id() {
         Some(Commands::Job {
             cmd: JobCmd::Show { id },
         }) => assert_eq!(id, "jid-1"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn cron_list_parses() {
+    let cli = parse(&["cron", "list"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Cron { cmd: CronCmd::List })
+    ));
+}
+
+#[test]
+fn cron_show_requires_id() {
+    assert!(Cli::try_parse_from(["aura", "cron", "show"]).is_err());
+    let cli = parse(&["cron", "show", "cron-1"]);
+    match cli.command {
+        Some(Commands::Cron {
+            cmd: CronCmd::Show { id },
+        }) => assert_eq!(id, "cron-1"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn cron_rm_accepts_yes_flag() {
+    let cli = parse(&["cron", "rm", "c1"]);
+    match cli.command {
+        Some(Commands::Cron {
+            cmd: CronCmd::Rm { id, yes },
+        }) => {
+            assert_eq!(id, "c1");
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["cron", "rm", "c1", "--yes"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Cron {
+            cmd: CronCmd::Rm { yes: true, .. }
+        })
+    ));
+}
+
+#[test]
+fn cron_enable_disable_parse() {
+    let cli = parse(&["cron", "enable", "c1"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Cron {
+            cmd: CronCmd::Enable { .. }
+        })
+    ));
+    let cli = parse(&["cron", "disable", "c1"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Cron {
+            cmd: CronCmd::Disable { .. }
+        })
+    ));
+}
+
+#[test]
+fn cron_run_requires_yes_flag_only_in_slash_mode() {
+    let cli = parse(&["cron", "run", "c1"]);
+    match cli.command {
+        Some(Commands::Cron {
+            cmd: CronCmd::Run { id, yes },
+        }) => {
+            assert_eq!(id, "c1");
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["cron", "run", "c1", "-y"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Cron {
+            cmd: CronCmd::Run { yes: true, .. }
+        })
+    ));
+}
+
+#[test]
+fn cron_runs_requires_id_flag() {
+    assert!(Cli::try_parse_from(["aura", "cron", "runs"]).is_err());
+    assert!(Cli::try_parse_from(["aura", "cron", "runs", "c1"]).is_err());
+    let cli = parse(&["cron", "runs", "--id", "c1"]);
+    match cli.command {
+        Some(Commands::Cron {
+            cmd: CronCmd::Runs { id },
+        }) => assert_eq!(id, "c1"),
         other => panic!("unexpected: {other:?}"),
     }
 }

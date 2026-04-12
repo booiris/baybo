@@ -293,6 +293,20 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&secret_vault),
     ));
 
+    // Shutdown signal — needed by the cron scheduler below and by the signal
+    // handler task spawned later.
+    let shutdown = ShutdownSignal::new();
+
+    // Cron scheduler. Constructed before the slash context so the `cron list`
+    // / `cron run` commands can reach it; the background tick loop is spawned
+    // further down, once `task_tracker` exists.
+    let (cron_trigger_tx, cron_trigger_rx) = mpsc::channel(64);
+    let cron_scheduler = Arc::new(CronScheduler::new(
+        storage.cron,
+        cron_trigger_tx,
+        shutdown.clone(),
+    ));
+
     // Build the slash-handler context once everything above is wired.
     let slash_ctx = Arc::new(
         ContextBuilder::new(Arc::clone(&config))
@@ -304,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
             .workspace(Arc::clone(&workspace))
             .session(Arc::clone(&session_manager))
             .job(Arc::clone(&job_manager))
+            .cron(Arc::clone(&cron_scheduler))
             .build()
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),
@@ -373,8 +388,8 @@ async fn main() -> anyhow::Result<()> {
         sender
     }));
 
-    // Shutdown coordination
-    let shutdown = ShutdownSignal::new();
+    // Shutdown coordination. `shutdown` itself was created earlier so the
+    // CronScheduler could take a clone; we still need the task tracker here.
     let mut task_tracker = TaskTracker::new();
 
     // Signal handler
@@ -400,11 +415,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("all components initialized, starting router");
 
-    // Cron scheduler
-    let (cron_trigger_tx, cron_trigger_rx) = mpsc::channel(64);
-    let cron_scheduler = CronScheduler::new(storage.cron, cron_trigger_tx, shutdown.clone());
-    let cron_scheduler = std::sync::Arc::new(cron_scheduler);
-    let cron_handle = std::sync::Arc::clone(&cron_scheduler);
+    // Spawn the cron scheduler's background tick loop (the scheduler itself
+    // was built above alongside the slash context).
+    let cron_handle = Arc::clone(&cron_scheduler);
     task_tracker.track(tokio::spawn(async move {
         cron_handle.run().await;
     }));

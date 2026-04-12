@@ -8,25 +8,28 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::JobManager;
+use aura_agent::{CronScheduler, JobManager, ShutdownSignal};
 use aura_channels::ChannelRegistry;
 use aura_cli::cli::{
-    ChannelsCmd, Commands, ConfigCmd, JobCmd, JobStatusArg, LlmCmd, SessionCmd, SkillsCmd,
+    ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, SessionCmd, SkillsCmd,
     ToolsCmd, WorkspaceCmd,
 };
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
+use aura_cron::CronRunMode;
 use aura_job::{Job, JobError, JobStatus, JobTransition, OperationKind};
 use aura_session::store::SessionStore;
 use aura_session::{ChannelType, Session, SessionError, SessionManager, SessionState, User};
 use aura_skills::SkillRegistry;
-use aura_storage::JobStore;
+use aura_storage::{
+    CronExecutionRow, CronJobRow, CronStore, CronStoreError, JobStore, cron::Result as CronResult,
+};
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 fn context() -> aura_cli::CommandContext {
     let config = Arc::new(AuraConfig::default());
@@ -262,6 +265,191 @@ async fn context_with_jobs() -> (aura_cli::CommandContext, Vec<(String, JobStatu
         .with_invocation(Invocation::Argv)
         .with_format(OutputFormat::Plain);
     (ctx, seeded)
+}
+
+struct MemoryCronStore {
+    jobs: Mutex<Vec<CronJobRow>>,
+    executions: Mutex<Vec<CronExecutionRow>>,
+}
+
+impl MemoryCronStore {
+    fn new() -> Self {
+        Self {
+            jobs: Mutex::new(Vec::new()),
+            executions: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CronStore for MemoryCronStore {
+    async fn create(&self, row: &CronJobRow) -> CronResult<()> {
+        self.jobs.lock().unwrap().push(row.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: &str) -> CronResult<Option<CronJobRow>> {
+        Ok(self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .cloned())
+    }
+
+    async fn save(&self, row: &CronJobRow) -> CronResult<()> {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(existing) = jobs.iter_mut().find(|r| r.id == row.id) {
+            *existing = row.clone();
+            Ok(())
+        } else {
+            Err(CronStoreError::NotFound(row.id.clone()))
+        }
+    }
+
+    async fn delete(&self, id: &str) -> CronResult<()> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let before = jobs.len();
+        jobs.retain(|r| r.id != id);
+        if jobs.len() == before {
+            Err(CronStoreError::NotFound(id.into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn list_by_user(&self, user: &str) -> CronResult<Vec<CronJobRow>> {
+        Ok(self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.user_id == user)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all(&self) -> CronResult<Vec<CronJobRow>> {
+        Ok(self.jobs.lock().unwrap().clone())
+    }
+
+    async fn list_enabled(&self) -> CronResult<Vec<CronJobRow>> {
+        Ok(self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.status == "enabled")
+            .cloned()
+            .collect())
+    }
+
+    async fn list_due(&self, now: &str) -> CronResult<Vec<CronJobRow>> {
+        Ok(self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.status == "enabled"
+                    && !r.next_trigger_at.is_empty()
+                    && r.next_trigger_at.as_str() <= now
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn record_execution(&self, row: &CronExecutionRow) -> CronResult<()> {
+        self.executions.lock().unwrap().push(row.clone());
+        Ok(())
+    }
+
+    async fn list_executions_by_job(&self, job_id: &str) -> CronResult<Vec<CronExecutionRow>> {
+        Ok(self
+            .executions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.job_id == job_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_executions_by_user(&self, user: &str) -> CronResult<Vec<CronExecutionRow>> {
+        Ok(self
+            .executions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.user_id == user)
+            .cloned()
+            .collect())
+    }
+
+    async fn has_execution_for_schedule(
+        &self,
+        job_id: &str,
+        scheduled_fire_time: &str,
+    ) -> CronResult<bool> {
+        Ok(self
+            .executions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.job_id == job_id && r.scheduled_fire_time == scheduled_fire_time))
+    }
+
+    async fn update_execution_status(&self, id: &str, status: &str) -> CronResult<()> {
+        let mut execs = self.executions.lock().unwrap();
+        if let Some(e) = execs.iter_mut().find(|r| r.id == id) {
+            e.status = status.into();
+            Ok(())
+        } else {
+            Err(CronStoreError::NotFound(id.into()))
+        }
+    }
+
+    async fn list_executions_by_status(&self, status: &str) -> CronResult<Vec<CronExecutionRow>> {
+        Ok(self
+            .executions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.status == status)
+            .cloned()
+            .collect())
+    }
+}
+
+/// Build a cron scheduler wired to an in-memory store. Returns the scheduler
+/// and the receiver half of its trigger channel (kept alive so `send` does
+/// not fail with a closed channel).
+fn make_cron_scheduler() -> (
+    Arc<CronScheduler>,
+    mpsc::Receiver<aura_agent::CronTriggerEvent>,
+) {
+    let (tx, rx) = mpsc::channel(16);
+    let scheduler = CronScheduler::new(Box::new(MemoryCronStore::new()), tx, ShutdownSignal::new());
+    (Arc::new(scheduler), rx)
+}
+
+async fn context_with_cron() -> (
+    aura_cli::CommandContext,
+    mpsc::Receiver<aura_agent::CronTriggerEvent>,
+    Arc<CronScheduler>,
+) {
+    let (sched, rx) = make_cron_scheduler();
+    let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .cron(Arc::clone(&sched))
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain);
+    (ctx, rx, sched)
 }
 
 #[tokio::test]
@@ -735,4 +923,289 @@ async fn job_cancel_terminal_job_errors() {
     .await
     .expect_err("cancel of terminal job must fail");
     assert!(format!("{err}").to_lowercase().contains("cannot cancel"));
+}
+
+#[tokio::test]
+async fn cron_list_without_manager_reports_unavailable() {
+    let ctx = context();
+    let err = dispatch::run(&ctx, Commands::Cron { cmd: CronCmd::List })
+        .await
+        .expect_err("without cron scheduler should error");
+    assert!(format!("{err}").contains("cron scheduler"));
+}
+
+#[tokio::test]
+async fn cron_list_reports_empty_when_none_scheduled() {
+    let (ctx, _rx, _sched) = context_with_cron().await;
+    let out = dispatch::run(&ctx, Commands::Cron { cmd: CronCmd::List })
+        .await
+        .expect("cron list");
+    assert!(out.human.contains("no cron jobs"));
+    let data = out.data.expect("structured payload");
+    assert!(data["jobs"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cron_list_returns_all_scheduled_jobs() {
+    let (ctx, _rx, sched) = context_with_cron().await;
+    sched
+        .create_job(
+            "alice",
+            ChannelType::Cli,
+            "0 9 * * *",
+            "morning",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+    sched
+        .create_job(
+            "bob",
+            ChannelType::Cli,
+            "0 18 * * *",
+            "evening",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+
+    let out = dispatch::run(&ctx, Commands::Cron { cmd: CronCmd::List })
+        .await
+        .expect("cron list");
+    let data = out.data.expect("structured payload");
+    assert_eq!(data["jobs"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn cron_show_errors_for_missing_id() {
+    let (ctx, _rx, _sched) = context_with_cron().await;
+    let err = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Show { id: "ghost".into() },
+        },
+    )
+    .await
+    .expect_err("show missing should fail");
+    assert!(format!("{err}").contains("ghost"));
+}
+
+#[tokio::test]
+async fn cron_show_returns_metadata_for_known_id() {
+    let (ctx, _rx, sched) = context_with_cron().await;
+    let job = sched
+        .create_job(
+            "alice",
+            ChannelType::Cli,
+            "0 9 * * *",
+            "hello",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Show { id: job.id.clone() },
+        },
+    )
+    .await
+    .expect("cron show");
+    let data = out.data.expect("structured payload");
+    assert_eq!(data["id"], job.id);
+    assert_eq!(data["prompt"], "hello");
+}
+
+#[tokio::test]
+async fn cron_rm_requires_yes_in_slash_mode() {
+    let (ctx, _rx, sched) = context_with_cron().await;
+    let job = sched
+        .create_job(
+            "alice",
+            ChannelType::Cli,
+            "0 9 * * *",
+            "test",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+    let slash_ctx = ctx.with_invocation(Invocation::Slash);
+    let err = dispatch::run(
+        &slash_ctx,
+        Commands::Cron {
+            cmd: CronCmd::Rm {
+                id: job.id,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("rm without --yes should fail");
+    assert!(matches!(err, aura_cli::CliError::ConfirmationRequired(_)));
+}
+
+#[tokio::test]
+async fn cron_rm_with_yes_deletes() {
+    let (ctx, _rx, sched) = context_with_cron().await;
+    let job = sched
+        .create_job(
+            "alice",
+            ChannelType::Cli,
+            "0 9 * * *",
+            "test",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Rm {
+                id: job.id.clone(),
+                yes: true,
+            },
+        },
+    )
+    .await
+    .expect("rm should succeed");
+    assert_eq!(out.data.unwrap()["deleted"], job.id);
+    assert!(sched.get_job(&job.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn cron_enable_disable_round_trip() {
+    let (ctx, _rx, sched) = context_with_cron().await;
+    let job = sched
+        .create_job(
+            "alice",
+            ChannelType::Cli,
+            "0 9 * * *",
+            "test",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+
+    dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Disable { id: job.id.clone() },
+        },
+    )
+    .await
+    .expect("disable");
+    assert!(
+        sched
+            .get_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_trigger_at
+            .is_none()
+    );
+
+    dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Enable { id: job.id.clone() },
+        },
+    )
+    .await
+    .expect("enable");
+    assert!(
+        sched
+            .get_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_trigger_at
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn cron_run_requires_yes_in_slash_mode() {
+    let (ctx, _rx, sched) = context_with_cron().await;
+    let job = sched
+        .create_job(
+            "alice",
+            ChannelType::Cli,
+            "0 9 * * *",
+            "fire",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+    let slash_ctx = ctx.with_invocation(Invocation::Slash);
+    let err = dispatch::run(
+        &slash_ctx,
+        Commands::Cron {
+            cmd: CronCmd::Run {
+                id: job.id,
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("run without --yes should fail in slash mode");
+    assert!(matches!(err, aura_cli::CliError::ConfirmationRequired(_)));
+}
+
+#[tokio::test]
+async fn cron_run_dispatches_and_records_execution() {
+    let (ctx, mut rx, sched) = context_with_cron().await;
+    let job = sched
+        .create_job(
+            "alice",
+            ChannelType::Cli,
+            "0 9 * * *",
+            "fire",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+
+    let out = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Run {
+                id: job.id.clone(),
+                yes: true,
+            },
+        },
+    )
+    .await
+    .expect("run should succeed");
+    assert_eq!(out.data.unwrap()["job"], job.id);
+
+    let event = rx.try_recv().expect("trigger dispatched");
+    assert_eq!(event.job_id, job.id);
+    assert_eq!(event.prompt, "fire");
+}
+
+#[tokio::test]
+async fn cron_runs_returns_empty_for_unfired_job() {
+    let (ctx, _rx, sched) = context_with_cron().await;
+    let job = sched
+        .create_job(
+            "alice",
+            ChannelType::Cli,
+            "0 9 * * *",
+            "fresh",
+            CronRunMode::Recurring,
+        )
+        .await
+        .unwrap();
+    let out = dispatch::run(
+        &ctx,
+        Commands::Cron {
+            cmd: CronCmd::Runs { id: job.id.clone() },
+        },
+    )
+    .await
+    .expect("runs");
+    assert!(out.human.contains("no executions"));
+    assert!(out.data.unwrap()["runs"].as_array().unwrap().is_empty());
 }

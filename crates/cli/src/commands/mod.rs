@@ -1,6 +1,7 @@
 pub mod channels;
 pub mod completion;
 pub mod config;
+pub mod cron;
 pub mod doctor;
 pub mod job;
 pub mod llm;

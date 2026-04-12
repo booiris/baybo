@@ -59,6 +59,9 @@ pub trait CronStore: Send + Sync {
     async fn save(&self, row: &CronJobRow) -> Result<()>;
     async fn delete(&self, job_id: &str) -> Result<()>;
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<CronJobRow>>;
+    /// Return every stored cron job regardless of user or status. Ordering is
+    /// unspecified — callers sort as needed.
+    async fn list_all(&self) -> Result<Vec<CronJobRow>>;
     async fn list_enabled(&self) -> Result<Vec<CronJobRow>>;
     /// Return all enabled job rows whose `next_trigger_at` is at or before `now`.
     async fn list_due(&self, now: &str) -> Result<Vec<CronJobRow>>;

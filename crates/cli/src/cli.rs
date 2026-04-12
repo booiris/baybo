@@ -86,6 +86,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: JobCmd,
     },
+    /// Inspect and manage cron-scheduled jobs.
+    Cron {
+        #[command(subcommand)]
+        cmd: CronCmd,
+    },
     /// One-shot summary of current runtime state.
     Status,
     /// Run health checks against config, storage, and env.
@@ -215,6 +220,50 @@ pub enum JobStatusArg {
     Accepted,
     Failed,
     Stuck,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CronCmd {
+    /// List scheduled cron jobs across every user. Operator view.
+    List,
+    /// Show a cron job's metadata.
+    Show {
+        /// Cron job id.
+        id: String,
+    },
+    /// Remove a cron job. Requires `--yes` in slash mode.
+    Rm {
+        /// Cron job id.
+        id: String,
+        /// Confirm the destructive action (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Enable a previously-disabled cron job.
+    Enable {
+        /// Cron job id.
+        id: String,
+    },
+    /// Disable a cron job, clearing its next trigger time.
+    Disable {
+        /// Cron job id.
+        id: String,
+    },
+    /// Manually fire a cron job now, outside the regular schedule. Requires
+    /// `--yes` in slash mode.
+    Run {
+        /// Cron job id.
+        id: String,
+        /// Confirm the side-effect (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// List execution records for a cron job.
+    Runs {
+        /// Cron job id whose runs to list.
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]

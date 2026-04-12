@@ -203,6 +203,83 @@ impl CronScheduler {
             .collect()
     }
 
+    /// List every cron job regardless of user. Used by operator CLI surfaces
+    /// where the invoking identity is a CLI session rather than a per-user
+    /// identity.
+    pub async fn list_all_jobs(&self) -> Result<Vec<CronJob>> {
+        self.store
+            .list_all()
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(row_to_job)
+            .collect()
+    }
+
+    /// Fetch a cron job by id, or `None` if it does not exist.
+    pub async fn get_job(&self, job_id: &str) -> Result<Option<CronJob>> {
+        match self.store.get(job_id).await.map_err(store_err)? {
+            Some(row) => Ok(Some(row_to_job(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Manually fire a cron job now, outside the regular schedule.
+    ///
+    /// Records an execution row (so the run is auditable), dispatches the
+    /// trigger event, and does **not** touch the job's `next_trigger_at` —
+    /// the normal schedule continues to fire independently.
+    pub async fn trigger_now(&self, job_id: &str) -> Result<CronExecution> {
+        let row = self
+            .store
+            .get(job_id)
+            .await
+            .map_err(store_err)?
+            .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
+        let job = row_to_job(row)?;
+
+        let now = Utc::now();
+        let execution = CronExecution {
+            id: uuid::Uuid::new_v4().to_string(),
+            job_id: job.id.clone(),
+            user_id: job.user_id.clone(),
+            channel: job.channel,
+            schedule: job.schedule.clone(),
+            prompt: job.prompt.clone(),
+            run_mode: job.run_mode.clone(),
+            scheduled_fire_time: now,
+            triggered_at: now,
+            status: ExecutionStatus::Pending,
+        };
+
+        let exec_row = execution_to_row(&execution)?;
+        self.store
+            .record_execution(&exec_row)
+            .await
+            .map_err(store_err)?;
+
+        let event = CronTriggerEvent {
+            job_id: execution.job_id.clone(),
+            user_id: execution.user_id.clone(),
+            channel: execution.channel,
+            prompt: execution.prompt.clone(),
+        };
+
+        self.trigger_tx
+            .send(event)
+            .await
+            .map_err(|e| CronError::Storage(format!("failed to dispatch trigger: {e}")))?;
+
+        self.store
+            .update_execution_status(&execution.id, "dispatched")
+            .await
+            .map_err(store_err)?;
+
+        let mut updated = execution;
+        updated.status = ExecutionStatus::Dispatched;
+        Ok(updated)
+    }
+
     /// List execution records for a job.
     pub async fn list_executions(&self, job_id: &str) -> Result<Vec<CronExecution>> {
         self.store
@@ -493,6 +570,10 @@ mod tests {
                 .filter(|r| r.user_id == user_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn list_all(&self) -> aura_storage::cron::Result<Vec<CronJobRow>> {
+            Ok(self.jobs.lock().unwrap().clone())
         }
 
         async fn list_enabled(&self) -> aura_storage::cron::Result<Vec<CronJobRow>> {
@@ -907,6 +988,100 @@ mod tests {
             .await
             .unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_all_jobs_returns_every_user() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        scheduler
+            .create_job(
+                "u1",
+                ChannelType::Cli,
+                "0 9 * * *",
+                "alice",
+                CronRunMode::Recurring,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .create_job(
+                "u2",
+                ChannelType::Cli,
+                "0 10 * * *",
+                "bob",
+                CronRunMode::Recurring,
+            )
+            .await
+            .unwrap();
+
+        let all = scheduler.list_all_jobs().await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_none_when_missing() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        assert!(scheduler.get_job("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_full_job_when_present() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let created = scheduler
+            .create_job(
+                "u1",
+                ChannelType::Cli,
+                "0 9 * * *",
+                "fetch me",
+                CronRunMode::Recurring,
+            )
+            .await
+            .unwrap();
+
+        let got = scheduler.get_job(&created.id).await.unwrap().unwrap();
+        assert_eq!(got.id, created.id);
+        assert_eq!(got.prompt, "fetch me");
+    }
+
+    #[tokio::test]
+    async fn trigger_now_dispatches_and_records_execution() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(
+                "u1",
+                ChannelType::Cli,
+                "0 9 * * *",
+                "manual fire",
+                CronRunMode::Recurring,
+            )
+            .await
+            .unwrap();
+        let scheduled_next = job.next_trigger_at;
+
+        let exec = scheduler.trigger_now(&job.id).await.unwrap();
+        assert_eq!(exec.job_id, job.id);
+        assert_eq!(exec.status, ExecutionStatus::Dispatched);
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.job_id, job.id);
+        assert_eq!(event.prompt, "manual fire");
+
+        // Manual trigger must not advance the schedule.
+        let fetched = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.next_trigger_at, scheduled_next);
+        assert!(fetched.last_triggered_at.is_none());
+
+        // Execution row exists with Dispatched status.
+        let execs = scheduler.list_executions(&job.id).await.unwrap();
+        assert_eq!(execs.len(), 1);
+        assert_eq!(execs[0].status, ExecutionStatus::Dispatched);
+    }
+
+    #[tokio::test]
+    async fn trigger_now_errors_for_missing_job() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let err = scheduler.trigger_now("ghost").await.unwrap_err();
+        assert!(matches!(err, CronError::NotFound(_)));
     }
 
     #[tokio::test]

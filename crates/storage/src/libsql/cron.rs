@@ -146,6 +146,28 @@ impl CronStore for LibsqlCronStore {
         Ok(out)
     }
 
+    async fn list_all(&self) -> crate::cron::Result<Vec<CronJobRow>> {
+        let mut rows = self
+            .pool
+            .conn()
+            .query(
+                "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs",
+                (),
+            )
+            .await
+            .map_err(|e| CronStoreError::Internal(format!("libsql query: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| CronStoreError::Internal(format!("libsql row: {e}")))?
+        {
+            out.push(read_job_row(&row)?);
+        }
+        Ok(out)
+    }
+
     async fn list_enabled(&self) -> crate::cron::Result<Vec<CronJobRow>> {
         let mut rows = self
             .pool
