@@ -12,7 +12,7 @@ One row per subsystem. Signatures are indicative; the real shape is whatever kee
 
 | Subsystem              | Missing                                                                                                                                                                                                                                              | CLI that unlocks                                                      |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `SessionManager`       | `list()`, `history(id)`, `delete(id)`                                                                                                                                                                                                                | `session list/show/history/kill`                                      |
+| ~~`SessionManager`~~   | ~~`list()`, `history(id)`, `delete(id)`~~ — shipped                                                                                                                                                                                                  | ~~`session list/show/history/kill`~~ — shipped                        |
 | `JobManager`           | `list(Option<JobStatus>)`, `get(id)`, `cancel(id)`                                                                                                                                                                                                   | `job list/show/cancel`                                                |
 | `TraceCollector`       | `list(filter)`, `get(session_id)`, `export(session_id)`, `snapshot(session_id)`                                                                                                                                                                      | `trace list/show/export/snapshot`                                     |
 | `CronScheduler`        | `get_job(id)`, `trigger_now(id)`; rework `list_jobs` to not require `user_id`                                                                                                                                                                        | `cron list/show/run`; `add/rm/enable/disable/runs` already reachable  |
@@ -34,7 +34,7 @@ Land one subsystem at a time, smallest blast radius first. Each step is a PR tha
 
 Suggested order:
 
-1. **`session`** — smallest surface (list/get/history/delete), no external state. Good warm-up for the pattern.
+1. ~~**`session`** — smallest surface (list/get/history/delete), no external state. Good warm-up for the pattern.~~ — shipped
 2. **`job`** — similar shape; unblocks observability workflows (`job list --status=failed`, `job cancel <id>`).
 3. **`cron`** — the user-facing scheduling surface already exists (`list_jobs/create/enable/disable/delete`); the gaps are small. `list` needs to accept "all users" semantics for operator mode.
 4. **`memory`** — requires defining `MemoryEntry` identity (id vs session+hash) before list/search can return stable handles.

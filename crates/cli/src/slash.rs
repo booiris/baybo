@@ -55,6 +55,7 @@ impl CliSlashHandler {
             channels: self.ctx.channels.clone(),
             llm: self.ctx.llm.clone(),
             workspace: self.ctx.workspace.clone(),
+            session: self.ctx.session.clone(),
             format,
             invocation: Invocation::Slash,
             confirmed: false,

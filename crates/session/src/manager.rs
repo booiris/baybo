@@ -1,3 +1,4 @@
+use aura_model::ChatMessage;
 use chrono::{Duration, Utc};
 use tracing::{debug, warn};
 
@@ -58,6 +59,34 @@ impl SessionManager {
 
     pub async fn get(&self, session_id: &str) -> Result<Option<Session>> {
         self.store.get(session_id).await
+    }
+
+    /// Return every session known to the underlying store, newest-active first.
+    pub async fn list(&self) -> Result<Vec<Session>> {
+        let mut sessions = self.store.list_all().await?;
+        sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        Ok(sessions)
+    }
+
+    /// Return the transcript (`messages`) of the given session. Errors with
+    /// `SessionError::NotFound` if the session does not exist.
+    pub async fn history(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
+        match self.store.get(session_id).await? {
+            Some(session) => Ok(session.messages),
+            None => Err(SessionError::NotFound(format!("session {session_id}"))),
+        }
+    }
+
+    /// Remove a session by id. Errors with `SessionError::NotFound` if the
+    /// session did not exist at the time of the call so the operator sees
+    /// feedback instead of a silent no-op.
+    pub async fn delete(&self, session_id: &str) -> Result<()> {
+        if self.store.get(session_id).await?.is_none() {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        self.store.delete(session_id).await?;
+        debug!(session_id, "deleted session");
+        Ok(())
     }
 
     pub async fn touch(&self, session_id: &str) -> Result<()> {
@@ -144,6 +173,11 @@ mod tests {
                 .map(|s| s.id.clone())
                 .collect();
             Ok(expired)
+        }
+
+        async fn list_all(&self) -> Result<Vec<Session>> {
+            let data = self.data.lock().unwrap();
+            Ok(data.values().cloned().collect())
         }
     }
 
@@ -250,6 +284,73 @@ mod tests {
 
         let count = mgr.cleanup_expired().await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn list_returns_all_sessions_newest_first() {
+        let store = Box::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let first = mgr
+            .create_session(test_user(), ChannelType::Cli)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let second = mgr
+            .create_session(test_user(), ChannelType::Telegram)
+            .await
+            .unwrap();
+
+        let listed = mgr.list().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, second.id);
+        assert_eq!(listed[1].id, first.id);
+    }
+
+    #[tokio::test]
+    async fn history_returns_messages_for_existing_session() {
+        let store = Box::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let session = mgr
+            .create_session(test_user(), ChannelType::Cli)
+            .await
+            .unwrap();
+
+        let messages = mgr.history(&session.id).await.unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_errors_for_missing_session() {
+        let store = Box::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let err = mgr.history("nonexistent").await.unwrap_err();
+        assert!(matches!(err, crate::SessionError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_existing_session() {
+        let store = Box::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let session = mgr
+            .create_session(test_user(), ChannelType::Cli)
+            .await
+            .unwrap();
+
+        mgr.delete(&session.id).await.unwrap();
+        assert!(mgr.get(&session.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_errors_for_missing_session() {
+        let store = Box::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let err = mgr.delete("nonexistent").await.unwrap_err();
+        assert!(matches!(err, crate::SessionError::NotFound(_)));
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ pub mod completion;
 pub mod config;
 pub mod doctor;
 pub mod llm;
+pub mod session;
 pub mod skills;
 pub mod status;
 pub mod tools;

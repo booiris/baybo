@@ -64,7 +64,7 @@ pub type ActorSpawner =
 
 /// Routes incoming messages to the appropriate AgentActor.
 pub struct Router {
-    session_manager: SessionManager,
+    session_manager: Arc<SessionManager>,
     supervisor: AgentSupervisor,
     channels: Arc<RwLock<ChannelRegistry>>,
     security_gateway: Arc<SecurityGateway>,
@@ -80,7 +80,7 @@ const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 impl Router {
     pub fn new(
-        session_manager: SessionManager,
+        session_manager: Arc<SessionManager>,
         supervisor: AgentSupervisor,
         channels: Arc<RwLock<ChannelRegistry>>,
         security_gateway: Arc<SecurityGateway>,

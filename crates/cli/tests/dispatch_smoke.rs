@@ -9,12 +9,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aura_channels::ChannelRegistry;
-use aura_cli::cli::{ChannelsCmd, Commands, ConfigCmd, LlmCmd, SkillsCmd, ToolsCmd, WorkspaceCmd};
+use aura_cli::cli::{
+    ChannelsCmd, Commands, ConfigCmd, LlmCmd, SessionCmd, SkillsCmd, ToolsCmd, WorkspaceCmd,
+};
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
+use aura_session::store::SessionStore;
+use aura_session::{ChannelType, Session, SessionError, SessionManager, SessionState, User};
 use aura_skills::SkillRegistry;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
+use chrono::{DateTime, Duration, Utc};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 fn context() -> aura_cli::CommandContext {
@@ -27,6 +34,95 @@ fn context() -> aura_cli::CommandContext {
         .build()
         .with_invocation(Invocation::Argv)
         .with_format(OutputFormat::Plain)
+}
+
+struct MemorySessionStore {
+    data: Mutex<HashMap<String, Session>>,
+}
+
+impl MemorySessionStore {
+    fn new() -> Self {
+        Self {
+            data: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionStore for MemorySessionStore {
+    async fn get(&self, session_id: &str) -> Result<Option<Session>, SessionError> {
+        Ok(self.data.lock().unwrap().get(session_id).cloned())
+    }
+
+    async fn save(&self, session: &Session) -> Result<(), SessionError> {
+        self.data
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), session.clone());
+        Ok(())
+    }
+
+    async fn delete(&self, session_id: &str) -> Result<(), SessionError> {
+        self.data.lock().unwrap().remove(session_id);
+        Ok(())
+    }
+
+    async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<String>, SessionError> {
+        Ok(self
+            .data
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.last_active < before)
+            .map(|s| s.id.clone())
+            .collect())
+    }
+
+    async fn list_all(&self) -> Result<Vec<Session>, SessionError> {
+        Ok(self.data.lock().unwrap().values().cloned().collect())
+    }
+}
+
+fn seeded_session_manager(ids: &[&str]) -> (Arc<SessionManager>, Vec<String>) {
+    let store = Box::new(MemorySessionStore::new());
+    let mut populated = Vec::with_capacity(ids.len());
+    for id in ids {
+        let session = Session {
+            id: (*id).to_string(),
+            user: User {
+                id: "user-1".to_string(),
+                name: Some("Alice".to_string()),
+                channel: ChannelType::Cli,
+            },
+            channel: ChannelType::Cli,
+            messages: vec![],
+            created_at: Utc::now(),
+            last_active: Utc::now(),
+            state: SessionState::default(),
+        };
+        store
+            .data
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), session.clone());
+        populated.push(session.id);
+    }
+    let mgr = SessionManager::new(store, Duration::minutes(30));
+    (Arc::new(mgr), populated)
+}
+
+fn context_with_sessions(ids: &[&str]) -> (aura_cli::CommandContext, Vec<String>) {
+    let (mgr, populated) = seeded_session_manager(ids);
+    let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
+        .skills(Arc::new(SkillRegistry::new()))
+        .tools(Arc::new(ToolRegistry::new()))
+        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
+        .session(mgr)
+        .build()
+        .with_invocation(Invocation::Argv)
+        .with_format(OutputFormat::Plain);
+    (ctx, populated)
 }
 
 #[tokio::test]
@@ -177,6 +273,138 @@ async fn status_reports_zero_counts_on_defaults() {
     assert_eq!(data["skills"], 0);
     assert_eq!(data["tools"], 0);
     assert_eq!(data["channels"], 0);
+}
+
+#[tokio::test]
+async fn session_list_reports_empty_when_no_sessions() {
+    let (ctx, _) = context_with_sessions(&[]);
+    let out = dispatch::run(
+        &ctx,
+        Commands::Session {
+            cmd: SessionCmd::List,
+        },
+    )
+    .await
+    .expect("session list");
+    assert!(out.human.contains("no sessions"));
+    let data = out.data.expect("structured payload");
+    assert!(data["sessions"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn session_list_returns_populated_sessions() {
+    let (ctx, ids) = context_with_sessions(&["sid-a", "sid-b"]);
+    let out = dispatch::run(
+        &ctx,
+        Commands::Session {
+            cmd: SessionCmd::List,
+        },
+    )
+    .await
+    .expect("session list");
+    let data = out.data.expect("structured payload");
+    let listed = data["sessions"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    for id in &ids {
+        assert!(listed.iter().any(|s| s["id"] == id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn session_show_returns_error_for_missing_id() {
+    let (ctx, _) = context_with_sessions(&[]);
+    let err = dispatch::run(
+        &ctx,
+        Commands::Session {
+            cmd: SessionCmd::Show { id: "ghost".into() },
+        },
+    )
+    .await
+    .expect_err("show missing");
+    assert!(format!("{err}").contains("ghost"));
+}
+
+#[tokio::test]
+async fn session_history_returns_error_for_missing_id() {
+    let (ctx, _) = context_with_sessions(&[]);
+    let err = dispatch::run(
+        &ctx,
+        Commands::Session {
+            cmd: SessionCmd::History { id: "ghost".into() },
+        },
+    )
+    .await
+    .expect_err("history missing");
+    assert!(format!("{err}").contains("ghost"));
+}
+
+#[tokio::test]
+async fn session_kill_requires_yes_in_slash_mode() {
+    let (ctx, ids) = context_with_sessions(&["sid-a"]);
+    let slash_ctx = ctx.with_invocation(Invocation::Slash);
+    let err = dispatch::run(
+        &slash_ctx,
+        Commands::Session {
+            cmd: SessionCmd::Kill {
+                id: ids[0].clone(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect_err("kill without --yes should fail");
+    assert!(matches!(err, aura_cli::CliError::ConfirmationRequired(_)));
+}
+
+#[tokio::test]
+async fn session_kill_with_yes_deletes_in_slash_mode() {
+    let (ctx, ids) = context_with_sessions(&["sid-a"]);
+    let slash_ctx = ctx.with_invocation(Invocation::Slash);
+    let out = dispatch::run(
+        &slash_ctx,
+        Commands::Session {
+            cmd: SessionCmd::Kill {
+                id: ids[0].clone(),
+                yes: true,
+            },
+        },
+    )
+    .await
+    .expect("kill with --yes should succeed");
+    let data = out.data.expect("structured payload");
+    assert_eq!(data["deleted"], ids[0]);
+}
+
+#[tokio::test]
+async fn session_kill_succeeds_in_argv_mode_without_yes() {
+    let (ctx, ids) = context_with_sessions(&["sid-a"]);
+    let out = dispatch::run(
+        &ctx,
+        Commands::Session {
+            cmd: SessionCmd::Kill {
+                id: ids[0].clone(),
+                yes: false,
+            },
+        },
+    )
+    .await
+    .expect("argv kill should not require --yes");
+    let data = out.data.expect("structured payload");
+    assert_eq!(data["deleted"], ids[0]);
+}
+
+#[tokio::test]
+async fn session_list_without_manager_reports_unavailable() {
+    let ctx = context();
+    let err = dispatch::run(
+        &ctx,
+        Commands::Session {
+            cmd: SessionCmd::List,
+        },
+    )
+    .await
+    .expect_err("without session manager should error");
+    assert!(format!("{err}").contains("session manager"));
 }
 
 #[tokio::test]

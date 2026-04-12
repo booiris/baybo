@@ -4,6 +4,7 @@ use std::sync::Arc;
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
+use aura_session::SessionManager;
 use aura_skills::SkillRegistry;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
@@ -32,6 +33,7 @@ pub struct CommandContext {
     pub channels: Arc<RwLock<ChannelRegistry>>,
     pub llm: Option<Arc<LlmClient>>,
     pub workspace: Arc<WorkspaceManager>,
+    pub session: Option<Arc<SessionManager>>,
     pub format: OutputFormat,
     pub invocation: Invocation,
     pub confirmed: bool,
@@ -66,6 +68,7 @@ pub struct ContextBuilder {
     channels: Option<Arc<RwLock<ChannelRegistry>>>,
     llm: Option<Arc<LlmClient>>,
     workspace: Option<Arc<WorkspaceManager>>,
+    session: Option<Arc<SessionManager>>,
 }
 
 impl ContextBuilder {
@@ -78,6 +81,7 @@ impl ContextBuilder {
             channels: None,
             llm: None,
             workspace: None,
+            session: None,
         }
     }
 
@@ -111,6 +115,11 @@ impl ContextBuilder {
         self
     }
 
+    pub fn session(mut self, session: Arc<SessionManager>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
     pub fn build(self) -> CommandContext {
         CommandContext {
             config: self.config,
@@ -126,6 +135,7 @@ impl ContextBuilder {
             workspace: self
                 .workspace
                 .unwrap_or_else(|| Arc::new(WorkspaceManager::new(PathBuf::from(".")))),
+            session: self.session,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,
             confirmed: false,

@@ -76,6 +76,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: WorkspaceCmd,
     },
+    /// Inspect and manage chat sessions.
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
     /// One-shot summary of current runtime state.
     Status,
     /// Run health checks against config, storage, and env.
@@ -144,6 +149,30 @@ pub enum LlmCmd {
 pub enum WorkspaceCmd {
     /// Show the workspace root and loaded identity files.
     Show,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCmd {
+    /// List known sessions, newest-active first.
+    List,
+    /// Show session metadata.
+    Show {
+        /// Session id.
+        id: String,
+    },
+    /// Show the chat transcript for a session.
+    History {
+        /// Session id.
+        id: String,
+    },
+    /// Delete a session and its transcript. Requires `--yes` in slash mode.
+    Kill {
+        /// Session id.
+        id: String,
+        /// Confirm the destructive action (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]

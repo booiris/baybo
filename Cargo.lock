@@ -292,6 +292,7 @@ dependencies = [
  "aura-skills",
  "aura-tools",
  "aura-workspace",
+ "chrono",
  "clap",
  "clap_complete",
  "serde",

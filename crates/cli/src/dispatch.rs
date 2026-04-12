@@ -13,6 +13,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Channels { cmd } => commands::channels::handle(ctx, cmd).await,
         Commands::Llm { cmd } => commands::llm::handle(ctx, cmd),
         Commands::Workspace { cmd } => commands::workspace::handle(ctx, cmd).await,
+        Commands::Session { cmd } => commands::session::handle(ctx, cmd).await,
         Commands::Status => commands::status::handle(ctx).await,
         Commands::Doctor => commands::doctor::handle(ctx).await,
         Commands::Completion { shell } => commands::completion::handle(shell),

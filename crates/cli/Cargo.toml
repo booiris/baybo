@@ -24,3 +24,6 @@ tracing = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 shell-words = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }

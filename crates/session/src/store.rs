@@ -12,4 +12,7 @@ pub trait SessionStore: Send + Sync {
     async fn save(&self, session: &Session) -> Result<()>;
     async fn delete(&self, session_id: &str) -> Result<()>;
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<String>>;
+    /// Return every stored session, ordered by `last_active` descending.
+    /// Operator-facing: drives `aura session list` and must not filter by expiry.
+    async fn list_all(&self) -> Result<Vec<Session>>;
 }

@@ -5,7 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    ChannelsCmd, Cli, Commands, ConfigCmd, LlmCmd, ShellKind, SkillsCmd, ToolsCmd, WorkspaceCmd,
+    ChannelsCmd, Cli, Commands, ConfigCmd, LlmCmd, SessionCmd, ShellKind, SkillsCmd, ToolsCmd,
+    WorkspaceCmd,
 };
 use clap::Parser;
 
@@ -163,4 +164,69 @@ fn unknown_subcommand_is_rejected() {
     assert!(Cli::try_parse_from(["aura", "mcp", "serve"]).is_err());
     assert!(Cli::try_parse_from(["aura", "gateway"]).is_err());
     assert!(Cli::try_parse_from(["aura", "daemon", "start"]).is_err());
+}
+
+#[test]
+fn session_list_parses() {
+    let cli = parse(&["session", "list"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Session {
+            cmd: SessionCmd::List
+        })
+    ));
+}
+
+#[test]
+fn session_show_requires_id() {
+    assert!(Cli::try_parse_from(["aura", "session", "show"]).is_err());
+    let cli = parse(&["session", "show", "abc"]);
+    match cli.command {
+        Some(Commands::Session {
+            cmd: SessionCmd::Show { id },
+        }) => assert_eq!(id, "abc"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn session_history_requires_id() {
+    assert!(Cli::try_parse_from(["aura", "session", "history"]).is_err());
+    let cli = parse(&["session", "history", "sid-1"]);
+    match cli.command {
+        Some(Commands::Session {
+            cmd: SessionCmd::History { id },
+        }) => assert_eq!(id, "sid-1"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn session_kill_accepts_yes_flag() {
+    let cli = parse(&["session", "kill", "sid"]);
+    match cli.command {
+        Some(Commands::Session {
+            cmd: SessionCmd::Kill { id, yes },
+        }) => {
+            assert_eq!(id, "sid");
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["session", "kill", "sid", "--yes"]);
+    match cli.command {
+        Some(Commands::Session {
+            cmd: SessionCmd::Kill { yes, .. },
+        }) => assert!(yes),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["session", "kill", "sid", "-y"]);
+    match cli.command {
+        Some(Commands::Session {
+            cmd: SessionCmd::Kill { yes, .. },
+        }) => assert!(yes),
+        other => panic!("unexpected: {other:?}"),
+    }
 }

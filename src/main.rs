@@ -200,8 +200,10 @@ async fn main() -> anyhow::Result<()> {
     let storage = Store::in_memory().await?;
 
     // Session manager
-    let session_manager =
-        SessionManager::new(storage.session, boot::to_session_timeout(&config.session));
+    let session_manager = Arc::new(SessionManager::new(
+        storage.session,
+        boot::to_session_timeout(&config.session),
+    ));
 
     // Job manager — recover any jobs interrupted by a prior shutdown
     let job_manager = JobManager::new(storage.job);
@@ -300,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
             .channels(Arc::clone(&channels_registry))
             .llm(Arc::clone(&llm_client))
             .workspace(Arc::clone(&workspace))
+            .session(Arc::clone(&session_manager))
             .build()
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),
@@ -335,7 +338,7 @@ async fn main() -> anyhow::Result<()> {
     let actor_buffer = buffer;
 
     let router = Router::new(
-        session_manager,
+        Arc::clone(&session_manager),
         supervisor,
         Arc::clone(&channels_registry),
         security_gateway,

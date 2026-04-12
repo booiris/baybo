@@ -96,6 +96,29 @@ impl SessionStore for LibsqlSessionStore {
         }
         Ok(expired)
     }
+
+    async fn list_all(&self) -> Result<Vec<Session>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query("SELECT data FROM sessions", ())
+            .await
+            .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+
+        let mut sessions = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let session: Session = serde_json::from_str(&data)
+                .map_err(|e| SessionError::Storage(format!("deserialize session: {e}")))?;
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
 }
 
 #[cfg(test)]
