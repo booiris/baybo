@@ -18,6 +18,7 @@ members = [
     "crates/registry",
     "crates/skills",
     "crates/cron",
+    "crates/config",
 ]
 
 [workspace.package]
@@ -44,6 +45,7 @@ aura-storage = { path = "crates/storage" }
 aura-registry = { path = "crates/registry" }
 aura-skills = { path = "crates/skills" }
 aura-cron = { path = "crates/cron" }
+aura-config = { path = "crates/config" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

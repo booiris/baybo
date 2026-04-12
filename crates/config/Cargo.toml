@@ -1,0 +1,16 @@
+[package]
+name = "aura-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Mirror contract tests only. The library itself is leaf-level and keeps no
+# runtime dependency on aura-* crates.
+aura-registry = { workspace = true }
+aura-tools = { workspace = true }

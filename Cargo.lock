@@ -225,6 +225,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-config"
+version = "0.1.0"
+dependencies = [
+ "aura-registry",
+ "aura-tools",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "aura-context"
 version = "0.1.0"
 dependencies = [

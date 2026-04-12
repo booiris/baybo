@@ -1,0 +1,197 @@
+# config - Unified Configuration Loading and Validation
+
+## Overview
+
+The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `validate()` method. It centralizes settings that were previously scattered across individual crates or hardcoded in `main.rs` (session timeout, token budget, channel buffer sizes, trace snapshot interval, rate limits, etc.).
+
+A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consumers (`main.rs` and `aura-agent`) map each section into the corresponding domain type.
+
+Top-level sections: `llm`, `agent`, `session`, `channels`, `sandbox`, `security`, `tools`, `trace`, `cost`.
+
+## Current status
+
+`AuraConfig` is implemented and unit-tested, but bootstrap does not yet consume it. `src/main.rs` still builds `LlmClient` directly from environment variables (`AURA_LLM_PROVIDER`, `OPENAI_API_KEY`, …) and hardcodes session timeout, tool timeout, mpsc buffer sizes, context budget, trace snapshot cadence, and the dev master key. The remaining wiring work:
+
+- Load `AuraConfig` in `main.rs` and map each section to its domain type.
+- Replace `build_llm_client_from_env()` with a `LlmConfig → LlmProviderConfig` mapping (see §"Section boundaries" for `fallback_model` orchestration).
+- Route secrets through the config indirection rather than reading env vars ad hoc.
+
+Known surface gaps that should be closed before or alongside the wiring:
+
+- `LlmConfig::api_key: Option<String>` currently accepts raw strings. Target: either rename to `api_key_env` or introduce a typed `SecretRef` so the type system enforces "references, not values" (see §"Secret handling").
+- `SecretRequirementConfig.access: String` and `McpServerEntry.capabilities: Vec<String>` should become mirror enums (`SecretAccessConfig` = `ReadOnly | ReadWrite`, `CapabilityConfig` = `ReadWorkspace | WriteWorkspace | Http(..) | SpawnProcess | BrowserAutomation`). Current stringly-typed form violates the project's "prefer strong types over strings" rule and defers validation to bootstrap.
+
+Until these land, the spec below describes target state; deviations are flagged inline.
+
+## Design Decisions
+
+### Leaf-level placement in the dependency graph
+
+The crate depends on external libraries only — `serde`, `serde_json`, `tokio`, `thiserror`. It does **not** depend on any `aura-*` crate. This is deliberate:
+
+- Avoids coupling the config surface to domain type changes
+- Keeps `config` buildable in isolation
+- Prevents circular dependencies when `agent` wants to read configuration
+
+To compensate, `config` defines **mirror structs** for domain types it references (e.g., `TrustLevelConfig` mirrors `aura_registry::TrustLevel`, `McpTransportConfig` mirrors `aura_tools::McpTransport`). Mapping between mirror and domain types happens at the consumer (startup code in `main.rs` or `agent` bootstrap). See §"Mirror maintenance contract" for drift prevention.
+
+### Defaults-first serde strategy (top-level only)
+
+Every **top-level** section carries `#[serde(default)]` and a matching `Default` impl. An empty JSON object `{}` deserializes into a fully valid `AuraConfig`; users only specify fields they want to override.
+
+This does **not** extend uniformly into nested structs. The following nested types have required serde fields — supplying the parent object without them fails at deserialization, not in `validate()`:
+
+- `HttpChannelConfig` (`enabled`, `bind_address`, `port`) — under `channels.http`
+- `TelegramChannelConfig` (`enabled`, `bot_token_env`) — under `channels.telegram`
+- `DiscordChannelConfig` (`enabled`, `bot_token_env`) — under `channels.discord`
+- `McpServerEntry` (`name`, `transport`, `trust_level`) — each item in `tools.mcp_servers`
+- `SecretRequirementConfig` (`key`) — each item in `McpServerEntry.secret_requirements`
+
+Required-ness beyond serde (non-empty strings, numeric ranges, URL schemes) is enforced by `validate()`.
+
+### Collect-all validation, not fail-fast
+
+`AuraConfig::validate()` walks every section and accumulates all `ValidationError` entries before returning. The returned `ConfigError::Validation(Vec<ValidationError>)` surfaces every problem at once so users can fix the entire file in one pass rather than iterating on single errors. `AuraConfig::load_from_str` and `load_from_file` call `validate()` internally — callers do not need to invoke it separately.
+
+### JSON format (not TOML or YAML)
+
+JSON is the sole supported format. It has the widest tooling support, round-trips through `serde_json`, and matches the project's existing use of JSON for hook I/O and trace payloads.
+
+### Unknown fields
+
+`serde`'s default tolerance applies: unknown keys are silently ignored. This is permissive by design so a newer JSON file (with fields an older binary does not yet know about) does not hard-fail at load. The cost is that typos in field names are also silent — `"session.timout_minutes": 10` parses fine and the real `timeout_minutes` stays at its default.
+
+Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security`, `tools.mcp_servers[]`, `sandbox`) may opt into `#[serde(deny_unknown_fields)]` individually. The root `AuraConfig` intentionally keeps permissive semantics.
+
+### Secret handling
+
+Config does **not** store live secret values; it stores references:
+
+- `LlmConfig::api_key` should be a reference to an env-var name (e.g., `"OPENAI_API_KEY"`), not raw key material. `llm.md` §Constraints prohibits inline keys. Current type (`Option<String>`) is permissive — tighten per §"Current status".
+- `SecurityConfig::encryption_key_file` and `encryption_key_env` are filesystem and environment indirections; the key bytes are loaded at startup by `agent::security`.
+
+### Section boundaries
+
+Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external reference:
+
+| Section    | Maps to                                                     | Notes                                                                                                                                                                                                |
+| ---------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `llm`      | `aura_llm::LlmProviderConfig`                               | `fallback_model` is an orchestration concern, consumed by `agent` (not by `LlmProviderConfig`). Until wiring lands, the field is carried by `LlmConfig` for forward compatibility.                   |
+| `agent`    | `ExecutionPolicy` + `TokenBudget` + `Truncate::keep_recent` | Tool timeout layering: `agent.default_tool_timeout_ms` is the **per-call requested** timeout the agent loop asks for; `tools.default_timeout_ms` is the **hard cap** at the executor. Executor wins. |
+| `session`  | `SessionManager` timeout + cleanup cadence                  | `timeout_minutes` sets idle expiry; `cleanup_interval_minutes` sets sweep cadence (`0` disables cleanup).                                                                                            |
+| `channels` | `ChannelRegistry` adapter enablement + mpsc buffer sizes    | See §"Channel enablement model".                                                                                                                                                                     |
+| `sandbox`  | `SandboxLimits` + `NetworkPolicy`                           |                                                                                                                                                                                                      |
+| `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
+| `tools`    | `McpServerConfig` list + `ToolExecutor` default timeout     |                                                                                                                                                                                                      |
+| `trace`    | `TraceCollector` auto-snapshot and interval                 |                                                                                                                                                                                                      |
+| `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
+
+`workspace`, `registry`, `skills`, and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
+
+### Channel enablement model
+
+Each optional channel (`telegram`, `discord`, `http`) is wrapped in `Option<_>`: **absent ⇒ disabled, present ⇒ enabled**. The inner `enabled: bool` is redundant with the `Option` wrapper and is retained only for migration; `validate()` must reject `Some { enabled: false, ... }` and guide the operator to omit the section instead. The `cli` channel is always present because it has no required configuration and ships as the default adapter.
+
+## Out-of-scope modules
+
+The following modules do not (yet) have sections in the root config. This is a deliberate phased decision, not an oversight. Each has a planned placement:
+
+- **workspace** — currently borrows `agent.workspace_path`. Target: a `workspace` section (`workspace.path`, identity-file overrides). Move `agent.workspace_path` → `workspace.path` when `WorkspaceManager` grows additional knobs.
+- **skills** — hot-reload switch, skill directories, trust tiers. Today the defaults are hardcoded in `SkillRegistry::new()`.
+- **registry** — artifact source allowlist, signature verification policy, trust ceilings. Today the defaults are baked into the registry constructors.
+- **cron** — scheduler poll interval, max concurrent runs, missed-run policy. Today `CronScheduler` uses compile-time defaults.
+
+Principle: a module earns a config section when operators need to tune it in production. Until that need appears, keeping the surface small avoids defaults sprawl.
+
+## Mirror maintenance contract
+
+`aura-config` holds mirrors of selected domain types (`TrustLevelConfig`, `McpTransportConfig`, planned `SecretAccessConfig` / `CapabilityConfig`) to stay decoupled. Drift prevention:
+
+1. **Ownership** — mirrors live in `aura-config`. Whenever the upstream domain type (e.g. `aura_registry::TrustLevel`, `aura_tools::McpTransport`) changes shape, the same PR updates the mirror and the conversion between them.
+2. **Contract tests** — each mirror has a round-trip test (`From<DomainType> for MirrorType` and `TryFrom<MirrorType> for DomainType`) in `aura-config`'s integration tests. These act as the drift detector: adding a variant upstream without a mirror update breaks match exhaustiveness and fails CI.
+3. **Forward compatibility** — domain enums that mirrors target should be `#[non_exhaustive]`; the mirror's `TryFrom` returns a typed `ConfigError::UnsupportedVariant { ty, variant }` rather than panicking when it encounters an unknown variant.
+4. **Scope limit** — only types that appear in the config surface are mirrored. Transient/internal domain types must not leak into `aura-config`.
+
+## Reload semantics
+
+`aura-config` has **no reload API today**. Configuration is loaded once at startup; live changes require a process restart. The `ConfigChange` hook in `aura-hook` exists for future hot-reload support and for startup-time provenance, not for current runtime mutation.
+
+When hot reload is implemented, the following contract must be in place **before** reload code lands:
+
+- **Hot-updatable fields** — an explicit whitelist. Plausible candidates: `cost.rate_limit.*`, `cost.spending_limits.*`, `trace.snapshot_interval`, `security.leak_detection_enabled`. Clearly not hot-updatable: `channels.http.port`, `channels.http.bind_address`, `sandbox.wasm.max_memory_bytes`, anything influencing `llm` client identity.
+- **Atomic swap** — a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden.
+- **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError::Validation` to the caller; no partial state is exposed.
+- **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config.
+- **Provenance** — every successful reload emits a `ConfigChange` hook event with the old/new config hashes, and `trace` records the transition in `ExecutionProvenance`.
+
+Until reload is implemented, `ConfigChange` fires exactly once at startup (for provenance) and any "reload" is restart-mediated.
+
+## Validation Rules
+
+### Field-level rules
+
+| Section                               | Rule                                                 |
+| ------------------------------------- | ---------------------------------------------------- |
+| `llm.provider`                        | non-empty                                            |
+| `llm.model`                           | non-empty                                            |
+| `llm.base_url`                        | if set, scheme is `http://` or `https://`            |
+| `llm.fallback_model`                  | if set, non-empty                                    |
+| `agent.max_iterations`                | in `1..=1000`                                        |
+| `agent.default_tool_timeout_ms`       | ≥ 100                                                |
+| `agent.workspace_path`                | non-empty                                            |
+| `agent.context.max_tokens`            | ≥ 1                                                  |
+| `agent.context.compression_threshold` | in `(0.0, 1.0]`, finite                              |
+| `agent.context.keep_recent`           | ≥ 1                                                  |
+| `session.timeout_minutes`             | ≥ 1                                                  |
+| `session.cleanup_interval_minutes`    | no constraint; `0` disables cleanup                  |
+| `channels.message_buffer_size`        | in `1..=65536`                                       |
+| `channels.http.*`                     | non-empty `bind_address`, non-zero `port`            |
+| `channels.telegram.bot_token_env`     | non-empty                                            |
+| `channels.discord.bot_token_env`      | non-empty                                            |
+| `sandbox.wasm.timeout_ms`             | ≥ 100                                                |
+| `sandbox.wasm.max_memory_bytes`       | ≥ 1 MB                                               |
+| `sandbox.wasm.max_fuel`               | ≥ 1000                                               |
+| `tools.default_timeout_ms`            | ≥ 100                                                |
+| `tools.mcp_servers[i].name`           | non-empty, unique across all entries                 |
+| `tools.mcp_servers[i] (Stdio)`        | `command` non-empty                                  |
+| `tools.mcp_servers[i] (Http)`         | URL scheme is `http://` or `https://`                |
+| `cost.spending_limits.*_usd`          | if set, strictly positive, finite                    |
+| `cost.spending_limits.user_*`         | cross-field: `daily_usd ≤ monthly_usd` when both set |
+| `cost.rate_limit.*`                   | `max_requests ≥ 1`, `window_secs ≥ 1`                |
+| `trace.snapshot_interval`             | ≥ 1 when `auto_snapshot` is true                     |
+
+### Cross-section rules
+
+Field-level checks catch syntax errors; cross-section checks catch policy inconsistencies. These live in a dedicated `validate_cross_section(&self, ...)` pass that runs after the per-section passes complete:
+
+| Rule                                                                                                                                                                             | Sections involved  |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| Every `tools.mcp_servers[].transport.Http.url` host resolves to an entry in `sandbox.network.allowed_domains`, unless `allow_loopback` covers it                                 | `tools`, `sandbox` |
+| When `llm.provider` is set, at least one secret source is resolvable: `llm.api_key` (as env-var reference), or a provider-specific fallback env var documented for that provider | `llm`, `security`  |
+| `McpServerEntry.trust_level` vs declared `capabilities` conforms to `tools.md` governance ceilings (e.g. `Installed` ⇒ no `WriteWorkspace` / `SpawnProcess`)                     | `tools`            |
+| Each `channels.*` with `enabled: false` is rejected (enablement-model self-consistency)                                                                                          | `channels`         |
+| `security.encryption_key_file` and `encryption_key_env` cannot both be unset when any downstream consumer requires an encryption key                                             | `security`         |
+
+Cross-section rules are part of the default `validate()` pass. A future strict-load flag will also enforce advisory hygiene (e.g. key-file extension hints, env-var name syntax); today those are handled case-by-case in bootstrap.
+
+## Constraints
+
+- No `aura-*` dependencies — leaf level alongside `model`
+- No secret plaintext in the config struct; only references (env var names, file paths)
+- Validation must be pure — no I/O, no time-of-day dependencies, no filesystem probes
+- All top-level sections must provide a `Default` impl whose output passes `validate()`
+- Mirrors of domain types must satisfy §"Mirror maintenance contract"
+- Runtime config mutations are not supported today; see §"Reload semantics" for the target contract
+
+## Collaboration
+
+| Module     | Role                                                                                                                                                                                   |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.rs`  | Loads the config at startup, maps each section into domain types, passes them down                                                                                                     |
+| `agent`    | Consumes `AgentConfig`, `SessionConfig`, `TraceConfig`, `CostConfig`                                                                                                                   |
+| `llm`      | Receives `LlmProviderConfig` built from `LlmConfig`                                                                                                                                    |
+| `sandbox`  | Receives `SandboxLimits` and `NetworkPolicy` built from `SandboxConfig`                                                                                                                |
+| `tools`    | Receives `McpServerConfig` list built from `ToolsConfig::mcp_servers`                                                                                                                  |
+| `channels` | Channel adapters are registered based on `ChannelsConfig` section enablement                                                                                                           |
+| `hook`     | `ConfigChange` is an extension point that _observes_ or _vetoes_ proposed changes. It does **not** emit provenance — provenance is recorded by the bootstrap/agent layer into `trace`. |
+| `trace`    | Records `provider_config_hash` / `config_version` in `ExecutionProvenance` when config is loaded or changed                                                                            |

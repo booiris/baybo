@@ -6,7 +6,7 @@ Each document covers: module responsibilities, design decisions, key constraints
 
 Bottom-up along the dependency graph:
 
-1. [model.md](model.md) → [session.md](session.md) → [channels.md](channels.md)
+1. [model.md](model.md) → [config.md](config.md) → [session.md](session.md) → [channels.md](channels.md)
 2. [job.md](job.md) → [cron.md](cron.md) → [registry.md](registry.md) → [skills.md](skills.md)
 3. [llm.md](llm.md) → [security.md](security.md) → [sandbox.md](sandbox.md)
 4. [tools.md](tools.md) → [workspace.md](workspace.md) → [context.md](context.md)
@@ -18,6 +18,7 @@ Bottom-up along the dependency graph:
 ### Foundational Types Layer
 
 - **model** — Shared content primitives (ChatMessage, ContentBlock, Role, BlobRef, MessageMetadata) and memory domain types (MemoryEntry, MemoryCategory). No business traits.
+- **config** — Root `AuraConfig` with JSON loading and `validate()`. Nine sections (llm, agent, session, channels, sandbox, security, tools, trace, cost). Uses mirror structs to stay decoupled from domain crates.
 
 ### Ingress and Security Boundary Layer
 
@@ -63,9 +64,10 @@ model
   └── registry (no internal deps)
   └── workspace (no internal deps)
   └── sandbox (no internal deps)
+  └── config (no internal deps; external only)
 
 storage ──► model, session, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
-agent   ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, sandbox, channels, registry
+agent   ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, sandbox, channels, registry, config
 ```
 
 ## Key Constraints
