@@ -41,6 +41,7 @@ impl LibsqlPool {
         let pool = Self {
             conn: Arc::new(conn),
         };
+        pool.set_wal_mode().await?;
         pool.init_db().await?;
         Ok(pool)
     }
@@ -64,6 +65,17 @@ impl LibsqlPool {
     /// Get a reference to the underlying connection.
     pub(crate) fn conn(&self) -> &libsql::Connection {
         &self.conn
+    }
+
+    /// Enable WAL journaling so writers no longer churn a `-journal` sidecar
+    /// on every transaction. `synchronous=NORMAL` is the recommended pairing
+    /// for WAL (crash-safe, faster than FULL).
+    async fn set_wal_mode(&self) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to enable WAL mode: {e}"))?;
+        Ok(())
     }
 
     /// Create all required tables if they do not already exist.
