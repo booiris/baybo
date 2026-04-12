@@ -5,7 +5,7 @@ use aura_model::{ContentBlock, MessageMetadata};
 use aura_session::{ChannelType, User};
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
 use crate::{IncomingMessage, Message, OutgoingMessage, Result};

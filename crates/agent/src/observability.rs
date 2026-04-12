@@ -161,10 +161,7 @@ impl ObservabilityRecorder {
     ///
     /// Returns the snapshot that was found.  The caller uses it to restore
     /// the session's message history and context budget.
-    pub async fn rollback_to(
-        &self,
-        target_node: &TraceNodeId,
-    ) -> anyhow::Result<ContextSnapshot> {
+    pub async fn rollback_to(&self, target_node: &TraceNodeId) -> anyhow::Result<ContextSnapshot> {
         let mut collector = self.trace_collector.lock().await;
         let snapshot = collector.find_snapshot_at(target_node)?;
         collector.fork_from(target_node.clone())?;

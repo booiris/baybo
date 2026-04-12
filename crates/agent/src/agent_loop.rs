@@ -8,8 +8,8 @@ use aura_model::{ChatMessage, ContentBlock, Role};
 
 use crate::memory::MemoryManager;
 use aura_session::Session;
-use aura_tools::ToolRegistry;
 use aura_skills::SkillRegistry;
+use aura_tools::ToolRegistry;
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult, TraceNodeId};
 use serde_json::Value;
 use tracing::{debug, info, warn};
