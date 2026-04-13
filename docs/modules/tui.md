@@ -74,13 +74,16 @@ These are intercepted by `TuiAdapter` before `SlashHandler::handle` is called.
 
 ### Chat
 
-| Key                                              | Action                              |
-| ------------------------------------------------ | ----------------------------------- |
-| `Enter`                                          | Submit input (or run slash command) |
-| `Up`/`Down`                                      | Walk input history back/forward     |
-| `PageUp`/`PageDown`                              | Scroll scrollback                   |
-| `Home`/`End`/`Left`/`Right`/`Backspace`/`Delete` | Standard cursor edits               |
-| Any printable character                          | Insert at cursor                    |
+| Key                                              | Action                                                                       |
+| ------------------------------------------------ | ---------------------------------------------------------------------------- |
+| `Enter`                                          | Submit input (or run slash command)                                          |
+| `Shift-Enter` / `Alt-Enter`                      | Insert newline in the input (see terminal support below)                     |
+| `Up`/`Down`                                      | Move cursor within a multi-line draft; on the first/last line walks history  |
+| `PageUp`/`PageDown`                              | Scroll scrollback                                                            |
+| `Home`/`End`/`Left`/`Right`/`Backspace`/`Delete` | Standard cursor edits                                                        |
+| Any printable character                          | Insert at cursor                                                             |
+
+`Shift-Enter` requires the Kitty keyboard protocol (`DISAMBIGUATE_ESCAPE_CODES`), which `run_loop` pushes at startup and pops on teardown. Supported by Kitty, WezTerm, Foot, recent Alacritty, iTerm2, and Ghostty; terminals without it fall back to treating Shift-Enter as plain Enter, so `Alt-Enter` is offered as a universal alternative that does not depend on the protocol. The input box grows up to `INPUT_MAX_ROWS = 10` rows; beyond that the caret may clip.
 
 ### Dashboard
 

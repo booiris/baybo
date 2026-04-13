@@ -94,6 +94,17 @@ pub(crate) fn translate(mode: &ViewMode, key: KeyEvent, ctx: KeyContext) -> Acti
 
 fn translate_chat(key: KeyEvent, completion_open: bool) -> Action {
     match key.code {
+        // Shift-Enter / Alt-Enter insert a literal newline so the input can
+        // span multiple lines. Shift-Enter requires the Kitty keyboard
+        // protocol (pushed in `run_loop`); Alt-Enter works on terminals
+        // without it. Both take precedence over completion-accept.
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            Action::Insert('\n')
+        }
         KeyCode::Enter if completion_open => Action::CompletionAccept,
         KeyCode::Enter => Action::Submit,
         KeyCode::Tab if completion_open => Action::CompletionAccept,
@@ -145,6 +156,10 @@ mod tests {
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn with_mods(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
     }
 
     fn ctx(input_empty: bool) -> KeyContext {
@@ -209,6 +224,44 @@ mod tests {
         assert_eq!(
             translate(&app.mode, press(KeyCode::Esc), ctx(false)),
             Action::DashboardExit
+        );
+    }
+
+    #[test]
+    fn shift_or_alt_enter_inserts_newline() {
+        let app = AppState::new();
+        assert_eq!(
+            translate(
+                &app.mode,
+                with_mods(KeyCode::Enter, KeyModifiers::SHIFT),
+                ctx(false)
+            ),
+            Action::Insert('\n')
+        );
+        assert_eq!(
+            translate(
+                &app.mode,
+                with_mods(KeyCode::Enter, KeyModifiers::ALT),
+                ctx(false)
+            ),
+            Action::Insert('\n')
+        );
+    }
+
+    #[test]
+    fn shift_enter_overrides_completion_accept() {
+        let app = AppState::new();
+        let open = KeyContext {
+            input_empty: false,
+            completion_open: true,
+        };
+        assert_eq!(
+            translate(
+                &app.mode,
+                with_mods(KeyCode::Enter, KeyModifiers::SHIFT),
+                open
+            ),
+            Action::Insert('\n')
         );
     }
 

@@ -13,10 +13,16 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::app::{AppState, ChatLine};
 use crate::tui::event::LogLevel;
 
+/// Maximum rows the input box grows to before it clips. Beyond this, the
+/// cursor may scroll off-screen; that's acceptable for a chat-style input
+/// where very tall drafts are rare.
+const INPUT_MAX_ROWS: u16 = 10;
+
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    let input_h = input_box_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([Constraint::Min(1), Constraint::Length(input_h)])
         .split(area);
 
     render_scrollback(frame, chunks[0], state);
@@ -24,20 +30,36 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     render_completion_popup(frame, chunks[1], state);
 }
 
+fn input_box_height(state: &AppState) -> u16 {
+    let lines = state.input.matches('\n').count().saturating_add(1) as u16;
+    (lines.min(INPUT_MAX_ROWS)).saturating_add(2)
+}
+
 fn render_scrollback(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(state.scrollback.len() * 2);
     for chat in &state.scrollback {
         match chat {
             ChatLine::User(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "you> ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text.clone()),
-                ]));
+                let prefix = Span::styled(
+                    "you> ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let mut first = true;
+                for line_text in text.lines() {
+                    let spans = if first {
+                        vec![prefix.clone(), Span::raw(line_text.to_string())]
+                    } else {
+                        vec![Span::raw("     "), Span::raw(line_text.to_string())]
+                    };
+                    lines.push(Line::from(spans));
+                    first = false;
+                }
+                if first {
+                    // Empty text still deserves a visible prompt row.
+                    lines.push(Line::from(vec![prefix, Span::raw("")]));
+                }
             }
             ChatLine::Assistant(blocks) => {
                 let prefix = Span::styled(
@@ -145,21 +167,39 @@ fn render_scrollback(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState) {
+    // Right-aligned hint on the top border. Shows the newline shortcut so
+    // first-time users discover multi-line input without needing to open
+    // the docs. Dim style to stay unobtrusive against the main " input "
+    // title on the left.
+    let hint = Line::from(Span::styled(
+        " shift+enter · alt+enter = newline ",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .right_aligned();
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
-        .title(" input ");
+        .title(" input ")
+        .title_top(hint);
     let inner = block.inner(area);
     let paragraph = Paragraph::new(state.input.as_str()).block(block);
     frame.render_widget(paragraph, area);
 
     // Put the cursor where the insertion point is, inside the input box.
-    // Use display width (not byte or code-point count) so CJK/wide chars
-    // and zero-width combiners land the caret on the right terminal column.
+    // For multi-line input we split the prefix on '\n' to compute the row,
+    // and use display width (not byte or code-point count) on the current
+    // line so CJK/wide chars and zero-width combiners land the caret on the
+    // right terminal column. Clamp the row to the visible viewport so the
+    // caret doesn't leak past the border when the draft exceeds
+    // INPUT_MAX_ROWS.
     let byte_cursor = state.cursor.min(state.input.len());
-    let prefix_width = state.input[..byte_cursor].width() as u16;
-    let cursor_x = inner.x + prefix_width;
-    let cursor_y = inner.y;
+    let prefix = &state.input[..byte_cursor];
+    let line_index = prefix.matches('\n').count() as u16;
+    let last_line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col_width = prefix[last_line_start..].width() as u16;
+    let row = line_index.min(inner.height.saturating_sub(1));
+    let cursor_x = inner.x + col_width;
+    let cursor_y = inner.y + row;
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 

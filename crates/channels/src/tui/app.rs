@@ -261,6 +261,60 @@ impl AppState {
         self.cursor = self.input.len();
     }
 
+    /// True when no `\n` precedes the cursor — i.e. the insertion point sits
+    /// on the first logical line of the input buffer.
+    pub(crate) fn cursor_at_first_line(&self) -> bool {
+        !self.input[..self.cursor].contains('\n')
+    }
+
+    /// True when no `\n` follows the cursor — the cursor is on the last
+    /// logical line of the buffer.
+    pub(crate) fn cursor_at_last_line(&self) -> bool {
+        !self.input[self.cursor..].contains('\n')
+    }
+
+    /// Move the cursor up one logical line, preserving byte-column where
+    /// possible and clamping to the previous line's length. No-op when
+    /// already on the first line.
+    pub(crate) fn move_up_line(&mut self) {
+        if self.cursor_at_first_line() {
+            return;
+        }
+        let prefix = &self.input[..self.cursor];
+        let cur_line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let col = self.cursor - cur_line_start;
+        let prev_newline = cur_line_start - 1;
+        let prev_line_start = self.input[..prev_newline]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_line_len = prev_newline - prev_line_start;
+        let target = prev_line_start + col.min(prev_line_len);
+        self.cursor = clamp_to_boundary(&self.input, target);
+    }
+
+    /// Move the cursor down one logical line, preserving byte-column where
+    /// possible and clamping to the next line's length. No-op when already
+    /// on the last line.
+    pub(crate) fn move_down_line(&mut self) {
+        if self.cursor_at_last_line() {
+            return;
+        }
+        let prefix = &self.input[..self.cursor];
+        let cur_line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let col = self.cursor - cur_line_start;
+        // Cursor is not on last line, so there is a '\n' at or after cursor.
+        let next_newline = cur_line_start + self.input[cur_line_start..].find('\n').unwrap();
+        let next_line_start = next_newline + 1;
+        let next_line_end = self.input[next_line_start..]
+            .find('\n')
+            .map(|i| next_line_start + i)
+            .unwrap_or(self.input.len());
+        let next_line_len = next_line_end - next_line_start;
+        let target = next_line_start + col.min(next_line_len);
+        self.cursor = clamp_to_boundary(&self.input, target);
+    }
+
     pub(crate) fn history_prev(&mut self) {
         if self.history.is_empty() {
             return;
@@ -387,6 +441,19 @@ impl AppState {
     }
 }
 
+/// Round `idx` down to the nearest UTF-8 char boundary. Used when
+/// translating byte-column targets (from multi-line cursor movement) back
+/// into safe insertion indices.
+fn clamp_to_boundary(s: &str, mut idx: usize) -> usize {
+    if idx > s.len() {
+        idx = s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 fn prev_char_boundary(s: &str, idx: usize) -> usize {
     let mut i = idx.saturating_sub(1);
     while i > 0 && !s.is_char_boundary(i) {
@@ -417,6 +484,45 @@ mod tests {
         app.backspace();
         app.backspace();
         assert_eq!(app.input, "hel");
+    }
+
+    #[test]
+    fn multiline_cursor_predicates_track_newlines() {
+        let mut app = AppState::new();
+        app.input = "a\nbc".to_string();
+        app.cursor = 0;
+        assert!(app.cursor_at_first_line());
+        assert!(!app.cursor_at_last_line());
+        app.cursor = 2; // just past '\n', start of line 2
+        assert!(!app.cursor_at_first_line());
+        assert!(app.cursor_at_last_line());
+    }
+
+    #[test]
+    fn move_up_and_down_line_clamp_to_line_length() {
+        let mut app = AppState::new();
+        app.input = "abcd\nef\nghij".to_string();
+        app.cursor = 12; // end of "ghij"
+        app.move_up_line();
+        // Middle line "ef" has len 2; col 4 clamps to 2, so cursor lands at
+        // the byte just past "ef" (the next '\n' boundary).
+        assert_eq!(app.cursor, 7);
+        app.move_up_line();
+        // No sticky preferred column: col is recomputed from the current
+        // cursor (col 2 on "ef"), then applied to "abcd" → cursor = 2.
+        assert_eq!(app.cursor, 2);
+        app.move_down_line();
+        // Col 2 from "abcd" applies to "ef" (len 2) → end-of-line, cursor 7.
+        assert_eq!(app.cursor, 7);
+    }
+
+    #[test]
+    fn move_up_line_is_noop_on_first_line() {
+        let mut app = AppState::new();
+        app.input = "only line".to_string();
+        app.cursor = 3;
+        app.move_up_line();
+        assert_eq!(app.cursor, 3);
     }
 
     #[test]

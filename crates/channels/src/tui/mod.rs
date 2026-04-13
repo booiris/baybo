@@ -31,7 +31,8 @@ use aura_session::{ChannelType, User};
 use chrono::Utc;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEvent,
-    KeyEventKind, MouseEvent, MouseEventKind,
+    KeyEventKind, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -220,10 +221,18 @@ struct LoopCtx {
 struct TuiTeardownGuard {
     stdout: io::Stdout,
     on_exit: Option<OnExit>,
+    /// Whether `PushKeyboardEnhancementFlags` was issued at startup. Only
+    /// then do we emit the matching pop on teardown.
+    keyboard_enhanced: bool,
 }
 
 impl Drop for TuiTeardownGuard {
     fn drop(&mut self) {
+        if self.keyboard_enhanced
+            && let Err(e) = execute!(self.stdout, PopKeyboardEnhancementFlags)
+        {
+            warn!("pop keyboard enhancement failed: {e}");
+        }
         if let Err(e) = disable_raw_mode() {
             warn!("disable_raw_mode failed: {e}");
         }
@@ -243,11 +252,22 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     enable_raw_mode().map_err(|e| anyhow::anyhow!("enable_raw_mode: {e}"))?;
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .map_err(|e| anyhow::anyhow!("EnterAlternateScreen: {e}"))?;
+    // Request the Kitty keyboard protocol so Shift+Enter and other
+    // modified keys arrive with their modifier bits set. Unsupported
+    // terminals silently ignore the escape sequence; if the write itself
+    // fails we fall back to the legacy protocol (Shift+Enter will look
+    // like plain Enter — Alt+Enter still works as a newline fallback).
+    let keyboard_enhanced = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+    )
+    .is_ok();
     // From here on, any early return must restore the terminal and fire
     // on_exit — the guard's Drop impl handles both.
     let mut _guard = TuiTeardownGuard {
         stdout: io::stdout(),
         on_exit: ctx.on_exit.take(),
+        keyboard_enhanced,
     };
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| anyhow::anyhow!("Terminal::new: {e}"))?;
@@ -396,8 +416,23 @@ async fn handle_key(
         Action::MoveRight => state.move_right(),
         Action::MoveHome => state.move_home(),
         Action::MoveEnd => state.move_end(),
-        Action::HistoryPrev => state.history_prev(),
-        Action::HistoryNext => state.history_next(),
+        Action::HistoryPrev => {
+            // Within a multi-line draft, Up first moves the cursor up a
+            // line; only when already on the first line does it walk back
+            // through the input history (same rule as common IDE inputs).
+            if state.cursor_at_first_line() {
+                state.history_prev();
+            } else {
+                state.move_up_line();
+            }
+        }
+        Action::HistoryNext => {
+            if state.cursor_at_last_line() {
+                state.history_next();
+            } else {
+                state.move_down_line();
+            }
+        }
         Action::ScrollPageUp => state.scroll_up(10),
         Action::ScrollPageDown => state.scroll_down(10),
         Action::ClearScrollback => state.clear_scrollback(),
@@ -531,6 +566,11 @@ fn install_panic_hook() {
     INSTALLED.get_or_init(|| {
         let prev = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
+            // Pop keyboard enhancement unconditionally — an extra pop on a
+            // stack that was never pushed is harmless (the terminal just
+            // ignores the sequence) and avoids threading state into the
+            // panic hook.
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
             let _ = disable_raw_mode();
             let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
             prev(info);

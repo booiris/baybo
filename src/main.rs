@@ -21,7 +21,6 @@ use aura_cli::{
     Cli, CliDashboardProvider, CliSlashHandler, Commands, ContextBuilder, Invocation, OutputFormat,
     dispatch,
 };
-use clap::CommandFactory;
 use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
 use aura_hook::HookManager;
 use aura_security::EncryptionKey;
@@ -29,6 +28,7 @@ use aura_skills::SkillRegistry;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
+use clap::CommandFactory;
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
