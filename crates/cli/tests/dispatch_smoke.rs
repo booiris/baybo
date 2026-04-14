@@ -2741,14 +2741,16 @@ fn sample_skill(name: &str, description: &str) -> aura_skills::SkillDefinition {
         name: name.into(),
         version: "0.1.0".into(),
         description: description.into(),
-        trigger: aura_skills::SkillTrigger::AgentDecision,
+        command: Some(name.into()),
+        agent_invocable: true,
+        argument_hint: None,
         prompt_template: "be helpful".into(),
         allowed_tools: vec![],
-        post_processing: None,
         source: aura_registry::ArtifactSource::Workspace,
         trust_level: aura_registry::TrustLevel::Trusted,
         requirements: aura_skills::SkillRequirements::default(),
         token_budget_hint: 1024,
+        source_path: None,
     }
 }
 

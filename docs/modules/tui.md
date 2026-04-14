@@ -110,6 +110,7 @@ Neither `send_response` nor `send_stream_delta` renders directly. Both push into
 
 - `send_stream_delta(session_id, delta)` → `AppEvent::StreamDelta(String)`. The loop appends to `AppState.streaming`, redrawing on each chunk so the partial response appears live.
 - `send_response(outgoing)` → `AppEvent::Outgoing(Vec<ContentBlock>)`. The loop clears `AppState.streaming` and pushes the canonical `ChatLine::Assistant` onto the scrollback.
+- `send_notice(session_id, level, text)` → `AppEvent::Log(LogRecord { level, target: "agent", message })`. Reuses the log-line surface so a notice from the agent (e.g. a Suspicious skill advisory) appears with the same colour coding as warn/error tracing events; no dedicated chat-line variant was worth adding for a rare out-of-band signal.
 
 Routing the final message through the same mpsc keeps ordering against deltas trivially correct (single consumer) and keeps the router task off the terminal.
 

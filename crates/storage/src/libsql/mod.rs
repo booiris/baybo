@@ -4,6 +4,7 @@ mod job;
 mod memory;
 mod secret;
 mod session;
+mod skill_risk;
 mod trace;
 
 pub use cost::LibsqlCostStore;
@@ -12,6 +13,7 @@ pub use job::LibsqlJobStore;
 pub use memory::LibsqlMemoryStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
+pub use skill_risk::LibsqlSkillRiskStore;
 pub use trace::LibsqlTraceStore;
 
 use std::sync::Arc;
@@ -161,7 +163,31 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_job_id ON cron_executions(job_id);
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_user_id ON cron_executions(user_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_executions_dedup ON cron_executions(job_id, scheduled_fire_time);
-                CREATE INDEX IF NOT EXISTS idx_cron_executions_status ON cron_executions(status);",
+                CREATE INDEX IF NOT EXISTS idx_cron_executions_status ON cron_executions(status);
+
+                CREATE TABLE IF NOT EXISTS skill_risk_assessments (
+                    skill_name   TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    level        TEXT NOT NULL,
+                    rationale    TEXT NOT NULL,
+                    model        TEXT NOT NULL,
+                    assessed_at  INTEGER NOT NULL,
+                    PRIMARY KEY (skill_name, content_hash)
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_risk_assessment_jobs (
+                    skill_name   TEXT    NOT NULL,
+                    content_hash TEXT    NOT NULL,
+                    source_path  TEXT    NOT NULL,
+                    status       TEXT    NOT NULL,
+                    attempts     INTEGER NOT NULL DEFAULT 0,
+                    last_error   TEXT,
+                    created_at   INTEGER NOT NULL,
+                    updated_at   INTEGER NOT NULL,
+                    PRIMARY KEY (skill_name, content_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_skill_risk_jobs_status
+                    ON skill_risk_assessment_jobs(status);",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;

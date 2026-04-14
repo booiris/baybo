@@ -48,11 +48,11 @@ use uuid::Uuid;
 use std::time::Instant;
 
 use crate::tui::app::{AppState, CONFIRM_EXIT_WINDOW, ViewMode};
-use crate::tui::event::{AppEvent, TuiLogSink};
+use crate::tui::event::{AppEvent, LogLevel, LogRecord, TuiLogSink};
 use crate::tui::keymap::{Action, KeyContext, translate};
 use crate::{
-    ChannelAdapter, ChannelError, DashboardProvider, IncomingMessage, Message, OutgoingMessage,
-    Result, SlashHandler, SlashOutcome, ViewKind,
+    ChannelAdapter, ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel,
+    OutgoingMessage, Result, SlashHandler, SlashOutcome, ViewKind,
 };
 
 /// Callback invoked exactly once when the TUI event loop exits, regardless
@@ -190,6 +190,25 @@ impl ChannelAdapter for TuiAdapter {
     async fn send_stream_delta(&self, _session_id: &str, delta: &str) -> Result<()> {
         self.event_tx
             .send(AppEvent::StreamDelta(delta.to_string()))
+            .await
+            .map_err(|_| ChannelError::Send("TUI event loop has exited".into()))?;
+        Ok(())
+    }
+
+    async fn send_notice(&self, _session_id: &str, level: NoticeLevel, text: &str) -> Result<()> {
+        // Reuse the log scrollback surface — agent notices are
+        // semantically close to warn/error tracing events and already
+        // have dedicated styling there.
+        let record = LogRecord {
+            level: match level {
+                NoticeLevel::Warn => LogLevel::Warn,
+                NoticeLevel::Error => LogLevel::Error,
+            },
+            target: "agent".to_string(),
+            message: text.to_string(),
+        };
+        self.event_tx
+            .send(AppEvent::Log(record))
             .await
             .map_err(|_| ChannelError::Send("TUI event loop has exited".into()))?;
         Ok(())

@@ -5,6 +5,7 @@ pub mod job;
 pub mod libsql;
 pub mod memory;
 pub mod secret;
+pub mod skill_risk;
 pub mod trace;
 
 use aura_session::SessionStore;
@@ -15,6 +16,7 @@ pub use error::StorageError;
 pub use job::JobStore;
 pub use memory::MemoryStore;
 pub use secret::SecretStore;
+pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use trace::TraceStore;
 
 /// Bundles all store implementations into a single container
@@ -27,6 +29,7 @@ pub struct Store {
     pub cost: Box<dyn CostStore>,
     pub job: Box<dyn JobStore>,
     pub cron: Box<dyn CronStore>,
+    pub risk: Box<dyn SkillRiskStore>,
 }
 
 impl Store {
@@ -52,7 +55,8 @@ impl Store {
             secret: Box::new(libsql::LibsqlSecretStore::new(pool.clone())),
             cost: Box::new(libsql::LibsqlCostStore::new(pool.clone())),
             job: Box::new(libsql::LibsqlJobStore::new(pool.clone())),
-            cron: Box::new(libsql::LibsqlCronStore::new(pool)),
+            cron: Box::new(libsql::LibsqlCronStore::new(pool.clone())),
+            risk: Box::new(libsql::LibsqlSkillRiskStore::new(pool)),
         })
     }
 }

@@ -10,6 +10,7 @@ use aura_llm::LlmClient;
 use aura_security::LeakDetector;
 use aura_session::SessionManager;
 use aura_skills::SkillRegistry;
+use aura_skills_assessor::SkillAssessor;
 use aura_storage::TraceStore;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
@@ -47,6 +48,7 @@ pub struct CommandContext {
     pub recorder: Option<Arc<ObservabilityRecorder>>,
     pub security: Option<Arc<SecurityGateway>>,
     pub leak_detector: Option<Arc<LeakDetector>>,
+    pub skill_assessor: Option<Arc<SkillAssessor>>,
     pub format: OutputFormat,
     pub invocation: Invocation,
     pub confirmed: bool,
@@ -90,6 +92,7 @@ pub struct ContextBuilder {
     recorder: Option<Arc<ObservabilityRecorder>>,
     security: Option<Arc<SecurityGateway>>,
     leak_detector: Option<Arc<LeakDetector>>,
+    skill_assessor: Option<Arc<SkillAssessor>>,
 }
 
 impl ContextBuilder {
@@ -111,6 +114,7 @@ impl ContextBuilder {
             recorder: None,
             security: None,
             leak_detector: None,
+            skill_assessor: None,
         }
     }
 
@@ -189,6 +193,11 @@ impl ContextBuilder {
         self
     }
 
+    pub fn skill_assessor(mut self, assessor: Arc<SkillAssessor>) -> Self {
+        self.skill_assessor = Some(assessor);
+        self
+    }
+
     pub fn build(self) -> CommandContext {
         CommandContext {
             config: self.config,
@@ -213,6 +222,7 @@ impl ContextBuilder {
             recorder: self.recorder,
             security: self.security,
             leak_detector: self.leak_detector,
+            skill_assessor: self.skill_assessor,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,
             confirmed: false,

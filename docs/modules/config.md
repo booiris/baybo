@@ -99,7 +99,7 @@ Each optional channel (`telegram`, `discord`, `http`) is wrapped in `Option<_>`:
 
 The following modules do not (yet) have sections in the root config. This is a deliberate phased decision, not an oversight. Each has a planned placement:
 
-- **skills** — hot-reload switch, skill directories, trust tiers. Today the defaults are hardcoded in `SkillRegistry::new()`.
+- **skills** — hot-reload switch, additional skill directories, trust tiers. Today `SkillRegistry::load_dir(<workspace.path>/skills)` is the only source, with all loaded skills pinned to `Trusted`; no operator-tunable knobs yet.
 - **registry** — artifact source allowlist, signature verification policy, trust ceilings. Today the defaults are baked into the registry constructors.
 - **cron** — scheduler poll interval, max concurrent runs, missed-run policy. Today `CronScheduler` uses compile-time defaults.
 

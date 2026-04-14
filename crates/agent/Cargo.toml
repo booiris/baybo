@@ -10,6 +10,7 @@ aura-registry = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
 aura-skills = { workspace = true }
+aura-skills-assessor = { workspace = true }
 aura-workspace = { workspace = true }
 aura-context = { workspace = true }
 aura-session = { workspace = true }

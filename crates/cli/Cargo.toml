@@ -12,6 +12,7 @@ aura-cron = { workspace = true }
 aura-job = { workspace = true }
 aura-session = { workspace = true }
 aura-skills = { workspace = true }
+aura-skills-assessor = { workspace = true }
 aura-storage = { workspace = true }
 aura-security = { workspace = true }
 aura-tools = { workspace = true }

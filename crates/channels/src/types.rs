@@ -48,6 +48,33 @@ pub enum AgentOutput {
     },
     /// Final, canonical assistant response for the turn.
     Message(OutgoingMessage),
+    /// Out-of-band notice addressed to the user for a specific session.
+    ///
+    /// Distinct from `Message` because the user did not prompt for it —
+    /// it's emitted by the agent when an operational condition warrants
+    /// surfacing (e.g. a skill the user invoked has been rated
+    /// `Suspicious`, so it still runs but the user should know).
+    /// Channels decide how to render; the TUI inlines it into scrollback
+    /// styled by `level`, transports without a banner surface may drop it.
+    Notice {
+        session_id: String,
+        channel: ChannelType,
+        level: NoticeLevel,
+        text: String,
+    },
+}
+
+/// Severity attached to an `AgentOutput::Notice`. Used only for
+/// presentation — semantics (whether the action proceeded) are already
+/// baked into the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    /// Action proceeded with a caveat worth seeing (e.g. suspicious
+    /// skill still injected).
+    Warn,
+    /// Action was blocked or degraded (e.g. dangerous skill filtered
+    /// out; tools the user asked for are unavailable this turn).
+    Error,
 }
 
 /// Lifecycle status of a registered channel adapter.

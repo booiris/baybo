@@ -223,6 +223,7 @@ dependencies = [
  "aura-security",
  "aura-session",
  "aura-skills",
+ "aura-skills-assessor",
  "aura-storage",
  "aura-tools",
  "aura-trace",
@@ -255,6 +256,7 @@ dependencies = [
  "aura-security",
  "aura-session",
  "aura-skills",
+ "aura-skills-assessor",
  "aura-storage",
  "aura-tools",
  "aura-trace",
@@ -311,6 +313,7 @@ dependencies = [
  "aura-security",
  "aura-session",
  "aura-skills",
+ "aura-skills-assessor",
  "aura-storage",
  "aura-tools",
  "aura-trace",
@@ -488,6 +491,26 @@ dependencies = [
  "aura-registry",
  "regex",
  "serde",
+ "tracing",
+]
+
+[[package]]
+name = "aura-skills-assessor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aura-llm",
+ "aura-model",
+ "aura-skills",
+ "aura-storage",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

@@ -27,10 +27,12 @@ One Actor per session: natural serialization within a session (no context races)
 1. Build system prompt, Soul, identity injection from `workspace`
 2. Recall long-term memory
 3. Append current user message to Context
-4. Skill selection: match user input against `SkillRegistry`, inject prompt template and tool filter if a skill matches
-5. Loop: `maybe_compress()` → build `ChatRequest` → call `LlmClient` → parse response → dispatch tool/skill execution
-6. Produce final `OutgoingMessage`
-7. Persist Job, Trace, and Cost state
+4. Skill selection (derived from `SkillRegistry::select`):
+   - An exact `/<cmd>` message returns just that one skill; any other message returns the full registered set. No scoring or mention-scanning happens — narrowing is handled upstream by the slash-equality check, not by heuristic ranking.
+   - Every returned candidate runs through `SkillAssessor` (`aura-skills-assessor`). `Dangerous` verdicts drop the skill *and* emit `AgentOutput::Notice { level: Error }`; `Suspicious` verdicts keep the skill and emit `Notice { level: Warn }`; `Safe` verdicts pass silently.
+   - Admitted skills have their `prompt_template` rendered via `aura_skills::render::render_skill_block` and injected as a system message, their names recorded on `session.state.active_skills`, and their `allowed_tools` unioned into this turn's tool ceiling.
+5. Loop: `maybe_compress()` → build `ChatRequest` → call `LlmClient` → parse response → dispatch tool execution
+6. Emit `OutgoingMessage` and persist Job, Trace, and Cost state
 
 ### ObservabilityRecorder lock strategy
 

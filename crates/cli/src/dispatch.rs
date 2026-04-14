@@ -8,7 +8,7 @@ use crate::format::CommandOutput;
 pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
     match cmd {
         Commands::Config { cmd } => commands::config::handle(ctx, cmd).await,
-        Commands::Skills { cmd } => commands::skills::handle(ctx, cmd),
+        Commands::Skills { cmd } => commands::skills::handle(ctx, cmd).await,
         Commands::Tools { cmd } => commands::tools::handle(ctx, cmd).await,
         Commands::Channels { cmd } => commands::channels::handle(ctx, cmd).await,
         Commands::Security { cmd } => commands::security::handle(ctx, cmd).await,

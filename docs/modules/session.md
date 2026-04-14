@@ -27,7 +27,7 @@ Aura uses one Actor per session. All messages targeting the same session (user i
 
 ### SessionState use cases
 
-- `active_skill`: set during multi-turn skill flows, cleared on completion. `AgentLoop` uses it to route to skill handlers.
+- `active_skills`: names of skills explicitly invoked this turn (slash-command or inline `/mention`, score ≥ 0.9). Repopulated every turn by `AgentLoop` from the active band — kept as a `Vec<String>` because multiple skills can be active simultaneously. Pure provenance for trace/CLI display; tool governance is computed separately as the union of those skills' `allowed_tools` lists.
 - `compression_count`: incremented after each context compression, useful for monitoring or strategy switching.
 - `extra`: reserved extension fields for experimental features or plugin state.
 

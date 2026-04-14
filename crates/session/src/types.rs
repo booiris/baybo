@@ -46,11 +46,14 @@ pub struct Session {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
-    /// Currently active skill during multi-turn flows.
-    /// Set when a skill begins, cleared on completion.
-    /// `AgentLoop` uses this to route to the correct skill handler.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_skill: Option<String>,
+    /// Skills currently active on this turn.
+    ///
+    /// Populated every turn by `AgentLoop` from the explicit-trigger band
+    /// (slash command or inline `/mention`, score ≥ 0.9). Multiple may be
+    /// active simultaneously; the list is pure provenance for trace and
+    /// CLI display — tool governance is computed separately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_skills: Vec<String>,
 
     /// Number of context compressions performed in this session.
     /// Incremented after each compression pass; useful for monitoring
@@ -76,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_type_deserialises_legacy_cli_alias() {
+    fn channel_type_deserializes_legacy_cli_alias() {
         let back: ChannelType = serde_json::from_str("\"cli\"").unwrap();
         assert_eq!(back, ChannelType::Tui);
     }

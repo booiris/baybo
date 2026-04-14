@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, OutgoingMessage};
+use aura_channels::{AgentOutput, NoticeLevel, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::OperationKind;
 use aura_llm::{
@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::memory::MemoryManager;
 use aura_session::Session;
 use aura_skills::SkillRegistry;
+use aura_skills_assessor::{RiskLevel, SkillAssessor};
 use aura_tools::ToolRegistry;
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult, TraceNodeId};
 use serde_json::Value;
@@ -23,6 +24,16 @@ use crate::observability::ObservabilityRecorder;
 use crate::policy::ExecutionPolicy;
 use crate::soul::Soul;
 use crate::tool_executor::ToolExecutor;
+
+/// Outcome of the skill risk assessor for a single candidate. `run()`
+/// dispatches on this — `Block` drops the skill with an error notice,
+/// `PassWithWarning` keeps it with a warning notice, and `Pass` is
+/// silent.
+enum SkillGate {
+    Pass,
+    PassWithWarning { rationale: String },
+    Block { rationale: String },
+}
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
@@ -35,6 +46,10 @@ pub struct AgentLoop {
     policy: ExecutionPolicy,
     soul: Soul,
     error_handler: ErrorHandler,
+    /// Optional LLM risk assessor. When set, every skill candidate is
+    /// checked before injection: `Dangerous` verdicts veto the skill,
+    /// `Suspicious` verdicts log a warning but allow it through.
+    skill_assessor: Option<Arc<SkillAssessor>>,
 }
 
 impl AgentLoop {
@@ -59,7 +74,13 @@ impl AgentLoop {
             policy,
             soul,
             error_handler: ErrorHandler::default(),
+            skill_assessor: None,
         }
+    }
+
+    pub fn with_skill_assessor(mut self, assessor: Arc<SkillAssessor>) -> Self {
+        self.skill_assessor = Some(assessor);
+        self
     }
 
     /// Run the main conversation loop for a single user message.
@@ -109,34 +130,80 @@ impl AgentLoop {
         };
         self.context_manager.append(session, &user_msg).await?;
 
-        // Skill selection: check if a skill matches the user message.
-        // If a command/pattern skill matches, inject its prompt template so
-        // the LLM operates within the skill's declared constraints.
+        // Skill selection: `SkillRegistry::select` returns exactly the
+        // one skill invoked by `/<cmd>`, or the full registered set
+        // otherwise. We inject every returned candidate after the risk
+        // assessor clears it — narrowing already happened upstream.
+        //
+        // Risk gating: `Dangerous` drops the skill with an error
+        // notice, `Suspicious` keeps it with a warn notice. Slash
+        // invocations were explicit, and the full-set fall-through is
+        // also a user-visible action (they opened the chat with this
+        // registry loaded), so in both cases a non-Safe verdict is
+        // surfaced via `AgentOutput::Notice` rather than hidden.
         let user_text = aura_llm::multimodal::extract_text(&user_content);
         let skill_candidates = self.skill_registry.select(&user_text);
-        let active_skill = skill_candidates.first().filter(|c| c.score >= 0.8);
-        let allowed_tools: Option<Vec<String>> = active_skill.map(|c| {
-            debug!(
-                skill = %c.skill.name,
-                score = c.score,
-                "skill selected"
-            );
-            session.state.active_skill = Some(c.skill.name.clone());
 
-            // Inject the skill prompt template into the context.
-            let skill_msg = ChatMessage {
+        let mut active_skills: Vec<aura_skills::SkillDefinition> = Vec::new();
+        for candidate in skill_candidates.into_iter() {
+            match self.assess_skill_risk(&candidate.skill).await {
+                SkillGate::Pass => active_skills.push(candidate.skill),
+                SkillGate::PassWithWarning { rationale } => {
+                    self.emit_skill_notice(
+                        session,
+                        NoticeLevel::Warn,
+                        &candidate.skill.name,
+                        "rated suspicious",
+                        &rationale,
+                        delta_tx.as_ref(),
+                    )
+                    .await;
+                    active_skills.push(candidate.skill);
+                }
+                SkillGate::Block { rationale } => {
+                    self.emit_skill_notice(
+                        session,
+                        NoticeLevel::Error,
+                        &candidate.skill.name,
+                        "blocked",
+                        &rationale,
+                        delta_tx.as_ref(),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        for skill in &active_skills {
+            session.messages.push(ChatMessage {
                 role: Role::System,
-                content: vec![ContentBlock::Text(format!(
-                    "[Skill: {}]\n{}",
-                    c.skill.name, c.skill.prompt_template
+                content: vec![ContentBlock::Text(aura_skills::render::render_skill_block(
+                    skill,
                 ))],
-            };
-            // Append synchronously is fine here — we already appended above.
-            // We'll handle the Result at the top of the loop.
-            session.messages.push(skill_msg);
+            });
+        }
 
-            c.skill.allowed_tools.clone()
-        });
+        session.state.active_skills = active_skills.iter().map(|s| s.name.clone()).collect();
+
+        // `allowed_tools` is the union of the active skills' declared
+        // allow-lists. Union over intersection means the user doesn't
+        // get starved when two active skills have disjoint needs; the
+        // tradeoff is accepting the most permissive policy across
+        // active skills, which matches the user's explicit intent to
+        // invoke all of them together.
+        let allowed_tools: Option<Vec<String>> = if active_skills.is_empty() {
+            None
+        } else {
+            let mut union: Vec<String> = Vec::new();
+            for s in &active_skills {
+                for t in &s.allowed_tools {
+                    if !union.iter().any(|existing| existing == t) {
+                        union.push(t.clone());
+                    }
+                }
+            }
+            Some(union)
+        };
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -186,6 +253,7 @@ impl AgentLoop {
                 } else {
                     response.content_blocks.clone()
                 };
+
                 let final_text = aura_llm::multimodal::extract_text(&final_blocks);
 
                 info!(
@@ -507,6 +575,86 @@ impl AgentLoop {
                     content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
                 },
             );
+        }
+    }
+
+    /// Run the LLM risk assessor against a selected skill. The caller
+    /// surfaces `PassWithWarning` / `Block` verdicts as user-facing
+    /// notices. All non-verdict outcomes — no assessor configured,
+    /// inline skill with no on-disk source, or a transient assessor
+    /// error — fall through as `Pass` so the agent stays functional
+    /// when the judge is unavailable.
+    async fn assess_skill_risk(&self, skill: &aura_skills::SkillDefinition) -> SkillGate {
+        let Some(assessor) = self.skill_assessor.as_ref() else {
+            return SkillGate::Pass;
+        };
+        match assessor.check(skill).await {
+            Ok(assessed) => match assessed.verdict.level {
+                RiskLevel::Dangerous => {
+                    warn!(
+                        skill = %skill.name,
+                        scope = %assessed.scope.as_str(),
+                        rationale = %assessed.verdict.rationale,
+                        "skill blocked by risk assessor"
+                    );
+                    SkillGate::Block {
+                        rationale: assessed.verdict.rationale,
+                    }
+                }
+                RiskLevel::Suspicious => {
+                    warn!(
+                        skill = %skill.name,
+                        scope = %assessed.scope.as_str(),
+                        background_pending = assessed.background_pending,
+                        rationale = %assessed.verdict.rationale,
+                        "skill rated suspicious — injecting with warning"
+                    );
+                    SkillGate::PassWithWarning {
+                        rationale: assessed.verdict.rationale,
+                    }
+                }
+                RiskLevel::Safe => SkillGate::Pass,
+            },
+            Err(aura_skills_assessor::AssessError::NoSourcePath) => SkillGate::Pass,
+            Err(err) => {
+                warn!(
+                    skill = %skill.name,
+                    error = %err,
+                    "risk assessor failed; allowing skill through"
+                );
+                SkillGate::Pass
+            }
+        }
+    }
+
+    /// Fire an `AgentOutput::Notice` telling the user that a skill they
+    /// explicitly invoked was flagged by the risk assessor. `headline`
+    /// is the short verb ("blocked", "rated suspicious"); `rationale`
+    /// is the assessor's free-form reason. Silently no-ops when no
+    /// output channel is attached (e.g. cron-triggered turns with no
+    /// live user surface).
+    async fn emit_skill_notice(
+        &self,
+        session: &Session,
+        level: NoticeLevel,
+        skill_name: &str,
+        headline: &str,
+        rationale: &str,
+        output_tx: Option<&mpsc::Sender<AgentOutput>>,
+    ) {
+        let Some(tx) = output_tx else { return };
+        let text = format!("Skill '{skill_name}' {headline}: {rationale}");
+        if tx
+            .send(AgentOutput::Notice {
+                session_id: session.id.clone(),
+                channel: session.channel,
+                level,
+                text,
+            })
+            .await
+            .is_err()
+        {
+            debug!("notice receiver dropped; skipping skill risk notice");
         }
     }
 

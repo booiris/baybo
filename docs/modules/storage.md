@@ -2,11 +2,11 @@
 
 ## Overview
 
-The `storage` crate is the single source of truth for all persistence interfaces and implementations. It defines **all** Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`) and implements them via **libsql** as the sole backend.
+The `storage` crate is the single source of truth for all persistence interfaces and implementations. It defines **all** Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`) and implements them via **libsql** as the sole backend.
 
 Its job is:
 
-- Define all Store traits (each in its own submodule: `session`, `memory`, `trace`, `secret`, `job`, `cost`)
+- Define all Store traits (each in its own submodule: `session`, `memory`, `trace`, `secret`, `job`, `cost`, `cron`, `risk`)
 - Implement all Store traits via libsql
 - Provide `Store` for dependency injection
 - Manage database schema initialization
@@ -26,9 +26,16 @@ trace.rs    → TraceStore    (uses aura_trace types)
 secret.rs   → SecretStore   (uses aura_security types)
 job.rs      → JobStore      (uses aura_job types)
 cost.rs     → CostStore     (defines its own types: CostRecord, CostSummary, TimeRange)
+cron.rs     → CronStore     (opaque row types: CronJobRow, CronExecutionRow — no dep on aura_cron)
+risk.rs     → SkillRiskStore     (defines RiskVerdict, RiskLevel, AssessmentJob, AssessmentJobStatus — consumed by aura-skills-assessor)
 ```
 
-`CostStore` is unique in that it also defines its own data types, because cost has no separate domain crate.
+`CostStore` and `SkillRiskStore` are unique in that they also define their own data types: cost has no separate domain crate, and risk types live in storage to keep `aura-skills` LLM-free while still allowing the assessor crate to persist verdicts.
+
+`SkillRiskStore` persists two kinds of rows:
+
+- `skill_risk_assessments` — finalized `RiskVerdict`s, keyed by `(skill_name, content_hash)`. The content hash's prefix tag distinguishes full-scope from primary-scope verdicts, so one table serves both scopes without an extra column.
+- `skill_risk_assessment_jobs` — in-flight full-scope assessments enqueued for the background worker (`AssessmentJob { skill_name, content_hash, source_path, status, attempts, last_error, created_at, updated_at }`, status one of `Pending`/`InProgress`/`Failed`). Written _before_ the channel send so a crash between persist and send is recoverable; `load_pending_jobs()` re-enqueues survivors on startup. `forget(skill)` deletes from both tables so a removed skill doesn't leave orphan work behind.
 
 ### Single backend: libsql
 
@@ -64,8 +71,8 @@ Use transactions for: `TraceStore.save_trace()` writing trace root and nodes ato
 
 ## Collaboration
 
-| Module                                               | Role                                                                                         |
-| ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `storage` (self)                                     | Defines all Store traits; provides all libsql implementations; defines cost types             |
-| `model` / `session` / `trace` / `security` / `job`   | Provide domain types consumed by Store traits                                                 |
-| `agent`                                              | Injects stores into managers; owns all business logic (SessionManager, MemoryManager, etc.)   |
+| Module                                             | Role                                                                                        |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `storage` (self)                                   | Defines all Store traits; provides all libsql implementations; defines cost types           |
+| `model` / `session` / `trace` / `security` / `job` | Provide domain types consumed by Store traits                                               |
+| `agent`                                            | Injects stores into managers; owns all business logic (SessionManager, MemoryManager, etc.) |

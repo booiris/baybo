@@ -34,6 +34,18 @@ against the canonical `OutgoingMessage` when the turn finishes. Delivery
 ordering per `session_id` is the caller's responsibility; adapters assume
 chunks arrive in the order the LLM emitted them.
 
+### Out-of-band notices
+
+`AgentOutput` carries three variants (`Delta`, `Message`, `Notice`).
+`Notice { level: NoticeLevel, text }` is the path for events the user
+didn't prompt for but should see — e.g. "a skill you invoked was rated
+suspicious and was kept with a warning" or "…was blocked". The router
+fans notices out to the per-session channel adapter via
+`ChannelAdapter::send_notice`; the default trait method is a no-op so
+transports without a side-channel (one-shot HTTP) can drop them. The
+built-in TUI forwards notices into the same scrollback surface it uses
+for `warn!` / `error!` tracing events, preserving colour coding.
+
 ### Unified message mapping
 
 All platforms map to the same `IncomingMessage` structure via consistent ID prefixing (e.g. `tg_{msg_id}`, `dc_{msg_id}`) and session derivation rules.

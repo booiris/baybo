@@ -83,19 +83,25 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "created_at": session.created_at.to_rfc3339(),
         "last_active": session.last_active.to_rfc3339(),
         "messages": session.messages.len(),
-        "active_skill": session.state.active_skill,
+        "active_skills": session.state.active_skills,
         "compression_count": session.state.compression_count,
     });
 
+    let active_skills_human = if session.state.active_skills.is_empty() {
+        "(none)".to_string()
+    } else {
+        session.state.active_skills.join(", ")
+    };
+
     let human = format!(
-        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\nactive_skill:   {}\ncompressions:   {}",
+        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\nactive_skills:  {}\ncompressions:   {}",
         session.id,
         session.user.id,
         session.channel,
         session.created_at.to_rfc3339(),
         session.last_active.to_rfc3339(),
         session.messages.len(),
-        session.state.active_skill.as_deref().unwrap_or("(none)"),
+        active_skills_human,
         session.state.compression_count,
     );
 

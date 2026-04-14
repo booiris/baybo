@@ -17,6 +17,7 @@ members = [
     "crates/storage",
     "crates/registry",
     "crates/skills",
+    "crates/skills-assessor",
     "crates/cron",
     "crates/config",
     "crates/cli",
@@ -45,6 +46,7 @@ aura-sandbox = { path = "crates/sandbox" }
 aura-storage = { path = "crates/storage" }
 aura-registry = { path = "crates/registry" }
 aura-skills = { path = "crates/skills" }
+aura-skills-assessor = { path = "crates/skills-assessor" }
 aura-cron = { path = "crates/cron" }
 aura-config = { path = "crates/config" }
 aura-cli = { path = "crates/cli" }
@@ -113,6 +115,7 @@ aura-agent = { workspace = true }
 aura-sandbox = { workspace = true }
 aura-storage = { workspace = true }
 aura-skills = { workspace = true }
+aura-skills-assessor = { workspace = true }
 aura-config = { workspace = true }
 aura-cli = { workspace = true }
 tokio = { workspace = true }

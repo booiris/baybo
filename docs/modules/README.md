@@ -33,6 +33,7 @@ Bottom-up along the dependency graph:
 - **tools** — Tool abstraction, registration, capability declarations, runtime routing. MCP client support via `rmcp`.
 - **registry** — Extension artifact verification and installation governance. Owns TrustLevel, ArtifactSource.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.
+- **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
 - **workspace** — Identity files and long-running configuration.
 - **cron** — Cron job domain types (`CronJob`, `CronExecution`, `CronStatus`, `CronRunMode`, `CronError`). Standard cron syntax.
 - **context** — Context appending, compression, snapshots, restoration.
@@ -45,7 +46,7 @@ Bottom-up along the dependency graph:
 
 ### Infrastructure and Assembly Layer
 
-- **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate.
+- **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free.
 - **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, ObservabilityRecorder, cost management (CostTracker, CostGuard), plus all domain managers (SessionManager, MemoryManager, TraceCollector, JobManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
 - **bootstrap** — Binary entry point (`src/main.rs`) and `boot` submodule. Loads `AuraConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
 - **cli** — Operator-facing command layer (`aura-cli`). One `clap` tree drives both argv-mode commands (`aura config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input never enters the agent's context.
@@ -63,6 +64,7 @@ model
   ├── trace ──► model, context, job
   ├── tools ──► model, session, registry, sandbox, rmcp
   ├── skills ──► registry
+  ├── skills-assessor ──► skills, storage, llm, model
   └── job (no internal deps)
   └── registry (no internal deps)
   └── workspace (no internal deps)

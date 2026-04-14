@@ -176,7 +176,19 @@ async fn main() -> anyhow::Result<()> {
 
     // --- minimal services required by both argv and chat modes ---
 
-    let skill_registry = Arc::new(SkillRegistry::new());
+    let skill_registry = {
+        let mut reg = SkillRegistry::new();
+        let workspace_skills = workspace_root.join("skills");
+        let workspace_loaded = reg.load_dir(&workspace_skills);
+        if workspace_loaded > 0 {
+            info!(
+                count = workspace_loaded,
+                path = %workspace_skills.display(),
+                "loaded skills from workspace"
+            );
+        }
+        Arc::new(reg)
+    };
     let tool_registry = Arc::new(ToolRegistry::new());
     let workspace = Arc::new(WorkspaceManager::new(PathBuf::from(&config.workspace.path)));
     let channels_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
@@ -249,6 +261,27 @@ async fn main() -> anyhow::Result<()> {
 
     // Storage layer — persistent libsql under the project root (`workspace.path`).
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
+
+    // Skill risk assessor — LLM-backed classifier with hash-keyed cache.
+    // Consulted lazily at skill-use time (slash dispatch + agent_loop gating).
+    // Large skills fall into a tiered flow where `SKILL.md` is judged
+    // synchronously and the full directory is handed to a background
+    // worker; persisted job rows are recovered below so an interrupted
+    // assessment resumes after restart instead of losing progress.
+    let risk_store: Arc<dyn aura_storage::SkillRiskStore> = Arc::from(storage.risk);
+    let skill_assessor = Arc::new(aura_skills_assessor::SkillAssessor::with_background_worker(
+        Arc::clone(&llm_client),
+        Arc::clone(&risk_store),
+    ));
+    {
+        let registry = Arc::clone(&skill_registry);
+        let lookup = move |name: &str| registry.get(name).map(|s| (*s).clone());
+        match skill_assessor.recover_pending_jobs(lookup).await {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "re-enqueued skill-risk jobs from prior run"),
+            Err(e) => tracing::warn!(error = %e, "failed to recover skill-risk jobs"),
+        }
+    }
 
     // Session manager
     let session_manager = Arc::new(SessionManager::new(
@@ -379,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
             .recorder(Arc::clone(&recorder))
             .security(Arc::clone(&security_gateway))
             .leak_detector(Arc::clone(&leak_detector))
+            .skill_assessor(Arc::clone(&skill_assessor))
             .build()
             .with_invocation(Invocation::Slash)
             .with_format(OutputFormat::Plain),
@@ -415,6 +449,7 @@ async fn main() -> anyhow::Result<()> {
     let actor_tokenizer = Arc::clone(&tokenizer);
     let actor_hooks = Arc::clone(&hook_manager);
     let actor_recorder = Arc::clone(&recorder);
+    let actor_skill_assessor = Arc::clone(&skill_assessor);
     let actor_token_budget = boot::to_token_budget(&config.agent.context);
     let actor_keep_recent = config.agent.context.keep_recent;
 
@@ -438,7 +473,8 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&actor_memory_manager),
             actor_policy.clone(),
             Soul::custom(actor_system_prompt.clone()),
-        );
+        )
+        .with_skill_assessor(Arc::clone(&actor_skill_assessor));
         let actor = AgentActor::new(
             session,
             agent_loop,

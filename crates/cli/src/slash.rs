@@ -64,6 +64,7 @@ impl CliSlashHandler {
             recorder: self.ctx.recorder.clone(),
             security: self.ctx.security.clone(),
             leak_detector: self.ctx.leak_detector.clone(),
+            skill_assessor: self.ctx.skill_assessor.clone(),
             format,
             invocation: Invocation::Slash,
             confirmed: false,

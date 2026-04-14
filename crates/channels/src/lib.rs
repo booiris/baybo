@@ -11,7 +11,9 @@ pub use slash::{
 };
 pub use tui::event::{LogLevel, LogRecord, TuiLogSink};
 pub use tui::{OnExit, TuiAdapter};
-pub use types::{AgentOutput, ChannelStatus, IncomingMessage, Message, OutgoingMessage};
+pub use types::{
+    AgentOutput, ChannelStatus, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
+};
 
 use async_trait::async_trait;
 use aura_session::ChannelType;
@@ -51,6 +53,17 @@ pub trait ChannelAdapter: Send + Sync + 'static {
     /// channels assume chunks arrive in the order the LLM emitted them.
     async fn send_stream_delta(&self, session_id: &str, delta: &str) -> Result<()> {
         let _ = (session_id, delta);
+        Ok(())
+    }
+
+    /// Deliver an out-of-band notice to the user for this session.
+    ///
+    /// Used for events the user didn't prompt for but should see (e.g.
+    /// a skill they invoked was rated suspicious). Channels that have
+    /// no user-visible surface for such notices may drop them; the
+    /// default implementation does exactly that.
+    async fn send_notice(&self, session_id: &str, level: NoticeLevel, text: &str) -> Result<()> {
+        let _ = (session_id, level, text);
         Ok(())
     }
 

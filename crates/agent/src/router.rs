@@ -341,6 +341,32 @@ impl Router {
                 }
             }
             AgentOutput::Message(outgoing) => self.handle_outgoing(outgoing).await,
+            AgentOutput::Notice {
+                session_id,
+                channel,
+                level,
+                text,
+            } => {
+                let channels = self.channels.read().await;
+                match channels.get(channel) {
+                    Some(adapter) => {
+                        if let Err(e) = adapter.send_notice(&session_id, level, &text).await {
+                            error!(
+                                channel = %channel,
+                                session_id = %session_id,
+                                error = %e,
+                                "failed to deliver notice"
+                            );
+                        }
+                    }
+                    None => {
+                        debug!(
+                            channel = %channel,
+                            "no adapter registered for notice"
+                        );
+                    }
+                }
+            }
         }
     }
 
