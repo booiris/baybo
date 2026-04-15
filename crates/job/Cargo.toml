@@ -15,4 +15,4 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-anyhow = "1"
+anyhow = { workspace = true }

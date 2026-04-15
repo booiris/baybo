@@ -23,6 +23,14 @@ RUST_LOG=aura=debug cargo run                                  # run with loggin
 - Comments for non-obvious logic only
 - Avoid exporting unnecessary item, prefer `pub(crate)` for functions and structs; use `pub` only when necessary
 
+## Dependency Management
+
+- All dependency versions are managed centrally in the root `Cargo.toml` under `[workspace.dependencies]`.
+- Crate `Cargo.toml` files MUST reference dependencies via `{ workspace = true }` — never hardcode a version in a crate.
+- Adding a new external dep: declare it in the root `[workspace.dependencies]` first, then pull it into the crate with `dep = { workspace = true }` (add per-crate `features = [...]` only when the crate needs extras beyond the workspace default).
+- Internal crates (`aura-*`) are also listed in `[workspace.dependencies]` with `path = "crates/<name>"` and consumed via `{ workspace = true }`.
+- Applies to both `[dependencies]` and `[dev-dependencies]`.
+
 ## Architecture
 
 Prefer generic/extensible architectures over hardcoding specific integrations. Ask clarifying questions about the desired abstraction level before implementing.
