@@ -1,8 +1,8 @@
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use aura_model::{ContentBlock, MemoryCategory, MemoryEntry};
 use aura_model::Session;
+use aura_model::{ContentBlock, MemoryCategory, MemoryEntry};
 use aura_storage::{MemoryStore, StorageError};
 
 #[derive(Debug, Error)]

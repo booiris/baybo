@@ -182,8 +182,8 @@ impl SecretVault {
 
 use aura_channels::{Message, OutgoingMessage};
 use aura_model::ContentBlock;
-use aura_security::LeakDetector;
 use aura_model::Session;
+use aura_security::LeakDetector;
 
 const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
 
@@ -385,8 +385,8 @@ enum NetworkPolicyDecision {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use aura_security::leak_detector::{LeakAction, LeakDetectionRule};
     use aura_model::ChannelType;
+    use aura_security::leak_detector::{LeakAction, LeakDetectionRule};
     use chrono::Utc;
     use regex::Regex;
     use std::sync::Mutex;

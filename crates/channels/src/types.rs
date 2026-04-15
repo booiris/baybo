@@ -1,5 +1,5 @@
-use aura_model::{ContentBlock, MessageMetadata};
 use aura_model::{ChannelType, User};
+use aura_model::{ContentBlock, MessageMetadata};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
