@@ -16,7 +16,7 @@ pub use types::{
 };
 
 use async_trait::async_trait;
-use aura_session::ChannelType;
+use aura_model::ChannelType;
 use tokio::sync::mpsc;
 
 pub type Result<T> = std::result::Result<T, ChannelError>;

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage, OutgoingMessage};
-use aura_session::{Session, User};
+use aura_model::{Session, User};
 
 use crate::cost::CostGuard;
 use crate::cron::CronTriggerEvent;

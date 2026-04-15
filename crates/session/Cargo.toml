@@ -5,12 +5,11 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
+aura-storage = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-anyhow = { workspace = true }
 thiserror = { workspace = true }
+anyhow = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 

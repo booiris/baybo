@@ -11,16 +11,16 @@ Its job is:
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Domain crates (`model`, `session`, `trace`, `security`, `job`) provide only **types**. Business logic (managers, collectors, gateways) lives in `agent`.
+Domain crates (`model`, `trace`, `security`, `job`) provide only **types**. Business logic (managers, collectors, gateways) lives in `agent` or — for `SessionManager` — in `aura-session`, which depends on `aura-storage` for the `SessionStore` trait.
 
 ## Design Decisions
 
 ### All Store traits defined in storage
 
-Every Store trait lives in `storage`, not in the domain crate. This avoids circular dependencies: domain crates define types → `storage` depends on those types to define traits → `agent` depends on both to wire business logic. All Store traits use `StorageError` as their error type — domain-specific error types do not leak into storage.
+Every Store trait lives in `storage`, not in the domain crate. This avoids circular dependencies: domain crates define types → `storage` depends on those types to define traits → managers depend on both to wire business logic. All Store traits use `StorageError` as their error type — domain-specific error types do not leak into storage.
 
 ```
-session.rs  → SessionStore  (uses aura_session types)
+session.rs  → SessionStore  (uses aura_model session types)
 memory.rs   → MemoryStore   (uses aura_model memory types)
 trace.rs    → TraceStore    (uses aura_trace types)
 secret.rs   → SecretStore   (uses aura_security types)
@@ -29,6 +29,8 @@ cost.rs     → CostStore     (defines its own types: CostRecord, CostSummary, T
 cron.rs     → CronStore     (opaque row types: CronJobRow, CronExecutionRow — no dep on aura_cron)
 risk.rs     → SkillRiskStore     (defines RiskVerdict, RiskLevel, AssessmentJob, AssessmentJobStatus — consumed by aura-skills-assessor)
 ```
+
+`Session`, `User`, `ChannelType`, and `SessionState` live in `aura-model` (not `aura-session`) so that `storage` can type `SessionStore` on `aura_model::Session` without pulling in `aura-session`. That keeps `aura-session` free to depend on `aura-storage` for the trait it consumes, avoiding a cycle via `storage → trace → context → session` and `storage → security → channels → session`.
 
 `CostStore` and `SkillRiskStore` are unique in that they also define their own data types: cost has no separate domain crate, and risk types live in storage to keep `aura-skills` LLM-free while still allowing the assessor crate to persist verdicts.
 
@@ -65,14 +67,15 @@ Use transactions for: `TraceStore.save_trace()` writing trace root and nodes ato
 
 ## Constraints
 
-- Depends on domain crates for types only (`model`, `session`, `trace`, `security`, `job`)
+- Depends on domain crates for types only (`model`, `trace`, `security`, `job`) — not on `aura-session`, to keep `aura-session → aura-storage` acyclic
 - Exposes trait objects externally, not concrete backend types
 - Assumes upper layers have already sanitized data before persistence
 
 ## Collaboration
 
-| Module                                             | Role                                                                                        |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `storage` (self)                                   | Defines all Store traits; provides all libsql implementations; defines cost types           |
-| `model` / `session` / `trace` / `security` / `job` | Provide domain types consumed by Store traits                                               |
-| `agent`                                            | Injects stores into managers; owns all business logic (SessionManager, MemoryManager, etc.) |
+| Module                                   | Role                                                                                      |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `storage` (self)                         | Defines all Store traits; provides all libsql implementations; defines cost / risk types  |
+| `model` / `trace` / `security` / `job`   | Provide domain types consumed by Store traits                                             |
+| `session`                                | Owns `SessionManager`; depends on `storage` to consume `SessionStore`                     |
+| `agent`                                  | Injects stores into managers (MemoryManager, JobManager, etc.); re-exports SessionManager |

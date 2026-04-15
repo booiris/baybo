@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aura_channels::{AgentOutput, IncomingMessage};
 use aura_hook::{HookContext, HookEventData, HookManager, HookPoint};
 use aura_model::ContentBlock;
-use aura_session::Session;
+use aura_model::Session;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 

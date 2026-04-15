@@ -5,10 +5,9 @@ pub mod job;
 pub mod libsql;
 pub mod memory;
 pub mod secret;
+pub mod session;
 pub mod skill_risk;
 pub mod trace;
-
-use aura_session::SessionStore;
 
 pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 pub use cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
@@ -16,6 +15,7 @@ pub use error::StorageError;
 pub use job::JobStore;
 pub use memory::MemoryStore;
 pub use secret::SecretStore;
+pub use session::SessionStore;
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use trace::TraceStore;
 

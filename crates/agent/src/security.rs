@@ -183,7 +183,7 @@ impl SecretVault {
 use aura_channels::{Message, OutgoingMessage};
 use aura_model::ContentBlock;
 use aura_security::LeakDetector;
-use aura_session::Session;
+use aura_model::Session;
 
 const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
 
@@ -386,7 +386,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule};
-    use aura_session::ChannelType;
+    use aura_model::ChannelType;
     use chrono::Utc;
     use regex::Regex;
     use std::sync::Mutex;
@@ -459,7 +459,7 @@ mod tests {
             id: "msg-1".into(),
             session_id: "sess-1".into(),
             channel: ChannelType::Tui,
-            sender: aura_session::User {
+            sender: aura_model::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
                 channel: ChannelType::Tui,
@@ -474,7 +474,7 @@ mod tests {
     fn make_session() -> Session {
         Session {
             id: "sess-1".into(),
-            user: aura_session::User {
+            user: aura_model::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
                 channel: ChannelType::Tui,

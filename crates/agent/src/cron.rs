@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use aura_cron::{CronError, CronExecution, CronJob, CronRunMode, CronStatus, ExecutionStatus};
-use aura_session::ChannelType;
+use aura_model::ChannelType;
 use aura_storage::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;

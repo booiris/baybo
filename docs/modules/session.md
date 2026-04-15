@@ -1,10 +1,10 @@
-# session - Session Types, Store Trait, and Manager
+# session - Session Lifecycle Manager
 
 ## Overview
 
-The `session` crate owns session-related domain types (`Session`, `SessionState`, `User`, `ChannelType`), the `SessionStore` persistence trait, and the `SessionManager` that implements session lifecycle logic.
+The `session` crate owns `SessionError` and the `SessionManager` that implements session lifecycle logic. Domain types (`Session`, `SessionState`, `User`, `ChannelType`) live in `aura-model`; the `SessionStore` persistence trait lives in `aura-storage`. `aura-session` depends on both and wraps the store behind the manager API.
 
-**Design principle**: session is a self-contained module — types, store interface, and business logic live together. Concrete storage implementations (e.g. libsql) live in `storage`; higher-level orchestration (Router, Actor) lives in `agent`.
+**Design principle**: types and store interface are pushed down into lower crates (`aura-model`, `aura-storage`) so this crate can consume the store without creating a dependency cycle. `SessionManager` itself is the only business-logic resident. Concrete storage implementations live in `storage`; higher-level orchestration (Router, Actor) lives in `agent`, which re-exports `SessionManager` for convenience.
 
 ## Design Decisions
 
@@ -34,13 +34,14 @@ Aura uses one Actor per session. All messages targeting the same session (user i
 ## Constraints
 
 - Session IDs are caller-supplied opaque strings; typical producers prefix a UUID v4 to namespace by channel (e.g. `cli-<uuid>`, `cron-<user>-<channel>`). `SessionManager::create_session` generates a bare UUID v4 only when no id is requested.
-- `SessionStore` trait lives in this crate; concrete implementations live in `storage`
-- `SessionManager` owns lifecycle logic; `agent` re-exports it for convenience
+- `Session`, `User`, `ChannelType`, `SessionState` live in `aura-model`; `SessionStore` lives in `aura-storage`.
+- `SessionManager` owns lifecycle logic; `StorageError` is wrapped into `SessionError::Storage` at the manager boundary; `agent` re-exports the manager for convenience.
 
 ## Collaboration
 
 | Module    | Role                                                                                    |
 | --------- | --------------------------------------------------------------------------------------- |
+| `model`   | Owns `Session`, `User`, `ChannelType`, `SessionState` — pure data types                 |
+| `storage` | Defines `SessionStore` trait and provides `LibsqlSessionStore`                          |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance |
-| `storage` | Provides concrete `SessionStore` implementations (e.g. `LibsqlSessionStore`)            |
 | `hook`    | `SessionCreated` / `SessionDestroyed` hook points for welcome messages, audit, cleanup  |

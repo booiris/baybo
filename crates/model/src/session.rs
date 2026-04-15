@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
-use aura_model::ChatMessage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::ChatMessage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {

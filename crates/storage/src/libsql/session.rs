@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use aura_session::store::Result;
-use aura_session::{Session, SessionError, SessionStore};
+use crate::error::StorageError;
+use crate::session::{Result, SessionStore};
+use aura_model::Session;
 
 pub struct LibsqlSessionStore {
     pool: LibsqlPool,
@@ -25,20 +26,20 @@ impl SessionStore for LibsqlSessionStore {
                 libsql::params![session_id.to_string()],
             )
             .await
-            .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
         let row = rows
             .next()
             .await
-            .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
 
         match row {
             Some(row) => {
                 let data: String = row
                     .get(0)
-                    .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let session: Session = serde_json::from_str(&data)
-                    .map_err(|e| SessionError::Storage(format!("deserialize session: {e}")))?;
+                    .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
                 Ok(Some(session))
             }
             None => Ok(None),
@@ -48,7 +49,7 @@ impl SessionStore for LibsqlSessionStore {
     async fn save(&self, session: &Session) -> Result<()> {
         let conn = self.pool.conn();
         let data = serde_json::to_string(session)
-            .map_err(|e| SessionError::Storage(format!("serialize session: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("serialize session: {e}")))?;
         // INSERT OR REPLACE rewrites the row, so `deleted_at` falls back to
         // its NULL default — saving a previously soft-deleted id revives it.
         conn.execute(
@@ -56,7 +57,7 @@ impl SessionStore for LibsqlSessionStore {
             libsql::params![session.id.clone(), data],
         )
         .await
-        .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql insert session: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql insert session: {e}")))?;
         Ok(())
     }
 
@@ -68,7 +69,7 @@ impl SessionStore for LibsqlSessionStore {
             libsql::params![now, session_id.to_string()],
         )
         .await
-        .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql delete session: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete session: {e}")))?;
         Ok(())
     }
 
@@ -77,20 +78,20 @@ impl SessionStore for LibsqlSessionStore {
         let mut rows = conn
             .query("SELECT id, data FROM sessions WHERE deleted_at IS NULL", ())
             .await
-            .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
         let mut expired = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
         {
             let id: String = row
                 .get(0)
-                .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             let data: String = row
                 .get(1)
-                .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             if let Ok(session) = serde_json::from_str::<Session>(&data)
                 && session.last_active < before
             {
@@ -105,19 +106,19 @@ impl SessionStore for LibsqlSessionStore {
         let mut rows = conn
             .query("SELECT data FROM sessions WHERE deleted_at IS NULL", ())
             .await
-            .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
         let mut sessions = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
         {
             let data: String = row
                 .get(0)
-                .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             let session: Session = serde_json::from_str(&data)
-                .map_err(|e| SessionError::Storage(format!("deserialize session: {e}")))?;
+                .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
             sessions.push(session);
         }
         Ok(sessions)
@@ -127,7 +128,7 @@ impl SessionStore for LibsqlSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_session::{ChannelType, SessionState, User};
+    use aura_model::{ChannelType, SessionState, User};
 
     fn make_session(id: &str) -> Session {
         Session {

@@ -5,7 +5,7 @@ use std::time::Duration;
 use aura_job::OperationKind;
 use aura_registry::TrustLevel;
 use aura_sandbox::{NetworkPolicy, SandboxPolicy};
-use aura_session::{ChannelType, User};
+use aura_model::{ChannelType, User};
 
 use crate::security::{ScopedSecretAccessor, SecretVault};
 use aura_tools::{

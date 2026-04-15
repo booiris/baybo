@@ -22,7 +22,7 @@ Bottom-up along the dependency graph:
 
 ### Ingress and Security Boundary Layer
 
-- **session** — Session domain types (User, ChannelType, Session, SessionState) and error definitions.
+- **session** — `SessionError` and `SessionManager` (lifecycle logic). Session domain types (`User`, `ChannelType`, `Session`, `SessionState`) live in `model`; the `SessionStore` trait lives in `storage`. `aura-session` depends on both.
 - **channels** — Channel adapter trait, shared message types (Message, IncomingMessage, OutgoingMessage), and `ChannelRegistry`. Includes the built-in `TuiAdapter` (Ratatui terminal UI, see [`tui.md`](./tui.md)); additional adapters can be WASM modules loaded at runtime.
 - **security** — Cryptographic primitives (EncryptionKey, encrypt/decrypt), leak detection (LeakDetector), error types.
 
@@ -54,15 +54,15 @@ Bottom-up along the dependency graph:
 ## Dependency Overview
 
 ```
-model
-  ├── session ──► model
-  ├── channels ──► model, session
+model (owns Session/User/ChannelType/SessionState + memory/message types; no internal deps)
+  ├── channels ──► model
   ├── llm ──► model
-  ├── context ──► model, session
-  ├── security ──► model, session, channels
+  ├── context ──► model
+  ├── security ──► model, channels
   ├── hook ──► channels
   ├── trace ──► model, context, job
-  ├── tools ──► model, session, registry, sandbox, rmcp
+  ├── tools ──► model, registry, sandbox, rmcp
+  ├── cron ──► model
   ├── skills ──► registry
   ├── skills-assessor ──► skills, storage, llm, model
   └── job (no internal deps)
@@ -71,7 +71,8 @@ model
   └── sandbox (no internal deps)
   └── config (no internal deps; external only)
 
-storage   ──► model, session, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
+storage   ──► model, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
+session   ──► model, storage (owns SessionManager; consumes SessionStore from storage)
 agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, sandbox, channels, registry, config
 bootstrap ──► config + all domain crates it assembles (entry point only)
 ```

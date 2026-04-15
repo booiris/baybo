@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aura-session = { workspace = true }
 aura-model = { workspace = true }
 aura-trace = { workspace = true }
 aura-security = { workspace = true }

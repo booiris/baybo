@@ -281,7 +281,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
- "aura-session",
  "chrono",
  "crossterm",
  "futures",
@@ -348,7 +347,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
- "aura-session",
  "chrono",
  "serde",
  "serde_json",
@@ -363,7 +361,7 @@ name = "aura-cron"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aura-session",
+ "aura-model",
  "chrono",
  "serde",
  "serde_json",
@@ -421,6 +419,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -457,7 +456,6 @@ dependencies = [
  "async-trait",
  "aura-channels",
  "aura-model",
- "aura-session",
  "chrono",
  "rand 0.10.0",
  "regex",
@@ -475,9 +473,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
+ "aura-storage",
  "chrono",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -523,7 +520,6 @@ dependencies = [
  "aura-job",
  "aura-model",
  "aura-security",
- "aura-session",
  "aura-trace",
  "chrono",
  "libsql",
@@ -542,7 +538,6 @@ dependencies = [
  "aura-model",
  "aura-registry",
  "aura-sandbox",
- "aura-session",
  "rmcp",
  "serde",
  "serde_json",

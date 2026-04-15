@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use aura_model::{ContentBlock, MessageMetadata};
-use aura_session::{ChannelType, User};
+use aura_model::{ChannelType, User};
 use chrono::Utc;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEvent,

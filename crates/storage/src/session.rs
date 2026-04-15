@@ -1,9 +1,10 @@
 use async_trait::async_trait;
+use aura_model::Session;
 use chrono::{DateTime, Utc};
 
-use crate::{Session, SessionError};
+use crate::error::StorageError;
 
-pub type Result<T> = std::result::Result<T, SessionError>;
+pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Abstract interface for session persistence.
 #[async_trait]

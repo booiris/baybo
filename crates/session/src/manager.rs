@@ -1,11 +1,15 @@
-use aura_model::ChatMessage;
+use aura_model::{ChannelType, ChatMessage, Session, SessionState, User};
+use aura_storage::{SessionStore, StorageError};
 use chrono::{Duration, Utc};
 use tracing::{debug, warn};
 
-use crate::store::SessionStore;
-use crate::{ChannelType, Session, SessionError, SessionState, User};
+use crate::SessionError;
 
 type Result<T> = std::result::Result<T, SessionError>;
+
+fn wrap(e: StorageError) -> SessionError {
+    SessionError::Storage(e.to_string())
+}
 
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
@@ -42,7 +46,7 @@ impl SessionManager {
             last_active: now,
             state: SessionState::default(),
         };
-        self.store.save(&session).await?;
+        self.store.save(&session).await.map_err(wrap)?;
         debug!(session_id = %session.id, "created new session");
         Ok(session)
     }
@@ -53,11 +57,11 @@ impl SessionManager {
         user: User,
         channel: ChannelType,
     ) -> Result<Session> {
-        if let Some(session) = self.store.get(session_id).await? {
+        if let Some(session) = self.store.get(session_id).await.map_err(wrap)? {
             let cutoff = Utc::now() - self.session_timeout;
             if session.last_active < cutoff {
                 debug!(session_id, "session expired, replacing with new session");
-                self.store.delete(session_id).await?;
+                self.store.delete(session_id).await.map_err(wrap)?;
                 return self
                     .create_session_with_id(session_id.to_string(), user, channel)
                     .await;
@@ -71,12 +75,12 @@ impl SessionManager {
     }
 
     pub async fn get(&self, session_id: &str) -> Result<Option<Session>> {
-        self.store.get(session_id).await
+        self.store.get(session_id).await.map_err(wrap)
     }
 
     /// Return every session known to the underlying store, newest-active first.
     pub async fn list(&self) -> Result<Vec<Session>> {
-        let mut sessions = self.store.list_all().await?;
+        let mut sessions = self.store.list_all().await.map_err(wrap)?;
         sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
         Ok(sessions)
     }
@@ -84,7 +88,7 @@ impl SessionManager {
     /// Return the transcript (`messages`) of the given session. Errors with
     /// `SessionError::NotFound` if the session does not exist.
     pub async fn history(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
-        match self.store.get(session_id).await? {
+        match self.store.get(session_id).await.map_err(wrap)? {
             Some(session) => Ok(session.messages),
             None => Err(SessionError::NotFound(format!("session {session_id}"))),
         }
@@ -94,20 +98,20 @@ impl SessionManager {
     /// session did not exist at the time of the call so the operator sees
     /// feedback instead of a silent no-op.
     pub async fn delete(&self, session_id: &str) -> Result<()> {
-        if self.store.get(session_id).await?.is_none() {
+        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
-        self.store.delete(session_id).await?;
+        self.store.delete(session_id).await.map_err(wrap)?;
         debug!(session_id, "deleted session");
         Ok(())
     }
 
     pub async fn touch(&self, session_id: &str) -> Result<()> {
-        let session = self.store.get(session_id).await?;
+        let session = self.store.get(session_id).await.map_err(wrap)?;
         match session {
             Some(mut session) => {
                 session.last_active = Utc::now();
-                self.store.save(&session).await?;
+                self.store.save(&session).await.map_err(wrap)?;
                 debug!(session_id, "touched session");
                 Ok(())
             }
@@ -122,10 +126,10 @@ impl SessionManager {
     /// Returns the number of sessions removed.
     pub async fn cleanup_expired(&self) -> Result<usize> {
         let cutoff = Utc::now() - self.session_timeout;
-        let expired_ids = self.store.list_expired(cutoff).await?;
+        let expired_ids = self.store.list_expired(cutoff).await.map_err(wrap)?;
         let count = expired_ids.len();
         for id in &expired_ids {
-            self.store.delete(id).await?;
+            self.store.delete(id).await.map_err(wrap)?;
         }
         if count > 0 {
             debug!(count, "cleaned up expired sessions");
@@ -140,12 +144,11 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use aura_model::{ChannelType, Session, User};
+    use aura_storage::session::Result as StoreResult;
     use chrono::{DateTime, Duration, Utc};
 
-    use crate::store::SessionStore;
-    use crate::{ChannelType, Session, User};
-
-    use super::{Result, SessionManager};
+    use super::{SessionError, SessionManager, SessionStore};
 
     struct MemorySessionStore {
         data: Mutex<HashMap<String, Session>>,
@@ -161,24 +164,24 @@ mod tests {
 
     #[async_trait]
     impl SessionStore for MemorySessionStore {
-        async fn get(&self, session_id: &str) -> Result<Option<Session>> {
+        async fn get(&self, session_id: &str) -> StoreResult<Option<Session>> {
             let data = self.data.lock().unwrap();
             Ok(data.get(session_id).cloned())
         }
 
-        async fn save(&self, session: &Session) -> Result<()> {
+        async fn save(&self, session: &Session) -> StoreResult<()> {
             let mut data = self.data.lock().unwrap();
             data.insert(session.id.clone(), session.clone());
             Ok(())
         }
 
-        async fn delete(&self, session_id: &str) -> Result<()> {
+        async fn delete(&self, session_id: &str) -> StoreResult<()> {
             let mut data = self.data.lock().unwrap();
             data.remove(session_id);
             Ok(())
         }
 
-        async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<String>> {
+        async fn list_expired(&self, before: DateTime<Utc>) -> StoreResult<Vec<String>> {
             let data = self.data.lock().unwrap();
             let expired = data
                 .values()
@@ -188,7 +191,7 @@ mod tests {
             Ok(expired)
         }
 
-        async fn list_all(&self) -> Result<Vec<Session>> {
+        async fn list_all(&self) -> StoreResult<Vec<Session>> {
             let data = self.data.lock().unwrap();
             Ok(data.values().cloned().collect())
         }
@@ -341,7 +344,7 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let err = mgr.history("nonexistent").await.unwrap_err();
-        assert!(matches!(err, crate::SessionError::NotFound(_)));
+        assert!(matches!(err, SessionError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -364,7 +367,7 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let err = mgr.delete("nonexistent").await.unwrap_err();
-        assert!(matches!(err, crate::SessionError::NotFound(_)));
+        assert!(matches!(err, SessionError::NotFound(_)));
     }
 
     #[tokio::test]

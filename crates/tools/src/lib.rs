@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_sandbox::{NetworkPolicy, SandboxPolicy};
-use aura_session::User;
+use aura_model::User;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

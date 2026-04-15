@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aura_model::ChatMessage;
-use aura_session::Session;
+use aura_model::Session;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -242,12 +242,12 @@ mod tests {
     fn make_session(messages: Vec<ChatMessage>) -> Session {
         Session {
             id: "test-session".to_string(),
-            user: aura_session::User {
+            user: aura_model::User {
                 id: "user-1".to_string(),
                 name: None,
-                channel: aura_session::ChannelType::Tui,
+                channel: aura_model::ChannelType::Tui,
             },
-            channel: aura_session::ChannelType::Tui,
+            channel: aura_model::ChannelType::Tui,
             messages,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),

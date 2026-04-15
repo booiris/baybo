@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use aura_session::ChannelType;
+use aura_model::ChannelType;
 use tokio::sync::mpsc;
 
 use crate::{ChannelAdapter, ChannelError, ChannelStatus, IncomingMessage, Result};

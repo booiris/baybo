@@ -14,7 +14,7 @@ pub async fn handle(ctx: &CommandContext, cmd: SessionCmd) -> Result<CommandOutp
     }
 }
 
-fn sessions(ctx: &CommandContext) -> Result<&aura_session::SessionManager> {
+fn sessions(ctx: &CommandContext) -> Result<&aura_agent::SessionManager> {
     ctx.session.as_deref().ok_or_else(|| {
         CliError::Manager("session manager is not available in this invocation".into())
     })

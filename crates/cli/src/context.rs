@@ -2,13 +2,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aura_agent::{
-    CronScheduler, JobManager, MemoryManager, ObservabilityRecorder, SecurityGateway, ToolExecutor,
+    CronScheduler, JobManager, MemoryManager, ObservabilityRecorder, SecurityGateway,
+    SessionManager, ToolExecutor,
 };
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
 use aura_security::LeakDetector;
-use aura_session::SessionManager;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
 use aura_storage::TraceStore;

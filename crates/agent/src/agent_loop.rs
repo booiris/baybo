@@ -11,7 +11,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
-use aura_session::Session;
+use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
 use aura_tools::ToolRegistry;

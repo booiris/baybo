@@ -1,5 +1,5 @@
 use aura_cron::{CronJob, CronRunMode, CronStatus};
-use aura_session::ChannelType;
+use aura_model::ChannelType;
 use serde_json::{Value, json};
 
 use crate::cli::CronCmd;

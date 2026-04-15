@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, JobManager, MemoryManager, ShutdownSignal};
+use aura_agent::{CronScheduler, JobManager, MemoryManager, SessionManager, ShutdownSignal};
 use aura_channels::ChannelRegistry;
 use aura_cli::cli::{
     AgentCmd, ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LeaksCmd, LlmCmd,
@@ -18,13 +18,12 @@ use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
 use aura_cron::CronRunMode;
 use aura_job::{Job, JobError, JobStatus, JobTransition, OperationKind};
-use aura_model::{MemoryCategory, MemoryEntry};
-use aura_session::store::SessionStore;
-use aura_session::{ChannelType, Session, SessionError, SessionManager, SessionState, User};
+use aura_model::{ChannelType, MemoryCategory, MemoryEntry, Session, SessionState, User};
 use aura_skills::SkillRegistry;
 use aura_storage::{
-    CronExecutionRow, CronJobRow, CronStore, CronStoreError, JobStore, MemoryStore, TraceStore,
-    cron::Result as CronResult, memory::Result as MemoryResult, trace::Result as TraceResult,
+    CronExecutionRow, CronJobRow, CronStore, CronStoreError, JobStore, MemoryStore, SessionStore,
+    TraceStore, cron::Result as CronResult, memory::Result as MemoryResult,
+    session::Result as SessionResult, trace::Result as TraceResult,
 };
 use aura_tools::ToolRegistry;
 use aura_trace::{
@@ -62,11 +61,11 @@ impl MemorySessionStore {
 
 #[async_trait::async_trait]
 impl SessionStore for MemorySessionStore {
-    async fn get(&self, session_id: &str) -> Result<Option<Session>, SessionError> {
+    async fn get(&self, session_id: &str) -> SessionResult<Option<Session>> {
         Ok(self.data.lock().unwrap().get(session_id).cloned())
     }
 
-    async fn save(&self, session: &Session) -> Result<(), SessionError> {
+    async fn save(&self, session: &Session) -> SessionResult<()> {
         self.data
             .lock()
             .unwrap()
@@ -74,12 +73,12 @@ impl SessionStore for MemorySessionStore {
         Ok(())
     }
 
-    async fn delete(&self, session_id: &str) -> Result<(), SessionError> {
+    async fn delete(&self, session_id: &str) -> SessionResult<()> {
         self.data.lock().unwrap().remove(session_id);
         Ok(())
     }
 
-    async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<String>, SessionError> {
+    async fn list_expired(&self, before: DateTime<Utc>) -> SessionResult<Vec<String>> {
         Ok(self
             .data
             .lock()
@@ -90,7 +89,7 @@ impl SessionStore for MemorySessionStore {
             .collect())
     }
 
-    async fn list_all(&self) -> Result<Vec<Session>, SessionError> {
+    async fn list_all(&self) -> SessionResult<Vec<Session>> {
         Ok(self.data.lock().unwrap().values().cloned().collect())
     }
 }
