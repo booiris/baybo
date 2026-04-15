@@ -264,14 +264,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Skill risk assessor — LLM-backed classifier with hash-keyed cache.
     // Consulted lazily at skill-use time (slash dispatch + agent_loop gating).
-    // Large skills fall into a tiered flow where `SKILL.md` is judged
-    // synchronously and the full directory is handed to a background
-    // worker; persisted job rows are recovered below so an interrupted
-    // assessment resumes after restart instead of losing progress.
+    // `config.skills.risk_check` picks the scope: `off` skips the check
+    // entirely, `primary` (the default) judges `SKILL.md` only, `full`
+    // judges the whole directory. Persisted job rows from older tiered
+    // builds are recovered below so upgrading the assessor doesn't
+    // silently abandon in-flight verdicts.
     let risk_store: Arc<dyn aura_storage::SkillRiskStore> = Arc::from(storage.risk);
+    let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
     let skill_assessor = Arc::new(aura_skills_assessor::SkillAssessor::with_background_worker(
         Arc::clone(&llm_client),
         Arc::clone(&risk_store),
+        assessment_mode,
     ));
     {
         let registry = Arc::clone(&skill_registry);

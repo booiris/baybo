@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 
 use aura_agent::policy::ExecutionPolicy;
 use aura_config::{
-    AgentConfig, AuraConfig, LlmConfig, SecurityConfig, SessionConfig, ToolsConfig, WorkspaceConfig,
+    AgentConfig, AuraConfig, LlmConfig, RiskCheckConfig, SecurityConfig, SessionConfig,
+    ToolsConfig, WorkspaceConfig,
 };
 use aura_context::TokenBudget;
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
+use aura_skills_assessor::AssessmentMode;
 use tracing::info;
 
 // ---------------------------------------------------------------------------
@@ -137,6 +139,14 @@ pub fn to_session_timeout(cfg: &SessionConfig) -> chrono::Duration {
 
 pub fn to_tool_timeout(cfg: &ToolsConfig) -> std::time::Duration {
     std::time::Duration::from_millis(cfg.default_timeout_ms)
+}
+
+pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
+    match cfg {
+        RiskCheckConfig::Off => AssessmentMode::Off,
+        RiskCheckConfig::Primary => AssessmentMode::Primary,
+        RiskCheckConfig::Full => AssessmentMode::Full,
+    }
 }
 
 pub fn build_leak_detector(cfg: &SecurityConfig) -> LeakDetector {

@@ -6,7 +6,7 @@ The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `val
 
 A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consumers (`main.rs` and `aura-agent`) map each section into the corresponding domain type.
 
-Top-level sections: `llm`, `agent`, `session`, `channels`, `sandbox`, `security`, `tools`, `trace`, `cost`, `workspace`.
+Top-level sections: `llm`, `agent`, `session`, `channels`, `sandbox`, `security`, `skills`, `tools`, `trace`, `cost`, `workspace`.
 
 There is no `storage` section. Storage paths are **derived** from the project root (`workspace.path`) — operators choose a project root, not individual data-file locations.
 
@@ -84,12 +84,13 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 | `channels` | `ChannelRegistry` adapter enablement + mpsc buffer sizes    | See §"Channel enablement model".                                                                                                                                                                     |
 | `sandbox`  | `SandboxLimits` + `NetworkPolicy`                           |                                                                                                                                                                                                      |
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
+| `skills`   | `aura_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
 | `tools`    | `McpServerConfig` list + `ToolExecutor` default timeout     |                                                                                                                                                                                                      |
 | `trace`    | `TraceCollector` auto-snapshot and interval                 |                                                                                                                                                                                                      |
 | `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
 | `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/.aura/storage.db`).                                                                |
 
-`registry`, `skills`, and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
+`registry` and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
 
 ### Channel enablement model
 
@@ -99,7 +100,6 @@ Each optional channel (`telegram`, `discord`, `http`) is wrapped in `Option<_>`:
 
 The following modules do not (yet) have sections in the root config. This is a deliberate phased decision, not an oversight. Each has a planned placement:
 
-- **skills** — hot-reload switch, additional skill directories, trust tiers. Today `SkillRegistry::load_dir(<workspace.path>/skills)` is the only source, with all loaded skills pinned to `Trusted`; no operator-tunable knobs yet.
 - **registry** — artifact source allowlist, signature verification policy, trust ceilings. Today the defaults are baked into the registry constructors.
 - **cron** — scheduler poll interval, max concurrent runs, missed-run policy. Today `CronScheduler` uses compile-time defaults.
 

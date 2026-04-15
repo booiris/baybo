@@ -44,6 +44,9 @@
     "encryption_key_env": "AURA_ENCRYPTION_KEY",
     "leak_detection_enabled": true
   },
+  "skills": {
+    "risk_check": "primary"
+  },
   "tools": {
     "mcp_servers": [],
     "default_timeout_ms": 30000

@@ -2,15 +2,17 @@
 //!
 //! The worker runs on its own Tokio task and drains an mpsc queue
 //! serially — one LLM call at a time, to keep provider load bounded.
-//! Every job that lands in the queue is also persisted in the
-//! `skill_risk_assessment_jobs` table *before* the send, so a crash
-//! between persist and send, or between send and completion, can be
-//! recovered on the next startup via [`SkillRiskStore::load_pending_jobs`].
+//! Under `AssessmentMode::Full`, large skills (> `TIER_MAX_FILES` or
+//! `TIER_MAX_BYTES`) are tiered: `check_full` classifies `SKILL.md`
+//! synchronously and enqueues a full-scope job here so a chat turn
+//! doesn't block on a big LLM prompt. The worker also drains any
+//! `skill_risk_assessment_jobs` rows left behind by older binaries so
+//! upgrades don't silently abandon in-flight verdicts.
 //!
 //! "Progress" in this system is coarse: an LLM call is atomic, so the
 //! only resumable state is "the job is still owed, run it again." If a
 //! skill's content changed while the job was queued the worker drops
-//! the stale job and a fresh `check` call will enqueue a new one.
+//! the stale job and a fresh `check` call will produce a new verdict.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,10 +27,12 @@ use tracing::{debug, info, warn};
 use crate::hash::hash_skill_dir;
 use crate::prompt::{Scope, build_messages, parse_verdict};
 
-/// Work order sent from `SkillAssessor::check` into the background
-/// queue. A copy of the skill definition is captured so the worker can
-/// reconstruct the prompt without re-locating the skill in the
-/// registry (which may have been reloaded by the time the job runs).
+/// Full-scope work order. Produced by `check_full` when a skill trips
+/// the tier threshold and at startup when recovering rows from the
+/// persisted jobs table. A copy of the skill definition is captured so
+/// the worker can reconstruct the prompt without re-locating the skill
+/// in the registry (which may have been reloaded by the time the job
+/// runs).
 #[derive(Debug, Clone)]
 pub struct BackgroundJob {
     pub skill: SkillDefinition,

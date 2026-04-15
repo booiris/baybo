@@ -10,26 +10,25 @@ Core responsibilities:
 
 - Hash a skill directory in a stable, tamper-evident way (`hash_skill_dir`, `hash_skill_primary`).
 - Prompt an LLM with the skill contents, parse the JSON verdict.
-- Persist verdicts and in-flight jobs via `SkillRiskStore` (defined in `storage`).
-- Tier large skills: fast `SKILL.md`-only verdict up front, full-directory check deferred to a background worker.
-- Recover interrupted background jobs across restarts.
+- Persist verdicts via `SkillRiskStore` (defined in `storage`).
+- Honour the `AssessmentMode` set at construction: `Off` skips the check, `Primary` judges `SKILL.md`, `Full` judges the whole tree (tiering oversized trees to a background worker).
+- Run oversized full-scope jobs on a background worker so chat turns don't block on a large LLM prompt, and recover any persisted job rows left behind by older builds so upgrades don't silently abandon in-flight verdicts.
 
 ## Public surface
 
 ```
 AssessError            — enum: NoSourcePath | Hash | Store | Llm | UnparseableReply
-AssessmentScope        — enum: Primary | Full
+AssessmentMode         — enum: Off | Primary (default) | Full
+AssessmentScope        — enum: Disabled | Primary | Full
 AssessedSkill          — { verdict: RiskVerdict, scope: AssessmentScope, background_pending: bool }
 SkillAssessor
-  ::new(llm, store)                         — sync-only, no worker (argv mode)
-  ::with_background_worker(llm, store)      — spawns worker on current Tokio runtime
-  .check(skill) -> AssessedSkill            — main entrypoint
-  .cached(skill) -> Option<(RiskVerdict, AssessmentScope)>  — cache-only, never calls LLM
-  .recover_pending_jobs(lookup)             — re-enqueue persisted jobs at startup
+  ::with_background_worker(llm, store, mode) — spawns a recovery worker on the current Tokio runtime
+  .check(skill) -> AssessedSkill             — main entrypoint; dispatches on mode
+  .mode() -> AssessmentMode
+  .recover_pending_jobs(lookup)              — re-enqueue persisted jobs at startup (no-op when mode=Off)
 
 hash_skill_dir(dir)     -> io::Result<String>          — full-scope SHA-256
 hash_skill_primary(dir) -> io::Result<Option<String>>  — SKILL.md-only SHA-256
-should_tier(dir)        -> io::Result<bool>            — size probe
 
 // re-exported from aura-storage so callers only need to depend on this crate:
 RiskVerdict, RiskLevel, SkillRiskStore, AssessmentJob, AssessmentJobStatus
@@ -60,31 +59,26 @@ An LLM call per skill per agent turn is not affordable. Verdicts are cached unde
 
 **Tradeoff, explicitly**: an attacker who can `touch -t` a file back to its prior mtime, or a filesystem with coarse mtime resolution (HFS, some network FS), could in principle keep a modified file indistinguishable from the previous version under this scheme. The threat model already assumes the attacker has some write access inside the workspace; defeating mtime forgery too would require re-reading every byte on every gate call, which is the cost we chose to stop paying. If this ever becomes a concrete threat, swap `hash_metadata` back to a content hash — the surrounding plumbing (scope prefix, length prefix, entry sort) is unchanged.
 
-### Tiered assessment
+### Mode selection
 
-Many skills are small (one `SKILL.md`, a few KiB). A single synchronous LLM call is the cheapest possible path and it's what `check` does by default. But large packages (helper scripts, long instructions) would block every first-use call for seconds. `should_tier(dir)` returns `true` when either threshold is exceeded:
+`AssessmentMode` is chosen at construction (bootstrapped from `config.skills.risk_check` in `aura.json`) and controls the entire `check` flow:
 
-- File count > 4
-- Aggregate bytes > 16 KiB (symlink targets don't count)
+- **Off** — the classifier is never called. Every skill returns a synthesised `Safe` verdict with `scope = Disabled`. No hashing, no I/O, no cache reads or writes. The background recovery worker is also idle — we don't want disabling the check to silently drain persisted jobs to the LLM.
+- **Primary** (default) — classify `SKILL.md` alone. Helper scripts are neither read nor judged. If the skill directory has no `SKILL.md`, the assessor returns a synthesised `Safe` verdict rather than escalating: operators who want helper-script coverage must opt into `Full`.
+- **Full** — classify the whole directory tree. Small trees (≤ `TIER_MAX_FILES` files AND ≤ `TIER_MAX_BYTES` aggregate) are judged synchronously on first use; subsequent calls hit the cache. Oversized trees tier automatically: the assessor classifies `SKILL.md` synchronously (returning `scope = Primary`, `background_pending = true`) and enqueues a full-scope job for the background worker. A later `check_full` call that still finds no full-scope cache entry returns the primary verdict without re-enqueuing, so the worker runs the full-scope LLM call at most once per `(skill, full_hash)`.
 
-Above the threshold, `check` splits into two phases:
+The tier thresholds are deliberately tight (`TIER_MAX_FILES = 4`, `TIER_MAX_BYTES = 16 KiB`): a real skill is usually one prompt file, so anything above this is either a helper-heavy package or a signal that the LLM prompt is going to be expensive — either way, not work to put on the chat hot path. The hard caps in [Hashing rules](#hashing-rules) still apply on top and reject pathological trees before any tiering decision.
 
-1. **Primary (synchronous)** — LLM classifies `SKILL.md` only, with a system-prompt preamble telling the model helpers are being assessed asynchronously. Caller gets an `AssessedSkill { scope: Primary, background_pending: true }` immediately.
-2. **Full (background)** — a job row is persisted in `skill_risk_assessment_jobs` *before* the in-memory send, then handed to a single worker that drains serially. On success the full verdict replaces the primary one and the job row is deleted.
+### Crash-safe recovery worker
 
-The synchronous-only constructor (`SkillAssessor::new`) skips tiered mode entirely — an argv command like `aura skills check` doesn't have a long-lived runtime to own a worker, and a slow one-shot is preferable to losing the full verdict altogether.
+The background worker handles two kinds of full-scope jobs: ones enqueued live by `check_full` when a skill trips the tier threshold, and ones recovered from `skill_risk_assessment_jobs` at startup (either tiered jobs that didn't finish before the last shutdown, or rows written by older binaries). "Progress" in this system is coarse: an LLM call is atomic, so the only resumable state is *"this job is still owed, run it again."*
 
-### Crash-safe background worker
-
-"Progress" in this system is coarse: an LLM call is atomic, so the only resumable state is *"this job is still owed, run it again."* The worker is designed around that:
-
-- Job row is persisted via `SkillRiskStore::upsert_job` **before** the channel send, so a crash between persist and send is recoverable.
 - Worker marks the row `InProgress` on pickup. If the marker write fails it proceeds anyway — a lost marker just means the row looks `Pending` on next startup, which is still semantically correct.
-- Worker re-hashes the directory on pickup. If the current hash differs from the job's `expected_hash`, the skill changed while the job was queued; the stale row is deleted and a fresh `check` will enqueue a new job keyed on the new hash.
+- Worker re-hashes the directory on pickup. If the current hash differs from the job's `expected_hash`, the skill changed while the job was queued; the stale row is deleted.
 - On transient failure the row goes back to `Pending` with `attempts` incremented and a `last_error` string. `MAX_ATTEMPTS = 3`, `RETRY_DELAY = 5s`.
-- After exhausting retries the row is left in `Failed` state for operator inspection rather than deleted — deleting a repeatedly-failing row would just cause the next `check` to re-enqueue it and hide the problem.
+- After exhausting retries the row is left in `Failed` state for operator inspection.
 
-`recover_pending_jobs(lookup)` runs once at startup after the skill registry is populated. It takes a closure mapping `skill_name` → `Option<SkillDefinition>`; rows for unregistered skills or missing-on-disk source paths are deleted, survivors are re-sent to the worker.
+`recover_pending_jobs(lookup)` runs once at startup after the skill registry is populated. It takes a closure mapping `skill_name` → `Option<SkillDefinition>`; rows for unregistered skills or missing-on-disk source paths are deleted, survivors are re-sent to the worker. Recovery runs regardless of the current `AssessmentMode` — `Off` only suppresses new enqueues, it does not strand work already committed to disk. A previous `Full` tiered session whose worker died mid-flight will finish on the next start even if the operator has since flipped to `Off`.
 
 ### Non-blocking error policy
 
@@ -105,25 +99,25 @@ Only `Dangerous` blocks skill injection. Assessor errors (LLM unreachable, unpar
 ```
 check(skill)
   │
-  ├─ hash_skill_dir → full_hash
-  ├─ SkillRiskStore::get(name, full_hash) → hit? return Full
+  ├─ mode == Off      → synth Safe (scope=Disabled), no I/O
   │
-  ├─ should_tier(dir)?
-  │     │
-  │     ├─ false / no worker → LLM(full) → put → return Full
-  │     │
-  │     └─ true → hash_skill_primary
-  │              ├─ None (no SKILL.md) → LLM(full) → put → return Full
-  │              └─ Some(primary_hash)
-  │                    ├─ SkillRiskStore::get(name, primary_hash) → hit?
-  │                    │                                         └─ enqueue full job
-  │                    │                                            return Primary
-  │                    └─ miss → LLM(primary) → put
-  │                                           → enqueue full job
-  │                                           → return Primary
+  ├─ mode == Primary  → hash_skill_primary
+  │                       ├─ None (no SKILL.md) → synth Safe (scope=Disabled)
+  │                       └─ Some(hash)
+  │                             ├─ cache hit → return Primary
+  │                             └─ miss → LLM(primary) → put → return Primary
+  │
+  └─ mode == Full     → hash_skill_dir
+                          ├─ cache hit → return Full
+                          └─ miss
+                             ├─ !should_tier → LLM(full) sync → put → return Full
+                             └─ should_tier → hash_skill_primary
+                                  ├─ primary cache hit → enqueued earlier; return Primary (pending=true)
+                                  └─ miss → LLM(primary) sync → put
+                                            → upsert_job + tx.send(full) → return Primary (pending=true)
 ```
 
-Background worker loop:
+Worker loop (new tiered jobs + recovered rows from older builds):
 
 ```
 recv(job)
@@ -139,21 +133,20 @@ recv(job)
 Owned by `storage::risk` (see [storage.md](storage.md)):
 
 - `skill_risk_assessments(skill_name, content_hash, level, rationale, model, assessed_at)` — finalised verdicts. One table for both scopes; scope is encoded in the hash prefix, not a separate column.
-- `skill_risk_assessment_jobs(skill_name, content_hash, source_path, status, attempts, last_error, created_at, updated_at)` — in-flight full-scope work. `status` is `Pending` | `InProgress` | `Failed`. Written before the channel send.
+- `skill_risk_assessment_jobs(skill_name, content_hash, source_path, status, attempts, last_error, created_at, updated_at)` — in-flight full-scope work. `status` is `Pending` | `InProgress` | `Failed`. Written live when `Full` mode tiers a large skill; also carries rows left behind by older builds that can be recovered at startup.
 - `SkillRiskStore::forget(skill)` clears both tables so a removed skill doesn't leave orphan work behind.
 
 ## Integration points
 
-- **`aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. JSON output includes `scope` and `background_pending`; human-readable lines suffix `(full-scope assessment in progress)` when pending.
+- **`aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. JSON output includes `scope` and `background_pending`.
 - **`AgentLoop::assess_skill_risk`** — gates per-skill system-message injection. `Dangerous` verdicts drop the skill silently (logged with `scope` and `background_pending`) so the model is never shown the prompt body. Lazy: no work until the skill is actually reached.
-- **`main.rs`** — constructs the assessor with `with_background_worker`, then calls `recover_pending_jobs` once after the skill registry is populated. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
+- **`main.rs`** — constructs the assessor with `with_background_worker(llm, store, mode)`, mapping `config.skills.risk_check` via `boot::to_assessment_mode`, then calls `recover_pending_jobs` once after the skill registry is populated. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
 
 ## Constraints
 
 - Depends on `aura-skills` (for `SkillDefinition`), `aura-storage` (for `SkillRiskStore` + types), `aura-llm`, and `aura-model`. Nothing else in the assistant depends on this crate's internals — callers see `AssessedSkill` and trait-object re-exports only.
 - Does not define its own `RiskVerdict` / `RiskLevel` / `AssessmentJob` — those live in `storage`, co-located with the libsql persistence that operates on them. This crate re-exports the types so downstream callers only need one dependency.
 - Production code has no `.unwrap()` / `.expect()`; all I/O and LLM errors map to `AssessError` variants.
-- Tiered mode requires the background worker; `SkillAssessor::new` falls back to full synchronous assessment for every call.
 
 ## Collaboration
 

@@ -48,12 +48,6 @@ const PRIMARY_SCOPE_TAG: &[u8] = b"aura.skill.primary:v1\n";
 /// The entrypoint file inspected by the primary-scope hash.
 pub(crate) const PRIMARY_FILE: &str = "SKILL.md";
 
-/// Directory-size thresholds. If either is exceeded, the assessor
-/// switches to tiered mode: a fast primary-only verdict gates use,
-/// and the full-scope check runs in the background.
-const TIER_MAX_FILES: usize = 4;
-const TIER_MAX_BYTES: u64 = 16 * 1024;
-
 /// Directory-level hard-reject thresholds. Any skill directory whose
 /// file count or aggregate byte size exceeds these caps is refused
 /// outright — a legitimate skill is a prompt plus a handful of helper
@@ -62,6 +56,14 @@ const TIER_MAX_BYTES: u64 = 16 * 1024;
 /// [`hash_skill_dir`] before any hashing work starts.
 const MAX_TOTAL_FILES: usize = 500;
 const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Tiered-assessment thresholds under `Full` mode. A skill directory at
+/// or below both caps is small enough to classify synchronously; above
+/// either cap the assessor degrades to primary-sync + full-background
+/// so a chat turn doesn't block on a large LLM prompt. The caps are
+/// deliberately tight — a real skill is usually one prompt file.
+const TIER_MAX_FILES: usize = 4;
+const TIER_MAX_BYTES: u64 = 16 * 1024;
 
 /// Compute a hex-encoded SHA-256 over the metadata fingerprint of `dir`.
 ///
@@ -110,6 +112,17 @@ pub fn hash_skill_dir(dir: &Path) -> io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Decide whether a skill directory should be judged synchronously or
+/// tiered to primary-sync + full-background. Returns `true` when either
+/// [`TIER_MAX_FILES`] or [`TIER_MAX_BYTES`] is exceeded. Stat-only walk
+/// — no file bodies are read.
+pub fn should_tier(dir: &Path) -> io::Result<bool> {
+    let mut files = 0usize;
+    let mut bytes: u64 = 0;
+    probe(dir, &mut files, &mut bytes)?;
+    Ok(files > TIER_MAX_FILES || bytes > TIER_MAX_BYTES)
+}
+
 /// Compute the primary-scope metadata hash — SKILL.md alone, ignoring
 /// any helper files. Used as the fast-path cache key for tiered
 /// assessment. Returns `Ok(None)` if `SKILL.md` is missing (skill is
@@ -134,18 +147,6 @@ pub fn hash_skill_primary(dir: &Path) -> io::Result<Option<String>> {
         }
         Ok(_) | Err(_) => Ok(None),
     }
-}
-
-/// Probe `dir` to decide whether the assessor should tier the check.
-///
-/// Returns `true` if either the file count or the aggregate byte size
-/// exceeds the configured threshold. Symlinks count toward the file
-/// total but their target bytes do not contribute.
-pub fn should_tier(dir: &Path) -> io::Result<bool> {
-    let mut files = 0usize;
-    let mut bytes: u64 = 0;
-    probe(dir, &mut files, &mut bytes)?;
-    Ok(files > TIER_MAX_FILES || bytes > TIER_MAX_BYTES)
 }
 
 /// Reject trees that blow past the hard caps. Called up front in
@@ -365,25 +366,26 @@ mod tests {
     }
 
     #[test]
-    fn should_tier_returns_false_for_small_skills() {
+    fn should_tier_is_false_for_small_tree() {
         let d = tempdir().unwrap();
-        fs::write(d.path().join("SKILL.md"), "tiny").unwrap();
+        fs::write(d.path().join("SKILL.md"), "small").unwrap();
         assert!(!should_tier(d.path()).unwrap());
     }
 
     #[test]
-    fn should_tier_triggers_on_aggregate_bytes() {
+    fn should_tier_trips_on_file_count() {
         let d = tempdir().unwrap();
-        fs::write(d.path().join("SKILL.md"), "x".repeat(20 * 1024)).unwrap();
+        for i in 0..=TIER_MAX_FILES {
+            fs::write(d.path().join(format!("f{i}")), "x").unwrap();
+        }
         assert!(should_tier(d.path()).unwrap());
     }
 
     #[test]
-    fn should_tier_triggers_on_file_count() {
+    fn should_tier_trips_on_byte_size() {
         let d = tempdir().unwrap();
-        for i in 0..6 {
-            fs::write(d.path().join(format!("f{i}.md")), "x").unwrap();
-        }
+        let blob = vec![0u8; (TIER_MAX_BYTES + 1) as usize];
+        fs::write(d.path().join("SKILL.md"), &blob).unwrap();
         assert!(should_tier(d.path()).unwrap());
     }
 

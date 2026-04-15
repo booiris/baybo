@@ -105,51 +105,33 @@ Downstream gating still happens, just not here:
 
 Static governance (trust levels, allow-lists, validator checks) catches structural problems but can't judge *semantic* intent: a skill with clean YAML can still instruct the model to exfiltrate secrets or run destructive commands. The `aura-skills-assessor` crate adds an LLM-backed second opinion, kept in its own crate so `aura-skills` stays LLM-free (selection must remain deterministic and offline-capable).
 
-**Flow**:
+**Mode** (`config.skills.risk_check` → `AssessmentMode`):
+
+- `off` — classifier is skipped; every skill returns `Safe` with `scope = Disabled`.
+- `primary` (default) — `SKILL.md` is hashed and judged. Helper scripts are ignored. A missing `SKILL.md` short-circuits to a synthesised Safe verdict.
+- `full` — the whole directory tree is hashed and judged. Small trees (≤ 4 files and ≤ 16 KiB) classify synchronously on first use; oversized trees tier automatically — `SKILL.md` is classified synchronously and the full-scope verdict is computed on a background worker, so a chat turn never blocks on a big LLM prompt.
+
+**Flow** (for `primary` / `full`):
 
 ```
 check(skill)
-  └─ hash all entries under skill.source_path  (sha256 over
-  │                                              (path, kind, size,
-  │                                              mtime-ns) per entry;
-  │                                              sorted rel-paths,
-  │                                              length-prefixed,
-  │                                              symlinks as path-only)
-  └─ SkillRiskStore::get(name, full_hash)
-        ├─ hit  → return cached Full verdict
-        └─ miss → should_tier(dir)?
-              ├─ false → LLM classifier (full) → put → return Full
-              └─ true  → SkillRiskStore::get(name, primary_hash)
-                    ├─ hit → enqueue background full-scope → return Primary
-                    └─ miss → LLM classifier (primary) → put
-                              → enqueue background full-scope → return Primary
+  └─ hash the in-scope file(s)
+  └─ SkillRiskStore::get(name, hash)
+        ├─ hit  → return cached verdict
+        └─ miss → LLM classifier → put → return verdict
 ```
 
-The hash is a **metadata fingerprint**, not a content hash — see [skills-assessor.md](skills-assessor.md) for the full rationale and tradeoff. It covers every entry in the skill directory — `SKILL.md` plus any helper scripts — so a normal edit to a supporting file bumps mtime and re-triggers the check without us reading file bodies on the hot path. Length-prefixing the rel-path and symlink-target fields closes aliasing hazards across adjacent variable-length fields. Two scope discriminators (`aura.skill.full:v1` and `aura.skill.primary:v1`) are mixed into the hasher state so a one-file skill's primary hash and full hash never collide — both scopes can share the `(skill_name, content_hash)` primary key without ambiguity. A 500-file / 100 MiB hard cap rejects pathological trees outright before any hashing work runs.
-
-**Tiered assessment (large skills)**:
-
-`should_tier(dir)` returns `true` when the directory exceeds either threshold:
-
-- **File count** > 4
-- **Aggregate bytes** > 16 KiB (symlink targets don't count)
-
-Below the threshold, small skills keep the simple single-call path so they don't pay for worker coordination. Above it, the assessor runs in two phases:
-
-1. **Primary (synchronous)** — LLM classifies `SKILL.md` alone with a preamble telling the model that helpers are being assessed asynchronously. Caller returns with `AssessmentScope::Primary` + `background_pending: true`.
-2. **Full (background)** — a job row is persisted in `skill_risk_assessment_jobs` *before* the in-memory send, then handed to a serial background worker. When the worker picks it up it re-hashes the directory; if the hash has drifted the stale row is dropped (a fresh `check` will enqueue a new one keyed on the new hash). On success the full verdict is stored and the job row deleted; on retry-exhaustion (`MAX_ATTEMPTS = 3`) the row is left in `Failed` state for operator inspection.
-
-**Restart-safe progress**: "progress" is coarse — an LLM call is atomic, so the only resumable state is "this job is still owed, run it again." `SkillAssessor::recover_pending_jobs` is called once at startup with a `lookup` closure that maps a skill name to its registered definition; rows for unregistered skills or missing-on-disk paths are deleted, everything else is re-sent to the worker.
+The hash is a **metadata fingerprint**, not a content hash — see [skills-assessor.md](skills-assessor.md) for the full rationale and tradeoff. It covers every entry in the hashed scope (`SKILL.md` alone under `primary`, or `SKILL.md` plus all helper files under `full`), so a normal edit bumps mtime and re-triggers the check without us reading file bodies on the hot path. Length-prefixing the rel-path and symlink-target fields closes aliasing hazards across adjacent variable-length fields. Two scope discriminators (`aura.skill.full:v1` and `aura.skill.primary:v1`) are mixed into the hasher state so a one-file skill's primary hash and full hash never collide — both scopes can share the `(skill_name, content_hash)` primary key without ambiguity. A 500-file / 100 MiB hard cap rejects pathological trees outright before any hashing work runs.
 
 **Return type** (`AssessedSkill`):
 
 | Field                | Meaning |
 |----------------------|---------|
 | `verdict`            | The `RiskVerdict` (Safe/Suspicious/Dangerous + rationale). |
-| `scope`              | `Full` — whole directory judged. `Primary` — SKILL.md only, background check outstanding. |
-| `background_pending` | `true` when a full-scope check has been enqueued and not yet completed. |
+| `scope`              | `Disabled` — classifier was skipped. `Primary` — SKILL.md only. `Full` — whole directory. |
+| `background_pending` | `true` when `full` mode tiered the skill — a primary verdict is returned now and a full-scope verdict is running on the background worker. `false` otherwise. |
 
-`SkillAssessor::new(llm, store)` constructs a synchronous-only assessor (no worker) suitable for one-shot argv commands; `with_background_worker(llm, store)` spawns the worker on the current Tokio runtime and enables tiered mode.
+`SkillAssessor::with_background_worker(llm, store, mode)` is the only constructor; the worker it spawns runs full-scope verdicts tiered out by `full` mode and also drains any `skill_risk_assessment_jobs` rows recovered at startup (including any left behind by older builds) so upgrades don't silently abandon in-flight verdicts.
 
 **Verdict shape** (`RiskVerdict`, persisted in `skill_risk_assessments`):
 
@@ -166,10 +148,10 @@ Below the threshold, small skills keep the simple single-call path so they don't
 
 **Integration points** (both lazy — no work until the skill is actually reached):
 
-- **CLI `aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. Output includes `risk: {status, scope, background_pending, level, rationale, model, content_hash, assessed_at}`; human-readable lines append `(full-scope assessment in progress)` when `background_pending`.
+- **CLI `aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. Output includes `risk: {status, scope, background_pending, level, rationale, model, content_hash, assessed_at}`.
 - **`AgentLoop` skill injection** — `assess_skill_risk` returns a `SkillGate` (`Pass` / `PassWithWarning { rationale }` / `Block { rationale }`) per candidate. `Block` drops the skill and emits `AgentOutput::Notice { level: Error }`; `PassWithWarning` keeps the skill and emits `Notice { level: Warn }`; `Pass` injects silently. There is no longer a silent-drop band: either the user invoked the skill via `/<cmd>` or every registered skill is in play, and in both cases a non-Safe verdict is worth surfacing.
 
-The assessor is wired in `main.rs` alongside the other shared services using `with_background_worker`, and `recover_pending_jobs` runs once after the skill registry is populated. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
+The assessor is wired in `main.rs` alongside the other shared services using `with_background_worker(llm, store, mode)` where `mode` is read from `config.skills.risk_check`; `recover_pending_jobs` runs once after the skill registry is populated and drains persisted rows regardless of mode — `Off` only suppresses new enqueues. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
 
 ### Hot reload constraints
 

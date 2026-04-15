@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use aura_llm::{ChatRequest, LlmClient};
 use aura_skills::SkillDefinition;
-use aura_storage::{AssessmentJob, AssessmentJobStatus, RiskVerdict, SkillRiskStore};
+use aura_storage::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -31,6 +31,9 @@ pub enum AssessError {
 /// Which scope a returned verdict covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssessmentScope {
+    /// Assessment was skipped (mode = `Off`); the accompanying verdict
+    /// is a synthesized `Safe` and carries no rationale.
+    Disabled,
     /// SKILL.md only. A full-scope check may still be pending in the
     /// background; consult `AssessedSkill::background_pending`.
     Primary,
@@ -41,10 +44,24 @@ pub enum AssessmentScope {
 impl AssessmentScope {
     pub fn as_str(self) -> &'static str {
         match self {
+            AssessmentScope::Disabled => "disabled",
             AssessmentScope::Primary => "primary",
             AssessmentScope::Full => "full",
         }
     }
+}
+
+/// How `SkillAssessor::check` judges a skill. Mirrors
+/// `aura_config::RiskCheckConfig`; bootstrap maps between them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AssessmentMode {
+    /// Skip the LLM classifier. Every skill comes back `Safe`.
+    Off,
+    /// Read and classify `SKILL.md` only. Default.
+    #[default]
+    Primary,
+    /// Read and classify the whole directory tree synchronously.
+    Full,
 }
 
 /// Richer result from `SkillAssessor::check`: the verdict plus
@@ -62,30 +79,41 @@ pub struct AssessedSkill {
 /// LLM-backed risk assessor with a persistent verdict cache.
 ///
 /// `check` is idempotent and safe to call every time a skill is about
-/// to be used. Small skills produce a single full-scope verdict on the
-/// first call; larger skills switch to a tiered flow where a
-/// primary-scope verdict on `SKILL.md` is returned synchronously and
-/// the full-scope check is delegated to a background worker.
+/// to be used. The `mode` passed at construction time decides whether
+/// the classifier runs at all, and if so which scope it judges —
+/// `Primary` reads only `SKILL.md`, `Full` reads the whole tree.
 pub struct SkillAssessor {
     llm: Arc<LlmClient>,
     store: Arc<dyn SkillRiskStore>,
-    /// None when the assessor is configured without a worker (e.g.
-    /// short-lived argv commands). `check` falls back to fully
-    /// synchronous assessment — tiered mode requires the worker.
+    mode: AssessmentMode,
+    /// Background worker handle. Under `Full` mode `check_full` tiers
+    /// oversized skills here; recovery of persisted rows from previous
+    /// runs also flows through it. `None` when the assessor was
+    /// constructed without a runtime (argv one-shots).
     background: Option<mpsc::Sender<BackgroundJob>>,
 }
 
 impl SkillAssessor {
-    /// Construct an assessor with a background worker for tiered
-    /// assessment. The worker is spawned on the current Tokio runtime
-    /// and lives as long as any sender is held.
-    pub fn with_background_worker(llm: Arc<LlmClient>, store: Arc<dyn SkillRiskStore>) -> Self {
+    /// Construct an assessor with a background worker attached for
+    /// recovery of jobs persisted by previous runs. The worker is
+    /// spawned on the current Tokio runtime and lives as long as any
+    /// sender is held.
+    pub fn with_background_worker(
+        llm: Arc<LlmClient>,
+        store: Arc<dyn SkillRiskStore>,
+        mode: AssessmentMode,
+    ) -> Self {
         let tx = spawn_worker(Arc::clone(&llm), Arc::clone(&store), 64);
         Self {
             llm,
             store,
+            mode,
             background: Some(tx),
         }
+    }
+
+    pub fn mode(&self) -> AssessmentMode {
+        self.mode
     }
 
     /// Load persisted pending jobs and re-enqueue them for the worker.
@@ -94,7 +122,11 @@ impl SkillAssessor {
     /// the skill registry is populated. `lookup` maps a skill name to
     /// its current definition (if the skill is still registered). Jobs
     /// for unknown or missing-on-disk skills are deleted from the
-    /// store, not re-enqueued.
+    /// store, not re-enqueued. Recovery runs regardless of the current
+    /// `AssessmentMode` — rows that were committed to disk represent
+    /// work already paid for, and flipping to `Off` suppresses new
+    /// enqueues but should still let in-flight verdicts finish rather
+    /// than stranding them until the operator flips back.
     pub async fn recover_pending_jobs(
         &self,
         lookup: impl Fn(&str) -> Option<SkillDefinition>,
@@ -120,18 +152,60 @@ impl SkillAssessor {
 
     /// Return the best available verdict for `skill`.
     ///
-    /// Small skills: single synchronous LLM call, full-scope verdict.
-    /// Large skills: primary-scope verdict returned synchronously, full
-    /// scope enqueued for background assessment.
+    /// `Off`     → synthesized `Safe`, no I/O.
+    /// `Primary` → classify `SKILL.md`; helper files are ignored.
+    /// `Full`    → classify the whole directory tree synchronously.
     pub async fn check(&self, skill: &SkillDefinition) -> Result<AssessedSkill, AssessError> {
+        match self.mode {
+            AssessmentMode::Off => Ok(disabled_verdict(skill)),
+            AssessmentMode::Primary => self.check_primary(skill).await,
+            AssessmentMode::Full => self.check_full(skill).await,
+        }
+    }
+
+    async fn check_primary(&self, skill: &SkillDefinition) -> Result<AssessedSkill, AssessError> {
+        let dir = skill
+            .source_path
+            .as_deref()
+            .ok_or(AssessError::NoSourcePath)?;
+
+        // No SKILL.md on disk → Primary mode has nothing to judge.
+        // Return a synthesized Safe rather than silently escalating;
+        // operators who want helper-script coverage must opt into Full.
+        let Some(primary_hash) = hash_skill_primary(dir)? else {
+            return Ok(disabled_verdict(skill));
+        };
+
+        if let Some(cached) = self.store.get(&skill.name, &primary_hash).await? {
+            debug!(
+                skill = %skill.name,
+                hash = %primary_hash,
+                level = %cached.level.as_str(),
+                "primary-scope risk cache hit"
+            );
+            return Ok(AssessedSkill {
+                verdict: cached,
+                scope: AssessmentScope::Primary,
+                background_pending: false,
+            });
+        }
+
+        let verdict = self.call_llm_primary(skill, dir, primary_hash).await?;
+        self.store.put(&verdict).await?;
+        Ok(AssessedSkill {
+            verdict,
+            scope: AssessmentScope::Primary,
+            background_pending: false,
+        })
+    }
+
+    async fn check_full(&self, skill: &SkillDefinition) -> Result<AssessedSkill, AssessError> {
         let dir = skill
             .source_path
             .as_deref()
             .ok_or(AssessError::NoSourcePath)?;
 
         let full_hash = hash_skill_dir(dir)?;
-
-        // Authoritative cache hit — nothing else to do.
         if let Some(cached) = self.store.get(&skill.name, &full_hash).await? {
             debug!(
                 skill = %skill.name,
@@ -146,11 +220,10 @@ impl SkillAssessor {
             });
         }
 
-        let tier = should_tier(dir)?;
-
-        // Below the threshold: keep the simple single-call path so
-        // small skills don't pay for worker coordination.
-        if !tier || self.background.is_none() {
+        // Small skills classify synchronously; large ones degrade to
+        // primary-sync + full-background so a chat turn doesn't block
+        // on a big LLM prompt.
+        if !should_tier(dir)? {
             let verdict = self.call_llm_full(skill, dir, full_hash).await?;
             self.store.put(&verdict).await?;
             return Ok(AssessedSkill {
@@ -160,38 +233,38 @@ impl SkillAssessor {
             });
         }
 
-        // Tiered flow: primary cache → primary LLM, then enqueue full.
-        let primary_verdict = match hash_skill_primary(dir)? {
-            Some(primary_hash) => {
-                if let Some(cached) = self.store.get(&skill.name, &primary_hash).await? {
-                    debug!(
-                        skill = %skill.name,
-                        hash = %primary_hash,
-                        level = %cached.level.as_str(),
-                        "primary-scope risk cache hit"
-                    );
-                    cached
-                } else {
-                    let v = self.call_llm_primary(skill, dir, primary_hash).await?;
-                    self.store.put(&v).await?;
-                    v
-                }
-            }
-            None => {
-                // No SKILL.md to isolate — fall back to full-scope
-                // synchronous assessment. Better to pay the latency
-                // once than to serve the caller with no verdict.
-                let verdict = self.call_llm_full(skill, dir, full_hash).await?;
-                self.store.put(&verdict).await?;
-                return Ok(AssessedSkill {
-                    verdict,
-                    scope: AssessmentScope::Full,
-                    background_pending: false,
-                });
-            }
+        let Some(primary_hash) = hash_skill_primary(dir)? else {
+            // No SKILL.md to isolate — no way to tier cleanly; fall
+            // through to sync full. For a registered skill this is a
+            // misconfiguration but we'd rather classify than bail.
+            let verdict = self.call_llm_full(skill, dir, full_hash).await?;
+            self.store.put(&verdict).await?;
+            return Ok(AssessedSkill {
+                verdict,
+                scope: AssessmentScope::Full,
+                background_pending: false,
+            });
         };
 
-        self.enqueue_full_job(skill, dir, &full_hash).await;
+        // If we've tiered this skill before, the primary verdict is
+        // already cached and the full job is already enqueued. Re-using
+        // the cache entry avoids a duplicate channel send (which would
+        // waste an LLM call on the worker side).
+        let primary_verdict =
+            if let Some(cached) = self.store.get(&skill.name, &primary_hash).await? {
+                debug!(
+                    skill = %skill.name,
+                    hash = %primary_hash,
+                    level = %cached.level.as_str(),
+                    "primary-scope risk cache hit (tiered, full still pending)"
+                );
+                cached
+            } else {
+                let verdict = self.call_llm_primary(skill, dir, primary_hash).await?;
+                self.store.put(&verdict).await?;
+                self.enqueue_full(skill, dir, &full_hash).await?;
+                verdict
+            };
 
         Ok(AssessedSkill {
             verdict: primary_verdict,
@@ -200,27 +273,39 @@ impl SkillAssessor {
         })
     }
 
-    /// Look up a cached verdict without calling the LLM. Preference
-    /// order: full-scope > primary-scope. Returned tuple includes the
-    /// scope so the caller can tell whether a full check is still
-    /// owed. Used by hot-path gates that can't afford a blocking call.
-    pub async fn cached(
+    async fn enqueue_full(
         &self,
         skill: &SkillDefinition,
-    ) -> Result<Option<(RiskVerdict, AssessmentScope)>, AssessError> {
-        let Some(dir) = skill.source_path.as_deref() else {
-            return Ok(None);
+        dir: &Path,
+        full_hash: &str,
+    ) -> Result<(), AssessError> {
+        let now = chrono::Utc::now().timestamp();
+        let row = AssessmentJob {
+            skill_name: skill.name.clone(),
+            content_hash: full_hash.to_string(),
+            source_path: dir.to_string_lossy().into_owned(),
+            status: AssessmentJobStatus::Pending,
+            attempts: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
         };
-        let full_hash = hash_skill_dir(dir)?;
-        if let Some(v) = self.store.get(&skill.name, &full_hash).await? {
-            return Ok(Some((v, AssessmentScope::Full)));
+        self.store.upsert_job(&row).await?;
+
+        if let Some(tx) = &self.background {
+            let msg = BackgroundJob {
+                skill: skill.clone(),
+                source_path: dir.to_path_buf(),
+                expected_hash: full_hash.to_string(),
+            };
+            if tx.send(msg).await.is_err() {
+                warn!(
+                    skill = %skill.name,
+                    "background worker channel closed; full verdict will only arrive after restart"
+                );
+            }
         }
-        if let Some(primary_hash) = hash_skill_primary(dir)?
-            && let Some(v) = self.store.get(&skill.name, &primary_hash).await?
-        {
-            return Ok(Some((v, AssessmentScope::Primary)));
-        }
-        Ok(None)
+        Ok(())
     }
 
     async fn call_llm_primary(
@@ -287,45 +372,24 @@ impl SkillAssessor {
             assessed_at: chrono::Utc::now().timestamp(),
         })
     }
+}
 
-    /// Persist a job row and hand the job to the background worker.
-    /// Errors are logged, not propagated: failing to enqueue does not
-    /// change the caller-visible primary verdict, and the job row (if
-    /// it was written) will be retried on the next startup.
-    async fn enqueue_full_job(&self, skill: &SkillDefinition, dir: &Path, full_hash: &str) {
-        let Some(tx) = self.background.as_ref() else {
-            return;
-        };
-        let now = chrono::Utc::now().timestamp();
-        let job_row = AssessmentJob {
+/// Synthesize the verdict returned when the assessor is disabled (mode
+/// `Off`) or the skill has no `SKILL.md` to isolate under `Primary`
+/// mode. The hash is left empty on purpose — this verdict is never
+/// persisted, so there's no cache key to bind.
+fn disabled_verdict(skill: &SkillDefinition) -> AssessedSkill {
+    AssessedSkill {
+        verdict: RiskVerdict {
             skill_name: skill.name.clone(),
-            content_hash: full_hash.to_string(),
-            source_path: dir.display().to_string(),
-            status: AssessmentJobStatus::Pending,
-            attempts: 0,
-            last_error: None,
-            created_at: now,
-            updated_at: now,
-        };
-        if let Err(e) = self.store.upsert_job(&job_row).await {
-            warn!(
-                skill = %skill.name,
-                error = %e,
-                "failed to persist background risk-assessment job; skipping enqueue"
-            );
-            return;
-        }
-        let in_memory = BackgroundJob {
-            skill: skill.clone(),
-            source_path: dir.to_path_buf(),
-            expected_hash: full_hash.to_string(),
-        };
-        if tx.try_send(in_memory).is_err() {
-            debug!(
-                skill = %skill.name,
-                "background queue full or closed; job row will be picked up on next startup"
-            );
-        }
+            content_hash: String::new(),
+            level: RiskLevel::Safe,
+            rationale: "skill risk assessment disabled".to_string(),
+            model: String::new(),
+            assessed_at: chrono::Utc::now().timestamp(),
+        },
+        scope: AssessmentScope::Disabled,
+        background_pending: false,
     }
 }
 

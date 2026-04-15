@@ -21,6 +21,7 @@ pub mod llm;
 pub mod sandbox;
 pub mod security;
 pub mod session;
+pub mod skills;
 pub mod tools;
 pub mod trace;
 mod validate;
@@ -41,6 +42,7 @@ pub use crate::llm::LlmConfig;
 pub use crate::sandbox::{NetworkPolicyConfig, SandboxConfig, WasmLimitsConfig};
 pub use crate::security::SecurityConfig;
 pub use crate::session::SessionConfig;
+pub use crate::skills::{RiskCheckConfig, SkillsConfig};
 pub use crate::tools::{
     CapabilityConfig, McpServerEntry, McpTransportConfig, SecretAccessConfig,
     SecretRequirementConfig, ToolsConfig, TrustLevelConfig,
@@ -61,6 +63,7 @@ pub struct AuraConfig {
     pub channels: ChannelsConfig,
     pub sandbox: SandboxConfig,
     pub security: SecurityConfig,
+    pub skills: SkillsConfig,
     pub tools: ToolsConfig,
     pub trace: TraceConfig,
     pub cost: CostConfig,
