@@ -111,6 +111,10 @@ Each family is added under the same naming scheme when its subsystem ships.
 
 Bare dashboard commands — `/skills`, `/tools`, `/jobs`, `/sessions`, `/memory` with no further tokens — bypass the clap path and return `SlashOutcome::OpenView(ViewKind::_)`. Interactive adapters swap into a table view backed by `DashboardProvider::snapshot(kind)`; line-mode adapters treat the outcome as a no-op. Commands with arguments (e.g. `/skills info foo`) still go through clap as `SlashOutcome::Handled`.
 
+### Skill shortcut
+
+`CliSlashHandler::commands()` also surfaces every user-invocable skill (`SkillDefinition::command.is_some()`) so the TUI completion popup lists `/<skill>` alongside built-in commands. Clap subcommands win on name collisions. When `handle` sees `/<token>` whose first token matches a registered user-invocable skill, it returns `SlashOutcome::PassThrough` so the TUI forwards the raw line to the agent as a normal user message — `SkillRegistry::select` then narrows on the exact-match branch. This is the one sanctioned exception to the "slash ≠ chat message" invariant below: skill invocations are explicit user intent to run a skill, not operator chatter, so they belong in the conversation.
+
 ### Output rendering over channels
 
 `ChannelResponseSink` turns `CommandOutput` into a single `ContentBlock::Text`. Tables are rendered as monospace text; `--json` produces JSON text. Images and files are never produced by CLI commands.
@@ -122,7 +126,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 ## Constraints
 
 - `aura-cli` holds no mutable state; all managers are `Arc`. The crate is `Send + Sync + 'static`.
-- Slash input **must not** be forwarded to the agent when it parses as a known command. Unknown `/` input (parse error `UnknownCommand`) falls back to `PassThrough` only if the dispatcher explicitly says so — never by default.
+- Slash input **must not** be forwarded to the agent when it parses as a known CLI command. Unknown `/` input (parse error `UnknownCommand`) falls back to `PassThrough` only if the dispatcher explicitly says so — never by default. The skill shortcut is the one sanctioned `PassThrough` path: a `/<token>` whose first token matches a user-invocable skill is forwarded to the agent as a normal chat message.
 - Commands that mutate must route their effect through the manager (never touching a store directly), so traces and hooks fire naturally.
 - The `SecretVault` value of any secret is never rendered; `security` and `config` commands redact to `********`.
 - No `unwrap` / `expect` in command handlers. Parser-level `expect` on derive macros is acceptable.

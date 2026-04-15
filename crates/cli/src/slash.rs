@@ -79,6 +79,7 @@ impl CliSlashHandler {
 impl SlashHandler for CliSlashHandler {
     fn commands(&self) -> Vec<SlashCommand> {
         let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let cmd = Cli::command();
         for sub in cmd.get_subcommands() {
             if sub.is_hide_set() {
@@ -89,7 +90,26 @@ impl SlashHandler for CliSlashHandler {
                 continue;
             }
             let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
-            out.push(SlashCommand::new(format!("/{name}"), about));
+            let slash = format!("/{name}");
+            seen.insert(slash.clone());
+            out.push(SlashCommand::new(slash, about));
+        }
+        // User-invocable skills surface as slash commands alongside built-ins.
+        // Clap subcommands take precedence on name collisions so operators
+        // can't shadow `/config` or `/skills` with a workspace skill.
+        for skill in self.ctx.skills.all_sorted() {
+            let Some(cmd_name) = skill.command.as_deref() else {
+                continue;
+            };
+            let slash = format!("/{cmd_name}");
+            if !seen.insert(slash.clone()) {
+                continue;
+            }
+            let hint = match &skill.argument_hint {
+                Some(h) if !h.is_empty() => format!("{h}  {}", skill.description),
+                _ => skill.description.clone(),
+            };
+            out.push(SlashCommand::new(slash, hint));
         }
         // TUI-adapter built-ins that never reach the clap tree.
         out.push(SlashCommand::new("/clear", "Clear the chat scrollback."));
@@ -105,6 +125,14 @@ impl SlashHandler for CliSlashHandler {
         // adapters that don't support views treat this as a no-op.
         if let Some(kind) = dashboard_shortcut(raw) {
             return SlashOutcome::OpenView(kind);
+        }
+        // Skill slash commands (`/<skill>` with optional args) aren't in the
+        // clap tree — forward them to the agent so `SkillRegistry::select`
+        // can narrow on the exact-match branch. Only do this when the first
+        // token actually names a user-invocable skill; otherwise fall through
+        // to clap, which yields the normal "unknown command" error.
+        if is_skill_invocation(raw, &self.ctx.skills) {
+            return SlashOutcome::PassThrough;
         }
         match self.try_dispatch(raw).await {
             Ok(out) => {
@@ -144,8 +172,156 @@ fn dashboard_shortcut(raw: &str) -> Option<ViewKind> {
     }
 }
 
+/// Return true when the first whitespace-separated token after the leading
+/// `/` names a user-invocable skill. Skill lookup goes through `get`, which
+/// indexes by skill name; we also require the stored `command` to match so
+/// skills with `user-invocable: false` are ignored.
+fn is_skill_invocation(raw: &str, skills: &aura_skills::SkillRegistry) -> bool {
+    let without_slash = raw.trim().strip_prefix('/').unwrap_or("");
+    let Some(first) = without_slash.split_whitespace().next() else {
+        return false;
+    };
+    skills
+        .get(first)
+        .and_then(|s| s.command.as_deref())
+        .is_some_and(|cmd| cmd == first)
+}
+
 enum DispatchError {
     NotACommand,
     Parse(String),
     Cli(crate::error::CliError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ContextBuilder;
+    use aura_config::AuraConfig;
+    use aura_registry::{ArtifactSource, TrustLevel};
+    use aura_skills::{SkillDefinition, SkillRegistry, SkillRequirements};
+
+    fn skill(name: &str, description: &str, user_invocable: bool) -> SkillDefinition {
+        SkillDefinition {
+            name: name.into(),
+            version: "0.1.0".into(),
+            description: description.into(),
+            command: if user_invocable {
+                Some(name.into())
+            } else {
+                None
+            },
+            agent_invocable: true,
+            argument_hint: None,
+            prompt_template: "body".into(),
+            allowed_tools: vec![],
+            source: ArtifactSource::Workspace,
+            trust_level: TrustLevel::Trusted,
+            requirements: SkillRequirements::default(),
+            token_budget_hint: 1024,
+            source_path: None,
+        }
+    }
+
+    fn handler_with(registry: SkillRegistry) -> CliSlashHandler {
+        let config = Arc::new(AuraConfig::default());
+        let ctx = ContextBuilder::new(config)
+            .skills(Arc::new(registry))
+            .build();
+        CliSlashHandler::new(Arc::new(ctx))
+    }
+
+    #[test]
+    fn commands_list_includes_user_invocable_skills() {
+        let mut reg = SkillRegistry::new();
+        reg.register(skill("greet", "say hi", true));
+        reg.register(skill("hidden", "model-only skill", false));
+        let handler = handler_with(reg);
+
+        let cmds = handler.commands();
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"/greet"), "expected /greet in: {names:?}");
+        assert!(
+            !names.contains(&"/hidden"),
+            "skills with user-invocable: false must not surface"
+        );
+    }
+
+    #[test]
+    fn commands_list_uses_argument_hint_when_present() {
+        let mut reg = SkillRegistry::new();
+        let mut s = skill("fix-issue", "fix a GitHub issue", true);
+        s.argument_hint = Some("[issue-number]".into());
+        reg.register(s);
+        let handler = handler_with(reg);
+
+        let cmds = handler.commands();
+        let entry = cmds
+            .iter()
+            .find(|c| c.name == "/fix-issue")
+            .expect("skill listed");
+        assert!(
+            entry.description.contains("[issue-number]"),
+            "description should surface argument hint, got: {}",
+            entry.description
+        );
+        assert!(entry.description.contains("fix a GitHub issue"));
+    }
+
+    #[test]
+    fn clap_subcommand_wins_collision_with_skill() {
+        // `config` is a real clap subcommand; a workspace skill with the same
+        // name must not duplicate or shadow it.
+        let mut reg = SkillRegistry::new();
+        reg.register(skill("config", "impersonate built-in", true));
+        let handler = handler_with(reg);
+
+        let cmds = handler.commands();
+        let config_entries: Vec<&SlashCommand> =
+            cmds.iter().filter(|c| c.name == "/config").collect();
+        assert_eq!(
+            config_entries.len(),
+            1,
+            "expected exactly one /config entry, got {}",
+            config_entries.len()
+        );
+        assert_ne!(
+            config_entries[0].description, "impersonate built-in",
+            "skill description must not overwrite the clap subcommand description"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_slash_is_passed_through_to_agent() {
+        let mut reg = SkillRegistry::new();
+        reg.register(skill("greet", "say hi", true));
+        let handler = handler_with(reg);
+
+        match handler.handle("/greet").await {
+            SlashOutcome::PassThrough => {}
+            other => panic!("expected PassThrough, got {other:?}"),
+        }
+
+        // Args after the skill name should still pass through.
+        match handler.handle("/greet Alice").await {
+            SlashOutcome::PassThrough => {}
+            other => panic!("expected PassThrough with args, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_slash_ignores_non_user_invocable() {
+        // `disable-model-invocation: true` + `user-invocable: false` would
+        // make `command` None, so the slash should hit the clap path and
+        // come back as a parse error — not a PassThrough.
+        let mut reg = SkillRegistry::new();
+        reg.register(skill("hidden", "model-only", false));
+        let handler = handler_with(reg);
+
+        match handler.handle("/hidden").await {
+            SlashOutcome::PassThrough => panic!("hidden skill must not be invocable via slash"),
+            SlashOutcome::Handled(_) => {}
+            other => panic!("expected Handled error, got {other:?}"),
+        }
+    }
 }

@@ -28,7 +28,7 @@ No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands
 ### Slash completion
 
 - When the input starts with `/` and the cursor sits on the command token (no whitespace between `/` and cursor), a popup renders above the input box listing matching commands.
-- Candidates come from `SlashHandler::commands()`; `CliSlashHandler` derives them from clap's subcommand tree plus adapter-reserved tokens (`/quit`, `/exit`, `/clear`).
+- Candidates come from `SlashHandler::commands()`; `CliSlashHandler` derives them from clap's subcommand tree, every user-invocable skill in `SkillRegistry` (name surfaces as `/<skill>`, description — prefixed with the `argument-hint` when present — surfaces as the popup hint), plus adapter-reserved tokens (`/quit`, `/exit`, `/clear`). Clap wins on name collisions so a workspace skill cannot shadow `/config` or `/skills`.
 - `Up`/`Down` cycle the selection; `Tab` accepts the highlighted candidate, rewriting the prefix up to the next whitespace and appending a trailing space so arguments can follow. `Enter` submits without accepting the completion.
 
 ### Dashboard
@@ -53,6 +53,10 @@ Bare commands with no arguments open the matching dashboard view:
 | `/memory`   | `SlashOutcome::OpenView(ViewKind::Memory)`   |
 
 Anything with additional tokens (e.g. `/skills info foo`) falls through to the normal clap dispatcher and returns text that is appended to the chat scrollback.
+
+### Skill shortcuts
+
+When the first token after `/` names a user-invocable skill, `CliSlashHandler::handle` returns `SlashOutcome::PassThrough` — the TUI forwards the raw line to the agent as an ordinary user message, and `SkillRegistry::select` narrows on the exact `/<cmd>` branch. This keeps skills out of the clap tree (so operators don't get "unknown command" errors on workspace skills) while reusing the existing skill-selection path for actual execution.
 
 ### Adapter-reserved tokens
 
