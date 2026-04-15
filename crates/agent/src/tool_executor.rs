@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,11 +5,7 @@ use aura_job::OperationKind;
 use aura_model::{ChannelType, User};
 use aura_registry::TrustLevel;
 
-use crate::security::{ScopedSecretAccessor, SecretVault};
-use aura_tools::{
-    SecretAccessor, SecretValue, ToolCapability, ToolContext, ToolManifest, ToolOutput,
-    ToolRegistry,
-};
+use aura_tools::{ToolCapability, ToolContext, ToolManifest, ToolOutput, ToolRegistry};
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -18,22 +13,16 @@ use tracing::debug;
 
 use crate::observability::ObservabilityRecorder;
 
-/// Executes tools with secret injection and observability recording.
+/// Executes tools with trust-level validation and observability recording.
 pub struct ToolExecutor {
     tool_registry: Arc<ToolRegistry>,
-    secret_vault: Arc<SecretVault>,
     default_timeout: Duration,
 }
 
 impl ToolExecutor {
-    pub fn new(
-        tool_registry: Arc<ToolRegistry>,
-        secret_vault: Arc<SecretVault>,
-        default_timeout: Duration,
-    ) -> Self {
+    pub fn new(tool_registry: Arc<ToolRegistry>, default_timeout: Duration) -> Self {
         Self {
             tool_registry,
-            secret_vault,
             default_timeout,
         }
     }
@@ -109,17 +98,12 @@ impl ToolExecutor {
             )
             .await?;
 
-        // Inject secrets
-        let (secrets, secret_accessor) = self.inject_secrets(tool_name).await?;
-
         // Build tool context
         let ctx = ToolContext {
             session_id: session_id.to_string(),
             user: user.clone(),
             timeout: self.default_timeout,
             cancellation_token: CancellationToken::new(),
-            secrets,
-            secret_accessor,
         };
 
         // Execute with timeout enforcement
@@ -178,42 +162,5 @@ impl ToolExecutor {
         };
         self.execute(tool_name, params, &session_id, &user, recorder, None)
             .await
-    }
-
-    async fn inject_secrets(
-        &self,
-        tool_name: &str,
-    ) -> anyhow::Result<(
-        HashMap<String, SecretValue>,
-        Option<Arc<dyn SecretAccessor>>,
-    )> {
-        let tool = self.tool_registry.get(tool_name);
-        let requirements = tool.map(|t| t.secret_requirements()).unwrap_or_default();
-        if requirements.is_empty() {
-            return Ok((HashMap::new(), None));
-        }
-
-        let keys: Vec<String> = requirements.iter().map(|r| r.key.clone()).collect();
-        let vault_secrets = self
-            .secret_vault
-            .get_secrets_for_tool(tool_name, &keys)
-            .await?;
-
-        let mut static_secrets = HashMap::new();
-        for (k, v) in vault_secrets {
-            let s = v
-                .as_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| String::from_utf8_lossy(v.as_bytes()).to_string());
-            static_secrets.insert(k, SecretValue::new(s));
-        }
-
-        // Build the runtime accessor with permission enforcement
-        let accessor: Arc<dyn SecretAccessor> = Arc::new(ScopedSecretAccessor::new(
-            &requirements,
-            Arc::clone(&self.secret_vault),
-        ));
-
-        Ok((static_secrets, Some(accessor)))
     }
 }

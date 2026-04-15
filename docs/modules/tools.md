@@ -23,15 +23,12 @@ Core responsibilities:
 
 `ToolRegistry` exposes a single `Tool` interface: Rust tools implement it directly. This keeps `AgentLoop` independent of execution shape.
 
-### Secret declaration and runtime access
+### Secret access (deferred)
 
-Tools declare their secret requirements via `secret_requirements() -> Vec<SecretRequirement>`. Each requirement specifies a key, an access level (`ReadOnly` or `ReadWrite`), and whether the secret is required or optional.
-
-At execution time, `agent::ToolExecutor` injects secrets into `ToolContext` in two ways:
-- A static `secrets: HashMap<String, SecretValue>` snapshot
-- A `secret_accessor: Option<Arc<dyn SecretAccessor>>` for runtime get/set with permission enforcement
-
-The `SecretAccessor` trait is defined in the tools crate but implemented as `ScopedSecretAccessor` in the agent crate, enforcing that tools can only access declared keys and can only write keys declared with `ReadWrite` access. There is no direct dependency on `security`.
+Tool-level secret declaration and runtime injection were removed pending the
+final tool-system design. `ToolContext` currently carries no secrets; a future
+iteration will reintroduce per-tool secret access on top of the finalized
+`Tool` trait and governance model.
 
 ### MCP client support (removed — pending reintroduction)
 
@@ -53,7 +50,7 @@ Typical rules:
 
 ### LLM visibility boundary
 
-`tool_definitions()` exposes only `name`, `description`, and `parameters_schema` to the model. `secret_requirements`, capabilities, and trust level are never exposed.
+`tool_definitions()` exposes only `name`, `description`, and `parameters_schema` to the model. Capabilities and trust level are never exposed.
 
 ### Output control
 
@@ -70,7 +67,7 @@ Tool output should prefer structured `Json`, use `LargeText` for long text with 
 
 | Module | Role |
 |--------|------|
-| `agent` | `ToolExecutor` executes tools, injects secrets via `ScopedSecretAccessor`, records observability |
+| `agent` | `ToolExecutor` validates trust/capability, executes tools, records observability |
 | `security` | Upper layers inject secrets and network policy (no direct dependency) |
 | `registry` | Provides verified third-party tool artifacts; `TrustLevel` will govern MCP tools once reintroduced |
 | `trace` | Records tool parameters, results, artifact hash, and source |

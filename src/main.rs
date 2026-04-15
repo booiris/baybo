@@ -347,7 +347,6 @@ async fn main() -> anyhow::Result<()> {
     // Tool executor
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
-        Arc::clone(&secret_vault),
         boot::to_tool_timeout(&config.tools),
     ));
 

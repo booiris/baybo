@@ -14,7 +14,7 @@ Core responsibilities of the primitives in this crate:
 
 Business logic in `agent::security` builds on these primitives:
 
-- **SecretVault**: encrypt and store real secrets, inject with least privilege per tool declarations
+- **SecretVault**: encrypt and store real secrets (tool-scoped injection is deferred pending the finalized tool system)
 - **SecurityGateway**: input sanitization, output re-sanitization, session placeholder mapping
 - **SecretValue**: redacted wrapper preventing plaintext in Debug/Display
 
@@ -32,11 +32,12 @@ Before any response leaves the system, it passes through `sanitize_output()` aga
 
 Secrets are encrypted with AES-256-GCM (random nonce + ciphertext + tag). The master key exists only in process memory and is never persisted. `SecretValue` should not support plaintext `Debug`.
 
-### Least-privilege injection
+### Least-privilege injection (deferred)
 
-`get_secrets_for_tool()` returns only secrets explicitly declared by the tool via `secret_requirements()`. Security does not understand tool business logic — it only returns the minimal set based on declarations.
-
-`ScopedSecretAccessor` (in `agent::security`) enforces per-tool permissions at runtime: tools can only `get()` keys they declared, and can only `set()` keys declared with `ReadWrite` access. Read-only keys reject write attempts with `ReadOnlyViolation`.
+Per-tool secret declaration and `ScopedSecretAccessor` were removed pending the
+finalized tool system. Until they return, `SecretVault` only backs
+`SecurityGateway` placeholder storage; tools receive no secrets through
+`ToolContext`.
 
 ### Network decision boundary
 
@@ -55,6 +56,6 @@ Security only decides allow/deny. It does not execute network access. The chain 
 | Module | Role |
 |--------|------|
 | `channels` | Input messages go to `agent::security::SecurityGateway` first |
-| `agent` | `agent::security::SecurityGateway` and `SecretVault` own business logic; `ToolExecutor` retrieves secrets and injects into tools |
+| `agent` | `agent::security::SecurityGateway` and `SecretVault` own business logic |
 | `trace` / `job` | Receive only sanitized payloads and placeholders |
 | `storage` | Defines `SecretStore` trait; provides libsql implementation |
