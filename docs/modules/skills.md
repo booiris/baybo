@@ -76,6 +76,8 @@ Every skill exposes two independent entry points; both default on:
 
 A `/deploy` skill that's too dangerous to auto-trigger sets `disable-model-invocation: true`; a `legacy-system-context` reference that isn't actionable as a command sets `user-invocable: false`. A regex-based pattern trigger is **not** modelled — use `description` plus model decision instead.
 
+The `/<name>` entry point is surfaced on channel adapters by `aura-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `select()` narrows on the exact match. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#skill-shortcuts) for the full wiring.
+
 ### Three-tier trust model
 
 - **Trusted**: workspace or admin-placed skills. May hot-reload and request full tool set.
