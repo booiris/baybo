@@ -1,6 +1,5 @@
 pub mod error;
 pub mod registry;
-pub mod wasm;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,7 +7,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::User;
-use aura_sandbox::{NetworkPolicy, SandboxPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -103,10 +101,6 @@ pub trait SecretAccessor: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Tool trait — the unified interface for all tool implementations.
-///
-/// Built-in Rust tools implement this directly.
-/// WASM tools are adapted through `WasmTool`.
-/// High-risk tools are still exposed as `Tool` but routed to container execution at runtime.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -128,13 +122,9 @@ pub struct ToolContext {
     pub timeout: Duration,
     pub cancellation_token: tokio_util::sync::CancellationToken,
     /// Static snapshot of secrets injected at execution start.
-    /// Kept for WASM tools that read secrets via host functions.
     pub secrets: HashMap<String, SecretValue>,
     /// Runtime secret accessor with permission enforcement.
-    /// `None` for WASM tools (they use the static `secrets` map).
     pub secret_accessor: Option<Arc<dyn SecretAccessor>>,
-    pub sandbox_policy: SandboxPolicy,
-    pub network_policy: NetworkPolicy,
 }
 
 /// Opaque secret value that redacts itself in Debug output.
@@ -198,4 +188,3 @@ pub enum ToolCapability {
 }
 
 pub use registry::ToolRegistry;
-pub use wasm::WasmTool;

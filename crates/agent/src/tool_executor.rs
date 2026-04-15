@@ -5,7 +5,6 @@ use std::time::Duration;
 use aura_job::OperationKind;
 use aura_model::{ChannelType, User};
 use aura_registry::TrustLevel;
-use aura_sandbox::{NetworkPolicy, SandboxPolicy};
 
 use crate::security::{ScopedSecretAccessor, SecretVault};
 use aura_tools::{
@@ -37,69 +36,6 @@ impl ToolExecutor {
             secret_vault,
             default_timeout,
         }
-    }
-
-    /// Resolve sandbox and network policies based on tool capabilities and trust level.
-    ///
-    /// Built-in tools get `WasmOnly` with empty network policy.
-    /// WASM tools are examined for capabilities to determine the appropriate policy.
-    fn resolve_policy(&self, tool_name: &str) -> (SandboxPolicy, NetworkPolicy) {
-        let manifest = match self.tool_registry.get_manifest(tool_name) {
-            Some(m) => m,
-            None => {
-                // Built-in tool: default restrictive policy
-                debug!(tool = tool_name, "built-in tool, using WasmOnly policy");
-                return (
-                    SandboxPolicy::WasmOnly,
-                    NetworkPolicy {
-                        allowed_domains: vec![],
-                        allow_loopback: false,
-                    },
-                );
-            }
-        };
-
-        let mut sandbox = SandboxPolicy::WasmOnly;
-        let mut allowed_domains = Vec::new();
-        let mut allow_loopback = false;
-
-        for cap in &manifest.capabilities {
-            match cap {
-                ToolCapability::SpawnProcess | ToolCapability::BrowserAutomation => {
-                    sandbox = SandboxPolicy::ContainerRestricted;
-                }
-                ToolCapability::WriteWorkspace => {
-                    if manifest.trust_level == TrustLevel::Trusted {
-                        // Only upgrade to WorkspaceWrite if not already ContainerRestricted
-                        if sandbox == SandboxPolicy::WasmOnly {
-                            sandbox = SandboxPolicy::WorkspaceWrite;
-                        }
-                    }
-                    // For non-Trusted, WriteWorkspace is denied at the trust validation step
-                }
-                ToolCapability::Http(domains) => {
-                    allowed_domains.extend(domains.iter().cloned());
-                }
-                ToolCapability::ReadWorkspace => {
-                    // ReadWorkspace does not escalate sandbox policy
-                }
-            }
-        }
-
-        // Allow loopback only in container modes (for local service access)
-        if sandbox == SandboxPolicy::ContainerRestricted
-            || sandbox == SandboxPolicy::ContainerElevated
-        {
-            allow_loopback = true;
-        }
-
-        (
-            sandbox,
-            NetworkPolicy {
-                allowed_domains,
-                allow_loopback,
-            },
-        )
     }
 
     /// Validate that the tool's trust level permits execution with its declared capabilities.
@@ -154,7 +90,6 @@ impl ToolExecutor {
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
-        // Validate trust level for WASM tools before any execution
         if let Some(manifest) = self.tool_registry.get_manifest(tool_name) {
             self.validate_trust(tool_name, manifest)?;
         }
@@ -177,17 +112,6 @@ impl ToolExecutor {
         // Inject secrets
         let (secrets, secret_accessor) = self.inject_secrets(tool_name).await?;
 
-        // Resolve capability-based sandbox and network policies
-        let (sandbox_policy, network_policy) = self.resolve_policy(tool_name);
-
-        debug!(
-            tool = tool_name,
-            sandbox = ?sandbox_policy,
-            allowed_domains = ?network_policy.allowed_domains,
-            allow_loopback = network_policy.allow_loopback,
-            "resolved execution policy"
-        );
-
         // Build tool context
         let ctx = ToolContext {
             session_id: session_id.to_string(),
@@ -196,8 +120,6 @@ impl ToolExecutor {
             cancellation_token: CancellationToken::new(),
             secrets,
             secret_accessor,
-            sandbox_policy,
-            network_policy,
         };
 
         // Execute with timeout enforcement
@@ -271,7 +193,6 @@ impl ToolExecutor {
             return Ok((HashMap::new(), None));
         }
 
-        // Build the static secrets map (for WASM backward compat)
         let keys: Vec<String> = requirements.iter().map(|r| r.key.clone()).collect();
         let vault_secrets = self
             .secret_vault

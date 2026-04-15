@@ -9,7 +9,7 @@ Core responsibilities:
 - Trigger extension logic at 31 lifecycle points across session, turn, LLM, tool, response, subagent, task/job, context, cost, and async events
 - Allow extensions to inspect, modify, block, or abort execution flows
 - Filter hook execution via matchers (exact, pattern, regex)
-- Support multiple hook handler types: trait (Rust), command (shell), HTTP (webhook), WASM (sandboxed)
+- Support multiple hook handler types: trait (Rust), command (shell), HTTP (webhook)
 - Keep security, auditing, and operations logic decoupled from the `agent` main loop
 
 ## Hook Events
@@ -171,26 +171,24 @@ Hooks fire conditionally based on a matcher. Each event defines a matcher target
 |:--|:--|:--|
 | `*`, `""`, or omitted | Match all | Fires on every occurrence of the event |
 | Only alphanumeric + `_` + `\|` | Exact string or `\|`-separated list | `Bash` or `Edit\|Write` |
-| Any other character | Regex | `^wasm_.*` or `builtin__file.*` |
+| Any other character | Regex | `^ext_.*` or `builtin__file.*` |
 
-**Tool name matching**: Built-in tools use their registered name (e.g. `file_read`, `bash`). WASM tools follow the pattern `wasm__<extension>__<tool>`. Match all WASM tools from one extension: `wasm__memory__.*` (regex).
+**Tool name matching**: Built-in tools use their registered name (e.g. `file_read`, `bash`).
 
 **Why matchers live on the hook, not on the manager**: Each hook knows its own scope. The manager triggers all hooks for a `HookPoint`, and each hook's matcher decides whether it actually fires. This keeps the manager simple and the filtering logic co-located with the hook definition.
 
-### Four hook handler types
+### Three hook handler types
 
 | Type | Description | Isolation | Use Case |
 |------|-------------|-----------|----------|
 | **Trait** | Rust `Hook` trait implementation | In-process | Built-in extensions, maximum performance |
 | **Command** | Shell command execution | Process-level | External scripts, workspace-local hooks |
 | **HTTP** | Webhook POST to URL | Network | External services, dashboards, audit systems |
-| **WASM** | WASM module via `sandbox` runtime | WASM sandbox | Third-party extensions with isolation |
 
-Trait hooks are the primary handler type and the only type implemented directly. Command, HTTP, and WASM handlers are adapter structs that implement the `Hook` trait internally:
+Trait hooks are the primary handler type and the only type implemented directly. Command and HTTP handlers are adapter structs that implement the `Hook` trait internally:
 
 - **Command adapter**: Spawns shell process, writes `HookInput` JSON to stdin, reads `HookOutput` JSON from stdout, maps exit code to `HookAction`
 - **HTTP adapter**: POSTs `HookInput` JSON to URL, parses response body as `HookOutput`, maps HTTP status to `HookAction`
-- **WASM adapter**: Calls WASM module export via `sandbox::WasmRuntime`, passes `HookInput`, parses `HookOutput`
 
 ### Four-action model
 
@@ -244,7 +242,7 @@ Event-specific fields are carried in an `event_data` enum. Each variant contains
 | `SessionStart` | `start_method` (`new`/`resume`/`clear`) |
 | `SessionEnd` | `exit_reason` (`normal`/`timeout`/`error`/`clear`) |
 
-### Hook output protocol (command / HTTP / WASM handlers)
+### Hook output protocol (command / HTTP handlers)
 
 For external (non-trait) handlers, the exit code or HTTP status determines the base action:
 
@@ -306,7 +304,7 @@ Critical hook failure aborts the main flow; non-critical hook failure is logged 
 
 ### Async hooks
 
-Command, HTTP, and WASM hooks can be marked `async: true`. Async hooks:
+Command and HTTP hooks can be marked `async: true`. Async hooks:
 
 - Run in a background tokio task without blocking the main flow
 - Cannot return `Block`, `ContinueWith`, or `Abort` actions (only side effects)
@@ -322,7 +320,6 @@ Every hook handler has a configurable timeout:
 | Trait | 10 seconds |
 | Command | 30 seconds |
 | HTTP | 30 seconds |
-| WASM | 60 seconds |
 
 Timeout triggers the failure path — non-critical hooks log a warning and continue; critical hooks abort the flow.
 
@@ -336,9 +333,7 @@ Hooks can be registered from multiple sources with different scopes:
 | Admin policy | Organization-wide | High | Compliance audit hooks |
 | Workspace config | Per-workspace | Medium | AGENTS.md hook declarations |
 | Skill frontmatter | While skill is active | Medium | Skill-specific pre/post hooks |
-| WASM extension | Per-extension | Low | Third-party extension hooks |
-
-Higher-priority sources can override or disable lower-priority hooks. Admin policy hooks cannot be overridden by workspace or extension hooks.
+Higher-priority sources can override or disable lower-priority hooks. Admin policy hooks cannot be overridden by workspace hooks.
 
 ## Typical Use Cases
 
@@ -378,7 +373,7 @@ Higher-priority sources can override or disable lower-priority hooks. Admin poli
 - Depends only on `channels`
 - `HookContext.extra` must not contain sensitive plaintext
 - Hook execution must have timeout protection to prevent external extensions from blocking the main flow
-- Command/HTTP hooks run in a separate process/request; WASM hooks run within `sandbox` isolation
+- Command/HTTP hooks run in a separate process/request
 - Hook output injected into context is capped at 10,000 characters
 - Async hooks cannot modify context or block actions
 
@@ -395,4 +390,3 @@ Higher-priority sources can override or disable lower-priority hooks. Admin poli
 | `channels` | `ChannelRegistry` triggers `ChannelStatusChanged` on adapter status changes; channel delivery triggers `PreResponse` / `PostResponse` | Hook points defined, not yet triggered in code |
 | `skills` | `SkillRegistry` triggers `SkillReloaded` on hot reload | Hook point defined, not yet triggered in code |
 | `workspace` | `WorkspaceManager` triggers `InstructionsLoaded` on identity file load | Hook point defined, not yet triggered in code |
-| `sandbox` | Provides WASM runtime for WASM hook handlers | — |

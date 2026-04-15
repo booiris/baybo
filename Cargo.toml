@@ -13,7 +13,6 @@ members = [
     "crates/security",
     "crates/hook",
     "crates/agent",
-    "crates/sandbox",
     "crates/storage",
     "crates/registry",
     "crates/skills",
@@ -42,7 +41,6 @@ aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
 aura-hook = { path = "crates/hook" }
 aura-agent = { path = "crates/agent" }
-aura-sandbox = { path = "crates/sandbox" }
 aura-storage = { path = "crates/storage" }
 aura-registry = { path = "crates/registry" }
 aura-skills = { path = "crates/skills" }
@@ -72,8 +70,6 @@ sha2 = "0.10"
 hex = "0.4"
 aes-gcm = "0.10"
 rand = "0.10"
-wasmtime = "43"
-wat = "1"
 libsql = "0.9"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
@@ -113,7 +109,6 @@ aura-trace = { workspace = true }
 aura-security = { workspace = true }
 aura-hook = { workspace = true }
 aura-agent = { workspace = true }
-aura-sandbox = { workspace = true }
 aura-storage = { workspace = true }
 aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }

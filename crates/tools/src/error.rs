@@ -11,9 +11,6 @@ pub enum ToolError {
     #[error("tool timeout: {0}")]
     Timeout(String),
 
-    #[error("WASM error: {0}")]
-    Wasm(String),
-
     #[error("secret access error: {0}")]
     SecretAccess(String),
 

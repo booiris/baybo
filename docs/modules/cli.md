@@ -51,14 +51,14 @@ Commands return `CommandOutput`, not `String`. The sink decides how to render:
 
 ### `SlashHandler` lives in `channels`
 
-The trait that lets a channel adapter intercept `/` input is defined in `aura-channels` (not `aura-cli`). `aura-cli` _implements_ the trait but does not own it. This matters for dependency direction: future `HttpAdapter`, `TelegramAdapter`, `DiscordAdapter` (whether built-in or WASM) can accept a `SlashHandler` without any of them depending on `aura-cli`.
+The trait that lets a channel adapter intercept `/` input is defined in `aura-channels` (not `aura-cli`). `aura-cli` _implements_ the trait but does not own it. This matters for dependency direction: future `HttpAdapter`, `TelegramAdapter`, `DiscordAdapter` can accept a `SlashHandler` without any of them depending on `aura-cli`.
 
 ## Command Reference
 
 **Global flags** (apply to every command in both modes):
 `--config <path>` · `--profile <name>` · `--json` · `--plain` · `--no-color` · `-v/--verbose` · `-V/--version`
 
-"Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs are tracked in the per-subsystem follow-up todos (`docs/todo/cli-agent-send-argv.md`, `docs/todo/cli-sandbox-registry.md`) — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
+"Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs are tracked in the per-subsystem follow-up todos (`docs/todo/cli-agent-send-argv.md`) — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
 
 | Family       | Subcommands                                                                                               | Backing module                                                               | Mutation                                                                                           | Status                                            |
 | ------------ | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
@@ -82,7 +82,6 @@ The trait that lets a channel adapter intercept `/` input is defined in `aura-ch
 | `cron`       | `add --user <u> [--channel <c>] --schedule <expr> --prompt <text> [--one-shot]`                           | `CronScheduler::create_job`                                                  | `add` mutates (requires `--yes` in slash mode); cron expression is validated before insert         | shipped                                           |
 | `memory`     | `list [--user <u>]` · `search <query> [--user <u>]` · `show <id>` · `promote <id> [--to <f>]` · `clear --session <id>` | `MemoryManager`                                                              | `promote`/`clear` mutate (require `--yes` in slash mode)                                           | shipped                                           |
 | `security`   | `audit` · `leaks check <file>`                                                                            | `SecurityGateway::audit` / `LeakDetector::check_file`                        | read-only; `audit` returns rule count by action + vault master-key flag (never secret material); `leaks check` reports blocked/hits via the shared detector | shipped                                           |
-| `sandbox`    | `list` · `info`                                                                                           | `sandbox` crate                                                              | read-only                                                                                          | deferred — no runtime registry exists             |
 | `agent`      | `send --session <id> --message <text>`                                                                    | `Router` / `AgentLoop`                                                       | mutates; **disabled in slash mode** (returns `AgentSendForbiddenInSlash`)                          | partial — grammar + slash guard shipped; argv returns a deferred `Manager` error pending a `Router` one-shot entry |
 | `status`     | —                                                                                                         | `SessionManager` + `JobManager` + `CostTracker`                              | read-only                                                                                          | shipped                                           |
 | `doctor`     | —                                                                                                         | Aggregates `AuraConfig::validate`, storage ping, `llm::probe`, env-var audit | read-only                                                                                          | shipped (LLM probe gated on `llm probe` landing)  |
@@ -141,7 +140,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 | `config`                                                                                                            | `config` family directly reads/writes `AuraConfig`; `doctor` calls `validate`.                                                                                   |
 | `agent`                                                                                                             | Supplies all manager `Arc`s; `agent send` reuses the `Router` path.                                                                                              |
 | `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |
-| `trace` / `job` / `cron` / `skills` / `tools` / `session` / `memory` / `security` / `workspace` / `llm` / `sandbox` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
+| `trace` / `job` / `cron` / `skills` / `tools` / `session` / `memory` / `security` / `workspace` / `llm` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
 
 ## Verification
 
@@ -149,7 +148,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 1. `docs/modules/cli.md` exists with the seven sections above.
 2. `docs/modules/README.md` lists `cli` in its module groups and Reading Order.
-3. Every command family in the table maps to a manager already present in `src/main.rs`; the remaining "deferred" rows (`agent send` argv, `sandbox list/info`) are tracked in their own follow-up todos under `docs/todo/`.
+3. Every command family in the table maps to a manager already present in `src/main.rs`; the remaining "deferred" rows (`agent send` argv) are tracked in their own follow-up todos under `docs/todo/`.
 
 **Phase 2a — read-only commands** — complete.
 
@@ -159,7 +158,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 - `aura completion zsh > /tmp/_aura && zsh -c 'source /tmp/_aura'` loads without error.
 - `aura doctor` reports a warning when `AURA_ALLOW_DEV_ENCRYPTION_KEY=1` and an error when no LLM client is configured.
 
-**Phase 2b — write-mutating commands** — complete. Tracked in `docs/todo/archives/cli-write-commands.md` (archived; two subsystem-level follow-ups — `cli-agent-send-argv.md`, `cli-sandbox-registry.md` — carry the remaining deferred work). Each shipped family landed with the following:
+**Phase 2b — write-mutating commands** — complete. Tracked in `docs/todo/archives/cli-write-commands.md` (archived; one subsystem-level follow-up — `cli-agent-send-argv.md` — carries the remaining deferred work). Each shipped family landed with the following:
 
 - Parser snapshot test in `crates/cli/tests/parser.rs`.
 - Dispatch smoke test in `crates/cli/tests/dispatch_smoke.rs`.

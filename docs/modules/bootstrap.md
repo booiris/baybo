@@ -91,7 +91,6 @@ The dev fallback for the encryption key is intentional but explicit: a fresh che
 
 ## What boot does NOT do
 
-- **No sandbox construction** — `SandboxConfig` has no downstream consumer in `main.rs` today.
 - **No MCP server registration** — MCP support (and the `tools.mcp_servers[]` config surface) is temporarily removed; see `docs/todo/reintroduce-mcp-support.md`.
 - **No optional channel adapters** — `channels.{http, telegram, discord}` are validated but only `cli` is wired.
 - **No cost guard or rate limiter** — `cost.*` is validated but not yet consumed by the running router.

@@ -12,7 +12,7 @@ There is also no config-side notion of "which account is authorized." No `allowe
 
 1. **Sender identity does not reach `SlashHandler`.** The trait signature needs to grow a principal argument (or an auth context struct) so the dispatcher can see *who* invoked the command, not just *what*. This is a cross-crate surface change: `aura-channels`, every adapter, and `aura-cli`'s `CliSlashHandler` all move together.
 
-2. **No authorization model in config.** There is no `AuraConfig` section declaring the workspace owner, nor per-channel `allowed_users` lists. The sandbox-registry todo (`docs/todo/cli-sandbox-registry.md`) and `docs/todo/config-wire-remaining-sections.md` already flag that several config sections are missing — auth should land in the same batch so the schema commitment is made once.
+2. **No authorization model in config.** There is no `AuraConfig` section declaring the workspace owner, nor per-channel `allowed_users` lists. `docs/todo/config-wire-remaining-sections.md` already flags that several config sections are missing — auth should land in the same batch so the schema commitment is made once.
 
 3. **`CommandContext::invocation` is too coarse.** It distinguishes `Argv` vs `Slash` but has no principal. Handlers that want to gate on "this is the owner" have nowhere to read it from. The `confirmed: bool` field follows the same pattern — an auth principal slot next to it is the natural shape.
 
@@ -61,7 +61,7 @@ channel = "discord"
 user_id = "987654321"
 ```
 
-Validated in `aura-config::validate` the same way `sandbox.network.allowed_domains` is. Exposed as `Arc<AccessPolicy>` on `CommandContext`.
+Validated in `aura-config::validate` the same way other allow-list sections are. Exposed as `Arc<AccessPolicy>` on `CommandContext`.
 
 ### Stage 3 — enforcement
 

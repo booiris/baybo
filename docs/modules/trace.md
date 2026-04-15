@@ -27,7 +27,7 @@ One LLM call may spawn multiple child operations (tool calls, memory operations)
 
 ### Provenance for replayability
 
-If the system supports skill hot reload, WASM tool replacement, Soul config updates, or provider config changes, input/output alone is insufficient — version source must be recorded. Otherwise historical replay becomes "rerun yesterday's conversation with today's code," which is not auditable.
+If the system supports skill hot reload, tool replacement, Soul config updates, or provider config changes, input/output alone is insufficient — version source must be recorded. Otherwise historical replay becomes "rerun yesterday's conversation with today's code," which is not auditable.
 
 Provenance fields: `skill_version`, `tool_artifact_hash`, `provider_config_hash`, `soul_version`.
 

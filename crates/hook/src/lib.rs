@@ -182,7 +182,7 @@ pub trait Hook: Send + Sync {
     async fn execute(&self, ctx: &mut HookContext) -> Result<HookAction>;
 }
 
-/// Structured output from external (command / HTTP / WASM) hook handlers.
+/// Structured output from external (command / HTTP) hook handlers.
 ///
 /// Trait-based hooks return `HookAction` directly. This struct is the
 /// intermediate representation for external handlers that communicate

@@ -3,7 +3,6 @@ use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
 use crate::error::{ConfigError, ValidationError};
 use crate::llm::LlmConfig;
-use crate::sandbox::SandboxConfig;
 use crate::session::SessionConfig;
 use crate::tools::ToolsConfig;
 use crate::trace::TraceConfig;
@@ -19,7 +18,6 @@ impl AuraConfig {
         validate_agent(self, &mut errors);
         validate_session(&self.session, &mut errors);
         validate_channels(&self.channels, &mut errors);
-        validate_sandbox(&self.sandbox, &mut errors);
         validate_tools(&self.tools, &mut errors);
         validate_trace(&self.trace, &mut errors);
         validate_cost(&self.cost, &mut errors);
@@ -163,27 +161,6 @@ fn validate_channels(channels: &ChannelsConfig, errors: &mut Vec<ValidationError
                 "must be non-empty",
             ));
         }
-    }
-}
-
-fn validate_sandbox(sandbox: &SandboxConfig, errors: &mut Vec<ValidationError>) {
-    if sandbox.wasm.timeout_ms < 100 {
-        errors.push(ValidationError::new(
-            "sandbox.wasm.timeout_ms",
-            "must be >= 100",
-        ));
-    }
-    if sandbox.wasm.max_memory_bytes < 1_048_576 {
-        errors.push(ValidationError::new(
-            "sandbox.wasm.max_memory_bytes",
-            "must be >= 1048576 (1 MB)",
-        ));
-    }
-    if sandbox.wasm.max_fuel < 1_000 {
-        errors.push(ValidationError::new(
-            "sandbox.wasm.max_fuel",
-            "must be >= 1000",
-        ));
     }
 }
 

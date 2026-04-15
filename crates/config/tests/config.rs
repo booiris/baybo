@@ -131,14 +131,6 @@ fn http_channel_requires_bind_address_and_port() {
 }
 
 #[test]
-fn sandbox_memory_minimum() {
-    let mut c = AuraConfig::default();
-    c.sandbox.wasm.max_memory_bytes = 1024;
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "sandbox.wasm.max_memory_bytes"));
-}
-
-#[test]
 fn spending_limits_must_be_positive() {
     let mut c = AuraConfig::default();
     c.cost.spending_limits.user_daily_usd = Some(-1.0);

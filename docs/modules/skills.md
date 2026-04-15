@@ -172,7 +172,7 @@ Filesystem watching is not wired yet — reload is on-demand only.
 
 ### Boundary with tool governance
 
-Skills declare `allowed-tools`, but this is only one input to the upper bound. Before execution, the system still checks: skill's allowlist → trust-level ceiling → `ToolManifest.capabilities` → `sandbox` policy. The skill's allowlist is not the final execution authorization.
+Skills declare `allowed-tools`, but this is only one input to the upper bound. Before execution, the system still checks: skill's allowlist → trust-level ceiling → `ToolManifest.capabilities`. The skill's allowlist is not the final execution authorization.
 
 ## Constraints
 

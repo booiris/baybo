@@ -98,18 +98,18 @@ mod tests {
 
     #[test]
     fn regex_matcher() {
-        let m = HookMatcher::parse("^wasm__.*").unwrap();
-        assert!(m.matches("wasm__memory__create"));
-        assert!(m.matches("wasm__fs__read"));
+        let m = HookMatcher::parse("^ext__.*").unwrap();
+        assert!(m.matches("ext__memory__create"));
+        assert!(m.matches("ext__fs__read"));
         assert!(!m.matches("builtin__bash"));
     }
 
     #[test]
     fn regex_matcher_complex() {
-        let m = HookMatcher::parse("wasm__.*__write.*").unwrap();
-        assert!(m.matches("wasm__fs__write_file"));
-        assert!(m.matches("wasm__memory__write"));
-        assert!(!m.matches("wasm__fs__read"));
+        let m = HookMatcher::parse("ext__.*__write.*").unwrap();
+        assert!(m.matches("ext__fs__write_file"));
+        assert!(m.matches("ext__memory__write"));
+        assert!(!m.matches("ext__fs__read"));
     }
 
     #[test]

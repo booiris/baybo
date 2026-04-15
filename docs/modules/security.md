@@ -40,7 +40,7 @@ Secrets are encrypted with AES-256-GCM (random nonce + ciphertext + tag). The ma
 
 ### Network decision boundary
 
-Security only decides allow/deny. It does not execute network access. The chain is: manifest + admin config + runtime request → `NetworkPolicyDecider::decide()` → sandbox executes. This separates permission decisions from execution isolation.
+Security only decides allow/deny. It does not execute network access. The chain is: manifest + admin config + runtime request → `NetworkPolicyDecider::decide()` → tool executes. This separates permission decisions from execution.
 
 ## Constraints
 
@@ -56,6 +56,5 @@ Security only decides allow/deny. It does not execute network access. The chain 
 |--------|------|
 | `channels` | Input messages go to `agent::security::SecurityGateway` first |
 | `agent` | `agent::security::SecurityGateway` and `SecretVault` own business logic; `ToolExecutor` retrieves secrets and injects into tools |
-| `sandbox` | Consumes allow/deny decisions from `NetworkPolicyDecider` |
 | `trace` / `job` | Receive only sanitized payloads and placeholders |
 | `storage` | Defines `SecretStore` trait; provides libsql implementation |

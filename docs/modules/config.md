@@ -6,7 +6,7 @@ The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `val
 
 A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consumers (`main.rs` and `aura-agent`) map each section into the corresponding domain type.
 
-Top-level sections: `llm`, `agent`, `session`, `channels`, `sandbox`, `security`, `skills`, `tools`, `trace`, `cost`, `workspace`.
+Top-level sections: `llm`, `agent`, `session`, `channels`, `security`, `skills`, `tools`, `trace`, `cost`, `workspace`.
 
 > **MCP status note.** The `tools.mcp_servers[]` surface, its mirror structs
 > (`McpServerEntry`, `McpTransportConfig`, `SecretRequirementConfig`,
@@ -69,7 +69,7 @@ JSON is the sole supported format. It has the widest tooling support, round-trip
 
 `serde`'s default tolerance applies: unknown keys are silently ignored. This is permissive by design so a newer JSON file (with fields an older binary does not yet know about) does not hard-fail at load. The cost is that typos in field names are also silent — `"session.timeout_minutes": 10` parses fine and the real `timeout_minutes` stays at its default.
 
-Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security`, `sandbox`, and — once reintroduced — `tools.mcp_servers[]`) may opt into `#[serde(deny_unknown_fields)]` individually. The root `AuraConfig` intentionally keeps permissive semantics.
+Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security` and — once reintroduced — `tools.mcp_servers[]`) may opt into `#[serde(deny_unknown_fields)]` individually. The root `AuraConfig` intentionally keeps permissive semantics.
 
 ### Secret handling
 
@@ -88,7 +88,6 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 | `agent`    | `ExecutionPolicy` + `TokenBudget` + `Truncate::keep_recent` | Tool timeout layering: `agent.default_tool_timeout_ms` is the **per-call requested** timeout the agent loop asks for; `tools.default_timeout_ms` is the **hard cap** at the executor. Executor wins. |
 | `session`  | `SessionManager` timeout + cleanup cadence                  | `timeout_minutes` sets idle expiry; `cleanup_interval_minutes` sets sweep cadence (`0` disables cleanup).                                                                                            |
 | `channels` | `ChannelRegistry` adapter enablement + mpsc buffer sizes    | See §"Channel enablement model".                                                                                                                                                                     |
-| `sandbox`  | `SandboxLimits` + `NetworkPolicy`                           |                                                                                                                                                                                                      |
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
 | `skills`   | `aura_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
 | `tools`    | `ToolExecutor` default timeout (MCP server list returns with reintroduction) |                                                                                                                                                                                      |
@@ -126,7 +125,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 
 When hot reload is implemented, the following contract must be in place **before** reload code lands:
 
-- **Hot-updatable fields** — an explicit whitelist. Plausible candidates: `cost.rate_limit.*`, `cost.spending_limits.*`, `trace.snapshot_interval`, `security.leak_detection_enabled`. Clearly not hot-updatable: `channels.http.port`, `channels.http.bind_address`, `sandbox.wasm.max_memory_bytes`, anything influencing `llm` client identity.
+- **Hot-updatable fields** — an explicit whitelist. Plausible candidates: `cost.rate_limit.*`, `cost.spending_limits.*`, `trace.snapshot_interval`, `security.leak_detection_enabled`. Clearly not hot-updatable: `channels.http.port`, `channels.http.bind_address`, anything influencing `llm` client identity.
 - **Atomic swap** — a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden.
 - **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError::Validation` to the caller; no partial state is exposed.
 - **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config.
@@ -156,9 +155,6 @@ Until reload is implemented, `ConfigChange` fires exactly once at startup (for p
 | `channels.http.*`                     | non-empty `bind_address`, non-zero `port`            |
 | `channels.telegram.bot_token_env`     | non-empty                                            |
 | `channels.discord.bot_token_env`      | non-empty                                            |
-| `sandbox.wasm.timeout_ms`             | ≥ 100                                                |
-| `sandbox.wasm.max_memory_bytes`       | ≥ 1 MB                                               |
-| `sandbox.wasm.max_fuel`               | ≥ 1000                                               |
 | `tools.default_timeout_ms`            | ≥ 100                                                |
 | `cost.spending_limits.*_usd`          | if set, strictly positive, finite                    |
 | `cost.spending_limits.user_*`         | cross-field: `daily_usd ≤ monthly_usd` when both set |
@@ -175,7 +171,7 @@ Field-level checks catch syntax errors; cross-section checks catch policy incons
 | Each `channels.*` with `enabled: false` is rejected (enablement-model self-consistency)                                                                                          | `channels`         |
 | `security.encryption_key_file` and `encryption_key_env` cannot both be unset when any downstream consumer requires an encryption key                                             | `security`         |
 
-(The two MCP-specific cross-section rules — host-allowlist/loopback vs. `sandbox.network`, and the trust/capability matrix — were removed with MCP support. They'll return with the MCP re-add.)
+(The two MCP-specific cross-section rules — host-allowlist/loopback and the trust/capability matrix — were removed with MCP support. They'll return with the MCP re-add.)
 
 Cross-section rules are part of the default `validate()` pass. A future strict-load flag will also enforce advisory hygiene (e.g. key-file extension hints, env-var name syntax); today those are handled case-by-case in bootstrap.
 
@@ -195,7 +191,6 @@ Cross-section rules are part of the default `validate()` pass. A future strict-l
 | `main.rs`  | Loads the config at startup, maps each section into domain types, passes them down                                                                                                     |
 | `agent`    | Consumes `AgentConfig`, `SessionConfig`, `TraceConfig`, `CostConfig`                                                                                                                   |
 | `llm`      | Receives `LlmProviderConfig` built from `LlmConfig`                                                                                                                                    |
-| `sandbox`  | Receives `SandboxLimits` and `NetworkPolicy` built from `SandboxConfig`                                                                                                                |
 | `tools`    | Receives `ToolsConfig::default_timeout_ms`. (Once MCP lands again, it will also receive `McpServerConfig` list built from `ToolsConfig::mcp_servers`.)                                 |
 | `channels` | Channel adapters are registered based on `ChannelsConfig` section enablement                                                                                                           |
 | `hook`     | `ConfigChange` is an extension point that _observes_ or _vetoes_ proposed changes. It does **not** emit provenance — provenance is recorded by the bootstrap/agent layer into `trace`. |

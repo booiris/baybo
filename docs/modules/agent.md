@@ -40,7 +40,7 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### ToolExecutor responsibility
 
-ToolExecutor: lookup tool → read declared secrets → determine sandbox/network policy → construct `ToolContext` → create child Job/Trace nodes → execute → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
+ToolExecutor: lookup tool → read declared secrets → construct `ToolContext` → create child Job/Trace nodes → execute → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
 
 ### Long-running model
 
@@ -82,5 +82,4 @@ Before a message enters an actor, Router completes: session identification/creat
 | `security` | Provides crypto primitives (`EncryptionKey`, `LeakDetector`) used by `agent::security::{SecretVault, SecurityGateway}` |
 | `channels` | `ChannelRegistry` and adapters (e.g. `TuiAdapter`); Router owns the registry for dispatch |
 | `storage` | Provides all Store traits and libsql implementations; injected into managers |
-| `sandbox` | WASM or container isolated execution |
 | `hook` | `AgentActor` triggers `PreMessage` and `PreResponse` hooks at lifecycle points |

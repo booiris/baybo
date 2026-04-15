@@ -10,7 +10,7 @@ The `ConfigChange` hook point exists in `aura-hook` for future hot-reload and fo
 
 The contract in `config.md` is non-negotiable and must land **before** any reload code ships:
 
-1. **Hot-updatable whitelist** — explicit allowlist of fields safe to swap live. Plausible: `cost.rate_limit.*`, `cost.spending_limits.*`, `trace.snapshot_interval`, `security.leak_detection_enabled`. Explicitly not hot-updatable: `channels.http.port`, `channels.http.bind_address`, `sandbox.wasm.max_memory_bytes`, anything that influences `LlmClient` identity.
+1. **Hot-updatable whitelist** — explicit allowlist of fields safe to swap live. Plausible: `cost.rate_limit.*`, `cost.spending_limits.*`, `trace.snapshot_interval`, `security.leak_detection_enabled`. Explicitly not hot-updatable: `channels.http.port`, `channels.http.bind_address`, anything that influences `LlmClient` identity.
 2. **Atomic swap** — a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden.
 3. **Validation rollback** — if the new config fails `validate()`, the running config stays untouched and the caller gets `ConfigError::Validation` back. No observable partial state.
 4. **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new one.

@@ -656,13 +656,13 @@ mod tests {
         let mut manager = HookManager::new();
 
         manager.register(MatchedHook {
-            hook_name: "wasm-hooks",
+            hook_name: "ext-hooks",
             point: HookPoint::PreToolUse,
-            hook_matcher: HookMatcher::parse("^wasm__.*").unwrap(),
+            hook_matcher: HookMatcher::parse("^ext__.*").unwrap(),
             counter: counter.clone(),
         });
 
-        let mut ctx = make_tool_ctx("wasm__memory__create");
+        let mut ctx = make_tool_ctx("ext__memory__create");
         manager
             .trigger(HookPoint::PreToolUse, &mut ctx)
             .await

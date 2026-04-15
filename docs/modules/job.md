@@ -58,7 +58,7 @@ All successfully completed Jobs follow the same path: `Pending → InProgress �
 
 ### Stuck and recovery
 
-`Stuck` means execution state is unknown or hung (e.g. LLM timeout, WASM tool stuck). Recovery: watchdog scans `InProgress` → timeout → `stuck()` → system decides `recover()` (back to `InProgress`) or `fail()`.
+`Stuck` means execution state is unknown or hung (e.g. LLM timeout, tool stuck). Recovery: watchdog scans `InProgress` → timeout → `stuck()` → system decides `recover()` (back to `InProgress`) or `fail()`.
 
 ### Restart recovery
 

@@ -25,9 +25,6 @@ pub type Result<T> = std::result::Result<T, ChannelError>;
 ///
 /// Each channel converts platform-specific messages into `IncomingMessage`
 /// and sends `OutgoingMessage` back in the platform-native format.
-///
-/// Concrete implementations live outside this crate (in `channels/`) and
-/// are loaded at runtime via the WASM extension mechanism.
 #[async_trait]
 pub trait ChannelAdapter: Send + Sync + 'static {
     /// Returns the channel type identifier for this adapter.

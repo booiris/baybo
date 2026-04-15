@@ -4,7 +4,7 @@
 
 The `channels` crate defines the **trait interface** for receiving messages from multiple platforms and converting them into a unified `IncomingMessage`, then converting `OutgoingMessage` back into platform-native formats for delivery.
 
-**Design pattern**: Adapter pattern. The crate provides the `ChannelAdapter` trait, shared message types, and `ChannelRegistry`. Built-in adapters (e.g. `TuiAdapter` — a Ratatui-based terminal UI that is the default interactive channel) are implemented directly in this crate. Additional platform adapters (Telegram, Discord, HTTP, etc.) can be built as WASM modules and loaded at runtime via the `sandbox` extension mechanism.
+**Design pattern**: Adapter pattern. The crate provides the `ChannelAdapter` trait, shared message types, and `ChannelRegistry`. Built-in adapters (e.g. `TuiAdapter` — a Ratatui-based terminal UI that is the default interactive channel) are implemented directly in this crate. Additional platform adapters (Telegram, Discord, HTTP, etc.) can be added as native crates behind the same trait.
 
 Core responsibilities of this crate:
 
@@ -17,7 +17,7 @@ Core responsibilities of this crate:
 
 ### Built-in and extensible adapters
 
-This crate contains the `ChannelAdapter` trait and built-in adapters that require only pure-Rust dependencies (e.g. `TuiAdapter`, which pulls in `ratatui` + `crossterm`). Platform-specific adapters that bring SDK dependencies (Telegram, Discord, etc.) are built as WASM modules under the top-level `channels/` directory, keeping those dependencies out of the main workspace and enabling hot-reload and sandboxed execution.
+This crate contains the `ChannelAdapter` trait and built-in adapters that require only pure-Rust dependencies (e.g. `TuiAdapter`, which pulls in `ratatui` + `crossterm`). Platform-specific adapters that bring SDK dependencies (Telegram, Discord, etc.) live in their own crates behind the same trait so their dependencies stay opt-in.
 
 ### No business logic
 
@@ -61,7 +61,7 @@ Router calls `stop()` on all channels, each exits its background loop and releas
 
 ## Channel Implementations
 
-Built-in adapters are implemented directly in this crate. Platform-specific adapters are built as WASM modules under `channels/` at the project root, implementing the `ChannelAdapter` trait and loaded at runtime through the `sandbox` crate's WASM runtime.
+Built-in adapters are implemented directly in this crate. Platform-specific adapters live in their own crates that implement the `ChannelAdapter` trait and are wired in by the bootstrap layer.
 
 Current and planned adapters:
 
@@ -124,7 +124,7 @@ Design rules:
 
 - `channels` (the crate) stays independent of `agent`, `llm`, `tools`, and all other business crates (depends only on `model` and `session`)
 - Each adapter must be `Send + Sync + 'static` for safe use across tokio tasks
-- Platform SDK dependencies belong in the WASM modules, not in this crate; built-in adapters must have no external dependencies
+- Platform SDK dependencies belong in their own adapter crates, not in this crate; built-in adapters must have no external dependencies
 
 ## Collaboration
 
@@ -134,4 +134,3 @@ Design rules:
 | `session`  | Provides `ChannelType`, `User`                                              |
 | `agent`    | Router registers adapters and dispatches outgoing messages by `ChannelType` |
 | `security` | Input messages go to `SecurityGateway` first after entering the system      |
-| `sandbox`  | Provides WASM runtime for loading channel adapter modules                   |

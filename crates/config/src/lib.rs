@@ -18,7 +18,6 @@ pub mod channels;
 pub mod cost;
 pub mod error;
 pub mod llm;
-pub mod sandbox;
 pub mod security;
 pub mod session;
 pub mod skills;
@@ -39,7 +38,6 @@ pub use crate::channels::{
 pub use crate::cost::{CostConfig, RateLimitConfig, SpendingLimitsConfig};
 pub use crate::error::{ConfigError, Result, ValidationError};
 pub use crate::llm::LlmConfig;
-pub use crate::sandbox::{NetworkPolicyConfig, SandboxConfig, WasmLimitsConfig};
 pub use crate::security::SecurityConfig;
 pub use crate::session::SessionConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
@@ -58,7 +56,6 @@ pub struct AuraConfig {
     pub agent: AgentConfig,
     pub session: SessionConfig,
     pub channels: ChannelsConfig,
-    pub sandbox: SandboxConfig,
     pub security: SecurityConfig,
     pub skills: SkillsConfig,
     pub tools: ToolsConfig,
