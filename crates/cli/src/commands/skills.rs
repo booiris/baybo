@@ -120,7 +120,7 @@ async fn check(ctx: &CommandContext, name: Option<&str>) -> Result<CommandOutput
     let mut risk_summaries: Vec<RiskSummary> = Vec::with_capacity(reports.len());
     for r in &reports {
         let summary = match ctx.skills.get(&r.name) {
-            Some(skill) => assess_one(ctx.skill_assessor.as_deref(), skill).await,
+            Some(skill) => assess_one(ctx.skill_assessor.as_deref(), &skill).await,
             None => RiskSummary::Error(format!("skill '{}' is no longer registered", r.name)),
         };
         risk_summaries.push(summary);

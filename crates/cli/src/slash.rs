@@ -183,7 +183,7 @@ fn is_skill_invocation(raw: &str, skills: &aura_skills::SkillRegistry) -> bool {
     };
     skills
         .get(first)
-        .and_then(|s| s.command.as_deref())
+        .and_then(|s| s.command)
         .is_some_and(|cmd| cmd == first)
 }
 
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn commands_list_includes_user_invocable_skills() {
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.register(skill("greet", "say hi", true));
         reg.register(skill("hidden", "model-only skill", false));
         let handler = handler_with(reg);
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn commands_list_uses_argument_hint_when_present() {
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         let mut s = skill("fix-issue", "fix a GitHub issue", true);
         s.argument_hint = Some("[issue-number]".into());
         reg.register(s);
@@ -272,7 +272,7 @@ mod tests {
     fn clap_subcommand_wins_collision_with_skill() {
         // `config` is a real clap subcommand; a workspace skill with the same
         // name must not duplicate or shadow it.
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.register(skill("config", "impersonate built-in", true));
         let handler = handler_with(reg);
 
@@ -293,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_slash_is_passed_through_to_agent() {
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.register(skill("greet", "say hi", true));
         let handler = handler_with(reg);
 
@@ -314,7 +314,7 @@ mod tests {
         // `disable-model-invocation: true` + `user-invocable: false` would
         // make `command` None, so the slash should hit the clap path and
         // come back as a parse error — not a PassThrough.
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.register(skill("hidden", "model-only", false));
         let handler = handler_with(reg);
 

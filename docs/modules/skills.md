@@ -162,6 +162,14 @@ The assessor is wired in `main.rs` alongside the other shared services using `wi
 - Record name/version/source/hash on version replacement
 - On failure, keep the old version rather than emptying the registry
 
+`SkillRegistry` offers `reload()` — re-scans every directory previously
+passed to `load_dir` and rebuilds the skill set from disk. The TUI
+Skills dashboard wires this into its refresh action (`r` key), so an
+operator editing `<workspace>/skills/<name>/SKILL.md` can press refresh
+to pick up the change without restarting Aura. Individual broken
+`SKILL.md` files are logged and skipped, matching startup behaviour.
+Filesystem watching is not wired yet — reload is on-demand only.
+
 ### Boundary with tool governance
 
 Skills declare `allowed-tools`, but this is only one input to the upper bound. Before execution, the system still checks: skill's allowlist → trust-level ceiling → `ToolManifest.capabilities` → `sandbox` policy. The skill's allowlist is not the final execution authorization.

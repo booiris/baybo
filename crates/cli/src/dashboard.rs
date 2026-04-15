@@ -40,6 +40,11 @@ impl DashboardProvider for CliDashboardProvider {
 }
 
 fn skills_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
+    // Refreshing the Skills view also hot-reloads from disk so operators
+    // can edit `<workspace>/skills/<name>/SKILL.md` and see the change
+    // without restarting Aura. Other dashboards don't pair with a
+    // filesystem source, so they skip this step.
+    let total = ctx.skills.reload();
     let mut names = ctx.skills.list();
     names.sort();
     let rows: Vec<Vec<String>> = names
@@ -57,7 +62,7 @@ fn skills_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
         title: "Skills".into(),
         columns: vec!["NAME".into(), "DESCRIPTION".into()],
         rows,
-        footer: None,
+        footer: Some(format!("reloaded from disk · {total} skill(s)")),
     }
 }
 

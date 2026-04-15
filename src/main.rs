@@ -177,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
     // --- minimal services required by both argv and chat modes ---
 
     let skill_registry = {
-        let mut reg = SkillRegistry::new();
+        let reg = Arc::new(SkillRegistry::new());
         let workspace_skills = workspace_root.join("skills");
         let workspace_loaded = reg.load_dir(&workspace_skills);
         if workspace_loaded > 0 {
@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
                 "loaded skills from workspace"
             );
         }
-        Arc::new(reg)
+        reg
     };
     let tool_registry = Arc::new(ToolRegistry::new());
     let workspace = Arc::new(WorkspaceManager::new(PathBuf::from(&config.workspace.path)));
@@ -278,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     {
         let registry = Arc::clone(&skill_registry);
-        let lookup = move |name: &str| registry.get(name).map(|s| (*s).clone());
+        let lookup = move |name: &str| registry.get(name);
         match skill_assessor.recover_pending_jobs(lookup).await {
             Ok(0) => {}
             Ok(n) => info!(count = n, "re-enqueued skill-risk jobs from prior run"),

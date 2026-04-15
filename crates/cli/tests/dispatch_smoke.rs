@@ -2756,7 +2756,7 @@ fn sample_skill(name: &str, description: &str) -> aura_skills::SkillDefinition {
 
 #[tokio::test]
 async fn skills_search_returns_hits_for_substring() {
-    let mut registry = SkillRegistry::new();
+    let registry = SkillRegistry::new();
     registry.register(sample_skill("summarize", "condense long text"));
     registry.register(sample_skill("translate", "convert between languages"));
     let ctx = context_with_skills(registry);
@@ -2778,7 +2778,7 @@ async fn skills_search_returns_hits_for_substring() {
 
 #[tokio::test]
 async fn skills_search_empty_query_returns_everything() {
-    let mut registry = SkillRegistry::new();
+    let registry = SkillRegistry::new();
     registry.register(sample_skill("a", "x"));
     registry.register(sample_skill("b", "y"));
     let ctx = context_with_skills(registry);
@@ -2796,7 +2796,7 @@ async fn skills_search_empty_query_returns_everything() {
 
 #[tokio::test]
 async fn skills_check_reports_ok_for_clean_skill() {
-    let mut registry = SkillRegistry::new();
+    let registry = SkillRegistry::new();
     registry.register(sample_skill("clean", "no external reqs"));
     let ctx = context_with_skills(registry);
 
@@ -2818,7 +2818,7 @@ async fn skills_check_reports_ok_for_clean_skill() {
 async fn skills_check_flags_missing_binary() {
     let mut skill = sample_skill("needs-bin", "requires a missing binary");
     skill.requirements.required_bins = vec!["aura_not_a_binary_xyz_98765".into()];
-    let mut registry = SkillRegistry::new();
+    let registry = SkillRegistry::new();
     registry.register(skill);
     let ctx = context_with_skills(registry);
 
