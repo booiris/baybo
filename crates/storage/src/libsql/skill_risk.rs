@@ -24,7 +24,7 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
             .query(
                 "SELECT level, rationale, model, assessed_at \
                  FROM skill_risk_assessments \
-                 WHERE skill_name = ?1 AND content_hash = ?2",
+                 WHERE skill_name = ?1 AND content_hash = ?2 AND deleted_at IS NULL",
                 libsql::params![skill_name.to_string(), content_hash.to_string()],
             )
             .await
@@ -91,15 +91,18 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
 
     async fn forget(&self, skill_name: &str) -> Result<()> {
         let conn = self.pool.conn();
+        let now = chrono::Utc::now().timestamp();
         conn.execute(
-            "DELETE FROM skill_risk_assessments WHERE skill_name = ?1",
-            libsql::params![skill_name.to_string()],
+            "UPDATE skill_risk_assessments SET deleted_at = ?1 \
+             WHERE skill_name = ?2 AND deleted_at IS NULL",
+            libsql::params![now, skill_name.to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete risk: {e}")))?;
         conn.execute(
-            "DELETE FROM skill_risk_assessment_jobs WHERE skill_name = ?1",
-            libsql::params![skill_name.to_string()],
+            "UPDATE skill_risk_assessment_jobs SET deleted_at = ?1 \
+             WHERE skill_name = ?2 AND deleted_at IS NULL",
+            libsql::params![now, skill_name.to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete risk jobs: {e}")))?;
@@ -118,7 +121,8 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
                  status      = excluded.status, \
                  attempts    = excluded.attempts, \
                  last_error  = excluded.last_error, \
-                 updated_at  = excluded.updated_at",
+                 updated_at  = excluded.updated_at, \
+                 deleted_at  = NULL",
             libsql::params![
                 job.skill_name.clone(),
                 job.content_hash.clone(),
@@ -148,7 +152,7 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
         conn.execute(
             "UPDATE skill_risk_assessment_jobs \
              SET status = ?1, attempts = ?2, last_error = ?3, updated_at = ?4 \
-             WHERE skill_name = ?5 AND content_hash = ?6",
+             WHERE skill_name = ?5 AND content_hash = ?6 AND deleted_at IS NULL",
             libsql::params![
                 status.as_str().to_string(),
                 attempts as i64,
@@ -167,10 +171,11 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
 
     async fn delete_job(&self, skill_name: &str, content_hash: &str) -> Result<()> {
         let conn = self.pool.conn();
+        let now = chrono::Utc::now().timestamp();
         conn.execute(
-            "DELETE FROM skill_risk_assessment_jobs \
-             WHERE skill_name = ?1 AND content_hash = ?2",
-            libsql::params![skill_name.to_string(), content_hash.to_string()],
+            "UPDATE skill_risk_assessment_jobs SET deleted_at = ?1 \
+             WHERE skill_name = ?2 AND content_hash = ?3 AND deleted_at IS NULL",
+            libsql::params![now, skill_name.to_string(), content_hash.to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete risk job: {e}")))?;
@@ -184,6 +189,7 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
                 "SELECT skill_name, content_hash, source_path, status, attempts, last_error, \
                         created_at, updated_at \
                  FROM skill_risk_assessment_jobs \
+                 WHERE deleted_at IS NULL \
                  ORDER BY created_at ASC",
                 libsql::params![],
             )

@@ -21,7 +21,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM sessions WHERE id = ?1",
+                "SELECT data FROM sessions WHERE id = ?1 AND deleted_at IS NULL",
                 libsql::params![session_id.to_string()],
             )
             .await
@@ -49,6 +49,8 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let data = serde_json::to_string(session)
             .map_err(|e| SessionError::Storage(format!("serialize session: {e}")))?;
+        // INSERT OR REPLACE rewrites the row, so `deleted_at` falls back to
+        // its NULL default — saving a previously soft-deleted id revives it.
         conn.execute(
             "INSERT OR REPLACE INTO sessions (id, data) VALUES (?1, ?2)",
             libsql::params![session.id.clone(), data],
@@ -60,9 +62,10 @@ impl SessionStore for LibsqlSessionStore {
 
     async fn delete(&self, session_id: &str) -> Result<()> {
         let conn = self.pool.conn();
+        let now = Utc::now().timestamp();
         conn.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            libsql::params![session_id.to_string()],
+            "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            libsql::params![now, session_id.to_string()],
         )
         .await
         .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql delete session: {e}")))?;
@@ -72,7 +75,7 @@ impl SessionStore for LibsqlSessionStore {
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<String>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT id, data FROM sessions", ())
+            .query("SELECT id, data FROM sessions WHERE deleted_at IS NULL", ())
             .await
             .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
@@ -100,7 +103,7 @@ impl SessionStore for LibsqlSessionStore {
     async fn list_all(&self) -> Result<Vec<Session>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM sessions", ())
+            .query("SELECT data FROM sessions WHERE deleted_at IS NULL", ())
             .await
             .map_err(|e| SessionError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 

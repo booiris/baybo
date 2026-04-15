@@ -31,6 +31,17 @@ RUST_LOG=aura=debug cargo run                                  # run with loggin
 - Internal crates (`aura-*`) are also listed in `[workspace.dependencies]` with `path = "crates/<name>"` and consumed via `{ workspace = true }`.
 - Applies to both `[dependencies]` and `[dev-dependencies]`.
 
+## Storage (libsql) — Soft Delete
+
+All libsql-backed tables that support deletion use **soft delete**, never a hard `DELETE`. This preserves history for audit, replay, and compliance.
+
+- Every deletable table carries a nullable `deleted_at INTEGER` column (Unix seconds; `NULL` = live row).
+- Deletion = `UPDATE ... SET deleted_at = ?now WHERE ... AND deleted_at IS NULL`. Do not emit `DELETE FROM` against these tables.
+- Every read (`SELECT`) MUST include `AND deleted_at IS NULL` so soft-deleted rows stay hidden. Every mutation (`UPDATE`) on a live row MUST include the same guard so you never write through a deleted row.
+- Re-insertion semantics: `INSERT OR REPLACE` and `ON CONFLICT ... DO UPDATE` must reset `deleted_at` back to `NULL` so recreating a soft-deleted id revives it (see `skill_risk.rs::upsert_job` for the pattern).
+- Schema changes: add the column both to the `CREATE TABLE IF NOT EXISTS` in `crates/storage/src/libsql/mod.rs` and to the `migrate_soft_delete` table list so existing databases get `ALTER TABLE ADD COLUMN` backfilled (idempotent — the duplicate-column error is swallowed).
+- Tables currently covered: `sessions`, `memories`, `trace_nodes`, `secrets`, `cron_jobs`, `skill_risk_assessments`, `skill_risk_assessment_jobs`. Pure append-only tables (`cost_records`, `jobs`, `job_transitions`, `cron_executions`, `session_traces`) have no delete path and therefore no `deleted_at` column.
+
 ## Architecture
 
 Prefer generic/extensible architectures over hardcoding specific integrations. Ask clarifying questions about the desired abstraction level before implementing.

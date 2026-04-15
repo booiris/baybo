@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::trace::{Result, TraceStore};
@@ -44,16 +45,23 @@ impl TraceStore for LibsqlTraceStore {
         .await
         .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert session_trace: {e}")))?;
 
+        // Soft-delete every prior node for this session; any node_id that the
+        // new trace re-introduces will be revived by the INSERT OR REPLACE
+        // below (which defaults deleted_at back to NULL).
+        let now = Utc::now().timestamp();
         tx.execute(
-            "DELETE FROM trace_nodes WHERE session_id = ?1",
-            libsql::params![session_id.clone()],
+            "UPDATE trace_nodes SET deleted_at = ?1 \
+             WHERE session_id = ?2 AND deleted_at IS NULL",
+            libsql::params![now, session_id.clone()],
         )
         .await
-        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql delete old trace_nodes: {e}")))?;
+        .map_err(|e| {
+            TraceError::Internal(anyhow::anyhow!("libsql soft-delete old trace_nodes: {e}"))
+        })?;
 
         for (node_id, node_data) in &node_rows {
             tx.execute(
-                "INSERT INTO trace_nodes (id, session_id, data) VALUES (?1, ?2, ?3)",
+                "INSERT OR REPLACE INTO trace_nodes (id, session_id, data) VALUES (?1, ?2, ?3)",
                 libsql::params![node_id.clone(), session_id.clone(), node_data.clone()],
             )
             .await
@@ -146,7 +154,8 @@ impl TraceStore for LibsqlTraceStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM trace_nodes WHERE session_id = ?1 AND id = ?2",
+                "SELECT data FROM trace_nodes \
+                 WHERE session_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 libsql::params![session_id.to_string(), node_id.clone()],
             )
             .await

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
@@ -68,7 +69,8 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs WHERE id = ?1",
+                "SELECT id, user_id, status, next_trigger_at, data \
+                 FROM cron_jobs WHERE id = ?1 AND deleted_at IS NULL",
                 libsql::params![job_id.to_string()],
             )
             .await
@@ -89,7 +91,8 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .execute(
-                "UPDATE cron_jobs SET user_id = ?1, status = ?2, next_trigger_at = ?3, data = ?4 WHERE id = ?5",
+                "UPDATE cron_jobs SET user_id = ?1, status = ?2, next_trigger_at = ?3, data = ?4 \
+                 WHERE id = ?5 AND deleted_at IS NULL",
                 libsql::params![
                     row.user_id.clone(),
                     row.status.clone(),
@@ -108,12 +111,13 @@ impl CronStore for LibsqlCronStore {
     }
 
     async fn delete(&self, job_id: &str) -> crate::cron::Result<()> {
+        let now = Utc::now().timestamp();
         let affected = self
             .pool
             .conn()
             .execute(
-                "DELETE FROM cron_jobs WHERE id = ?1",
-                libsql::params![job_id.to_string()],
+                "UPDATE cron_jobs SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                libsql::params![now, job_id.to_string()],
             )
             .await
             .map_err(|e| CronStoreError::Internal(format!("libsql delete: {e}")))?;
@@ -129,7 +133,8 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs WHERE user_id = ?1",
+                "SELECT id, user_id, status, next_trigger_at, data \
+                 FROM cron_jobs WHERE user_id = ?1 AND deleted_at IS NULL",
                 libsql::params![user_id.to_string()],
             )
             .await
@@ -151,7 +156,8 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs",
+                "SELECT id, user_id, status, next_trigger_at, data \
+                 FROM cron_jobs WHERE deleted_at IS NULL",
                 (),
             )
             .await
@@ -173,7 +179,8 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs WHERE status = 'enabled'",
+                "SELECT id, user_id, status, next_trigger_at, data \
+                 FROM cron_jobs WHERE status = 'enabled' AND deleted_at IS NULL",
                 (),
             )
             .await
@@ -195,7 +202,9 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs WHERE status = 'enabled' AND next_trigger_at != '' AND next_trigger_at <= ?1",
+                "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs \
+                 WHERE status = 'enabled' AND next_trigger_at != '' AND next_trigger_at <= ?1 \
+                 AND deleted_at IS NULL",
                 libsql::params![now.to_string()],
             )
             .await

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::error::StorageError;
@@ -39,7 +40,7 @@ impl MemoryStore for LibsqlMemoryStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM memories WHERE id = ?1 AND user_id = ?2",
+                "SELECT data FROM memories WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
                 libsql::params![key.to_string(), user_id.to_string()],
             )
             .await
@@ -68,7 +69,9 @@ impl MemoryStore for LibsqlMemoryStore {
         let pattern = format!("%{}%", query.to_lowercase());
         let mut rows = conn
             .query(
-                "SELECT data FROM memories WHERE user_id = ?1 AND LOWER(content) LIKE ?2 LIMIT ?3",
+                "SELECT data FROM memories \
+                 WHERE user_id = ?1 AND LOWER(content) LIKE ?2 AND deleted_at IS NULL \
+                 LIMIT ?3",
                 libsql::params![user_id.to_string(), pattern, limit as i64],
             )
             .await
@@ -92,9 +95,10 @@ impl MemoryStore for LibsqlMemoryStore {
 
     async fn delete(&self, id: &str) -> Result<()> {
         let conn = self.pool.conn();
+        let now = Utc::now().timestamp();
         conn.execute(
-            "DELETE FROM memories WHERE id = ?1",
-            libsql::params![id.to_string()],
+            "UPDATE memories SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            libsql::params![now, id.to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete memory: {e}")))?;
@@ -105,7 +109,7 @@ impl MemoryStore for LibsqlMemoryStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM memories WHERE user_id = ?1",
+                "SELECT data FROM memories WHERE user_id = ?1 AND deleted_at IS NULL",
                 libsql::params![user_id.to_string()],
             )
             .await
@@ -130,7 +134,7 @@ impl MemoryStore for LibsqlMemoryStore {
     async fn list_all(&self) -> Result<Vec<MemoryEntry>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM memories", ())
+            .query("SELECT data FROM memories WHERE deleted_at IS NULL", ())
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
@@ -154,7 +158,7 @@ impl MemoryStore for LibsqlMemoryStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM memories WHERE id = ?1",
+                "SELECT data FROM memories WHERE id = ?1 AND deleted_at IS NULL",
                 libsql::params![id.to_string()],
             )
             .await

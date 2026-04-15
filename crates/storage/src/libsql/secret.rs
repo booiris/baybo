@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::secret::SecretStore;
@@ -31,7 +32,7 @@ impl SecretStore for LibsqlSecretStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT encrypted_value FROM secrets WHERE name = ?1",
+                "SELECT encrypted_value FROM secrets WHERE name = ?1 AND deleted_at IS NULL",
                 libsql::params![name.to_string()],
             )
             .await
@@ -55,9 +56,10 @@ impl SecretStore for LibsqlSecretStore {
 
     async fn delete(&self, name: &str) -> aura_security::Result<()> {
         let conn = self.pool.conn();
+        let now = Utc::now().timestamp();
         conn.execute(
-            "DELETE FROM secrets WHERE name = ?1",
-            libsql::params![name.to_string()],
+            "UPDATE secrets SET deleted_at = ?1 WHERE name = ?2 AND deleted_at IS NULL",
+            libsql::params![now, name.to_string()],
         )
         .await
         .map_err(|e| SecurityError::Internal(anyhow::anyhow!("libsql delete error: {e}")))?;
@@ -67,7 +69,7 @@ impl SecretStore for LibsqlSecretStore {
     async fn list(&self) -> aura_security::Result<Vec<String>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT name FROM secrets", ())
+            .query("SELECT name FROM secrets WHERE deleted_at IS NULL", ())
             .await
             .map_err(|e| SecurityError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 

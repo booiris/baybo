@@ -45,6 +45,7 @@ impl LibsqlPool {
         };
         pool.set_wal_mode().await?;
         pool.init_db().await?;
+        pool.migrate_soft_delete().await?;
         Ok(pool)
     }
 
@@ -61,6 +62,7 @@ impl LibsqlPool {
             conn: Arc::new(conn),
         };
         pool.init_db().await?;
+        pool.migrate_soft_delete().await?;
         Ok(pool)
     }
 
@@ -81,19 +83,24 @@ impl LibsqlPool {
     }
 
     /// Create all required tables if they do not already exist.
+    ///
+    /// All tables that support deletion carry a `deleted_at` column (Unix
+    /// seconds, NULL when the row is live). See `soft_delete` module rules.
     async fn init_db(&self) -> anyhow::Result<()> {
         self.conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS sessions (
-                    id   TEXT PRIMARY KEY,
-                    data TEXT NOT NULL
+                    id         TEXT PRIMARY KEY,
+                    data       TEXT NOT NULL,
+                    deleted_at INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS memories (
-                    id      TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    data    TEXT NOT NULL
+                    id         TEXT PRIMARY KEY,
+                    user_id    TEXT NOT NULL,
+                    content    TEXT NOT NULL,
+                    data       TEXT NOT NULL,
+                    deleted_at INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
 
@@ -106,12 +113,14 @@ impl LibsqlPool {
                     id         TEXT NOT NULL,
                     session_id TEXT NOT NULL,
                     data       TEXT NOT NULL,
+                    deleted_at INTEGER,
                     PRIMARY KEY (session_id, id)
                 );
 
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,
-                    encrypted_value BLOB NOT NULL
+                    encrypted_value BLOB NOT NULL,
+                    deleted_at      INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS cost_records (
@@ -146,7 +155,8 @@ impl LibsqlPool {
                     user_id         TEXT NOT NULL,
                     status          TEXT NOT NULL,
                     next_trigger_at TEXT NOT NULL DEFAULT '',
-                    data            TEXT NOT NULL
+                    data            TEXT NOT NULL,
+                    deleted_at      INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_due ON cron_jobs(status, next_trigger_at);
@@ -172,6 +182,7 @@ impl LibsqlPool {
                     rationale    TEXT NOT NULL,
                     model        TEXT NOT NULL,
                     assessed_at  INTEGER NOT NULL,
+                    deleted_at   INTEGER,
                     PRIMARY KEY (skill_name, content_hash)
                 );
 
@@ -184,6 +195,7 @@ impl LibsqlPool {
                     last_error   TEXT,
                     created_at   INTEGER NOT NULL,
                     updated_at   INTEGER NOT NULL,
+                    deleted_at   INTEGER,
                     PRIMARY KEY (skill_name, content_hash)
                 );
                 CREATE INDEX IF NOT EXISTS idx_skill_risk_jobs_status
@@ -191,6 +203,34 @@ impl LibsqlPool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
+        Ok(())
+    }
+
+    /// Ensure every soft-delete-aware table carries the `deleted_at` column.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does not backfill columns onto a
+    /// pre-existing table, so on older databases we have to add the column
+    /// ourselves. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we attempt
+    /// the ALTER and swallow the duplicate-column error.
+    async fn migrate_soft_delete(&self) -> anyhow::Result<()> {
+        const TABLES: &[&str] = &[
+            "sessions",
+            "memories",
+            "trace_nodes",
+            "secrets",
+            "cron_jobs",
+            "skill_risk_assessments",
+            "skill_risk_assessment_jobs",
+        ];
+        for table in TABLES {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN deleted_at INTEGER");
+            if let Err(e) = self.conn.execute(&sql, ()).await {
+                let msg = e.to_string().to_lowercase();
+                if !msg.contains("duplicate column") {
+                    return Err(anyhow::anyhow!("failed to add deleted_at to {table}: {e}"));
+                }
+            }
+        }
         Ok(())
     }
 }
