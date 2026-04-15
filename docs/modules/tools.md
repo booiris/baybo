@@ -17,6 +17,28 @@ Core responsibilities:
 - Generate tool definitions for the LLM (name, description, parameters schema only — no secrets or governance details)
 - Carry source, capability, trust, and runtime metadata in `ToolManifest`
 
+### Builtin tool set
+
+Modeled after Claude Code's
+[tools reference](https://code.claude.com/docs/en/tools-reference). Tool
+names match the strings the LLM uses in function calls and operators use in
+permission rules.
+
+| Tool                                                                                                                                                                                                                                                                  | Status      | Notes                                                                                                       |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------- |
+| `Read`, `Write`, `Edit`                                                                                                                                                                                                                                               | implemented | file I/O on absolute paths                                                                                  |
+| `Bash`                                                                                                                                                                                                                                                                | implemented | `sh -c`; no env/cwd persistence across calls                                                                |
+| `Glob`, `Grep`                                                                                                                                                                                                                                                        | implemented | basic walkdir + regex; will be upgraded if throughput becomes an issue                                      |
+| `WebFetch`                                                                                                                                                                                                                                                            | implemented | returns raw body; no side-channel LLM extraction yet                                                        |
+| `Echo`                                                                                                                                                                                                                                                                | debug-only  | returns params verbatim; registered only under `debug_assertions` for round-trip smoke-testing              |
+| `Agent`, `AskUserQuestion`, `SendMessage`, `Cron*`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `Skill`, `Task*`/`TodoWrite`, `ToolSearch`, `WebSearch`, `Team*`, `ListMcpResourcesTool`, `ReadMcpResourceTool` | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed |
+
+`ToolRegistry::with_defaults()` registers the implemented set with
+`TrustLevel::Trusted` manifests declaring their capabilities
+(`ReadWorkspace`, `WriteWorkspace`, `SpawnProcess`, `Http`). Stubs exist so
+downstream can register them once their backing subsystem is ready without
+having to invent the tool name/schema at that point.
+
 ## Design Decisions
 
 ### Unified abstraction across execution surfaces
@@ -65,11 +87,11 @@ Tool output should prefer structured `Json`, use `LargeText` for long text with 
 
 ## Collaboration
 
-| Module | Role |
-|--------|------|
-| `agent` | `ToolExecutor` validates trust/capability, executes tools, records observability |
-| `security` | Upper layers inject secrets and network policy (no direct dependency) |
+| Module     | Role                                                                                               |
+| ---------- | -------------------------------------------------------------------------------------------------- |
+| `agent`    | `ToolExecutor` validates trust/capability, executes tools, records observability                   |
+| `security` | Upper layers inject secrets and network policy (no direct dependency)                              |
 | `registry` | Provides verified third-party tool artifacts; `TrustLevel` will govern MCP tools once reintroduced |
-| `trace` | Records tool parameters, results, artifact hash, and source |
-| `llm` | Consumes tool definitions for function calling |
-| `rmcp` | (Removed) External SDK for MCP client transports — to be restored with MCP support |
+| `trace`    | Records tool parameters, results, artifact hash, and source                                        |
+| `llm`      | Consumes tool definitions for function calling                                                     |
+| `rmcp`     | (Removed) External SDK for MCP client transports — to be restored with MCP support                 |

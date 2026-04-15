@@ -14,7 +14,7 @@ use crate::memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
-use aura_tools::ToolRegistry;
+use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult, TraceNodeId};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -310,7 +310,10 @@ impl AgentLoop {
                     .await;
 
                 let result_text = match &tool_result {
-                    Ok(output) => format!("{output:?}"),
+                    Ok(ToolOutput::Text(s)) => s.clone(),
+                    Ok(ToolOutput::Json(v)) => serde_json::to_string(v)
+                        .unwrap_or_else(|_| v.to_string()),
+                    Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
                     Err(e) => format!("Error: {e}"),
                 };
 

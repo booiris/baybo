@@ -44,6 +44,7 @@
         "Ollama",
         "oneline",
         "oneshot",
+        "peekable",
         "pids",
         "prefilter",
         "RAII",
@@ -82,7 +83,10 @@
         "Turso",
         "unconfigured",
         "usize",
-        "wasmtime"
+        "walkdir",
+        "wasmtime",
+        "worktree",
+        "worktrees"
     ],
     "files.exclude": {
         "**/target": true,

@@ -14,3 +14,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
+glob = { workspace = true }
+walkdir = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -25,6 +25,29 @@ impl ToolRegistry {
         }
     }
 
+    /// Registry pre-populated with all implemented builtin tools.
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+        for (tool, manifest) in crate::builtin::default_tools() {
+            registry.register(tool, manifest);
+        }
+        registry
+    }
+
+    /// Register a tool together with its governance manifest.
+    ///
+    /// The manifest's `name` must match the tool's `name()`; only the last
+    /// registration for a given name wins.
+    pub fn register(&mut self, tool: Arc<dyn Tool>, manifest: ToolManifest) {
+        let name = tool.name().to_string();
+        debug_assert_eq!(
+            name, manifest.name,
+            "tool name does not match manifest name"
+        );
+        self.manifests.insert(name.clone(), manifest);
+        self.builtin.insert(name, tool);
+    }
+
     /// Generate tool definitions visible to the LLM.
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = Vec::new();
@@ -56,7 +79,7 @@ impl ToolRegistry {
         tool.execute(params, ctx).await
     }
 
-    /// Look up the manifest for a non-builtin tool by name.
+    /// Look up the manifest for a registered tool by name.
     pub fn get_manifest(&self, name: &str) -> Option<&ToolManifest> {
         self.manifests.get(name)
     }

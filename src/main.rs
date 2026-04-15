@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
         }
         reg
     };
-    let tool_registry = Arc::new(ToolRegistry::new());
+    let tool_registry = Arc::new(ToolRegistry::with_defaults());
     let workspace = Arc::new(WorkspaceManager::new(PathBuf::from(&config.workspace.path)));
     let channels_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
 
