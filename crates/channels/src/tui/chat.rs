@@ -149,8 +149,35 @@ fn render_scrollback(frame: &mut Frame, area: Rect, state: &AppState) {
         .title(" chat ")
         .title_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Carve a pinned banner off the top of the inner area so the greet
+    // stays visible once scrollback fills up. Wraps on narrow terminals;
+    // capped so the banner never swallows more than half the pane.
+    let content_area = if !state.banner.is_empty() && inner.height >= 2 {
+        let max_banner_h = inner.height / 2;
+        let banner_h = wrapped_line_count(&state.banner, inner.width).min(max_banner_h);
+        let banner = Paragraph::new(Span::styled(
+            state.banner.as_str(),
+            Style::default().fg(Color::DarkGray),
+        ))
+        .wrap(Wrap { trim: false });
+        let banner_area = Rect {
+            height: banner_h,
+            ..inner
+        };
+        frame.render_widget(banner, banner_area);
+        Rect {
+            y: inner.y + banner_h,
+            height: inner.height - banner_h,
+            ..inner
+        }
+    } else {
+        inner
+    };
+
     let total = lines.len() as u16;
-    let viewport = inner.height;
+    let viewport = content_area.height;
     let scroll = if total > viewport {
         total
             .saturating_sub(viewport)
@@ -160,10 +187,9 @@ fn render_scrollback(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let paragraph = Paragraph::new(lines)
-        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, content_area);
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -255,6 +281,42 @@ fn render_completion_popup(frame: &mut Frame, input_area: Rect, state: &AppState
 
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut list_state);
+}
+
+/// Count how many rows a paragraph will occupy when rendered with
+/// `Wrap { trim: false }` at the given width. Mirrors ratatui's word-wrap
+/// behaviour: break on spaces, hard-break words longer than the column
+/// budget. Used to reserve an accurate row count for the banner so text
+/// isn't clipped on narrow terminals.
+fn wrapped_line_count(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    let width = width as usize;
+    let mut total: u16 = 0;
+    for logical in text.split('\n') {
+        let mut col: usize = 0;
+        let mut line_started = false;
+        for word in logical.split(' ') {
+            let w = word.width();
+            let need = if line_started { col + 1 + w } else { w };
+            if !line_started {
+                col = w;
+                line_started = true;
+            } else if need <= width {
+                col = need;
+            } else {
+                total = total.saturating_add(1);
+                col = w;
+            }
+            while col > width {
+                total = total.saturating_add(1);
+                col -= width;
+            }
+        }
+        total = total.saturating_add(1);
+    }
+    total.max(1)
 }
 
 fn render_block(block: &ContentBlock) -> String {

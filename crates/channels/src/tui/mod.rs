@@ -299,7 +299,9 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     let mut mouse_captured = true;
 
     // Initial greet so the user sees something before their first message.
-    state.push_system(format!(
+    // Pinned as a persistent top banner so it remains visible after the
+    // scrollback fills up; toggling mouse wheel updates it in place.
+    state.set_banner(format!(
         "Session {} — type / to see commands, /quit or Ctrl-D twice to leave. Alt-M toggles mouse wheel (off enables text selection).",
         ctx.session_id
     ));

@@ -38,6 +38,9 @@ pub(crate) enum ViewMode {
 
 pub(crate) struct AppState {
     pub(crate) mode: ViewMode,
+    /// Persistent one-line banner pinned above the scrollback in chat mode.
+    /// Empty string means no banner is rendered.
+    pub(crate) banner: String,
     pub(crate) scrollback: VecDeque<ChatLine>,
     pub(crate) input: String,
     pub(crate) cursor: usize,
@@ -70,6 +73,7 @@ impl AppState {
     pub(crate) fn new() -> Self {
         Self {
             mode: ViewMode::Chat,
+            banner: String::new(),
             scrollback: VecDeque::new(),
             input: String::new(),
             cursor: 0,
@@ -85,6 +89,10 @@ impl AppState {
 
     pub(crate) fn set_commands(&mut self, commands: Vec<SlashCommand>) {
         self.commands = commands;
+    }
+
+    pub(crate) fn set_banner(&mut self, text: String) {
+        self.banner = text;
     }
 
     /// Return the filtered completion list for the current input. Only
