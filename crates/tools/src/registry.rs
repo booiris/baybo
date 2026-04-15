@@ -3,14 +3,12 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::mcp::McpTool;
 use crate::{Tool, ToolContext, ToolDefinition, ToolManifest, ToolOutput, WasmTool};
 
-/// Central registry for all available tools (built-in, WASM, and MCP).
+/// Central registry for all available tools (built-in and WASM).
 pub struct ToolRegistry {
     builtin: HashMap<String, Arc<dyn Tool>>,
     wasm_tools: HashMap<String, WasmTool>,
-    mcp_tools: HashMap<String, McpTool>,
 }
 
 impl Default for ToolRegistry {
@@ -24,19 +22,7 @@ impl ToolRegistry {
         Self {
             builtin: HashMap::new(),
             wasm_tools: HashMap::new(),
-            mcp_tools: HashMap::new(),
         }
-    }
-
-    /// Register an MCP tool discovered from an MCP server.
-    pub fn register_mcp_tool(&mut self, tool: McpTool) {
-        self.mcp_tools.insert(tool.qualified_name.clone(), tool);
-    }
-
-    /// Remove all MCP tools belonging to a given server.
-    pub fn remove_mcp_tools_for_server(&mut self, server_name: &str) {
-        let prefix = format!("{server_name}/");
-        self.mcp_tools.retain(|name, _| !name.starts_with(&prefix));
     }
 
     /// Generate tool definitions visible to the LLM.
@@ -56,13 +42,6 @@ impl ToolRegistry {
                 parameters_schema: wasm_tool.manifest.parameters_schema.clone(),
             });
         }
-        for mcp_tool in self.mcp_tools.values() {
-            defs.push(ToolDefinition {
-                name: mcp_tool.name().to_string(),
-                description: mcp_tool.description().to_string(),
-                parameters_schema: mcp_tool.parameters_schema(),
-            });
-        }
         defs
     }
 
@@ -73,9 +52,6 @@ impl ToolRegistry {
         }
         if let Some(wasm_tool) = self.wasm_tools.get(name) {
             return Some(wasm_tool as &dyn Tool);
-        }
-        if let Some(mcp_tool) = self.mcp_tools.get(name) {
-            return Some(mcp_tool as &dyn Tool);
         }
         None
     }
@@ -97,9 +73,6 @@ impl ToolRegistry {
     pub fn get_manifest(&self, name: &str) -> Option<&ToolManifest> {
         if let Some(wt) = self.wasm_tools.get(name) {
             return Some(&wt.manifest);
-        }
-        if let Some(mt) = self.mcp_tools.get(name) {
-            return Some(&mt.manifest);
         }
         None
     }

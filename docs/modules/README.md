@@ -30,7 +30,7 @@ Bottom-up along the dependency graph:
 
 - **llm** — LLM provider wrapping and response parsing.
 - **sandbox** — Execution isolation (WASM + container), including WasmRuntime subcomponent.
-- **tools** — Tool abstraction, registration, capability declarations, runtime routing. MCP client support via `rmcp`.
+- **tools** — Tool abstraction, registration, capability declarations, runtime routing. (MCP client support is temporarily removed; see `docs/todo/reintroduce-mcp-support.md`.)
 - **registry** — Extension artifact verification and installation governance. Owns TrustLevel, ArtifactSource.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
@@ -61,7 +61,7 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
   ├── security ──► model, channels
   ├── hook ──► channels
   ├── trace ──► model, context, job
-  ├── tools ──► model, registry, sandbox, rmcp
+  ├── tools ──► model, registry, sandbox
   ├── cron ──► model
   ├── skills ──► registry
   ├── skills-assessor ──► skills, storage, llm, model

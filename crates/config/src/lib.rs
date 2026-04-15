@@ -43,10 +43,7 @@ pub use crate::sandbox::{NetworkPolicyConfig, SandboxConfig, WasmLimitsConfig};
 pub use crate::security::SecurityConfig;
 pub use crate::session::SessionConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
-pub use crate::tools::{
-    CapabilityConfig, McpServerEntry, McpTransportConfig, SecretAccessConfig,
-    SecretRequirementConfig, ToolsConfig, TrustLevelConfig,
-};
+pub use crate::tools::{ToolsConfig, TrustLevelConfig};
 pub use crate::trace::TraceConfig;
 pub use crate::workspace::WorkspaceConfig;
 

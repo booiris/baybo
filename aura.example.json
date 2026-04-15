@@ -48,7 +48,6 @@
     "risk_check": "primary"
   },
   "tools": {
-    "mcp_servers": [],
     "default_timeout_ms": 30000
   },
   "trace": {

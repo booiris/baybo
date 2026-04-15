@@ -1,6 +1,5 @@
 use aura_config::{
-    AuraConfig, CapabilityConfig, ConfigError, DiscordChannelConfig, HttpChannelConfig,
-    McpServerEntry, McpTransportConfig, TelegramChannelConfig, TrustLevelConfig,
+    AuraConfig, ConfigError, DiscordChannelConfig, HttpChannelConfig, TelegramChannelConfig,
 };
 
 fn has_field(errors: &[aura_config::ValidationError], field: &str) -> bool {
@@ -140,54 +139,6 @@ fn sandbox_memory_minimum() {
 }
 
 #[test]
-fn mcp_server_name_must_be_unique() {
-    let mut c = AuraConfig::default();
-    c.tools.mcp_servers = vec![
-        McpServerEntry {
-            name: "dup".into(),
-            transport: McpTransportConfig::Stdio {
-                command: "echo".into(),
-                args: vec![],
-                env: Default::default(),
-            },
-            secret_requirements: vec![],
-            trust_level: TrustLevelConfig::Installed,
-            capabilities: vec![],
-        },
-        McpServerEntry {
-            name: "dup".into(),
-            transport: McpTransportConfig::Stdio {
-                command: "echo".into(),
-                args: vec![],
-                env: Default::default(),
-            },
-            secret_requirements: vec![],
-            trust_level: TrustLevelConfig::Installed,
-            capabilities: vec![],
-        },
-    ];
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "tools.mcp_servers[1].name"));
-}
-
-#[test]
-fn mcp_http_requires_url_scheme() {
-    let mut c = AuraConfig::default();
-    c.tools.mcp_servers = vec![McpServerEntry {
-        name: "srv".into(),
-        transport: McpTransportConfig::Http {
-            url: "example.com".into(),
-            headers: Default::default(),
-        },
-        secret_requirements: vec![],
-        trust_level: TrustLevelConfig::Installed,
-        capabilities: vec![],
-    }];
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "tools.mcp_servers[0].transport.url"));
-}
-
-#[test]
 fn spending_limits_must_be_positive() {
     let mut c = AuraConfig::default();
     c.cost.spending_limits.user_daily_usd = Some(-1.0);
@@ -320,113 +271,6 @@ fn encryption_key_requires_a_source() {
     let mut c = AuraConfig::default();
     c.security.encryption_key_file = None;
     c.security.encryption_key_env = "AURA_KEY".into();
-    assert!(c.validate().is_ok());
-}
-
-fn mcp_http_server(name: &str, url: &str) -> McpServerEntry {
-    McpServerEntry {
-        name: name.into(),
-        transport: McpTransportConfig::Http {
-            url: url.into(),
-            headers: Default::default(),
-        },
-        secret_requirements: vec![],
-        trust_level: TrustLevelConfig::Trusted,
-        capabilities: vec![],
-    }
-}
-
-#[test]
-fn mcp_http_host_must_be_covered_by_allowlist() {
-    let mut c = AuraConfig::default();
-    c.tools.mcp_servers = vec![mcp_http_server("srv", "https://api.example.com/rpc")];
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "tools.mcp_servers[0].transport.url"));
-}
-
-#[test]
-fn mcp_http_host_suffix_match_accepts_subdomain() {
-    let mut c = AuraConfig::default();
-    c.sandbox.network.allowed_domains = vec!["example.com".into()];
-    c.tools.mcp_servers = vec![mcp_http_server("srv", "https://api.example.com:8443/rpc")];
-    assert!(c.validate().is_ok());
-}
-
-#[test]
-fn mcp_http_host_suffix_match_rejects_non_subdomain() {
-    let mut c = AuraConfig::default();
-    c.sandbox.network.allowed_domains = vec!["example.com".into()];
-    // "notexample.com" shares a suffix substring but is not a subdomain
-    c.tools.mcp_servers = vec![mcp_http_server("srv", "https://notexample.com/rpc")];
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "tools.mcp_servers[0].transport.url"));
-}
-
-#[test]
-fn mcp_http_loopback_allowed_when_flag_set() {
-    let mut c = AuraConfig::default();
-    c.sandbox.network.allow_loopback = true;
-    c.tools.mcp_servers = vec![
-        mcp_http_server("srv1", "http://localhost:8080/"),
-        mcp_http_server("srv2", "http://127.0.0.1/"),
-        mcp_http_server("srv3", "http://[::1]:9090/"),
-    ];
-    assert!(c.validate().is_ok());
-}
-
-#[test]
-fn mcp_http_loopback_rejected_when_flag_unset() {
-    let mut c = AuraConfig::default();
-    c.sandbox.network.allow_loopback = false;
-    c.tools.mcp_servers = vec![mcp_http_server("srv", "http://127.0.0.1:9090/")];
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "tools.mcp_servers[0].transport.url"));
-}
-
-#[test]
-fn installed_trust_level_forbids_destructive_capabilities() {
-    let mut c = AuraConfig::default();
-    c.tools.mcp_servers = vec![McpServerEntry {
-        name: "srv".into(),
-        transport: McpTransportConfig::Stdio {
-            command: "echo".into(),
-            args: vec![],
-            env: Default::default(),
-        },
-        secret_requirements: vec![],
-        trust_level: TrustLevelConfig::Installed,
-        capabilities: vec![
-            CapabilityConfig::WriteWorkspace,
-            CapabilityConfig::SpawnProcess,
-        ],
-    }];
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert_eq!(
-        errors
-            .iter()
-            .filter(|e| e.field == "tools.mcp_servers[0].capabilities")
-            .count(),
-        2
-    );
-}
-
-#[test]
-fn trusted_level_allows_destructive_capabilities() {
-    let mut c = AuraConfig::default();
-    c.tools.mcp_servers = vec![McpServerEntry {
-        name: "srv".into(),
-        transport: McpTransportConfig::Stdio {
-            command: "echo".into(),
-            args: vec![],
-            env: Default::default(),
-        },
-        secret_requirements: vec![],
-        trust_level: TrustLevelConfig::Trusted,
-        capabilities: vec![
-            CapabilityConfig::WriteWorkspace,
-            CapabilityConfig::SpawnProcess,
-        ],
-    }];
     assert!(c.validate().is_ok());
 }
 

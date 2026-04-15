@@ -189,7 +189,6 @@ mod tests {
     fn tool_timeout_converts_millis() {
         let cfg = ToolsConfig {
             default_timeout_ms: 250,
-            ..ToolsConfig::default()
         };
         assert_eq!(to_tool_timeout(&cfg), std::time::Duration::from_millis(250));
     }

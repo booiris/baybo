@@ -15,4 +15,3 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
-rmcp = { workspace = true }

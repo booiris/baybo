@@ -1,6 +1,4 @@
 pub mod error;
-pub mod mcp;
-pub mod mcp_provider;
 pub mod registry;
 pub mod wasm;
 
@@ -9,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_sandbox::{NetworkPolicy, SandboxPolicy};
 use aura_model::User;
+use aura_sandbox::{NetworkPolicy, SandboxPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -108,7 +106,6 @@ pub trait SecretAccessor: Send + Sync {
 ///
 /// Built-in Rust tools implement this directly.
 /// WASM tools are adapted through `WasmTool`.
-/// MCP tools are adapted through `McpTool`.
 /// High-risk tools are still exposed as `Tool` but routed to container execution at runtime.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -200,7 +197,5 @@ pub enum ToolCapability {
     BrowserAutomation,
 }
 
-pub use mcp::McpTool;
-pub use mcp_provider::McpToolProvider;
 pub use registry::ToolRegistry;
 pub use wasm::WasmTool;

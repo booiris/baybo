@@ -8,6 +8,13 @@ A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consu
 
 Top-level sections: `llm`, `agent`, `session`, `channels`, `sandbox`, `security`, `skills`, `tools`, `trace`, `cost`, `workspace`.
 
+> **MCP status note.** The `tools.mcp_servers[]` surface, its mirror structs
+> (`McpServerEntry`, `McpTransportConfig`, `SecretRequirementConfig`,
+> `SecretAccessConfig`, `CapabilityConfig`), and their validation have been
+> temporarily removed along with MCP client support in `aura-tools`. The
+> remaining `tools` section keeps only `default_timeout_ms`. The full MCP
+> re-add plan is in `docs/todo/reintroduce-mcp-support.md`.
+
 There is no `storage` section. Storage paths are **derived** from the project root (`workspace.path`) — operators choose a project root, not individual data-file locations.
 
 ## Current status
@@ -21,7 +28,7 @@ There is no `storage` section. Storage paths are **derived** from the project ro
 Known surface gaps that should be closed before or alongside the wiring:
 
 - `LlmConfig::api_key: Option<String>` currently accepts raw strings. Target: either rename to `api_key_env` or introduce a typed `SecretRef` so the type system enforces "references, not values" (see §"Secret handling").
-- `SecretRequirementConfig.access: String` and `McpServerEntry.capabilities: Vec<String>` should become mirror enums (`SecretAccessConfig` = `ReadOnly | ReadWrite`, `CapabilityConfig` = `ReadWorkspace | WriteWorkspace | Http(..) | SpawnProcess | BrowserAutomation`). Current stringly-typed form violates the project's "prefer strong types over strings" rule and defers validation to bootstrap.
+- `SecretRequirementConfig.access: String` and `McpServerEntry.capabilities: Vec<String>` should become mirror enums (`SecretAccessConfig` = `ReadOnly | ReadWrite`, `CapabilityConfig` = `ReadWorkspace | WriteWorkspace | Http(..) | SpawnProcess | BrowserAutomation`). Current stringly-typed form violates the project's "prefer strong types over strings" rule and defers validation to bootstrap. (These mirrors are removed alongside MCP; they return with the MCP re-add.)
 
 Until these land, the spec below describes target state; deviations are flagged inline.
 
@@ -35,7 +42,7 @@ The crate depends on external libraries only — `serde`, `serde_json`, `tokio`,
 - Keeps `config` buildable in isolation
 - Prevents circular dependencies when `agent` wants to read configuration
 
-To compensate, `config` defines **mirror structs** for domain types it references (e.g., `TrustLevelConfig` mirrors `aura_registry::TrustLevel`, `McpTransportConfig` mirrors `aura_tools::McpTransport`). Mapping between mirror and domain types happens at the consumer (startup code in `main.rs` or `agent` bootstrap). See §"Mirror maintenance contract" for drift prevention.
+To compensate, `config` defines **mirror structs** for domain types it references (e.g., `TrustLevelConfig` mirrors `aura_registry::TrustLevel`). Mapping between mirror and domain types happens at the consumer (startup code in `main.rs` or `agent` bootstrap). See §"Mirror maintenance contract" for drift prevention. (MCP-specific mirrors like `McpTransportConfig` were removed with MCP support and will return when it's reintroduced.)
 
 ### Defaults-first serde strategy (top-level only)
 
@@ -46,8 +53,7 @@ This does **not** extend uniformly into nested structs. The following nested typ
 - `HttpChannelConfig` (`enabled`, `bind_address`, `port`) — under `channels.http`
 - `TelegramChannelConfig` (`enabled`, `bot_token_env`) — under `channels.telegram`
 - `DiscordChannelConfig` (`enabled`, `bot_token_env`) — under `channels.discord`
-- `McpServerEntry` (`name`, `transport`, `trust_level`) — each item in `tools.mcp_servers`
-- `SecretRequirementConfig` (`key`) — each item in `McpServerEntry.secret_requirements`
+- (`McpServerEntry` and `SecretRequirementConfig` required-field notes are removed alongside MCP support.)
 
 Required-ness beyond serde (non-empty strings, numeric ranges, URL schemes) is enforced by `validate()`.
 
@@ -63,7 +69,7 @@ JSON is the sole supported format. It has the widest tooling support, round-trip
 
 `serde`'s default tolerance applies: unknown keys are silently ignored. This is permissive by design so a newer JSON file (with fields an older binary does not yet know about) does not hard-fail at load. The cost is that typos in field names are also silent — `"session.timeout_minutes": 10` parses fine and the real `timeout_minutes` stays at its default.
 
-Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security`, `tools.mcp_servers[]`, `sandbox`) may opt into `#[serde(deny_unknown_fields)]` individually. The root `AuraConfig` intentionally keeps permissive semantics.
+Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security`, `sandbox`, and — once reintroduced — `tools.mcp_servers[]`) may opt into `#[serde(deny_unknown_fields)]` individually. The root `AuraConfig` intentionally keeps permissive semantics.
 
 ### Secret handling
 
@@ -85,7 +91,7 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 | `sandbox`  | `SandboxLimits` + `NetworkPolicy`                           |                                                                                                                                                                                                      |
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
 | `skills`   | `aura_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
-| `tools`    | `McpServerConfig` list + `ToolExecutor` default timeout     |                                                                                                                                                                                                      |
+| `tools`    | `ToolExecutor` default timeout (MCP server list returns with reintroduction) |                                                                                                                                                                                      |
 | `trace`    | `TraceCollector` auto-snapshot and interval                 |                                                                                                                                                                                                      |
 | `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
 | `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/.aura/storage.db`).                                                                |
@@ -107,9 +113,9 @@ Principle: a module earns a config section when operators need to tune it in pro
 
 ## Mirror maintenance contract
 
-`aura-config` holds mirrors of selected domain types (`TrustLevelConfig`, `McpTransportConfig`, planned `SecretAccessConfig` / `CapabilityConfig`) to stay decoupled. Drift prevention:
+`aura-config` holds mirrors of selected domain types (today just `TrustLevelConfig`; `McpTransportConfig`, `SecretAccessConfig`, and `CapabilityConfig` will return with MCP support) to stay decoupled. Drift prevention:
 
-1. **Ownership** — mirrors live in `aura-config`. Whenever the upstream domain type (e.g. `aura_registry::TrustLevel`, `aura_tools::McpTransport`) changes shape, the same PR updates the mirror and the conversion between them.
+1. **Ownership** — mirrors live in `aura-config`. Whenever the upstream domain type (e.g. `aura_registry::TrustLevel`) changes shape, the same PR updates the mirror and the conversion between them.
 2. **Contract tests** — each mirror has a round-trip test (`From<DomainType> for MirrorType` and `TryFrom<MirrorType> for DomainType`) in `aura-config`'s integration tests. These act as the drift detector: adding a variant upstream without a mirror update breaks match exhaustiveness and fails CI.
 3. **Forward compatibility** — domain enums that mirrors target should be `#[non_exhaustive]`; the mirror's `TryFrom` returns a typed `ConfigError::UnsupportedVariant { ty, variant }` rather than panicking when it encounters an unknown variant.
 4. **Scope limit** — only types that appear in the config surface are mirrored. Transient/internal domain types must not leak into `aura-config`.
@@ -154,9 +160,6 @@ Until reload is implemented, `ConfigChange` fires exactly once at startup (for p
 | `sandbox.wasm.max_memory_bytes`       | ≥ 1 MB                                               |
 | `sandbox.wasm.max_fuel`               | ≥ 1000                                               |
 | `tools.default_timeout_ms`            | ≥ 100                                                |
-| `tools.mcp_servers[i].name`           | non-empty, unique across all entries                 |
-| `tools.mcp_servers[i] (Stdio)`        | `command` non-empty                                  |
-| `tools.mcp_servers[i] (Http)`         | URL scheme is `http://` or `https://`                |
 | `cost.spending_limits.*_usd`          | if set, strictly positive, finite                    |
 | `cost.spending_limits.user_*`         | cross-field: `daily_usd ≤ monthly_usd` when both set |
 | `cost.rate_limit.*`                   | `max_requests ≥ 1`, `window_secs ≥ 1`                |
@@ -168,11 +171,11 @@ Field-level checks catch syntax errors; cross-section checks catch policy incons
 
 | Rule                                                                                                                                                                             | Sections involved  |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| Every `tools.mcp_servers[].transport.Http.url` host resolves to an entry in `sandbox.network.allowed_domains`, unless `allow_loopback` covers it                                 | `tools`, `sandbox` |
 | When `llm.provider` is set, at least one secret source is resolvable: `llm.api_key` (as env-var reference), or a provider-specific fallback env var documented for that provider | `llm`, `security`  |
-| `McpServerEntry.trust_level` vs declared `capabilities` conforms to `tools.md` governance ceilings (e.g. `Installed` ⇒ no `WriteWorkspace` / `SpawnProcess`)                     | `tools`            |
 | Each `channels.*` with `enabled: false` is rejected (enablement-model self-consistency)                                                                                          | `channels`         |
 | `security.encryption_key_file` and `encryption_key_env` cannot both be unset when any downstream consumer requires an encryption key                                             | `security`         |
+
+(The two MCP-specific cross-section rules — host-allowlist/loopback vs. `sandbox.network`, and the trust/capability matrix — were removed with MCP support. They'll return with the MCP re-add.)
 
 Cross-section rules are part of the default `validate()` pass. A future strict-load flag will also enforce advisory hygiene (e.g. key-file extension hints, env-var name syntax); today those are handled case-by-case in bootstrap.
 
@@ -193,7 +196,7 @@ Cross-section rules are part of the default `validate()` pass. A future strict-l
 | `agent`    | Consumes `AgentConfig`, `SessionConfig`, `TraceConfig`, `CostConfig`                                                                                                                   |
 | `llm`      | Receives `LlmProviderConfig` built from `LlmConfig`                                                                                                                                    |
 | `sandbox`  | Receives `SandboxLimits` and `NetworkPolicy` built from `SandboxConfig`                                                                                                                |
-| `tools`    | Receives `McpServerConfig` list built from `ToolsConfig::mcp_servers`                                                                                                                  |
+| `tools`    | Receives `ToolsConfig::default_timeout_ms`. (Once MCP lands again, it will also receive `McpServerConfig` list built from `ToolsConfig::mcp_servers`.)                                 |
 | `channels` | Channel adapters are registered based on `ChannelsConfig` section enablement                                                                                                           |
 | `hook`     | `ConfigChange` is an extension point that _observes_ or _vetoes_ proposed changes. It does **not** emit provenance — provenance is recorded by the bootstrap/agent layer into `trace`. |
 | `trace`    | Records `provider_config_hash` / `config_version` in `ExecutionProvenance` when config is loaded or changed                                                                            |

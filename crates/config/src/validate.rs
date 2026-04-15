@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::AuraConfig;
 use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
@@ -7,7 +5,7 @@ use crate::error::{ConfigError, ValidationError};
 use crate::llm::LlmConfig;
 use crate::sandbox::SandboxConfig;
 use crate::session::SessionConfig;
-use crate::tools::{CapabilityConfig, McpTransportConfig, ToolsConfig, TrustLevelConfig};
+use crate::tools::ToolsConfig;
 use crate::trace::TraceConfig;
 use crate::workspace::WorkspaceConfig;
 
@@ -196,38 +194,6 @@ fn validate_tools(tools: &ToolsConfig, errors: &mut Vec<ValidationError>) {
             "must be >= 100",
         ));
     }
-
-    let mut seen = HashSet::new();
-    for (i, entry) in tools.mcp_servers.iter().enumerate() {
-        let name_field = format!("tools.mcp_servers[{i}].name");
-        if entry.name.trim().is_empty() {
-            errors.push(ValidationError::new(&name_field, "must be non-empty"));
-        } else if !seen.insert(entry.name.as_str()) {
-            errors.push(ValidationError::new(
-                &name_field,
-                format!("duplicate MCP server name '{}'", entry.name),
-            ));
-        }
-
-        match &entry.transport {
-            McpTransportConfig::Stdio { command, .. } => {
-                if command.trim().is_empty() {
-                    errors.push(ValidationError::new(
-                        format!("tools.mcp_servers[{i}].transport.command"),
-                        "must be non-empty",
-                    ));
-                }
-            }
-            McpTransportConfig::Http { url, .. } => {
-                if !is_http_url(url) {
-                    errors.push(ValidationError::new(
-                        format!("tools.mcp_servers[{i}].transport.url"),
-                        "must start with http:// or https://",
-                    ));
-                }
-            }
-        }
-    }
 }
 
 fn validate_trace(trace: &TraceConfig, errors: &mut Vec<ValidationError>) {
@@ -291,8 +257,6 @@ fn validate_workspace(workspace: &WorkspaceConfig, errors: &mut Vec<ValidationEr
 fn validate_cross_section(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
     validate_encryption_key_source(&config.security, errors);
     validate_llm_secret_source(&config.llm, errors);
-    validate_mcp_hosts_against_network(config, errors);
-    validate_trust_capability_matrix(&config.tools, errors);
 }
 
 fn validate_encryption_key_source(
@@ -339,102 +303,6 @@ fn is_env_var_name(s: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Every MCP Http URL must point to a host explicitly permitted by the sandbox
-/// network policy, either via [`NetworkPolicyConfig::allowed_domains`] (suffix
-/// match on domain labels) or [`NetworkPolicyConfig::allow_loopback`].
-fn validate_mcp_hosts_against_network(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
-    for (i, entry) in config.tools.mcp_servers.iter().enumerate() {
-        let McpTransportConfig::Http { url, .. } = &entry.transport else {
-            continue;
-        };
-        let Some(host) = extract_host(url) else {
-            continue; // field-level validation already rejected bad URL schemes
-        };
-        if config.sandbox.network.allow_loopback && is_loopback_host(host) {
-            continue;
-        }
-        if !host_matches_allowlist(host, &config.sandbox.network.allowed_domains) {
-            errors.push(ValidationError::new(
-                format!("tools.mcp_servers[{i}].transport.url"),
-                format!(
-                    "host '{host}' is not covered by sandbox.network.allowed_domains \
-                     (or allow_loopback)"
-                ),
-            ));
-        }
-    }
-}
-
-/// Trust ceilings: `Installed`-level MCP servers must not declare destructive
-/// capabilities. Matches the governance rules laid out in `docs/modules/tools.md`.
-fn validate_trust_capability_matrix(tools: &ToolsConfig, errors: &mut Vec<ValidationError>) {
-    for (i, entry) in tools.mcp_servers.iter().enumerate() {
-        if !matches!(entry.trust_level, TrustLevelConfig::Installed) {
-            continue;
-        }
-        for cap in &entry.capabilities {
-            let forbidden_name = match cap {
-                CapabilityConfig::WriteWorkspace => Some("write_workspace"),
-                CapabilityConfig::SpawnProcess => Some("spawn_process"),
-                _ => None,
-            };
-            if let Some(name) = forbidden_name {
-                errors.push(ValidationError::new(
-                    format!("tools.mcp_servers[{i}].capabilities"),
-                    format!(
-                        "capability '{name}' is not permitted for trust_level=installed; \
-                         set trust_level=trusted if the tool truly requires it"
-                    ),
-                ));
-            }
-        }
-    }
-}
-
-fn extract_host(url: &str) -> Option<&str> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let after_userinfo = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
-    let host_port = after_userinfo
-        .split_once(['/', '?', '#'])
-        .map(|(h, _)| h)
-        .unwrap_or(after_userinfo);
-    if let Some(stripped) = host_port.strip_prefix('[') {
-        // IPv6 literal: [addr]:port
-        let end = stripped.find(']')?;
-        return Some(&stripped[..end]);
-    }
-    Some(
-        host_port
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(host_port),
-    )
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
-}
-
-/// Suffix match on domain labels. `pattern = "example.com"` covers
-/// `"example.com"` and `"*.example.com"` (any number of subdomain labels), but
-/// not `"notexample.com"`.
-fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
-    allowed.iter().any(|pattern| {
-        let p = pattern.trim();
-        if p.is_empty() {
-            return false;
-        }
-        if host == p {
-            return true;
-        }
-        host.len() > p.len() + 1
-            && host.ends_with(p)
-            && host.as_bytes()[host.len() - p.len() - 1] == b'.'
-    })
 }
 
 fn check_positive(value: Option<f64>, field: &str, errors: &mut Vec<ValidationError>) {
