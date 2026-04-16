@@ -35,4 +35,3 @@ shell-words = { workspace = true }
 
 [dev-dependencies]
 aura-context = { workspace = true }
-aura-registry = { workspace = true }

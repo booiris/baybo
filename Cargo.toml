@@ -14,7 +14,6 @@ members = [
     "crates/hook",
     "crates/agent",
     "crates/storage",
-    "crates/registry",
     "crates/skills",
     "crates/skills-assessor",
     "crates/cron",
@@ -42,7 +41,6 @@ aura-security = { path = "crates/security" }
 aura-hook = { path = "crates/hook" }
 aura-agent = { path = "crates/agent" }
 aura-storage = { path = "crates/storage" }
-aura-registry = { path = "crates/registry" }
 aura-skills = { path = "crates/skills" }
 aura-skills-assessor = { path = "crates/skills-assessor" }
 aura-cron = { path = "crates/cron" }

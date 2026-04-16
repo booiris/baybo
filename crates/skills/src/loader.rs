@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use aura_registry::{ArtifactSource, TrustLevel};
+use aura_model::{ArtifactSource, TrustLevel};
 
 use crate::validation::{normalize_line_endings, validate_skill_name, validate_skill_version};
 use crate::{SkillDefinition, SkillRequirements};

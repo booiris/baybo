@@ -42,7 +42,7 @@ The crate depends on external libraries only — `serde`, `serde_json`, `tokio`,
 - Keeps `config` buildable in isolation
 - Prevents circular dependencies when `agent` wants to read configuration
 
-To compensate, `config` defines **mirror structs** for domain types it references (e.g., `TrustLevelConfig` mirrors `aura_registry::TrustLevel`). Mapping between mirror and domain types happens at the consumer (startup code in `main.rs` or `agent` bootstrap). See §"Mirror maintenance contract" for drift prevention. (MCP-specific mirrors like `McpTransportConfig` were removed with MCP support and will return when it's reintroduced.)
+To compensate, `config` defines **mirror structs** for domain types it references (e.g., `TrustLevelConfig` mirrors `aura_model::TrustLevel`). Mapping between mirror and domain types happens at the consumer (startup code in `main.rs` or `agent` bootstrap). See §"Mirror maintenance contract" for drift prevention. (MCP-specific mirrors like `McpTransportConfig` were removed with MCP support and will return when it's reintroduced.)
 
 ### Defaults-first serde strategy (top-level only)
 
@@ -114,7 +114,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 
 `aura-config` holds mirrors of selected domain types (today just `TrustLevelConfig`; `McpTransportConfig`, `SecretAccessConfig`, and `CapabilityConfig` will return with MCP support) to stay decoupled. Drift prevention:
 
-1. **Ownership** — mirrors live in `aura-config`. Whenever the upstream domain type (e.g. `aura_registry::TrustLevel`) changes shape, the same PR updates the mirror and the conversion between them.
+1. **Ownership** — mirrors live in `aura-config`. Whenever the upstream domain type (e.g. `aura_model::TrustLevel`) changes shape, the same PR updates the mirror and the conversion between them.
 2. **Contract tests** — each mirror has a round-trip test (`From<DomainType> for MirrorType` and `TryFrom<MirrorType> for DomainType`) in `aura-config`'s integration tests. These act as the drift detector: adding a variant upstream without a mirror update breaks match exhaustiveness and fails CI.
 3. **Forward compatibility** — domain enums that mirrors target should be `#[non_exhaustive]`; the mirror's `TryFrom` returns a typed `ConfigError::UnsupportedVariant { ty, variant }` rather than panicking when it encounters an unknown variant.
 4. **Scope limit** — only types that appear in the config surface are mirrored. Transient/internal domain types must not leak into `aura-config`.

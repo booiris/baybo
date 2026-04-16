@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aura_job::OperationKind;
 use aura_model::User;
-use aura_registry::TrustLevel;
+use aura_model::TrustLevel;
 
 use aura_tools::{
     ApprovalDecision, ApprovalGateMap, ApprovalRequest, ApprovedResource, ResourceAccess,

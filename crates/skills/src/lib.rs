@@ -5,7 +5,7 @@ pub mod validation;
 
 pub use registry::{SkillCandidate, SkillIssue, SkillIssueKind, SkillRegistry, SkillValidation};
 
-use aura_registry::{ArtifactSource, TrustLevel};
+use aura_model::{ArtifactSource, TrustLevel};
 use serde::{Deserialize, Serialize};
 
 /// A declarative skill definition.

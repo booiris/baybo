@@ -17,28 +17,28 @@ use aura_config::{ConfigError, TrustLevelConfig};
 // TrustLevel ↔ TrustLevelConfig
 // ---------------------------------------------------------------------------
 
-fn trust_domain_to_mirror(d: &aura_registry::TrustLevel) -> TrustLevelConfig {
+fn trust_domain_to_mirror(d: &aura_model::TrustLevel) -> TrustLevelConfig {
     match d {
-        aura_registry::TrustLevel::Trusted => TrustLevelConfig::Trusted,
-        aura_registry::TrustLevel::Installed => TrustLevelConfig::Installed,
-        aura_registry::TrustLevel::Untrusted => TrustLevelConfig::Untrusted,
+        aura_model::TrustLevel::Trusted => TrustLevelConfig::Trusted,
+        aura_model::TrustLevel::Installed => TrustLevelConfig::Installed,
+        aura_model::TrustLevel::Untrusted => TrustLevelConfig::Untrusted,
     }
 }
 
-fn trust_mirror_to_domain(m: TrustLevelConfig) -> Result<aura_registry::TrustLevel, ConfigError> {
+fn trust_mirror_to_domain(m: TrustLevelConfig) -> Result<aura_model::TrustLevel, ConfigError> {
     Ok(match m {
-        TrustLevelConfig::Trusted => aura_registry::TrustLevel::Trusted,
-        TrustLevelConfig::Installed => aura_registry::TrustLevel::Installed,
-        TrustLevelConfig::Untrusted => aura_registry::TrustLevel::Untrusted,
+        TrustLevelConfig::Trusted => aura_model::TrustLevel::Trusted,
+        TrustLevelConfig::Installed => aura_model::TrustLevel::Installed,
+        TrustLevelConfig::Untrusted => aura_model::TrustLevel::Untrusted,
     })
 }
 
 #[test]
 fn trust_level_mirror_roundtrip() {
     let all = [
-        aura_registry::TrustLevel::Trusted,
-        aura_registry::TrustLevel::Installed,
-        aura_registry::TrustLevel::Untrusted,
+        aura_model::TrustLevel::Trusted,
+        aura_model::TrustLevel::Installed,
+        aura_model::TrustLevel::Untrusted,
     ];
     for d in all {
         let mirror = trust_domain_to_mirror(&d);

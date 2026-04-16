@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 aura-cron = { workspace = true }
 aura-model = { workspace = true }
-aura-registry = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
 aura-skills = { workspace = true }

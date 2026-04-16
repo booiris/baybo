@@ -8,12 +8,13 @@ Contents:
 
 - **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage`, `Role`, `MessageMetadata`
 - **Memory types**: `MemoryEntry`, `MemoryCategory`
+- **Governance types**: `TrustLevel`, `ArtifactSource`, `ExtensionManifest`, `ExtensionKind`
 
 ## Design Decisions
 
 ### Minimal scope
 
-`model` retains only the content primitives that are genuinely used by both the channel layer and the LLM layer and cannot naturally belong to either. Session/user types live in `session`, message types in `channels`, operation types in `job`, governance types in `registry`, and per-module error types replace any shared error enum.
+`model` retains only the content primitives that are genuinely used by both the channel layer and the LLM layer and cannot naturally belong to either. Session/user types live in `session`, message types in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`.
 
 ### Media by reference, not inline
 

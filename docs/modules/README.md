@@ -7,7 +7,7 @@ Each document covers: module responsibilities, design decisions, key constraints
 Bottom-up along the dependency graph:
 
 1. [model.md](model.md) → [config.md](config.md) → [session.md](session.md) → [channels.md](channels.md)
-2. [job.md](job.md) → [cron.md](cron.md) → [registry.md](registry.md) → [skills.md](skills.md)
+2. [job.md](job.md) → [cron.md](cron.md) → [skills.md](skills.md)
 3. [llm.md](llm.md) → [security.md](security.md)
 4. [tools.md](tools.md) → [workspace.md](workspace.md) → [context.md](context.md)
 5. [trace.md](trace.md) → [hook.md](hook.md)
@@ -17,7 +17,7 @@ Bottom-up along the dependency graph:
 
 ### Foundational Types Layer
 
-- **model** — Shared content primitives (ChatMessage, ContentBlock, Role, BlobRef, MessageMetadata) and memory domain types (MemoryEntry, MemoryCategory). No business traits.
+- **model** — Shared content primitives (ChatMessage, ContentBlock, Role, BlobRef, MessageMetadata), memory domain types (MemoryEntry, MemoryCategory), and governance types (TrustLevel, ArtifactSource, ExtensionManifest). No business traits.
 - **config** — Root `AuraConfig` with JSON loading and `validate()`. Sections (llm, agent, session, channels, security, tools, trace, cost, workspace). Uses mirror structs to stay decoupled from domain crates.
 
 ### Ingress and Security Boundary Layer
@@ -30,7 +30,6 @@ Bottom-up along the dependency graph:
 
 - **llm** — LLM provider wrapping and response parsing.
 - **tools** — Tool abstraction, registration, capability declarations, runtime routing. (MCP client support is temporarily removed; see `docs/todo/reintroduce-mcp-support.md`.)
-- **registry** — Extension artifact verification and installation governance. Owns TrustLevel, ArtifactSource.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
 - **workspace** — Identity files and long-running configuration.
@@ -60,18 +59,17 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
   ├── security ──► model, channels
   ├── hook ──► channels
   ├── trace ──► model, context, job
-  ├── tools ──► model, registry
+  ├── tools ──► model
   ├── cron ──► model
-  ├── skills ──► registry
+  ├── skills ──► model
   ├── skills-assessor ──► skills, storage, llm, model
   └── job (no internal deps)
-  └── registry (no internal deps)
   └── workspace (no internal deps)
   └── config (no internal deps; external only)
 
 storage   ──► model, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
 session   ──► model, storage (owns SessionManager; consumes SessionStore from storage)
-agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, channels, registry, config
+agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, channels, config
 bootstrap ──► config + all domain crates it assembles (entry point only)
 ```
 

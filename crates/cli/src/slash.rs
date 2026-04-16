@@ -195,7 +195,7 @@ mod tests {
     use super::*;
     use crate::context::ContextBuilder;
     use aura_config::AuraConfig;
-    use aura_registry::{ArtifactSource, TrustLevel};
+    use aura_model::{ArtifactSource, TrustLevel};
     use aura_skills::{SkillDefinition, SkillRegistry, SkillRequirements};
 
     fn skill(name: &str, description: &str, user_invocable: bool) -> SkillDefinition {

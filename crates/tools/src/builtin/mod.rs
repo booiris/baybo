@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use aura_registry::TrustLevel;
+use aura_model::TrustLevel;
 
 use crate::{Tool, ToolCapability, ToolManifest};
 

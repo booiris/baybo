@@ -71,7 +71,7 @@ pub struct ToolDefinition {
 pub struct ToolManifest {
     pub name: String,
     pub description: String,
-    pub trust_level: aura_registry::TrustLevel,
+    pub trust_level: aura_model::TrustLevel,
     pub parameters_schema: Value,
     pub capabilities: Vec<ToolCapability>,
 }

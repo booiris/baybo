@@ -12,5 +12,5 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # Mirror contract tests only. The library itself is leaf-level and keeps no
 # runtime dependency on aura-* crates.
-aura-registry = { workspace = true }
+aura-model = { workspace = true }
 aura-tools = { workspace = true }

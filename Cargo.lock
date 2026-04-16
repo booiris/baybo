@@ -235,7 +235,6 @@ dependencies = [
  "aura-job",
  "aura-llm",
  "aura-model",
- "aura-registry",
  "aura-security",
  "aura-session",
  "aura-skills",
@@ -292,7 +291,6 @@ dependencies = [
  "aura-job",
  "aura-llm",
  "aura-model",
- "aura-registry",
  "aura-security",
  "aura-session",
  "aura-skills",
@@ -316,7 +314,7 @@ dependencies = [
 name = "aura-config"
 version = "0.1.0"
 dependencies = [
- "aura-registry",
+ "aura-model",
  "aura-tools",
  "serde",
  "serde_json",
@@ -408,13 +406,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-registry"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "aura-security"
 version = "0.1.0"
 dependencies = [
@@ -452,7 +443,7 @@ dependencies = [
 name = "aura-skills"
 version = "0.1.0"
 dependencies = [
- "aura-registry",
+ "aura-model",
  "regex",
  "serde",
  "tracing",
@@ -504,7 +495,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
- "aura-registry",
  "glob",
  "regex",
  "reqwest 0.12.28",

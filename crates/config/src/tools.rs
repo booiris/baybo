@@ -16,7 +16,7 @@ impl Default for ToolsConfig {
     }
 }
 
-/// Mirror of `aura_registry::TrustLevel`. The consumer maps between them.
+/// Mirror of `aura_model::TrustLevel`. The consumer maps between them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevelConfig {

@@ -67,7 +67,7 @@ fn escape_skill_content(content: &str) -> String {
 mod tests {
     use super::*;
     use crate::SkillRequirements;
-    use aura_registry::{ArtifactSource, TrustLevel};
+    use aura_model::{ArtifactSource, TrustLevel};
 
     fn mk(name: &str, version: &str, body: &str) -> SkillDefinition {
         SkillDefinition {
