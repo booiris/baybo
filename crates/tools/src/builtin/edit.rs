@@ -26,9 +26,12 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Replace `old_string` with `new_string` inside a file. When \
-         `replace_all` is false (default), `old_string` must appear exactly \
-         once; otherwise the tool fails without touching the file."
+        "Perform targeted string replacement inside a file. Always use \
+         this instead of Bash commands like sed or awk for editing files. \
+         Replace `old_string` with `new_string`; when `replace_all` is \
+         false (default), `old_string` must appear exactly once — otherwise \
+         the tool fails without touching the file. Provide enough surrounding \
+         context in `old_string` to ensure a unique match."
     }
 
     fn parameters_schema(&self) -> Value {

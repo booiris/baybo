@@ -42,9 +42,11 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents with a regular expression. `output_mode` may be \
+        "Search file contents with a regular expression. Always use this \
+         instead of Bash commands like grep or rg. `output_mode` may be \
          `content` (matching lines), `files_with_matches` (default, paths \
-         only), or `count` (match counts per file)."
+         only), or `count` (match counts per file). Supports file-type \
+         filtering via the `glob` parameter."
     }
 
     fn parameters_schema(&self) -> Value {

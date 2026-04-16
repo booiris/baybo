@@ -26,8 +26,10 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "Match files by glob pattern (e.g. `**/*.rs`). Results are sorted by \
-         modification time, newest first, and capped at 1000 entries."
+        "Find files by glob pattern (e.g. `**/*.rs`). Always use this \
+         instead of Bash commands like find or ls for file searching. \
+         Results are sorted by modification time, newest first, and \
+         capped at 1000 entries."
     }
 
     fn parameters_schema(&self) -> Value {

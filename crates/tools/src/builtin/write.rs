@@ -23,8 +23,11 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create or overwrite a file with the provided content. Parent \
-         directories must already exist."
+        "Create or overwrite a file with the provided content. \
+         Always use this instead of Bash commands like echo with \
+         redirection or cat with heredoc. Prefer `Edit` for modifying \
+         existing files — only use `Write` for new files or complete \
+         rewrites. Parent directories must already exist."
     }
 
     fn parameters_schema(&self) -> Value {

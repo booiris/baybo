@@ -29,9 +29,11 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file from the local filesystem. Supports \
-         optional `offset` (1-based starting line) and `limit` (max lines). \
-         Long individual lines are truncated to 2000 characters."
+        "Read the contents of a file from the local filesystem. \
+         Always use this instead of Bash commands like cat, head, or tail. \
+         Supports optional `offset` (1-based starting line) and `limit` \
+         (max lines). Long individual lines are truncated to 2000 characters. \
+         Output is formatted with line numbers for easy reference."
     }
 
     fn parameters_schema(&self) -> Value {

@@ -36,7 +36,15 @@ impl Tool for BashTool {
     fn description(&self) -> &str {
         "Execute a shell command in a fresh `sh -c` process. Environment \
          changes and `cd` do not persist across invocations. Combined \
-         stdout/stderr output is truncated at 64 KiB."
+         stdout/stderr output is truncated at 64 KiB.\n\n\
+         IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:\n\
+         - To read files use `Read` (not cat/head/tail/sed)\n\
+         - To write files use `Write` (not echo/cat with redirection)\n\
+         - To edit files use `Edit` (not sed/awk)\n\
+         - To search file names use `Glob` (not find/ls)\n\
+         - To search file contents use `Grep` (not grep/rg)\n\
+         Reserve Bash for system commands, git operations, build/test, \
+         and terminal tasks that require shell execution."
     }
 
     fn parameters_schema(&self) -> Value {
