@@ -33,7 +33,7 @@ impl JobStore for LibsqlJobStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM jobs WHERE id = ?1",
+                "SELECT data FROM jobs WHERE id = ?1 AND deleted_at IS NULL",
                 libsql::params![job_id.to_string()],
             )
             .await
@@ -64,7 +64,7 @@ impl JobStore for LibsqlJobStore {
 
         let rows_affected = conn
             .execute(
-                "UPDATE jobs SET data = ?1 WHERE id = ?2",
+                "UPDATE jobs SET data = ?1 WHERE id = ?2 AND deleted_at IS NULL",
                 libsql::params![data, job.id.clone()],
             )
             .await
@@ -79,7 +79,7 @@ impl JobStore for LibsqlJobStore {
     async fn list_by_session(&self, session_id: &str) -> aura_job::Result<Vec<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM jobs", ())
+            .query("SELECT data FROM jobs WHERE deleted_at IS NULL", ())
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -104,7 +104,7 @@ impl JobStore for LibsqlJobStore {
     async fn list_by_status(&self, status: JobStatus) -> aura_job::Result<Vec<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM jobs", ())
+            .query("SELECT data FROM jobs WHERE deleted_at IS NULL", ())
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -129,7 +129,7 @@ impl JobStore for LibsqlJobStore {
     async fn list_children(&self, parent_job_id: &str) -> aura_job::Result<Vec<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM jobs", ())
+            .query("SELECT data FROM jobs WHERE deleted_at IS NULL", ())
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -154,7 +154,7 @@ impl JobStore for LibsqlJobStore {
     async fn list_all(&self) -> aura_job::Result<Vec<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM jobs", ())
+            .query("SELECT data FROM jobs WHERE deleted_at IS NULL", ())
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -191,7 +191,7 @@ impl JobStore for LibsqlJobStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM job_transitions WHERE job_id = ?1",
+                "SELECT data FROM job_transitions WHERE job_id = ?1 AND deleted_at IS NULL",
                 libsql::params![job_id.to_string()],
             )
             .await

@@ -251,7 +251,7 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE job_id = ?1 ORDER BY triggered_at DESC",
+                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE job_id = ?1 AND deleted_at IS NULL ORDER BY triggered_at DESC",
                 libsql::params![job_id.to_string()],
             )
             .await
@@ -276,7 +276,7 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE user_id = ?1 ORDER BY triggered_at DESC",
+                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE user_id = ?1 AND deleted_at IS NULL ORDER BY triggered_at DESC",
                 libsql::params![user_id.to_string()],
             )
             .await
@@ -325,7 +325,7 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .execute(
-                "UPDATE cron_executions SET status = ?1 WHERE id = ?2",
+                "UPDATE cron_executions SET status = ?1 WHERE id = ?2 AND deleted_at IS NULL",
                 libsql::params![status.to_string(), execution_id.to_string()],
             )
             .await
@@ -345,7 +345,7 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE status = ?1",
+                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE status = ?1 AND deleted_at IS NULL",
                 libsql::params![status.to_string()],
             )
             .await

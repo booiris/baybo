@@ -39,8 +39,8 @@ All libsql-backed tables that support deletion use **soft delete**, never a hard
 - Deletion = `UPDATE ... SET deleted_at = ?now WHERE ... AND deleted_at IS NULL`. Do not emit `DELETE FROM` against these tables.
 - Every read (`SELECT`) MUST include `AND deleted_at IS NULL` so soft-deleted rows stay hidden. Every mutation (`UPDATE`) on a live row MUST include the same guard so you never write through a deleted row.
 - Re-insertion semantics: `INSERT OR REPLACE` and `ON CONFLICT ... DO UPDATE` must reset `deleted_at` back to `NULL` so recreating a soft-deleted id revives it (see `skill_risk.rs::upsert_job` for the pattern).
-- Schema changes: add the column both to the `CREATE TABLE IF NOT EXISTS` in `crates/storage/src/libsql/mod.rs` and to the `migrate_soft_delete` table list so existing databases get `ALTER TABLE ADD COLUMN` backfilled (idempotent — the duplicate-column error is swallowed).
-- Tables currently covered: `sessions`, `memories`, `trace_nodes`, `secrets`, `cron_jobs`, `skill_risk_assessments`, `skill_risk_assessment_jobs`. Pure append-only tables (`cost_records`, `jobs`, `job_transitions`, `cron_executions`, `session_traces`) have no delete path and therefore no `deleted_at` column.
+- Schema changes: add the column to the `CREATE TABLE IF NOT EXISTS` in `crates/storage/src/libsql/mod.rs`.
+- Tables currently covered: `sessions`, `memories`, `session_traces`, `trace_nodes`, `trace_forks`, `secrets`, `jobs`, `job_transitions`, `cron_jobs`, `cron_executions`, `skill_risk_assessments`, `skill_risk_assessment_jobs`. The only append-only table without `deleted_at` is `cost_records` (billing audit trail).
 
 ## Architecture
 
