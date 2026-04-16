@@ -47,6 +47,7 @@ Branching creates a new branch below the target node without overwriting the ori
 - `TraceCollector` (in `agent::trace`) should lock only for short critical sections, never across `await`
 - Apply uniform sanitization to `SpanResult::Error` to prevent sensitive data leaking through exception paths
 - `save_trace()` should save the whole tree in one transaction
+- Storage uses columnar schema: `session_traces` (metadata), `trace_nodes` (one row per node with queryable columns), `trace_forks` (fork records). `children` lists are derived from `parent_id` on load.
 
 ## Collaboration
 

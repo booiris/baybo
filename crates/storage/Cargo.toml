@@ -18,4 +18,5 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+aura-context = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

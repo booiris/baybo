@@ -45,7 +45,6 @@ impl LibsqlPool {
         };
         pool.set_wal_mode().await?;
         pool.init_db().await?;
-        pool.migrate_soft_delete().await?;
         Ok(pool)
     }
 
@@ -62,7 +61,6 @@ impl LibsqlPool {
             conn: Arc::new(conn),
         };
         pool.init_db().await?;
-        pool.migrate_soft_delete().await?;
         Ok(pool)
     }
 
@@ -105,17 +103,43 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
 
                 CREATE TABLE IF NOT EXISTS session_traces (
-                    session_id TEXT PRIMARY KEY,
-                    data       TEXT NOT NULL
+                    session_id  TEXT PRIMARY KEY,
+                    root_node   TEXT NOT NULL,
+                    active_leaf TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL,
+                    deleted_at  INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS trace_nodes (
                     id         TEXT NOT NULL,
                     session_id TEXT NOT NULL,
-                    data       TEXT NOT NULL,
+                    parent_id  TEXT,
+                    kind       TEXT NOT NULL,
+                    job_id     TEXT,
+                    provenance TEXT NOT NULL DEFAULT '{}',
+                    input      TEXT NOT NULL DEFAULT '{}',
+                    result     TEXT,
+                    started_at TEXT NOT NULL,
+                    ended_at   TEXT,
+                    snapshot   TEXT,
                     deleted_at INTEGER,
                     PRIMARY KEY (session_id, id)
                 );
+                CREATE INDEX IF NOT EXISTS idx_trace_nodes_started
+                    ON trace_nodes(session_id, started_at);
+
+                CREATE TABLE IF NOT EXISTS trace_forks (
+                    id         TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    from_node  TEXT NOT NULL,
+                    fork_root  TEXT NOT NULL,
+                    reason     TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    deleted_at INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_trace_forks_session
+                    ON trace_forks(session_id);
 
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,
@@ -139,14 +163,16 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_cost_timestamp ON cost_records(timestamp);
 
                 CREATE TABLE IF NOT EXISTS jobs (
-                    id   TEXT PRIMARY KEY,
-                    data TEXT NOT NULL
+                    id         TEXT PRIMARY KEY,
+                    data       TEXT NOT NULL,
+                    deleted_at INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS job_transitions (
-                    id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id TEXT NOT NULL,
-                    data   TEXT NOT NULL
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id     TEXT NOT NULL,
+                    data       TEXT NOT NULL,
+                    deleted_at INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);
 
@@ -168,7 +194,8 @@ impl LibsqlPool {
                     scheduled_fire_time TEXT NOT NULL DEFAULT '',
                     triggered_at        TEXT NOT NULL,
                     status              TEXT NOT NULL DEFAULT 'pending',
-                    data                TEXT NOT NULL
+                    data                TEXT NOT NULL,
+                    deleted_at          INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_job_id ON cron_executions(job_id);
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_user_id ON cron_executions(user_id);
@@ -206,31 +233,4 @@ impl LibsqlPool {
         Ok(())
     }
 
-    /// Ensure every soft-delete-aware table carries the `deleted_at` column.
-    ///
-    /// `CREATE TABLE IF NOT EXISTS` does not backfill columns onto a
-    /// pre-existing table, so on older databases we have to add the column
-    /// ourselves. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we attempt
-    /// the ALTER and swallow the duplicate-column error.
-    async fn migrate_soft_delete(&self) -> anyhow::Result<()> {
-        const TABLES: &[&str] = &[
-            "sessions",
-            "memories",
-            "trace_nodes",
-            "secrets",
-            "cron_jobs",
-            "skill_risk_assessments",
-            "skill_risk_assessment_jobs",
-        ];
-        for table in TABLES {
-            let sql = format!("ALTER TABLE {table} ADD COLUMN deleted_at INTEGER");
-            if let Err(e) = self.conn.execute(&sql, ()).await {
-                let msg = e.to_string().to_lowercase();
-                if !msg.contains("duplicate column") {
-                    return Err(anyhow::anyhow!("failed to add deleted_at to {table}: {e}"));
-                }
-            }
-        }
-        Ok(())
-    }
 }
