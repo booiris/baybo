@@ -304,21 +304,8 @@ async fn main() -> anyhow::Result<()> {
     // Cost tracker
     let cost_tracker = Arc::new(CostTracker::new(storage.cost));
 
-    // Trace collector
+    // Trace store — shared by per-session TraceCollectors and the slash context.
     let trace_store: Arc<dyn aura_storage::TraceStore> = Arc::from(storage.trace);
-    let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
-        "global",
-        Arc::clone(&trace_store),
-        config.trace.auto_snapshot,
-        config.trace.snapshot_interval,
-    )));
-
-    // Observability recorder
-    let recorder = Arc::new(ObservabilityRecorder::new(
-        Arc::clone(&job_manager),
-        trace_collector,
-        cost_tracker,
-    ));
 
     // Secret vault
     let master_key = match boot::load_encryption_key(&config.security) {
@@ -452,7 +439,11 @@ async fn main() -> anyhow::Result<()> {
     let actor_system_prompt = soul.system_prompt().to_string();
     let actor_tokenizer = Arc::clone(&tokenizer);
     let actor_hooks = Arc::clone(&hook_manager);
-    let actor_recorder = Arc::clone(&recorder);
+    let actor_trace_store = Arc::clone(&trace_store);
+    let actor_auto_snapshot = config.trace.auto_snapshot;
+    let actor_snapshot_interval = config.trace.snapshot_interval;
+    let actor_job_manager = Arc::clone(&job_manager);
+    let actor_cost_tracker = Arc::clone(&cost_tracker);
     let actor_skill_assessor = Arc::clone(&skill_assessor);
     let actor_token_budget = boot::to_token_budget(&config.agent.context);
     let actor_keep_recent = config.agent.context.keep_recent;
@@ -479,12 +470,27 @@ async fn main() -> anyhow::Result<()> {
             Soul::custom(actor_system_prompt.clone()),
         )
         .with_skill_assessor(Arc::clone(&actor_skill_assessor));
+
+        // Per-session trace collector and observability recorder so each
+        // actor records spans under its own session_id.
+        let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
+            &session.id,
+            Arc::clone(&actor_trace_store),
+            actor_auto_snapshot,
+            actor_snapshot_interval,
+        )));
+        let recorder = Arc::new(ObservabilityRecorder::new(
+            Arc::clone(&actor_job_manager),
+            trace_collector,
+            Arc::clone(&actor_cost_tracker),
+        ));
+
         let actor = AgentActor::new(
             session,
             agent_loop,
             response_tx,
             Arc::clone(&actor_hooks),
-            Arc::clone(&actor_recorder),
+            recorder,
         );
         let (sender, mailbox) = mpsc::channel(buffer);
         tokio::spawn(async move {
