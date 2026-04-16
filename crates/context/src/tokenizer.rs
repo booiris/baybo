@@ -34,6 +34,11 @@ const IMAGE_TOKEN_ESTIMATE: usize = 85;
 const AUDIO_TOKEN_ESTIMATE: usize = 100;
 const FILE_TOKEN_ESTIMATE: usize = 50;
 
+/// Overhead for the structural envelope of a tool_use / tool_result block
+/// (id, name, JSON framing). The actual text/JSON payload is counted
+/// separately and added on top.
+const TOOL_USE_OVERHEAD: usize = 20;
+
 /// BPE-based tokenizer backed by `tiktoken-rs`.
 ///
 /// Uses OpenAI's `cl100k_base` or `o200k_base` encodings. Both are pure
@@ -96,6 +101,25 @@ impl Tokenizer for TiktokenTokenizer {
                 ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
                 ContentBlock::Audio { .. } => AUDIO_TOKEN_ESTIMATE,
                 ContentBlock::File { .. } => FILE_TOKEN_ESTIMATE,
+                ContentBlock::ToolUse { input, .. } => {
+                    let s = serde_json::to_string(input).unwrap_or_default();
+                    TOOL_USE_OVERHEAD + self.count_text(&s)
+                }
+                ContentBlock::ToolResult { content, .. } => {
+                    TOOL_USE_OVERHEAD + self.count_text(content)
+                }
+                ContentBlock::Thinking { content, .. } => {
+                    let text: String = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            aura_model::ThinkingContent::Text { text, .. } => Some(text.as_str()),
+                            aura_model::ThinkingContent::Summary { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    TOOL_USE_OVERHEAD + self.count_text(&text)
+                }
             };
         }
         tokens

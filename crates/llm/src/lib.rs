@@ -57,6 +57,11 @@ pub struct ToolCallInfo {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Provider-specific cryptographic signature (e.g. Gemini's
+    /// `thought_signature`). Must be echoed back when the tool call is
+    /// included in subsequent requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// Token usage statistics for a single LLM call.
@@ -89,8 +94,12 @@ pub enum StreamEvent {
     Text(String),
     /// A complete tool call.
     ToolCall(ToolCallInfo),
-    /// A reasoning/thinking text chunk.
+    /// A reasoning/thinking text chunk (incremental delta).
     Reasoning(String),
+    /// A complete, structured reasoning block. Must be preserved for
+    /// providers that require thinking to be echoed back (Anthropic,
+    /// Gemini).
+    ThinkingBlock(aura_model::ContentBlock),
     /// Token usage statistics (emitted at stream end).
     Usage(TokenUsage),
 }
@@ -144,10 +153,16 @@ fn convert_stream_event<R: GetTokenUsage>(
                 id: tool_call.id,
                 name: tool_call.function.name,
                 arguments: tool_call.function.arguments,
+                signature: tool_call.signature,
             })))
         }
         StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
             Some(Ok(StreamEvent::Reasoning(reasoning)))
+        }
+        StreamedAssistantContent::Reasoning(reasoning) => {
+            Some(Ok(StreamEvent::ThinkingBlock(convert_reasoning_to_block(
+                &reasoning,
+            ))))
         }
         StreamedAssistantContent::Final(r) => r.token_usage().map(|usage| {
             Ok(StreamEvent::Usage(TokenUsage {
@@ -155,8 +170,8 @@ fn convert_stream_event<R: GetTokenUsage>(
                 output_tokens: usage.output_tokens as usize,
             }))
         }),
-        // ToolCallDelta and full Reasoning blocks are skipped;
-        // we emit ReasoningDelta for incremental text and ToolCall for complete calls.
+        // ToolCallDelta events are skipped — we emit the complete
+        // ToolCall once it's fully assembled.
         _ => None,
     }
 }
@@ -293,7 +308,7 @@ impl LlmClient {
                     system_parts.push(multimodal::extract_text(&msg.content));
                 }
                 aura_model::Role::User => {
-                    let content: Vec<UserContent> = msg
+                    let mut parts: Vec<UserContent> = msg
                         .content
                         .iter()
                         .map(|block| match block {
@@ -305,27 +320,91 @@ impl LlmClient {
                             }),
                         })
                         .collect();
-                    if let Some(first) = content.into_iter().next() {
-                        chat_messages.push(Message::User {
-                            content: OneOrMany::one(first),
-                        });
+                    if !parts.is_empty() {
+                        let first = parts.remove(0);
+                        let mut content = OneOrMany::one(first);
+                        for part in parts {
+                            content.push(part);
+                        }
+                        chat_messages.push(Message::User { content });
                     }
                 }
                 aura_model::Role::Assistant => {
-                    let text = multimodal::extract_text(&msg.content);
-                    if !text.is_empty() {
-                        chat_messages.push(Message::Assistant {
-                            id: None,
-                            content: OneOrMany::one(AssistantContent::Text(Text { text })),
-                        });
+                    let mut parts: Vec<AssistantContent> = Vec::new();
+                    for block in &msg.content {
+                        match block {
+                            aura_model::ContentBlock::Text(t) if !t.is_empty() => {
+                                parts.push(AssistantContent::Text(Text { text: t.clone() }));
+                            }
+                            aura_model::ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input,
+                                signature,
+                            } => {
+                                parts.push(AssistantContent::ToolCall(
+                                    completion::message::ToolCall {
+                                        id: id.clone(),
+                                        call_id: None,
+                                        function: completion::message::ToolFunction {
+                                            name: name.clone(),
+                                            arguments: input.clone(),
+                                        },
+                                        signature: signature.clone(),
+                                        additional_params: None,
+                                    },
+                                ));
+                            }
+                            aura_model::ContentBlock::Thinking { id, content } => {
+                                parts.push(convert_thinking_to_reasoning(id, content));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !parts.is_empty() {
+                        let first = parts.remove(0);
+                        let mut content = OneOrMany::one(first);
+                        for part in parts {
+                            content.push(part);
+                        }
+                        chat_messages.push(Message::Assistant { id: None, content });
                     }
                 }
                 aura_model::Role::Tool => {
-                    // Tool results are sent as user messages for simplicity
-                    let text = multimodal::extract_text(&msg.content);
-                    chat_messages.push(Message::User {
-                        content: OneOrMany::one(UserContent::Text(Text { text })),
-                    });
+                    let mut parts: Vec<UserContent> = Vec::new();
+                    for block in &msg.content {
+                        match block {
+                            aura_model::ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                            } => {
+                                parts.push(UserContent::ToolResult(
+                                    completion::message::ToolResult {
+                                        id: tool_use_id.clone(),
+                                        call_id: None,
+                                        content: OneOrMany::one(
+                                            completion::message::ToolResultContent::Text(Text {
+                                                text: content.clone(),
+                                            }),
+                                        ),
+                                    },
+                                ));
+                            }
+                            aura_model::ContentBlock::Text(text) => {
+                                // Legacy fallback for plain-text tool results.
+                                parts.push(UserContent::Text(Text { text: text.clone() }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !parts.is_empty() {
+                        let first = parts.remove(0);
+                        let mut content = OneOrMany::one(first);
+                        for part in parts {
+                            content.push(part);
+                        }
+                        chat_messages.push(Message::User { content });
+                    }
                 }
             }
         }
@@ -396,9 +475,10 @@ impl LlmClient {
                         id: tc.id,
                         name: tc.function.name,
                         arguments: tc.function.arguments,
+                        signature: tc.signature,
                     });
                 }
-                AssistantContent::Reasoning(r) => {
+                AssistantContent::Reasoning(ref r) => {
                     let reasoning_text: String = r
                         .content
                         .iter()
@@ -416,6 +496,8 @@ impl LlmClient {
                     if !reasoning_text.is_empty() {
                         thinking = Some(reasoning_text);
                     }
+                    // Also preserve the full structured block for round-trip.
+                    content_blocks.push(convert_reasoning_to_block(r));
                 }
                 AssistantContent::Image(_) => {}
             }
@@ -476,4 +558,69 @@ pub struct ProbeReport {
     pub model: String,
     pub latency_ms: u64,
     pub tokens: TokenUsage,
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning / Thinking round-trip helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a rig `Reasoning` block into our provider-agnostic
+/// `ContentBlock::Thinking` representation.
+fn convert_reasoning_to_block(
+    reasoning: &completion::message::Reasoning,
+) -> aura_model::ContentBlock {
+    use aura_model::ThinkingContent;
+    let content = reasoning
+        .content
+        .iter()
+        .map(|c| match c {
+            rig::completion::message::ReasoningContent::Text { text, signature } => {
+                ThinkingContent::Text {
+                    text: text.clone(),
+                    signature: signature.clone(),
+                }
+            }
+            rig::completion::message::ReasoningContent::Summary(s) => ThinkingContent::Summary {
+                text: s.clone(),
+            },
+            rig::completion::message::ReasoningContent::Encrypted(d)
+            | rig::completion::message::ReasoningContent::Redacted { data: d } => {
+                ThinkingContent::Redacted { data: d.clone() }
+            }
+            _ => ThinkingContent::Summary {
+                text: String::new(),
+            },
+        })
+        .collect();
+    aura_model::ContentBlock::Thinking {
+        id: reasoning.id.clone(),
+        content,
+    }
+}
+
+/// Convert our `ContentBlock::Thinking` back into a rig
+/// `AssistantContent::Reasoning` for the completion request.
+fn convert_thinking_to_reasoning(
+    id: &Option<String>,
+    content: &[aura_model::ThinkingContent],
+) -> AssistantContent {
+    use rig::completion::message::{Reasoning, ReasoningContent};
+    let blocks = content
+        .iter()
+        .map(|tc| match tc {
+            aura_model::ThinkingContent::Text { text, signature } => ReasoningContent::Text {
+                text: text.clone(),
+                signature: signature.clone(),
+            },
+            aura_model::ThinkingContent::Summary { text } => {
+                ReasoningContent::Summary(text.clone())
+            }
+            aura_model::ThinkingContent::Redacted { data } => ReasoningContent::Redacted {
+                data: data.clone(),
+            },
+        })
+        .collect();
+    let mut reasoning = Reasoning::new("").optional_id(id.clone());
+    reasoning.content = blocks;
+    AssistantContent::Reasoning(reasoning)
 }

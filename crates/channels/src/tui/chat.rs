@@ -478,5 +478,8 @@ fn render_block(block: &ContentBlock) -> String {
             mime_type,
             ..
         } => format!("[File: {filename} ({mime_type})]"),
+        ContentBlock::ToolUse { name, .. } => format!("[Tool: {name}]"),
+        ContentBlock::ToolResult { content, .. } => content.clone(),
+        ContentBlock::Thinking { .. } => "[Thinking...]".to_string(),
     }
 }

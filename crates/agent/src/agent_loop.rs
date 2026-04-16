@@ -257,10 +257,30 @@ impl AgentLoop {
                 });
             }
 
-            // Append assistant message with tool call indicator
+            // Append assistant message including thinking and tool-call
+            // blocks so the LLM sees its own prior reasoning and tool
+            // invocations on the next turn.
+            let mut assistant_blocks = if response.content_blocks.is_empty() {
+                // Fallback: build from the flat content string.
+                if response.content.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ContentBlock::Text(response.content.clone())]
+                }
+            } else {
+                response.content_blocks.clone()
+            };
+            for tc in &response.tool_calls {
+                assistant_blocks.push(ContentBlock::ToolUse {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    input: tc.arguments.clone(),
+                    signature: tc.signature.clone(),
+                });
+            }
             let assistant_msg = ChatMessage {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text(response.content.clone())],
+                content: assistant_blocks,
             };
             self.context_manager.append(session, &assistant_msg).await?;
 
@@ -310,10 +330,14 @@ impl AgentLoop {
                     }
                 };
 
-                // Append tool result to context (auto-compresses if needed)
+                // Append tool result to context with the tool_use_id so the
+                // LLM can correlate results with their originating calls.
                 let tool_msg = ChatMessage {
                     role: Role::Tool,
-                    content: vec![ContentBlock::Text(result_text)],
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: tool_call.id.clone(),
+                        content: result_text,
+                    }],
                 };
                 self.context_manager.append(session, &tool_msg).await?;
 
@@ -500,6 +524,7 @@ impl AgentLoop {
         let mut tool_calls = Vec::new();
         let mut usage = TokenUsage::default();
         let mut thinking = String::new();
+        let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
 
         while let Some(event) = stream.next().await {
             match event? {
@@ -521,15 +546,17 @@ impl AgentLoop {
                 }
                 StreamEvent::ToolCall(info) => tool_calls.push(info),
                 StreamEvent::Reasoning(r) => thinking.push_str(&r),
+                StreamEvent::ThinkingBlock(block) => thinking_blocks.push(block),
                 StreamEvent::Usage(u) => usage = u,
             }
         }
 
-        let content_blocks = if content.is_empty() {
-            Vec::new()
-        } else {
-            vec![ContentBlock::Text(content.clone())]
-        };
+        // Build content_blocks: thinking blocks first (providers expect
+        // them before text), then text.
+        let mut content_blocks = thinking_blocks;
+        if !content.is_empty() {
+            content_blocks.push(ContentBlock::Text(content.clone()));
+        }
 
         Ok(LlmResponse {
             content,

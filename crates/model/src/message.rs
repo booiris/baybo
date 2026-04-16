@@ -16,6 +16,47 @@ pub enum ContentBlock {
         filename: String,
         mime_type: String,
     },
+    /// A tool invocation emitted by the assistant. Stored in conversation
+    /// history so subsequent LLM calls see their own prior tool calls.
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        /// Provider-specific cryptographic signature (e.g. Gemini's
+        /// `thought_signature`). Must be echoed back verbatim.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        signature: Option<String>,
+    },
+    /// The result of a tool invocation, keyed back to the originating
+    /// [`ToolUse`] via `tool_use_id`.
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+    /// Thinking/reasoning blocks emitted by the model. Must be preserved
+    /// and echoed back for providers that require it (Anthropic extended
+    /// thinking, Gemini thought signatures).
+    Thinking {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        id: Option<String>,
+        content: Vec<ThinkingContent>,
+    },
+}
+
+/// A single thinking/reasoning content item from the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ThinkingContent {
+    /// Main thinking text with optional cryptographic signature.
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        signature: Option<String>,
+    },
+    /// A provider summary of thinking.
+    Summary { text: String },
+    /// Opaque encrypted or redacted reasoning that must be echoed verbatim.
+    Redacted { data: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
