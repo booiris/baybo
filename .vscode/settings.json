@@ -15,6 +15,7 @@
         "cloudflared",
         "Crossterm",
         "dalek",
+        "Datelike",
         "dedup",
         "docstrings",
         "dotstart",
