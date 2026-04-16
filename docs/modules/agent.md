@@ -40,7 +40,19 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### ToolExecutor responsibility
 
-ToolExecutor: lookup tool → read declared secrets → construct `ToolContext` → create child Job/Trace nodes → execute → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
+ToolExecutor: lookup tool → validate trust/capability → consult approval gate → construct `ToolContext` → create child Job/Trace nodes → execute → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
+
+### Approval gate wiring
+
+`ToolExecutor` holds an `Arc<ApprovalGateMap>` shared with `ChannelRegistry`. The map is populated automatically when channels register via `ChannelAdapter::approval_gate()`. For every call:
+
+1. Resolve the gate for the session's channel via `gate_map.get(user.channel)`.
+2. Compute `ResourceAccess` list via the tool's `accessed_resources(params)`.
+3. Filter out entries covered by the snapshot of `SessionState::approved_resources` passed in from `AgentLoop`.
+4. If any remain, call `gate.request(...)` with the uncovered set and a truncated params preview. On `Deny` the call short-circuits to `ToolError::Denied` (recorded on the trace before return).
+5. On `ApproveAlways`, the executor de-dupes and pushes the newly-approved accesses directly into the shared `Mutex<Vec<ApprovedResource>>` passed by `AgentLoop`. After all tool calls complete, `AgentLoop` flushes the contents back into `session.state.approved_resources`, which persists through session save/restore because the types live in `aura-model`.
+
+Parallel tool calls within a turn each go through the gate independently; the gate implementation is responsible for its own serialization (TUI queues and shows one inline prompt at a time).
 
 ### Long-running model
 

@@ -12,7 +12,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_HITS: usize = 500;
 
@@ -63,6 +63,18 @@ impl Tool for GrepTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        let base = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        match base {
+            Some(p) => vec![ResourceAccess::ReadFile { path: p }],
+            None => Vec::new(),
+        }
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {

@@ -26,6 +26,10 @@ pub(crate) enum AppEvent {
     /// A warn/error tracing event, forwarded from the subscriber for display
     /// inline with chat scrollback.
     Log(LogRecord),
+    /// A tool-call approval was queued on the shared approval state. The
+    /// payload carries no data — the loop reads the current head from
+    /// `AppState::approval` when redrawing.
+    ApprovalRequested,
     /// External shutdown or user-initiated quit.
     Shutdown,
 }

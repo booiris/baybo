@@ -17,6 +17,10 @@ pub enum ToolError {
     #[error("tool not implemented: {0}")]
     NotImplemented(String),
 
+    /// The user denied the approval request for this call.
+    #[error("tool '{tool}' denied by user: {reason}")]
+    Denied { tool: String, reason: String },
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }

@@ -46,6 +46,19 @@ pub(crate) enum Action {
     /// Toggle terminal mouse capture on/off. Turning it off restores
     /// native drag-to-select across all terminals.
     ToggleMouseCapture,
+    /// Approve the head pending approval for this call only.
+    ApprovalApprove,
+    /// Approve the head pending approval and remember the resource for
+    /// the rest of the session.
+    ApprovalApproveAlways,
+    /// Deny the head pending approval.
+    ApprovalDeny,
+    /// Move the selection up in the inline approval prompt.
+    ApprovalSelectPrev,
+    /// Move the selection down in the inline approval prompt.
+    ApprovalSelectNext,
+    /// Confirm the currently highlighted approval option.
+    ApprovalConfirm,
     /// Key had no binding in the current mode.
     Nothing,
 }
@@ -57,6 +70,9 @@ pub(crate) enum Action {
 pub(crate) struct KeyContext {
     pub input_empty: bool,
     pub completion_open: bool,
+    /// An approval modal is overlaying the current view. When set, the
+    /// modal eats input before any other bindings fire.
+    pub approval_open: bool,
 }
 
 pub(crate) fn translate(mode: &ViewMode, key: KeyEvent, ctx: KeyContext) -> Action {
@@ -64,6 +80,14 @@ pub(crate) fn translate(mode: &ViewMode, key: KeyEvent, ctx: KeyContext) -> Acti
     // Crossterm may report Release/Repeat; only act on Press to avoid double-fires.
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Action::Nothing;
+    }
+
+    // Approval modal takes precedence over every other binding when open.
+    // Single-char answers only; unrelated keys are swallowed so the user
+    // cannot accidentally scroll / exit / type into a driver that owns
+    // input right now.
+    if ctx.approval_open {
+        return translate_approval(key);
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -144,6 +168,21 @@ fn translate_dashboard(key: KeyEvent) -> Action {
     }
 }
 
+fn translate_approval(key: KeyEvent) -> Action {
+    // Uppercase `A` is produced when the user holds Shift; crossterm does
+    // not add SHIFT to the modifiers for printable chars, so matching on
+    // the character is sufficient.
+    match key.code {
+        KeyCode::Char('a') => Action::ApprovalApprove,
+        KeyCode::Char('A') => Action::ApprovalApproveAlways,
+        KeyCode::Char('d') | KeyCode::Esc => Action::ApprovalDeny,
+        KeyCode::Up | KeyCode::Char('k') => Action::ApprovalSelectPrev,
+        KeyCode::Down | KeyCode::Char('j') => Action::ApprovalSelectNext,
+        KeyCode::Enter => Action::ApprovalConfirm,
+        _ => Action::Nothing,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +205,7 @@ mod tests {
         KeyContext {
             input_empty,
             completion_open: false,
+            approval_open: false,
         }
     }
 
@@ -254,6 +294,7 @@ mod tests {
         let open = KeyContext {
             input_empty: false,
             completion_open: true,
+            approval_open: false,
         };
         assert_eq!(
             translate(

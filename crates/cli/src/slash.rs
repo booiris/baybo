@@ -60,8 +60,6 @@ impl CliSlashHandler {
             cron: self.ctx.cron.clone(),
             memory: self.ctx.memory.clone(),
             trace: self.ctx.trace.clone(),
-            tool_executor: self.ctx.tool_executor.clone(),
-            recorder: self.ctx.recorder.clone(),
             security: self.ctx.security.clone(),
             leak_detector: self.ctx.leak_detector.clone(),
             skill_assessor: self.ctx.skill_assessor.clone(),

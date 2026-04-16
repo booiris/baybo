@@ -264,6 +264,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
+ "aura-tools",
  "chrono",
  "crossterm",
  "futures",
@@ -513,6 +514,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "walkdir",
 ]
 

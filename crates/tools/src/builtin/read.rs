@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LINE_LEN: usize = 2000;
@@ -44,6 +44,18 @@ impl Tool for ReadTool {
             },
             "required": ["file_path"]
         })
+    }
+
+    fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        params
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                vec![ResourceAccess::ReadFile {
+                    path: PathBuf::from(s),
+                }]
+            })
+            .unwrap_or_default()
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {

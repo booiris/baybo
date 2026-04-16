@@ -15,8 +15,11 @@ pub use types::{
     AgentOutput, ChannelStatus, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
 };
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use aura_model::ChannelType;
+use aura_tools::ApprovalGate;
 use tokio::sync::mpsc;
 
 pub type Result<T> = std::result::Result<T, ChannelError>;
@@ -62,6 +65,15 @@ pub trait ChannelAdapter: Send + Sync + 'static {
     async fn send_notice(&self, session_id: &str, level: NoticeLevel, text: &str) -> Result<()> {
         let _ = (session_id, level, text);
         Ok(())
+    }
+
+    /// Return an approval gate for interactive tool-call approval.
+    ///
+    /// Channels that support an approval UX (e.g. TUI modal, Slack reaction)
+    /// return `Some(gate)`; channels without one return `None`, which the
+    /// registry treats as auto-deny. Called once at registration time.
+    fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>> {
+        None
     }
 
     /// Gracefully shuts down the channel. Idempotent.

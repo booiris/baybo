@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -49,6 +49,18 @@ impl Tool for BashTool {
             },
             "required": ["command"]
         })
+    }
+
+    fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        params
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                vec![ResourceAccess::ExecCommand {
+                    command: s.to_string(),
+                }]
+            })
+            .unwrap_or_default()
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ChatMessage;
+use crate::approval::ApprovedResource;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -61,6 +63,13 @@ pub struct SessionState {
     /// or switching compression strategies.
     #[serde(default)]
     pub compression_count: u32,
+
+    /// Tool resources the user has granted permanent approval for in this
+    /// session. Populated on each `ApproveAlways` decision by the approval
+    /// gate; persisted with the session so restored sessions remember the
+    /// grants. See `aura_model::approval` for matching semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_resources: Vec<ApprovedResource>,
 
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]

@@ -185,26 +185,6 @@ impl AgentLoop {
 
         session.state.active_skills = active_skills.iter().map(|s| s.name.clone()).collect();
 
-        // `allowed_tools` is the union of the active skills' declared
-        // allow-lists. Union over intersection means the user doesn't
-        // get starved when two active skills have disjoint needs; the
-        // tradeoff is accepting the most permissive policy across
-        // active skills, which matches the user's explicit intent to
-        // invoke all of them together.
-        let allowed_tools: Option<Vec<String>> = if active_skills.is_empty() {
-            None
-        } else {
-            let mut union: Vec<String> = Vec::new();
-            for s in &active_skills {
-                for t in &s.allowed_tools {
-                    if !union.iter().any(|existing| existing == t) {
-                        union.push(t.clone());
-                    }
-                }
-            }
-            Some(union)
-        };
-
         // Iterative LLM loop
         let mut iterations = 0;
         loop {
@@ -233,13 +213,7 @@ impl AgentLoop {
                 None
             };
             let response = self
-                .call_llm_with_retry(
-                    session,
-                    recorder,
-                    parent_job_id,
-                    allowed_tools.as_deref(),
-                    iter_delta_tx,
-                )
+                .call_llm_with_retry(session, recorder, parent_job_id, iter_delta_tx)
                 .await?;
 
             // Auto-snapshot after LLM call if the interval has been reached
@@ -290,7 +264,11 @@ impl AgentLoop {
             };
             self.context_manager.append(session, &assistant_msg).await?;
 
-            // Execute tool calls
+            // Execute tool calls. Approved resources are shared via a
+            // Mutex so concurrent tool calls (when supported) see each
+            // other's grants immediately.
+            let approved = std::sync::Mutex::new(session.state.approved_resources.clone());
+
             for tool_call in &response.tool_calls {
                 debug!(
                     tool = %tool_call.name,
@@ -304,6 +282,7 @@ impl AgentLoop {
                         tool_call.arguments.clone(),
                         &session.id,
                         &session.user,
+                        &approved,
                         recorder,
                         parent_job_id,
                     )
@@ -311,10 +290,24 @@ impl AgentLoop {
 
                 let result_text = match &tool_result {
                     Ok(ToolOutput::Text(s)) => s.clone(),
-                    Ok(ToolOutput::Json(v)) => serde_json::to_string(v)
-                        .unwrap_or_else(|_| v.to_string()),
+                    Ok(ToolOutput::Json(v)) => {
+                        serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
+                    }
                     Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
-                    Err(e) => format!("Error: {e}"),
+                    Err(e) => {
+                        if let Some(denied) = e.downcast_ref::<aura_tools::ToolError>()
+                            && matches!(denied, aura_tools::ToolError::Denied { .. })
+                        {
+                            format!(
+                                "The user explicitly denied permission for tool '{}'. \
+                                 Do NOT retry this tool call. Either use an alternative \
+                                 approach or inform the user that the operation was skipped.",
+                                tool_call.name
+                            )
+                        } else {
+                            format!("Error: {e}")
+                        }
+                    }
                 };
 
                 // Append tool result to context (auto-compresses if needed)
@@ -327,6 +320,10 @@ impl AgentLoop {
                 // Auto-snapshot after tool execution if the interval has been reached
                 self.maybe_take_snapshot(session, recorder).await;
             }
+
+            // Flush accumulated approvals back into session state.
+            session.state.approved_resources =
+                approved.into_inner().unwrap_or_else(|e| e.into_inner());
         }
 
         // If we exhausted iterations, return what we have
@@ -347,13 +344,12 @@ impl AgentLoop {
         session: &Session,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
-        allowed_tools: Option<&[String]>,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<LlmResponse> {
         let mut attempt = 0u32;
         loop {
             match self
-                .call_llm(session, recorder, parent_job_id, allowed_tools, delta_tx)
+                .call_llm(session, recorder, parent_job_id, delta_tx)
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -376,16 +372,11 @@ impl AgentLoop {
     }
 
     /// Call the LLM with the current session context.
-    ///
-    /// When `allowed_tools` is `Some`, only tools whose names appear in the
-    /// list are sent to the model. This is used by the skill system to
-    /// restrict tool access according to the skill's `allowed_tools` field.
     async fn call_llm(
         &self,
         session: &Session,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
-        allowed_tools: Option<&[String]>,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<LlmResponse> {
         let model_id = self.llm_client.model_id().to_string();
@@ -413,13 +404,6 @@ impl AgentLoop {
             .tool_registry
             .tool_definitions()
             .into_iter()
-            .filter(|td| {
-                // When a skill restricts tools, only include those in the allowlist.
-                match allowed_tools {
-                    Some(list) => list.iter().any(|name| name == &td.name),
-                    None => true,
-                }
-            })
             .map(|td| ToolDefinitionForLlm {
                 name: td.name,
                 description: td.description,

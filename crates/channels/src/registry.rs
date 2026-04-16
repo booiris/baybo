@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aura_model::ChannelType;
+use aura_tools::ApprovalGateMap;
 use tokio::sync::mpsc;
 
 use crate::{ChannelAdapter, ChannelError, ChannelStatus, IncomingMessage, Result};
@@ -17,13 +19,26 @@ struct ChannelEntry {
 /// previously passed directly to the router.
 pub struct ChannelRegistry {
     channels: HashMap<ChannelType, ChannelEntry>,
+    /// Per-channel approval gates, populated at registration time from
+    /// [`ChannelAdapter::approval_gate`]. Shared with `ToolExecutor` so
+    /// it can resolve the right gate per-call without touching this
+    /// registry.
+    gate_map: Arc<ApprovalGateMap>,
 }
 
 impl ChannelRegistry {
     pub fn new() -> Self {
         Self {
             channels: HashMap::new(),
+            gate_map: Arc::new(ApprovalGateMap::new()),
         }
+    }
+
+    /// Shared handle to the per-channel gate map. Hand this to
+    /// `ToolExecutor` at bootstrap — gates registered later are visible
+    /// immediately since both sides share the same `Arc`.
+    pub fn approval_gates(&self) -> Arc<ApprovalGateMap> {
+        Arc::clone(&self.gate_map)
     }
 
     /// Register a channel adapter. Fails if the channel type is already registered.
@@ -31,6 +46,9 @@ impl ChannelRegistry {
         let channel_type = adapter.channel_type();
         if self.channels.contains_key(&channel_type) {
             return Err(ChannelError::DuplicateChannel(channel_type.to_string()));
+        }
+        if let Some(gate) = adapter.approval_gate() {
+            self.gate_map.insert(channel_type, gate);
         }
         self.channels.insert(
             channel_type,

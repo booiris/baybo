@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
@@ -45,6 +45,15 @@ impl Tool for WebFetchTool {
             },
             "required": ["url"]
         })
+    }
+
+    fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .and_then(extract_host)
+            .map(|host| vec![ResourceAccess::Http { host }])
+            .unwrap_or_default()
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
@@ -102,5 +111,39 @@ impl Tool for WebFetchTool {
             "content_type": content_type,
             "body": body,
         })))
+    }
+}
+
+/// Parse a URL and return its host (lowercased), normalizing the `http://` →
+/// `https://` upgrade that `execute()` applies. Returns `None` for
+/// host-less URLs (e.g. relative paths), which simply skips the approval
+/// gate — the request itself will then fail at `reqwest::get` with a clearer
+/// error.
+fn extract_host(url_str: &str) -> Option<String> {
+    let normalized = if let Some(rest) = url_str.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else {
+        url_str.to_string()
+    };
+    url::Url::parse(&normalized)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_host_from_urls() {
+        assert_eq!(
+            extract_host("https://example.com/path?q=1"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            extract_host("http://EXAMPLE.com"),
+            Some("example.com".into())
+        );
+        assert_eq!(extract_host("not-a-url"), None);
     }
 }

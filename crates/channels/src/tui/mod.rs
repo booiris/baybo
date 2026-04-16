@@ -15,10 +15,13 @@
 //!   loop; rendering happens on the loop task.
 
 mod app;
+mod approval;
 mod chat;
 mod dashboard;
 pub(crate) mod event;
 mod keymap;
+
+pub use aura_tools::{ApprovalQueue, ChannelApprovalGate};
 
 use std::io;
 use std::panic;
@@ -78,6 +81,9 @@ pub struct TuiAdapter {
     /// in the scrollback as soon as rendering begins.
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>,
+    /// Pending tool-approval queue shared with the approval gate. Cloned
+    /// into the event loop so key handlers can drain entries.
+    approval_queue: ApprovalQueue,
 }
 
 impl Default for TuiAdapter {
@@ -105,6 +111,7 @@ impl TuiAdapter {
             on_exit: None,
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
+            approval_queue: ApprovalQueue::new(),
         }
     }
 
@@ -147,6 +154,17 @@ impl ChannelAdapter for TuiAdapter {
         ChannelType::Tui
     }
 
+    fn approval_gate(&self) -> Option<Arc<dyn aura_tools::ApprovalGate>> {
+        let event_tx = self.event_tx.clone();
+        Some(Arc::new(ChannelApprovalGate::new(
+            self.approval_queue.clone(),
+            Arc::new(move || {
+                let _ = event_tx.try_send(AppEvent::ApprovalRequested);
+            }),
+            std::time::Duration::from_secs(300),
+        )))
+    }
+
     async fn start(&self, incoming: mpsc::Sender<IncomingMessage>) -> Result<()> {
         let event_rx = self
             .event_rx
@@ -165,6 +183,7 @@ impl ChannelAdapter for TuiAdapter {
             slash_handler: self.slash_handler.clone(),
             dashboard_provider: self.dashboard_provider.clone(),
             on_exit: self.on_exit.clone(),
+            approval_queue: self.approval_queue.clone(),
         };
 
         // Spawn the event loop. `start()` returns once spawned; the loop runs
@@ -230,6 +249,7 @@ struct LoopCtx {
     slash_handler: Option<Arc<dyn SlashHandler>>,
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
     on_exit: Option<OnExit>,
+    approval_queue: ApprovalQueue,
 }
 
 /// RAII guard that restores the terminal and fires the on_exit callback
@@ -291,7 +311,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| anyhow::anyhow!("Terminal::new: {e}"))?;
 
-    let mut state = AppState::new();
+    let mut state = AppState::new().with_approval(ctx.approval_queue.clone());
     if let Some(handler) = ctx.slash_handler.as_ref() {
         state.set_commands(handler.commands());
     }
@@ -374,6 +394,26 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         state.push_log(record);
                         terminal.draw(|f| render(f, &mut state))?;
                     }
+                    AppEvent::ApprovalRequested => {
+                        // Push an inline approval entry into the scrollback
+                        // if there isn't one already pending. When the active
+                        // entry is resolved, `resolve_active_approval` will
+                        // surface the next queued item automatically.
+                        if !state.approval_pending()
+                            && let Some(queue) = state.approval.as_ref()
+                            && let Some(req) = queue.peek_head()
+                        {
+                            state.push_approval(crate::tui::app::ApprovalChatEntry {
+                                tool: req.tool,
+                                accesses: req.accesses,
+                                params_preview: req.params_preview,
+                                state: crate::tui::app::ApprovalChatState::Pending {
+                                    selected: 0,
+                                },
+                            });
+                        }
+                        terminal.draw(|f| render(f, &mut state))?;
+                    }
                     AppEvent::Shutdown => break Ok(()),
                 }
             }
@@ -421,6 +461,7 @@ async fn handle_key(
     let key_ctx = KeyContext {
         input_empty: state.input.is_empty(),
         completion_open: !state.completion_candidates().is_empty(),
+        approval_open: state.approval_pending(),
     };
     let action = translate(&state.mode, key, key_ctx);
     // Any action other than ConfirmExit / Nothing cancels a pending
@@ -483,6 +524,26 @@ async fn handle_key(
             }
         }
         Action::ToggleMouseCapture => return Ok(KeyOutcome::ToggleMouseCapture),
+        Action::ApprovalApprove => {
+            state.resolve_active_approval(aura_tools::ApprovalDecision::Approve);
+        }
+        Action::ApprovalApproveAlways => {
+            state.resolve_active_approval(aura_tools::ApprovalDecision::ApproveAlways);
+        }
+        Action::ApprovalDeny => {
+            state.resolve_active_approval(aura_tools::ApprovalDecision::Deny);
+        }
+        Action::ApprovalSelectPrev => {
+            state.approval_select_prev();
+        }
+        Action::ApprovalSelectNext => {
+            state.approval_select_next();
+        }
+        Action::ApprovalConfirm => {
+            if let Some(decision) = state.active_approval_selected_decision() {
+                state.resolve_active_approval(decision);
+            }
+        }
         Action::DashboardExit => state.exit_dashboard(),
         Action::DashboardSelectPrev => state.dashboard_select_prev(),
         Action::DashboardSelectNext => state.dashboard_select_next(),

@@ -1,10 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{
-    CronScheduler, JobManager, MemoryManager, ObservabilityRecorder, SecurityGateway,
-    SessionManager, ToolExecutor,
-};
+use aura_agent::{CronScheduler, JobManager, MemoryManager, SecurityGateway, SessionManager};
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
@@ -44,8 +41,6 @@ pub struct CommandContext {
     pub cron: Option<Arc<CronScheduler>>,
     pub memory: Option<Arc<MemoryManager>>,
     pub trace: Option<Arc<dyn TraceStore>>,
-    pub tool_executor: Option<Arc<ToolExecutor>>,
-    pub recorder: Option<Arc<ObservabilityRecorder>>,
     pub security: Option<Arc<SecurityGateway>>,
     pub leak_detector: Option<Arc<LeakDetector>>,
     pub skill_assessor: Option<Arc<SkillAssessor>>,
@@ -88,8 +83,6 @@ pub struct ContextBuilder {
     cron: Option<Arc<CronScheduler>>,
     memory: Option<Arc<MemoryManager>>,
     trace: Option<Arc<dyn TraceStore>>,
-    tool_executor: Option<Arc<ToolExecutor>>,
-    recorder: Option<Arc<ObservabilityRecorder>>,
     security: Option<Arc<SecurityGateway>>,
     leak_detector: Option<Arc<LeakDetector>>,
     skill_assessor: Option<Arc<SkillAssessor>>,
@@ -110,8 +103,6 @@ impl ContextBuilder {
             cron: None,
             memory: None,
             trace: None,
-            tool_executor: None,
-            recorder: None,
             security: None,
             leak_detector: None,
             skill_assessor: None,
@@ -173,16 +164,6 @@ impl ContextBuilder {
         self
     }
 
-    pub fn tool_executor(mut self, exec: Arc<ToolExecutor>) -> Self {
-        self.tool_executor = Some(exec);
-        self
-    }
-
-    pub fn recorder(mut self, recorder: Arc<ObservabilityRecorder>) -> Self {
-        self.recorder = Some(recorder);
-        self
-    }
-
     pub fn security(mut self, security: Arc<SecurityGateway>) -> Self {
         self.security = Some(security);
         self
@@ -218,8 +199,6 @@ impl ContextBuilder {
             cron: self.cron,
             memory: self.memory,
             trace: self.trace,
-            tool_executor: self.tool_executor,
-            recorder: self.recorder,
             security: self.security,
             leak_detector: self.leak_detector,
             skill_assessor: self.skill_assessor,

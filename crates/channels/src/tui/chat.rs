@@ -1,16 +1,15 @@
 //! Chat view renderer: scrollback pane + input line.
 
 use aura_model::ContentBlock;
+use aura_tools::{ApprovalDecision, ResourceAccess};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::app::{AppState, ChatLine};
+use crate::tui::app::{AppState, ApprovalChatState, ChatLine};
 use crate::tui::event::LogLevel;
 
 /// Maximum rows the input box grows to before it clips. Beyond this, the
@@ -18,7 +17,7 @@ use crate::tui::event::LogLevel;
 /// where very tall drafts are rare.
 const INPUT_MAX_ROWS: u16 = 10;
 
-pub(crate) fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let input_h = input_box_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -116,6 +115,9 @@ fn render_scrollback(frame: &mut Frame, area: Rect, state: &AppState) {
                         Span::raw(rest.to_string()),
                     ]));
                 }
+            }
+            ChatLine::Approval(entry) => {
+                render_approval_inline(entry, &mut lines);
             }
         }
         lines.push(Line::from(""));
@@ -281,6 +283,153 @@ fn render_completion_popup(frame: &mut Frame, input_area: Rect, state: &AppState
 
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut list_state);
+}
+
+/// Append lines for an inline approval entry to `out`. When pending, the
+/// entry is expanded with tool info, resource accesses, params, and
+/// selectable options. When resolved, it collapses to a single summary
+/// line.
+fn render_approval_inline(
+    entry: &crate::tui::app::ApprovalChatEntry,
+    out: &mut Vec<Line<'static>>,
+) {
+    match entry.state {
+        ApprovalChatState::Pending { selected } => {
+            // Title
+            out.push(Line::from(vec![
+                Span::styled(
+                    "aura> ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "wants to run ",
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    entry.tool.clone(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            // Resource accesses
+            if !entry.accesses.is_empty() {
+                out.push(Line::from(""));
+                for acc in &entry.accesses {
+                    let mut spans = vec![Span::raw("      ")];
+                    spans.extend(format_access(acc));
+                    out.push(Line::from(spans));
+                }
+            }
+            // Params
+            if !entry.params_preview.is_empty() {
+                out.push(Line::from(""));
+                out.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled("params:", Style::default().fg(Color::DarkGray)),
+                ]));
+                for param_line in entry.params_preview.lines() {
+                    out.push(Line::from(vec![
+                        Span::raw("      "),
+                        Span::raw(param_line.to_string()),
+                    ]));
+                }
+            }
+            // Selectable options
+            out.push(Line::from(""));
+            let options = ["[a] Approve", "[A] Always approve", "[d] Deny"];
+            for (i, label) in options.iter().enumerate() {
+                let is_selected = i as u8 == selected;
+                let spans = if is_selected {
+                    vec![
+                        Span::raw("      "),
+                        Span::styled(
+                            "> ",
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            *label,
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]
+                } else {
+                    vec![
+                        Span::raw("        "),
+                        Span::styled(*label, Style::default().fg(Color::DarkGray)),
+                    ]
+                };
+                out.push(Line::from(spans));
+            }
+        }
+        ApprovalChatState::Resolved(decision) => {
+            let detail = access_summary(&entry.accesses);
+            let (verb, color) = match decision {
+                ApprovalDecision::Approve => ("approved", Color::Green),
+                ApprovalDecision::ApproveAlways => ("approved (always)", Color::Green),
+                ApprovalDecision::Deny => ("denied", Color::Red),
+            };
+            let mut spans = vec![
+                Span::styled(
+                    "aura> ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{verb}: {}", entry.tool),
+                    Style::default().fg(color),
+                ),
+            ];
+            if !detail.is_empty() {
+                spans.push(Span::styled(
+                    format!(" ({detail})"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            out.push(Line::from(spans));
+        }
+    }
+}
+
+/// Short one-line summary of the first resource access, used in the
+/// collapsed approval line. Returns an empty string when there are no
+/// accesses.
+fn access_summary(accesses: &[ResourceAccess]) -> String {
+    let Some(first) = accesses.first() else {
+        return String::new();
+    };
+    match first {
+        ResourceAccess::ReadFile { path } => path.display().to_string(),
+        ResourceAccess::WriteFile { path } => path.display().to_string(),
+        ResourceAccess::Http { host } => host.clone(),
+        ResourceAccess::ExecCommand { command } => command.clone(),
+    }
+}
+
+fn format_access(acc: &ResourceAccess) -> Vec<Span<'static>> {
+    let (verb, target) = match acc {
+        ResourceAccess::ReadFile { path } => ("read file", path.display().to_string()),
+        ResourceAccess::WriteFile { path } => ("write file", path.display().to_string()),
+        ResourceAccess::Http { host } => ("http", host.clone()),
+        ResourceAccess::ExecCommand { command } => ("exec", command.clone()),
+    };
+    vec![
+        Span::raw("  • "),
+        Span::styled(
+            verb,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::raw(target),
+    ]
 }
 
 /// Count how many rows a paragraph will occupy when rendered with

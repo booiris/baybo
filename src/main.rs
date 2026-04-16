@@ -344,13 +344,17 @@ async fn main() -> anyhow::Result<()> {
     };
     let secret_vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
 
-    // Tool executor
+    // Tool executor — the gate map is shared with ChannelRegistry and
+    // populated lazily when channels register (so no need to create the
+    // TUI adapter early).
+    let gate_map = channels_registry.read().await.approval_gates();
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         boot::to_tool_timeout(&config.tools),
+        gate_map,
     ));
 
-    // Memory manager (without embedder for Phase 1)
+    // Memory manager
     let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
 
     // Context manager (sliding window). Tokenizer picks an encoding based
@@ -410,8 +414,6 @@ async fn main() -> anyhow::Result<()> {
             .cron(Arc::clone(&cron_scheduler))
             .memory(Arc::clone(&memory_manager))
             .trace(Arc::clone(&trace_store))
-            .tool_executor(Arc::clone(&tool_executor))
-            .recorder(Arc::clone(&recorder))
             .security(Arc::clone(&security_gateway))
             .leak_detector(Arc::clone(&leak_detector))
             .skill_assessor(Arc::clone(&skill_assessor))
@@ -422,9 +424,9 @@ async fn main() -> anyhow::Result<()> {
     let slash_handler = Arc::new(CliSlashHandler::new(Arc::clone(&slash_ctx)));
     let dashboard_provider = Arc::new(CliDashboardProvider::new(Arc::clone(&slash_ctx)));
 
-    // Register and start the TUI adapter with slash + dashboard wiring
-    // attached. Wire the log sink so warn/error tracing events echo into the
-    // chat scrollback without corrupting raw-mode output.
+    // Build, register, and start the TUI adapter. The approval gate is
+    // extracted automatically by `ChannelRegistry::register` and is already
+    // visible to `ToolExecutor` through the shared `ApprovalGateMap`.
     {
         let tui_shutdown = shutdown.clone();
         let tui = TuiAdapter::new()

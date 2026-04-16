@@ -56,27 +56,19 @@ pub use write::WriteTool;
 pub fn default_tools() -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
-        trusted(ReadTool, vec![ToolCapability::ReadWorkspace]),
+        trusted(ReadTool, vec![ToolCapability::ReadFile]),
         trusted(
             WriteTool,
-            vec![
-                ToolCapability::ReadWorkspace,
-                ToolCapability::WriteWorkspace,
-            ],
+            vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
             EditTool,
-            vec![
-                ToolCapability::ReadWorkspace,
-                ToolCapability::WriteWorkspace,
-            ],
+            vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
-        trusted(BashTool, vec![ToolCapability::SpawnProcess]),
-        trusted(GlobTool, vec![ToolCapability::ReadWorkspace]),
-        trusted(GrepTool, vec![ToolCapability::ReadWorkspace]),
-        // `Http(vec![])` means "any host" here; the security layer narrows it
-        // per invocation once the networking policy wiring lands.
-        trusted(WebFetchTool, vec![ToolCapability::Http(vec![])]),
+        trusted(BashTool, vec![ToolCapability::ExecCommand]),
+        trusted(GlobTool, vec![ToolCapability::ReadFile]),
+        trusted(GrepTool, vec![ToolCapability::ReadFile]),
+        trusted(WebFetchTool, vec![ToolCapability::Http]),
     ];
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));

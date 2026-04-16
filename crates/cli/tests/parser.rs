@@ -783,41 +783,6 @@ fn config_set_requires_path_and_value() {
 }
 
 #[test]
-fn tools_test_requires_name_and_accepts_args() {
-    assert!(Cli::try_parse_from(["aura", "tools", "test"]).is_err());
-    let cli = parse(&["tools", "test", "web.fetch"]);
-    match cli.command {
-        Some(Commands::Tools {
-            cmd: ToolsCmd::Test { name, args, yes },
-        }) => {
-            assert_eq!(name, "web.fetch");
-            assert_eq!(args, "{}");
-            assert!(!yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    let cli = parse(&[
-        "tools",
-        "test",
-        "web.fetch",
-        "--args",
-        r#"{"url":"https://example.com"}"#,
-        "-y",
-    ]);
-    match cli.command {
-        Some(Commands::Tools {
-            cmd: ToolsCmd::Test { name, args, yes },
-        }) => {
-            assert_eq!(name, "web.fetch");
-            assert_eq!(args, r#"{"url":"https://example.com"}"#);
-            assert!(yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
 fn skills_search_accepts_optional_query() {
     let cli = parse(&["skills", "search"]);
     match cli.command {

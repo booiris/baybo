@@ -10,6 +10,8 @@ use std::time::Instant;
 use aura_model::ContentBlock;
 use ratatui::widgets::TableState;
 
+use aura_tools::{ApprovalDecision, ApprovalQueue, ResourceAccess};
+
 use crate::SlashCommand;
 use crate::tui::event::LogRecord;
 use crate::{DashboardSnapshot, ViewKind};
@@ -24,6 +26,29 @@ pub(crate) enum ChatLine {
     Assistant(Vec<ContentBlock>),
     System(String),
     Log(LogRecord),
+    /// Inline tool-approval prompt. Rendered expanded while pending (with
+    /// selectable options) and collapsed to a single summary line once
+    /// resolved.
+    Approval(ApprovalChatEntry),
+}
+
+/// An approval request rendered inline in the chat scrollback.
+#[derive(Debug, Clone)]
+pub(crate) struct ApprovalChatEntry {
+    pub tool: String,
+    pub accesses: Vec<ResourceAccess>,
+    pub params_preview: String,
+    pub state: ApprovalChatState,
+}
+
+/// State of an inline approval entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalChatState {
+    /// Awaiting user decision. `selected` indexes the option list
+    /// (0 = Approve, 1 = Always, 2 = Deny).
+    Pending { selected: u8 },
+    /// User made a decision; the entry renders as a collapsed summary line.
+    Resolved(ApprovalDecision),
 }
 
 /// Top-level view the TUI is displaying.
@@ -63,6 +88,11 @@ pub(crate) struct AppState {
     /// (see [`CONFIRM_EXIT_WINDOW`]) commits the exit. Cleared by any other
     /// key so the confirmation doesn't linger across unrelated input.
     pub(crate) confirm_exit_at: Option<Instant>,
+    /// Shared pending-approval queue. A modal overlays the scrollback
+    /// whenever this queue is non-empty; keystrokes `a/A/d/Esc` resolve
+    /// the head entry. None means approval gating is disabled for the
+    /// test harness — production always wires this up.
+    pub(crate) approval: Option<ApprovalQueue>,
 }
 
 /// How long the "press Ctrl-D again to exit" prompt stays armed. Matches
@@ -84,7 +114,102 @@ impl AppState {
             commands: Vec::new(),
             completion_cursor: 0,
             confirm_exit_at: None,
+            approval: None,
         }
+    }
+
+    pub(crate) fn with_approval(mut self, shared: ApprovalQueue) -> Self {
+        self.approval = Some(shared);
+        self
+    }
+
+    /// True iff an inline approval prompt is pending in the scrollback.
+    pub(crate) fn approval_pending(&self) -> bool {
+        self.scrollback.iter().rev().any(|line| {
+            matches!(
+                line,
+                ChatLine::Approval(e) if matches!(e.state, ApprovalChatState::Pending { .. })
+            )
+        })
+    }
+
+    /// Push an approval entry into the scrollback.
+    pub(crate) fn push_approval(&mut self, entry: ApprovalChatEntry) {
+        self.push(ChatLine::Approval(entry));
+    }
+
+    /// Move the selection cursor up on the active (pending) approval.
+    pub(crate) fn approval_select_prev(&mut self) {
+        if let Some(entry) = self.active_approval_mut()
+            && let ApprovalChatState::Pending { selected } = &mut entry.state
+        {
+            *selected = selected.saturating_sub(1);
+        }
+    }
+
+    /// Move the selection cursor down on the active (pending) approval.
+    pub(crate) fn approval_select_next(&mut self) {
+        if let Some(entry) = self.active_approval_mut()
+            && let ApprovalChatState::Pending { selected } = &mut entry.state
+        {
+            *selected = (*selected + 1).min(2);
+        }
+    }
+
+    /// Return the decision mapped to the currently highlighted option on
+    /// the active approval. `None` when no approval is pending.
+    pub(crate) fn active_approval_selected_decision(&self) -> Option<ApprovalDecision> {
+        self.scrollback.iter().rev().find_map(|line| {
+            if let ChatLine::Approval(entry) = line
+                && let ApprovalChatState::Pending { selected } = entry.state
+            {
+                Some(match selected {
+                    0 => ApprovalDecision::Approve,
+                    1 => ApprovalDecision::ApproveAlways,
+                    _ => ApprovalDecision::Deny,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Resolve the active inline approval with the given decision:
+    /// collapse the scrollback entry and fire the queue's oneshot. If
+    /// the queue still has pending items, the next one is pushed into
+    /// the scrollback automatically.
+    pub(crate) fn resolve_active_approval(&mut self, decision: ApprovalDecision) {
+        // Collapse the scrollback entry.
+        if let Some(entry) = self.active_approval_mut() {
+            entry.state = ApprovalChatState::Resolved(decision);
+        }
+        // Fire the oneshot on the shared queue.
+        if let Some(queue) = self.approval.as_ref() {
+            queue.resolve_head(decision);
+            // If more items are already queued (concurrent tool calls),
+            // surface the next one immediately.
+            if let Some(req) = queue.peek_head() {
+                self.push(ChatLine::Approval(ApprovalChatEntry {
+                    tool: req.tool,
+                    accesses: req.accesses,
+                    params_preview: req.params_preview,
+                    state: ApprovalChatState::Pending { selected: 0 },
+                }));
+            }
+        }
+    }
+
+    /// Mutable reference to the active (pending) approval entry, if any.
+    fn active_approval_mut(&mut self) -> Option<&mut ApprovalChatEntry> {
+        self.scrollback.iter_mut().rev().find_map(|line| {
+            if let ChatLine::Approval(entry) = line
+                && matches!(entry.state, ApprovalChatState::Pending { .. })
+            {
+                Some(entry)
+            } else {
+                None
+            }
+        })
     }
 
     pub(crate) fn set_commands(&mut self, commands: Vec<SlashCommand>) {

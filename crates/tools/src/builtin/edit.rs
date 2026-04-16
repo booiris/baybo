@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 pub struct EditTool;
 
@@ -42,6 +42,20 @@ impl Tool for EditTool {
             },
             "required": ["file_path", "old_string", "new_string"]
         })
+    }
+
+    fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        params
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                let p = PathBuf::from(s);
+                vec![
+                    ResourceAccess::ReadFile { path: p.clone() },
+                    ResourceAccess::WriteFile { path: p },
+                ]
+            })
+            .unwrap_or_default()
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {

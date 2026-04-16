@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
+aura-tools = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

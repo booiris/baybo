@@ -35,9 +35,9 @@ permission rules.
 
 `ToolRegistry::with_defaults()` registers the implemented set with
 `TrustLevel::Trusted` manifests declaring their capabilities
-(`ReadWorkspace`, `WriteWorkspace`, `SpawnProcess`, `Http`). Stubs exist so
-downstream can register them once their backing subsystem is ready without
-having to invent the tool name/schema at that point.
+(`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). Stubs exist so downstream
+can register them once their backing subsystem is ready without having to
+invent the tool name/schema at that point.
 
 ## Design Decisions
 
@@ -62,13 +62,27 @@ removed pending the final tool-system design. The re-add plan lives in
 
 ### Capability-driven governance
 
-`ToolManifest` carries hard constraints (`ToolCapability`): `ReadWorkspace`, `WriteWorkspace`, `Http(domains)`, `SpawnProcess`, `BrowserAutomation`. Before execution, manifest capabilities are merged with governance ceilings from trust level.
+`ToolManifest` carries coarse capability ceilings (`ToolCapability`): `ReadFile`, `WriteFile`, `Http`, `ExecCommand`. The manifest answers "what *kind* of thing may this tool do"; the concrete resource per call comes from `Tool::accessed_resources(params)` as [`ResourceAccess`] and is what the approval gate routes on. Trust level is a separate axis enforced before execution.
 
 Typical rules:
 
 - `Untrusted` tools may not auto-execute
-- `Installed` tools should forbid `WriteWorkspace` and `SpawnProcess` by default
-- Undeclared HTTP domains are always denied
+- `Installed` tools may not declare `WriteFile` or `ExecCommand` (requires `Trusted`)
+- Concrete paths/hosts/commands are gated by user approval, not by manifest
+
+### User-approval gate
+
+`ToolExecutor` holds an `Arc<ApprovalGateMap>` shared with `ChannelRegistry`. At execution time it calls `gate_map.get(user.channel)` to resolve the right gate for the session's channel; if no gate is registered, `AutoDenyGate` (fail-closed) is returned. Matching:
+
+- `ReadFile` / `WriteFile` — component-aware path prefix (`Path::starts_with`). Approving `/tmp/a` covers `/tmp/a/b` but not `/tmp/ab`. Read and write are independent (an approved read does not cover a write).
+- `Http` — `HostPattern::Exact` is case-insensitive equality; `HostPattern::Wildcard("foo.com")` covers `foo.com` and any subdomain but not `barfoo.com`. `ResourceAccess::to_approved()` produces `Exact` only — wildcards are operator-authored.
+- `ExecCommand` — exact full-command string match (no shell tokenization).
+
+`ApprovalDecision::ApproveAlways` promotes every `ResourceAccess` the call touched into `ApprovedResource` entries that the executor pushes directly into the shared `Mutex<Vec<ApprovedResource>>` provided by `AgentLoop`. After all tool calls in a turn complete, `AgentLoop` flushes the contents back into `SessionState::approved_resources` so they survive session replay.
+
+`ChannelApprovalGate` + `ApprovalQueue` (`crates/tools/src/approval.rs`) extract the common queue-and-oneshot pattern so each channel only supplies a sync waker callback (e.g. `|| event_tx.try_send(WakeUp)`). The queue exposes `peek_head` / `resolve_head` / `len` so the channel's event loop can render and dismiss inline prompts without touching oneshot internals.
+
+`ApprovalGateMap` is a sync `HashMap<ChannelType, Arc<dyn ApprovalGate>>` behind a `std::sync::RwLock`. `ChannelRegistry` populates it at `register()` time by calling `ChannelAdapter::approval_gate()`; `ToolExecutor` reads it per-call. Both hold an `Arc` to the same map, so gates registered after `ToolExecutor` construction are visible immediately. Adding a new channel with approval support requires only implementing `fn approval_gate() -> Option<Arc<dyn ApprovalGate>>` on the adapter — no changes to `ToolExecutor` or bootstrap code.
 
 ### LLM visibility boundary
 
@@ -82,7 +96,7 @@ Tool output should prefer structured `Json`, use `LargeText` for long text with 
 
 - Depends on `model`, `session`, `registry` (the `rmcp` dep returns with MCP support)
 - Does not install third-party artifacts (that's `registry`)
-- Does not approve network/filesystem permissions — only consumes already-decided policies
+- Defines the `ApprovalGate` trait but never implements the user-facing UX — that lives in `channels` (`TuiApprovalGate`)
 - `artifact_hash` must be recorded in `trace::ExecutionProvenance`
 
 ## Collaboration

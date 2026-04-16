@@ -6,7 +6,7 @@
 
 The layout is intentionally minimal:
 
-- **Scrollback pane** — rendered chat lines (user, assistant, system).
+- **Scrollback pane** — rendered chat lines (user, assistant, system, approval).
 - **Input line** — single-line editor with emacs-style cursor motions and a history ring.
 - **Dashboard view** (modal) — opened by dashboard-style slash commands; returns to chat on `Esc`.
 
@@ -19,7 +19,7 @@ No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands
 
 ### Chat
 
-- Scrollback is a fixed-capacity ring (`SCROLLBACK_CAP = 5000`) of `ChatLine::{User,Assistant,System,Log}` entries.
+- Scrollback is a fixed-capacity ring (`SCROLLBACK_CAP = 5000`) of `ChatLine::{User,Assistant,System,Log,Approval}` entries.
 - Assistant lines render each `ContentBlock`: text inline, and `Image`/`Audio`/`File` as a bracketed placeholder.
 - Input history keeps up to `HISTORY_CAP = 500` non-empty submissions with trivial de-duplication of consecutive identical lines.
 - `scroll_offset` is measured in rendered rows from the tail: `0` keeps the newest line pinned at the bottom; `PageUp`/`PageDown` grow or shrink the offset by 10.
@@ -30,6 +30,14 @@ No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands
 - When the input starts with `/` and the cursor sits on the command token (no whitespace between `/` and cursor), a popup renders above the input box listing matching commands.
 - Candidates come from `SlashHandler::commands()`; `CliSlashHandler` derives them from clap's subcommand tree, every user-invocable skill in `SkillRegistry` (name surfaces as `/<skill>`, description — prefixed with the `argument-hint` when present — surfaces as the popup hint), plus adapter-reserved tokens (`/quit`, `/exit`, `/clear`). Clap wins on name collisions so a workspace skill cannot shadow `/config` or `/skills`.
 - `Up`/`Down` cycle the selection; `Tab` accepts the highlighted candidate, rewriting the prefix up to the next whitespace and appending a trailing space so arguments can follow. `Enter` submits without accepting the completion.
+
+### Inline approval prompt
+
+- Approval requests are rendered **inline in the scrollback** as a `ChatLine::Approval(ApprovalChatEntry)` entry — no overlay modal.
+- When pending, the entry is expanded: tool name, resource accesses, params preview, and three selectable options (`Approve` / `Always approve` / `Deny`). The user navigates options with `Up`/`Down` (or `k`/`j`) and confirms with `Enter`, or presses a direct shortcut (`a`/`A`/`d`).
+- After resolution the entry collapses to a single `aura>` line with the decision, tool name, and the first resource access detail — e.g. `aura> approved: Bash (echo hello)` or `aura> denied: Read (/etc/shadow)`. Normal input resumes immediately.
+- The TUI uses `ChannelApprovalGate` + `ApprovalQueue` (defined in `aura-tools`, not channel-specific). `TuiAdapter::approval_gate()` constructs a `ChannelApprovalGate` with a waker closure that sends `AppEvent::ApprovalRequested` via `try_send`. The queue lives on `AppState.approval`; the event loop peeks the head, pushes a `ChatLine::Approval`, and resolves via `AppState::resolve_active_approval()`. Dropping the responder (e.g. loop shutdown) surfaces as `ApprovalDecision::Deny` — fail-closed.
+- If multiple approvals are queued (concurrent tool calls), resolving one auto-surfaces the next into the scrollback.
 
 ### Dashboard
 
@@ -97,6 +105,19 @@ These are intercepted by `TuiAdapter` before `SlashHandler::handle` is called.
 | `Up`/`Down`         | Move row selection   |
 | `PageUp`/`PageDown` | Page selection       |
 | `r`                 | Refresh the snapshot |
+
+### Inline approval prompt
+
+When an approval is pending, keymap translation short-circuits — chat edits, scroll, and dashboard keys are all suppressed until the entry is resolved.
+
+| Key           | Action                                                      |
+| ------------- | ----------------------------------------------------------- |
+| `Up`/`k`      | Select previous option                                      |
+| `Down`/`j`    | Select next option                                          |
+| `Enter`       | Confirm the highlighted option                              |
+| `a`           | Approve once (direct shortcut)                              |
+| `A`           | Approve always (persists touched resources to session)      |
+| `d`, `Esc`    | Deny (tool call surfaces as `ToolError::Denied`)            |
 
 ## Architecture
 

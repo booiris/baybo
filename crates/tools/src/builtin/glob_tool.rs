@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_RESULTS: usize = 1000;
 
@@ -39,6 +39,20 @@ impl Tool for GlobTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        // Glob enumerates filenames within a directory; treat the search root
+        // as a read access so directory approvals cover subsequent reads.
+        let base = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        match base {
+            Some(p) => vec![ResourceAccess::ReadFile { path: p }],
+            None => Vec::new(),
+        }
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {

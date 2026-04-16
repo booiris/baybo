@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 pub struct WriteTool;
 
@@ -36,6 +36,18 @@ impl Tool for WriteTool {
             },
             "required": ["file_path", "content"]
         })
+    }
+
+    fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        params
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                vec![ResourceAccess::WriteFile {
+                    path: PathBuf::from(s),
+                }]
+            })
+            .unwrap_or_default()
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
