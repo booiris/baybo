@@ -21,9 +21,7 @@ One LLM call may spawn multiple child operations (tool calls, memory operations)
 ### Sanitization constraints
 
 - Record only sanitized payloads — secrets appear only as placeholders
-- Outputs keep only previews or summaries
-- `reasoning_redacted = true` means provider reasoning was not persisted
-- `SpanResult::LLMResponse` uses `output_preview` instead of full output
+- `SpanResult::LlmResponse` records full `output_content`, `thinking` (reasoning), and `tool_calls`
 
 ### Provenance for replayability
 

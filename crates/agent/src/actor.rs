@@ -67,6 +67,7 @@ impl AgentActor {
                             "failed to handle user input"
                         );
                     }
+                    self.flush_trace().await;
                 }
                 AgentMessage::CronTrigger { job_id, prompt } => {
                     debug!(session_id = %self.session.id, job_id = %job_id, "received cron trigger");
@@ -78,6 +79,7 @@ impl AgentActor {
                             "failed to handle cron trigger"
                         );
                     }
+                    self.flush_trace().await;
                 }
                 AgentMessage::Rollback { target_node } => {
                     debug!(
@@ -92,6 +94,7 @@ impl AgentActor {
                             "failed to handle rollback"
                         );
                     }
+                    self.flush_trace().await;
                 }
                 AgentMessage::Shutdown => {
                     debug!(session_id = %self.session.id, "actor shutting down");
@@ -128,6 +131,17 @@ impl AgentActor {
             warn!(error = %e, "failed to send {source} response to channel");
         }
         Ok(())
+    }
+
+    /// Best-effort flush of trace data after each turn.
+    async fn flush_trace(&self) {
+        if let Err(e) = self.recorder.flush().await {
+            warn!(
+                session_id = %self.session.id,
+                error = %e,
+                "failed to flush trace after turn"
+            );
+        }
     }
 
     async fn handle_rollback(&mut self, target_node: TraceNodeId) -> anyhow::Result<()> {

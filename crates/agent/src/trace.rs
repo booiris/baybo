@@ -240,10 +240,11 @@ mod tests {
         collector.end_span(
             handle,
             SpanResult::LlmResponse {
-                output_preview: "hello".to_owned(),
+                output_content: "hello".to_owned(),
                 input_tokens: 10,
                 output_tokens: 5,
-                reasoning_redacted: false,
+                thinking: None,
+                tool_calls: Vec::new(),
                 latency: std::time::Duration::from_millis(100),
             },
         );

@@ -89,15 +89,24 @@ pub enum SpanInput {
     None,
 }
 
+/// A tool call recorded in a trace span.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmToolCallRecord {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
 /// Sanitized result recorded for a span.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpanResult {
     LlmResponse {
-        output_preview: String,
+        output_content: String,
         input_tokens: usize,
         output_tokens: usize,
-        reasoning_redacted: bool,
+        thinking: Option<String>,
+        tool_calls: Vec<LlmToolCallRecord>,
         latency: Duration,
     },
     ToolResult {

@@ -32,7 +32,7 @@ A `multimodal` module converts Aura's `ContentBlock` types into text representat
 
 ### Observability constraints
 
-`LlmResponse` may carry provider reasoning/thinking, but upper layers decide whether it is recorded. Trace records only `output_preview`, token usage, and `reasoning_redacted` — full reasoning is not persisted by default in production.
+`LlmResponse` carries provider reasoning/thinking, tool calls, and full output content. The trace layer records all of these: `output_content`, `thinking`, `tool_calls`, and token usage.
 
 ### Error handling
 

@@ -424,21 +424,22 @@ impl AgentLoop {
 
         match llm_result {
             Ok(response) => {
-                let output_preview = if response.content.len() > 200 {
-                    let mut end = 200;
-                    while !response.content.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}...", &response.content[..end])
-                } else {
-                    response.content.clone()
-                };
+                let trace_tool_calls: Vec<aura_trace::LlmToolCallRecord> = response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| aura_trace::LlmToolCallRecord {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    })
+                    .collect();
 
                 let result = SpanResult::LlmResponse {
-                    output_preview,
+                    output_content: response.content.clone(),
                     input_tokens: response.usage.input_tokens,
                     output_tokens: response.usage.output_tokens,
-                    reasoning_redacted: response.thinking.is_some(),
+                    thinking: response.thinking.clone(),
+                    tool_calls: trace_tool_calls,
                     latency: std::time::Duration::from_millis(0),
                 };
 
@@ -469,11 +470,18 @@ impl AgentLoop {
                     )
                     .await;
 
+                if let Err(e) = recorder.flush().await {
+                    warn!(error = %e, "failed to flush trace after LLM call");
+                }
+
                 Ok(response)
             }
             Err(e) => {
                 let error_msg = e.to_string();
                 recorder.fail(handle, &error_msg).await?;
+                if let Err(fe) = recorder.flush().await {
+                    warn!(error = %fe, "failed to flush trace after LLM failure");
+                }
                 Err(e.into())
             }
         }
