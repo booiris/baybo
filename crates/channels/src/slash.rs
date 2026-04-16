@@ -32,7 +32,6 @@ pub enum SlashOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewKind {
     Skills,
-    Tools,
     Jobs,
     Sessions,
     Memory,

@@ -31,7 +31,6 @@ impl DashboardProvider for CliDashboardProvider {
     async fn snapshot(&self, kind: ViewKind) -> DashboardSnapshot {
         match kind {
             ViewKind::Skills => skills_snapshot(&self.ctx),
-            ViewKind::Tools => tools_snapshot(&self.ctx),
             ViewKind::Jobs => jobs_snapshot(&self.ctx).await,
             ViewKind::Sessions => sessions_snapshot(&self.ctx).await,
             ViewKind::Memory => memory_snapshot(&self.ctx).await,
@@ -63,20 +62,6 @@ fn skills_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
         columns: vec!["NAME".into(), "DESCRIPTION".into()],
         rows,
         footer: Some(format!("reloaded from disk · {total} skill(s)")),
-    }
-}
-
-fn tools_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
-    let defs = ctx.tools.tool_definitions();
-    let rows: Vec<Vec<String>> = defs
-        .iter()
-        .map(|d| vec![d.name.clone(), first_line(&d.description)])
-        .collect();
-    DashboardSnapshot {
-        title: "Tools".into(),
-        columns: vec!["NAME".into(), "DESCRIPTION".into()],
-        rows,
-        footer: None,
     }
 }
 

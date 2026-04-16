@@ -319,7 +319,7 @@ mod tests {
     fn up_arrow_scrolls_rows_in_dashboard_not_history() {
         let mut app = AppState::new();
         app.enter_dashboard(
-            crate::ViewKind::Tools,
+            crate::ViewKind::Skills,
             DashboardSnapshot {
                 title: "s".into(),
                 columns: vec![],

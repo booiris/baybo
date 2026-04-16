@@ -162,7 +162,6 @@ fn dashboard_shortcut(raw: &str) -> Option<ViewKind> {
     };
     match cmd.as_str() {
         "skills" => Some(ViewKind::Skills),
-        "tools" => Some(ViewKind::Tools),
         "jobs" => Some(ViewKind::Jobs),
         "sessions" => Some(ViewKind::Sessions),
         "memory" => Some(ViewKind::Memory),
