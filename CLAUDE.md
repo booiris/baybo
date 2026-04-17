@@ -22,6 +22,10 @@ RUST_LOG=aura=debug cargo run                                  # run with loggin
 - Keep functions focused, extract helpers when logic is reused
 - Comments for non-obvious logic only
 - Avoid exporting unnecessary item, prefer `pub(crate)` for functions and structs; use `pub` only when necessary
+- Test-only helpers (fakes, `NeverShutdown`-style stubs, dummy fixtures) MUST be gated so they don't ship in release builds:
+  - Same-crate tests only → `#[cfg(test)]`.
+  - Consumed by another crate's tests → gate with `#[cfg(any(test, feature = "test-support"))]` and add a `test-support = []` feature in `Cargo.toml`. Downstream crates pull them in via `aura-<crate> = { workspace = true, features = ["test-support"] }` in `[dev-dependencies]`.
+  - Never leave a test-only item plain `pub` — "it's named `Never...`" is not a gate.
 
 ## Dependency Management
 
