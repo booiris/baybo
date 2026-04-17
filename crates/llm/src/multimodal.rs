@@ -21,7 +21,9 @@ pub fn content_block_to_text(block: &ContentBlock) -> String {
                 filename, mime_type, blob.blob_id
             )
         }
-        ContentBlock::ToolUse { id, name, input, .. } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             format!("[tool_use: {name} id={id} input={input}]")
         }
         ContentBlock::ToolResult {

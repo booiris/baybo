@@ -7,7 +7,6 @@ use serde_json::Value;
 use crate::ChatMessage;
 use crate::approval::ApprovedResource;
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: String,

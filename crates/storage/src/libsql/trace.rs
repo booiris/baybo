@@ -89,8 +89,7 @@ impl TraceStore for LibsqlTraceStore {
             let result_json: Option<String> = node.span.result.as_ref().map(ser).transpose()?;
             let started = node.span.started_at.to_rfc3339();
             let ended: Option<String> = node.span.ended_at.map(|t| t.to_rfc3339());
-            let snap_json: Option<String> =
-                node.context_snapshot.as_ref().map(ser).transpose()?;
+            let snap_json: Option<String> = node.context_snapshot.as_ref().map(ser).transpose()?;
 
             tx.execute(
                 "INSERT OR REPLACE INTO trace_nodes
@@ -141,9 +140,7 @@ impl TraceStore for LibsqlTraceStore {
             .map_err(|e| ie(format!("upsert trace_fork {}: {e}", fork.id)))?;
         }
 
-        tx.commit()
-            .await
-            .map_err(|e| ie(format!("commit: {e}")))?;
+        tx.commit().await.map_err(|e| ie(format!("commit: {e}")))?;
         Ok(())
     }
 
@@ -615,10 +612,7 @@ mod tests {
         let root = root.unwrap();
         assert_eq!(root.children, vec!["child"]);
 
-        let missing = store
-            .load_node("s1", &"nope".to_string())
-            .await
-            .unwrap();
+        let missing = store.load_node("s1", &"nope".to_string()).await.unwrap();
         assert!(missing.is_none());
     }
 
@@ -667,11 +661,7 @@ mod tests {
         let store = LibsqlTraceStore::new(pool);
 
         let mut trace = make_trace("s1");
-        trace
-            .nodes
-            .get_mut("n1")
-            .unwrap()
-            .context_snapshot = Some(ContextSnapshot {
+        trace.nodes.get_mut("n1").unwrap().context_snapshot = Some(ContextSnapshot {
             messages: vec![ChatMessage {
                 role: aura_model::Role::User,
                 content: vec![aura_model::ContentBlock::Text("hi".to_string())],

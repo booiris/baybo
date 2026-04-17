@@ -232,5 +232,4 @@ impl LibsqlPool {
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
         Ok(())
     }
-
 }

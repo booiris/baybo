@@ -227,10 +227,7 @@ impl ChannelApprovalGate {
 impl ApprovalGate for ChannelApprovalGate {
     async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
         let (tx, rx) = oneshot::channel();
-        self.queue.push(PendingApproval {
-            req,
-            responder: tx,
-        });
+        self.queue.push(PendingApproval { req, responder: tx });
         (self.waker)();
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(decision)) => decision,
@@ -325,7 +322,10 @@ mod tests {
     async fn dropped_responder_yields_deny() {
         let (tx, rx) = oneshot::channel::<ApprovalDecision>();
         drop(tx);
-        assert_eq!(rx.await.unwrap_or(ApprovalDecision::Deny), ApprovalDecision::Deny);
+        assert_eq!(
+            rx.await.unwrap_or(ApprovalDecision::Deny),
+            ApprovalDecision::Deny
+        );
     }
 
     #[test]

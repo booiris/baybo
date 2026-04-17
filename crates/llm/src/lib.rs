@@ -159,11 +159,9 @@ fn convert_stream_event<R: GetTokenUsage>(
         StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
             Some(Ok(StreamEvent::Reasoning(reasoning)))
         }
-        StreamedAssistantContent::Reasoning(reasoning) => {
-            Some(Ok(StreamEvent::ThinkingBlock(convert_reasoning_to_block(
-                &reasoning,
-            ))))
-        }
+        StreamedAssistantContent::Reasoning(reasoning) => Some(Ok(StreamEvent::ThinkingBlock(
+            convert_reasoning_to_block(&reasoning),
+        ))),
         StreamedAssistantContent::Final(r) => r.token_usage().map(|usage| {
             Ok(StreamEvent::Usage(TokenUsage {
                 input_tokens: usage.input_tokens as usize,
@@ -580,9 +578,9 @@ fn convert_reasoning_to_block(
                     signature: signature.clone(),
                 }
             }
-            rig::completion::message::ReasoningContent::Summary(s) => ThinkingContent::Summary {
-                text: s.clone(),
-            },
+            rig::completion::message::ReasoningContent::Summary(s) => {
+                ThinkingContent::Summary { text: s.clone() }
+            }
             rig::completion::message::ReasoningContent::Encrypted(d)
             | rig::completion::message::ReasoningContent::Redacted { data: d } => {
                 ThinkingContent::Redacted { data: d.clone() }
@@ -615,9 +613,9 @@ fn convert_thinking_to_reasoning(
             aura_model::ThinkingContent::Summary { text } => {
                 ReasoningContent::Summary(text.clone())
             }
-            aura_model::ThinkingContent::Redacted { data } => ReasoningContent::Redacted {
-                data: data.clone(),
-            },
+            aura_model::ThinkingContent::Redacted { data } => {
+                ReasoningContent::Redacted { data: data.clone() }
+            }
         })
         .collect();
     let mut reasoning = Reasoning::new("").optional_id(id.clone());
