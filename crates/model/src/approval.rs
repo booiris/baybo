@@ -83,7 +83,7 @@ fn path_covers(approved: &Path, requested: &Path) -> bool {
 
 /// Host pattern on `ApprovedResource::Http`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum HostPattern {
     /// Exact host, case-insensitive.
     Exact(String),
