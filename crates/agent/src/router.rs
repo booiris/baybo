@@ -5,8 +5,9 @@ use std::time::Instant;
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use aura_model::{Session, User};
 
+use aura_cron::CronTriggerEvent;
+
 use crate::cost::CostGuard;
-use crate::cron::CronTriggerEvent;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
 use tokio::sync::{RwLock, mpsc};
@@ -193,7 +194,7 @@ impl Router {
 
         let message = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
-            prompt: event.prompt,
+            action: event.action,
         };
 
         let routed = self.supervisor.route(&session_id, message.clone()).await;

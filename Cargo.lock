@@ -200,6 +200,7 @@ dependencies = [
  "aura-cli",
  "aura-config",
  "aura-context",
+ "aura-cron",
  "aura-hook",
  "aura-job",
  "aura-llm",
@@ -244,7 +245,6 @@ dependencies = [
  "aura-trace",
  "aura-workspace",
  "chrono",
- "cron",
  "futures",
  "regex",
  "serde",
@@ -343,11 +343,18 @@ name = "aura-cron"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aura-model",
+ "aura-storage",
+ "aura-tools",
  "chrono",
+ "cron",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -495,7 +502,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
+ "chrono",
  "glob",
+ "iana-time-zone",
  "regex",
  "reqwest 0.12.28",
  "serde",

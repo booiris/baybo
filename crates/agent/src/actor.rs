@@ -1,14 +1,17 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, IncomingMessage};
+use aura_channels::{AgentOutput, IncomingMessage, OutgoingMessage};
+use aura_cron::TriggerAction;
 use aura_hook::{HookContext, HookEventData, HookManager, HookPoint};
-use aura_model::ContentBlock;
 use aura_model::Session;
+use aura_model::{ApprovedResource, ContentBlock, MessageMetadata};
+use aura_tools::ToolOutput;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::AgentLoop;
 use crate::observability::ObservabilityRecorder;
+use crate::tool_executor::ToolExecutor;
 use aura_trace::TraceNodeId;
 
 /// Messages that can be sent to an AgentActor.
@@ -17,7 +20,10 @@ pub enum AgentMessage {
     /// A user sent a message.
     UserInput(Box<IncomingMessage>),
     /// A cron job fired.
-    CronTrigger { job_id: String, prompt: String },
+    CronTrigger {
+        job_id: String,
+        action: TriggerAction,
+    },
     /// Roll back the session to a previous trace node.
     ///
     /// Reads the nearest snapshot from `TraceCollector`, forks the trace tree,
@@ -31,6 +37,7 @@ pub enum AgentMessage {
 pub struct AgentActor {
     session: Session,
     agent_loop: AgentLoop,
+    tool_executor: Arc<ToolExecutor>,
     response_tx: mpsc::Sender<AgentOutput>,
     hooks: Arc<HookManager>,
     recorder: Arc<ObservabilityRecorder>,
@@ -40,6 +47,7 @@ impl AgentActor {
     pub fn new(
         session: Session,
         agent_loop: AgentLoop,
+        tool_executor: Arc<ToolExecutor>,
         response_tx: mpsc::Sender<AgentOutput>,
         hooks: Arc<HookManager>,
         recorder: Arc<ObservabilityRecorder>,
@@ -47,6 +55,7 @@ impl AgentActor {
         Self {
             session,
             agent_loop,
+            tool_executor,
             response_tx,
             hooks,
             recorder,
@@ -69,9 +78,27 @@ impl AgentActor {
                     }
                     self.flush_trace().await;
                 }
-                AgentMessage::CronTrigger { job_id, prompt } => {
+                AgentMessage::CronTrigger { job_id, action } => {
                     debug!(session_id = %self.session.id, job_id = %job_id, "received cron trigger");
-                    if let Err(e) = self.dispatch_prompt(&prompt, "cron", &job_id).await {
+                    let result = match &action {
+                        TriggerAction::Prompt { prompt } => {
+                            self.dispatch_prompt(prompt, "cron", &job_id).await
+                        }
+                        TriggerAction::ToolCall {
+                            tool_name,
+                            params,
+                            approved_resources,
+                        } => {
+                            self.handle_cron_tool_call(
+                                &job_id,
+                                tool_name,
+                                params.clone(),
+                                approved_resources.clone(),
+                            )
+                            .await
+                        }
+                    };
+                    if let Err(e) = result {
                         error!(
                             session_id = %self.session.id,
                             job_id = %job_id,
@@ -131,6 +158,75 @@ impl AgentActor {
             warn!(error = %e, "failed to send {source} response to channel");
         }
         Ok(())
+    }
+
+    /// Execute a tool directly for a cron job, falling back to LLM on failure.
+    async fn handle_cron_tool_call(
+        &mut self,
+        job_id: &str,
+        tool_name: &str,
+        params: serde_json::Value,
+        pre_approved: Vec<ApprovedResource>,
+    ) -> anyhow::Result<()> {
+        let approved = std::sync::Mutex::new(pre_approved);
+
+        let tool_result = self
+            .tool_executor
+            .execute(
+                tool_name,
+                params.clone(),
+                &self.session.id,
+                &self.session.user,
+                &approved,
+                &self.recorder,
+                Some(job_id),
+            )
+            .await;
+
+        match tool_result {
+            Ok(output) => {
+                let text = match &output {
+                    ToolOutput::Text(t) => t.clone(),
+                    ToolOutput::Json(v) => {
+                        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+                    }
+                    ToolOutput::Error(e) => {
+                        // Tool returned an error output — fall back to LLM
+                        let diagnostic = format!(
+                            "[cron:{job_id}] Tool '{tool_name}' returned error: {e}\n\
+                             Diagnose the issue and report to the user.",
+                        );
+                        return self.dispatch_prompt(&diagnostic, "cron", job_id).await;
+                    }
+                };
+
+                let response = OutgoingMessage {
+                    session_id: self.session.id.clone(),
+                    channel: self.session.user.channel,
+                    content: vec![ContentBlock::Text(format!("[cron:{job_id}] {text}"))],
+                    reply_to: None,
+                    metadata: MessageMetadata::default(),
+                };
+                if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
+                    warn!(error = %e, "failed to send cron tool result to channel");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Execution failed — fall back to LLM for diagnosis
+                warn!(
+                    job_id = %job_id,
+                    tool = %tool_name,
+                    error = %e,
+                    "cron tool call failed, falling back to LLM"
+                );
+                let diagnostic = format!(
+                    "[cron:{job_id}] Tool '{tool_name}' failed with error: {e}\n\
+                     Diagnose the issue and report to the user.",
+                );
+                self.dispatch_prompt(&diagnostic, "cron", job_id).await
+            }
+        }
     }
 
     /// Best-effort flush of trace data after each turn.

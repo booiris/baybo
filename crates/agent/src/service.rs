@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use async_trait::async_trait;
 use tokio::sync::Notify;
 use tracing::info;
 
@@ -42,6 +44,17 @@ impl ShutdownSignal {
 impl Default for ShutdownSignal {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl aura_cron::Shutdown for ShutdownSignal {
+    async fn wait(&self) {
+        ShutdownSignal::wait(self).await;
+    }
+
+    fn is_triggered(&self) -> bool {
+        self.is_shutdown()
     }
 }
 

@@ -3,11 +3,25 @@ name = "aura-cron"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes test fixtures (e.g. `NeverShutdown`) to downstream crates' tests.
+# Enable via `aura-cron = { workspace = true, features = ["test-support"] }`
+# in a dev-dependency. Not enabled by default; production builds never see
+# these items.
+test-support = []
+
 [dependencies]
 aura-model = { workspace = true }
+aura-storage = { workspace = true }
+aura-tools = { workspace = true }
 
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+cron = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

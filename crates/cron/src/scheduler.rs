@@ -1,14 +1,18 @@
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use aura_cron::{CronError, CronExecution, CronJob, CronRunMode, CronStatus, ExecutionStatus};
 use aura_model::ChannelType;
 use aura_storage::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::service::ShutdownSignal;
+use crate::error::CronError;
+use crate::job::{
+    CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus, TriggerAction,
+};
+use crate::shutdown::Shutdown;
 
 // ── Error bridging ────────────────────────────────────────────────────
 
@@ -84,7 +88,7 @@ pub struct CronTriggerEvent {
     pub job_id: String,
     pub user_id: String,
     pub channel: ChannelType,
-    pub prompt: String,
+    pub action: TriggerAction,
 }
 
 /// Manages cron job lifecycle and runs a background tick loop
@@ -92,14 +96,22 @@ pub struct CronTriggerEvent {
 pub struct CronScheduler {
     store: Box<dyn CronStore>,
     trigger_tx: mpsc::Sender<CronTriggerEvent>,
-    shutdown: ShutdownSignal,
+    shutdown: Arc<dyn Shutdown>,
 }
+
+/// How often the scheduler wakes up to check for due jobs.
+///
+/// The underlying `cron` crate resolves expressions to seconds, and one-shot
+/// `At` timestamps carry full second precision, so the tick interval is the
+/// dominant lower bound on trigger latency. 10s keeps "N seconds after now"
+/// reminders usable without burning DB queries on subsecond polling.
+const TICK_INTERVAL: Duration = Duration::from_secs(10);
 
 impl CronScheduler {
     pub fn new(
         store: Box<dyn CronStore>,
         trigger_tx: mpsc::Sender<CronTriggerEvent>,
-        shutdown: ShutdownSignal,
+        shutdown: Arc<dyn Shutdown>,
     ) -> Self {
         Self {
             store,
@@ -108,33 +120,41 @@ impl CronScheduler {
         }
     }
 
-    /// Create a new cron job. Validates the cron expression and computes the
-    /// first trigger time.
+    /// Create a new cron job. Validates the schedule and computes the first
+    /// trigger time. A `CronSchedule::At` whose time is already in the past
+    /// is rejected.
     pub async fn create_job(
         &self,
         user_id: &str,
         channel: ChannelType,
-        schedule: &str,
-        prompt: &str,
-        run_mode: CronRunMode,
+        schedule: CronSchedule,
+        action: TriggerAction,
+        origin_session_id: Option<String>,
     ) -> Result<CronJob> {
-        let normalized = normalize_cron_expression(schedule);
-        cron::Schedule::from_str(&normalized)
-            .map_err(|e| CronError::InvalidExpression(format!("{schedule}: {e}")))?;
+        validate_schedule(&schedule)?;
 
         let now = Utc::now();
+        let next_trigger_at = compute_next_trigger(&schedule, now);
+        if next_trigger_at.is_none() {
+            // Only `At` with past time (Cron is infinite and never returns None here).
+            return Err(CronError::InvalidSchedule(format!(
+                "schedule {} has no future fire time",
+                schedule.display()
+            )));
+        }
+
         let job = CronJob {
             id: uuid::Uuid::new_v4().to_string(),
             user_id: user_id.to_string(),
             channel,
-            schedule: schedule.to_string(),
-            prompt: prompt.to_string(),
+            schedule,
+            action,
             status: CronStatus::Enabled,
-            run_mode,
             last_triggered_at: None,
-            next_trigger_at: compute_next_trigger(schedule, now),
+            next_trigger_at,
             created_at: now,
             updated_at: now,
+            origin_session_id,
         };
 
         let row = job_to_row(&job)?;
@@ -148,7 +168,9 @@ impl CronScheduler {
         Ok(())
     }
 
-    /// Enable a cron job, recomputing the next trigger time.
+    /// Enable a cron job, recomputing the next trigger time. Returns an error
+    /// if the job is an `At` schedule whose time has already passed — there
+    /// is no future fire time to enable.
     pub async fn enable_job(&self, job_id: &str) -> Result<()> {
         let row = self
             .store
@@ -159,8 +181,16 @@ impl CronScheduler {
         let mut job = row_to_job(row)?;
 
         let now = Utc::now();
+        let next = compute_next_trigger(&job.schedule, now);
+        if next.is_none() {
+            return Err(CronError::InvalidSchedule(format!(
+                "cannot enable cron job {job_id}: schedule {} has no future fire time",
+                job.schedule.display()
+            )));
+        }
+
         job.status = CronStatus::Enabled;
-        job.next_trigger_at = compute_next_trigger(&job.schedule, now);
+        job.next_trigger_at = next;
         job.updated_at = now;
 
         self.store
@@ -226,9 +256,11 @@ impl CronScheduler {
 
     /// Manually fire a cron job now, outside the regular schedule.
     ///
-    /// Records an execution row (so the run is auditable), dispatches the
-    /// trigger event, and does **not** touch the job's `next_trigger_at` —
-    /// the normal schedule continues to fire independently.
+    /// Records an execution row (so the run is auditable) and dispatches the
+    /// trigger event. Recurring (`Cron`) jobs keep their existing
+    /// `next_trigger_at` — the normal schedule continues independently.
+    /// One-shot (`At`) jobs are evicted after dispatch, matching the tick
+    /// path so manual vs scheduled firing have identical lifecycle effects.
     pub async fn trigger_now(&self, job_id: &str) -> Result<CronExecution> {
         let row = self
             .store
@@ -245,8 +277,7 @@ impl CronScheduler {
             user_id: job.user_id.clone(),
             channel: job.channel,
             schedule: job.schedule.clone(),
-            prompt: job.prompt.clone(),
-            run_mode: job.run_mode.clone(),
+            action: job.action.clone(),
             scheduled_fire_time: now,
             triggered_at: now,
             status: ExecutionStatus::Pending,
@@ -262,7 +293,7 @@ impl CronScheduler {
             job_id: execution.job_id.clone(),
             user_id: execution.user_id.clone(),
             channel: execution.channel,
-            prompt: execution.prompt.clone(),
+            action: execution.action.clone(),
         };
 
         self.trigger_tx
@@ -274,6 +305,13 @@ impl CronScheduler {
             .update_execution_status(&execution.id, "dispatched")
             .await
             .map_err(store_err)?;
+
+        if job.is_one_shot() {
+            info!(job_id = %job.id, "evicting one-shot cron job after manual trigger");
+            if let Err(e) = self.store.delete(&job.id).await {
+                error!(job_id = %job.id, error = %e, "failed to evict one-shot cron job after manual trigger");
+            }
+        }
 
         let mut updated = execution;
         updated.status = ExecutionStatus::Dispatched;
@@ -291,13 +329,16 @@ impl CronScheduler {
             .collect()
     }
 
-    /// Run the background tick loop. Checks for due jobs every 30 seconds
-    /// and fires triggers. Exits on shutdown signal.
+    /// Run the background tick loop. Checks for due jobs at every tick and
+    /// fires triggers. Exits on shutdown signal.
     pub async fn run(&self) {
         self.recover_pending().await;
 
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        info!("cron scheduler started");
+        let mut interval = tokio::time::interval(TICK_INTERVAL);
+        info!(
+            tick_secs = TICK_INTERVAL.as_secs(),
+            "cron scheduler started"
+        );
 
         loop {
             tokio::select! {
@@ -342,7 +383,7 @@ impl CronScheduler {
                 job_id: exec.job_id.clone(),
                 user_id: exec.user_id.clone(),
                 channel: exec.channel,
-                prompt: exec.prompt.clone(),
+                action: exec.action.clone(),
             };
 
             if let Err(e) = self.trigger_tx.send(event).await {
@@ -419,8 +460,7 @@ impl CronScheduler {
                 user_id: job.user_id.clone(),
                 channel: job.channel,
                 schedule: job.schedule.clone(),
-                prompt: job.prompt.clone(),
-                run_mode: job.run_mode.clone(),
+                action: job.action.clone(),
                 scheduled_fire_time,
                 triggered_at: now,
                 status: ExecutionStatus::Pending,
@@ -459,7 +499,7 @@ impl CronScheduler {
                 job_id: execution.job_id.clone(),
                 user_id: execution.user_id.clone(),
                 channel: execution.channel,
-                prompt: execution.prompt.clone(),
+                action: execution.action.clone(),
             };
 
             if let Err(e) = self.trigger_tx.send(event).await {
@@ -495,16 +535,41 @@ fn normalize_cron_expression(expression: &str) -> String {
     }
 }
 
-/// Compute the next trigger time for a cron expression after the given timestamp.
-fn compute_next_trigger(expression: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let normalized = normalize_cron_expression(expression);
-    let schedule = cron::Schedule::from_str(&normalized).ok()?;
-    schedule.after(&after).next()
+/// Parse-validate a schedule at creation time. Does not check whether the
+/// schedule has a future fire time — that's `compute_next_trigger`'s job.
+fn validate_schedule(schedule: &CronSchedule) -> Result<()> {
+    match schedule {
+        CronSchedule::Cron { expr } => {
+            let normalized = normalize_cron_expression(expr);
+            cron::Schedule::from_str(&normalized)
+                .map(|_| ())
+                .map_err(|e| CronError::InvalidSchedule(format!("{expr}: {e}")))
+        }
+        CronSchedule::At { .. } => Ok(()),
+    }
+}
+
+/// Compute the next trigger time for a schedule after the given timestamp.
+///
+/// - `Cron(expr)` returns the next matching tick (infinite-recurring, so this
+///   effectively never returns `None` for a valid expression).
+/// - `At(time)` returns `Some(time)` if it is strictly in the future, else
+///   `None` — callers treat `None` as "nothing more to fire".
+fn compute_next_trigger(schedule: &CronSchedule, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match schedule {
+        CronSchedule::Cron { expr } => {
+            let normalized = normalize_cron_expression(expr);
+            let parsed = cron::Schedule::from_str(&normalized).ok()?;
+            parsed.after(&after).next()
+        }
+        CronSchedule::At { time } => (*time > after).then_some(*time),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shutdown::NeverShutdown;
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -681,58 +746,102 @@ mod tests {
         store: InMemoryCronStore,
     ) -> (CronScheduler, mpsc::Receiver<CronTriggerEvent>) {
         let (tx, rx) = mpsc::channel(64);
-        let scheduler = CronScheduler::new(Box::new(store), tx, ShutdownSignal::new());
+        let scheduler = CronScheduler::new(Box::new(store), tx, Arc::new(NeverShutdown));
         (scheduler, rx)
     }
 
-    #[tokio::test]
-    async fn create_job_with_valid_expression() {
-        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
-        let job = scheduler
+    /// Helper: create a prompt-action cron job.
+    async fn create_prompt_cron(
+        scheduler: &CronScheduler,
+        user_id: &str,
+        expr: &str,
+        prompt: &str,
+    ) -> CronJob {
+        scheduler
             .create_job(
-                "u1",
+                user_id,
                 ChannelType::Tui,
-                "0 9 * * *",
-                "morning news",
-                CronRunMode::Recurring,
+                CronSchedule::cron(expr),
+                TriggerAction::Prompt {
+                    prompt: prompt.to_string(),
+                },
+                None,
             )
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_job_with_valid_cron() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "morning news").await;
         assert_eq!(job.user_id, "u1");
         assert_eq!(job.status, CronStatus::Enabled);
-        assert_eq!(job.run_mode, CronRunMode::Recurring);
+        assert!(!job.is_one_shot());
         assert!(job.next_trigger_at.is_some());
     }
 
     #[tokio::test]
-    async fn create_job_with_invalid_expression() {
+    async fn create_job_with_future_at() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let fire_at = Utc::now() + chrono::Duration::minutes(5);
+        let job = scheduler
+            .create_job(
+                "u1",
+                ChannelType::Tui,
+                CronSchedule::at(fire_at),
+                TriggerAction::Prompt {
+                    prompt: "later".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(job.is_one_shot());
+        assert_eq!(job.next_trigger_at, Some(fire_at));
+    }
+
+    #[tokio::test]
+    async fn create_job_with_past_at_rejected() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let past = Utc::now() - chrono::Duration::minutes(1);
+        let err = scheduler
+            .create_job(
+                "u1",
+                ChannelType::Tui,
+                CronSchedule::at(past),
+                TriggerAction::Prompt {
+                    prompt: "too late".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CronError::InvalidSchedule(_)));
+    }
+
+    #[tokio::test]
+    async fn create_job_with_invalid_cron_expression() {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
         let err = scheduler
             .create_job(
                 "u1",
                 ChannelType::Tui,
-                "not a cron",
-                "test",
-                CronRunMode::Recurring,
+                CronSchedule::cron("not a cron"),
+                TriggerAction::Prompt {
+                    prompt: "test".to_string(),
+                },
+                None,
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, CronError::InvalidExpression(_)));
+        assert!(matches!(err, CronError::InvalidSchedule(_)));
     }
 
     #[tokio::test]
     async fn enable_disable_job() {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
-        let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::Tui,
-                "0 9 * * *",
-                "test",
-                CronRunMode::Recurring,
-            )
-            .await
-            .unwrap();
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
 
         scheduler.disable_job(&job.id).await.unwrap();
         let jobs = scheduler.list_jobs("u1").await.unwrap();
@@ -746,20 +855,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_fires_due_jobs() {
-        let store = InMemoryCronStore::new();
-        let (scheduler, mut rx) = make_scheduler(store);
-
+    async fn enable_expired_at_job_rejected() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let fire_at = Utc::now() + chrono::Duration::seconds(30);
         let job = scheduler
             .create_job(
                 "u1",
                 ChannelType::Tui,
-                "* * * * *",
-                "every minute",
-                CronRunMode::Recurring,
+                CronSchedule::at(fire_at),
+                TriggerAction::Prompt {
+                    prompt: "later".into(),
+                },
+                None,
             )
             .await
             .unwrap();
+        scheduler.disable_job(&job.id).await.unwrap();
+
+        // Simulate passage of time past the fire point by rewriting the row.
+        let mut row = scheduler.store.get(&job.id).await.unwrap().unwrap();
+        let stored: CronJob = serde_json::from_str(&row.data).unwrap();
+        let expired = CronJob {
+            schedule: CronSchedule::at(Utc::now() - chrono::Duration::seconds(10)),
+            ..stored
+        };
+        row.data = serde_json::to_string(&expired).unwrap();
+        scheduler.store.save(&row).await.unwrap();
+
+        let err = scheduler.enable_job(&job.id).await.unwrap_err();
+        assert!(matches!(err, CronError::InvalidSchedule(_)));
+    }
+
+    #[tokio::test]
+    async fn tick_fires_due_jobs() {
+        let store = InMemoryCronStore::new();
+        let (scheduler, mut rx) = make_scheduler(store);
+
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "every minute").await;
 
         // Manually set next_trigger_at to the past so tick() considers it due.
         {
@@ -773,7 +905,10 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.job_id, job.id);
-        assert_eq!(event.prompt, "every minute");
+        assert!(matches!(
+            &event.action,
+            TriggerAction::Prompt { prompt } if prompt == "every minute"
+        ));
 
         // Verify next_trigger_at was advanced
         let updated_row = scheduler.store.get(&job.id).await.unwrap().unwrap();
@@ -793,16 +928,7 @@ mod tests {
         let store = InMemoryCronStore::new();
         let (scheduler, mut rx) = make_scheduler(store);
 
-        let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::Tui,
-                "* * * * *",
-                "test",
-                CronRunMode::Recurring,
-            )
-            .await
-            .unwrap();
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
 
         scheduler.disable_job(&job.id).await.unwrap();
         {
@@ -819,33 +945,27 @@ mod tests {
     #[tokio::test]
     async fn delete_job_removes_from_store() {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
-        let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::Tui,
-                "0 9 * * *",
-                "test",
-                CronRunMode::Recurring,
-            )
-            .await
-            .unwrap();
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
         scheduler.delete_job(&job.id).await.unwrap();
         let jobs = scheduler.list_jobs("u1").await.unwrap();
         assert!(jobs.is_empty());
     }
 
     #[tokio::test]
-    async fn one_shot_job_evicted_after_firing() {
+    async fn at_job_evicted_after_firing() {
         let store = InMemoryCronStore::new();
         let (scheduler, mut rx) = make_scheduler(store);
 
+        let fire_at = Utc::now() + chrono::Duration::seconds(30);
         let job = scheduler
             .create_job(
                 "u1",
                 ChannelType::Tui,
-                "* * * * *",
-                "run once",
-                CronRunMode::OneShot,
+                CronSchedule::at(fire_at),
+                TriggerAction::Prompt {
+                    prompt: "run once".into(),
+                },
+                None,
             )
             .await
             .unwrap();
@@ -871,7 +991,7 @@ mod tests {
         // Execution record preserved
         let execs = scheduler.list_executions(&job_id).await.unwrap();
         assert_eq!(execs.len(), 1);
-        assert_eq!(execs[0].run_mode, CronRunMode::OneShot);
+        assert!(execs[0].schedule.is_one_shot());
     }
 
     #[test]
@@ -880,14 +1000,16 @@ mod tests {
             id: "cj-rt".to_string(),
             user_id: "u1".to_string(),
             channel: ChannelType::Tui,
-            schedule: "0 9 * * *".to_string(),
-            prompt: "test".to_string(),
+            schedule: CronSchedule::cron("0 9 * * *"),
+            action: TriggerAction::Prompt {
+                prompt: "test".to_string(),
+            },
             status: CronStatus::Enabled,
-            run_mode: CronRunMode::OneShot,
             last_triggered_at: None,
             next_trigger_at: Some(Utc::now()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            origin_session_id: None,
         };
         let row = job_to_row(&job).unwrap();
         assert_eq!(row.status, "enabled");
@@ -895,7 +1017,7 @@ mod tests {
 
         let restored = row_to_job(row).unwrap();
         assert_eq!(restored.id, "cj-rt");
-        assert_eq!(restored.run_mode, CronRunMode::OneShot);
+        assert!(!restored.is_one_shot());
     }
 
     #[tokio::test]
@@ -903,16 +1025,7 @@ mod tests {
         let store = InMemoryCronStore::new();
         let (scheduler, mut rx) = make_scheduler(store);
 
-        let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::Tui,
-                "* * * * *",
-                "dedup test",
-                CronRunMode::Recurring,
-            )
-            .await
-            .unwrap();
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "dedup test").await;
 
         let past = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
         {
@@ -954,9 +1067,10 @@ mod tests {
             job_id: "cj-1".to_string(),
             user_id: "u1".to_string(),
             channel: ChannelType::Tui,
-            schedule: "* * * * *".to_string(),
-            prompt: "recover me".to_string(),
-            run_mode: CronRunMode::Recurring,
+            schedule: CronSchedule::cron("* * * * *"),
+            action: TriggerAction::Prompt {
+                prompt: "recover me".to_string(),
+            },
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,
@@ -970,7 +1084,10 @@ mod tests {
         // The pending execution was re-dispatched
         let event = rx.try_recv().unwrap();
         assert_eq!(event.job_id, "cj-1");
-        assert_eq!(event.prompt, "recover me");
+        assert!(matches!(
+            &event.action,
+            TriggerAction::Prompt { prompt } if prompt == "recover me"
+        ));
 
         // Status updated to dispatched
         let execs = scheduler
@@ -993,26 +1110,8 @@ mod tests {
     #[tokio::test]
     async fn list_all_jobs_returns_every_user() {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
-        scheduler
-            .create_job(
-                "u1",
-                ChannelType::Tui,
-                "0 9 * * *",
-                "alice",
-                CronRunMode::Recurring,
-            )
-            .await
-            .unwrap();
-        scheduler
-            .create_job(
-                "u2",
-                ChannelType::Tui,
-                "0 10 * * *",
-                "bob",
-                CronRunMode::Recurring,
-            )
-            .await
-            .unwrap();
+        create_prompt_cron(&scheduler, "u1", "0 9 * * *", "alice").await;
+        create_prompt_cron(&scheduler, "u2", "0 10 * * *", "bob").await;
 
         let all = scheduler.list_all_jobs().await.unwrap();
         assert_eq!(all.len(), 2);
@@ -1027,35 +1126,20 @@ mod tests {
     #[tokio::test]
     async fn get_job_returns_full_job_when_present() {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
-        let created = scheduler
-            .create_job(
-                "u1",
-                ChannelType::Tui,
-                "0 9 * * *",
-                "fetch me",
-                CronRunMode::Recurring,
-            )
-            .await
-            .unwrap();
+        let created = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "fetch me").await;
 
         let got = scheduler.get_job(&created.id).await.unwrap().unwrap();
         assert_eq!(got.id, created.id);
-        assert_eq!(got.prompt, "fetch me");
+        assert!(matches!(
+            &got.action,
+            TriggerAction::Prompt { prompt } if prompt == "fetch me"
+        ));
     }
 
     #[tokio::test]
     async fn trigger_now_dispatches_and_records_execution() {
         let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
-        let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::Tui,
-                "0 9 * * *",
-                "manual fire",
-                CronRunMode::Recurring,
-            )
-            .await
-            .unwrap();
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "manual fire").await;
         let scheduled_next = job.next_trigger_at;
 
         let exec = scheduler.trigger_now(&job.id).await.unwrap();
@@ -1064,9 +1148,12 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.job_id, job.id);
-        assert_eq!(event.prompt, "manual fire");
+        assert!(matches!(
+            &event.action,
+            TriggerAction::Prompt { prompt } if prompt == "manual fire"
+        ));
 
-        // Manual trigger must not advance the schedule.
+        // Recurring job preserved, schedule unchanged.
         let fetched = scheduler.get_job(&job.id).await.unwrap().unwrap();
         assert_eq!(fetched.next_trigger_at, scheduled_next);
         assert!(fetched.last_triggered_at.is_none());
@@ -1075,6 +1162,33 @@ mod tests {
         let execs = scheduler.list_executions(&job.id).await.unwrap();
         assert_eq!(execs.len(), 1);
         assert_eq!(execs[0].status, ExecutionStatus::Dispatched);
+    }
+
+    #[tokio::test]
+    async fn trigger_now_evicts_at_job() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let fire_at = Utc::now() + chrono::Duration::minutes(5);
+        let job = scheduler
+            .create_job(
+                "u1",
+                ChannelType::Tui,
+                CronSchedule::at(fire_at),
+                TriggerAction::Prompt {
+                    prompt: "manual one-shot".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let exec = scheduler.trigger_now(&job.id).await.unwrap();
+        assert_eq!(exec.status, ExecutionStatus::Dispatched);
+        assert!(rx.try_recv().is_ok());
+
+        // Job gone, execution preserved.
+        assert!(scheduler.get_job(&job.id).await.unwrap().is_none());
+        let execs = scheduler.list_executions(&job.id).await.unwrap();
+        assert_eq!(execs.len(), 1);
     }
 
     #[tokio::test]
@@ -1091,9 +1205,10 @@ mod tests {
             job_id: "cj-1".to_string(),
             user_id: "u1".to_string(),
             channel: ChannelType::Tui,
-            schedule: "0 9 * * *".to_string(),
-            prompt: "test".to_string(),
-            run_mode: CronRunMode::Recurring,
+            schedule: CronSchedule::cron("0 9 * * *"),
+            action: TriggerAction::Prompt {
+                prompt: "test".to_string(),
+            },
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,

@@ -29,6 +29,5 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }
-cron = { workspace = true }
 regex = { workspace = true }
 futures = { workspace = true }

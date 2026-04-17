@@ -2,9 +2,9 @@
 
 ## Overview
 
-The `cron` crate defines domain types for scheduled recurring work: `CronJob`, `CronExecution`, `CronStatus`, `CronRunMode`, and `CronError`. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate).
+The `cron` crate defines domain types for scheduled recurring work: `CronJob`, `CronExecution`, `CronStatus`, `CronRunMode`, `TriggerAction`, and `CronError`. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate).
 
-CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Session resolution happens dynamically at trigger time in the agent layer.
+CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Session resolution happens dynamically at trigger time in the agent layer. A `CronJob` also records its `origin_session_id` — the session that created it — purely for traceability; trigger-time session resolution is unaffected.
 
 ## Design Decisions
 
@@ -23,6 +23,15 @@ Each `CronJob` stores `next_trigger_at` — the next time it should fire. This a
 ### Schedule stored as String
 
 The `schedule` field stores the raw cron expression as a `String`. Parsing and validation happen at creation time in `CronScheduler` (in the `agent` crate), not at the type level. This keeps the domain type simple and serialization-friendly.
+
+### Two trigger modes: `Prompt` vs `ToolCall`
+
+`TriggerAction` is a tagged enum (`#[serde(tag = "kind")]`) with two variants:
+
+- `Prompt { prompt }` — feeds `prompt` through the full agent loop every fire. Use for open-ended tasks ("summarize overnight news") where the LLM decides what tools to invoke.
+- `ToolCall { tool_name, params, approved_resources }` — directly invokes a registered tool, bypassing the LLM. Use for deterministic recurring work (fetch a URL, run a backup script). `approved_resources` is captured at creation time so the execution does not need to prompt the user on every fire. If the direct call fails, the agent layer falls back to dispatching a diagnostic prompt through the LLM so the failure surfaces as a normal reply.
+
+The same enum is stored on `CronExecution` as an immutable snapshot of what was actually executed at fire time.
 
 ### Domain crate, not business logic
 

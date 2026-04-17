@@ -58,6 +58,15 @@ Parallel tool calls within a turn each go through the gate independently; the ga
 
 Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentSupervisor` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; sessions are resolved dynamically at trigger time.
 
+`AgentMessage::CronTrigger` carries a `TriggerAction` (from `aura-cron`). The `AgentActor` branches on the variant:
+
+- `TriggerAction::Prompt { prompt }` — dispatches `prompt` through the normal `AgentLoop` path.
+- `TriggerAction::ToolCall { tool_name, params, approved_resources }` — the actor invokes `ToolExecutor::execute` directly with the pre-approved resources seeded into the approval-gate snapshot. The `ToolOutput` is emitted as an `AgentOutput::Message`. If the direct call fails, the actor synthesizes a diagnostic prompt and falls back to `dispatch_prompt` so the LLM can explain the failure to the user. This requires `AgentActor` to hold an `Arc<ToolExecutor>` alongside its other dependencies.
+
+### LLM-invocable cron tools
+
+`aura_agent::cron_tools` defines `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-agent` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, which would otherwise pull `aura-agent` into `aura-tools` and create a circular dependency. Registration happens in `src/main.rs` after the scheduler is constructed, via `Arc::get_mut(&mut tool_registry)` while no other clones exist yet.
+
 ### Rollback mechanism
 
 `Rollback` message → read snapshot from `TraceCollector` → `fork_from(target_node)` → restore session messages and context state from snapshot.

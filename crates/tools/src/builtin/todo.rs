@@ -74,26 +74,6 @@ todo_tool!(
     reason = "agent teams are experimental and not yet modeled in Aura"
 );
 
-// -- Cron --------------------------------------------------------------------
-todo_tool!(
-    CronCreateTool,
-    name = "CronCreate",
-    desc = "Schedule a recurring or one-shot prompt.",
-    reason = "CronScheduler integration from the agent tool surface is pending"
-);
-todo_tool!(
-    CronDeleteTool,
-    name = "CronDelete",
-    desc = "Cancel a scheduled task by ID.",
-    reason = "CronScheduler integration from the agent tool surface is pending"
-);
-todo_tool!(
-    CronListTool,
-    name = "CronList",
-    desc = "List all scheduled tasks.",
-    reason = "CronScheduler integration from the agent tool surface is pending"
-);
-
 // -- Plan / worktree ---------------------------------------------------------
 todo_tool!(
     EnterPlanModeTool,

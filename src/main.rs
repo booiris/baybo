@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
         }
         reg
     };
-    let tool_registry = Arc::new(ToolRegistry::with_defaults());
+    let mut tool_registry = Arc::new(ToolRegistry::with_defaults());
     let workspace = Arc::new(WorkspaceManager::new(PathBuf::from(&config.workspace.path)));
     let channels_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
 
@@ -331,6 +331,33 @@ async fn main() -> anyhow::Result<()> {
     };
     let secret_vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
 
+    // Shutdown signal — created here (earlier than strictly needed) so the
+    // cron scheduler below can take a clone before `ToolExecutor` clones
+    // `tool_registry` and pins its strong count above 1.
+    let shutdown = ShutdownSignal::new();
+
+    // Cron scheduler. Must be built BEFORE `ToolExecutor` so its tools can
+    // be registered while `Arc::get_mut(&mut tool_registry)` still succeeds.
+    // The background tick loop is spawned further down, once `task_tracker`
+    // exists.
+    let (cron_trigger_tx, cron_trigger_rx) = mpsc::channel(64);
+    let cron_scheduler = Arc::new(CronScheduler::new(
+        storage.cron,
+        cron_trigger_tx,
+        Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
+    ));
+
+    // Register cron-management tools while `tool_registry` still has a single
+    // owner. Once `ToolExecutor::new` below clones the Arc, `get_mut` would
+    // fail.
+    {
+        let reg = Arc::get_mut(&mut tool_registry)
+            .expect("tool_registry has no other owners at this point");
+        for (tool, manifest) in aura_cron::agent_tools(Arc::clone(&cron_scheduler)) {
+            reg.register(tool, manifest);
+        }
+    }
+
     // Tool executor — the gate map is shared with ChannelRegistry and
     // populated lazily when channels register (so no need to create the
     // TUI adapter early).
@@ -371,20 +398,6 @@ async fn main() -> anyhow::Result<()> {
     let security_gateway = Arc::new(SecurityGateway::new(
         Arc::clone(&leak_detector),
         Arc::clone(&secret_vault),
-    ));
-
-    // Shutdown signal — needed by the cron scheduler below and by the signal
-    // handler task spawned later.
-    let shutdown = ShutdownSignal::new();
-
-    // Cron scheduler. Constructed before the slash context so the `cron list`
-    // / `cron run` commands can reach it; the background tick loop is spawned
-    // further down, once `task_tracker` exists.
-    let (cron_trigger_tx, cron_trigger_rx) = mpsc::channel(64);
-    let cron_scheduler = Arc::new(CronScheduler::new(
-        storage.cron,
-        cron_trigger_tx,
-        shutdown.clone(),
     ));
 
     // Build the slash-handler context once everything above is wired.
@@ -488,6 +501,7 @@ async fn main() -> anyhow::Result<()> {
         let actor = AgentActor::new(
             session,
             agent_loop,
+            Arc::clone(&actor_tool_executor),
             response_tx,
             Arc::clone(&actor_hooks),
             recorder,
