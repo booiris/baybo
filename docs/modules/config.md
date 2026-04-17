@@ -27,7 +27,6 @@ There is no `storage` section. Storage paths are **derived** from the project ro
 
 Known surface gaps that should be closed before or alongside the wiring:
 
-- `LlmConfig::api_key: Option<String>` currently accepts raw strings. Target: either rename to `api_key_env` or introduce a typed `SecretRef` so the type system enforces "references, not values" (see §"Secret handling").
 - `SecretRequirementConfig.access: String` and `McpServerEntry.capabilities: Vec<String>` should become mirror enums (`SecretAccessConfig` = `ReadOnly | ReadWrite`, `CapabilityConfig` = `ReadWorkspace | WriteWorkspace | Http(..) | SpawnProcess | BrowserAutomation`). Current stringly-typed form violates the project's "prefer strong types over strings" rule and defers validation to bootstrap. (These mirrors are removed alongside MCP; they return with the MCP re-add.)
 
 Until these land, the spec below describes target state; deviations are flagged inline.
@@ -75,7 +74,7 @@ Sections that must not accept typos (security-sensitive or governance-sensitive 
 
 Config does **not** store live secret values; it stores references:
 
-- `LlmConfig::api_key` should be a reference to an env-var name (e.g., `"OPENAI_API_KEY"`), not raw key material. `llm.md` §Constraints prohibits inline keys. Current type (`Option<String>`) is permissive — tighten per §"Current status".
+- `LlmConfig::api_key_env` is a reference to an env-var name (e.g., `"OPENAI_API_KEY"`), not raw key material. `llm.md` §Constraints prohibits inline keys.
 - `SecurityConfig::encryption_key_file` and `encryption_key_env` are filesystem and environment indirections; the key bytes are loaded at startup by `agent::security`.
 
 ### Section boundaries
@@ -93,7 +92,7 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 | `tools`    | `ToolExecutor` default timeout (MCP server list returns with reintroduction) |                                                                                                                                                                                      |
 | `trace`    | `TraceCollector` auto-snapshot and interval                 |                                                                                                                                                                                                      |
 | `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
-| `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/.aura/storage.db`).                                                                |
+| `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/storage.db`).                                                                      |
 
 `registry` and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
 
@@ -167,7 +166,7 @@ Field-level checks catch syntax errors; cross-section checks catch policy incons
 
 | Rule                                                                                                                                                                             | Sections involved  |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| When `llm.provider` is set, at least one secret source is resolvable: `llm.api_key` (as env-var reference), or a provider-specific fallback env var documented for that provider | `llm`, `security`  |
+| When `llm.provider` is set, at least one secret source is resolvable: `llm.api_key_env` (env-var reference), or a provider-specific fallback env var documented for that provider | `llm`, `security`  |
 | Each `channels.*` with `enabled: false` is rejected (enablement-model self-consistency)                                                                                          | `channels`         |
 | `security.encryption_key_file` and `encryption_key_env` cannot both be unset when any downstream consumer requires an encryption key                                             | `security`         |
 

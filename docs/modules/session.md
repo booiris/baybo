@@ -29,6 +29,7 @@ Aura uses one Actor per session. All messages targeting the same session (user i
 
 - `active_skills`: names of skills explicitly invoked this turn (slash-command or inline `/mention`, score ≥ 0.9). Repopulated every turn by `AgentLoop` from the active band — kept as a `Vec<String>` because multiple skills can be active simultaneously. Pure provenance for trace/CLI display; tool governance is computed separately as the union of those skills' `allowed_tools` lists.
 - `compression_count`: incremented after each context compression, useful for monitoring or strategy switching.
+- `approved_resources`: tool resources the user has granted permanent approval for in this session. Appended on each `ApproveAlways` decision by the approval gate and persisted with the session so restored sessions remember the grants. Matching semantics live in `aura_model::approval`.
 - `extra`: reserved extension fields for experimental features or plugin state.
 
 ## Constraints

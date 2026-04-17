@@ -57,7 +57,7 @@ All platforms map to the same `IncomingMessage` structure via consistent ID pref
 
 ### Graceful shutdown
 
-Router calls `stop()` on all channels, each exits its background loop and releases resources, with a global timeout for forced exit.
+Router calls `stop()` on all channels and each exits its background loop and releases resources. Shutdown is best-effort: `ChannelRegistry::stop_all` walks every running adapter, records `ChannelStatus::Error` on individual failures, and continues. There is no built-in deadline — callers that need a hard timeout must wrap the call themselves.
 
 ## Channel Implementations
 
@@ -90,10 +90,11 @@ Each adapter must:
 `ChannelRegistry` manages the full lifecycle of channel adapters:
 
 ```rust
-pub struct ChannelRegistry { /* HashMap<ChannelType, ChannelEntry> */ }
+pub struct ChannelRegistry { /* HashMap<ChannelType, ChannelEntry> + Arc<ApprovalGateMap> */ }
 
 impl ChannelRegistry {
     pub fn new() -> Self;
+    pub fn approval_gates(&self) -> Arc<ApprovalGateMap>;
     pub fn register(&mut self, adapter: Box<dyn ChannelAdapter>) -> Result<()>;
     pub async fn unregister(&mut self, channel_type: ChannelType) -> Result<()>;
     pub fn get(&self, channel_type: ChannelType) -> Option<&dyn ChannelAdapter>;
@@ -104,6 +105,8 @@ impl ChannelRegistry {
     pub fn is_empty(&self) -> bool;
 }
 ```
+
+`approval_gates()` returns the shared `Arc<ApprovalGateMap>` populated at registration time from each adapter's `ChannelAdapter::approval_gate`. Bootstrap hands the same `Arc` to `ToolExecutor`, so gates registered later are visible immediately without re-plumbing.
 
 Each registered adapter has a tracked `ChannelStatus`:
 

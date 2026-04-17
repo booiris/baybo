@@ -20,7 +20,7 @@ Convention for derived paths:
 
 | Subsystem | Path                                 |
 | --------- | ------------------------------------ |
-| storage   | `<workspace.path>/.aura/storage.db`  |
+| storage   | `<workspace.path>/storage.db`        |
 
 ## Design Decisions
 

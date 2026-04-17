@@ -44,7 +44,7 @@ No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands
 - Single-table layout: title, bold header row, equal-width columns, footer hint.
 - Backed by a `DashboardSnapshot { title, columns, rows, footer }` value fetched from a `DashboardProvider`.
 - Refresh (`r`) re-fetches on a background task; the snapshot swap is transactional (existing selection clamps to the new row count).
-- Five built-in views map to `ViewKind::{Skills, Tools, Jobs, Sessions, Memory}`.
+- Four built-in views map to `ViewKind::{Skills, Jobs, Sessions, Memory}`.
 
 ## Slash Commands
 
@@ -55,7 +55,6 @@ Bare commands with no arguments open the matching dashboard view:
 | Slash input | Outcome                                      |
 | ----------- | -------------------------------------------- |
 | `/skills`   | `SlashOutcome::OpenView(ViewKind::Skills)`   |
-| `/tools`    | `SlashOutcome::OpenView(ViewKind::Tools)`    |
 | `/jobs`     | `SlashOutcome::OpenView(ViewKind::Jobs)`     |
 | `/sessions` | `SlashOutcome::OpenView(ViewKind::Sessions)` |
 | `/memory`   | `SlashOutcome::OpenView(ViewKind::Memory)`   |

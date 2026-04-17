@@ -16,7 +16,7 @@ Core responsibilities:
 
 ### rig-based completion with enum dispatch
 
-`LlmClient` wraps `AnyCompletionModel`, an enum that holds provider-specific rig completion models (OpenAI, Anthropic). This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
+`LlmClient` wraps `AnyCompletionModel`, an enum that holds provider-specific rig completion models (OpenAI, Anthropic, Gemini). This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
 
 ### Streaming
 
@@ -24,7 +24,7 @@ Core responsibilities:
 
 ### Provider registry pattern
 
-`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI, Anthropic) are registered by the crate itself. New providers are added by implementing `LlmProviderFactory` and registering it.
+`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI, Anthropic, Gemini) are registered by the crate itself. New providers are added by implementing `LlmProviderFactory` and registering it.
 
 ### Multimodal support
 

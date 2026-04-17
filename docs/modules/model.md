@@ -54,7 +54,7 @@ Cleanup is triggered externally (cron); memory exposes methods but does not own 
 
 #### Memory categories
 
-`UserPreference`, `KeyFact`, `InteractionSummary`, `Custom(String)` — providing semantic categorization for retrieval and management.
+`UserPreference`, `KeyFact` — providing semantic categorization for retrieval and management.
 
 #### Vector embeddings
 
