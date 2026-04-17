@@ -495,14 +495,12 @@ fn render_block(block: &ContentBlock) -> Option<String> {
         // cares about the assistant's final narration. The one exception
         // is CronCreate with a recurring schedule, where the TUI owes
         // the user a caveat about ephemeral sessions.
-        ContentBlock::ToolUse { name, input, .. } => {
-            (name == "CronCreate"
-                && input
-                    .get("schedule")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| !s.is_empty()))
-            .then(|| TUI_CRON_RECURRING_HINT.to_string())
-        }
+        ContentBlock::ToolUse { name, input, .. } => (name == "CronCreate"
+            && input
+                .get("schedule")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()))
+        .then(|| TUI_CRON_RECURRING_HINT.to_string()),
         ContentBlock::ToolResult { .. } => None,
         ContentBlock::Thinking { .. } => None,
     }

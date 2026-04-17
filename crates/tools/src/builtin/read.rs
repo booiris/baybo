@@ -64,6 +64,13 @@ impl Tool for ReadTool {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
+        if aura_security::is_sensitive_path(&p.file_path) {
+            return Err(ToolError::Execution(format!(
+                "refused to read sensitive path {} — credential-bearing files are blocked by security policy",
+                p.file_path.display()
+            )));
+        }
+
         let contents = tokio::fs::read_to_string(&p.file_path)
             .await
             .map_err(|e| ToolError::Execution(format!("read {}: {e}", p.file_path.display())))?;
@@ -123,6 +130,24 @@ mod tests {
         };
         assert!(s.contains("one"));
         assert!(s.contains("three"));
+    }
+
+    #[tokio::test]
+    async fn refuses_sensitive_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        tokio::fs::create_dir(&ssh).await.unwrap();
+        let key = ssh.join("id_rsa");
+        tokio::fs::write(&key, "FAKE KEY DATA").await.unwrap();
+        let err = ReadTool
+            .execute(json!({ "file_path": key }), &ctx())
+            .await
+            .unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("sensitive path") || msg.contains("credential-bearing"),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test]

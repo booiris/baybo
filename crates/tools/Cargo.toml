@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
+aura-security = { workspace = true }
 chrono = { workspace = true }
 iana-time-zone = { workspace = true }
 thiserror = { workspace = true }

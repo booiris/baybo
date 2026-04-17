@@ -358,6 +358,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Security gateway must exist before the tool executor — the executor
+    // delegates placeholder reveal on tool-call arguments to the gateway.
+    // The leak detector is shared (`Arc`) so the slash context can expose
+    // the same rule set to `aura security leaks check`.
+    let leak_detector = Arc::new(boot::build_leak_detector(&config.security));
+    let security_gateway = Arc::new(SecurityGateway::new(
+        Arc::clone(&leak_detector),
+        Arc::clone(&secret_vault),
+    ));
+
     // Tool executor — the gate map is shared with ChannelRegistry and
     // populated lazily when channels register (so no need to create the
     // TUI adapter early).
@@ -366,6 +376,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&tool_registry),
         boot::to_tool_timeout(&config.tools),
         gate_map,
+        Arc::clone(&security_gateway),
     ));
 
     // Memory manager
@@ -391,14 +402,6 @@ async fn main() -> anyhow::Result<()> {
     // Message channels
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
     let (response_tx, response_rx) = mpsc::channel(buffer);
-
-    // Security gateway. The leak detector is shared (`Arc`) so the slash
-    // context can expose the same rule set to `aura security leaks check`.
-    let leak_detector = Arc::new(boot::build_leak_detector(&config.security));
-    let security_gateway = Arc::new(SecurityGateway::new(
-        Arc::clone(&leak_detector),
-        Arc::clone(&secret_vault),
-    ));
 
     // Build the slash-handler context once everything above is wired.
     let slash_ctx = Arc::new(
@@ -460,6 +463,7 @@ async fn main() -> anyhow::Result<()> {
     let actor_skill_assessor = Arc::clone(&skill_assessor);
     let actor_token_budget = boot::to_token_budget(&config.agent.context);
     let actor_keep_recent = config.agent.context.keep_recent;
+    let actor_security_gateway = Arc::clone(&security_gateway);
 
     let router = Router::new(
         Arc::clone(&session_manager),
@@ -481,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&actor_memory_manager),
             actor_policy.clone(),
             Soul::custom(actor_system_prompt.clone()),
+            Arc::clone(&actor_security_gateway),
         )
         .with_skill_assessor(Arc::clone(&actor_skill_assessor));
 

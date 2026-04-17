@@ -2,31 +2,76 @@
 
 ## Overview
 
-The `security` crate provides low-level security primitives: cryptographic operations (`EncryptionKey`, `encrypt`/`decrypt`), leak detection (`LeakDetector`, `LeakDetectionRule`), and the `SecurityError` error type.
+The `security` crate provides low-level security primitives: cryptographic operations (`EncryptionKey`, `encrypt`/`decrypt`), encrypted secret storage (`SecretVault`, `SecretValue`), leak detection (`LeakDetector`, `LeakDetectionRule`, `LeakMatch`, `LeakScanResult`), deterministic placeholder minting (`PlaceholderMinter`), prompt-injection detection (`InjectionDetector`, `InjectionWarning`, `InjectionSeverity`), filesystem path sensitivity checks (`is_sensitive_path`), and the `SecurityError` error type.
 
-Business logic (`SecretVault`, `SecretValue`, `SecurityGateway`) lives in `agent::security`. The `SecretStore` trait is defined in `storage::secret`.
+The gateway (`SecurityGateway`) lives in `agent::security` — it holds session-scoped state and orchestrates scanning, minting, and reveal across the agent loop. The `SecretStore` trait is defined in `storage::secret` and consumed here via `aura_storage::SecretStore`; `SecretVault` maps `StorageError` to `SecurityError::Storage` at that boundary.
 
 Core responsibilities of the primitives in this crate:
 
-- **Leak detection**: identify API keys, passwords, tokens in content blocks via regex rules
-- **Placeholder replacement**: replace sensitive plaintext with `{{SECRET_xxx}}`
-- **AES-256-GCM encryption**: encrypt/decrypt secret values with a master key
+- **Leak detection**: identify API keys, passwords, tokens in content blocks via regex rules. `scan_text` / `scan_content_blocks` return `LeakScanResult { matches, blocked, block_reason }`; substitution is the caller's responsibility. Default rule set covers AWS (access key, secret key), Google (API key, OAuth), GitHub (ghp/gho/ghu/ghs/ghr/pat variants), GitLab PAT, npm token, Anthropic (API key + OAuth `sk-ant-oat…`), OpenAI, OpenRouter (`sk-or-v1-…`), Groq (`gsk_…`), Stripe (live/test), Slack, SendGrid, Twilio (`SK…`), Telegram bot tokens (`<id>:AA…`), NEAR AI session cookies (`sess_…`), JWTs, PEM private keys, generic `api_key=`/`bearer …`/`Authorization: …`/`password=` assignments, and a 64-char high-entropy hex fallback.
+- **Deterministic placeholder minting**: `PlaceholderMinter::from_master_key(&EncryptionKey)` derives a per-process HMAC key via HKDF-SHA256 (info `b"aura-placeholder-v1"`). `mint(secret_bytes)` returns `{{SECRET_<24-hex>}}` — the hex is the first 24 chars of HMAC-SHA256(subkey, secret). Identical secrets therefore always mint the same placeholder, so the vault accumulates at most one entry per unique secret.
+- **Placeholder regex**: `PlaceholderMinter::placeholder_regex()` exposes a cached `\{\{SECRET_[0-9a-f]{16,32}\}\}` matcher for reveal passes.
+- **Prompt-injection detection**: `InjectionDetector::with_default_rules()` returns a detector built from an Aho-Corasick literal matcher (override phrases like "ignore previous", role manipulation, fake turn prefixes `system:` / `assistant:` / `human:`, control tokens `<|im_start|>` / `[INST]` / `<s>`, forged `<tool_output>` delimiters, `\`\`\`system` code fences) plus regex rules for base64 payloads, `eval(`/`exec(` calls, and null bytes. `scan` returns a `Vec<InjectionWarning>`; the detector never rewrites content — callers log or block based on `InjectionSeverity`.
+- **Sensitive-path checks**: `is_sensitive_path(&Path) -> bool` matches credential-bearing locations (`~/.ssh/`, `~/.aws/`, `~/.azure/`, `~/.gcloud/`, `~/.kube/`, `~/.docker/`, `~/.gnupg/`, `~/.netrc`, `/etc/shadow`, shell-history files, `.env` variants, `*.pem` / `*.key` / `*.p12` / `*.jks`, `id_rsa` / `authorized_keys`). `.env.example`/`.env.template`/`.env.sample`/`.env.dist` and `*.dist` suffixes are allowed. Paths are canonicalized to defeat symlink bypass.
+- **AES-256-GCM encryption**: encrypt/decrypt secret values with a master key.
+- **SecretVault**: encrypt and persist real secrets through an injected `Arc<dyn SecretStore>`; exposes `master_key()` so the gateway can bootstrap its `PlaceholderMinter` from the same key material. Maps underlying `StorageError` into `SecurityError::Storage`.
+- **SecretValue**: redacted wrapper preventing plaintext in Debug/Display.
 
-Business logic in `agent::security` builds on these primitives:
+The gateway in `agent::security` builds on these primitives:
 
-- **SecretVault**: encrypt and store real secrets (tool-scoped injection is deferred pending the finalized tool system)
-- **SecurityGateway**: input sanitization, output re-sanitization, session placeholder mapping
-- **SecretValue**: redacted wrapper preventing plaintext in Debug/Display
+- **SecurityGateway**: input/output sanitization, LLM-response defensive scrubbing, stream-fragment scrubbing, tool-output scrubbing (including prompt-injection warnings and structural wrapping), error-string scrubbing, and the reveal API. Also owns the tool-output length cap (`MAX_TOOL_OUTPUT_BYTES = 32 KiB`).
 
 ## Design Decisions
 
 ### Input sanitization flow
 
-Messages pass through `SecurityGateway::sanitize_input()` immediately after channel ingress. The leak detector scans content blocks, generates unpredictable placeholders, and stores the mapping. **The context that enters Agent may only see placeholders, never raw secrets.**
+Messages pass through `SecurityGateway::sanitize_input()` immediately after channel ingress. The leak detector identifies matches; the gateway mints a deterministic placeholder per unique secret, upserts the plaintext into `SecretVault` (idempotent), and replaces each match in every text block. A session-scoped `{placeholder → rule_name}` map is maintained for audit. **The context that enters Agent, memory, and trace may only see placeholders, never raw secrets.**
+
+### LLM-response defensive scrubbing
+
+`SecurityGateway::sanitize_llm_response(&mut LlmResponse)` is called in `AgentLoop::call_llm` *before* the response is recorded to the trace, pushed onto `session.messages`, or passed to the memory manager. It scans `content`, each `ContentBlock::Text`, `thinking`, and every string leaf inside `tool_calls[*].arguments`, minting placeholders and writing them back in place. An LLM that fabricates a secret-shaped string therefore cannot leak it through any downstream sink — the JSON dump stored by `SpanResult::LlmResponse` sees only placeholders.
 
 ### Output re-sanitization
 
-Before any response leaves the system, it passes through `sanitize_output()` again. Placeholders are kept as-is; if the response reconstructs secret-like content, it is matched and replaced. **Never perform reverse mapping from placeholders back to plaintext.**
+Before any response leaves the system, `sanitize_output()` runs again. Placeholders flow through unchanged; any newly-matched secret-like content is minted and vaulted. **Non-streaming `OutgoingMessage` keeps placeholder form — no reveal on the final egress.**
+
+### Stream-delta buffering and reveal
+
+Streaming output is the one legitimate plaintext boundary. `AgentLoop::chat_streaming` buffers chunks in a small `pending: String` and calls `safe_flush_boundary` to find the largest prefix that cannot contain a partial placeholder. The rule: locate the last `{{`; if its tail lacks `}}`, withhold from that `{{`. A lone trailing `{` is also withheld in case the next chunk completes it into `{{`. The buffer is capped at 128 bytes (`STREAM_BUFFER_HIGH_WATER`) to bound worst-case memory.
+
+For the flushable prefix the gateway runs the scan/mint/vault pipeline, then:
+
+- the *scanned* (placeholder-bearing) text is appended to the `LlmResponse.content` accumulator the caller returns — so trace, memory, and session-message persistence all receive placeholders;
+- the *revealed* text (via `reveal_in_text`) is sent to `delta_tx` so the user-facing stream shows the real plaintext.
+
+### Reveal API
+
+`SecurityGateway::reveal_in_text(&str)` and `reveal_in_value(&mut serde_json::Value)` substitute every known placeholder with its vaulted plaintext. Reveal is **vault-global**: any placeholder present in the vault is revealable regardless of session. Unknown placeholders (e.g. LLM-fabricated strings matching the regex but without a vault entry) are passed through unchanged, with a `warn!` that logs only a SHA-256 fingerprint prefix — never the placeholder body.
+
+`reveal_in_value` walks JSON recursively; only `Value::String` leaves are substituted, and object keys are left untouched. No serialize/parse round trip is performed.
+
+### Tool-argument reveal boundary
+
+`ToolExecutor::execute` captures `SpanInput::ToolExecution { parameters: params.clone() }` (placeholder form) *before* the reveal happens, then calls `reveal_in_value` on a separate copy and passes that copy to the tool. The trace and approval prompt see placeholders; the tool receives plaintext for its real API call. On return, `sanitize_tool_output` runs on the `ToolOutput` so that any echoed secret is re-minted and vaulted before the value flows into the trace, the next LLM call's `ToolResult`, or memory.
+
+### Prompt-injection defense
+
+Injection markers (`ignore previous`, fake turn prefixes, ChatML/LLaMA control tokens, forged `<tool_output>` tags, etc.) are scanned at two points:
+
+- **Inbound messages** (`sanitize_input`): every text block is scanned; hits are logged via `tracing` at a level that scales with severity (`Critical`/`High` → `warn`, `Medium` → `info`, `Low` → `debug`). User input is not blocked — legitimate prose contains many of these literals — but the logs give operators a signal.
+- **Tool output** (`sanitize_tool_output` + `wrap_tool_output_for_llm`): warnings are logged the same way, and `wrap_tool_output_for_llm` prepends an inline security banner naming the triggered rules inside the `<tool_output>` envelope so the LLM treats the content as untrusted data rather than instructions.
+
+### Tool-output structural wrapping
+
+`SecurityGateway::wrap_tool_output_for_llm(tool_name, content)` wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the slash and the tag name so untrusted content cannot forge the closing boundary. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
+
+### Tool-output length cap
+
+`SecurityGateway::cap_tool_output(content)` truncates to `MAX_TOOL_OUTPUT_BYTES` on a UTF-8 char boundary and appends a truncation notice. The cap runs **before** wrapping so the notice lands inside the `<tool_output>` envelope. Individual tools keep their own tighter bounds (`Bash` 64 KiB, `WebFetch` 256 KiB, `Grep` 500 hits, `Read` 2000 lines × 2000 chars/line, `Glob` 1000 paths) — the gateway cap is a final defense for any tool that didn't apply one.
+
+### Sensitive-path filter
+
+Because `ResourceAccess::ReadFile` bypasses the approval gate (see `ToolExecutor::execute`), file reads have no per-call user confirmation. `ReadTool` instead rejects the call outright when `aura_security::is_sensitive_path` matches, returning a `ToolError::Execution` with a message the LLM can relay to the user. Any future file-reading tool must apply the same check at its entry point.
 
 ### SecretVault encryption
 
@@ -35,8 +80,9 @@ Secrets are encrypted with AES-256-GCM (random nonce + ciphertext + tag). The ma
 ### Least-privilege injection (deferred)
 
 Per-tool secret declaration and `ScopedSecretAccessor` were removed pending the
-finalized tool system. Until they return, `SecretVault` only backs
-`SecurityGateway` placeholder storage; tools receive no secrets through
+finalized tool system. Until they return, `SecretVault` backs
+`SecurityGateway` placeholder storage and reveal; tools receive plaintext only
+through the tool-argument reveal boundary described above, never via
 `ToolContext`.
 
 ### Network decision boundary
@@ -46,10 +92,13 @@ Security only decides allow/deny. It does not execute network access. The chain 
 ## Constraints
 
 - Primitives crate — no session/channel/storage dependencies
-- Trace records only sanitized `SpanInput` and `SpanResult`
+- Trace records only sanitized `SpanInput` and `SpanResult` (including tool-call arguments)
 - Job `input/output` stores sanitized versions only
-- Structured logs must not print `SecretValue` directly
-- Placeholder generation should use unpredictable random suffixes to avoid collisions
+- Structured logs must not print `SecretValue` directly; reveal warnings log only a SHA-256 fingerprint prefix
+- Placeholder generation is deterministic per secret — same secret → same placeholder → single vault entry
+- The only code paths permitted to hold plaintext are: the tool executor's post-reveal `params_revealed` on its way into `tool_registry.execute`, and the stream-delta send into `delta_tx`
+- Injection detection is log-only at inbound and log-plus-wrap at tool output; never auto-block user input on injection markers alone
+- Any tool that reads filesystem paths MUST apply `is_sensitive_path` at its entry point, regardless of approval-gate status
 
 ## Collaboration
 

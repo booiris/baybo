@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use aura_security::SecurityError;
 
-pub type Result<T> = std::result::Result<T, SecurityError>;
+use crate::StorageError;
+
+pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Async trait for encrypted secret persistence.
 #[async_trait]

@@ -40,7 +40,21 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### ToolExecutor responsibility
 
-ToolExecutor: lookup tool → validate trust/capability → consult approval gate → construct `ToolContext` → create child Job/Trace nodes → execute → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
+ToolExecutor: lookup tool → validate trust/capability → consult approval gate → construct `ToolContext` → create child Job/Trace nodes → reveal placeholders in args → execute → sanitize output → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
+
+`ToolExecutor` holds an `Arc<SecurityGateway>`. Tool invocation is the one legitimate plaintext boundary for arguments: the pre-reveal `params` is what flows into `SpanInput::ToolExecution` and the approval preview (placeholder form), while a cloned `params_revealed` — with `reveal_in_value` applied — is what's passed to `tool_registry.execute`. After execution the returned `ToolOutput` is run through `sanitize_tool_output` so any tool-echoed secret is re-minted and vaulted before it enters the trace, the next LLM call, or memory. Errors are passed through `sanitize_error` before `recorder.fail`.
+
+### LLM-response defensive scrubbing
+
+`AgentLoop` holds an `Arc<SecurityGateway>`. In `call_llm`, every `LlmResponse` — including `content`, `content_blocks` text, `thinking`, and `tool_calls[*].arguments` — is run through `SecurityGateway::sanitize_llm_response` *before* the response is recorded to the trace, appended to `session.messages`, or passed to the memory manager. This prevents LLM-fabricated secret-shaped strings from leaking into any downstream sink.
+
+### Tool-result formatting into LLM context
+
+After `ToolExecutor::execute` returns, `AgentLoop` renders the result into a text blob (`ToolOutput::Text` → raw; `ToolOutput::Json` → serialized; `ToolOutput::Error` and errors → a prefixed error line), then pipes it through the security gateway: `cap_tool_output` first (so the truncation notice lands inside the envelope) and `wrap_tool_output_for_llm(&tool_name, ...)` second. The wrapped string is what populates `ContentBlock::ToolResult { content }`. This gives the LLM a clear, forgery-resistant boundary around untrusted tool output and limits any single tool call's context impact to `MAX_TOOL_OUTPUT_BYTES` bytes.
+
+### Streaming delta reveal
+
+`AgentLoop::chat_streaming` is the only path that emits plaintext secrets. Raw chunks accumulate into a `pending` buffer; `safe_flush_boundary` returns the largest prefix that cannot contain a partial placeholder (last unmatched `{{`, or a lone trailing `{`). Buffer size is capped at `STREAM_BUFFER_HIGH_WATER = 128` bytes to force flushes under pathological input. The flushable prefix is scanned/minted/vaulted once; the placeholder form is appended to the `LlmResponse.content` accumulator that the caller returns (so trace and memory see placeholders), while `reveal_in_text` is applied to the copy sent to `delta_tx` for user-facing display.
 
 ### Approval gate wiring
 
@@ -65,7 +79,7 @@ Cron jobs flow through the Actor model and observability chain: `CronScheduler` 
 
 ### LLM-invocable cron tools
 
-`aura_agent::cron_tools` defines `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-agent` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, which would otherwise pull `aura-agent` into `aura-tools` and create a circular dependency. Registration happens in `src/main.rs` after the scheduler is constructed, via `Arc::get_mut(&mut tool_registry)` while no other clones exist yet.
+`aura_cron::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-cron` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot pull in `aura-cron` without creating a circular dependency. `src/main.rs` registers them after the scheduler is constructed, via `Arc::get_mut(&mut tool_registry)` while no other clones exist yet.
 
 ### Rollback mechanism
 
@@ -100,7 +114,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager`; startup recovery via `recover_interrupted()` |
 | `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |
 | `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
-| `security` | Provides crypto primitives (`EncryptionKey`, `LeakDetector`) used by `agent::security::{SecretVault, SecurityGateway}` |
+| `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `ChannelRegistry` and adapters (e.g. `TuiAdapter`); Router owns the registry for dispatch |
 | `storage` | Provides all Store traits and libsql implementations; injected into managers |
 | `hook` | `AgentActor` triggers `PreMessage` and `PreResponse` hooks at lifecycle points |

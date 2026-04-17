@@ -5,16 +5,21 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
-aura-channels = { workspace = true }
+aura-storage = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
+aho-corasick = { workspace = true }
 uuid = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

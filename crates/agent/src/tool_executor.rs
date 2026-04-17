@@ -17,6 +17,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::observability::ObservabilityRecorder;
+use crate::security::SecurityGateway;
 
 /// Preview length used when rendering parameters inside an approval prompt.
 const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
@@ -27,6 +28,7 @@ pub struct ToolExecutor {
     tool_registry: Arc<ToolRegistry>,
     default_timeout: Duration,
     gate_map: Arc<ApprovalGateMap>,
+    security_gateway: Arc<SecurityGateway>,
 }
 
 impl ToolExecutor {
@@ -34,11 +36,13 @@ impl ToolExecutor {
         tool_registry: Arc<ToolRegistry>,
         default_timeout: Duration,
         gate_map: Arc<ApprovalGateMap>,
+        security_gateway: Arc<SecurityGateway>,
     ) -> Self {
         Self {
             tool_registry,
             default_timeout,
             gate_map,
+            security_gateway,
         }
     }
 
@@ -190,18 +194,34 @@ impl ToolExecutor {
             cancellation_token: CancellationToken::new(),
         };
 
+        // Reveal placeholders in the tool's arguments just before
+        // execution. The pre-reveal `params` was already captured in
+        // `SpanInput::ToolExecution` above and in the approval prompt, so
+        // the trace / approval surfaces keep placeholder form while the
+        // tool itself receives plaintext for its API call.
+        let mut params_revealed = params.clone();
+        self.security_gateway
+            .reveal_in_value(&mut params_revealed)
+            .await?;
+
         // Execute with timeout enforcement
         let start = std::time::Instant::now();
         let result = tokio::time::timeout(
             ctx.timeout,
-            self.tool_registry.execute(tool_name, params, &ctx),
+            self.tool_registry.execute(tool_name, params_revealed, &ctx),
         )
         .await;
 
         let elapsed = start.elapsed();
 
         match result {
-            Ok(Ok(output)) => {
+            Ok(Ok(mut output)) => {
+                // Defensive: if the tool echoed back any secret-looking
+                // content, sanitize before the result flows into trace,
+                // memory, or the next LLM call as a tool-result message.
+                self.security_gateway
+                    .sanitize_tool_output(&mut output)
+                    .await?;
                 let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
                 let result = SpanResult::ToolResult {
                     output: output_value.clone(),
@@ -212,7 +232,12 @@ impl ToolExecutor {
                 Ok(output)
             }
             Ok(Err(e)) => {
-                let error_msg = e.to_string();
+                let raw = e.to_string();
+                let error_msg = self
+                    .security_gateway
+                    .sanitize_error(&raw)
+                    .await
+                    .unwrap_or(raw);
                 recorder.fail(handle, &error_msg).await?;
                 Err(e.into())
             }

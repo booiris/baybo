@@ -22,8 +22,43 @@ use tracing::{debug, info, warn};
 use crate::error_recovery::ErrorHandler;
 use crate::observability::ObservabilityRecorder;
 use crate::policy::ExecutionPolicy;
+use crate::security::SecurityGateway;
 use crate::soul::Soul;
 use crate::tool_executor::ToolExecutor;
+
+/// The maximum amount of text we'll hold in the streaming buffer waiting
+/// for a placeholder to complete. If a chunk ends with a lone `{{` but no
+/// closing `}}` arrives within this many bytes, we flush anyway — no real
+/// placeholder is this long, so holding further would be a DoS vector.
+const STREAM_BUFFER_HIGH_WATER: usize = 128;
+
+/// Compute the byte index at which it is safe to flush `pending` to the
+/// output stream. Anything after that index is withheld because it might
+/// be the beginning of a `{{SECRET_...}}` placeholder split across chunks.
+///
+/// Returns `pending.len()` when no partial placeholder is pending, or a
+/// smaller value pointing at the earliest `{` of a potential placeholder.
+/// If the buffer grows past `STREAM_BUFFER_HIGH_WATER` we flush the whole
+/// thing to avoid unbounded buffering on pathological input.
+fn safe_flush_boundary(pending: &str) -> usize {
+    if pending.len() > STREAM_BUFFER_HIGH_WATER {
+        return pending.len();
+    }
+    // Placeholders open with `{{`. If the last `{{` has no matching
+    // `}}` after it, it might be a placeholder split across chunks —
+    // withhold from that `{{`. A lone trailing `{` could become `{{`
+    // when the next chunk lands, so withhold it too.
+    if let Some(idx) = pending.rfind("{{") {
+        let tail = &pending[idx..];
+        if !tail.contains("}}") {
+            return idx;
+        }
+    }
+    if pending.ends_with('{') {
+        return pending.len() - 1;
+    }
+    pending.len()
+}
 
 /// Outcome of the skill risk assessor for a single candidate. `run()`
 /// dispatches on this — `Block` drops the skill with an error notice,
@@ -45,6 +80,7 @@ pub struct AgentLoop {
     memory_manager: Arc<MemoryManager>,
     policy: ExecutionPolicy,
     soul: Soul,
+    security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
     /// Optional LLM risk assessor. When set, every skill candidate is
     /// checked before injection: `Dangerous` verdicts veto the skill,
@@ -63,6 +99,7 @@ impl AgentLoop {
         memory_manager: Arc<MemoryManager>,
         policy: ExecutionPolicy,
         soul: Soul,
+        security_gateway: Arc<SecurityGateway>,
     ) -> Self {
         Self {
             llm_client,
@@ -73,6 +110,7 @@ impl AgentLoop {
             memory_manager,
             policy,
             soul,
+            security_gateway,
             error_handler: ErrorHandler::default(),
             skill_assessor: None,
         }
@@ -325,7 +363,7 @@ impl AgentLoop {
                     )
                     .await;
 
-                let result_text = match &tool_result {
+                let raw_result_text = match &tool_result {
                     Ok(ToolOutput::Text(s)) => s.clone(),
                     Ok(ToolOutput::Json(v)) => {
                         serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
@@ -347,13 +385,21 @@ impl AgentLoop {
                     }
                 };
 
+                // Cap size before wrapping so the truncation notice lands
+                // inside the `<tool_output>` envelope, then wrap so the LLM
+                // sees a clear boundary around untrusted tool output.
+                let capped = self.security_gateway.cap_tool_output(raw_result_text);
+                let wrapped = self
+                    .security_gateway
+                    .wrap_tool_output_for_llm(&tool_call.name, &capped);
+
                 // Append tool result to context with the tool_use_id so the
                 // LLM can correlate results with their originating calls.
                 let tool_msg = ChatMessage {
                     role: Role::Tool,
                     content: vec![ContentBlock::ToolResult {
                         tool_use_id: tool_call.id.clone(),
-                        content: result_text,
+                        content: wrapped,
                     }],
                 };
                 self.context_manager.append(session, &tool_msg).await?;
@@ -464,7 +510,18 @@ impl AgentLoop {
         };
 
         match llm_result {
-            Ok(response) => {
+            Ok(mut response) => {
+                // Defensive scrub of LLM output before it touches trace,
+                // memory, or session history. The LLM never saw real
+                // secrets (input is already sanitized), but it may echo
+                // back placeholders or fabricate secret-looking strings.
+                if let Err(e) = self
+                    .security_gateway
+                    .sanitize_llm_response(&mut response)
+                    .await
+                {
+                    warn!(error = %e, "failed to sanitize LLM response");
+                }
                 let trace_tool_calls: Vec<aura_trace::LlmToolCallRecord> = response
                     .tool_calls
                     .iter()
@@ -518,7 +575,12 @@ impl AgentLoop {
                 Ok(response)
             }
             Err(e) => {
-                let error_msg = e.to_string();
+                let raw = e.to_string();
+                let error_msg = self
+                    .security_gateway
+                    .sanitize_error(&raw)
+                    .await
+                    .unwrap_or(raw);
                 recorder.fail(handle, &error_msg).await?;
                 if let Err(fe) = recorder.flush().await {
                     warn!(error = %fe, "failed to flush trace after LLM failure");
@@ -530,6 +592,14 @@ impl AgentLoop {
 
     /// Run a streaming chat request, forwarding each text chunk through
     /// `delta_tx` while accumulating the full response to return.
+    ///
+    /// The delta stream is the single place where real plaintext may
+    /// legitimately leave the agent: each chunk is scanned for leaks
+    /// (tokenized into the placeholder form that the accumulated
+    /// `content` remembers) and then revealed via the vault just before
+    /// being sent to the adapter. The returned `LlmResponse.content`
+    /// remains in placeholder form so trace / memory / next-turn context
+    /// never see real secrets.
     async fn chat_streaming(
         &self,
         request: &ChatRequest,
@@ -543,22 +613,21 @@ impl AgentLoop {
         let mut thinking = String::new();
         let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
 
+        // Buffer for a trailing fragment that might be the start of a
+        // placeholder (e.g. the chunk ends in "{{SECR"). We hold it back
+        // until a safe boundary is seen.
+        let mut pending = String::new();
+
         while let Some(event) = stream.next().await {
             match event? {
                 StreamEvent::Text(chunk) => {
-                    content.push_str(&chunk);
-                    if delta_tx
-                        .send(AgentOutput::Delta {
-                            session_id: session.id.clone(),
-                            channel: session.channel,
-                            text: chunk,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        // Receiver gone; keep draining the LLM stream so the
-                        // provider connection closes cleanly.
-                        debug!("delta receiver dropped, continuing without forwarding");
+                    pending.push_str(&chunk);
+
+                    let flush_to = safe_flush_boundary(&pending);
+                    if flush_to > 0 {
+                        let flushable: String = pending.drain(..flush_to).collect();
+                        self.stream_emit(&flushable, session, &mut content, delta_tx)
+                            .await;
                     }
                 }
                 StreamEvent::ToolCall(info) => tool_calls.push(info),
@@ -566,6 +635,13 @@ impl AgentLoop {
                 StreamEvent::ThinkingBlock(block) => thinking_blocks.push(block),
                 StreamEvent::Usage(u) => usage = u,
             }
+        }
+
+        // Flush any remaining buffered text.
+        if !pending.is_empty() {
+            let flushable = std::mem::take(&mut pending);
+            self.stream_emit(&flushable, session, &mut content, delta_tx)
+                .await;
         }
 
         // Build content_blocks: thinking blocks first (providers expect
@@ -586,6 +662,56 @@ impl AgentLoop {
                 Some(thinking)
             },
         })
+    }
+
+    /// Tokenize + reveal a single stream fragment:
+    ///   1. Scan for leaks, mint placeholders, persist to vault, substitute.
+    ///      The substituted (placeholder-form) text is appended to `content`
+    ///      so the non-streaming `LlmResponse` stays sanitized.
+    ///   2. Reveal placeholders in the fragment for delivery to the adapter,
+    ///      so the user-visible stream shows plaintext.
+    async fn stream_emit(
+        &self,
+        fragment: &str,
+        session: &Session,
+        content: &mut String,
+        delta_tx: &mpsc::Sender<AgentOutput>,
+    ) {
+        let sanitized = match self
+            .security_gateway
+            .sanitize_stream_fragment(fragment)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to sanitize stream fragment; dropping");
+                return;
+            }
+        };
+
+        // Record the placeholder-form in the accumulated content.
+        content.push_str(&sanitized);
+
+        // Reveal for adapter delivery.
+        let revealed = match self.security_gateway.reveal_in_text(&sanitized).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "failed to reveal stream fragment; sending placeholder form");
+                sanitized.clone()
+            }
+        };
+
+        if delta_tx
+            .send(AgentOutput::Delta {
+                session_id: session.id.clone(),
+                channel: session.channel,
+                text: revealed,
+            })
+            .await
+            .is_err()
+        {
+            debug!("delta receiver dropped, continuing without forwarding");
+        }
     }
 
     /// If the trace collector's auto-snapshot interval has been reached,
@@ -716,5 +842,45 @@ impl AgentLoop {
             "session rolled back"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stream_buffer_tests {
+    use super::safe_flush_boundary;
+
+    #[test]
+    fn empty_flushes_nothing() {
+        assert_eq!(safe_flush_boundary(""), 0);
+    }
+
+    #[test]
+    fn plain_text_flushes_all() {
+        let s = "hello world";
+        assert_eq!(safe_flush_boundary(s), s.len());
+    }
+
+    #[test]
+    fn trailing_open_brace_is_withheld() {
+        let s = "hello {";
+        assert_eq!(safe_flush_boundary(s), s.find('{').unwrap());
+    }
+
+    #[test]
+    fn trailing_partial_placeholder_is_withheld() {
+        let s = "abc {{SECRET_deadbee";
+        assert_eq!(safe_flush_boundary(s), s.find('{').unwrap());
+    }
+
+    #[test]
+    fn complete_placeholder_flushes_all() {
+        let s = "abc {{SECRET_deadbeefdeadbeefdeadbeef}} def";
+        assert_eq!(safe_flush_boundary(s), s.len());
+    }
+
+    #[test]
+    fn high_water_forces_flush() {
+        let s: String = "a".repeat(200) + "{";
+        assert_eq!(safe_flush_boundary(&s), s.len());
     }
 }
