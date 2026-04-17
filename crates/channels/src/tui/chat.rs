@@ -6,7 +6,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::{AppState, ApprovalChatState, ChatLine};
@@ -69,7 +71,10 @@ fn render_scrollback(frame: &mut Frame, area: Rect, state: &AppState) {
                 );
                 let mut first = true;
                 for block in blocks {
-                    for (i, text) in render_block(block).lines().enumerate() {
+                    let Some(rendered) = render_block(block) else {
+                        continue;
+                    };
+                    for (i, text) in rendered.lines().enumerate() {
                         let spans = if first && i == 0 {
                             vec![prefix.clone(), Span::raw(text.to_string())]
                         } else {
@@ -303,10 +308,7 @@ fn render_approval_inline(
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "wants to run ",
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled("wants to run ", Style::default().fg(Color::Yellow)),
                 Span::styled(
                     entry.tool.clone(),
                     Style::default()
@@ -434,7 +436,7 @@ fn format_access(acc: &ResourceAccess) -> Vec<Span<'static>> {
 
 /// Count how many rows a paragraph will occupy when rendered with
 /// `Wrap { trim: false }` at the given width. Mirrors ratatui's word-wrap
-/// behaviour: break on spaces, hard-break words longer than the column
+/// behavior: break on spaces, hard-break words longer than the column
 /// budget. Used to reserve an accurate row count for the banner so text
 /// isn't clipped on narrow terminals.
 fn wrapped_line_count(text: &str, width: u16) -> u16 {
@@ -468,18 +470,40 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
     total.max(1)
 }
 
-fn render_block(block: &ContentBlock) -> String {
+/// Warning appended below a `CronCreate` tool call whose schedule recurs.
+/// TUI sessions are ephemeral — triggers fired while the daemon is down
+/// are lost, and a fresh TUI session will not replay them. Keeping this
+/// purely in the TUI renderer means cron/the LLM stay agnostic to channel
+/// quirks: whoever schedules it doesn't need to know, but whoever watches
+/// the TUI gets the caveat inline.
+const TUI_CRON_RECURRING_HINT: &str = "⚠ This cron is tied to the TUI channel. \
+    It only fires while the Aura daemon is running, and a new TUI session \
+    will not replay triggers missed while it was down. For long-lived \
+    recurring jobs, prefer a persistent channel (telegram/discord/http).";
+
+fn render_block(block: &ContentBlock) -> Option<String> {
     match block {
-        ContentBlock::Text(text) => text.clone(),
-        ContentBlock::Image { mime_type, .. } => format!("[Image: {mime_type}]"),
-        ContentBlock::Audio { mime_type, .. } => format!("[Audio: {mime_type}]"),
+        ContentBlock::Text(text) => Some(text.clone()),
+        ContentBlock::Image { mime_type, .. } => Some(format!("[Image: {mime_type}]")),
+        ContentBlock::Audio { mime_type, .. } => Some(format!("[Audio: {mime_type}]")),
         ContentBlock::File {
             filename,
             mime_type,
             ..
-        } => format!("[File: {filename} ({mime_type})]"),
-        ContentBlock::ToolUse { name, .. } => format!("[Tool: {name}]"),
-        ContentBlock::ToolResult { content, .. } => content.clone(),
-        ContentBlock::Thinking { .. } => "[Thinking...]".to_string(),
+        } => Some(format!("[File: {filename} ({mime_type})]")),
+        // Tool activity is an implementation detail — the user only
+        // cares about the assistant's final narration. The one exception
+        // is CronCreate with a recurring schedule, where the TUI owes
+        // the user a caveat about ephemeral sessions.
+        ContentBlock::ToolUse { name, input, .. } => {
+            (name == "CronCreate"
+                && input
+                    .get("schedule")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty()))
+            .then(|| TUI_CRON_RECURRING_HINT.to_string())
+        }
+        ContentBlock::ToolResult { .. } => None,
+        ContentBlock::Thinking { .. } => None,
     }
 }

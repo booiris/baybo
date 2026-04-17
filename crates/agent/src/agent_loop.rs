@@ -187,6 +187,12 @@ impl AgentLoop {
 
         // Iterative LLM loop
         let mut iterations = 0;
+        // Tool invocations issued during intermediate iterations. Channels
+        // only receive the terminal `OutgoingMessage`, so without this the
+        // TUI (which renders `ContentBlock::ToolUse`) would never see tool
+        // activity — breaking any channel-side behavior keyed on the tool
+        // call (e.g. the TUI cron-recurring hint).
+        let mut accumulated_tool_uses: Vec<ContentBlock> = Vec::new();
         loop {
             if iterations >= self.policy.max_iterations {
                 warn!(max = self.policy.max_iterations, "max iterations reached");
@@ -222,13 +228,20 @@ impl AgentLoop {
             // If no tool calls, we have the final response
             if response.tool_calls.is_empty() {
                 // Use content_blocks when available, falling back to the text string.
-                let final_blocks = if response.content_blocks.is_empty() {
+                let response_blocks = if response.content_blocks.is_empty() {
                     vec![ContentBlock::Text(response.content.clone())]
                 } else {
                     response.content_blocks.clone()
                 };
 
-                let final_text = aura_llm::multimodal::extract_text(&final_blocks);
+                // Append the tool_use blocks issued during intermediate
+                // iterations after the final narration so channels that
+                // key off them (e.g. the TUI cron hint) can render below
+                // the assistant's reply.
+                let mut final_blocks = response_blocks.clone();
+                final_blocks.extend(std::mem::take(&mut accumulated_tool_uses));
+
+                let final_text = aura_llm::multimodal::extract_text(&response_blocks);
 
                 info!(
                     iterations,
@@ -236,10 +249,12 @@ impl AgentLoop {
                     "conversation loop complete"
                 );
 
-                // Append assistant response to context
+                // Append only the final response blocks to context —
+                // intermediate tool_use blocks were already appended in
+                // prior iterations.
                 let assistant_msg = ChatMessage {
                     role: Role::Assistant,
-                    content: final_blocks.clone(),
+                    content: response_blocks,
                 };
                 self.context_manager.append(session, &assistant_msg).await?;
 
@@ -271,12 +286,14 @@ impl AgentLoop {
                 response.content_blocks.clone()
             };
             for tc in &response.tool_calls {
-                assistant_blocks.push(ContentBlock::ToolUse {
+                let block = ContentBlock::ToolUse {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.arguments.clone(),
                     signature: tc.signature.clone(),
-                });
+                };
+                assistant_blocks.push(block.clone());
+                accumulated_tool_uses.push(block);
             }
             let assistant_msg = ChatMessage {
                 role: Role::Assistant,
