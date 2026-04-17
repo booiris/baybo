@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
+chrono = { workspace = true }
+iana-time-zone = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

@@ -30,6 +30,7 @@ pub mod bash;
 pub mod edit;
 pub mod glob_tool;
 pub mod grep;
+pub mod now;
 pub mod read;
 pub mod todo;
 pub mod web_fetch;
@@ -44,6 +45,7 @@ pub use echo::EchoTool;
 pub use edit::EditTool;
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
+pub use now::NowTool;
 pub use read::ReadTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
@@ -69,6 +71,7 @@ pub fn default_tools() -> Vec<(Arc<dyn Tool>, ToolManifest)> {
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
         trusted(WebFetchTool, vec![ToolCapability::Http]),
+        trusted(NowTool, vec![]),
     ];
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));
