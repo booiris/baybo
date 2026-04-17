@@ -344,173 +344,30 @@ fn cron_list_parses() {
 }
 
 #[test]
-fn cron_add_requires_user_schedule_and_prompt() {
-    assert!(Cli::try_parse_from(["aura", "cron", "add"]).is_err());
-    assert!(
-        Cli::try_parse_from([
+fn cron_mutating_subcommands_are_rejected() {
+    for args in [
+        &[
             "aura",
             "cron",
             "add",
-            "--user",
+            "-u",
             "alice",
-            "--schedule",
-            "* * * * *"
-        ])
-        .is_err(),
-        "missing --prompt must fail"
-    );
-
-    let cli = parse(&[
-        "cron",
-        "add",
-        "--user",
-        "alice",
-        "--schedule",
-        "0 9 * * *",
-        "--prompt",
-        "morning report",
-    ]);
-    match cli.command {
-        Some(Commands::Cron {
-            cmd:
-                CronCmd::Add {
-                    user,
-                    channel,
-                    schedule,
-                    prompt,
-                    one_shot,
-                    yes,
-                },
-        }) => {
-            assert_eq!(user, "alice");
-            assert_eq!(channel, "cli", "defaults to cli channel");
-            assert_eq!(schedule, "0 9 * * *");
-            assert_eq!(prompt, "morning report");
-            assert!(!one_shot);
-            assert!(!yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn cron_add_accepts_one_shot_and_channel_and_yes() {
-    let cli = parse(&[
-        "cron",
-        "add",
-        "--user",
-        "bob",
-        "--channel",
-        "telegram",
-        "--schedule",
-        "*/5 * * * *",
-        "--prompt",
-        "ping",
-        "--one-shot",
-        "--yes",
-    ]);
-    match cli.command {
-        Some(Commands::Cron {
-            cmd:
-                CronCmd::Add {
-                    channel,
-                    one_shot,
-                    yes,
-                    ..
-                },
-        }) => {
-            assert_eq!(channel, "telegram");
-            assert!(one_shot);
-            assert!(yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn cron_show_requires_id() {
-    assert!(Cli::try_parse_from(["aura", "cron", "show"]).is_err());
-    let cli = parse(&["cron", "show", "cron-1"]);
-    match cli.command {
-        Some(Commands::Cron {
-            cmd: CronCmd::Show { id },
-        }) => assert_eq!(id, "cron-1"),
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn cron_rm_accepts_yes_flag() {
-    let cli = parse(&["cron", "rm", "c1"]);
-    match cli.command {
-        Some(Commands::Cron {
-            cmd: CronCmd::Rm { id, yes },
-        }) => {
-            assert_eq!(id, "c1");
-            assert!(!yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    let cli = parse(&["cron", "rm", "c1", "--yes"]);
-    assert!(matches!(
-        cli.command,
-        Some(Commands::Cron {
-            cmd: CronCmd::Rm { yes: true, .. }
-        })
-    ));
-}
-
-#[test]
-fn cron_enable_disable_parse() {
-    let cli = parse(&["cron", "enable", "c1"]);
-    assert!(matches!(
-        cli.command,
-        Some(Commands::Cron {
-            cmd: CronCmd::Enable { .. }
-        })
-    ));
-    let cli = parse(&["cron", "disable", "c1"]);
-    assert!(matches!(
-        cli.command,
-        Some(Commands::Cron {
-            cmd: CronCmd::Disable { .. }
-        })
-    ));
-}
-
-#[test]
-fn cron_run_requires_yes_flag_only_in_slash_mode() {
-    let cli = parse(&["cron", "run", "c1"]);
-    match cli.command {
-        Some(Commands::Cron {
-            cmd: CronCmd::Run { id, yes },
-        }) => {
-            assert_eq!(id, "c1");
-            assert!(!yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    let cli = parse(&["cron", "run", "c1", "-y"]);
-    assert!(matches!(
-        cli.command,
-        Some(Commands::Cron {
-            cmd: CronCmd::Run { yes: true, .. }
-        })
-    ));
-}
-
-#[test]
-fn cron_runs_requires_id_flag() {
-    assert!(Cli::try_parse_from(["aura", "cron", "runs"]).is_err());
-    assert!(Cli::try_parse_from(["aura", "cron", "runs", "c1"]).is_err());
-    let cli = parse(&["cron", "runs", "--id", "c1"]);
-    match cli.command {
-        Some(Commands::Cron {
-            cmd: CronCmd::Runs { id },
-        }) => assert_eq!(id, "c1"),
-        other => panic!("unexpected: {other:?}"),
+            "-s",
+            "0 9 * * *",
+            "-p",
+            "hi",
+        ][..],
+        &["aura", "cron", "show", "c1"],
+        &["aura", "cron", "rm", "c1"],
+        &["aura", "cron", "enable", "c1"],
+        &["aura", "cron", "disable", "c1"],
+        &["aura", "cron", "run", "c1"],
+        &["aura", "cron", "runs", "--id", "c1"],
+    ] {
+        assert!(
+            Cli::try_parse_from(args).is_err(),
+            "expected rejection of cron mutation subcommand: {args:?}"
+        );
     }
 }
 

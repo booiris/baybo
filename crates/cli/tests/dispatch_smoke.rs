@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, JobManager, MemoryManager, SessionManager, ShutdownSignal};
+use aura_agent::{CronScheduler, JobManager, MemoryManager, SessionManager};
 use aura_channels::ChannelRegistry;
 use aura_cli::cli::{
     AgentCmd, ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd,
@@ -16,7 +16,7 @@ use aura_cli::cli::{
 };
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
-use aura_cron::CronRunMode;
+use aura_cron::{CronSchedule, TriggerAction};
 use aura_job::{Job, JobError, JobStatus, JobTransition, OperationKind};
 use aura_model::{ChannelType, MemoryCategory, MemoryEntry, Session, SessionState, User};
 use aura_skills::SkillRegistry;
@@ -434,7 +434,11 @@ fn make_cron_scheduler() -> (
     mpsc::Receiver<aura_agent::CronTriggerEvent>,
 ) {
     let (tx, rx) = mpsc::channel(16);
-    let scheduler = CronScheduler::new(Box::new(MemoryCronStore::new()), tx, ShutdownSignal::new());
+    let scheduler = CronScheduler::new(
+        Box::new(MemoryCronStore::new()),
+        tx,
+        Arc::new(aura_cron::NeverShutdown),
+    );
     (Arc::new(scheduler), rx)
 }
 
@@ -1049,9 +1053,11 @@ async fn cron_list_returns_all_scheduled_jobs() {
         .create_job(
             "alice",
             ChannelType::Tui,
-            "0 9 * * *",
-            "morning",
-            CronRunMode::Recurring,
+            CronSchedule::cron("0 9 * * *"),
+            TriggerAction::Prompt {
+                prompt: "morning".into(),
+            },
+            None,
         )
         .await
         .unwrap();
@@ -1059,9 +1065,11 @@ async fn cron_list_returns_all_scheduled_jobs() {
         .create_job(
             "bob",
             ChannelType::Tui,
-            "0 18 * * *",
-            "evening",
-            CronRunMode::Recurring,
+            CronSchedule::cron("0 18 * * *"),
+            TriggerAction::Prompt {
+                prompt: "evening".into(),
+            },
+            None,
         )
         .await
         .unwrap();
@@ -1071,368 +1079,6 @@ async fn cron_list_returns_all_scheduled_jobs() {
         .expect("cron list");
     let data = out.data.expect("structured payload");
     assert_eq!(data["jobs"].as_array().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn cron_show_errors_for_missing_id() {
-    let (ctx, _rx, _sched) = context_with_cron().await;
-    let err = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Show { id: "ghost".into() },
-        },
-    )
-    .await
-    .expect_err("show missing should fail");
-    assert!(format!("{err}").contains("ghost"));
-}
-
-#[tokio::test]
-async fn cron_show_returns_metadata_for_known_id() {
-    let (ctx, _rx, sched) = context_with_cron().await;
-    let job = sched
-        .create_job(
-            "alice",
-            ChannelType::Tui,
-            "0 9 * * *",
-            "hello",
-            CronRunMode::Recurring,
-        )
-        .await
-        .unwrap();
-
-    let out = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Show { id: job.id.clone() },
-        },
-    )
-    .await
-    .expect("cron show");
-    let data = out.data.expect("structured payload");
-    assert_eq!(data["id"], job.id);
-    assert_eq!(data["prompt"], "hello");
-}
-
-#[tokio::test]
-async fn cron_rm_requires_yes_in_slash_mode() {
-    let (ctx, _rx, sched) = context_with_cron().await;
-    let job = sched
-        .create_job(
-            "alice",
-            ChannelType::Tui,
-            "0 9 * * *",
-            "test",
-            CronRunMode::Recurring,
-        )
-        .await
-        .unwrap();
-    let slash_ctx = ctx.with_invocation(Invocation::Slash);
-    let err = dispatch::run(
-        &slash_ctx,
-        Commands::Cron {
-            cmd: CronCmd::Rm {
-                id: job.id,
-                yes: false,
-            },
-        },
-    )
-    .await
-    .expect_err("rm without --yes should fail");
-    assert!(matches!(err, aura_cli::CliError::ConfirmationRequired(_)));
-}
-
-#[tokio::test]
-async fn cron_rm_with_yes_deletes() {
-    let (ctx, _rx, sched) = context_with_cron().await;
-    let job = sched
-        .create_job(
-            "alice",
-            ChannelType::Tui,
-            "0 9 * * *",
-            "test",
-            CronRunMode::Recurring,
-        )
-        .await
-        .unwrap();
-
-    let out = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Rm {
-                id: job.id.clone(),
-                yes: true,
-            },
-        },
-    )
-    .await
-    .expect("rm should succeed");
-    assert_eq!(out.data.unwrap()["deleted"], job.id);
-    assert!(sched.get_job(&job.id).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn cron_enable_disable_round_trip() {
-    let (ctx, _rx, sched) = context_with_cron().await;
-    let job = sched
-        .create_job(
-            "alice",
-            ChannelType::Tui,
-            "0 9 * * *",
-            "test",
-            CronRunMode::Recurring,
-        )
-        .await
-        .unwrap();
-
-    dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Disable { id: job.id.clone() },
-        },
-    )
-    .await
-    .expect("disable");
-    assert!(
-        sched
-            .get_job(&job.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .next_trigger_at
-            .is_none()
-    );
-
-    dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Enable { id: job.id.clone() },
-        },
-    )
-    .await
-    .expect("enable");
-    assert!(
-        sched
-            .get_job(&job.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .next_trigger_at
-            .is_some()
-    );
-}
-
-#[tokio::test]
-async fn cron_run_requires_yes_in_slash_mode() {
-    let (ctx, _rx, sched) = context_with_cron().await;
-    let job = sched
-        .create_job(
-            "alice",
-            ChannelType::Tui,
-            "0 9 * * *",
-            "fire",
-            CronRunMode::Recurring,
-        )
-        .await
-        .unwrap();
-    let slash_ctx = ctx.with_invocation(Invocation::Slash);
-    let err = dispatch::run(
-        &slash_ctx,
-        Commands::Cron {
-            cmd: CronCmd::Run {
-                id: job.id,
-                yes: false,
-            },
-        },
-    )
-    .await
-    .expect_err("run without --yes should fail in slash mode");
-    assert!(matches!(err, aura_cli::CliError::ConfirmationRequired(_)));
-}
-
-#[tokio::test]
-async fn cron_run_dispatches_and_records_execution() {
-    let (ctx, mut rx, sched) = context_with_cron().await;
-    let job = sched
-        .create_job(
-            "alice",
-            ChannelType::Tui,
-            "0 9 * * *",
-            "fire",
-            CronRunMode::Recurring,
-        )
-        .await
-        .unwrap();
-
-    let out = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Run {
-                id: job.id.clone(),
-                yes: true,
-            },
-        },
-    )
-    .await
-    .expect("run should succeed");
-    assert_eq!(out.data.unwrap()["job"], job.id);
-
-    let event = rx.try_recv().expect("trigger dispatched");
-    assert_eq!(event.job_id, job.id);
-    assert_eq!(event.prompt, "fire");
-}
-
-#[tokio::test]
-async fn cron_runs_returns_empty_for_unfired_job() {
-    let (ctx, _rx, sched) = context_with_cron().await;
-    let job = sched
-        .create_job(
-            "alice",
-            ChannelType::Tui,
-            "0 9 * * *",
-            "fresh",
-            CronRunMode::Recurring,
-        )
-        .await
-        .unwrap();
-    let out = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Runs { id: job.id.clone() },
-        },
-    )
-    .await
-    .expect("runs");
-    assert!(out.human.contains("no executions"));
-    assert!(out.data.unwrap()["runs"].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn cron_add_persists_job_and_round_trips_through_list() {
-    let (ctx, _rx, _sched) = context_with_cron().await;
-    let out = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Add {
-                user: "alice".into(),
-                channel: "cli".into(),
-                schedule: "0 9 * * *".into(),
-                prompt: "morning report".into(),
-                one_shot: false,
-                yes: false,
-            },
-        },
-    )
-    .await
-    .expect("cron add");
-    let data = out.data.expect("payload");
-    let new_id = data["id"].as_str().expect("id").to_string();
-    assert_eq!(data["user"], "alice");
-    assert_eq!(data["run_mode"], "recurring");
-    assert!(data["next_trigger_at"].is_string(), "enabled by default");
-
-    let list = dispatch::run(&ctx, Commands::Cron { cmd: CronCmd::List })
-        .await
-        .expect("cron list");
-    let rows = list.data.expect("payload")["jobs"].clone();
-    assert!(
-        rows.as_array()
-            .unwrap()
-            .iter()
-            .any(|j| j["id"] == new_id.as_str()),
-        "added job should surface in list"
-    );
-}
-
-#[tokio::test]
-async fn cron_add_one_shot_flag_flips_run_mode() {
-    let (ctx, _rx, _sched) = context_with_cron().await;
-    let out = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Add {
-                user: "bob".into(),
-                channel: "cli".into(),
-                schedule: "*/5 * * * *".into(),
-                prompt: "ping".into(),
-                one_shot: true,
-                yes: false,
-            },
-        },
-    )
-    .await
-    .expect("cron add one-shot");
-    assert_eq!(out.data.expect("payload")["run_mode"], "one_shot");
-}
-
-#[tokio::test]
-async fn cron_add_rejects_bad_channel() {
-    let (ctx, _rx, _sched) = context_with_cron().await;
-    let err = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Add {
-                user: "alice".into(),
-                channel: "mars".into(),
-                schedule: "0 9 * * *".into(),
-                prompt: "hi".into(),
-                one_shot: false,
-                yes: false,
-            },
-        },
-    )
-    .await
-    .expect_err("unknown channel");
-    assert!(err.to_string().contains("mars"));
-}
-
-#[tokio::test]
-async fn cron_add_rejects_invalid_schedule() {
-    let (ctx, _rx, _sched) = context_with_cron().await;
-    let err = dispatch::run(
-        &ctx,
-        Commands::Cron {
-            cmd: CronCmd::Add {
-                user: "alice".into(),
-                channel: "cli".into(),
-                schedule: "not-a-cron".into(),
-                prompt: "hi".into(),
-                one_shot: false,
-                yes: false,
-            },
-        },
-    )
-    .await
-    .expect_err("invalid cron expression");
-    assert!(
-        err.to_string().to_lowercase().contains("cron"),
-        "error should mention cron: {err}"
-    );
-}
-
-#[tokio::test]
-async fn cron_add_slash_mode_requires_yes() {
-    let (ctx, _rx, _sched) = context_with_cron().await;
-    let slash_ctx = ctx.with_invocation(Invocation::Slash);
-    let err = dispatch::run(
-        &slash_ctx,
-        Commands::Cron {
-            cmd: CronCmd::Add {
-                user: "alice".into(),
-                channel: "cli".into(),
-                schedule: "0 9 * * *".into(),
-                prompt: "hi".into(),
-                one_shot: false,
-                yes: false,
-            },
-        },
-    )
-    .await
-    .expect_err("slash without --yes");
-    assert!(
-        matches!(err, aura_cli::CliError::ConfirmationRequired(_)),
-        "expected ConfirmationRequired, got: {err:?}"
-    );
 }
 
 // ----------------------- memory family --------------------------------------
@@ -2517,7 +2163,6 @@ async fn llm_probe_without_client_reports_unavailable() {
         .expect_err("no client configured");
     assert!(err.to_string().contains("llm client"));
 }
-
 
 // --- skills ---
 

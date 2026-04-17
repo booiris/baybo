@@ -35,3 +35,4 @@ shell-words = { workspace = true }
 
 [dev-dependencies]
 aura-context = { workspace = true }
+aura-cron = { workspace = true, features = ["test-support"] }
