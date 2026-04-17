@@ -20,6 +20,7 @@ members = [
     "crates/config",
     "crates/cli",
 ]
+exclude = ["crates/security/fuzz"]
 
 [workspace.package]
 version = "0.1.0"

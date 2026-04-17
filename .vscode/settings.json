@@ -91,6 +91,7 @@
         "roundtrips",
         "rsproxy",
         "rusqlite",
+        "rustup",
         "Sandboxed",
         "sandboxing",
         "sanitizable",

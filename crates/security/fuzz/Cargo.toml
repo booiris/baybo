@@ -1,0 +1,52 @@
+[package]
+name = "aura-security-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.aura-security]
+path = ".."
+
+# Excluded from the outer workspace so `cargo fuzz` has its own resolver.
+[workspace]
+
+[[bin]]
+name = "fuzz_injection_detector"
+path = "fuzz_targets/fuzz_injection_detector.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_leak_detector"
+path = "fuzz_targets/fuzz_leak_detector.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sensitive_paths"
+path = "fuzz_targets/fuzz_sensitive_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_crypto_roundtrip"
+path = "fuzz_targets/fuzz_crypto_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_placeholder"
+path = "fuzz_targets/fuzz_placeholder.rs"
+test = false
+doc = false
+bench = false
