@@ -665,12 +665,11 @@ impl AgentLoop {
         })
     }
 
-    /// Tokenize + reveal a single stream fragment:
-    ///   1. Scan for leaks, mint placeholders, persist to vault, substitute.
-    ///      The substituted (placeholder-form) text is appended to `content`
-    ///      so the non-streaming `LlmResponse` stays sanitized.
-    ///   2. Reveal placeholders in the fragment for delivery to the adapter,
-    ///      so the user-visible stream shows plaintext.
+    /// Tokenize a single stream fragment:
+    /// scan for leaks, mint placeholders, persist to vault, substitute. The
+    /// placeholder-form is both appended to `content` (so the accumulated
+    /// `LlmResponse` stays sanitized) and delivered as-is to the adapter, so
+    /// the streaming view matches the final persisted message.
     async fn stream_emit(
         &self,
         fragment: &str,
@@ -690,23 +689,13 @@ impl AgentLoop {
             }
         };
 
-        // Record the placeholder-form in the accumulated content.
         content.push_str(&sanitized);
-
-        // Reveal for adapter delivery.
-        let revealed = match self.security_gateway.reveal_in_text(&sanitized).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "failed to reveal stream fragment; sending placeholder form");
-                sanitized.clone()
-            }
-        };
 
         if delta_tx
             .send(AgentOutput::Delta {
                 session_id: session.id.clone(),
                 channel: session.channel,
-                text: revealed,
+                text: sanitized,
             })
             .await
             .is_err()

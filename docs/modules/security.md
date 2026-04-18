@@ -35,14 +35,14 @@ Messages pass through `SecurityGateway::sanitize_input()` immediately after chan
 
 Before any response leaves the system, `sanitize_output()` runs again. Placeholders flow through unchanged; any newly-matched secret-like content is minted and vaulted. **Non-streaming `OutgoingMessage` keeps placeholder form — no reveal on the final egress.**
 
-### Stream-delta buffering and reveal
+### Stream-delta buffering
 
-Streaming output is the one legitimate plaintext boundary. `AgentLoop::chat_streaming` buffers chunks in a small `pending: String` and calls `safe_flush_boundary` to find the largest prefix that cannot contain a partial placeholder. The rule: locate the last `[{`; if its tail lacks `}]`, withhold from that `[{`. A lone trailing `[` is also withheld in case the next chunk completes it into `[{`. The buffer is capped at 128 bytes (`STREAM_BUFFER_HIGH_WATER`) to bound worst-case memory.
+Streaming output never reveals plaintext. `AgentLoop::chat_streaming` buffers chunks in a small `pending: String` and calls `safe_flush_boundary` to find the largest prefix that cannot contain a partial placeholder. The rule: locate the last `[{`; if its tail lacks `}]`, withhold from that `[{`. A lone trailing `[` is also withheld in case the next chunk completes it into `[{`. The buffer is capped at 128 bytes (`STREAM_BUFFER_HIGH_WATER`) to bound worst-case memory.
 
-For the flushable prefix the gateway runs the scan/mint/vault pipeline, then:
+For the flushable prefix the gateway runs the scan/mint/vault pipeline, and the *scanned* (placeholder-bearing) text is both:
 
-- the *scanned* (placeholder-bearing) text is appended to the `LlmResponse.content` accumulator the caller returns — so trace, memory, and session-message persistence all receive placeholders;
-- the *revealed* text (via `reveal_in_text`) is sent to `delta_tx` so the user-facing stream shows the real plaintext.
+- appended to the `LlmResponse.content` accumulator the caller returns — so trace, memory, and session-message persistence all receive placeholders;
+- sent as-is to `delta_tx`, so the streaming view and the final persisted message agree character-for-character.
 
 ### Reveal API
 
@@ -112,7 +112,7 @@ Security only decides allow/deny. It does not execute network access. The chain 
 - Job `input/output` stores sanitized versions only
 - Structured logs must not print `SecretValue` directly; reveal warnings log only a SHA-256 fingerprint prefix
 - Placeholder generation is deterministic per secret — same secret → same placeholder → single vault entry
-- The only code paths permitted to hold plaintext are: the tool executor's post-reveal `params_revealed` on its way into `tool_registry.execute`, and the stream-delta send into `delta_tx`
+- The only code path permitted to hold plaintext at egress is the tool executor's post-reveal `params_revealed` on its way into `tool_registry.execute`; stream deltas, outgoing messages, trace, memory, and persistence all carry placeholder form
 - Injection detection is log-only at inbound and log-plus-wrap at tool output; never auto-block user input on injection markers alone
 - Any tool that reads filesystem paths MUST apply `is_sensitive_path` at its entry point, regardless of approval-gate status
 
