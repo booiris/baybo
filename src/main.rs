@@ -1,4 +1,5 @@
 mod boot;
+mod log_redact;
 mod singleton;
 mod tui_log;
 
@@ -23,7 +24,7 @@ use aura_cli::{
 };
 use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
 use aura_hook::HookManager;
-use aura_security::EncryptionKey;
+use aura_security::{EncryptionKey, LeakDetector};
 use aura_skills::SkillRegistry;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
@@ -39,6 +40,7 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::log_redact::RedactingMakeWriter;
 use crate::tui_log::TuiLogLayer;
 
 struct SecondPrecisionTimer;
@@ -54,8 +56,13 @@ enum TracingMode<'a> {
     Stdout,
     /// Chat path: fmt layer writes rolling file under `<log_dir>/aura.log`,
     /// plus a warn/error echo layer feeding the TUI scrollback via the
-    /// returned `OnceLock<TuiLogSink>`.
-    Chat { log_dir: &'a Path },
+    /// returned `OnceLock<TuiLogSink>`. The file writer is wrapped in a
+    /// leak-detector redactor so secrets matched by `LeakAction::Replace`
+    /// rules are masked before landing on disk.
+    Chat {
+        log_dir: &'a Path,
+        leak_detector: Arc<LeakDetector>,
+    },
 }
 
 struct ChatTracing {
@@ -88,7 +95,10 @@ fn init_tracing(mode: TracingMode<'_>) -> Option<ChatTracing> {
             }
             None
         }
-        TracingMode::Chat { log_dir } => {
+        TracingMode::Chat {
+            log_dir,
+            leak_detector,
+        } => {
             if let Err(e) = std::fs::create_dir_all(log_dir) {
                 eprintln!(
                     "warning: could not create log dir {}: {e}. Falling back to stdout logging.",
@@ -98,6 +108,7 @@ fn init_tracing(mode: TracingMode<'_>) -> Option<ChatTracing> {
             }
             let appender = tracing_appender::rolling::daily(log_dir, "aura.log");
             let (writer, guard) = tracing_appender::non_blocking(appender);
+            let writer = RedactingMakeWriter::new(leak_detector, writer);
             let tui_sink: Arc<OnceLock<TuiLogSink>> = Arc::new(OnceLock::new());
             let tui_layer = TuiLogLayer::new(Arc::clone(&tui_sink));
             let fmt_layer = fmt::layer()
@@ -166,8 +177,15 @@ async fn main() -> anyhow::Result<()> {
     let chat_mode = matches!(cli.command, Some(Commands::Tui));
     let workspace_root = PathBuf::from(&config.workspace.path);
     let log_dir = workspace_root.join("logs");
+    // Shared between the log file redactor (below) and the chat-loop security
+    // gateway built further down, so log lines and gateway reveal logic see
+    // the same rule set.
+    let leak_detector = Arc::new(boot::build_leak_detector(&config.security));
     let chat_tracing = if chat_mode {
-        init_tracing(TracingMode::Chat { log_dir: &log_dir })
+        init_tracing(TracingMode::Chat {
+            log_dir: &log_dir,
+            leak_detector: Arc::clone(&leak_detector),
+        })
     } else {
         init_tracing(TracingMode::Stdout)
     };
@@ -360,9 +378,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Security gateway must exist before the tool executor — the executor
     // delegates placeholder reveal on tool-call arguments to the gateway.
-    // The leak detector is shared (`Arc`) so the slash context can expose
-    // the same rule set to `aura security leaks check`.
-    let leak_detector = Arc::new(boot::build_leak_detector(&config.security));
+    // `leak_detector` was built earlier (shared with the log redactor); the
+    // same Arc also feeds the slash context so `aura security leaks check`
+    // sees the same rule set.
     let security_gateway = Arc::new(SecurityGateway::new(
         Arc::clone(&leak_detector),
         Arc::clone(&secret_vault),
