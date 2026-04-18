@@ -129,9 +129,10 @@ impl LlmCompletion for StubLlm {
 
     async fn chat_stream(&self, _request: &ChatRequest) -> crate::Result<LlmStream> {
         let raw = {
-            let mut q = self.stream_queue.lock().map_err(|_| {
-                LlmError::Provider("StubLlm: stream queue mutex poisoned".into())
-            })?;
+            let mut q = self
+                .stream_queue
+                .lock()
+                .map_err(|_| LlmError::Provider("StubLlm: stream queue mutex poisoned".into()))?;
             q.pop_front()
                 .ok_or_else(|| LlmError::Provider("StubLlm: stream queue empty".into()))?
         };

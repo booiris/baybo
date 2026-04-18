@@ -93,18 +93,12 @@ async fn s6_placeholder_split_across_chunks_is_delivered_whole() {
     // Mint a real placeholder and then drive it as a stream that
     // chunks 1 char at a time, forcing `[{` and `}]` across boundaries.
     let (gw, _store, vault) = gateway_with_memory_vault();
-    let minter =
-        aura_security::PlaceholderMinter::from_master_key(vault.master_key());
+    let minter = aura_security::PlaceholderMinter::from_master_key(vault.master_key());
     let ph = minter.mint(AWS_KEY.as_bytes());
-    vault
-        .store_secret(&ph, AWS_KEY.as_bytes())
-        .await
-        .unwrap();
+    vault.store_secret(&ph, AWS_KEY.as_bytes()).await.unwrap();
 
     let stub = StubLlm::new().with_text_chunk_size(Some(1));
-    stub.push_stream(vec![StreamEvent::Text(format!(
-        "lead-in {ph} trailing"
-    ))]);
+    stub.push_stream(vec![StreamEvent::Text(format!("lead-in {ph} trailing"))]);
 
     let emitted = drive_stream(&stub, &gw).await;
 
@@ -164,18 +158,12 @@ async fn placeholder_already_in_stream_round_trips_unchanged() {
     // other side intact and continue to resolve via the vault.
     let (gw, _store, vault) = gateway_with_memory_vault();
     // Pre-populate the vault as if a prior turn had minted this secret.
-    let minter =
-        aura_security::PlaceholderMinter::from_master_key(vault.master_key());
+    let minter = aura_security::PlaceholderMinter::from_master_key(vault.master_key());
     let ph = minter.mint(AWS_KEY.as_bytes());
-    vault
-        .store_secret(&ph, AWS_KEY.as_bytes())
-        .await
-        .unwrap();
+    vault.store_secret(&ph, AWS_KEY.as_bytes()).await.unwrap();
 
     let stub = StubLlm::new().with_text_chunk_size(Some(2));
-    stub.push_stream(vec![StreamEvent::Text(format!(
-        "Use the key {ph} please."
-    ))]);
+    stub.push_stream(vec![StreamEvent::Text(format!("Use the key {ph} please."))]);
 
     let emitted = drive_stream(&stub, &gw).await;
     let joined: String = emitted.join("");
@@ -192,9 +180,7 @@ async fn secret_in_a_single_large_chunk_is_redacted() {
     // the whole secret in one event ends up sanitized.
     let (gw, _store, _vault) = gateway_with_memory_vault();
     let stub = StubLlm::new(); // no chunking — one event = one chunk
-    stub.push_stream(vec![StreamEvent::Text(format!(
-        "before {AWS_KEY} after"
-    ))]);
+    stub.push_stream(vec![StreamEvent::Text(format!("before {AWS_KEY} after"))]);
     let emitted = drive_stream(&stub, &gw).await;
     let joined = emitted.join("");
     assert!(!joined.contains(AWS_KEY), "raw secret leaked: {joined}");

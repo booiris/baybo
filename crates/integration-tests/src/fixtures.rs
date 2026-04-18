@@ -18,8 +18,11 @@ pub fn master_key_for_tests() -> EncryptionKey {
 /// Build a fresh `SecurityGateway` backed by an in-memory secret store.
 /// Returns the gateway plus a handle to the store so tests can assert
 /// on vault state (e.g. "exactly one entry minted").
-pub fn gateway_with_memory_vault() -> (Arc<SecurityGateway>, Arc<MemorySecretStore>, Arc<SecretVault>)
-{
+pub fn gateway_with_memory_vault() -> (
+    Arc<SecurityGateway>,
+    Arc<MemorySecretStore>,
+    Arc<SecretVault>,
+) {
     let detector = Arc::new(LeakDetector::with_default_rules());
     let store = Arc::new(MemorySecretStore::new());
     let vault = Arc::new(SecretVault::new(

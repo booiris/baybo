@@ -7,12 +7,10 @@
 //! fails loudly. That coupling is intentional: it keeps the test
 //! suite in step with the production rule set.
 
-use std::sync::Arc;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use aura_security::{
-    EncryptionKey, LeakAction, LeakDetector, PlaceholderMinter, SecretVault,
-};
+use aura_security::{EncryptionKey, LeakAction, LeakDetector, PlaceholderMinter, SecretVault};
 use aura_storage::test_support::MemorySecretStore;
 
 fn make_vault() -> (Arc<SecretVault>, Arc<MemorySecretStore>) {
@@ -31,17 +29,41 @@ fn make_vault() -> (Arc<SecretVault>, Arc<MemorySecretStore>) {
 fn corpus() -> Vec<(&'static str, &'static str)> {
     vec![
         ("aws_access_key", "AKIAIOSFODNN7EXAMPLE"),
-        ("aws_secret_key", "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+        (
+            "aws_secret_key",
+            "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ),
         ("google_api_key", "AIzaSyA-1234567890abcdefghijklmnopqrstu"),
         ("github_token", "ghp_1234567890abcdefghijklmnopqrstuvwxyz"),
-        ("anthropic_api_key", "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-ABC"),
-        ("openai_api_key", "sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"),
-        ("openrouter_api_key", "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-        ("groq_api_key", "gsk_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx"),
+        (
+            "anthropic_api_key",
+            "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-ABC",
+        ),
+        (
+            "openai_api_key",
+            "sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
+        ),
+        (
+            "openrouter_api_key",
+            "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+        (
+            "groq_api_key",
+            "gsk_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx",
+        ),
         ("stripe_key", "sk_live_abcdefghijklmnopqrstuvwx"),
-        ("slack_token", "xoxb-1234567890-1234567890-abcdefghijklmnopqrstuvwx"),
-        ("sendgrid_api_key", "SG.abcdefghijklmnopqrst22.abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"),
-        ("nearai_session", "sess_AbCd0123EfGh4567IjKl89mnOpQr0123StUv4567WxYzABCD0123efgh"),
+        (
+            "slack_token",
+            "xoxb-1234567890-1234567890-abcdefghijklmnopqrstuvwx",
+        ),
+        (
+            "sendgrid_api_key",
+            "SG.abcdefghijklmnopqrst22.abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        ),
+        (
+            "nearai_session",
+            "sess_AbCd0123EfGh4567IjKl89mnOpQr0123StUv4567WxYzABCD0123efgh",
+        ),
     ]
 }
 

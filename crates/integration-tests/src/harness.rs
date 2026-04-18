@@ -441,9 +441,7 @@ impl aura_storage::MemoryStore for MemoryStoreShared {
     ) -> Result<Vec<aura_model::MemoryEntry>, aura_storage::StorageError> {
         self.0.list_by_user(user_id).await
     }
-    async fn list_all(
-        &self,
-    ) -> Result<Vec<aura_model::MemoryEntry>, aura_storage::StorageError> {
+    async fn list_all(&self) -> Result<Vec<aura_model::MemoryEntry>, aura_storage::StorageError> {
         self.0.list_all().await
     }
     async fn get_by_id(

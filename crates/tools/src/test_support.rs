@@ -148,10 +148,7 @@ mod tests {
     #[tokio::test]
     async fn echo_returns_serialized_params() {
         let tool = EchoTool::new("echo");
-        let out = tool
-            .execute(json!({"k": "v"}), &ctx())
-            .await
-            .unwrap();
+        let out = tool.execute(json!({"k": "v"}), &ctx()).await.unwrap();
         assert!(matches!(out, ToolOutput::Text(s) if s == "{\"k\":\"v\"}"));
     }
 

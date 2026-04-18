@@ -70,7 +70,12 @@ async fn s1_inbound_secret_is_minted_and_vaulted() {
     let ph = placeholder_in(text).expect("placeholder substituted into message");
     assert_eq!(store.len(), 1, "exactly one vault entry minted");
     // The session state holds an audit map placeholder → rule_name.
-    assert!(session.state.extra.contains_key("__security_placeholder_map"));
+    assert!(
+        session
+            .state
+            .extra
+            .contains_key("__security_placeholder_map")
+    );
 
     // The placeholder must be resolvable back through the vault.
     let revealed = gw.reveal_in_text(&ph).await.unwrap();
@@ -184,7 +189,12 @@ async fn s10_clean_input_is_a_pass_through() {
         assert_eq!(s, "hello, world!");
     }
     assert_eq!(store.len(), 0);
-    assert!(!session.state.extra.contains_key("__security_placeholder_map"));
+    assert!(
+        !session
+            .state
+            .extra
+            .contains_key("__security_placeholder_map")
+    );
 }
 
 #[tokio::test]
@@ -194,7 +204,10 @@ async fn s12_audit_report_reflects_default_rule_set() {
     assert!(report.total_rules >= 30, "expect rich default rule set");
     assert!(report.replace_rules > 0);
     assert!(report.secret_vault.master_key_configured);
-    assert_eq!(report.total_rules, report.block_rules + report.replace_rules);
+    assert_eq!(
+        report.total_rules,
+        report.block_rules + report.replace_rules
+    );
 }
 
 #[tokio::test]

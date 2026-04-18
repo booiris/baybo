@@ -15,8 +15,6 @@ pub mod fixtures;
 pub mod harness;
 pub mod tracing_capture;
 
-pub use fixtures::{
-    SessionBuilder, gateway_with_memory_vault, master_key_for_tests,
-};
+pub use fixtures::{SessionBuilder, gateway_with_memory_vault, master_key_for_tests};
 pub use harness::{AgentTestHarness, AgentTestHarnessBuilder};
 pub use tracing_capture::{CapturedEvent, TracingCapture, capture_tracing};

@@ -126,14 +126,14 @@ async fn tool_call_round_trip_invokes_recording_tool() {
 
     // Iter 1 (streaming): one tool call, no text. AgentLoop will fire
     // the tool, append its output, and loop.
-    harness.stub_llm.push_stream(vec![StreamEvent::ToolCall(
-        ToolCallInfo {
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
             id: "call-1".into(),
             name: "echo_tool".into(),
             arguments: json!({"q": "ping"}),
             signature: None,
-        },
-    )]);
+        })]);
     // Iter 2 (non-streaming chat): final response with no tool calls →
     // loop exits and dispatches the Message.
     harness.stub_llm.push_response(LlmResponse {
