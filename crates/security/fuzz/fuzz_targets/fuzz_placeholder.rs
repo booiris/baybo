@@ -21,11 +21,11 @@ fuzz_target!(|data: &[u8]| {
 
     let ph = minter.mint(data);
     assert!(
-        ph.starts_with("{{SECRET_") && ph.ends_with("}}"),
+        ph.starts_with("[{REDACTED_SECRET_") && ph.ends_with("}]"),
         "unexpected placeholder shape: {ph}"
     );
-    // "{{SECRET_" (9) + 24 hex chars + "}}" (2) = 35 bytes.
-    assert_eq!(ph.len(), 35);
+    // "[{" (2) + "REDACTED_SECRET_" (16) + 24 hex chars + "}]" (2) = 44 bytes.
+    assert_eq!(ph.len(), 44);
 
     let re = PlaceholderMinter::placeholder_regex();
     assert!(

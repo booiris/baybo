@@ -27,34 +27,35 @@ use crate::soul::Soul;
 use crate::tool_executor::ToolExecutor;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
-/// for a placeholder to complete. If a chunk ends with a lone `{{` but no
-/// closing `}}` arrives within this many bytes, we flush anyway — no real
+/// for a placeholder to complete. If a chunk ends with an open `[{` but no
+/// closing `}]` arrives within this many bytes, we flush anyway — no real
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
 
 /// Compute the byte index at which it is safe to flush `pending` to the
 /// output stream. Anything after that index is withheld because it might
-/// be the beginning of a `{{SECRET_...}}` placeholder split across chunks.
+/// be the beginning of a `[{REDACTED_SECRET_...}]` placeholder split
+/// across chunks.
 ///
 /// Returns `pending.len()` when no partial placeholder is pending, or a
-/// smaller value pointing at the earliest `{` of a potential placeholder.
+/// smaller value pointing at the earliest `[` of a potential placeholder.
 /// If the buffer grows past `STREAM_BUFFER_HIGH_WATER` we flush the whole
 /// thing to avoid unbounded buffering on pathological input.
 fn safe_flush_boundary(pending: &str) -> usize {
     if pending.len() > STREAM_BUFFER_HIGH_WATER {
         return pending.len();
     }
-    // Placeholders open with `{{`. If the last `{{` has no matching
-    // `}}` after it, it might be a placeholder split across chunks —
-    // withhold from that `{{`. A lone trailing `{` could become `{{`
-    // when the next chunk lands, so withhold it too.
-    if let Some(idx) = pending.rfind("{{") {
+    // Placeholders open with `[{`. If the last `[{` has no matching `}]`
+    // after it, it might be a placeholder split across chunks — withhold
+    // from that `[{`. A lone trailing `[` could become `[{` when the next
+    // chunk lands, so withhold it too.
+    if let Some(idx) = pending.rfind("[{") {
         let tail = &pending[idx..];
-        if !tail.contains("}}") {
+        if !tail.contains("}]") {
             return idx;
         }
     }
-    if pending.ends_with('{') {
+    if pending.ends_with('[') {
         return pending.len() - 1;
     }
     pending.len()
@@ -861,26 +862,26 @@ mod stream_buffer_tests {
     }
 
     #[test]
-    fn trailing_open_brace_is_withheld() {
-        let s = "hello {";
-        assert_eq!(safe_flush_boundary(s), s.find('{').unwrap());
+    fn trailing_open_bracket_is_withheld() {
+        let s = "hello [";
+        assert_eq!(safe_flush_boundary(s), s.find('[').unwrap());
     }
 
     #[test]
     fn trailing_partial_placeholder_is_withheld() {
-        let s = "abc {{SECRET_deadbee";
-        assert_eq!(safe_flush_boundary(s), s.find('{').unwrap());
+        let s = "abc [{REDACTED_SECRET_deadbee";
+        assert_eq!(safe_flush_boundary(s), s.find('[').unwrap());
     }
 
     #[test]
     fn complete_placeholder_flushes_all() {
-        let s = "abc {{SECRET_deadbeefdeadbeefdeadbeef}} def";
+        let s = "abc [{REDACTED_SECRET_deadbeefdeadbeefdeadbeef}] def";
         assert_eq!(safe_flush_boundary(s), s.len());
     }
 
     #[test]
     fn high_water_forces_flush() {
-        let s: String = "a".repeat(200) + "{";
+        let s: String = "a".repeat(200) + "[";
         assert_eq!(safe_flush_boundary(&s), s.len());
     }
 }

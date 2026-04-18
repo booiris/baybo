@@ -10,9 +10,19 @@ use crate::crypto::EncryptionKey;
 const HKDF_INFO: &[u8] = b"aura-placeholder-v1";
 const PLACEHOLDER_HEX_LEN: usize = 24;
 
-/// Deterministically mints `{{SECRET_<hex>}}` placeholders from raw secret
-/// bytes using HMAC-SHA256 with a subkey derived from the master encryption
-/// key via HKDF-Expand.
+/// Opening / closing markers use the asymmetric ASCII pairs `[{` and `}]`.
+/// The mismatched outer/inner brackets cannot be parsed by any mainstream
+/// template engine (Handlebars/Jinja/Mustache `{{…}}`, shell/JS `${…}`,
+/// ERB `<%…%>`), and every char is in the base ASCII set so every LLM can
+/// reproduce the placeholder byte-for-byte when echoing it back through
+/// tool arguments — a precondition for vault-side `reveal_in_text` to hit.
+pub(crate) const PLACEHOLDER_OPEN: &str = "[{";
+pub(crate) const PLACEHOLDER_CLOSE: &str = "}]";
+pub(crate) const PLACEHOLDER_PREFIX: &str = "REDACTED_SECRET_";
+
+/// Deterministically mints `[{REDACTED_SECRET_<hex>}]` placeholders from
+/// raw secret bytes using HMAC-SHA256 with a subkey derived from the master
+/// encryption key via HKDF-Expand.
 ///
 /// Same secret bytes always produce the same placeholder within a process,
 /// which bounds vault growth to one entry per unique secret.
@@ -41,7 +51,10 @@ impl PlaceholderMinter {
         mac.update(secret);
         let tag = mac.finalize().into_bytes();
         let full = hex::encode(tag);
-        format!("{{{{SECRET_{}}}}}", &full[..PLACEHOLDER_HEX_LEN])
+        format!(
+            "{PLACEHOLDER_OPEN}{PLACEHOLDER_PREFIX}{}{PLACEHOLDER_CLOSE}",
+            &full[..PLACEHOLDER_HEX_LEN]
+        )
     }
 
     /// Regex matching any well-formed placeholder emitted by `mint`, plus
@@ -49,7 +62,7 @@ impl PlaceholderMinter {
     pub fn placeholder_regex() -> &'static Regex {
         static RE: OnceLock<Regex> = OnceLock::new();
         RE.get_or_init(|| {
-            Regex::new(r"\{\{SECRET_[0-9a-f]{16,32}\}\}")
+            Regex::new(r"\[\{REDACTED_SECRET_[0-9a-f]{16,32}\}\]")
                 .expect("static placeholder regex compiles")
         })
     }
@@ -81,10 +94,16 @@ mod tests {
     fn placeholder_format() {
         let minter = PlaceholderMinter::from_master_key(&make_key());
         let ph = minter.mint(b"something");
-        assert!(ph.starts_with("{{SECRET_"));
-        assert!(ph.ends_with("}}"));
-        // "{{SECRET_" (9) + 24 hex + "}}" (2)
-        assert_eq!(ph.len(), 9 + PLACEHOLDER_HEX_LEN + 2);
+        assert!(ph.starts_with("[{REDACTED_SECRET_"));
+        assert!(ph.ends_with("}]"));
+        // "[{" (2) + "REDACTED_SECRET_" (16) + 24 hex + "}]" (2)
+        assert_eq!(
+            ph.len(),
+            PLACEHOLDER_OPEN.len()
+                + PLACEHOLDER_PREFIX.len()
+                + PLACEHOLDER_HEX_LEN
+                + PLACEHOLDER_CLOSE.len()
+        );
     }
 
     #[test]

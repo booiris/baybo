@@ -789,7 +789,7 @@ mod tests {
 
         if let ContentBlock::Text(ref s) = msg.content[0] {
             assert!(!s.contains("AKIAIOSFODNN7EXAMPLE"));
-            assert!(s.contains("{{SECRET_"));
+            assert!(s.contains("[{REDACTED_SECRET_"));
         } else {
             panic!("expected text block");
         }
@@ -860,7 +860,7 @@ mod tests {
 
         if let ContentBlock::Text(ref s) = response.content[0] {
             assert!(!s.contains("AKIAIOSFODNN7EXAMPLE"));
-            assert!(s.contains("{{SECRET_"));
+            assert!(s.contains("[{REDACTED_SECRET_"));
         } else {
             panic!("expected text block");
         }
@@ -898,7 +898,7 @@ mod tests {
     #[tokio::test]
     async fn reveal_unknown_placeholder_is_passthrough() {
         let (gw, _store) = make_gateway();
-        let fake = "before {{SECRET_deadbeefdeadbeefdeadbeef}} after";
+        let fake = "before [{REDACTED_SECRET_deadbeefdeadbeefdeadbeef}] after";
         let revealed = gw.reveal_in_text(fake).await.unwrap();
         assert_eq!(revealed, fake);
     }
@@ -949,14 +949,14 @@ mod tests {
         gw.sanitize_llm_response(&mut resp).await.unwrap();
 
         assert!(!resp.content.contains("ghp_"));
-        assert!(resp.content.contains("{{SECRET_"));
+        assert!(resp.content.contains("[{REDACTED_SECRET_"));
         if let ContentBlock::Text(s) = &resp.content_blocks[0] {
             assert!(!s.contains("AKIAIOSFODNN7EXAMPLE"));
-            assert!(s.contains("{{SECRET_"));
+            assert!(s.contains("[{REDACTED_SECRET_"));
         }
         let arg = resp.tool_calls[0].arguments["key"].as_str().unwrap();
         assert!(!arg.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(arg.starts_with("{{SECRET_"));
+        assert!(arg.starts_with("[{REDACTED_SECRET_"));
         let t = resp.thinking.as_ref().unwrap();
         assert!(!t.contains("AKIAIOSFODNN7EXAMPLE"));
         // ghp + AKIA → two distinct vault entries (AKIA appears 3x but same key)

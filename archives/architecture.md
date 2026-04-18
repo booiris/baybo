@@ -807,7 +807,7 @@ Flow:
 ```text
 1. Telegram channel receives the message
 2. ChannelAdapter converts it into a unified Message
-3. SecurityGateway detects the leaked secret and replaces "sk-abc123" with {{SECRET_x7k9}}
+3. SecurityGateway detects the leaked secret and replaces "sk-abc123" with [{REDACTED_SECRET_x7k9}]
 4. Router performs rate limiting and CostGuard checks
 5. Router sends AgentMessage::UserInput to AgentActor
 6. JobManager creates UserMessageHandling [Pending -> InProgress]
@@ -834,7 +834,7 @@ Flow:
 27. MemoryManager decides no new memory is needed
 28. JobManager finishes UserMessageHandling through Completed -> Submitted -> Accepted
 29. TraceCollector flushes sanitized payload and provenance
-30. SecurityGateway re-sanitizes output and preserves {{SECRET_x7k9}} as a placeholder
+30. SecurityGateway re-sanitizes output and preserves [{REDACTED_SECRET_x7k9}] as a placeholder
 31. ChannelAdapter converts the result back into Telegram format and sends it
 32. HookManager runs PostResponse hooks
 ```
