@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::StorageError;
@@ -54,18 +53,6 @@ impl SecretStore for LibsqlSecretStore {
         }
     }
 
-    async fn delete(&self, name: &str) -> crate::secret::Result<()> {
-        let conn = self.pool.conn();
-        let now = Utc::now().timestamp();
-        conn.execute(
-            "UPDATE secrets SET deleted_at = ?1 WHERE name = ?2 AND deleted_at IS NULL",
-            libsql::params![now, name.to_string()],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete error: {e}")))?;
-        Ok(())
-    }
-
     async fn list(&self) -> crate::secret::Result<Vec<String>> {
         let conn = self.pool.conn();
         let mut rows = conn
@@ -106,15 +93,6 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSecretStore::new(pool);
         assert!(store.retrieve("nonexistent").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn delete_secret() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSecretStore::new(pool);
-        store.store("key", b"val").await.unwrap();
-        store.delete("key").await.unwrap();
-        assert!(store.retrieve("key").await.unwrap().is_none());
     }
 
     #[tokio::test]

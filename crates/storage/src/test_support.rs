@@ -75,11 +75,6 @@ impl SecretStore for MemorySecretStore {
         Ok(self.data.lock().map_err(poison)?.get(name).cloned())
     }
 
-    async fn delete(&self, name: &str) -> SecretResult<()> {
-        self.data.lock().map_err(poison)?.remove(name);
-        Ok(())
-    }
-
     async fn list(&self) -> SecretResult<Vec<String>> {
         Ok(self.data.lock().map_err(poison)?.keys().cloned().collect())
     }
@@ -228,11 +223,7 @@ impl CostStore for MemoryCostStore {
         Ok(())
     }
 
-    async fn query_user(
-        &self,
-        user_id: &str,
-        range: TimeRange,
-    ) -> CostResult<Vec<CostRecord>> {
+    async fn query_user(&self, user_id: &str, range: TimeRange) -> CostResult<Vec<CostRecord>> {
         Ok(self
             .records
             .lock()
@@ -373,11 +364,7 @@ impl MemoryStore for MemoryMemoryStore {
         Ok(())
     }
 
-    async fn retrieve(
-        &self,
-        user_id: &str,
-        key: &str,
-    ) -> MemoryStoreResult<Option<MemoryEntry>> {
+    async fn retrieve(&self, user_id: &str, key: &str) -> MemoryStoreResult<Option<MemoryEntry>> {
         Ok(self
             .entries
             .lock()

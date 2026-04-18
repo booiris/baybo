@@ -51,16 +51,6 @@ impl SecretVault {
 }
 
 #[cfg(test)]
-impl SecretVault {
-    pub(crate) async fn delete_secret(&self, name: &str) -> Result<()> {
-        self.store
-            .delete(name)
-            .await
-            .map_err(|e| SecurityError::Storage(e.to_string()))
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use aura_storage::test_support::MemorySecretStore;
@@ -88,11 +78,4 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[tokio::test]
-    async fn delete_secret() {
-        let vault = make_vault();
-        vault.store_secret("temp", b"temporary").await.unwrap();
-        vault.delete_secret("temp").await.unwrap();
-        assert!(vault.get_secret("temp").await.unwrap().is_none());
-    }
 }
