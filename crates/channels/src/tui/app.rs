@@ -216,6 +216,20 @@ impl AppState {
         self.commands = commands;
     }
 
+    /// Seed the input history from a previously-persisted snapshot. Entries
+    /// are treated as chronological (oldest first); if the snapshot exceeds
+    /// `HISTORY_CAP` the oldest entries are dropped.
+    pub(crate) fn set_history(&mut self, entries: Vec<String>) {
+        let skip = entries.len().saturating_sub(HISTORY_CAP);
+        self.history = entries.into_iter().skip(skip).collect();
+        self.history_cursor = None;
+    }
+
+    /// Clone the current input-history ring in chronological order.
+    pub(crate) fn history_snapshot(&self) -> Vec<String> {
+        self.history.iter().cloned().collect()
+    }
+
     pub(crate) fn set_banner(&mut self, text: String) {
         self.banner = text;
     }

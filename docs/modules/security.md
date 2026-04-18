@@ -77,6 +77,22 @@ Because `ResourceAccess::ReadFile` bypasses the approval gate (see `ToolExecutor
 
 Secrets are encrypted with AES-256-GCM (random nonce + ciphertext + tag). The master key exists only in process memory and is never persisted. `SecretValue` should not support plaintext `Debug`.
 
+### Known vault entries
+
+The vault stores both deterministically-minted secrets (one entry per unique
+secret, keyed by placeholder) and a small set of fixed-name application
+records:
+
+| Vault key                 | Owner                    | Format                        | Purpose                                                         |
+| ------------------------- | ------------------------ | ----------------------------- | --------------------------------------------------------------- |
+| `[{REDACTED_SECRET_<hex>}]` | `SecurityGateway` reveal | raw secret bytes              | Plaintext for placeholder reveal at the tool-argument boundary  |
+| `aura.tui.input_history`  | `CliInputHistoryStore`   | UTF-8 JSON `Vec<String>`      | Persistent TUI input ring (see [`tui.md`](./tui.md))            |
+
+`CliInputHistoryStore` (in `aura-cli`) wraps `Arc<SecretVault>` to load and
+save the TUI input history under that key. The history is encrypted with the
+same master key as everything else in the vault, so commands or pasted
+credentials typed into the TUI never appear as plaintext on disk.
+
 ### Least-privilege injection (deferred)
 
 Per-tool secret declaration and `ScopedSecretAccessor` were removed pending the

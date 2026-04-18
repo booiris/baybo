@@ -104,6 +104,8 @@ Each family is added under the same naming scheme when its subsystem ships.
 
 `src/main.rs`, after `CommandContext` is assembled, constructs `aura_cli::CliSlashHandler::new(ctx)` and `aura_cli::CliDashboardProvider::new(ctx)`, then passes both to `TuiAdapter::new().with_slash_handler(...).with_dashboard_provider(...)`. Other adapters (HTTP/Telegram/Discord) accept the same `Arc<dyn SlashHandler>` when they land; `DashboardProvider` is only consumed by adapters that can render interactive views (i.e. TUI).
 
+`aura-cli` also implements `aura_channels::InputHistoryStore` as `CliInputHistoryStore`, a thin wrapper around `Arc<SecretVault>` that persists the TUI input ring as encrypted JSON under the vault key `aura.tui.input_history`. `src/main.rs` constructs it from the same `secret_vault` the gateway uses and passes it to `TuiAdapter::with_input_history`. The trait lives in `aura-channels` so the TUI stays decoupled from `aura-security`; storing the history in the vault (rather than a plaintext history file) means commands or pasted credentials typed into the prompt never land on disk in clear text. See [`tui.md`](./tui.md) and [`security.md`](./security.md).
+
 ### Dashboard shortcut
 
 Bare dashboard commands — `/skills`, `/tools`, `/jobs`, `/sessions`, `/memory` with no further tokens — bypass the clap path and return `SlashOutcome::OpenView(ViewKind::_)`. Interactive adapters swap into a table view backed by `DashboardProvider::snapshot(kind)`; line-mode adapters treat the outcome as a no-op. Commands with arguments (e.g. `/skills info foo`) still go through clap as `SlashOutcome::Handled`.

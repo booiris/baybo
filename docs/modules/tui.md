@@ -21,7 +21,7 @@ No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands
 
 - Scrollback is a fixed-capacity ring (`SCROLLBACK_CAP = 5000`) of `ChatLine::{User,Assistant,System,Log,Approval}` entries.
 - Assistant lines render each `ContentBlock`: text inline, and `Image`/`Audio`/`File` as a bracketed placeholder.
-- Input history keeps up to `HISTORY_CAP = 500` non-empty submissions with trivial de-duplication of consecutive identical lines.
+- Input history keeps up to `HISTORY_CAP = 500` non-empty submissions with trivial de-duplication of consecutive identical lines. The ring is **persistent**: see [Persistent input history](#persistent-input-history) below.
 - `scroll_offset` is measured in rendered rows from the tail: `0` keeps the newest line pinned at the bottom; `PageUp`/`PageDown` grow or shrink the offset by 10.
 - While the LLM is responding, an ephemeral streaming buffer is drawn immediately below the scrollback tail. Each `AgentOutput::Delta` extends the buffer; the final `AgentOutput::Message` replaces it with a persisted `ChatLine::Assistant` carrying the canonical `ContentBlock` list.
 
@@ -45,6 +45,19 @@ No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands
 - Backed by a `DashboardSnapshot { title, columns, rows, footer }` value fetched from a `DashboardProvider`.
 - Refresh (`r`) re-fetches on a background task; the snapshot swap is transactional (existing selection clamps to the new row count).
 - Four built-in views map to `ViewKind::{Skills, Jobs, Sessions, Memory}`.
+
+### Persistent input history
+
+The input history ring survives across TUI sessions. Because users routinely
+paste API keys, tokens, and other secrets into prompts, the ring is stored
+encrypted at rest rather than in a plaintext history file.
+
+- The trait `aura_channels::InputHistoryStore` (`crates/channels/src/tui/history.rs`) defines the contract: `load() -> Vec<String>` runs once at start-of-loop; `save(&[String])` runs after every accepted submission.
+- The TUI itself does not depend on `aura-security`. The production wiring is `aura_cli::CliInputHistoryStore`, which wraps `Arc<SecretVault>` and serializes the chronological ring as JSON under the fixed key `aura.tui.input_history` (see [`security.md`](./security.md)). Plaintext only ever exists in `AppState.history` — on disk it is AES-256-GCM ciphertext under the same master key the rest of the vault uses.
+- Load happens before the first `terminal.draw`, so the prior ring is already populated when the input box first renders.
+- Save runs from `Action::Submit` immediately after `take_input()`, in a detached `tokio::spawn`. The full history snapshot is persisted every time (no diffing); the disk/encryption latency therefore never blocks the key-handling path.
+- Failures (missing master key, corrupt JSON, libsql write error) log a `warn!` and are non-fatal: load failures yield an empty ring; save failures drop the persistence for that submission only. The TUI continues to function with the in-memory history.
+- `TuiAdapter::with_input_history` is optional. Tests construct adapters without a store; in-memory history then behaves exactly as before.
 
 ## Slash Commands
 

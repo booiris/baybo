@@ -10,7 +10,7 @@ pub use slash::{
     DashboardProvider, DashboardSnapshot, SlashCommand, SlashHandler, SlashOutcome, ViewKind,
 };
 pub use tui::event::{LogLevel, LogRecord, TuiLogSink};
-pub use tui::{OnExit, TuiAdapter};
+pub use tui::{InputHistoryStore, OnExit, TuiAdapter};
 pub use types::{
     AgentOutput, ChannelStatus, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
 };

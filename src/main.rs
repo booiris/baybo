@@ -18,8 +18,8 @@ use aura_agent::{
 use aura_channels::{ChannelRegistry, TuiAdapter, TuiLogSink};
 use aura_cli::cli::ShellKind;
 use aura_cli::{
-    Cli, CliDashboardProvider, CliSlashHandler, Commands, ContextBuilder, Invocation, OutputFormat,
-    dispatch,
+    Cli, CliDashboardProvider, CliInputHistoryStore, CliSlashHandler, Commands, ContextBuilder,
+    Invocation, OutputFormat, dispatch,
 };
 use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
 use aura_hook::HookManager;
@@ -432,9 +432,11 @@ async fn main() -> anyhow::Result<()> {
     // visible to `ToolExecutor` through the shared `ApprovalGateMap`.
     {
         let tui_shutdown = shutdown.clone();
+        let history_store = Arc::new(CliInputHistoryStore::new(Arc::clone(&secret_vault)));
         let tui = TuiAdapter::new()
             .with_slash_handler(slash_handler)
             .with_dashboard_provider(dashboard_provider)
+            .with_input_history(history_store)
             .with_on_exit(Arc::new(move || tui_shutdown.trigger()));
         if let Some(tracing) = chat_tracing.as_ref() {
             let _ = tracing.tui_sink.set(tui.log_sink());

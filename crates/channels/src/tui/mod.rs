@@ -19,9 +19,11 @@ mod approval;
 mod chat;
 mod dashboard;
 pub(crate) mod event;
+mod history;
 mod keymap;
 
 pub use aura_tools::{ApprovalQueue, ChannelApprovalGate};
+pub use history::InputHistoryStore;
 
 use std::io;
 use std::panic;
@@ -74,6 +76,7 @@ pub struct TuiAdapter {
     slash_handler: Option<Arc<dyn SlashHandler>>,
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
     on_exit: Option<OnExit>,
+    input_history: Option<Arc<dyn InputHistoryStore>>,
     /// Event channel: the sender is cloned to `send_response`, the tracing
     /// bridge, and the event loop; the receiver is taken out once at
     /// `start()`. The channel is created eagerly in `new()` so boot-time log
@@ -109,6 +112,7 @@ impl TuiAdapter {
             slash_handler: None,
             dashboard_provider: None,
             on_exit: None,
+            input_history: None,
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
             approval_queue: ApprovalQueue::new(),
@@ -133,6 +137,15 @@ impl TuiAdapter {
     /// silently ignored.
     pub fn with_dashboard_provider(mut self, provider: Arc<dyn DashboardProvider>) -> Self {
         self.dashboard_provider = Some(provider);
+        self
+    }
+
+    /// Attach a persistent input-history backend. When set, prior submissions
+    /// are loaded at the start of the event loop and every accepted submission
+    /// is saved asynchronously. Without one, the history remains in-memory
+    /// and is lost on exit.
+    pub fn with_input_history(mut self, store: Arc<dyn InputHistoryStore>) -> Self {
+        self.input_history = Some(store);
         self
     }
 
@@ -183,6 +196,7 @@ impl ChannelAdapter for TuiAdapter {
             slash_handler: self.slash_handler.clone(),
             dashboard_provider: self.dashboard_provider.clone(),
             on_exit: self.on_exit.clone(),
+            input_history: self.input_history.clone(),
             approval_queue: self.approval_queue.clone(),
         };
 
@@ -249,6 +263,7 @@ struct LoopCtx {
     slash_handler: Option<Arc<dyn SlashHandler>>,
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
     on_exit: Option<OnExit>,
+    input_history: Option<Arc<dyn InputHistoryStore>>,
     approval_queue: ApprovalQueue,
 }
 
@@ -314,6 +329,12 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     let mut state = AppState::new().with_approval(ctx.approval_queue.clone());
     if let Some(handler) = ctx.slash_handler.as_ref() {
         state.set_commands(handler.commands());
+    }
+    if let Some(store) = ctx.input_history.as_ref() {
+        match store.load().await {
+            Ok(entries) => state.set_history(entries),
+            Err(e) => warn!("failed to load TUI input history: {e}"),
+        }
     }
     let mut term_events = EventStream::new();
     let mut mouse_captured = true;
@@ -558,6 +579,7 @@ async fn handle_key(
         }
         Action::Submit => {
             if let Some(text) = state.take_input() {
+                persist_history(state, ctx);
                 if text == "/quit" || text == "/exit" {
                     return Ok(KeyOutcome::Exit);
                 }
@@ -618,6 +640,23 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
     if let Err(e) = ctx.incoming.send(msg).await {
         warn!("failed to forward TUI input to router: {e}");
     }
+}
+
+/// Snapshot the current input-history ring and persist it via the
+/// configured [`InputHistoryStore`]. No-op if no store is attached.
+/// Runs in a detached task so disk/encryption latency never blocks the
+/// key-handling path; failures log at warn level.
+fn persist_history(state: &AppState, ctx: &LoopCtx) {
+    let Some(store) = ctx.input_history.as_ref() else {
+        return;
+    };
+    let snapshot = state.history_snapshot();
+    let store = Arc::clone(store);
+    tokio::spawn(async move {
+        if let Err(e) = store.save(&snapshot).await {
+            warn!("failed to save TUI input history: {e}");
+        }
+    });
 }
 
 fn spawn_dashboard_fetch(
