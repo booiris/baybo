@@ -45,12 +45,13 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 
 ## Available test-support fixtures
 
-| Crate              | Helper                       | Purpose                                                                                       |
-| ------------------ | ---------------------------- | --------------------------------------------------------------------------------------------- |
-| `aura-storage`     | `MemorySecretStore`          | In-memory `SecretStore` impl with `len()` / `is_empty()` for vault-state assertions.          |
-| `aura-channels`    | `RecordingChannel`           | `ChannelAdapter` spy that captures every response, stream delta, and notice.                  |
-| `aura-tools`       | `EchoTool`, `RecordingTool`  | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
-| `aura-llm`         | `StubLlm`                    | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
+| Crate              | Helper                                                                  | Purpose                                                                                       |
+| ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `aura-storage`     | `MemorySecretStore`                                                     | In-memory `SecretStore` impl with `len()` / `is_empty()` for vault-state assertions.          |
+| `aura-storage`     | `MemoryJobStore`, `MemoryCostStore`, `MemoryTraceStore`, `MemoryMemoryStore` | In-memory backends for the remaining `Store` traits. Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. |
+| `aura-channels`    | `RecordingChannel`                                                      | `ChannelAdapter` spy that captures every response, stream delta, and notice.                  |
+| `aura-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
+| `aura-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
 
 The integration-tests crate composes these into higher-level builders:
 
@@ -60,6 +61,7 @@ The integration-tests crate composes these into higher-level builders:
 | `SessionBuilder`                | `aura_integration_tests::fixtures`                 | Fluent builder for `Session` so tests don't repeat field lists. |
 | `master_key_for_tests()`        | `aura_integration_tests::fixtures`                 | Stable 32-byte `EncryptionKey` so placeholder hex stays reproducible across runs. |
 | `capture_tracing()`             | `aura_integration_tests::tracing_capture`          | Per-test thread-local `tracing` subscriber. Returns `TracingCapture` (RAII) with `events()`, `at_level(Level)`, `any_contains(&str)`. |
+| `AgentTestHarnessBuilder` / `AgentTestHarness` | `aura_integration_tests::harness`   | Spawns a real `AgentActor` wired to the in-memory stores, the `StubLlm`, and the gateway. Tests push canned LLM responses, send user input via `harness.send_text(...)` (which runs `SecurityGateway::sanitize_input` first, just like the real `Router`), then drain `AgentOutput` from the channel side. `with_tool(Arc<dyn Tool>, ToolManifest)` registers tools before the actor spawns. |
 
 ## Six conventions
 
@@ -104,6 +106,11 @@ The integration-tests crate composes these into higher-level builders:
   and the high-water flush invariant.
 - `tool_boundary.rs` — reveal-on-call, sanitize-on-return, tool-output
   envelope and forged-close-tag neutralization.
+- `agent_loop_e2e.rs` — drives the full `IncomingMessage → gateway →
+  AgentActor → AgentLoop → StubLlm → AgentOutput` path through
+  `AgentTestHarness`. Pins clean-stream deltas, secret minting at the
+  router seam, the tool-call round trip, and inbound injection
+  warnings.
 
 Each file pins one cross-cutting contract. New e2e tests should follow
 the pattern: name the file after the contract, group scenarios as

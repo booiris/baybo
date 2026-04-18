@@ -378,12 +378,17 @@ dependencies = [
 name = "aura-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "aura-agent",
  "aura-channels",
+ "aura-context",
+ "aura-hook",
+ "aura-job",
  "aura-llm",
  "aura-model",
  "aura-security",
+ "aura-skills",
  "aura-storage",
  "aura-tools",
  "chrono",
