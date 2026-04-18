@@ -4,7 +4,7 @@ use aura_channels::{AgentOutput, NoticeLevel, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::OperationKind;
 use aura_llm::{
-    ChatRequest, LlmClient, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
+    ChatRequest, LlmCompletion, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
 use aura_model::{ChatMessage, ContentBlock, Role};
 use futures::StreamExt;
@@ -73,7 +73,7 @@ enum SkillGate {
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
-    llm_client: Arc<LlmClient>,
+    llm_client: Arc<dyn LlmCompletion>,
     tool_registry: Arc<ToolRegistry>,
     skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
@@ -92,7 +92,7 @@ pub struct AgentLoop {
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        llm_client: Arc<LlmClient>,
+        llm_client: Arc<dyn LlmCompletion>,
         tool_registry: Arc<ToolRegistry>,
         skill_registry: Arc<SkillRegistry>,
         tool_executor: Arc<ToolExecutor>,
@@ -467,7 +467,7 @@ impl AgentLoop {
         parent_job_id: Option<&str>,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<LlmResponse> {
-        let model_id = self.llm_client.model_id().to_string();
+        let model_id = self.llm_client.model_info().id.clone();
 
         let handle = recorder
             .begin(

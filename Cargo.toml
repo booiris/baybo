@@ -19,6 +19,7 @@ members = [
     "crates/cron",
     "crates/config",
     "crates/cli",
+    "crates/integration-tests",
 ]
 exclude = ["crates/security/fuzz"]
 
@@ -47,6 +48,7 @@ aura-skills-assessor = { path = "crates/skills-assessor" }
 aura-cron = { path = "crates/cron" }
 aura-config = { path = "crates/config" }
 aura-cli = { path = "crates/cli" }
+aura-integration-tests = { path = "crates/integration-tests" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

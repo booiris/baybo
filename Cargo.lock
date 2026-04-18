@@ -375,6 +375,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aura-agent",
+ "aura-channels",
+ "aura-llm",
+ "aura-model",
+ "aura-security",
+ "aura-storage",
+ "aura-tools",
+ "chrono",
+ "futures",
+ "regex",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aura-job"
 version = "0.1.0"
 dependencies = [
@@ -401,6 +422,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -433,8 +455,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

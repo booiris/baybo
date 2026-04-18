@@ -3,6 +3,13 @@ name = "aura-llm"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes `StubLlm` and the `LlmStream::from_events` constructor for
+# downstream crates' tests. Pull in via:
+#   aura-llm = { workspace = true, features = ["test-support"] }
+# inside the consumer's `[dev-dependencies]`.
+test-support = []
+
 [dependencies]
 aura-model = { workspace = true }
 rig-core = { workspace = true }
@@ -13,3 +20,6 @@ futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -11,6 +11,12 @@ cargo test                                                     # unit tests
 RUST_LOG=aura=debug cargo run                                  # run with logging
 ```
 
+Test layout, `test-support` feature gating, and the shared fixture inventory
+(`MemorySecretStore`, `RecordingChannel`, `StubLlm`, `gateway_with_memory_vault`,
+`SessionBuilder`, `capture_tracing`, …) are documented in
+[`docs/testing.md`](docs/testing.md). Read it before adding tests that cross
+crate boundaries.
+
 ### Fuzzing (aura-security)
 
 The `aura-security` crate ships a cargo-fuzz harness at `crates/security/fuzz/`

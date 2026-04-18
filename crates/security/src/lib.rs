@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod error;
 pub mod injection_detector;
 pub mod leak_detector;
+pub mod log_redact;
 pub mod placeholder;
 pub mod secret_value;
 pub mod secret_vault;
@@ -27,6 +28,7 @@ pub use crate::injection_detector::{InjectionDetector, InjectionSeverity, Inject
 pub use crate::leak_detector::{
     LeakAction, LeakDetectionRule, LeakDetector, LeakMatch, LeakScanResult,
 };
+pub use crate::log_redact::{RedactingMakeWriter, RedactingWriter};
 pub use crate::placeholder::PlaceholderMinter;
 pub use crate::secret_value::SecretValue;
 pub use crate::secret_vault::SecretVault;

@@ -1,0 +1,31 @@
+[package]
+name = "aura-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# This crate is a pure dev-only fixture library. It owns no production
+# code — `src/lib.rs` exposes builders and helpers that compose multiple
+# workspace crates' `test-support` features so that the e2e suites under
+# `tests/` can stay focused on the scenarios under test. No business
+# crate should ever depend on this; it lives outside the production
+# graph entirely.
+
+[dependencies]
+aura-agent = { workspace = true }
+aura-channels = { workspace = true, features = ["test-support"] }
+aura-llm = { workspace = true, features = ["test-support"] }
+aura-model = { workspace = true }
+aura-security = { workspace = true }
+aura-storage = { workspace = true, features = ["test-support"] }
+aura-tools = { workspace = true, features = ["test-support"] }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+regex = { workspace = true }

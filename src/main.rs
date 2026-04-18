@@ -1,5 +1,4 @@
 mod boot;
-mod log_redact;
 mod singleton;
 mod tui_log;
 
@@ -24,7 +23,7 @@ use aura_cli::{
 };
 use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
 use aura_hook::HookManager;
-use aura_security::{EncryptionKey, LeakDetector};
+use aura_security::{EncryptionKey, LeakDetector, RedactingMakeWriter};
 use aura_skills::SkillRegistry;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
@@ -40,7 +39,6 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::log_redact::RedactingMakeWriter;
 use crate::tui_log::TuiLogLayer;
 
 struct SecondPrecisionTimer;
@@ -466,7 +464,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Supervisor and Router
     let supervisor = AgentSupervisor::new(response_tx);
-    let actor_llm_client = Arc::clone(&llm_client);
+    let actor_llm_client: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&llm_client) as _;
     let actor_tool_registry = Arc::clone(&tool_registry);
     let actor_skill_registry = Arc::clone(&skill_registry);
     let actor_tool_executor = Arc::clone(&tool_executor);

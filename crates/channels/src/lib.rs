@@ -4,6 +4,9 @@ mod slash;
 mod tui;
 mod types;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use error::ChannelError;
 pub use registry::ChannelRegistry;
 pub use slash::{

@@ -3,6 +3,13 @@ name = "aura-storage"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes in-memory `SecretStore` (and future `SessionStore`, etc.) fakes
+# to downstream crates' tests. Pull in via:
+#   aura-storage = { workspace = true, features = ["test-support"] }
+# inside the consumer's `[dev-dependencies]`.
+test-support = []
+
 [dependencies]
 aura-model = { workspace = true }
 aura-trace = { workspace = true }

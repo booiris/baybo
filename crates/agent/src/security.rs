@@ -677,60 +677,13 @@ pub struct SecretVaultSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use aura_llm::{TokenUsage, ToolCallInfo};
     use aura_model::ChannelType;
     use aura_security::EncryptionKey;
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule};
-    use aura_storage::{SecretStore, StorageError};
+    use aura_storage::test_support::MemorySecretStore;
     use chrono::Utc;
     use regex::Regex;
-    use std::sync::Mutex;
-
-    struct MemorySecretStore {
-        data: Mutex<HashMap<String, Vec<u8>>>,
-    }
-
-    impl MemorySecretStore {
-        fn new() -> Self {
-            Self {
-                data: Mutex::new(HashMap::new()),
-            }
-        }
-
-        fn len(&self) -> usize {
-            self.data.lock().unwrap().len()
-        }
-    }
-
-    fn poison<E: std::fmt::Display>(e: E) -> StorageError {
-        StorageError::Storage(format!("mutex poisoned: {e}"))
-    }
-
-    #[async_trait]
-    impl SecretStore for MemorySecretStore {
-        async fn store(
-            &self,
-            name: &str,
-            encrypted_value: &[u8],
-        ) -> aura_storage::secret::Result<()> {
-            self.data
-                .lock()
-                .map_err(poison)?
-                .insert(name.to_owned(), encrypted_value.to_vec());
-            Ok(())
-        }
-        async fn retrieve(&self, name: &str) -> aura_storage::secret::Result<Option<Vec<u8>>> {
-            Ok(self.data.lock().map_err(poison)?.get(name).cloned())
-        }
-        async fn delete(&self, name: &str) -> aura_storage::secret::Result<()> {
-            self.data.lock().map_err(poison)?.remove(name);
-            Ok(())
-        }
-        async fn list(&self) -> aura_storage::secret::Result<Vec<String>> {
-            Ok(self.data.lock().map_err(poison)?.keys().cloned().collect())
-        }
-    }
 
     fn make_vault_with_store(store: Arc<MemorySecretStore>) -> SecretVault {
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();

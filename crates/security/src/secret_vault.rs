@@ -63,51 +63,7 @@ impl SecretVault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use aura_storage::StorageError;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    struct MemorySecretStore {
-        data: Mutex<HashMap<String, Vec<u8>>>,
-    }
-
-    impl MemorySecretStore {
-        fn new() -> Self {
-            Self {
-                data: Mutex::new(HashMap::new()),
-            }
-        }
-    }
-
-    fn poison<E: std::fmt::Display>(e: E) -> StorageError {
-        StorageError::Storage(format!("mutex poisoned: {e}"))
-    }
-
-    #[async_trait]
-    impl SecretStore for MemorySecretStore {
-        async fn store(
-            &self,
-            name: &str,
-            encrypted_value: &[u8],
-        ) -> aura_storage::secret::Result<()> {
-            self.data
-                .lock()
-                .map_err(poison)?
-                .insert(name.to_owned(), encrypted_value.to_vec());
-            Ok(())
-        }
-        async fn retrieve(&self, name: &str) -> aura_storage::secret::Result<Option<Vec<u8>>> {
-            Ok(self.data.lock().map_err(poison)?.get(name).cloned())
-        }
-        async fn delete(&self, name: &str) -> aura_storage::secret::Result<()> {
-            self.data.lock().map_err(poison)?.remove(name);
-            Ok(())
-        }
-        async fn list(&self) -> aura_storage::secret::Result<Vec<String>> {
-            Ok(self.data.lock().map_err(poison)?.keys().cloned().collect())
-        }
-    }
+    use aura_storage::test_support::MemorySecretStore;
 
     fn make_vault() -> SecretVault {
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();

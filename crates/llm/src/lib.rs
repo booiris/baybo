@@ -3,6 +3,9 @@ pub mod multimodal;
 mod providers;
 pub mod registry;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -118,6 +121,17 @@ impl Stream for LlmStream {
 }
 
 impl LlmStream {
+    /// Build a stream from a fixed sequence of events. Gated to test
+    /// builds only — production must construct streams via the rig
+    /// adapter so provider-specific event mapping stays a single path.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_events(events: Vec<crate::Result<StreamEvent>>) -> Self {
+        let stream = futures::stream::iter(events);
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
+
     /// Wraps a rig `StreamingCompletionResponse` into our type-erased `LlmStream`,
     /// converting provider-specific events into `StreamEvent`.
     fn from_rig_stream<R>(rig_stream: streaming::StreamingCompletionResponse<R>) -> Self
@@ -235,6 +249,31 @@ impl AnyCompletionModel {
                 Ok(LlmStream::from_rig_stream(stream))
             }
         }
+    }
+}
+
+/// Provider-agnostic completion contract used by the agent loop and any
+/// other consumer that doesn't need the concrete `LlmClient` (e.g. probe).
+///
+/// Implemented by `LlmClient` for production and by test stubs in
+/// `aura-llm`'s `test-support` feature for deterministic integration tests.
+#[async_trait::async_trait]
+pub trait LlmCompletion: Send + Sync {
+    async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse>;
+    async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream>;
+    fn model_info(&self) -> &ModelInfo;
+}
+
+#[async_trait::async_trait]
+impl LlmCompletion for LlmClient {
+    async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {
+        LlmClient::chat(self, request).await
+    }
+    async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
+        LlmClient::chat_stream(self, request).await
+    }
+    fn model_info(&self) -> &ModelInfo {
+        LlmClient::model_info(self)
     }
 }
 

@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::io;
 use std::sync::Arc;
 
-use aura_security::{LeakAction, LeakDetector};
+use crate::{LeakAction, LeakDetector};
 use tracing_subscriber::fmt::MakeWriter;
 
 pub struct RedactingMakeWriter<W> {

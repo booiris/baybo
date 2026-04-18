@@ -9,6 +9,9 @@ pub mod session;
 pub mod skill_risk;
 pub mod trace;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 pub use cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 pub use error::StorageError;

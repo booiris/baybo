@@ -3,6 +3,13 @@ name = "aura-channels"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes `RecordingChannel` (a spy `ChannelAdapter`) to downstream
+# crates' tests. Pull in via:
+#   aura-channels = { workspace = true, features = ["test-support"] }
+# inside the consumer's `[dev-dependencies]`.
+test-support = []
+
 [dependencies]
 aura-model = { workspace = true }
 aura-tools = { workspace = true }

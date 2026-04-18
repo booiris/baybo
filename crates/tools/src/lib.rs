@@ -3,6 +3,9 @@ pub mod builtin;
 pub mod error;
 pub mod registry;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
