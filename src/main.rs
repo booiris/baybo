@@ -573,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
     // that doesn't yield, the process hangs. An OS thread outside the
     // runtime is immune to that and terminates the process if the budget
     // is exceeded.
-    const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     std::thread::spawn(|| {
         std::thread::sleep(FORCE_EXIT_TIMEOUT);
         eprintln!(
