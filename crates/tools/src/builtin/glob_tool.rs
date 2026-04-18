@@ -15,8 +15,7 @@ pub struct GlobTool;
 #[derive(Debug, Deserialize)]
 struct Params {
     pattern: String,
-    #[serde(default)]
-    path: Option<PathBuf>,
+    path: PathBuf,
 }
 
 #[async_trait]
@@ -29,7 +28,12 @@ impl Tool for GlobTool {
         "Find files by glob pattern (e.g. `**/*.rs`). Always use this \
          instead of Bash commands like find or ls for file searching. \
          Results are sorted by modification time, newest first, and \
-         capped at 1000 entries."
+         capped at 1000 entries.\n\n\
+         PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
+         Relative paths and omission are rejected.\n\n\
+         BEFORE BROAD PATTERNS: When pointing at an unfamiliar directory, \
+         start with a narrow pattern (e.g. top-level `*` or `*/*.rs`) to \
+         gauge the file count before issuing recursive `**/*` walks."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -37,37 +41,38 @@ impl Tool for GlobTool {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Glob pattern to match" },
-                "path":    { "type": "string", "description": "Directory to search in (defaults to the current working directory)" }
+                "path":    { "type": "string", "description": "Absolute directory to search in (required)" }
             },
-            "required": ["pattern"]
+            "required": ["pattern", "path"]
         })
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
         // Glob enumerates filenames within a directory; treat the search root
         // as a read access so directory approvals cover subsequent reads.
-        let base = params
+        params
             .get("path")
             .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok());
-        match base {
-            Some(p) => vec![ResourceAccess::ReadFile { path: p }],
-            None => Vec::new(),
-        }
+            .map(|s| {
+                vec![ResourceAccess::ReadFile {
+                    path: PathBuf::from(s),
+                }]
+            })
+            .unwrap_or_default()
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        let base = match p.path {
-            Some(path) => path,
-            None => {
-                std::env::current_dir().map_err(|e| ToolError::Execution(format!("cwd: {e}")))?
-            }
-        };
+        if !p.path.is_absolute() {
+            return Err(ToolError::InvalidParams(format!(
+                "Glob `path` must be an absolute path, got `{}`",
+                p.path.display()
+            )));
+        }
 
+        let base = p.path;
         tokio::task::spawn_blocking(move || run_glob(&base, &p.pattern))
             .await
             .map_err(|e| ToolError::Execution(format!("join: {e}")))?
@@ -131,6 +136,30 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_relative_path() {
+        let err = GlobTool
+            .execute(json!({ "pattern": "*.rs", "path": "relative/dir" }), &ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
+            "expected InvalidParams about absolute, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_path() {
+        let err = GlobTool
+            .execute(json!({ "pattern": "*.rs" }), &ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(_)),
+            "expected InvalidParams, got: {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -44,7 +44,15 @@ impl Tool for BashTool {
          - To search file names use `Glob` (not find/ls)\n\
          - To search file contents use `Grep` (not grep/rg)\n\
          Reserve Bash for system commands, git operations, build/test, \
-         and terminal tasks that require shell execution."
+         and terminal tasks that require shell execution.\n\n\
+         PATHS: Any directory or file argument inside the command (cd, ls, \
+         mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional \
+         `cwd` parameter MUST also be absolute when provided — relative \
+         values are rejected.\n\n\
+         BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or \
+         similar walks against unknown directories without first checking \
+         their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a \
+         shallow `find -maxdepth 2`). Large trees can hang the process."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -74,6 +82,15 @@ impl Tool for BashTool {
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+
+        if let Some(dir) = &p.cwd
+            && !dir.is_absolute()
+        {
+            return Err(ToolError::InvalidParams(format!(
+                "Bash `cwd` must be an absolute path, got `{}`",
+                dir.display()
+            )));
+        }
 
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
@@ -187,5 +204,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_relative_cwd() {
+        let err = BashTool
+            .execute(
+                json!({ "command": "echo hi", "cwd": "relative/path" }),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
+            "expected InvalidParams about absolute, got: {err:?}"
+        );
     }
 }

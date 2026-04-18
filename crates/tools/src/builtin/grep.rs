@@ -21,8 +21,7 @@ pub struct GrepTool;
 #[derive(Debug, Deserialize)]
 struct Params {
     pattern: String,
-    #[serde(default)]
-    path: Option<PathBuf>,
+    path: PathBuf,
     #[serde(default)]
     glob: Option<String>,
     #[serde(default)]
@@ -46,7 +45,13 @@ impl Tool for GrepTool {
          instead of Bash commands like grep or rg. `output_mode` may be \
          `content` (matching lines), `files_with_matches` (default, paths \
          only), or `count` (match counts per file). Supports file-type \
-         filtering via the `glob` parameter."
+         filtering via the `glob` parameter.\n\n\
+         PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
+         Relative paths and omission are rejected.\n\n\
+         BEFORE SEARCHING: For an unfamiliar directory, first probe its \
+         scale with `Glob` (e.g. count entries) and narrow the search root \
+         or `glob` filter accordingly. Walking huge unfiltered trees can \
+         hang the process."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -54,7 +59,7 @@ impl Tool for GrepTool {
             "type": "object",
             "properties": {
                 "pattern":          { "type": "string", "description": "Rust-flavor regex" },
-                "path":             { "type": "string", "description": "Directory to search (default: cwd)" },
+                "path":             { "type": "string", "description": "Absolute directory to search (required)" },
                 "glob":             { "type": "string", "description": "Filename glob to filter files (e.g. `*.rs`)" },
                 "case_insensitive": { "type": "boolean", "default": false },
                 "output_mode":      {
@@ -63,33 +68,34 @@ impl Tool for GrepTool {
                     "default": "files_with_matches"
                 }
             },
-            "required": ["pattern"]
+            "required": ["pattern", "path"]
         })
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
-        let base = params
+        params
             .get("path")
             .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok());
-        match base {
-            Some(p) => vec![ResourceAccess::ReadFile { path: p }],
-            None => Vec::new(),
-        }
+            .map(|s| {
+                vec![ResourceAccess::ReadFile {
+                    path: PathBuf::from(s),
+                }]
+            })
+            .unwrap_or_default()
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
-        let mut p: Params =
+        let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        let base = match p.path.take() {
-            Some(path) => path,
-            None => {
-                std::env::current_dir().map_err(|e| ToolError::Execution(format!("cwd: {e}")))?
-            }
-        };
+        if !p.path.is_absolute() {
+            return Err(ToolError::InvalidParams(format!(
+                "Grep `path` must be an absolute path, got `{}`",
+                p.path.display()
+            )));
+        }
 
+        let base = p.path.clone();
         tokio::task::spawn_blocking(move || run_grep(&base, &p))
             .await
             .map_err(|e| ToolError::Execution(format!("join: {e}")))?
@@ -254,6 +260,30 @@ mod tests {
         };
         assert!(s.contains("a.rs"));
         assert!(!s.contains("b.rs"));
+    }
+
+    #[tokio::test]
+    async fn rejects_relative_path() {
+        let err = GrepTool
+            .execute(json!({ "pattern": "x", "path": "relative/dir" }), &ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
+            "expected InvalidParams about absolute, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_path() {
+        let err = GrepTool
+            .execute(json!({ "pattern": "x" }), &ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(_)),
+            "expected InvalidParams, got: {err:?}"
+        );
     }
 
     #[tokio::test]
