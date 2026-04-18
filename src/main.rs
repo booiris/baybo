@@ -566,6 +566,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Force-exit watchdog. A tool still running when the TUI quits can
+    // stall graceful teardown: the agent actor future is detached from
+    // `router.run` (spawned via `tokio::spawn` above), so the tokio runtime
+    // drop waits for it — and if the in-flight tool is in a blocking call
+    // that doesn't yield, the process hangs. An OS thread outside the
+    // runtime is immune to that and terminates the process if the budget
+    // is exceeded.
+    const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    std::thread::spawn(|| {
+        std::thread::sleep(FORCE_EXIT_TIMEOUT);
+        eprintln!(
+            "aura: graceful shutdown exceeded {}s, force-exiting",
+            FORCE_EXIT_TIMEOUT.as_secs()
+        );
+        std::process::exit(0);
+    });
+
     // Cleanup
     task_tracker.shutdown().await;
     info!("Aura shutdown complete");
