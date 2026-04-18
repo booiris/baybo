@@ -118,8 +118,8 @@ fn resolve_target_path(ctx: &CommandContext) -> Result<PathBuf> {
         .or_else(|| std::env::var("AURA_CONFIG_PATH").ok().map(PathBuf::from))
         .ok_or_else(|| {
             CliError::Config(
-                "no config file resolved; set AURA_CONFIG_PATH or pass --config so the mutation \
-                 has a destination"
+                "no config file resolved; set AURA_CONFIG_PATH (or pass --config <path>) so the \
+                 mutation has a destination"
                     .into(),
             )
         })

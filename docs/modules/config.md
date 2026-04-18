@@ -50,6 +50,11 @@ Every **top-level** section carries `#[serde(default)]` and a matching `Default`
 This does **not** extend uniformly into nested structs. The following nested types have required serde fields — supplying the parent object without them fails at deserialization, not in `validate()`:
 
 - `HttpChannelConfig` (`enabled`, `bind_address`, `port`) — under `channels.http`
+  **Deprecated**: the `channels.http` stub is retained for one release for
+  back-compatibility with older configs, but the HTTP surface is now owned by
+  the top-level `gateway` section (`aura-gateway` crate; see
+  [`gateway.md`](gateway.md)). Setting `channels.http.enabled = true` has no
+  runtime effect — use `gateway.enabled` and run `aura gateway start`.
 - `TelegramChannelConfig` (`enabled`, `bot_token_env`) — under `channels.telegram`
 - `DiscordChannelConfig` (`enabled`, `bot_token_env`) — under `channels.discord`
 - (`McpServerEntry` and `SecretRequirementConfig` required-field notes are removed alongside MCP support.)

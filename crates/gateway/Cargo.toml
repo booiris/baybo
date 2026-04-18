@@ -1,0 +1,56 @@
+[package]
+name = "aura-gateway"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["linux", "macos"]
+# Compile-in Linux-specific code paths (currently: systemd installer). Any
+# future Linux-only feature of the gateway should live behind this gate rather
+# than introducing a narrower flag — one knob per OS keeps cross-platform
+# opt-in/out legible.
+linux = []
+# Compile-in macOS-specific code paths (currently: launchd installer).
+macos = []
+# Exposes test helpers to downstream crate-level tests. Never enabled in
+# release builds.
+test-support = []
+
+[dependencies]
+aura-agent = { workspace = true }
+aura-channels = { workspace = true }
+aura-config = { workspace = true }
+aura-cron = { workspace = true }
+aura-job = { workspace = true }
+aura-llm = { workspace = true }
+aura-model = { workspace = true }
+aura-security = { workspace = true }
+aura-session = { workspace = true }
+aura-skills = { workspace = true }
+aura-storage = { workspace = true }
+aura-tools = { workspace = true }
+aura-trace = { workspace = true }
+aura-workspace = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+tower = { workspace = true }
+
+[dev-dependencies]
+aura-gateway = { workspace = true, features = ["test-support"] }
+aura-storage = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

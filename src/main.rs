@@ -1,44 +1,25 @@
 mod boot;
+mod gateway_cmd;
+mod runtime;
 mod singleton;
+mod tui_cmd;
 mod tui_log;
 
-use aura_agent::actor::AgentActor;
-use aura_agent::agent_loop::AgentLoop;
-use aura_agent::cost::CostTracker;
-use aura_agent::observability::ObservabilityRecorder;
-use aura_agent::router::Router;
-use aura_agent::service::{ShutdownSignal, TaskTracker};
-use aura_agent::soul::Soul;
-use aura_agent::supervisor::AgentSupervisor;
-use aura_agent::tool_executor::ToolExecutor;
-use aura_agent::{
-    CronScheduler, JobManager, MemoryManager, SecretVault, SecurityGateway, SessionManager,
-    TraceCollector,
-};
-use aura_channels::{ChannelRegistry, TuiAdapter, TuiLogSink};
+use aura_channels::TuiLogSink;
 use aura_cli::cli::ShellKind;
-use aura_cli::{
-    Cli, CliDashboardProvider, CliInputHistoryStore, CliSlashHandler, Commands, ContextBuilder,
-    Invocation, OutputFormat, dispatch,
-};
-use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
-use aura_hook::HookManager;
-use aura_security::{EncryptionKey, LeakDetector, RedactingMakeWriter};
-use aura_skills::SkillRegistry;
-use aura_storage::Store;
-use aura_tools::ToolRegistry;
-use aura_workspace::WorkspaceManager;
+use aura_cli::{Cli, Commands, ContextBuilder, Invocation, OutputFormat, dispatch};
+use aura_security::{LeakDetector, RedactingMakeWriter};
 use clap::CommandFactory;
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{Mutex, RwLock, mpsc};
-use tracing::{error, info};
+use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::runtime::build_leak_detector;
 use crate::tui_log::TuiLogLayer;
 
 struct SecondPrecisionTimer;
@@ -63,9 +44,9 @@ enum TracingMode<'a> {
     },
 }
 
-struct ChatTracing {
+pub struct ChatTracing {
     _file_guard: WorkerGuard,
-    tui_sink: Arc<OnceLock<TuiLogSink>>,
+    pub tui_sink: Arc<OnceLock<TuiLogSink>>,
 }
 
 fn init_tracing(mode: TracingMode<'_>) -> Option<ChatTracing> {
@@ -150,11 +131,36 @@ fn resolve_config_path() -> Option<PathBuf> {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Promote `--config <path>` into `AURA_CONFIG_PATH` before any
+    // reader runs, so every downstream caller can stay env-only with a
+    // single source of truth.
+    //
+    // SAFETY: `setenv` is process-global; Rust 2024 marks it unsafe
+    // because a concurrent `getenv` on another thread can observe a
+    // torn read on some libc implementations. We write exactly once,
+    // exactly here, before `boot::load_config` (the only reader in this
+    // binary) runs, and no other code in the process mutates or reads
+    // `AURA_CONFIG_PATH` concurrently — so the race window is empty in
+    // practice.
+    if let Some(path) = cli.global.config.as_deref() {
+        unsafe {
+            std::env::set_var("AURA_CONFIG_PATH", path);
+        }
+    }
+
     // `completion` is the only subcommand that must work without loading
     // config or initialising tracing — it is pure stdout output.
     if let Some(Commands::Completion { shell }) = cli.command {
         print_completion(shell)?;
         return Ok(());
+    }
+
+    // Gateway subcommands have their own entrypoint: they run without
+    // the chat-loop boot path (install/status) or with a lightweight
+    // vault-only boot (enable/token). `start` becomes a long-lived
+    // server. Route them here before the generic argv/chat branch.
+    if let Some(Commands::Gateway { cmd }) = cli.command {
+        return gateway_cmd::run(cmd).await;
     }
 
     // Bare `aura` (no subcommand) prints help and exits. The interactive
@@ -170,441 +176,90 @@ async fn main() -> anyhow::Result<()> {
 
     let config = boot::load_config().await?;
     let config = Arc::new(config);
-    let buffer = config.channels.message_buffer_size;
-
-    let chat_mode = matches!(cli.command, Some(Commands::Tui));
     let workspace_root = PathBuf::from(&config.workspace.path);
-    let log_dir = workspace_root.join("logs");
-    // Shared between the log file redactor (below) and the chat-loop security
-    // gateway built further down, so log lines and gateway reveal logic see
-    // the same rule set.
-    let leak_detector = Arc::new(boot::build_leak_detector(&config.security));
-    let chat_tracing = if chat_mode {
-        init_tracing(TracingMode::Chat {
+
+    // TUI: ratatui owns stdout, so tracing goes to a rolling file under
+    // `<workspace>/logs/` (redacted through the shared `LeakDetector`)
+    // and warn/error events mirror into the chat scrollback via
+    // `TuiLogLayer`. Gets its own early return so the rest of `main`
+    // doesn't need to branch on chat_mode.
+    if matches!(cli.command, Some(Commands::Tui)) {
+        let log_dir = workspace_root.join("logs");
+        let leak_detector = build_leak_detector(&config.security, None);
+        let chat_tracing = init_tracing(TracingMode::Chat {
             log_dir: &log_dir,
             leak_detector: Arc::clone(&leak_detector),
-        })
-    } else {
-        init_tracing(TracingMode::Stdout)
-    };
+        });
+        info!("Aura - Intelligent Assistant Framework starting");
+        return tui_cmd::run(config, leak_detector, chat_tracing).await;
+    }
 
-    info!("Aura - Intelligent Assistant Framework starting");
+    // ---------------- argv dispatch (one-shot command + exit) ----------------
+    //
+    // Everything reaching this point is a one-shot argv command (Tui,
+    // Completion, Gateway, None are all handled above). Argv mode needs
+    // only the lightweight inspection set (skills, tools, channels,
+    // workspace, optional LLM) — building the whole manager graph for
+    // `aura status` would needlessly open libsql and recover jobs.
+    init_tracing(TracingMode::Stdout);
 
-    // --- minimal services required by both argv and chat modes ---
+    let cmd = cli.command.expect("non-command branches handled above");
 
     let skill_registry = {
-        let reg = Arc::new(SkillRegistry::new());
+        let reg = Arc::new(aura_skills::SkillRegistry::new());
         let workspace_skills = workspace_root.join("skills");
-        let workspace_loaded = reg.load_dir(&workspace_skills);
-        if workspace_loaded > 0 {
+        let loaded = reg.load_dir(&workspace_skills);
+        if loaded > 0 {
             info!(
-                count = workspace_loaded,
+                count = loaded,
                 path = %workspace_skills.display(),
                 "loaded skills from workspace"
             );
         }
         reg
     };
-    let mut tool_registry = Arc::new(ToolRegistry::with_defaults());
-    let workspace = Arc::new(WorkspaceManager::new(PathBuf::from(&config.workspace.path)));
-    let channels_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
-
-    // LLM client is required for the chat loop but optional for argv commands
-    // that only inspect state. Argv mode logs and continues; chat mode errors.
+    let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults());
+    let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
+        workspace_root.clone(),
+    ));
+    let channels_registry = Arc::new(tokio::sync::RwLock::new(
+        aura_channels::ChannelRegistry::new(),
+    ));
     let llm_client = match boot::build_llm_client(&config.llm) {
-        Ok(c) => {
-            let client = Arc::new(c);
-            info!(
-                provider = %client.model_info().provider,
-                model = %client.model_id(),
-                "configured LLM client"
-            );
-            Some(client)
-        }
-        Err(e) if cli.command.is_some() => {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
             tracing::warn!(error = %e, "LLM client unavailable for this command");
             None
         }
-        Err(e) => return Err(e),
     };
 
-    // ---------------- argv dispatch (one-shot command + exit) ----------------
+    let mut builder = ContextBuilder::new(Arc::clone(&config))
+        .config_path(resolve_config_path())
+        .skills(Arc::clone(&skill_registry))
+        .tools(Arc::clone(&tool_registry))
+        .channels(Arc::clone(&channels_registry))
+        .workspace(Arc::clone(&workspace));
+    if let Some(ref client) = llm_client {
+        builder = builder.llm(Arc::clone(client));
+    }
+    let ctx = builder
+        .build()
+        .with_format(cli_format)
+        .with_invocation(Invocation::Argv);
 
-    // `Tui` falls through to the chat-loop boot below instead of running
-    // through `dispatch::run` — it's an interactive session, not a one-shot.
-    if let Some(cmd) = cli.command.filter(|c| !matches!(c, Commands::Tui)) {
-        let mut builder = ContextBuilder::new(Arc::clone(&config))
-            .config_path(resolve_config_path())
-            .skills(Arc::clone(&skill_registry))
-            .tools(Arc::clone(&tool_registry))
-            .channels(Arc::clone(&channels_registry))
-            .workspace(Arc::clone(&workspace));
-        if let Some(ref client) = llm_client {
-            builder = builder.llm(Arc::clone(client));
-        }
-        let ctx = builder
-            .build()
-            .with_format(cli_format)
-            .with_invocation(Invocation::Argv);
-
-        match dispatch::run(&ctx, cmd).await {
-            Ok(out) => {
-                let rendered = out.render(cli_format);
-                if !rendered.is_empty() {
-                    println!("{rendered}");
-                }
-                return Ok(());
+    match dispatch::run(&ctx, cmd).await {
+        Ok(out) => {
+            let rendered = out.render(cli_format);
+            if !rendered.is_empty() {
+                println!("{rendered}");
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
+            Ok(())
         }
-    }
-
-    // ---------------- chat-loop boot (no subcommand provided) ----------------
-
-    // Per-workspace singleton: the chat loop owns libsql, the job recovery
-    // pass, and cron ticks — two instances against the same workspace would
-    // race. Held for the lifetime of `main`; released by `Drop` on exit.
-    let _workspace_lock = singleton::acquire(workspace.root.as_path())?;
-
-    // By construction: the chat loop is only reached when `cli.command` is
-    // `None`, and in that branch `build_llm_client` must have succeeded or we
-    // already returned an error. Unwrap defensively to avoid a panic.
-    let llm_client =
-        llm_client.ok_or_else(|| anyhow::anyhow!("LLM client is required for chat loop"))?;
-
-    // Storage layer — persistent libsql under the project root (`workspace.path`).
-    let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
-
-    // Skill risk assessor — LLM-backed classifier with hash-keyed cache.
-    // Consulted lazily at skill-use time (slash dispatch + agent_loop gating).
-    // `config.skills.risk_check` picks the scope: `off` skips the check
-    // entirely, `primary` (the default) judges `SKILL.md` only, `full`
-    // judges the whole directory. Persisted job rows from older tiered
-    // builds are recovered below so upgrading the assessor doesn't
-    // silently abandon in-flight verdicts.
-    let risk_store: Arc<dyn aura_storage::SkillRiskStore> = Arc::from(storage.risk);
-    let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
-    let skill_assessor = Arc::new(aura_skills_assessor::SkillAssessor::with_background_worker(
-        Arc::clone(&llm_client),
-        Arc::clone(&risk_store),
-        assessment_mode,
-    ));
-    {
-        let registry = Arc::clone(&skill_registry);
-        let lookup = move |name: &str| registry.get(name);
-        match skill_assessor.recover_pending_jobs(lookup).await {
-            Ok(0) => {}
-            Ok(n) => info!(count = n, "re-enqueued skill-risk jobs from prior run"),
-            Err(e) => tracing::warn!(error = %e, "failed to recover skill-risk jobs"),
-        }
-    }
-
-    // Session manager
-    let session_manager = Arc::new(SessionManager::new(
-        storage.session,
-        boot::to_session_timeout(&config.session),
-    ));
-
-    // Job manager — recover any jobs interrupted by a prior shutdown
-    let job_manager = JobManager::new(storage.job);
-    match job_manager.recover_interrupted().await {
-        Ok(0) => {}
-        Ok(n) => info!(count = n, "recovered interrupted jobs from prior run"),
-        Err(e) => tracing::warn!(error = %e, "failed to recover interrupted jobs"),
-    }
-    let job_manager = Arc::new(job_manager);
-
-    // Cost tracker
-    let cost_tracker = Arc::new(CostTracker::new(storage.cost));
-
-    // Trace store — shared by per-session TraceCollectors and the slash context.
-    let trace_store: Arc<dyn aura_storage::TraceStore> = Arc::from(storage.trace);
-
-    // Secret vault
-    let master_key = match boot::load_encryption_key(&config.security) {
-        Ok(k) => k,
         Err(e) => {
-            let allow_dev = std::env::var("AURA_ALLOW_DEV_ENCRYPTION_KEY")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-            if !allow_dev {
-                return Err(anyhow::anyhow!(
-                    "failed to load encryption key: {e}. To run with an insecure dev-only key, \
-                     set AURA_ALLOW_DEV_ENCRYPTION_KEY=1 (NOT for production — secrets would be \
-                     encrypted with a publicly-known key)"
-                ));
-            }
-            error!(
-                error = %e,
-                "AURA_ALLOW_DEV_ENCRYPTION_KEY=1 — running with dev-only encryption key; \
-                 secrets are NOT confidential, DO NOT use in production"
-            );
-            EncryptionKey::new(b"aura-dev-master-key-32-bytes-ok!".to_vec())?
-        }
-    };
-    let secret_vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
-
-    // Shutdown signal — created here (earlier than strictly needed) so the
-    // cron scheduler below can take a clone before `ToolExecutor` clones
-    // `tool_registry` and pins its strong count above 1.
-    let shutdown = ShutdownSignal::new();
-
-    // Cron scheduler. Must be built BEFORE `ToolExecutor` so its tools can
-    // be registered while `Arc::get_mut(&mut tool_registry)` still succeeds.
-    // The background tick loop is spawned further down, once `task_tracker`
-    // exists.
-    let (cron_trigger_tx, cron_trigger_rx) = mpsc::channel(64);
-    let cron_scheduler = Arc::new(CronScheduler::new(
-        storage.cron,
-        cron_trigger_tx,
-        Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
-    ));
-
-    // Register cron-management tools while `tool_registry` still has a single
-    // owner. Once `ToolExecutor::new` below clones the Arc, `get_mut` would
-    // fail.
-    {
-        let reg = Arc::get_mut(&mut tool_registry)
-            .expect("tool_registry has no other owners at this point");
-        for (tool, manifest) in aura_cron::agent_tools(Arc::clone(&cron_scheduler)) {
-            reg.register(tool, manifest);
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
     }
-
-    // Security gateway must exist before the tool executor — the executor
-    // delegates placeholder reveal on tool-call arguments to the gateway.
-    // `leak_detector` was built earlier (shared with the log redactor); the
-    // same Arc also feeds the slash context so `aura security leaks check`
-    // sees the same rule set.
-    let security_gateway = Arc::new(SecurityGateway::new(
-        Arc::clone(&leak_detector),
-        Arc::clone(&secret_vault),
-    ));
-
-    // Tool executor — the gate map is shared with ChannelRegistry and
-    // populated lazily when channels register (so no need to create the
-    // TUI adapter early).
-    let gate_map = channels_registry.read().await.approval_gates();
-    let tool_executor = Arc::new(ToolExecutor::new(
-        Arc::clone(&tool_registry),
-        boot::to_tool_timeout(&config.tools),
-        gate_map,
-        Arc::clone(&security_gateway),
-    ));
-
-    // Memory manager
-    let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
-
-    // Context manager (sliding window). Tokenizer picks an encoding based
-    // on the configured model; Anthropic and other non-OpenAI models fall
-    // back to cl100k_base as a close approximation.
-    let tokenizer: Arc<dyn Tokenizer> =
-        Arc::new(TiktokenTokenizer::for_model(llm_client.model_id()));
-
-    // Soul derived from workspace identity files
-    let soul = Soul::from_workspace(&workspace)
-        .await
-        .unwrap_or_else(|_| Soul::custom("You are Aura, an intelligent assistant.".to_string()));
-
-    // Execution policy
-    let policy = boot::to_execution_policy(&config.agent);
-
-    // Hook manager (empty by default; hooks are loaded from config in later phases)
-    let hook_manager = Arc::new(HookManager::new());
-
-    // Message channels
-    let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
-    let (response_tx, response_rx) = mpsc::channel(buffer);
-
-    // Build the slash-handler context once everything above is wired.
-    let slash_ctx = Arc::new(
-        ContextBuilder::new(Arc::clone(&config))
-            .config_path(resolve_config_path())
-            .skills(Arc::clone(&skill_registry))
-            .tools(Arc::clone(&tool_registry))
-            .channels(Arc::clone(&channels_registry))
-            .llm(Arc::clone(&llm_client))
-            .workspace(Arc::clone(&workspace))
-            .session(Arc::clone(&session_manager))
-            .job(Arc::clone(&job_manager))
-            .cron(Arc::clone(&cron_scheduler))
-            .memory(Arc::clone(&memory_manager))
-            .trace(Arc::clone(&trace_store))
-            .security(Arc::clone(&security_gateway))
-            .leak_detector(Arc::clone(&leak_detector))
-            .skill_assessor(Arc::clone(&skill_assessor))
-            .build()
-            .with_invocation(Invocation::Slash)
-            .with_format(OutputFormat::Plain),
-    );
-    let slash_handler = Arc::new(CliSlashHandler::new(Arc::clone(&slash_ctx)));
-    let dashboard_provider = Arc::new(CliDashboardProvider::new(Arc::clone(&slash_ctx)));
-
-    // Build, register, and start the TUI adapter. The approval gate is
-    // extracted automatically by `ChannelRegistry::register` and is already
-    // visible to `ToolExecutor` through the shared `ApprovalGateMap`.
-    {
-        let tui_shutdown = shutdown.clone();
-        let history_store = Arc::new(CliInputHistoryStore::new(Arc::clone(&secret_vault)));
-        let tui = TuiAdapter::new()
-            .with_slash_handler(slash_handler)
-            .with_dashboard_provider(dashboard_provider)
-            .with_input_history(history_store)
-            .with_on_exit(Arc::new(move || tui_shutdown.trigger()));
-        if let Some(tracing) = chat_tracing.as_ref() {
-            let _ = tracing.tui_sink.set(tui.log_sink());
-        }
-        let mut reg = channels_registry.write().await;
-        reg.register(Box::new(tui))?;
-        reg.start_all(incoming_tx).await?;
-    }
-
-    // Supervisor and Router
-    let supervisor = AgentSupervisor::new(response_tx);
-    let actor_llm_client: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&llm_client) as _;
-    let actor_tool_registry = Arc::clone(&tool_registry);
-    let actor_skill_registry = Arc::clone(&skill_registry);
-    let actor_tool_executor = Arc::clone(&tool_executor);
-    let actor_memory_manager = Arc::clone(&memory_manager);
-    let actor_policy = policy.clone();
-    let actor_system_prompt = soul.system_prompt().to_string();
-    let actor_tokenizer = Arc::clone(&tokenizer);
-    let actor_hooks = Arc::clone(&hook_manager);
-    let actor_trace_store = Arc::clone(&trace_store);
-    let actor_auto_snapshot = config.trace.auto_snapshot;
-    let actor_snapshot_interval = config.trace.snapshot_interval;
-    let actor_job_manager = Arc::clone(&job_manager);
-    let actor_cost_tracker = Arc::clone(&cost_tracker);
-    let actor_skill_assessor = Arc::clone(&skill_assessor);
-    let actor_token_budget = boot::to_token_budget(&config.agent.context);
-    let actor_keep_recent = config.agent.context.keep_recent;
-    let actor_security_gateway = Arc::clone(&security_gateway);
-
-    let router = Router::new(
-        Arc::clone(&session_manager),
-        supervisor,
-        Arc::clone(&channels_registry),
-        security_gateway,
-    )
-    .with_actor_spawner(Box::new(move |session, response_tx| {
-        let agent_loop = AgentLoop::new(
-            Arc::clone(&actor_llm_client),
-            Arc::clone(&actor_tool_registry),
-            Arc::clone(&actor_skill_registry),
-            Arc::clone(&actor_tool_executor),
-            ContextManager::new(
-                Arc::clone(&actor_tokenizer),
-                Box::new(Truncate::new(actor_keep_recent)),
-                actor_token_budget.clone(),
-            ),
-            Arc::clone(&actor_memory_manager),
-            actor_policy.clone(),
-            Soul::custom(actor_system_prompt.clone()),
-            Arc::clone(&actor_security_gateway),
-        )
-        .with_skill_assessor(Arc::clone(&actor_skill_assessor));
-
-        // Per-session trace collector and observability recorder so each
-        // actor records spans under its own session_id.
-        let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
-            &session.id,
-            Arc::clone(&actor_trace_store),
-            actor_auto_snapshot,
-            actor_snapshot_interval,
-        )));
-        let recorder = Arc::new(ObservabilityRecorder::new(
-            Arc::clone(&actor_job_manager),
-            trace_collector,
-            Arc::clone(&actor_cost_tracker),
-        ));
-
-        let actor = AgentActor::new(
-            session,
-            agent_loop,
-            Arc::clone(&actor_tool_executor),
-            response_tx,
-            Arc::clone(&actor_hooks),
-            recorder,
-        );
-        let (sender, mailbox) = mpsc::channel(buffer);
-        tokio::spawn(async move {
-            actor.run(mailbox).await;
-        });
-        sender
-    }));
-
-    // Shutdown coordination. `shutdown` itself was created earlier so the
-    // CronScheduler could take a clone; we still need the task tracker here.
-    let mut task_tracker = TaskTracker::new();
-
-    // Signal handler
-    let sig_shutdown = shutdown.clone();
-    task_tracker.track(tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM");
-            tokio::select! {
-                _ = ctrl_c => { info!("received SIGINT"); }
-                _ = sigterm.recv() => { info!("received SIGTERM"); }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            ctrl_c.await.expect("failed to listen for ctrl_c");
-            info!("received SIGINT");
-        }
-        sig_shutdown.trigger();
-    }));
-
-    info!("all components initialized, starting router");
-
-    // Spawn the cron scheduler's background tick loop (the scheduler itself
-    // was built above alongside the slash context).
-    let cron_handle = Arc::clone(&cron_scheduler);
-    task_tracker.track(tokio::spawn(async move {
-        cron_handle.run().await;
-    }));
-
-    let router = router.with_cron_triggers(cron_trigger_rx);
-
-    // Run router with shutdown awareness
-    // The CLI adapter's background task holds a clone of the incoming sender.
-    // When the user types /quit or the adapter is stopped, the sender is
-    // dropped and the router's incoming channel closes naturally.
-    let router_shutdown = shutdown.clone();
-    tokio::select! {
-        _ = router.run(incoming_rx, response_rx) => {}
-        _ = router_shutdown.wait() => {
-            info!("shutdown signal received, stopping router");
-        }
-    }
-
-    // Force-exit watchdog. A tool still running when the TUI quits can
-    // stall graceful teardown: the agent actor future is detached from
-    // `router.run` (spawned via `tokio::spawn` above), so the tokio runtime
-    // drop waits for it — and if the in-flight tool is in a blocking call
-    // that doesn't yield, the process hangs. An OS thread outside the
-    // runtime is immune to that and terminates the process if the budget
-    // is exceeded.
-    const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    std::thread::spawn(|| {
-        std::thread::sleep(FORCE_EXIT_TIMEOUT);
-        eprintln!(
-            "aura: graceful shutdown exceeded {}s, force-exiting",
-            FORCE_EXIT_TIMEOUT.as_secs()
-        );
-        std::process::exit(0);
-    });
-
-    // Cleanup
-    task_tracker.shutdown().await;
-    info!("Aura shutdown complete");
-    Ok(())
 }
 
 fn pick_format(cli: &Cli) -> OutputFormat {

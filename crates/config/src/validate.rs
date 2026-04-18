@@ -2,6 +2,7 @@ use crate::AuraConfig;
 use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
 use crate::error::{ConfigError, ValidationError};
+use crate::gateway::GatewayConfig;
 use crate::llm::LlmConfig;
 use crate::session::SessionConfig;
 use crate::tools::ToolsConfig;
@@ -22,6 +23,7 @@ impl AuraConfig {
         validate_trace(&self.trace, &mut errors);
         validate_cost(&self.cost, &mut errors);
         validate_workspace(&self.workspace, &mut errors);
+        validate_gateway(&self.gateway, &mut errors);
         validate_cross_section(self, &mut errors);
         if errors.is_empty() {
             Ok(())
@@ -225,6 +227,32 @@ fn validate_cost(cost: &CostConfig, errors: &mut Vec<ValidationError>) {
 fn validate_workspace(workspace: &WorkspaceConfig, errors: &mut Vec<ValidationError>) {
     if workspace.path.trim().is_empty() {
         errors.push(ValidationError::new("workspace.path", "must be non-empty"));
+    }
+}
+
+fn validate_gateway(gateway: &GatewayConfig, errors: &mut Vec<ValidationError>) {
+    if gateway.bind_address.trim().is_empty() {
+        errors.push(ValidationError::new(
+            "gateway.bind_address",
+            "must be non-empty",
+        ));
+    }
+    if gateway.port == 0 {
+        errors.push(ValidationError::new("gateway.port", "must be > 0"));
+    }
+    if gateway.shutdown_grace_secs == 0 {
+        errors.push(ValidationError::new(
+            "gateway.shutdown_grace_secs",
+            "must be >= 1",
+        ));
+    }
+    for (i, origin) in gateway.cors_allowed_origins.iter().enumerate() {
+        if origin.trim().is_empty() {
+            errors.push(ValidationError::new(
+                format!("gateway.cors_allowed_origins[{i}]"),
+                "must be non-empty",
+            ));
+        }
     }
 }
 

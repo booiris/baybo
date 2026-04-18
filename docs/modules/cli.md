@@ -58,6 +58,13 @@ The trait that lets a channel adapter intercept `/` input is defined in `aura-ch
 **Global flags** (apply to every command in both modes):
 `--config <path>` · `--profile <name>` · `--json` · `--plain` · `--no-color` · `-v/--verbose` · `-V/--version`
 
+`--config` is UX sugar: `main` writes its value into `AURA_CONFIG_PATH`
+once at startup, and every downstream reader goes through the env var.
+So both `aura --config /foo/aura.json …` and
+`AURA_CONFIG_PATH=/foo/aura.json aura …` hit the same code path, and
+installed services (systemd/launchd) that only have env available work
+without special cases.
+
 "Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs are tracked in the per-subsystem follow-up todos (`docs/todo/cli-agent-send-argv.md`) — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
 
 | Family       | Subcommands                                                                                               | Backing module                                                               | Mutation                                                                                           | Status                                            |

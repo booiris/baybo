@@ -11,7 +11,7 @@ Bottom-up along the dependency graph:
 3. [llm.md](llm.md) → [security.md](security.md)
 4. [tools.md](tools.md) → [workspace.md](workspace.md) → [context.md](context.md)
 5. [trace.md](trace.md) → [hook.md](hook.md)
-6. [storage.md](storage.md) → [agent.md](agent.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md)
+6. [storage.md](storage.md) → [agent.md](agent.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md)
 
 ## Module Groups
 
@@ -48,6 +48,7 @@ Bottom-up along the dependency graph:
 - **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, ObservabilityRecorder, cost management (CostTracker, CostGuard), plus all domain managers (SessionManager, MemoryManager, TraceCollector, JobManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
 - **bootstrap** — Binary entry point (`src/main.rs`) and `boot` submodule. Loads `AuraConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
 - **cli** — Operator-facing command layer (`aura-cli`). One `clap` tree drives both argv-mode commands (`aura config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input that resolves to a CLI command never enters the agent's context. User-invocable skills are the one sanctioned exception: `/<skill>` is forwarded to the agent as a normal chat message so `SkillRegistry::select` can narrow on the exact-match branch.
+- **[gateway](gateway.md)** — Headless HTTP backend (`aura-gateway`). One axum server is both a `ChannelType::Http` adapter (chat flows through the normal Router path) and an admin REST/SSE API mirroring the CLI families. Auth is a dynamic per-install token stored in `SecretVault`; platform service units live behind `linux` / `macos` Cargo features (one knob per OS; reuse these for any future platform-specific gateway code). Driven by the `aura gateway …` command tree.
 
 ## Cross-Cutting Guides
 
@@ -74,6 +75,7 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
 storage   ──► model, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
 session   ──► model, storage (owns SessionManager; consumes SessionStore from storage)
 agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, channels, config
+gateway   ──► agent, channels, config, cron, job, llm, model, security, session, skills, storage, tools, trace, workspace
 bootstrap ──► config + all domain crates it assembles (entry point only)
 ```
 

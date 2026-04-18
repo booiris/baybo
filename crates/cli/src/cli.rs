@@ -15,9 +15,16 @@ pub struct Cli {
 }
 
 /// Global flags shared by every subcommand.
+///
+/// `--config` is pure UX sugar: `main` pushes its value into
+/// `AURA_CONFIG_PATH` once at startup, and every downstream reader goes
+/// through the env var. One source of truth at the read site, two
+/// surfaces at the call site.
 #[derive(Debug, clap::Args, Default, Clone)]
 pub struct GlobalArgs {
-    /// Override AURA_CONFIG_PATH.
+    /// Path to the Aura config file. Overrides `AURA_CONFIG_PATH`.
+    /// Clap's `env = "..."` makes the env var the fallback so both
+    /// surfaces land in the same field.
     #[arg(long, global = true, env = "AURA_CONFIG_PATH")]
     pub config: Option<String>,
 
@@ -103,6 +110,11 @@ pub enum Commands {
     },
     /// Launch the interactive Ratatui chat session.
     Tui,
+    /// Run or manage the HTTP gateway service.
+    Gateway {
+        #[command(subcommand)]
+        cmd: GatewayCmd,
+    },
     /// One-shot summary of current runtime state.
     Status,
     /// Run health checks against config, storage, and env.
@@ -406,6 +418,54 @@ pub enum AgentCmd {
         #[arg(long)]
         message: String,
         /// Confirm the mutation. Slash mode rejects before this is read.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GatewayCmd {
+    /// Run the HTTP gateway in the foreground.
+    Start,
+    /// Write a platform service unit (systemd user unit on Linux,
+    /// launchd agent on macOS) pointing at the current binary.
+    Install {
+        /// Install a system-wide unit instead of a per-user unit.
+        /// Requires root on Linux.
+        #[arg(long)]
+        system: bool,
+        /// Override the `ExecStart` path. Use this when the release
+        /// binary lives somewhere other than `$PATH`.
+        #[arg(long)]
+        exec_start: Option<String>,
+    },
+    /// Mint the auth token if absent and enable autostart at boot.
+    Enable,
+    /// Disable autostart at boot. Leaves the unit file in place.
+    Disable,
+    /// Remove the service unit. The vault-stored token is left in
+    /// place — use `token rotate` to invalidate a leaked one.
+    Uninstall {
+        /// Confirm the mutation in slash mode.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Print installation and runtime status of the service.
+    Status,
+    /// Inspect or rotate the auth token.
+    Token {
+        #[command(subcommand)]
+        cmd: GatewayTokenCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GatewayTokenCmd {
+    /// Print the current auth token.
+    Show,
+    /// Replace the token with a newly generated one and print it.
+    /// Requires `--yes` in slash mode.
+    Rotate {
         #[arg(long, short = 'y')]
         yes: bool,
     },

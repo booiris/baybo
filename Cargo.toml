@@ -19,6 +19,7 @@ members = [
     "crates/cron",
     "crates/config",
     "crates/cli",
+    "crates/gateway",
     "crates/integration-tests",
 ]
 exclude = ["crates/security/fuzz"]
@@ -48,6 +49,7 @@ aura-skills-assessor = { path = "crates/skills-assessor" }
 aura-cron = { path = "crates/cron" }
 aura-config = { path = "crates/config" }
 aura-cli = { path = "crates/cli" }
+aura-gateway = { path = "crates/gateway" }
 aura-integration-tests = { path = "crates/integration-tests" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
@@ -69,6 +71,8 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 aho-corasick = "1"
 tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-stream = "0.3"
 sha2 = "0.10"
 hex = "0.4"
 hmac = "0.12"
@@ -122,6 +126,7 @@ aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }
 aura-config = { workspace = true }
 aura-cli = { workspace = true }
+aura-gateway = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -132,3 +137,4 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
 clap = { workspace = true }
+regex = { workspace = true }

@@ -17,6 +17,7 @@ pub mod agent;
 pub mod channels;
 pub mod cost;
 pub mod error;
+pub mod gateway;
 pub mod llm;
 pub mod security;
 pub mod session;
@@ -37,6 +38,7 @@ pub use crate::channels::{
 };
 pub use crate::cost::{CostConfig, RateLimitConfig, SpendingLimitsConfig};
 pub use crate::error::{ConfigError, Result, ValidationError};
+pub use crate::gateway::GatewayConfig;
 pub use crate::llm::LlmConfig;
 pub use crate::security::SecurityConfig;
 pub use crate::session::SessionConfig;
@@ -62,6 +64,7 @@ pub struct AuraConfig {
     pub trace: TraceConfig,
     pub cost: CostConfig,
     pub workspace: WorkspaceConfig,
+    pub gateway: GatewayConfig,
 }
 
 impl AuraConfig {

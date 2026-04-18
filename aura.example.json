@@ -53,5 +53,12 @@
   },
   "workspace": {
     "path": "~/.aura"
+  },
+  "gateway": {
+    "enabled": false,
+    "bind_address": "127.0.0.1",
+    "port": 8888,
+    "cors_allowed_origins": [],
+    "shutdown_grace_secs": 30
   }
 }
