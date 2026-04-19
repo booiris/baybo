@@ -77,5 +77,4 @@ mod tests {
         let result = vault.get_secret("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
-
 }
