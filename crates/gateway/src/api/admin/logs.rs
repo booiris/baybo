@@ -92,6 +92,11 @@ async fn stream_logs(
     let stream: std::pin::Pin<
         Box<dyn Stream<Item = std::result::Result<Event, Infallible>> + Send>,
     > = Box::pin(try_stream! {
+        // Flush something immediately so the browser's EventSource
+        // fires `open` before the first real log event. Without this,
+        // idle streams stay in "Connecting…" until the first record
+        // happens to arrive — which can be minutes on a quiet system.
+        yield Event::default().comment("ready");
         loop {
             match rx.recv().await {
                 Ok(record) => {
