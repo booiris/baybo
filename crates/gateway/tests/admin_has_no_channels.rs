@@ -49,7 +49,8 @@ async fn admin_router() -> axum::Router {
         llm_client: std::sync::Arc::clone(&tg.deps.llm_client),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
-    let v1 = aura_gateway::api::admin::v1_router()
+    let (admin_router, _spec) = aura_gateway::api::admin::v1_router_and_spec();
+    let admin_router = admin_router
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -57,7 +58,7 @@ async fn admin_router() -> axum::Router {
         ));
     axum::Router::new()
         .merge(aura_gateway::api::health::routes())
-        .nest("/v1", v1)
+        .merge(admin_router)
 }
 
 async fn assert_not_found(method: Method, path: &str) {

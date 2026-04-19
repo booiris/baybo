@@ -14,4 +14,5 @@ pub mod admin;
 pub mod channel;
 pub mod dto;
 pub mod health;
+pub mod openapi;
 pub mod webui;

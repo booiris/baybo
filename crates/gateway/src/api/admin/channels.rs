@@ -5,29 +5,30 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::Router;
 use axum::extract::State;
-use axum::routing::get;
-use serde::Serialize;
 use tokio::sync::RwLock;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use aura_channels::ChannelRegistry;
-use aura_model::ChannelType;
 
 use crate::Result;
-use crate::api::dto::ListResponse;
+use crate::api::dto::{ChannelEntry, ErrorBody, ListResponse};
 use crate::server::AdminState;
 
-pub fn routes() -> Router<AdminState> {
-    Router::new().route("/channels", get(list_channels))
+pub fn routes() -> OpenApiRouter<AdminState> {
+    OpenApiRouter::new().routes(routes!(list_channels))
 }
 
-#[derive(Debug, Serialize)]
-pub struct ChannelEntry {
-    pub channel_type: ChannelType,
-    pub status: String,
-}
-
+#[utoipa::path(
+    get,
+    path = "/channels",
+    tag = "channels",
+    responses(
+        (status = 200, description = "Registered channels", body = inline(ListResponse<ChannelEntry>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
 async fn list_channels(
     State(state): State<AdminState>,
 ) -> Result<Json<ListResponse<ChannelEntry>>> {
@@ -41,7 +42,7 @@ async fn snapshot(registry: &Arc<RwLock<ChannelRegistry>>) -> Vec<ChannelEntry> 
         .list()
         .into_iter()
         .map(|(ct, status)| ChannelEntry {
-            channel_type: ct,
+            channel_type: ct.into(),
             status: format!("{status:?}"),
         })
         .collect()

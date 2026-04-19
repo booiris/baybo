@@ -1,40 +1,67 @@
 //! `/v1/cron` endpoints.
 
 use axum::Json;
-use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
-use aura_cron::{CronJob, CronSchedule, TriggerAction};
-use aura_model::ChannelType;
+use aura_cron::{CronSchedule, TriggerAction};
+use aura_model::ChannelType as ChannelTypeModel;
 
-use crate::api::dto::{CreateCronRequest, ListResponse};
+use crate::api::dto::{CreateCronRequest, CronJob, ErrorBody, ListResponse};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
-pub fn routes() -> Router<AdminState> {
-    Router::new()
-        .route("/cron", get(list_cron).post(create_cron))
-        .route("/cron/{id}", get(get_cron).delete(delete_cron))
+pub fn routes() -> OpenApiRouter<AdminState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_cron, create_cron))
+        .routes(routes!(get_cron, delete_cron))
 }
 
+#[utoipa::path(
+    get,
+    path = "/cron",
+    tag = "cron",
+    responses(
+        (status = 200, description = "All cron jobs", body = inline(ListResponse<CronJob>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Scheduler error", body = ErrorBody),
+    )
+)]
 async fn list_cron(State(state): State<AdminState>) -> Result<Json<ListResponse<CronJob>>> {
     let items = state
         .cron_scheduler
         .list_all_jobs()
         .await
-        .map_err(|e| GatewayError::Cron(e.to_string()))?;
+        .map_err(|e| GatewayError::Cron(e.to_string()))?
+        .into_iter()
+        .map(CronJob::from)
+        .collect();
     Ok(Json(ListResponse::new(items)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/cron",
+    tag = "cron",
+    request_body = CreateCronRequest,
+    responses(
+        (status = 201, description = "Created cron job", body = CronJob),
+        (status = 400, description = "Invalid schedule", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
 async fn create_cron(
     State(state): State<AdminState>,
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronJob>)> {
     let schedule = CronSchedule::cron(&req.schedule);
     let action = TriggerAction::Prompt { prompt: req.text };
-    let channel = req.channel.unwrap_or(ChannelType::Http);
+    let channel: ChannelTypeModel = req
+        .channel
+        .map(Into::into)
+        .unwrap_or(ChannelTypeModel::Http);
     let job = state
         .cron_scheduler
         .create_job(
@@ -46,9 +73,22 @@ async fn create_cron(
         )
         .await
         .map_err(|e| GatewayError::Cron(e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(job)))
+    Ok((StatusCode::CREATED, Json(CronJob::from(job))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/cron/{id}",
+    tag = "cron",
+    params(
+        ("id" = String, Path, description = "Cron job id"),
+    ),
+    responses(
+        (status = 200, description = "Cron job record", body = CronJob),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    )
+)]
 async fn get_cron(
     State(state): State<AdminState>,
     Path(id): Path<String>,
@@ -59,9 +99,22 @@ async fn get_cron(
         .await
         .map_err(|e| GatewayError::Cron(e.to_string()))?
         .ok_or_else(|| GatewayError::NotFound(format!("cron {id}")))?;
-    Ok(Json(job))
+    Ok(Json(CronJob::from(job)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/cron/{id}",
+    tag = "cron",
+    params(
+        ("id" = String, Path, description = "Cron job id"),
+    ),
+    responses(
+        (status = 204, description = "Cron job deleted"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Scheduler error", body = ErrorBody),
+    )
+)]
 async fn delete_cron(
     State(state): State<AdminState>,
     Path(id): Path<String>,

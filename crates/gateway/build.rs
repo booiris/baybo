@@ -65,7 +65,9 @@ fn main() {
 }
 
 fn collect(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(reader) = fs::read_dir(dir) else { return };
+    let Ok(reader) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in reader.flatten() {
         let path = entry.path();
         if path.is_dir() {

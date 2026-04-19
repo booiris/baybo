@@ -1,24 +1,27 @@
 //! `/v1/llm` — snapshot of configured LLM provider(s).
 
 use axum::Json;
-use axum::Router;
 use axum::extract::State;
-use axum::routing::get;
-use serde::Serialize;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::Result;
+use crate::api::dto::{ErrorBody, LlmInfo};
 use crate::server::AdminState;
 
-pub fn routes() -> Router<AdminState> {
-    Router::new().route("/llm", get(get_llm))
+pub fn routes() -> OpenApiRouter<AdminState> {
+    OpenApiRouter::new().routes(routes!(get_llm))
 }
 
-#[derive(Debug, Serialize)]
-pub struct LlmInfo {
-    pub model_id: String,
-    pub provider: String,
-}
-
+#[utoipa::path(
+    get,
+    path = "/llm",
+    tag = "llm",
+    responses(
+        (status = 200, description = "Configured LLM provider", body = LlmInfo),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
 async fn get_llm(State(state): State<AdminState>) -> Result<Json<LlmInfo>> {
     let info = state.llm_client.model_info();
     Ok(Json(LlmInfo {

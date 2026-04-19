@@ -163,6 +163,7 @@
         "unsanitised",
         "upserts",
         "usize",
+        "utoipa",
         "Vite",
         "Waitable",
         "walkdir",

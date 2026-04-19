@@ -7,48 +7,54 @@
 //! place, so callers must restart the gateway to pick the change up.
 
 use axum::Json;
-use axum::Router;
 use axum::extract::State;
-use axum::routing::{delete, get, put};
-use serde::{Deserialize, Serialize};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::Result;
+use crate::api::dto::{ErrorBody, MutateResponse, SetConfigRequest, UnsetConfigRequest};
 use crate::server::AdminState;
 
-pub fn routes() -> Router<AdminState> {
-    Router::new()
-        .route("/config", get(get_config))
-        .route("/config", put(set_config))
-        .route("/config", delete(unset_config))
+pub fn routes() -> OpenApiRouter<AdminState> {
+    OpenApiRouter::new().routes(routes!(get_config, set_config, unset_config))
 }
 
-#[derive(Debug, Deserialize)]
-struct SetRequest {
-    path: String,
-    value: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct UnsetRequest {
-    path: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MutateResponse {
-    path: String,
-    written_to: String,
-    requires_restart: bool,
-}
-
-async fn get_config(State(state): State<AdminState>) -> Result<axum::Json<serde_json::Value>> {
+#[utoipa::path(
+    get,
+    path = "/config",
+    tag = "config",
+    responses(
+        (
+            status = 200,
+            description = "Current in-memory config. Secret fields are redacted by `AuraConfig`'s serde impl.",
+            body = serde_json::Value,
+            content_type = "application/json",
+        ),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody),
+    )
+)]
+async fn get_config(State(state): State<AdminState>) -> Result<Json<serde_json::Value>> {
     let value = serde_json::to_value(&*state.config)
         .map_err(|e| crate::GatewayError::Internal(e.to_string()))?;
-    Ok(axum::Json(value))
+    Ok(Json(value))
 }
 
+#[utoipa::path(
+    put,
+    path = "/config",
+    tag = "config",
+    request_body = SetConfigRequest,
+    responses(
+        (status = 200, description = "Config updated on disk. Gateway restart required to pick up.", body = MutateResponse),
+        (status = 400, description = "Invalid path or value", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Write failure", body = ErrorBody),
+    )
+)]
 async fn set_config(
     State(state): State<AdminState>,
-    Json(req): Json<SetRequest>,
+    Json(req): Json<SetConfigRequest>,
 ) -> Result<Json<MutateResponse>> {
     let target = state.config_path.as_ref().ok_or_else(|| {
         crate::GatewayError::BadRequest(
@@ -74,9 +80,21 @@ async fn set_config(
     }))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/config",
+    tag = "config",
+    request_body = UnsetConfigRequest,
+    responses(
+        (status = 200, description = "Config entry removed on disk. Gateway restart required to pick up.", body = MutateResponse),
+        (status = 400, description = "Invalid path", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Write failure", body = ErrorBody),
+    )
+)]
 async fn unset_config(
     State(state): State<AdminState>,
-    Json(req): Json<UnsetRequest>,
+    Json(req): Json<UnsetConfigRequest>,
 ) -> Result<Json<MutateResponse>> {
     let target = state.config_path.as_ref().ok_or_else(|| {
         crate::GatewayError::BadRequest(

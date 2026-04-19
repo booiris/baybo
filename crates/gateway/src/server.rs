@@ -185,7 +185,8 @@ fn build_admin_router(deps: GatewayDeps) -> Router {
 
     let cors = build_cors(&deps.runtime_config.cors_allowed_origins);
 
-    let v1 = api::admin::v1_router()
+    let (admin_router, _admin_spec) = api::admin::v1_router_and_spec();
+    let admin_router = admin_router
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             auth_state,
@@ -194,7 +195,7 @@ fn build_admin_router(deps: GatewayDeps) -> Router {
 
     Router::new()
         .merge(api::health::routes())
-        .nest("/v1", v1)
+        .merge(admin_router)
         .fallback(api::webui::serve)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

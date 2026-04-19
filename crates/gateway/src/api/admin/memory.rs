@@ -1,23 +1,34 @@
 //! `/v1/memory` endpoints.
 
 use axum::Json;
-use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
-use aura_model::{MemoryCategory, MemoryEntry};
+use aura_model::{MemoryCategory, MemoryEntry as MemoryEntryModel};
 
-use crate::api::dto::{ListResponse, MemoryListQuery, StoreMemoryRequest};
+use crate::api::dto::{ErrorBody, ListResponse, MemoryEntry, MemoryListQuery, StoreMemoryRequest};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
-pub fn routes() -> Router<AdminState> {
-    Router::new()
-        .route("/memory", get(list_memory).post(store_memory))
-        .route("/memory/{id}", delete(delete_memory))
+pub fn routes() -> OpenApiRouter<AdminState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_memory, store_memory))
+        .routes(routes!(delete_memory))
 }
 
+#[utoipa::path(
+    get,
+    path = "/memory",
+    tag = "memory",
+    params(MemoryListQuery),
+    responses(
+        (status = 200, description = "Matching memory entries", body = inline(ListResponse<MemoryEntry>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Memory store error", body = ErrorBody),
+    )
+)]
 async fn list_memory(
     State(state): State<AdminState>,
     Query(q): Query<MemoryListQuery>,
@@ -30,15 +41,29 @@ async fn list_memory(
     } else {
         state.memory_manager.list(q.user_id.as_deref()).await
     }
-    .map_err(|e| GatewayError::Memory(e.to_string()))?;
+    .map_err(|e| GatewayError::Memory(e.to_string()))?
+    .into_iter()
+    .map(MemoryEntry::from)
+    .collect();
     Ok(Json(ListResponse::new(items)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/memory",
+    tag = "memory",
+    request_body = StoreMemoryRequest,
+    responses(
+        (status = 200, description = "Stored memory entry", body = MemoryEntry),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Memory store error", body = ErrorBody),
+    )
+)]
 async fn store_memory(
     State(state): State<AdminState>,
     Json(req): Json<StoreMemoryRequest>,
 ) -> Result<Json<MemoryEntry>> {
-    let entry = MemoryEntry::new(
+    let entry = MemoryEntryModel::new(
         req.user_id.unwrap_or_else(|| "http".to_owned()),
         req.content,
         MemoryCategory::KeyFact,
@@ -49,9 +74,22 @@ async fn store_memory(
         .store(entry.clone())
         .await
         .map_err(|e| GatewayError::Memory(e.to_string()))?;
-    Ok(Json(entry))
+    Ok(Json(MemoryEntry::from(entry)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/memory/{id}",
+    tag = "memory",
+    params(
+        ("id" = String, Path, description = "Memory entry id"),
+    ),
+    responses(
+        (status = 204, description = "Memory entry deleted"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Memory store error", body = ErrorBody),
+    )
+)]
 async fn delete_memory(
     State(state): State<AdminState>,
     Path(id): Path<String>,

@@ -1,25 +1,27 @@
 //! `GET /v1/status` — snapshot of running gateway state.
 
-use axum::Router;
 use axum::extract::State;
-use axum::routing::get;
-use serde::Serialize;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::Result;
+use crate::api::dto::{ErrorBody, StatusResponse};
 use crate::server::AdminState;
 
-pub fn routes() -> Router<AdminState> {
-    Router::new().route("/status", get(status))
+pub fn routes() -> OpenApiRouter<AdminState> {
+    OpenApiRouter::new().routes(routes!(status))
 }
 
-#[derive(Debug, Serialize)]
-pub struct StatusResponse {
-    pub version: &'static str,
-    pub bind_address: String,
-    pub sessions: usize,
-    pub jobs_in_flight: usize,
-}
-
+#[utoipa::path(
+    get,
+    path = "/status",
+    tag = "status",
+    responses(
+        (status = 200, description = "Gateway status snapshot", body = StatusResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody),
+    )
+)]
 async fn status(State(state): State<AdminState>) -> Result<axum::Json<StatusResponse>> {
     let sessions = state
         .session_manager
@@ -34,7 +36,7 @@ async fn status(State(state): State<AdminState>) -> Result<axum::Json<StatusResp
         .map_err(|e| crate::GatewayError::Job(e.to_string()))?
         .len();
     Ok(axum::Json(StatusResponse {
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
         bind_address: state.bind_display.clone(),
         sessions,
         jobs_in_flight,
