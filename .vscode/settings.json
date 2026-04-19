@@ -112,6 +112,7 @@
         "rfind",
         "rmcp",
         "roundtrips",
+        "rsplit",
         "rsproxy",
         "rusqlite",
         "RUSTFLAGS",
@@ -161,9 +162,11 @@
         "unsanitised",
         "upserts",
         "usize",
+        "Vite",
         "Waitable",
         "walkdir",
         "wasmtime",
+        "webui",
         "WHATWG",
         "worktree",
         "worktrees",
@@ -175,5 +178,8 @@
         "**/target": true,
         "Cargo.lock": true,
         "index.scip": true,
+        "**/node_modules": true,
+        "**/dist": true,
+        "**/package-lock.json": true
     }
 }

@@ -193,6 +193,44 @@ would force a cross-crate refactor of every `crates/cli/src/commands/`
 module. The duplicated surface is small and the independence is worth
 more than the line count saved.
 
+### WebUI — embedded React dashboard, no `rust-embed`
+
+The admin TCP listener doubles as a web frontend. Sources live at the
+repo root in `web/` (React 19 + TypeScript + Vite + Tailwind v4 +
+react-router, neo-brutalist style). `crates/gateway/build.rs` walks
+`web/dist/` at compile time and emits `$OUT_DIR/webui_assets.rs` with
+one `match` arm per asset — each arm pairs an `include_bytes!`
+reference with a pre-computed MIME string from a small hand-rolled
+extension table (`html`, `js`, `css`, `svg`, `png`, `ico`, fonts,
+fallbacks). No `rust-embed`, no `mime_guess`; the handler reduces to a
+two-entry lookup.
+
+`api::webui::serve` is mounted via `Router::fallback` so `/`,
+`/assets/...`, and any unmatched path resolve to a baked asset while
+`/healthz`, `/readyz`, and `/v1/*` keep their explicit handlers.
+Unknown paths fall back to `index.html` so SPA deep links keep working
+if we ever move off `HashRouter`.
+
+The bundle is unauthenticated on purpose: the embedded HTML/JS carries
+no server-side capability, and every privileged data path still goes
+through `/v1/*` behind `require_admin_token`. Treating the webui as a
+static inert asset rather than a privileged surface keeps the bearer-
+token contract simple — tokens gate data, not pages.
+
+Release flow:
+
+```bash
+cd web
+npm ci
+npm run build
+cargo build --release -p aura-gateway
+```
+
+If the frontend hasn't been built, `build.rs` drops a one-line
+placeholder `index.html` into `web/dist/` so `cargo build` still
+works for backend-only development. `cargo:rerun-if-changed=web/dist`
+makes the macro re-fire on the next `npm run build`.
+
 ### Platform installers behind Cargo features
 
 ```
@@ -449,6 +487,7 @@ subcommands use it for the same reason.
 ```
 crates/gateway/
 ├── Cargo.toml               # features above, all deps via workspace = true
+├── build.rs                 # emits $OUT_DIR/webui_assets.rs with include_bytes! + MIME per web/dist file
 ├── src/
 │   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, ChannelServer, …
 │   ├── config.rs            # RuntimeGatewayConfig (admin bind + channel socket path + shutdown grace)
@@ -463,6 +502,7 @@ crates/gateway/
 │   ├── api/
 │   │   ├── mod.rs           # health::routes()
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
+│   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
 │   │   ├── admin/           # mod.rs exposes v1_router() mounted on the admin TCP listener
 │   │   │   └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm,dto}.rs
 │   │   └── channel/         # mod.rs exposes v1_router() mounted on the channel UDS listener
@@ -478,6 +518,9 @@ crates/gateway/
     ├── admin_has_no_channels.rs  # /v1/sessions et al. are 404 on admin
     └── uds.rs               # full UDS round-trip via hyper client
 ```
+
+The frontend sources live outside the crate at `web/` (npm workspace,
+not a Cargo member) and produce `web/dist/` which `build.rs` consumes.
 
 The companion crate `aura-gateway-auth` exposes the PSK material, the
 channel header constants (`TUI_PSK_HEADER`, `CHANNEL_TOKEN_HEADER`), and

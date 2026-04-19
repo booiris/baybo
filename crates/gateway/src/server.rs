@@ -195,6 +195,7 @@ fn build_admin_router(deps: GatewayDeps) -> Router {
     Router::new()
         .merge(api::health::routes())
         .nest("/v1", v1)
+        .fallback(api::webui::serve)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
 }
