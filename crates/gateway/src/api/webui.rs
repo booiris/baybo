@@ -109,6 +109,9 @@ mod tests {
             .get(header::CACHE_CONTROL)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        assert!(cache.contains("no-cache"), "expected no-cache, got {cache:?}");
+        assert!(
+            cache.contains("no-cache"),
+            "expected no-cache, got {cache:?}"
+        );
     }
 }

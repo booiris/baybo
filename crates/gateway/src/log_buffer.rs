@@ -13,9 +13,17 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use tokio::sync::broadcast;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
+
+/// Fan-out capacity for the live log stream. Lagged subscribers —
+/// whose receiver is more than this many records behind — get a
+/// `RecvError::Lagged` instead of blocking the producer, which the
+/// `/v1/logs/stream` handler surfaces as a single "lagged" event and
+/// then resumes.
+const LIVE_STREAM_CAPACITY: usize = 256;
 
 /// Severity mirror of [`tracing::Level`], sortable from Error (highest)
 /// to Trace (lowest) so callers can compare with `>=`.
@@ -63,6 +71,38 @@ pub struct LogRecord {
     pub fields: Vec<(String, String)>,
 }
 
+impl LogRecord {
+    /// Does this record satisfy the non-pagination parts of `q`?
+    /// Shared between `LogBuffer::query` and the `/v1/logs/stream`
+    /// handler so both paths apply the exact same filter semantics.
+    pub fn matches(&self, q: &LogQuery) -> bool {
+        if let Some(level) = q.level
+            && self.level != level
+        {
+            return false;
+        }
+        if let Some(since) = q.since
+            && self.timestamp < since
+        {
+            return false;
+        }
+        if let Some(until) = q.until
+            && self.timestamp > until
+        {
+            return false;
+        }
+        if let Some(needle) = q.q.as_deref() {
+            let n = needle.to_ascii_lowercase();
+            let hit = self.message.to_ascii_lowercase().contains(&n)
+                || self.target.to_ascii_lowercase().contains(&n);
+            if !hit {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Debug)]
 struct Inner {
     capacity: usize,
@@ -70,10 +110,14 @@ struct Inner {
     records: VecDeque<LogRecord>,
 }
 
-/// Thread-safe, bounded ring buffer of [`LogRecord`]s.
+/// Thread-safe, bounded ring buffer of [`LogRecord`]s, with a
+/// side-channel `broadcast::Sender` so the admin router can push newly
+/// captured events to `/v1/logs/stream` subscribers without re-polling
+/// the buffer.
 #[derive(Debug)]
 pub struct LogBuffer {
     inner: Mutex<Inner>,
+    live: broadcast::Sender<LogRecord>,
 }
 
 /// Filter + paginate parameters for [`LogBuffer::query`].
@@ -98,13 +142,24 @@ pub struct LogPage {
 impl LogBuffer {
     pub fn new(capacity: usize) -> Arc<Self> {
         let capacity = capacity.max(1);
+        let (live, _rx) = broadcast::channel(LIVE_STREAM_CAPACITY);
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 capacity,
                 next_id: 0,
                 records: VecDeque::with_capacity(capacity),
             }),
+            live,
         })
+    }
+
+    /// Subscribe to the live stream of [`LogRecord`]s pushed after
+    /// this call returns. Back-pressure is bounded: if a subscriber
+    /// falls more than `LIVE_STREAM_CAPACITY` records behind, the
+    /// oldest entries in its view are dropped and it receives a
+    /// [`broadcast::error::RecvError::Lagged`] on the next recv.
+    pub fn subscribe(&self) -> broadcast::Receiver<LogRecord> {
+        self.live.subscribe()
     }
 
     fn push_record(
@@ -115,23 +170,31 @@ impl LogBuffer {
         message: String,
         fields: Vec<(String, String)>,
     ) {
-        let mut inner = match self.inner.lock() {
-            Ok(g) => g,
-            Err(poison) => poison.into_inner(),
+        let record = {
+            let mut inner = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poison) => poison.into_inner(),
+            };
+            let id = inner.next_id;
+            inner.next_id = inner.next_id.wrapping_add(1);
+            if inner.records.len() == inner.capacity {
+                inner.records.pop_front();
+            }
+            let rec = LogRecord {
+                id,
+                timestamp,
+                level,
+                target,
+                message,
+                fields,
+            };
+            inner.records.push_back(rec.clone());
+            rec
         };
-        let id = inner.next_id;
-        inner.next_id = inner.next_id.wrapping_add(1);
-        if inner.records.len() == inner.capacity {
-            inner.records.pop_front();
-        }
-        inner.records.push_back(LogRecord {
-            id,
-            timestamp,
-            level,
-            target,
-            message,
-            fields,
-        });
+        // No subscribers yet is normal: `broadcast::Sender::send`
+        // errors only when every receiver has been dropped, which we
+        // don't need to react to here.
+        let _ = self.live.send(record);
     }
 
     /// Push a synthetic record (used by tests).
@@ -152,33 +215,13 @@ impl LogBuffer {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
         };
-        let needle = q.q.as_deref().map(str::to_ascii_lowercase);
         let limit = if q.limit == 0 { usize::MAX } else { q.limit };
 
         let mut matched = 0usize;
         let mut items: Vec<LogRecord> = Vec::new();
         for rec in inner.records.iter().rev() {
-            if let Some(level) = q.level
-                && rec.level != level
-            {
+            if !rec.matches(q) {
                 continue;
-            }
-            if let Some(since) = q.since
-                && rec.timestamp < since
-            {
-                continue;
-            }
-            if let Some(until) = q.until
-                && rec.timestamp > until
-            {
-                continue;
-            }
-            if let Some(ref n) = needle {
-                let hit = rec.message.to_ascii_lowercase().contains(n)
-                    || rec.target.to_ascii_lowercase().contains(n);
-                if !hit {
-                    continue;
-                }
             }
             matched += 1;
             if matched > q.offset && items.len() < limit {
@@ -317,6 +360,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["m2", "m1"],
         );
+    }
+
+    #[tokio::test]
+    async fn subscribe_receives_pushed_records() {
+        let buf = LogBuffer::new(10);
+        let mut rx = buf.subscribe();
+        buf.push_for_test(ts(1), LogLevel::Info, "auth", "hello");
+        let got = rx.recv().await.expect("recv ok");
+        assert_eq!(got.message, "hello");
+        assert_eq!(got.level, LogLevel::Info);
+        assert_eq!(got.target, "auth");
+    }
+
+    #[test]
+    fn matches_applies_level_q_and_range() {
+        let rec = LogRecord {
+            id: 0,
+            timestamp: ts(100),
+            level: LogLevel::Warn,
+            target: "db".into(),
+            message: "slow query".into(),
+            fields: vec![],
+        };
+        let base = LogQuery {
+            limit: 10,
+            ..Default::default()
+        };
+        assert!(rec.matches(&base));
+        assert!(!rec.matches(&LogQuery {
+            level: Some(LogLevel::Error),
+            ..base.clone()
+        }));
+        assert!(rec.matches(&LogQuery {
+            q: Some("SLOW".into()),
+            ..base.clone()
+        }));
+        assert!(!rec.matches(&LogQuery {
+            q: Some("nope".into()),
+            ..base.clone()
+        }));
+        assert!(!rec.matches(&LogQuery {
+            since: Some(ts(200)),
+            ..base.clone()
+        }));
+        assert!(!rec.matches(&LogQuery {
+            until: Some(ts(50)),
+            ..base.clone()
+        }));
     }
 
     #[test]

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   RiAlertFill,
   RiBug2Fill,
+  RiBroadcastLine,
   RiCloseCircleFill,
   RiDownloadLine,
   RiEyeLine,
@@ -56,7 +57,7 @@ function triggerDownload(filename: string, mime: string, body: string): void {
 
 export function LogsPage() {
   const client = useAdminClient();
-  const { logout } = useAuth();
+  const { token, baseUrl, logout } = useAuth();
 
   const [filter, setFilter] = useState('');
   const [debouncedFilter, setDebouncedFilter] = useState('');
@@ -68,6 +69,8 @@ export function LogsPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<LogEntry | null>(null);
+  const [live, setLive] = useState(false);
+  const [liveConnected, setLiveConnected] = useState(false);
 
   // Debounce the filter input so we don't hammer the gateway on every keystroke.
   useEffect(() => {
@@ -122,6 +125,70 @@ export function LogsPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Live tail: subscribe to /v1/logs/stream while Live is on and we're
+  // on page 1. EventSource can't carry an Authorization header, so the
+  // token rides as a query param (the admin middleware accepts
+  // `?token=...` as a fallback). Re-opened whenever the filter changes.
+  useEffect(() => {
+    setLiveConnected(false);
+    if (!live || offset !== 0 || !token) return;
+
+    const params = new URLSearchParams();
+    params.set('token', token);
+    if (level !== 'all') params.set('level', level);
+    if (debouncedFilter.trim()) params.set('q', debouncedFilter.trim());
+    if (last24h) {
+      params.set(
+        'since',
+        new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      );
+    }
+    const base = baseUrl.replace(/\/$/, '');
+    const url = `${base}/v1/logs/stream?${params.toString()}`;
+    const es = new EventSource(url);
+
+    es.addEventListener('open', () => setLiveConnected(true));
+
+    es.addEventListener('log', (evt) => {
+      try {
+        const entry = JSON.parse((evt as MessageEvent).data) as LogEntry;
+        setItems((prev) => {
+          if (prev.some((e) => e.id === entry.id)) return prev;
+          const next = [entry, ...prev];
+          return next.length > PAGE_SIZE ? next.slice(0, PAGE_SIZE) : next;
+        });
+        setTotal((t) => t + 1);
+      } catch {
+        // Malformed payload — skip rather than tear the stream down.
+      }
+    });
+
+    es.addEventListener('lagged', (evt) => {
+      const dropped = (evt as MessageEvent).data;
+      setError(
+        `Live stream lagged behind — ${dropped} events were dropped. Refresh to resync.`,
+      );
+    });
+
+    es.addEventListener('error', () => {
+      setLiveConnected(false);
+      // Browsers auto-reconnect EventSource on transient network
+      // failures, so we don't tear it down here — the `open` handler
+      // will flip `liveConnected` back on.
+    });
+
+    return () => {
+      es.close();
+      setLiveConnected(false);
+    };
+  }, [live, offset, token, baseUrl, level, debouncedFilter, last24h]);
+
+  // Pagination away from page 1 implicitly drops the user out of live
+  // mode — the stream only makes sense at the head of the list.
+  useEffect(() => {
+    if (offset !== 0 && live) setLive(false);
+  }, [offset, live]);
 
   const pageStart = items.length === 0 ? 0 : offset + 1;
   const pageEnd = offset + items.length;
@@ -187,6 +254,22 @@ export function LogsPage() {
           aria-pressed={last24h}
         >
           Last 24 Hours
+        </Button>
+        <Button
+          variant={live ? 'primary' : 'default'}
+          onClick={() => setLive((v) => !v)}
+          aria-pressed={live}
+          disabled={offset !== 0}
+          title={
+            offset !== 0
+              ? 'Return to page 1 to enable live tail'
+              : 'Stream new log records as they arrive'
+          }
+        >
+          <RiBroadcastLine
+            className={live && liveConnected ? 'animate-pulse' : undefined}
+          />
+          {live ? (liveConnected ? 'Live' : 'Connecting…') : 'Live'}
         </Button>
         <Button onClick={() => void load()} disabled={loading}>
           <RiRefreshLine /> Refresh

@@ -196,6 +196,64 @@ async fn list_logs_paginates() {
 }
 
 #[tokio::test]
+async fn stream_logs_pushes_matching_records_as_sse() {
+    use futures::StreamExt;
+    use http_body_util::BodyStream;
+
+    let (router, buf) = router_with_seed().await;
+    let req = auth(
+        Request::builder()
+            .method("GET")
+            .uri("/v1/logs/stream?level=error")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp = router.oneshot(req).await.expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+    );
+
+    // Drive the buffer after the subscriber is wired so the broadcast
+    // has a live receiver. One non-matching info and one matching error.
+    let now = Utc::now();
+    buf.push_for_test(now, LogLevel::Info, "auth", "ignore me");
+    buf.push_for_test(now, LogLevel::Error, "auth", "boom");
+
+    let mut body = BodyStream::new(resp.into_body());
+    let mut buffered = Vec::<u8>::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut got_log = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let frame = match tokio::time::timeout(remaining, body.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            _ => break,
+        };
+        if let Ok(data) = frame.into_data() {
+            buffered.extend_from_slice(&data);
+        }
+        let text = String::from_utf8_lossy(&buffered);
+        if text.contains("event: log") && text.contains("\"message\":\"boom\"") {
+            got_log = true;
+            break;
+        }
+    }
+    assert!(
+        got_log,
+        "stream never emitted matching log event. Buffered: {}",
+        String::from_utf8_lossy(&buffered)
+    );
+    assert!(
+        !String::from_utf8_lossy(&buffered).contains("ignore me"),
+        "stream leaked a non-matching record",
+    );
+}
+
+#[tokio::test]
 async fn list_logs_requires_bearer_token() {
     let (router, _) = router_with_seed().await;
     let req = Request::builder()

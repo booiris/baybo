@@ -234,6 +234,20 @@ types without hitting a stale file.
 
 The frontend consumes the spec through two tools:
 
+The `/v1/logs` surface has two endpoints:
+
+- `GET /v1/logs` — paged snapshot from `LogBuffer::query` (filter by
+  `level`, `q`, `since`, `until`, `limit`, `offset`; `total` is
+  independent of pagination).
+- `GET /v1/logs/stream` — SSE stream subscribed to the same buffer's
+  `broadcast::Sender`. Each captured record that matches the query
+  params ships as an `event: log` frame with `LogEntry` JSON as `data`.
+  Back-pressure is bounded: a client that falls behind receives an
+  `event: lagged` with the drop count, then resumes. The admin auth
+  middleware accepts `?token=…` as a fallback because `EventSource`
+  can't set headers; the webui's Live toggle uses it for real-time
+  tail without polling.
+
 - `openapi-typescript` (`npm run gen:api`, also wired into `npm run
   build`) reads `docs/openapi.json` and writes
   `web/src/api/schema.d.ts` — a pure `.d.ts` with `paths` and

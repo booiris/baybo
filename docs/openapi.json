@@ -808,6 +808,86 @@
         }
       }
     },
+    "/v1/logs/stream": {
+      "get": {
+        "tags": [
+          "logs"
+        ],
+        "operationId": "stream_logs",
+        "parameters": [
+          {
+            "name": "level",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LogLevel"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream of LogEntry JSON — one `log` event per newly captured record matching the filters. Emits `lagged` if the subscriber can't keep up.",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/memory": {
       "get": {
         "tags": [
