@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use crate::{ChannelAdapter, ChannelError, ChannelStatus, IncomingMessage, Result};
 
 struct ChannelEntry {
-    adapter: Box<dyn ChannelAdapter>,
+    adapter: Arc<dyn ChannelAdapter>,
     status: ChannelStatus,
 }
 
@@ -42,7 +42,12 @@ impl ChannelRegistry {
     }
 
     /// Register a channel adapter. Fails if the channel type is already registered.
-    pub fn register(&mut self, adapter: Box<dyn ChannelAdapter>) -> Result<()> {
+    ///
+    /// Takes `Arc<dyn ChannelAdapter>` rather than `Box<dyn ...>` so
+    /// callers can keep their own handle to the adapter (e.g. route
+    /// handlers calling methods directly) without needing a newtype
+    /// wrapper just to satisfy the registry.
+    pub fn register(&mut self, adapter: Arc<dyn ChannelAdapter>) -> Result<()> {
         let channel_type = adapter.channel_type();
         if self.channels.contains_key(&channel_type) {
             return Err(ChannelError::DuplicateChannel(channel_type.to_string()));
@@ -79,7 +84,7 @@ impl ChannelRegistry {
 
     /// Look up a running adapter by channel type.
     pub fn get(&self, channel_type: ChannelType) -> Option<&dyn ChannelAdapter> {
-        self.channels.get(&channel_type).map(|e| e.adapter.as_ref())
+        self.channels.get(&channel_type).map(|e| &*e.adapter)
     }
 
     /// Start all registered channels that are not already running.
@@ -172,13 +177,30 @@ mod tests {
             Ok(())
         }
 
+        async fn send_stream_delta(&self, _session_id: &str, _delta: &str) -> ChannelResult<()> {
+            Ok(())
+        }
+
+        async fn send_notice(
+            &self,
+            _session_id: &str,
+            _level: crate::NoticeLevel,
+            _text: &str,
+        ) -> ChannelResult<()> {
+            Ok(())
+        }
+
+        fn approval_gate(&self) -> Option<std::sync::Arc<dyn aura_tools::ApprovalGate>> {
+            None
+        }
+
         async fn stop(&self) -> ChannelResult<()> {
             Ok(())
         }
     }
 
-    fn fake(ct: ChannelType) -> Box<dyn ChannelAdapter> {
-        Box::new(FakeAdapter { channel_type: ct })
+    fn fake(ct: ChannelType) -> Arc<dyn ChannelAdapter> {
+        Arc::new(FakeAdapter { channel_type: ct })
     }
 
     #[test]

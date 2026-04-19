@@ -128,24 +128,14 @@ pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<Secre
 /// into adapters and background tasks freely.
 ///
 /// The `cron_trigger_rx` is a one-shot — [`wire_router`] consumes it
-/// when attaching cron triggers to the router. `shutdown` is cloned to
-/// every subsystem that needs to coordinate graceful teardown.
+/// when attaching cron triggers to the router.
 pub struct ManagerGraph {
     pub config: Arc<AuraConfig>,
-    /// Kept for completeness (handlers that spawn background tasks may
-    /// wire the shared signal in future), even though the TUI/gateway
-    /// entry points already carry their own `shutdown` clone.
-    #[allow(dead_code)]
-    pub shutdown: ShutdownSignal,
-
-    pub leak_detector: Arc<LeakDetector>,
-
     pub session_manager: Arc<SessionManager>,
     pub job_manager: Arc<JobManager>,
     pub memory_manager: Arc<MemoryManager>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub trace_store: Arc<dyn TraceStore>,
-    pub secret_vault: Arc<SecretVault>,
     pub security_gateway: Arc<SecurityGateway>,
     pub skill_registry: Arc<SkillRegistry>,
     pub skill_assessor: Arc<SkillAssessor>,
@@ -175,7 +165,6 @@ pub async fn build_managers(
     shutdown: ShutdownSignal,
     leak_detector: Arc<LeakDetector>,
 ) -> anyhow::Result<ManagerGraph> {
-
     // --- minimal services shared by every mode
     let workspace_root = std::path::PathBuf::from(&config.workspace.path);
     let skill_registry = {
@@ -283,14 +272,11 @@ pub async fn build_managers(
 
     Ok(ManagerGraph {
         config,
-        shutdown,
-        leak_detector,
         session_manager,
         job_manager,
         memory_manager,
         cron_scheduler,
         trace_store,
-        secret_vault,
         security_gateway,
         skill_registry,
         skill_assessor,

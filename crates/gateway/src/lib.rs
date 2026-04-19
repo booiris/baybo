@@ -22,7 +22,7 @@ pub mod server;
 pub use crate::auth::GatewayToken;
 pub use crate::config::RuntimeGatewayConfig;
 pub use crate::error::{GatewayError, Result};
-pub use crate::http_adapter::HttpAdapter;
+pub use crate::http_adapter::{ApprovalEvent, HttpAdapter, SseEvent};
 pub use crate::installer::{
     InstallContext, InstallerError, ServiceInstaller, ServiceStatus, for_current_platform,
 };

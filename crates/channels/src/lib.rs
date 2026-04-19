@@ -12,7 +12,9 @@ pub use registry::ChannelRegistry;
 pub use slash::{
     DashboardProvider, DashboardSnapshot, SlashCommand, SlashHandler, SlashOutcome, ViewKind,
 };
+pub use tui::client as tui_client;
 pub use tui::event::{LogLevel, LogRecord, TuiLogSink};
+pub use tui::transport::{SharedTransport, TransportEvent, TransportEventStream, TuiTransport};
 pub use tui::{InputHistoryStore, OnExit, TuiAdapter};
 pub use types::{
     AgentOutput, ChannelStatus, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
@@ -49,35 +51,31 @@ pub trait ChannelAdapter: Send + Sync + 'static {
     ///
     /// Channels that can render partial output (e.g. the TUI) accumulate
     /// chunks and redraw; channels without a partial surface (e.g. HTTP
-    /// one-shot) may drop deltas and render only the final `send_response`.
-    /// The default implementation is a no-op for that reason.
+    /// one-shot) return `Ok(())` without rendering. Every adapter must
+    /// make the call explicitly — no default — so dropping deltas is a
+    /// deliberate choice per channel, not a silent fallback.
     ///
     /// Delivery ordering per `session_id` is the caller's responsibility —
     /// channels assume chunks arrive in the order the LLM emitted them.
-    async fn send_stream_delta(&self, session_id: &str, delta: &str) -> Result<()> {
-        let _ = (session_id, delta);
-        Ok(())
-    }
+    async fn send_stream_delta(&self, session_id: &str, delta: &str) -> Result<()>;
 
     /// Deliver an out-of-band notice to the user for this session.
     ///
     /// Used for events the user didn't prompt for but should see (e.g.
-    /// a skill they invoked was rated suspicious). Channels that have
-    /// no user-visible surface for such notices may drop them; the
-    /// default implementation does exactly that.
-    async fn send_notice(&self, session_id: &str, level: NoticeLevel, text: &str) -> Result<()> {
-        let _ = (session_id, level, text);
-        Ok(())
-    }
+    /// a skill they invoked was rated suspicious). Adapters without a
+    /// surface for this must opt in to dropping it — no default impl,
+    /// so the choice is always visible at the adapter site.
+    async fn send_notice(&self, session_id: &str, level: NoticeLevel, text: &str) -> Result<()>;
 
     /// Return an approval gate for interactive tool-call approval.
     ///
     /// Channels that support an approval UX (e.g. TUI modal, Slack reaction)
     /// return `Some(gate)`; channels without one return `None`, which the
     /// registry treats as auto-deny. Called once at registration time.
-    fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>> {
-        None
-    }
+    /// No default: forgetting to forward this from a wrapper silently
+    /// converts all tool calls into auto-deny, so the choice must be
+    /// explicit.
+    fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>>;
 
     /// Gracefully shuts down the channel. Idempotent.
     async fn stop(&self) -> Result<()>;

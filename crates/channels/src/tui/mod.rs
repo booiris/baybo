@@ -17,12 +17,14 @@
 mod app;
 mod approval;
 mod chat;
+pub mod client;
 mod dashboard;
 pub(crate) mod event;
 mod history;
 mod keymap;
+pub mod transport;
 
-pub use aura_tools::{ApprovalQueue, ChannelApprovalGate};
+pub use aura_tools::ApprovalQueue;
 pub use history::InputHistoryStore;
 
 use std::io;
@@ -30,7 +32,6 @@ use std::panic;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use async_trait::async_trait;
 use aura_model::{ChannelType, User};
 use aura_model::{ContentBlock, MessageMetadata};
 use chrono::Utc;
@@ -55,9 +56,10 @@ use std::time::Instant;
 use crate::tui::app::{AppState, CONFIRM_EXIT_WINDOW, ViewMode};
 use crate::tui::event::{AppEvent, LogLevel, LogRecord, TuiLogSink};
 use crate::tui::keymap::{Action, KeyContext, translate};
+use crate::tui::transport::{SharedTransport, TransportEvent};
 use crate::{
-    ChannelAdapter, ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel,
-    OutgoingMessage, Result, SlashHandler, SlashOutcome, ViewKind,
+    ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, SlashHandler,
+    SlashOutcome, ViewKind,
 };
 
 /// Callback invoked exactly once when the TUI event loop exits, regardless
@@ -87,6 +89,10 @@ pub struct TuiAdapter {
     /// Pending tool-approval queue shared with the approval gate. Cloned
     /// into the event loop so key handlers can drain entries.
     approval_queue: ApprovalQueue,
+    /// Transport driving the loop: `start` subscribes to its event
+    /// stream and publishes user input via `transport.submit`. Wired in
+    /// before `start` via `with_transport` — `start` errors if absent.
+    transport: Option<SharedTransport>,
 }
 
 impl Default for TuiAdapter {
@@ -116,7 +122,34 @@ impl TuiAdapter {
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
             approval_queue: ApprovalQueue::new(),
+            transport: None,
         }
+    }
+
+    /// Attach the transport that drives the TUI.
+    ///
+    /// * [`Self::start`] spawns a task that drives
+    ///   `transport.subscribe(session_id)` into the TUI's own
+    ///   `AppEvent` channel.
+    /// * User input is submitted via `transport.submit`.
+    /// * The approval gate uses the transport's queue, so approval
+    ///   events surfaced by the gateway land in the same UI mirror
+    ///   used by locally-originated ones.
+    ///
+    /// Must be called before `start()`. The transport's approval queue
+    /// replaces the default in-memory one.
+    pub fn with_transport(mut self, transport: SharedTransport) -> Self {
+        self.approval_queue = transport.approval_queue();
+        self.transport = Some(transport);
+        self
+    }
+
+    /// Pin the session id. Callers resolve a session by
+    /// creating/resuming it on the gateway and hand the id here so SSE
+    /// subscriptions and message POSTs target the right resource.
+    pub fn with_session_id(mut self, id: String) -> Self {
+        self.session_id = id;
+        self
     }
 
     /// Attach an exit callback. Invoked exactly once when the event loop
@@ -159,26 +192,12 @@ impl TuiAdapter {
     pub fn log_sink(&self) -> TuiLogSink {
         TuiLogSink::new(self.event_tx.clone())
     }
-}
 
-#[async_trait]
-impl ChannelAdapter for TuiAdapter {
-    fn channel_type(&self) -> ChannelType {
-        ChannelType::Tui
-    }
-
-    fn approval_gate(&self) -> Option<Arc<dyn aura_tools::ApprovalGate>> {
-        let event_tx = self.event_tx.clone();
-        Some(Arc::new(ChannelApprovalGate::new(
-            self.approval_queue.clone(),
-            Arc::new(move || {
-                let _ = event_tx.try_send(AppEvent::ApprovalRequested);
-            }),
-            std::time::Duration::from_secs(300),
-        )))
-    }
-
-    async fn start(&self, incoming: mpsc::Sender<IncomingMessage>) -> Result<()> {
+    /// Spawn the TUI event loop. Returns once the loop task has been
+    /// spawned; the loop runs until shutdown or user-initiated quit.
+    /// The [`Self::with_transport`] builder must have been called first
+    /// — the loop drives its input and output from the transport.
+    pub async fn start(&self) -> Result<()> {
         let event_rx = self
             .event_rx
             .lock()
@@ -186,11 +205,28 @@ impl ChannelAdapter for TuiAdapter {
             .take()
             .ok_or_else(|| ChannelError::Send("TuiAdapter::start called twice".into()))?;
 
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| {
+                ChannelError::Send(
+                    "TuiAdapter requires a transport — call with_transport before start".into(),
+                )
+            })
+            .map(Arc::clone)?;
+
+        spawn_transport_pump(
+            Arc::clone(&transport),
+            self.session_id.clone(),
+            self.event_tx.clone(),
+        )
+        .await;
+
         let ctx = LoopCtx {
             session_id: self.session_id.clone(),
             user: self.user.clone(),
             shutdown: Arc::clone(&self.shutdown),
-            incoming,
+            input: transport,
             event_tx: self.event_tx.clone(),
             event_rx,
             slash_handler: self.slash_handler.clone(),
@@ -200,9 +236,8 @@ impl ChannelAdapter for TuiAdapter {
             approval_queue: self.approval_queue.clone(),
         };
 
-        // Spawn the event loop. `start()` returns once spawned; the loop runs
-        // until shutdown or user-initiated quit. The shutdown Notify is the
-        // control signal, so the JoinHandle is intentionally dropped.
+        // The shutdown Notify is the control signal, so the JoinHandle
+        // is intentionally dropped.
         tokio::spawn(async move {
             if let Err(e) = run_loop(ctx).await {
                 error!("TUI event loop exited with error: {e}");
@@ -211,53 +246,13 @@ impl ChannelAdapter for TuiAdapter {
 
         Ok(())
     }
-
-    async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
-        self.event_tx
-            .send(AppEvent::Outgoing(response.content))
-            .await
-            .map_err(|_| ChannelError::Send("TUI event loop has exited".into()))?;
-        Ok(())
-    }
-
-    async fn send_stream_delta(&self, _session_id: &str, delta: &str) -> Result<()> {
-        self.event_tx
-            .send(AppEvent::StreamDelta(delta.to_string()))
-            .await
-            .map_err(|_| ChannelError::Send("TUI event loop has exited".into()))?;
-        Ok(())
-    }
-
-    async fn send_notice(&self, _session_id: &str, level: NoticeLevel, text: &str) -> Result<()> {
-        // Reuse the log scrollback surface — agent notices are
-        // semantically close to warn/error tracing events and already
-        // have dedicated styling there.
-        let record = LogRecord {
-            level: match level {
-                NoticeLevel::Warn => LogLevel::Warn,
-                NoticeLevel::Error => LogLevel::Error,
-            },
-            target: "agent".to_string(),
-            message: text.to_string(),
-        };
-        self.event_tx
-            .send(AppEvent::Log(record))
-            .await
-            .map_err(|_| ChannelError::Send("TUI event loop has exited".into()))?;
-        Ok(())
-    }
-
-    async fn stop(&self) -> Result<()> {
-        self.shutdown.notify_one();
-        Ok(())
-    }
 }
 
 struct LoopCtx {
     session_id: String,
     user: User,
     shutdown: Arc<Notify>,
-    incoming: mpsc::Sender<IncomingMessage>,
+    input: SharedTransport,
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: mpsc::Receiver<AppEvent>,
     slash_handler: Option<Arc<dyn SlashHandler>>,
@@ -265,6 +260,74 @@ struct LoopCtx {
     on_exit: Option<OnExit>,
     input_history: Option<Arc<dyn InputHistoryStore>>,
     approval_queue: ApprovalQueue,
+}
+
+/// Spawn a background task that pumps transport events into the TUI's
+/// AppEvent channel. Translates `TransportEvent` to the adapter's
+/// internal variants so the run loop can keep consuming the same
+/// `AppEvent` enum as before.
+async fn spawn_transport_pump(
+    transport: SharedTransport,
+    session_id: String,
+    event_tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let mut stream = match transport.subscribe(&session_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = event_tx
+                    .send(AppEvent::Log(LogRecord {
+                        level: LogLevel::Error,
+                        target: "tui.transport".into(),
+                        message: format!("subscribe failed: {e}"),
+                    }))
+                    .await;
+                return;
+            }
+        };
+        use futures::StreamExt;
+        while let Some(next) = stream.next().await {
+            let event = match next {
+                Ok(ev) => ev,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::Log(LogRecord {
+                            level: LogLevel::Warn,
+                            target: "tui.transport".into(),
+                            message: format!("stream error: {e}"),
+                        }))
+                        .await;
+                    continue;
+                }
+            };
+            let forwarded = match event {
+                TransportEvent::StreamDelta(text) => Some(AppEvent::StreamDelta(text)),
+                TransportEvent::Response(blocks) => Some(AppEvent::Outgoing(blocks)),
+                TransportEvent::Notice { level, text } => Some(AppEvent::Log(LogRecord {
+                    level: match level {
+                        NoticeLevel::Warn => LogLevel::Warn,
+                        NoticeLevel::Error => LogLevel::Error,
+                    },
+                    target: "agent".into(),
+                    message: text,
+                })),
+                TransportEvent::ApprovalRequested => Some(AppEvent::ApprovalRequested),
+                TransportEvent::ApprovalResolved { .. } => {
+                    // The transport has already dropped the local
+                    // mirror; the loop redraws naturally on the next
+                    // ApprovalRequested or input tick. Emitting a
+                    // dedicated variant would require a change to the
+                    // AppEvent enum — not justified by current UX.
+                    None
+                }
+            };
+            if let Some(ev) = forwarded
+                && event_tx.send(ev).await.is_err()
+            {
+                break;
+            }
+        }
+    });
 }
 
 /// RAII guard that restores the terminal and fires the on_exit callback
@@ -637,8 +700,8 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
             metadata: MessageMetadata::default(),
         },
     };
-    if let Err(e) = ctx.incoming.send(msg).await {
-        warn!("failed to forward TUI input to router: {e}");
+    if let Err(e) = ctx.input.submit(msg).await {
+        warn!("failed to forward TUI input: {e}");
     }
 }
 

@@ -5,6 +5,7 @@
 //! the shared [`crate::server::ApiState`] and translate manager results
 //! into serializable DTOs defined in [`dto`].
 
+pub mod approvals;
 pub mod channels;
 pub mod config;
 pub mod cron;
@@ -40,6 +41,7 @@ pub fn v1_router() -> Router<ApiState> {
         .merge(tools::routes())
         .merge(channels::routes())
         .merge(llm::routes())
+        .merge(approvals::routes())
 }
 
 #[cfg(test)]

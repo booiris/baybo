@@ -109,7 +109,25 @@ pub enum Commands {
         cmd: AgentCmd,
     },
     /// Launch the interactive Ratatui chat session.
-    Tui,
+    ///
+    /// Connects to an `aura gateway` over HTTP+SSE. The endpoint is
+    /// derived from `config.gateway.{bind_address,port}` and the
+    /// bearer token is read from the workspace vault. If the gateway
+    /// is unreachable the command exits with an error block
+    /// describing how to start one.
+    Tui {
+        /// Resume an existing session by id instead of creating a new
+        /// one. Sessions created with a different channel (http) are
+        /// acceptable; the TUI just pins to that id.
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Option<String>,
+        /// Dev-only: if the gateway is unreachable, spawn one as a
+        /// subprocess for the duration of this TUI session. Gated on
+        /// `debug_assertions` so release builds can never expose it.
+        #[cfg(debug_assertions)]
+        #[arg(long)]
+        dev_auto_gateway: bool,
+    },
     /// Run or manage the HTTP gateway service.
     Gateway {
         #[command(subcommand)]
@@ -478,4 +496,43 @@ pub enum ShellKind {
     Fish,
     Powershell,
     Elvish,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Regression guard for the dev-only `--dev-auto-gateway` flag.
+    /// Release builds must never expose it — it spawns a subprocess
+    /// with no operator supervision, which is acceptable in a dev
+    /// workflow and dangerous in production. Gated on
+    /// `debug_assertions`, so release builds must not carry it.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn tui_has_no_dev_auto_gateway_flag_in_release() {
+        let cmd = Cli::command();
+        let tui = cmd.find_subcommand("tui").expect("tui subcommand");
+        for arg in tui.get_arguments() {
+            assert_ne!(
+                arg.get_id().as_str(),
+                "dev_auto_gateway",
+                "--dev-auto-gateway leaked into a release build"
+            );
+        }
+    }
+
+    /// Mirror test: in debug builds the flag must be present. Keeps
+    /// the positive case honest.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn tui_has_dev_auto_gateway_flag_in_debug() {
+        let cmd = Cli::command();
+        let tui = cmd.find_subcommand("tui").expect("tui subcommand");
+        assert!(
+            tui.get_arguments()
+                .any(|a| a.get_id().as_str() == "dev_auto_gateway"),
+            "--dev-auto-gateway missing from debug build"
+        );
+    }
 }

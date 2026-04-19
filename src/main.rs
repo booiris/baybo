@@ -118,13 +118,12 @@ fn init_tracing(mode: TracingMode<'_>) -> Option<ChatTracing> {
     }
 }
 
-/// Resolve the effective aura.json path, if any, for display in diagnostics.
+/// Resolve the effective aura.json path, if any, for display in
+/// diagnostics. Thin wrapper so existing callers keep working; the real
+/// implementation lives in `boot` so `gateway_cmd` can reuse it without
+/// depending on `main.rs`.
 fn resolve_config_path() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("AURA_CONFIG_PATH") {
-        return Some(PathBuf::from(explicit));
-    }
-    let default = PathBuf::from("aura.json");
-    default.exists().then_some(default)
+    boot::resolve_config_path()
 }
 
 #[tokio::main]
@@ -183,7 +182,12 @@ async fn main() -> anyhow::Result<()> {
     // and warn/error events mirror into the chat scrollback via
     // `TuiLogLayer`. Gets its own early return so the rest of `main`
     // doesn't need to branch on chat_mode.
-    if matches!(cli.command, Some(Commands::Tui)) {
+    if let Some(Commands::Tui {
+        session,
+        #[cfg(debug_assertions)]
+        dev_auto_gateway,
+    }) = cli.command.as_ref()
+    {
         let log_dir = workspace_root.join("logs");
         let leak_detector = build_leak_detector(&config.security, None);
         let chat_tracing = init_tracing(TracingMode::Chat {
@@ -191,7 +195,12 @@ async fn main() -> anyhow::Result<()> {
             leak_detector: Arc::clone(&leak_detector),
         });
         info!("Aura - Intelligent Assistant Framework starting");
-        return tui_cmd::run(config, leak_detector, chat_tracing).await;
+        let opts = tui_cmd::Options {
+            session: session.clone(),
+            #[cfg(debug_assertions)]
+            dev_auto_gateway: *dev_auto_gateway,
+        };
+        return tui_cmd::run(config, chat_tracing, opts).await;
     }
 
     // ---------------- argv dispatch (one-shot command + exit) ----------------

@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::ChannelType;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub use aura_model::approval::{ApprovedResource, HostPattern, ResourceAccess};
@@ -35,7 +36,8 @@ pub use aura_model::approval::{ApprovedResource, HostPattern, ResourceAccess};
 // ---------------------------------------------------------------------------
 
 /// Decision returned by an [`ApprovalGate`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     /// Allow this call only.
     Approve,
@@ -47,9 +49,12 @@ pub enum ApprovalDecision {
 }
 
 /// A pending approval request forwarded to the gate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub call_id: String,
+    /// Session the tool call runs under. Lets HTTP clients (e.g. the
+    /// gateway-backed TUI) render approvals alongside the session they belong to.
+    pub session_id: String,
     pub tool: String,
     pub accesses: Vec<ResourceAccess>,
     /// Short truncated JSON preview of the parameters, for UI display only.
@@ -124,11 +129,26 @@ impl Default for ApprovalGateMap {
 // ApprovalQueue — reusable across channels
 // ---------------------------------------------------------------------------
 
-/// A single pending approval awaiting a decision via its oneshot responder.
+/// A single pending approval awaiting a decision via its oneshot
+/// responder.
+///
+/// `responder` is `Option` so the queue can also hold **display-only
+/// mirror** entries — entries sourced from an external authority (e.g.
+/// the HTTP gateway's approval stream, replayed into the TUI's local
+/// queue for rendering). Those entries have no oneshot to fire; the
+/// TUI still needs them in the queue so its existing `peek_head` /
+/// modal pipeline works unchanged.
 struct PendingApproval {
     req: ApprovalRequest,
-    responder: oneshot::Sender<ApprovalDecision>,
+    responder: Option<oneshot::Sender<ApprovalDecision>>,
 }
+
+/// Callback fired when a mirror entry is resolved locally, carrying the
+/// popped `(call_id, decision)`. The TUI transport installs one so the
+/// local resolution also POSTs to the gateway's authoritative gate. The
+/// callback runs synchronously from the resolve path; implementations
+/// that need async work should spawn a task themselves.
+pub type ResolveFn = Arc<dyn Fn(String, ApprovalDecision) + Send + Sync>;
 
 /// Thread-safe queue of pending approval prompts. Shared between a
 /// [`ChannelApprovalGate`] (producer) and the channel's event loop
@@ -136,13 +156,31 @@ struct PendingApproval {
 #[derive(Clone)]
 pub struct ApprovalQueue {
     inner: Arc<Mutex<VecDeque<PendingApproval>>>,
+    resolver: Arc<Mutex<Option<ResolveFn>>>,
 }
 
 impl ApprovalQueue {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::new())),
+            resolver: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Install a callback that runs whenever a queue entry is resolved
+    /// locally. The TUI transport uses this to forward the user's
+    /// decision back to the gateway's `/v1/approvals/:id` endpoint.
+    /// Replaces any previously-installed resolver.
+    pub fn set_resolver(&self, resolver: ResolveFn) {
+        let mut slot = self.resolver.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(resolver);
+    }
+
+    fn resolver(&self) -> Option<ResolveFn> {
+        self.resolver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn push(&self, entry: PendingApproval) {
@@ -156,18 +194,82 @@ impl ApprovalQueue {
         q.front().map(|e| e.req.clone())
     }
 
-    /// Resolve the head entry with the given decision, firing its oneshot.
-    /// Returns `true` if an entry was popped, `false` when the queue was
-    /// empty. Channels call this from their keypress handler — the oneshot
-    /// unblocks the `ChannelApprovalGate::request` future.
+    /// Resolve the head entry with the given decision, firing its
+    /// oneshot if one is attached. Returns `true` if an entry was
+    /// popped, `false` when the queue was empty. Channels call this
+    /// from their keypress handler — the oneshot unblocks the
+    /// `ChannelApprovalGate::request` future. Entries with no
+    /// responder (remote mirrors) pop silently; the caller handles
+    /// the actual resolution out-of-band.
     pub fn resolve_head(&self, decision: ApprovalDecision) -> bool {
-        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pending) = q.pop_front() {
-            let _ = pending.responder.send(decision);
-            true
-        } else {
-            false
+        let popped = {
+            let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            q.pop_front()
+        };
+        let Some(pending) = popped else {
+            return false;
+        };
+        match pending.responder {
+            Some(responder) => {
+                let _ = responder.send(decision);
+            }
+            None => {
+                if let Some(resolver) = self.resolver() {
+                    resolver(pending.req.call_id.clone(), decision);
+                }
+            }
         }
+        true
+    }
+
+    /// Resolve a pending approval by its `call_id`. Used by REST
+    /// clients (e.g. the HTTP gateway) where FIFO ordering on the
+    /// wire is not guaranteed and the UI may resolve approvals out
+    /// of submission order. Returns `true` when an entry matched.
+    pub fn resolve_by_call_id(&self, call_id: &str, decision: ApprovalDecision) -> bool {
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = q.iter().position(|e| e.req.call_id == call_id)
+            && let Some(pending) = q.remove(pos)
+        {
+            if let Some(responder) = pending.responder {
+                let _ = responder.send(decision);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Append a display-only mirror entry (no oneshot). Used by the
+    /// TUI transport to reflect approvals queued on the gateway into
+    /// the local queue so the existing TUI approval modal picks them
+    /// up. Resolution is still driven by the gateway — the local
+    /// `resolve_head` / `resolve_by_call_id` call just pops the
+    /// mirror entry.
+    pub fn enqueue_mirror(&self, req: ApprovalRequest) {
+        self.push(PendingApproval {
+            req,
+            responder: None,
+        });
+    }
+
+    /// Remove the entry with the given `call_id` without firing any
+    /// responder. Used by the TUI when the gateway broadcasts that
+    /// another client resolved the same approval, so we drop the
+    /// local mirror without second-guessing the decision.
+    pub fn drop_call(&self, call_id: &str) -> bool {
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = q.iter().position(|e| e.req.call_id == call_id) {
+            q.remove(pos);
+            return true;
+        }
+        false
+    }
+
+    /// Snapshot the full queue for listing via a REST endpoint. Order
+    /// matches insertion order.
+    pub fn list(&self) -> Vec<ApprovalRequest> {
+        let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        q.iter().map(|e| e.req.clone()).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -227,7 +329,10 @@ impl ChannelApprovalGate {
 impl ApprovalGate for ChannelApprovalGate {
     async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
         let (tx, rx) = oneshot::channel();
-        self.queue.push(PendingApproval { req, responder: tx });
+        self.queue.push(PendingApproval {
+            req,
+            responder: Some(tx),
+        });
         (self.waker)();
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(decision)) => decision,
@@ -266,6 +371,7 @@ mod tests {
         let out = gate
             .request(ApprovalRequest {
                 call_id: "x".into(),
+                session_id: "s".into(),
                 tool: "t".into(),
                 accesses: vec![],
                 params_preview: String::new(),
@@ -297,6 +403,7 @@ mod tests {
 
         let req = ApprovalRequest {
             call_id: "c1".into(),
+            session_id: "s".into(),
             tool: "read".into(),
             accesses: vec![],
             params_preview: String::new(),

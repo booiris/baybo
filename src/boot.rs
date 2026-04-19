@@ -52,6 +52,20 @@ pub async fn load_config() -> anyhow::Result<AuraConfig> {
         .map_err(|e| anyhow::anyhow!("failed to load config from {}: {e}", path.display()))
 }
 
+/// Resolve the effective `aura.json` path, if any.
+///
+/// Same precedence as [`load_config`]: `AURA_CONFIG_PATH` first, then
+/// `./aura.json` (only if present). Returns `None` when neither exists
+/// — callers running against `AuraConfig::default()` have no path to
+/// write back to, and mutation endpoints reject accordingly.
+pub fn resolve_config_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("AURA_CONFIG_PATH") {
+        return Some(PathBuf::from(explicit));
+    }
+    let default = PathBuf::from("aura.json");
+    default.exists().then_some(default)
+}
+
 /// Build an `LlmClient` from `LlmConfig`, resolving the api key through env.
 pub fn build_llm_client(cfg: &LlmConfig) -> anyhow::Result<LlmClient> {
     let registry = LlmProviderRegistry::with_default_providers();

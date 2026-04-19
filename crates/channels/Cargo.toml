@@ -13,6 +13,8 @@ test-support = []
 [dependencies]
 aura-model = { workspace = true }
 aura-tools = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
+bytes = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -26,3 +28,7 @@ futures = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
+shell-words = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

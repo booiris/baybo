@@ -13,6 +13,7 @@
 //! runtime or construct anything else.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aura_agent::{
@@ -44,6 +45,12 @@ use crate::{GatewayError, Result};
 /// managers can be shared with the router / TUI / cron loop.
 pub struct GatewayDeps {
     pub config: Arc<AuraConfig>,
+    /// Path to the on-disk `aura.json` the gateway was loaded from, if
+    /// any. Needed by `PUT/DELETE /v1/config` so remote clients can
+    /// write through to the same file that `aura config set/unset`
+    /// targets. `None` when running with defaults only — mutation
+    /// endpoints then reject with `ConfigPathUnset`.
+    pub config_path: Option<PathBuf>,
     pub runtime_config: RuntimeGatewayConfig,
     pub adapter: Arc<HttpAdapter>,
     pub session_manager: Arc<SessionManager>,
@@ -63,6 +70,10 @@ pub struct GatewayDeps {
 #[derive(Clone)]
 pub struct ApiState {
     pub config: Arc<AuraConfig>,
+    /// See [`GatewayDeps::config_path`]. Threaded into handlers so
+    /// config-mutation routes can write back to the same file the
+    /// server booted from.
+    pub config_path: Option<PathBuf>,
     pub adapter: Arc<HttpAdapter>,
     pub session_manager: Arc<SessionManager>,
     pub job_manager: Arc<JobManager>,
@@ -83,6 +94,7 @@ impl ApiState {
     fn from_deps(deps: &GatewayDeps) -> Self {
         Self {
             config: Arc::clone(&deps.config),
+            config_path: deps.config_path.clone(),
             adapter: Arc::clone(&deps.adapter),
             session_manager: Arc::clone(&deps.session_manager),
             job_manager: Arc::clone(&deps.job_manager),

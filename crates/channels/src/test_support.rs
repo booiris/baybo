@@ -108,6 +108,10 @@ impl ChannelAdapter for RecordingChannel {
         Ok(())
     }
 
+    fn approval_gate(&self) -> Option<Arc<dyn aura_tools::ApprovalGate>> {
+        None
+    }
+
     async fn stop(&self) -> Result<()> {
         Ok(())
     }

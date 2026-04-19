@@ -1,121 +1,263 @@
 //! CLI entrypoint for the interactive chat loop (`aura tui`).
 //!
-//! Sibling of `gateway_cmd`: both long-lived modes go through the same
-//! shape — build the manager graph via `runtime::build_managers` +
-//! `wire_router`, register their own `ChannelAdapter`, and drive the
-//! router + background tasks under a shared `ShutdownSignal`. `main.rs`
-//! is only the dispatcher; each mode owns its own boot logic.
+//! `aura tui` is a thin UI on top of an HTTP+SSE [`GatewayTransport`]
+//! pointed at `aura gateway` — the gateway holds the workspace
+//! singleton, the manager graph, and the router.
+//!
+//! Endpoint and token are read from the workspace config / vault:
+//! `config.gateway.bind_address:port` for the URL, `GatewayToken::get`
+//! for the bearer token. There are no CLI or env overrides — the TUI
+//! and the gateway share the same workspace, so the same config is
+//! authoritative for both.
+//!
+//! If `/healthz` is unreachable the command prints a concrete block
+//! telling the operator how to start a gateway and exits. The dev-only
+//! `--dev-auto-gateway` flag short-circuits that error by spawning one
+//! as a subprocess — compiled in only under `cfg(debug_assertions)`,
+//! so release builds never see it.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::service::{ShutdownSignal, TaskTracker};
+use aura_agent::service::ShutdownSignal;
 use aura_channels::TuiAdapter;
-use aura_cli::{
-    CliDashboardProvider, CliInputHistoryStore, CliSlashHandler, ContextBuilder, Invocation,
-    OutputFormat,
+use aura_channels::tui_client::{
+    GatewayClient, GatewayDashboardProvider, GatewaySlashHandler, GatewayTransport,
 };
+use aura_cli::CliInputHistoryStore;
 use aura_config::AuraConfig;
-use aura_security::LeakDetector;
-use tracing::info;
+use aura_gateway::GatewayToken;
+use tracing::{info, warn};
 
-use crate::runtime::{build_managers, force_exit_watchdog, install_signal_handler, wire_router};
-use crate::{ChatTracing, resolve_config_path, singleton};
+use crate::runtime::{build_secret_vault, install_signal_handler};
+use crate::{ChatTracing, runtime::force_exit_watchdog};
 
-/// Run the interactive TUI to completion. Returns once the router
+/// Resolved options passed from `main.rs` after parsing the clap
+/// struct-variant.
+pub struct Options {
+    pub session: Option<String>,
+    #[cfg(debug_assertions)]
+    pub dev_auto_gateway: bool,
+}
+
+/// Run the interactive TUI to completion. Returns once the event loop
 /// exits (user typed `/quit`, adapter closed) or the shared shutdown
 /// signal fires (SIGINT/SIGTERM).
 pub async fn run(
     config: Arc<AuraConfig>,
-    leak_detector: Arc<LeakDetector>,
     chat_tracing: Option<ChatTracing>,
+    opts: Options,
 ) -> anyhow::Result<()> {
-    let workspace_root = PathBuf::from(&config.workspace.path);
+    let endpoint = resolve_endpoint(&config);
+    let token = resolve_token(&config).await?;
 
-    // Per-workspace singleton: the chat loop owns libsql, the job
-    // recovery pass, and cron ticks — two instances against the same
-    // workspace would race. Held for the lifetime of this call;
-    // released by `Drop` on exit.
-    let _workspace_lock = singleton::acquire(workspace_root.as_path())?;
+    let client = Arc::new(
+        GatewayClient::new(&endpoint, &token)
+            .map_err(|e| anyhow::anyhow!("build gateway client: {e}"))?,
+    );
+
+    // Keep the auto-spawned child alive for the lifetime of the TUI.
+    // Dropping the guard sends SIGTERM (with a SIGKILL fallback) so we
+    // don't leak a background gateway when the TUI exits.
+    #[cfg(debug_assertions)]
+    let mut _auto_gateway: Option<dev_auto::AutoGatewayGuard> = None;
+
+    if let Err(e) = client.healthz().await {
+        #[cfg(debug_assertions)]
+        if opts.dev_auto_gateway {
+            // Propagate the parent's resolved config path so the
+            // spawned gateway reads the same workspace — otherwise a
+            // `--config` flag on the TUI would point the child at a
+            // different vault, and they'd disagree on the token.
+            let config_path = crate::boot::resolve_config_path();
+            _auto_gateway = Some(
+                dev_auto::spawn_and_wait_ready(&endpoint, Arc::clone(&client), config_path).await?,
+            );
+        } else {
+            return Err(unreachable_gateway_error(&endpoint, &e.to_string()));
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            return Err(unreachable_gateway_error(&endpoint, &e.to_string()));
+        }
+    }
+    info!(endpoint = %endpoint, "connected to gateway");
+
+    // Resolve the session id: either resume the one the operator
+    // passed, or create a fresh one so the SSE stream has something to
+    // attach to.
+    let session_id = match opts.session.clone() {
+        Some(id) => {
+            // Touch the session to surface a typo early; ignore the
+            // returned payload.
+            client
+                .get_session(&id)
+                .await
+                .map_err(|e| anyhow::anyhow!("resume session {id}: {e}"))?;
+            id
+        }
+        None => {
+            let s = client
+                .create_session(Default::default())
+                .await
+                .map_err(|e| anyhow::anyhow!("create session: {e}"))?;
+            s.id
+        }
+    };
+
+    // Slash-command allow-list needs the skill catalog up front.
+    let skills = client.list_skills().await.unwrap_or_else(|e| {
+        warn!("could not list skills from gateway: {e}");
+        Vec::new()
+    });
+
+    let transport = Arc::new(GatewayTransport::new(Arc::clone(&client)));
+    let slash_handler = Arc::new(GatewaySlashHandler::new(Arc::clone(&client), skills));
+    let dashboard_provider = Arc::new(GatewayDashboardProvider::new(Arc::clone(&client)));
+
+    // Input history stays local to the host — it's personal and
+    // contains secrets. Reuse the vault-backed store from the CLI.
+    let vault = build_secret_vault(&config).await?;
+    let history_store = Arc::new(CliInputHistoryStore::new(vault));
 
     let shutdown = ShutdownSignal::new();
-    let mut graph =
-        build_managers(Arc::clone(&config), shutdown.clone(), leak_detector).await?;
-    let run_handle = wire_router(&mut graph).await;
+    let tui_shutdown = shutdown.clone();
+    let tui = TuiAdapter::new()
+        .with_transport(transport)
+        .with_session_id(session_id.clone())
+        .with_slash_handler(slash_handler)
+        .with_dashboard_provider(dashboard_provider)
+        .with_input_history(history_store)
+        .with_on_exit(Arc::new(move || tui_shutdown.trigger()));
 
-    // Slash-command context is assembled from the live graph so every
-    // `/command` sees exactly the same manager instances the actor does.
-    let slash_ctx = Arc::new(
-        ContextBuilder::new(Arc::clone(&config))
-            .config_path(resolve_config_path())
-            .skills(Arc::clone(&graph.skill_registry))
-            .tools(Arc::clone(&graph.tool_registry))
-            .channels(Arc::clone(&graph.channels_registry))
-            .llm(Arc::clone(&graph.llm_client))
-            .workspace(Arc::clone(&graph.workspace))
-            .session(Arc::clone(&graph.session_manager))
-            .job(Arc::clone(&graph.job_manager))
-            .cron(Arc::clone(&graph.cron_scheduler))
-            .memory(Arc::clone(&graph.memory_manager))
-            .trace(Arc::clone(&graph.trace_store))
-            .security(Arc::clone(&graph.security_gateway))
-            .leak_detector(Arc::clone(&graph.leak_detector))
-            .skill_assessor(Arc::clone(&graph.skill_assessor))
-            .build()
-            .with_invocation(Invocation::Slash)
-            .with_format(OutputFormat::Plain),
-    );
-    let slash_handler = Arc::new(CliSlashHandler::new(Arc::clone(&slash_ctx)));
-    let dashboard_provider = Arc::new(CliDashboardProvider::new(Arc::clone(&slash_ctx)));
-
-    // Build, register, and start the TUI adapter. The approval gate is
-    // extracted automatically by `ChannelRegistry::register` and is
-    // already visible to `ToolExecutor` through the shared
-    // `ApprovalGateMap`.
-    {
-        let tui_shutdown = shutdown.clone();
-        let history_store =
-            Arc::new(CliInputHistoryStore::new(Arc::clone(&graph.secret_vault)));
-        let tui = TuiAdapter::new()
-            .with_slash_handler(slash_handler)
-            .with_dashboard_provider(dashboard_provider)
-            .with_input_history(history_store)
-            .with_on_exit(Arc::new(move || tui_shutdown.trigger()));
-        if let Some(tracing) = chat_tracing.as_ref() {
-            let _ = tracing.tui_sink.set(tui.log_sink());
-        }
-        let mut reg = graph.channels_registry.write().await;
-        reg.register(Box::new(tui))?;
-        reg.start_all(run_handle.incoming_tx.clone()).await?;
+    if let Some(tracing) = chat_tracing.as_ref() {
+        let _ = tracing.tui_sink.set(tui.log_sink());
     }
 
-    let mut task_tracker = TaskTracker::new();
+    tui.start().await?;
+
+    info!(session_id, "TUI session started");
+
+    let mut task_tracker = aura_agent::service::TaskTracker::new();
     install_signal_handler(&mut task_tracker, shutdown.clone());
 
-    info!("all components initialized, starting router");
+    shutdown.wait().await;
+    info!("shutdown signal received, stopping TUI");
 
-    let cron_handle = Arc::clone(&graph.cron_scheduler);
-    task_tracker.track(tokio::spawn(async move {
-        cron_handle.run().await;
-    }));
+    // A TUI redraw loop won't block tokio, but the SSE pump holds a
+    // long-lived HTTP response — bound teardown so the process always
+    // exits even if reqwest can't be persuaded to close promptly.
+    force_exit_watchdog(std::time::Duration::from_secs(5));
 
-    // The TUI adapter's background task holds a clone of the incoming
-    // sender; `/quit` or an adapter stop drops the sender and the
-    // router's incoming channel closes naturally.
-    let router_shutdown = shutdown.clone();
-    tokio::select! {
-        _ = run_handle.router.run(run_handle.incoming_rx, run_handle.response_rx) => {}
-        _ = router_shutdown.wait() => {
-            info!("shutdown signal received, stopping router");
+    task_tracker.shutdown().await;
+    Ok(())
+}
+
+/// Resolve the gateway base URL from workspace config. `0.0.0.0` is
+/// a bind wildcard, not a dial target, so rewrite it to loopback.
+fn resolve_endpoint(config: &AuraConfig) -> String {
+    let bind = if config.gateway.bind_address == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        &config.gateway.bind_address
+    };
+    format!("http://{}:{}", bind, config.gateway.port)
+}
+
+/// Read the bearer token from the workspace vault.
+async fn resolve_token(config: &AuraConfig) -> anyhow::Result<String> {
+    let vault = build_secret_vault(config).await?;
+    let token = GatewayToken::new(vault)
+        .get()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no gateway token available; run `aura gateway start`"))?;
+    Ok(token)
+}
+
+fn unreachable_gateway_error(endpoint: &str, underlying: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no aura gateway reachable at {endpoint}\n  - start it with:       aura gateway start\n  (underlying error: {underlying})"
+    )
+}
+
+#[cfg(debug_assertions)]
+mod dev_auto {
+    //! Dev-only: spawn an `aura gateway start` subprocess so a fresh
+    //! dev workspace doesn't need a second terminal to run the TUI.
+    //! Deliberately isolated in its own module so stripping the
+    //! feature also strips the `std::process::Command` call site.
+
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aura_channels::tui_client::GatewayClient;
+    use tokio::process::{Child, Command};
+    use tracing::info;
+
+    /// RAII guard that kills the spawned gateway when dropped.
+    pub struct AutoGatewayGuard {
+        child: Option<Child>,
+    }
+
+    impl Drop for AutoGatewayGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                // `start_kill` is non-blocking SIGKILL on Unix, which is
+                // what we want from a Drop impl: no async context and
+                // no opportunity to hang. Gateway's own graceful
+                // shutdown runs on its SIGTERM handler; for dev use
+                // the abrupt stop is acceptable.
+                let _ = child.start_kill();
+            }
         }
     }
 
-    // A tool still running when the TUI quits can stall graceful
-    // teardown. An OS thread outside the tokio runtime is immune and
-    // force-exits if the budget is exceeded.
-    force_exit_watchdog(std::time::Duration::from_secs(10));
+    /// Spawn `aura gateway start` as a subprocess and poll `/healthz`
+    /// until it responds (or the timeout elapses). Returns a guard
+    /// that kills the child on drop.
+    pub async fn spawn_and_wait_ready(
+        endpoint: &str,
+        client: Arc<GatewayClient>,
+        config_path: Option<PathBuf>,
+    ) -> anyhow::Result<AutoGatewayGuard> {
+        // Loud banner so nobody mistakes the dev convenience for a real
+        // deployment. Prints before the TUI's alternate-screen takes
+        // over so the operator sees it scrolling past in their shell.
+        eprintln!("DEV: auto-started gateway for TUI — not for production");
 
-    task_tracker.shutdown().await;
-    info!("Aura shutdown complete");
-    Ok(())
+        let exe = std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("read current_exe for auto-gateway: {e}"))?;
+        let mut cmd = Command::new(&exe);
+        if let Some(path) = config_path.as_deref() {
+            cmd.arg("--config").arg(path);
+        }
+        let child = cmd
+            .args(["gateway", "start"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn {}: {e}", exe.display()))?;
+
+        let mut guard = AutoGatewayGuard { child: Some(child) };
+
+        // Exponential-ish poll: 100ms, 200ms, 400ms, 800ms, capped at
+        // 1000ms. 15s total budget matches the design doc.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut wait = Duration::from_millis(100);
+        loop {
+            if client.healthz().await.is_ok() {
+                info!(endpoint, "auto-gateway ready");
+                return Ok(guard);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Drop guard kills the child as we bail.
+                let _ = guard.child.take().map(|mut c| c.start_kill());
+                anyhow::bail!("auto-gateway did not become reachable at {endpoint} within 15s");
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_secs(1));
+        }
+    }
 }

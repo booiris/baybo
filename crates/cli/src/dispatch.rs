@@ -21,7 +21,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Status => commands::status::handle(ctx).await,
         Commands::Doctor => commands::doctor::handle(ctx).await,
         Commands::Completion { shell } => commands::completion::handle(shell),
-        Commands::Tui => Err(crate::error::CliError::UnknownCommand(
+        Commands::Tui { .. } => Err(crate::error::CliError::UnknownCommand(
             "`tui` is an interactive session; main.rs handles it before dispatch".into(),
         )),
         Commands::Gateway { .. } => Err(crate::error::CliError::UnknownCommand(

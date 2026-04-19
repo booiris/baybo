@@ -279,18 +279,11 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Read the auth token BEFORE building the manager graph: the gateway
     // mode registers the token as a `LeakAction::Replace` rule on the
     // LeakDetector, which happens inside `build_managers` before the
-    // detector is sealed into an Arc.
+    // detector is sealed into an Arc. Auto-mint on first run so a fresh
+    // workspace can `aura gateway start` without a prior `enable`.
     let token = {
         let vault = runtime::build_secret_vault(&config).await?;
-        let token_mgr = GatewayToken::new(vault);
-        match token_mgr.get().await? {
-            Some(t) => t,
-            None => {
-                return Err(anyhow::anyhow!(
-                    "no gateway token minted; run `aura gateway enable` first"
-                ));
-            }
-        }
+        GatewayToken::new(vault).mint_if_absent().await?
     };
 
     // Build the leak detector (with the auth token registered as a
@@ -321,7 +314,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let http_adapter = Arc::new(HttpAdapter::new());
     {
         let mut reg = graph.channels_registry.write().await;
-        reg.register(Box::new(HttpAdapterHandle(Arc::clone(&http_adapter))))?;
+        reg.register(Arc::clone(&http_adapter) as Arc<dyn aura_channels::ChannelAdapter>)?;
         reg.start_all(run_handle.incoming_tx.clone()).await?;
     }
 
@@ -337,6 +330,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),
+        config_path: boot::resolve_config_path(),
         runtime_config: runtime_cfg.clone(),
         adapter: Arc::clone(&http_adapter),
         session_manager: Arc::clone(&graph.session_manager),
@@ -383,47 +377,3 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Thin adapter wrapper that gives the `HttpAdapter` a stable owner in
-/// the `ChannelRegistry` while the route handlers keep their own `Arc`
-/// reference into `http_adapter`. `ChannelRegistry::register` takes a
-/// `Box<dyn ChannelAdapter>`, so a newtype around `Arc<HttpAdapter>`
-/// lets both sides share the same state.
-struct HttpAdapterHandle(Arc<HttpAdapter>);
-
-#[async_trait::async_trait]
-impl aura_channels::ChannelAdapter for HttpAdapterHandle {
-    fn channel_type(&self) -> aura_model::ChannelType {
-        self.0.channel_type()
-    }
-
-    async fn start(
-        &self,
-        sender: tokio::sync::mpsc::Sender<aura_channels::IncomingMessage>,
-    ) -> aura_channels::Result<()> {
-        self.0.start(sender).await
-    }
-
-    async fn send_response(
-        &self,
-        response: aura_channels::OutgoingMessage,
-    ) -> aura_channels::Result<()> {
-        self.0.send_response(response).await
-    }
-
-    async fn send_stream_delta(&self, session_id: &str, delta: &str) -> aura_channels::Result<()> {
-        self.0.send_stream_delta(session_id, delta).await
-    }
-
-    async fn send_notice(
-        &self,
-        session_id: &str,
-        level: aura_channels::NoticeLevel,
-        text: &str,
-    ) -> aura_channels::Result<()> {
-        self.0.send_notice(session_id, level, text).await
-    }
-
-    async fn stop(&self) -> aura_channels::Result<()> {
-        self.0.stop().await
-    }
-}

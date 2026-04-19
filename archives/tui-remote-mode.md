@@ -1,5 +1,11 @@
 # TUI as Gateway Client (remote-only)
 
+> **Status**: Shipped. `aura tui` is now a remote-only HTTP+SSE client of
+> `aura gateway`. This document is archived as the design record; see
+> [`docs/modules/tui.md`](../modules/tui.md) for the current runtime
+> behavior and [`docs/modules/gateway.md`](../modules/gateway.md) for
+> the server-side surface.
+
 ## Problem
 
 Today a workspace supports exactly one `aura` process:
@@ -62,9 +68,8 @@ import `runtime::build_managers` — the whole boot path collapses to
 
 ### Dev-only auto-start
 
-Behind a compile-time gate (`cfg(debug_assertions)` plus an opt-in
-cargo feature `dev-gateway-autostart` so release builds cannot enable
-it even with `RUSTFLAGS`), add `--dev-auto-gateway` to `aura tui`.
+Behind a compile-time gate (`cfg(debug_assertions)`, so release
+builds cannot enable it), add `--dev-auto-gateway` to `aura tui`.
 When set and no gateway is reachable, the TUI boots one before
 connecting. Two viable shapes — pick during implementation:
 
@@ -99,11 +104,12 @@ production` banner.
   `ChannelRegistry`. Just: resolve endpoint + token → client →
   ratatui.
 - **`src/runtime.rs`** — `build_managers` + `wire_router` are now
-  only called from `gateway_cmd::start`. Can drop the
-  `shutdown: #[allow(dead_code)]` on `ManagerGraph` since it's no
-  longer kept for the TUI's "future use". Consider folding the
-  helpers back into `gateway_cmd` if no other caller appears, or
-  keep `runtime.rs` as the single assembly point and delete nothing.
+  only called from `gateway_cmd::start`. The previously kept-for-TUI
+  fields on `ManagerGraph` (`shutdown`, `leak_detector`,
+  `secret_vault`) are dropped since the TUI boot no longer threads
+  through the graph at all. Consider folding the helpers back into
+  `gateway_cmd` if no other caller appears, or keep `runtime.rs` as
+  the single assembly point and delete nothing.
 - **New `GatewayClient`** — likely in `crates/gateway/src/client.rs`
   or a new `crates/gateway-client` crate. Wraps reqwest + SSE;
   exposes methods mirroring the HTTP surface.

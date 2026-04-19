@@ -90,13 +90,26 @@ a subscriber is lagging past the buffer — in that case
 `error` event and continues. `stop` clears the map, which drops all
 senders and signals EOF on every live stream.
 
-### No approval over HTTP (first pass)
+### Approval over HTTP
 
-`HttpAdapter::approval_gate()` returns `None`. Tool calls that require
-user approval are auto-denied when they arrive over an HTTP-tagged
-session. A later pass can add a "pending approvals" endpoint once the
-UX is decided. Documented here so nobody spends an afternoon looking
-for the approval route.
+`HttpAdapter::approval_gate()` returns a `ChannelApprovalGate` backed by
+a gateway-scoped `ApprovalQueue` shared with the `/v1/approvals*` REST
+handlers. When a tool call hits the gate, the entry is queued and a
+`ApprovalEvent::Added` is broadcast on the gateway-wide approval
+stream; clients read the pending list from `GET /v1/approvals` and
+resolve individual entries via `POST /v1/approvals/:call_id { decision }`.
+The waker closure captured at gate construction fires synchronously
+after the push, so the SSE notification is enqueued before the gate's
+wait-for-decision future starts blocking. The timeout mirrors the
+TUI's 5 minutes — long enough for a human, short enough that forgotten
+prompts don't pin tool executors forever.
+
+Approvals key on `ChannelType::Http`, not on a specific chat session,
+so they live on a standalone SSE endpoint (`/v1/approvals/stream`)
+rather than the per-session stream. Any frontend can resolve any
+entry: a resolution POSTed by one client is broadcast as
+`ApprovalEvent::Resolved` so other connected clients drop the entry
+from their UI.
 
 ### Gateway owns its own DTOs
 
@@ -199,6 +212,8 @@ GET    /healthz                         liveness (no auth)
 GET    /readyz                          managers ready (no auth)
 GET    /v1/status                       aura status mirror
 GET    /v1/config                       redacted config snapshot (read-only)
+PUT    /v1/config                       { path, value } → 200 { path, written_to, requires_restart }
+DELETE /v1/config                       { path } → 200 { path, written_to, requires_restart }
 
 GET    /v1/sessions
 POST   /v1/sessions                     { user_id?, name? }
@@ -228,9 +243,15 @@ GET    /v1/skills
 GET    /v1/tools
 GET    /v1/channels
 GET    /v1/llm
+
+GET    /v1/approvals                    list pending approvals
+POST   /v1/approvals/:call_id           { decision: "approve" | "deny" } → 200 { call_id, decision }
+GET    /v1/approvals/stream             SSE: added | resolved | end
 ```
 
 ### SSE event schema
+
+Per-session stream (`/v1/sessions/:id/stream`):
 
 ```
 event: delta
@@ -246,41 +267,65 @@ event: end
 data:
 ```
 
+Approval stream (`/v1/approvals/stream`):
+
+```
+event: added
+data: { "kind": "added",    "call_id": "...", "session_id": "...",
+        "tool": "...", "accesses": [...], "params_preview": "..." }
+
+event: resolved
+data: { "kind": "resolved", "call_id": "...",
+        "decision": "approve" | "deny" }
+
+event: end
+data:
+```
+
+Mutation endpoints (`PUT /v1/config`, `DELETE /v1/config`) write
+through to the same on-disk `aura.json` that `aura config set/unset`
+targets. The in-memory `Arc<AuraConfig>` held by managers is **not**
+swapped; `requires_restart: true` in the response signals that the
+gateway must be restarted for the change to take effect. If the
+gateway was booted without a config path (pure-default boot), both
+endpoints return `400 Bad Request`.
+
 `KeepAlive` sends `ping` comments every 15 s so browser/proxy buffers
 don't reset the connection. A lagged consumer receives a single `error`
 event and the stream continues.
 
 ## Runtime Assembly
 
-`start` needs the same manager graph as the TUI — `SessionManager`,
+`start` builds the full manager graph — `SessionManager`,
 `JobManager`, `CronScheduler`, `MemoryManager`, `TraceStore`,
 `SecurityGateway`, `SkillRegistry`, `ToolRegistry`, `ToolExecutor`,
 `SkillAssessor`, `LlmClient`, `WorkspaceManager`, `LeakDetector`,
-`ChannelRegistry`, `CostTracker`, plus a `ShutdownSignal` and the
-`TaskTracker` wired through the hook manager. Today that graph is
-constructed inline in `src/main.rs`. The follow-up `runtime::` extraction
-will split it into:
+`ChannelRegistry`, `CostTracker` — plus a `ShutdownSignal` and a
+`TaskTracker` for graceful teardown. The wiring lives in
+`src/runtime.rs`:
 
 ```rust
-// src/runtime.rs (pending)
-pub struct ManagerGraph  { /* all Arcs + channels_registry */ }
-pub async fn build_managers(config: Arc<AuraConfig>, shutdown: ShutdownSignal) -> Result<ManagerGraph>;
-
-pub struct RouterRunHandle { /* router, supervisor, incoming_tx, cron_trigger_rx, … */ }
-pub fn wire_router(graph: &ManagerGraph, policy: ExecutionPolicy, soul: Soul, hooks: Arc<HookManager>, cost_tracker: Arc<CostTracker>) -> RouterRunHandle;
-
-pub async fn install_signal_handler(shutdown: ShutdownSignal);
+// src/runtime.rs
+pub struct ManagerGraph { /* all Arcs + channels_registry */ }
+pub async fn build_managers(config: Arc<AuraConfig>, shutdown: ShutdownSignal, leak_detector: Arc<LeakDetector>) -> Result<ManagerGraph>;
+pub struct RouterRunHandle { /* router, incoming_tx, incoming_rx, response_rx */ }
+pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle;
+pub fn install_signal_handler(tracker: &mut TaskTracker, shutdown: ShutdownSignal);
+pub async fn build_secret_vault(config: &AuraConfig) -> Result<Arc<SecretVault>>; // vault-only path, no manager graph
 ```
 
-Both the TUI (`src/main.rs`) and the gateway (`src/gateway_cmd.rs::start`)
-will call `build_managers` + `wire_router`, register their own adapter
-into `graph.channels_registry`, and then `start_all(incoming_tx)`. The
-gateway additionally builds a `GatewayServer` and drives it in parallel
-with the router via `tokio::select!` on `shutdown.wait`.
+`gateway_cmd::start` is now the **only** caller of `build_managers` +
+`wire_router` — the TUI talks to the gateway over HTTP and holds no
+manager graph of its own. The gateway registers the `HttpAdapter` into
+`graph.channels_registry`, builds a `GatewayServer` from
+`GatewayDeps`, and drives the axum server in parallel with the router
+via `tokio::select!` on `shutdown.wait`.
 
-Until that split lands, `aura gateway start` returns the informative
-error pointing here. `install`, `enable`, `disable`, `uninstall`,
-`status`, and `token {show,rotate}` are all fully functional.
+`build_secret_vault` is a narrow helper that only opens the libsql
+store far enough to construct a `SecretVault`. The TUI's remote boot
+uses it to read the gateway token without touching the workspace
+singleton lock; the vault-only `gateway token {show,rotate}`
+subcommands use it for the same reason.
 
 ## Security and Observability
 
@@ -295,10 +340,11 @@ error pointing here. `install`, `enable`, `disable`, `uninstall`,
   `SessionManager`, `JobManager`, `CronScheduler`, `MemoryManager` and
   friends directly; there are no side-channel writes that bypass
   Trace/Job observability.
-- **Singleton lock still applies.** `start` acquires the same
-  per-workspace lock the TUI does, so running `aura gateway start`
-  while a `aura tui` session is active fails fast with the existing
-  "another aura instance is running" error.
+- **Singleton lock applies only to the gateway.** `start` acquires
+  the per-workspace lock on `<workspace>/aura.lock`. `aura tui` is an
+  HTTP+SSE client (see [`tui.md`](./tui.md)) and **does not** take
+  the lock, so one long-lived `aura gateway` can serve many
+  concurrent TUI sessions in the same workspace.
 
 ## Crate Layout
 
