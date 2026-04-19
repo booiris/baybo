@@ -234,10 +234,11 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // graph's SecurityGateway uses the same rule set.
     let leak_detector = runtime::build_leak_detector(&config.security, Some(&token));
     let log_dir = workspace_root.join("logs");
-    let _tracing_guards = init_tracing(TracingMode::File {
+    let tracing_guards = init_tracing(TracingMode::File {
         log_dir: &log_dir,
         leak_detector: Arc::clone(&leak_detector),
     });
+    let log_buffer = tracing_guards.log_buffer();
     tracing::info!(token_len = token.len(), "gateway token loaded from vault");
 
     // Resolve the runtime gateway config up front so a bad `bind_address`
@@ -287,6 +288,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         channel_registry: Arc::clone(&graph.channels_registry),
         llm_client: Arc::clone(&graph.llm_client),
         admin_token: token.clone(),
+        log_buffer: Arc::clone(&log_buffer),
     };
 
     // Channel UDS listener — lives under the same workspace identity dir

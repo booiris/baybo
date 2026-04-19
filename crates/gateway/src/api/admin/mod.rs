@@ -7,6 +7,7 @@ pub mod config;
 pub mod cron;
 pub mod jobs;
 pub mod llm;
+pub mod logs;
 pub mod memory;
 pub mod skills;
 pub mod status;
@@ -41,6 +42,7 @@ use crate::server::AdminState;
         (name = "tools", description = "Registered tool manifests"),
         (name = "channels", description = "Registered channel plugins"),
         (name = "llm", description = "Configured LLM provider"),
+        (name = "logs", description = "Recent tracing events (in-memory ring buffer)"),
     )
 )]
 pub struct AdminApiDoc;
@@ -62,7 +64,8 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(skills::routes())
         .merge(tools::routes())
         .merge(channels::routes())
-        .merge(llm::routes());
+        .merge(llm::routes())
+        .merge(logs::routes());
     let (router, spec) = OpenApiRouter::with_openapi(AdminApiDoc::openapi())
         .nest("/v1", v1)
         .split_for_parts();

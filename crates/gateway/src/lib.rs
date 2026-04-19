@@ -23,6 +23,7 @@ pub mod config;
 pub mod error;
 pub mod http_adapter;
 pub mod installer;
+pub mod log_buffer;
 pub mod server;
 pub mod spawn;
 #[cfg(any(test, feature = "test-support"))]
@@ -36,6 +37,7 @@ pub use crate::http_adapter::{ApprovalEvent, HttpAdapter, SseEvent};
 pub use crate::installer::{
     InstallContext, InstallerError, ServiceInstaller, ServiceStatus, for_current_platform,
 };
+pub use crate::log_buffer::{LogBuffer, LogBufferLayer, LogLevel, LogPage, LogQuery, LogRecord};
 pub use crate::server::{GatewayDeps, GatewayServer};
 pub use crate::spawn::{ChannelSpawner, ChildHandle};
 pub use crate::uds::ChannelServer;

@@ -18,6 +18,7 @@
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
+use aura_gateway::{LogBuffer, LogBufferLayer};
 use aura_security::{LeakDetector, RedactingMakeWriter};
 use aura_tui::TuiLogSink;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -26,6 +27,10 @@ use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::tui_log::TuiLogLayer;
+
+/// How many recent events the in-memory `LogBuffer` keeps for `/v1/logs`.
+/// Bounded so a noisy trace level can't eat unbounded memory.
+const LOG_BUFFER_CAPACITY: usize = 2_000;
 
 pub struct SecondPrecisionTimer;
 
@@ -60,6 +65,20 @@ pub struct TracingGuards {
     /// stops the background writer, so the caller must bind the
     /// `TracingGuards` for the lifetime of the process.
     _worker: Option<WorkerGuard>,
+    /// Shared ring buffer backing `/v1/logs`. The gateway server holds
+    /// an Arc into it via `GatewayDeps::log_buffer`; other entrypoints
+    /// (stdout, tui) keep the buffer alive here even though they never
+    /// read from it, so the layer is always valid for the dispatcher.
+    log_buffer: Arc<LogBuffer>,
+}
+
+impl TracingGuards {
+    /// Access the shared in-memory log buffer. Callers wire this into
+    /// `GatewayDeps::log_buffer` so the admin `/v1/logs` endpoint can
+    /// query the same events the subscriber is capturing.
+    pub fn log_buffer(&self) -> Arc<LogBuffer> {
+        Arc::clone(&self.log_buffer)
+    }
 }
 
 /// Install the global tracing subscriber for this process.
@@ -71,6 +90,8 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aura=info"));
     let json = std::env::var("AURA_LOG_FORMAT").unwrap_or_default() == "json";
+    let log_buffer = LogBuffer::new(LOG_BUFFER_CAPACITY);
+    let buffer_layer = LogBufferLayer::new(Arc::clone(&log_buffer));
 
     match mode {
         TracingMode::Stdout => {
@@ -82,18 +103,23 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
             let result = if json {
                 tracing_subscriber::registry()
                     .with(env_filter)
+                    .with(buffer_layer)
                     .with(fmt_layer.json().with_span_list(true))
                     .try_init()
             } else {
                 tracing_subscriber::registry()
                     .with(env_filter)
+                    .with(buffer_layer)
                     .with(fmt_layer)
                     .try_init()
             };
             if let Err(e) = result {
                 eprintln!("warning: tracing subscriber already initialized: {e}");
             }
-            TracingGuards { _worker: None }
+            TracingGuards {
+                _worker: None,
+                log_buffer,
+            }
         }
         TracingMode::File {
             log_dir,
@@ -119,11 +145,13 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
             let result = if json {
                 tracing_subscriber::registry()
                     .with(env_filter)
+                    .with(buffer_layer)
                     .with(fmt_layer.json().with_span_list(true))
                     .try_init()
             } else {
                 tracing_subscriber::registry()
                     .with(env_filter)
+                    .with(buffer_layer)
                     .with(fmt_layer)
                     .try_init()
             };
@@ -132,17 +160,22 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
             }
             TracingGuards {
                 _worker: Some(guard),
+                log_buffer,
             }
         }
         TracingMode::Tui { tui_sink } => {
             let result = tracing_subscriber::registry()
                 .with(env_filter)
+                .with(buffer_layer)
                 .with(TuiLogLayer::new(tui_sink))
                 .try_init();
             if let Err(e) = result {
                 eprintln!("warning: tracing subscriber already initialized: {e}");
             }
-            TracingGuards { _worker: None }
+            TracingGuards {
+                _worker: None,
+                log_buffer,
+            }
         }
     }
 }

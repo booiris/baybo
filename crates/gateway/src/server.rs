@@ -42,6 +42,7 @@ use crate::api;
 use crate::auth_admin::{AdminAuthState, require_admin_token};
 use crate::config::RuntimeGatewayConfig;
 use crate::http_adapter::HttpAdapter;
+use crate::log_buffer::LogBuffer;
 use crate::{GatewayError, Result};
 
 /// Caller-supplied managers + config needed to run the gateway.
@@ -73,6 +74,9 @@ pub struct GatewayDeps {
     /// Bearer token for the admin TCP listener. Stored in the vault as
     /// `gateway.admin_token`.
     pub admin_token: String,
+    /// Shared ring buffer of recent tracing events surfaced by
+    /// `/v1/logs`. Installed as a `tracing::Layer` at process init.
+    pub log_buffer: Arc<LogBuffer>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -89,6 +93,7 @@ pub struct AdminState {
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<RwLock<ChannelRegistry>>,
     pub llm_client: Arc<LlmClient>,
+    pub log_buffer: Arc<LogBuffer>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
@@ -114,6 +119,7 @@ impl AdminState {
             tool_registry: Arc::clone(&deps.tool_registry),
             channel_registry: Arc::clone(&deps.channel_registry),
             llm_client: Arc::clone(&deps.llm_client),
+            log_buffer: Arc::clone(&deps.log_buffer),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }
     }

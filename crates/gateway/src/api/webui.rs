@@ -27,23 +27,40 @@ pub async fn serve(uri: Uri) -> Response {
     let path = if raw.is_empty() { "index.html" } else { raw };
 
     if let Some((bytes, mime)) = assets::lookup(path) {
-        return build_response(bytes, mime);
+        return build_response(path, bytes, mime);
     }
 
-    // Unknown path — fall back to index.html so SPA deep links keep
-    // working even if we later move off HashRouter.
+    // Missing hashed asset: return 404 rather than SPA-fallback so a
+    // stale `<script src>` never masquerades as HTML and trips the
+    // browser's strict-MIME guard.
+    if path.starts_with("assets/") {
+        return (StatusCode::NOT_FOUND, "asset not found").into_response();
+    }
+
+    // Unknown route — fall back to index.html so SPA deep links keep
+    // working.
     match assets::lookup("index.html") {
-        Some((bytes, mime)) => build_response(bytes, mime),
+        Some((bytes, mime)) => build_response("index.html", bytes, mime),
         None => (StatusCode::NOT_FOUND, "webui bundle not embedded").into_response(),
     }
 }
 
-fn build_response(bytes: &'static [u8], mime: &'static str) -> Response {
+fn build_response(path: &str, bytes: &'static [u8], mime: &'static str) -> Response {
     let content_type = HeaderValue::from_str(mime)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     let mut resp = Response::new(Body::from(bytes));
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, content_type);
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_TYPE, content_type);
+    // Hashed assets are fingerprinted — safe to cache forever. The
+    // entry page must revalidate so rebuilds with a new bundle hash
+    // take effect on the next load instead of waiting for the browser
+    // heuristic-cache to expire.
+    let cache_control = if path.starts_with("assets/") {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-cache")
+    };
+    headers.insert(header::CACHE_CONTROL, cache_control);
     resp
 }
 
@@ -74,5 +91,24 @@ mod tests {
         let uri: Uri = "/nope/nested/path".parse().expect("uri parses");
         let response = serve(uri).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_asset_returns_404_not_html() {
+        let uri: Uri = "/assets/index-DEADBEEF.js".parse().expect("uri parses");
+        let response = serve(uri).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn index_is_no_cache() {
+        let uri: Uri = "/".parse().expect("root parses");
+        let response = serve(uri).await;
+        let cache = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(cache.contains("no-cache"), "expected no-cache, got {cache:?}");
     }
 }

@@ -724,6 +724,90 @@
         }
       }
     },
+    "/v1/logs": {
+      "get": {
+        "tags": [
+          "logs"
+        ],
+        "operationId": "list_logs",
+        "parameters": [
+          {
+            "name": "level",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LogLevel"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of recent log records, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/memory": {
       "get": {
         "tags": [
@@ -1537,6 +1621,93 @@
           }
         }
       },
+      "LogEntry": {
+        "type": "object",
+        "description": "Mirror of [`crate::log_buffer::LogRecord`]. Used as the item type of\n[`LogsResponse`].",
+        "required": [
+          "id",
+          "timestamp",
+          "level",
+          "target",
+          "message",
+          "fields"
+        ],
+        "properties": {
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogField"
+            }
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "level": {
+            "$ref": "#/components/schemas/LogLevel"
+          },
+          "message": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string",
+            "description": "Tracing target that emitted the record (e.g.\n`aura_gateway::server`). Rendered as \"source\" in the UI."
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "LogField": {
+        "type": "object",
+        "description": "Single structured tracing field (`k=v`) captured alongside a log\nrecord. Kept as free-form strings — formatting / unquoting happens\nin the emitter.",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "LogLevel": {
+        "type": "string",
+        "description": "Mirror of [`crate::log_buffer::LogLevel`]. Snake-cased on the wire to\nmatch the rest of the admin surface.",
+        "enum": [
+          "error",
+          "warn",
+          "info",
+          "debug",
+          "trace"
+        ]
+      },
+      "LogsResponse": {
+        "type": "object",
+        "description": "Envelope for `GET /v1/logs`. Unlike [`ListResponse`] we expose\n`total` so the UI can render pagination (`Showing X of N`).",
+        "required": [
+          "items",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogEntry"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total number of records matching the filters — independent of\n`limit`/`offset`, so clients can size the pager without asking\nfor the full list.",
+            "minimum": 0
+          }
+        }
+      },
       "MemoryCategory": {
         "type": "object",
         "required": [
@@ -1939,6 +2110,10 @@
     {
       "name": "llm",
       "description": "Configured LLM provider"
+    },
+    {
+      "name": "logs",
+      "description": "Recent tracing events (in-memory ring buffer)"
     }
   ]
 }

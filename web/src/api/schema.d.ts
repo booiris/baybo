@@ -132,6 +132,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_logs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/memory": {
         parameters: {
             query?: never;
@@ -351,6 +367,52 @@ export interface components {
         LlmInfo: {
             model_id: string;
             provider: string;
+        };
+        /**
+         * @description Mirror of [`crate::log_buffer::LogRecord`]. Used as the item type of
+         *     [`LogsResponse`].
+         */
+        LogEntry: {
+            fields: components["schemas"]["LogField"][];
+            /** Format: int64 */
+            id: number;
+            level: components["schemas"]["LogLevel"];
+            message: string;
+            /**
+             * @description Tracing target that emitted the record (e.g.
+             *     `aura_gateway::server`). Rendered as "source" in the UI.
+             */
+            target: string;
+            /** Format: date-time */
+            timestamp: string;
+        };
+        /**
+         * @description Single structured tracing field (`k=v`) captured alongside a log
+         *     record. Kept as free-form strings — formatting / unquoting happens
+         *     in the emitter.
+         */
+        LogField: {
+            name: string;
+            value: string;
+        };
+        /**
+         * @description Mirror of [`crate::log_buffer::LogLevel`]. Snake-cased on the wire to
+         *     match the rest of the admin surface.
+         * @enum {string}
+         */
+        LogLevel: "error" | "warn" | "info" | "debug" | "trace";
+        /**
+         * @description Envelope for `GET /v1/logs`. Unlike [`ListResponse`] we expose
+         *     `total` so the UI can render pagination (`Showing X of N`).
+         */
+        LogsResponse: {
+            items: components["schemas"]["LogEntry"][];
+            /**
+             * @description Total number of records matching the filters — independent of
+             *     `limit`/`offset`, so clients can size the pager without asking
+             *     for the full list.
+             */
+            total: number;
         };
         MemoryCategory: {
             /** @enum {string} */
@@ -960,6 +1022,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LlmInfo"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_logs: {
+        parameters: {
+            query?: {
+                level?: components["schemas"]["LogLevel"];
+                q?: string;
+                since?: string;
+                until?: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of recent log records, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogsResponse"];
                 };
             };
             /** @description Unauthorized */

@@ -267,8 +267,15 @@ two-entry lookup.
 `api::webui::serve` is mounted via `Router::fallback` so `/`,
 `/assets/...`, and any unmatched path resolve to a baked asset while
 `/healthz`, `/readyz`, and `/v1/*` keep their explicit handlers.
-Unknown paths fall back to `index.html` so SPA deep links keep working
-if we ever move off `HashRouter`.
+Unknown non-asset paths fall back to `index.html` so SPA deep links keep
+working if we ever move off `HashRouter`. Requests under `/assets/`
+that miss return **404** instead of SPA-falling-back — this prevents a
+stale `<script src="/assets/index-OLDHASH.js">` on a cached
+`index.html` from being served as `text/html` and tripping the browser's
+strict-MIME guard (which manifests as a blank page after a rebuild).
+`index.html` is sent with `Cache-Control: no-cache` so bundle-hash
+changes take effect on the next load; hashed `/assets/*` carry
+`public, max-age=31536000, immutable`.
 
 The bundle is unauthenticated on purpose: the embedded HTML/JS carries
 no server-side capability, and every privileged data path still goes
@@ -295,6 +302,28 @@ If the frontend hasn't been built, `build.rs` drops a one-line
 placeholder `index.html` into `web/dist/` so `cargo build` still
 works for backend-only development. `cargo:rerun-if-changed=web/dist`
 makes the macro re-fire on the next `npm run build`.
+
+**Dev flow (HMR)**: rebuilding the gateway on every frontend tweak is
+slow, so for UI iteration run the two sides separately:
+
+```bash
+# terminal 1 — debug gateway, admin listener on 127.0.0.1:8889
+cargo run -- gateway start
+
+# terminal 2 — Vite dev server with HMR on http://localhost:5173
+cd web && npm run dev
+```
+
+`web/vite.config.ts` proxies `/v1`, `/healthz`, and `/readyz` to
+`127.0.0.1:8889`, so the browser only talks to the Vite origin. This
+avoids the CORS path entirely — `AdminAuthProvider` keeps `baseUrl =
+window.location.origin` (the Vite origin), and bearer-token auth
+still works end-to-end because the proxy forwards the `Authorization`
+header. If you need to point the web bundle at a gateway on a
+different origin (e.g. running `npm run dev` against a remote gateway),
+add that origin to `gateway.cors_allowed_origins` in `aura.json` and
+use the LoginScreen's **Advanced → Gateway base URL** field to
+override the stored `baseUrl`.
 
 ### Platform installers behind Cargo features
 

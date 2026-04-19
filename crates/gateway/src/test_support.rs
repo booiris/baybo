@@ -25,6 +25,7 @@ use tokio::sync::{RwLock, mpsc};
 
 use crate::config::RuntimeGatewayConfig;
 use crate::http_adapter::HttpAdapter;
+use crate::log_buffer::LogBuffer;
 use crate::server::GatewayDeps;
 
 /// Bearer token every test gateway is wired with. Exposed so callers
@@ -109,6 +110,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         channel_registry,
         llm_client,
         admin_token: TEST_ADMIN_TOKEN.to_string(),
+        log_buffer: LogBuffer::new(256),
     };
 
     TestGateway {

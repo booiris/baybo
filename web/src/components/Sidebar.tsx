@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { RiBookReadLine, RiLineChartLine, RiStackLine } from 'react-icons/ri';
+import { RiBookReadLine, RiFileList3Line } from 'react-icons/ri';
 
 const navItem =
   'flex items-center gap-3 px-4 py-3 no-underline text-ink font-semibold rounded-md transition-all duration-200 border-2 border-transparent hover:bg-gray-100';
@@ -15,18 +15,11 @@ export function Sidebar() {
 
       <nav className="flex-1 px-4 py-2.5 flex flex-col gap-3">
         <NavLink
-          to="/jobs"
+          to="/logs"
           className={({ isActive }) => `${navItem} ${isActive ? navItemActive : ''}`}
         >
-          <RiStackLine className="text-xl" />
-          Jobs
-        </NavLink>
-        <NavLink
-          to="/trace"
-          className={({ isActive }) => `${navItem} ${isActive ? navItemActive : ''}`}
-        >
-          <RiLineChartLine className="text-xl" />
-          Trace
+          <RiFileList3Line className="text-xl" />
+          Log
         </NavLink>
       </nav>
 

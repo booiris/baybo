@@ -524,6 +524,113 @@ impl From<aura_cron::CronJob> for CronJob {
     }
 }
 
+// ── Log records ──────────────────────────────────────────────────────
+
+/// Mirror of [`crate::log_buffer::LogLevel`]. Snake-cased on the wire to
+/// match the rest of the admin surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<crate::log_buffer::LogLevel> for LogLevel {
+    fn from(v: crate::log_buffer::LogLevel) -> Self {
+        match v {
+            crate::log_buffer::LogLevel::Error => Self::Error,
+            crate::log_buffer::LogLevel::Warn => Self::Warn,
+            crate::log_buffer::LogLevel::Info => Self::Info,
+            crate::log_buffer::LogLevel::Debug => Self::Debug,
+            crate::log_buffer::LogLevel::Trace => Self::Trace,
+        }
+    }
+}
+
+impl From<LogLevel> for crate::log_buffer::LogLevel {
+    fn from(v: LogLevel) -> Self {
+        match v {
+            LogLevel::Error => Self::Error,
+            LogLevel::Warn => Self::Warn,
+            LogLevel::Info => Self::Info,
+            LogLevel::Debug => Self::Debug,
+            LogLevel::Trace => Self::Trace,
+        }
+    }
+}
+
+/// Single structured tracing field (`k=v`) captured alongside a log
+/// record. Kept as free-form strings — formatting / unquoting happens
+/// in the emitter.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LogField {
+    pub name: String,
+    pub value: String,
+}
+
+/// Mirror of [`crate::log_buffer::LogRecord`]. Used as the item type of
+/// [`LogsResponse`].
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LogEntry {
+    pub id: u64,
+    pub timestamp: DateTime<Utc>,
+    pub level: LogLevel,
+    /// Tracing target that emitted the record (e.g.
+    /// `aura_gateway::server`). Rendered as "source" in the UI.
+    pub target: String,
+    pub message: String,
+    pub fields: Vec<LogField>,
+}
+
+impl From<crate::log_buffer::LogRecord> for LogEntry {
+    fn from(v: crate::log_buffer::LogRecord) -> Self {
+        Self {
+            id: v.id,
+            timestamp: v.timestamp,
+            level: v.level.into(),
+            target: v.target,
+            message: v.message,
+            fields: v
+                .fields
+                .into_iter()
+                .map(|(name, value)| LogField { name, value })
+                .collect(),
+        }
+    }
+}
+
+/// `GET /v1/logs` query params.
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LogsQuery {
+    #[serde(default)]
+    pub level: Option<LogLevel>,
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// Envelope for `GET /v1/logs`. Unlike [`ListResponse`] we expose
+/// `total` so the UI can render pagination (`Showing X of N`).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LogsResponse {
+    pub items: Vec<LogEntry>,
+    /// Total number of records matching the filters — independent of
+    /// `limit`/`offset`, so clients can size the pager without asking
+    /// for the full list.
+    pub total: usize,
+}
+
 // ── ToolDefinition ───────────────────────────────────────────────────
 
 /// Mirror of [`aura_tools::ToolDefinition`].
