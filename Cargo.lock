@@ -213,6 +213,7 @@ dependencies = [
  "aura-storage",
  "aura-tools",
  "aura-trace",
+ "aura-tui",
  "aura-workspace",
  "chrono",
  "clap",
@@ -268,21 +269,11 @@ dependencies = [
  "async-trait",
  "aura-model",
  "aura-tools",
- "axum 0.8.9",
- "bytes",
  "chrono",
- "crossterm",
- "futures",
- "ratatui",
- "reqwest 0.12.28",
  "serde",
- "serde_json",
- "shell-words",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "unicode-width",
- "uuid",
 ]
 
 [[package]]
@@ -306,6 +297,7 @@ dependencies = [
  "aura-storage",
  "aura-tools",
  "aura-trace",
+ "aura-tui",
  "aura-workspace",
  "chrono",
  "clap",
@@ -614,6 +606,32 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "aura-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aura-channels",
+ "aura-model",
+ "aura-tools",
+ "axum 0.8.9",
+ "bytes",
+ "chrono",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "unicode-width",
  "uuid",
 ]
 

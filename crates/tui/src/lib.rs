@@ -1,9 +1,10 @@
-//! Ratatui-based channel adapter.
+//! Ratatui-based TUI for `aura tui`.
 //!
-//! Serves as the default interactive channel when `aura` is run without a
-//! subcommand. Layout is minimal by design: a scrollback pane plus an input
-//! line. Slash commands that map to [`ViewKind`] open a dedicated dashboard
-//! view; other slash commands render as text into the scrollback.
+//! The TUI is a thin client on top of an `aura-gateway` reached over
+//! HTTP+SSE. Layout is minimal by design: a scrollback pane plus an
+//! input line. Slash commands that map to [`ViewKind`] open a dedicated
+//! dashboard view; other slash commands render as text into the
+//! scrollback.
 //!
 //! I/O architecture:
 //! - stdin is driven by [`crossterm::event::EventStream`]; do **not** read
@@ -25,13 +26,19 @@ mod keymap;
 pub mod transport;
 
 pub use aura_tools::ApprovalQueue;
+pub use event::{LogLevel, LogRecord, TuiLogSink};
 pub use history::InputHistoryStore;
+pub use transport::{SharedTransport, TransportEvent, TransportEventStream, TuiTransport};
 
 use std::io;
 use std::panic;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use aura_channels::{
+    ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, SlashHandler,
+    SlashOutcome, ViewKind,
+};
 use aura_model::{ChannelType, User};
 use aura_model::{ContentBlock, MessageMetadata};
 use chrono::Utc;
@@ -53,14 +60,9 @@ use uuid::Uuid;
 
 use std::time::Instant;
 
-use crate::tui::app::{AppState, CONFIRM_EXIT_WINDOW, ViewMode};
-use crate::tui::event::{AppEvent, LogLevel, LogRecord, TuiLogSink};
-use crate::tui::keymap::{Action, KeyContext, translate};
-use crate::tui::transport::{SharedTransport, TransportEvent};
-use crate::{
-    ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, SlashHandler,
-    SlashOutcome, ViewKind,
-};
+use crate::app::{AppState, CONFIRM_EXIT_WINDOW, ViewMode};
+use crate::event::AppEvent;
+use crate::keymap::{Action, KeyContext, translate};
 
 /// Callback invoked exactly once when the TUI event loop exits, regardless
 /// of cause (user-initiated quit, terminal disconnect, internal shutdown
@@ -487,11 +489,11 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             && let Some(queue) = state.approval.as_ref()
                             && let Some(req) = queue.peek_head()
                         {
-                            state.push_approval(crate::tui::app::ApprovalChatEntry {
+                            state.push_approval(crate::app::ApprovalChatEntry {
                                 tool: req.tool,
                                 accesses: req.accesses,
                                 params_preview: req.params_preview,
-                                state: crate::tui::app::ApprovalChatState::Pending {
+                                state: crate::app::ApprovalChatState::Pending {
                                     selected: 0,
                                 },
                             });

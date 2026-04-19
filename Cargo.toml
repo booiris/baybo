@@ -20,6 +20,7 @@ members = [
     "crates/config",
     "crates/cli",
     "crates/gateway",
+    "crates/tui",
     "crates/integration-tests",
 ]
 exclude = ["crates/security/fuzz"]
@@ -50,6 +51,7 @@ aura-cron = { path = "crates/cron" }
 aura-config = { path = "crates/config" }
 aura-cli = { path = "crates/cli" }
 aura-gateway = { path = "crates/gateway" }
+aura-tui = { path = "crates/tui" }
 aura-integration-tests = { path = "crates/integration-tests" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
@@ -128,6 +130,7 @@ aura-skills-assessor = { workspace = true }
 aura-config = { workspace = true }
 aura-cli = { workspace = true }
 aura-gateway = { workspace = true }
+aura-tui = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

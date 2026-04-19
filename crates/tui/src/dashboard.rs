@@ -1,12 +1,12 @@
 //! Dashboard view renderer: titled table with footer hint.
 
+use aura_channels::DashboardSnapshot;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 
-use crate::DashboardSnapshot;
-use crate::tui::app::{AppState, ViewMode};
+use crate::app::{AppState, ViewMode};
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let ViewMode::Dashboard {

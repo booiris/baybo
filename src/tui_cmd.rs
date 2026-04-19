@@ -19,13 +19,13 @@
 use std::sync::Arc;
 
 use aura_agent::service::ShutdownSignal;
-use aura_channels::TuiAdapter;
-use aura_channels::tui_client::{
-    GatewayClient, GatewayDashboardProvider, GatewaySlashHandler, GatewayTransport,
-};
 use aura_cli::CliInputHistoryStore;
 use aura_config::AuraConfig;
 use aura_gateway::GatewayToken;
+use aura_tui::TuiAdapter;
+use aura_tui::client::{
+    GatewayClient, GatewayDashboardProvider, GatewaySlashHandler, GatewayTransport,
+};
 use tracing::{info, warn};
 
 use crate::runtime::{build_secret_vault, install_signal_handler};
@@ -191,7 +191,7 @@ mod dev_auto {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use aura_channels::tui_client::GatewayClient;
+    use aura_tui::client::GatewayClient;
     use tokio::process::{Child, Command};
     use tracing::info;
 

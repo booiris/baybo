@@ -2,7 +2,7 @@
 
 ## Overview
 
-`TuiAdapter` is the interactive channel for Aura, launched via `aura tui`. Bare `aura` prints `--help`; the TUI is an explicit opt-in to avoid surprising users with a full-screen app. It is implemented with [Ratatui] over a [Crossterm] async event stream and lives inside the `channels` crate (`crates/channels/src/tui/`).
+`TuiAdapter` is the interactive channel for Aura, launched via `aura tui`. Bare `aura` prints `--help`; the TUI is an explicit opt-in to avoid surprising users with a full-screen app. It is implemented with [Ratatui] over a [Crossterm] async event stream and lives in its own crate (`crates/tui/`, published as `aura-tui`). It depends on `aura-channels` for shared trait definitions (`SlashHandler`, `DashboardProvider`, `IncomingMessage`) but nothing in `aura-channels` depends back on it.
 
 The layout is intentionally minimal:
 
@@ -54,7 +54,7 @@ against it — the gateway is the only process that holds state. See
 - Backed by a `DashboardSnapshot { title, columns, rows, footer }` value fetched from a `DashboardProvider`.
 - Refresh (`r`) re-fetches on a background task; the snapshot swap is transactional (existing selection clamps to the new row count).
 - Four built-in views map to `ViewKind::{Skills, Jobs, Sessions, Memory}`.
-- `GatewayDashboardProvider` (`crates/channels/src/tui/client/dashboard.rs`) fans out to `list_skills` / `list_jobs` / `list_sessions` / `list_memory` on the `GatewayClient` and shapes the result into a `DashboardSnapshot` client-side. There is deliberately no aggregate `/v1/dashboard` endpoint — per-kind REST routes already exist, and each snapshot function picks only the columns the TUI renders. HTTP errors degrade to an empty table with the message in the footer rather than exploding the TUI.
+- `GatewayDashboardProvider` (`crates/tui/src/client/dashboard.rs`) fans out to `list_skills` / `list_jobs` / `list_sessions` / `list_memory` on the `GatewayClient` and shapes the result into a `DashboardSnapshot` client-side. There is deliberately no aggregate `/v1/dashboard` endpoint — per-kind REST routes already exist, and each snapshot function picks only the columns the TUI renders. HTTP errors degrade to an empty table with the message in the footer rather than exploding the TUI.
 
 ### Persistent input history
 
@@ -62,7 +62,7 @@ The input history ring survives across TUI sessions. Because users routinely
 paste API keys, tokens, and other secrets into prompts, the ring is stored
 encrypted at rest rather than in a plaintext history file.
 
-- The trait `aura_channels::InputHistoryStore` (`crates/channels/src/tui/history.rs`) defines the contract: `load() -> Vec<String>` runs once at start-of-loop; `save(&[String])` runs after every accepted submission.
+- The trait `aura_tui::InputHistoryStore` (`crates/tui/src/history.rs`) defines the contract: `load() -> Vec<String>` runs once at start-of-loop; `save(&[String])` runs after every accepted submission.
 - The TUI itself does not depend on `aura-security`. The production wiring is `aura_cli::CliInputHistoryStore`, which wraps `Arc<SecretVault>` and serializes the chronological ring as JSON under the fixed key `aura.tui.input_history` (see [`security.md`](./security.md)). Plaintext only ever exists in `AppState.history` — on disk it is AES-256-GCM ciphertext under the same master key the rest of the vault uses.
 - Load happens before the first `terminal.draw`, so the prior ring is already populated when the input box first renders.
 - Save runs from `Action::Submit` immediately after `take_input()`, in a detached `tokio::spawn`. The full history snapshot is persisted every time (no diffing); the disk/encryption latency therefore never blocks the key-handling path.
@@ -86,7 +86,7 @@ Anything with additional tokens (e.g. `/skills info foo`) dispatches to the corr
 
 ### Gateway slash handler
 
-`GatewaySlashHandler` (`crates/channels/src/tui/client/slash.rs`) is the TUI's `SlashHandler` implementation. It ships an **allow-list** of commands that have an HTTP equivalent — bare dashboard openers, `/sessions`, `/jobs`, `/memory`, `/skills`, `/tools`, `/channels`, `/status`, `/llm`, `/trace`, `/config {get,set,unset}`, `/approve`, `/deny`, `/clear`, `/quit`, `/exit`. Anything not on the list (workspace-only `/doctor`, host-local `/workspace`) is hidden from completion and produces an "unknown command" error on submit, rather than half-working against the gateway.
+`GatewaySlashHandler` (`crates/tui/src/client/slash.rs`) is the TUI's `SlashHandler` implementation. It ships an **allow-list** of commands that have an HTTP equivalent — bare dashboard openers, `/sessions`, `/jobs`, `/memory`, `/skills`, `/tools`, `/channels`, `/status`, `/llm`, `/trace`, `/config {get,set,unset}`, `/approve`, `/deny`, `/clear`, `/quit`, `/exit`. Anything not on the list (workspace-only `/doctor`, host-local `/workspace`) is hidden from completion and produces an "unknown command" error on submit, rather than half-working against the gateway.
 
 Skill names from the gateway's `/v1/skills` response are appended as `SlashOutcome::PassThrough` entries at startup — `TuiAdapter` forwards the raw line to the gateway for normal skill selection, same as before.
 
@@ -212,7 +212,7 @@ The loop multiplexes three sources with `tokio::select!`:
 
 ### Transport
 
-`TuiTransport` (`crates/channels/src/tui/transport.rs`) abstracts the
+`TuiTransport` (`crates/tui/src/transport.rs`) abstracts the
 outbound message path from the inbound event source. The adapter
 holds an `Arc<dyn TuiTransport>` and calls three things on it:
 
@@ -281,12 +281,12 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 | `session`  | `ChannelType::Tui`, `User` used when constructing `IncomingMessage`                          |
 | `cli`      | `CliInputHistoryStore` for vault-encrypted input history (host-local; works without the gateway) |
 | `gateway`  | Server-side owner of sessions, approvals, and SSE fan-out. The TUI talks to it over HTTP+SSE |
-| `channels` | Hosts `TuiAdapter`, `TuiTransport` + `GatewayTransport`, `GatewaySlashHandler`, `GatewayDashboardProvider`, `DashboardProvider` trait, `SlashOutcome::OpenView`, and `ViewKind` |
+| `channels` | Trait definitions only: `SlashHandler`, `SlashOutcome`, `ViewKind`, `DashboardProvider`, `DashboardSnapshot`, `IncomingMessage`, `NoticeLevel`, `ChannelError`. No TUI code. |
 
 ## Verification
 
 ```bash
-cargo test -p aura-channels        # keymap, AppState, transport, slash, SSE parser, HTTP client
+cargo test -p aura-tui             # keymap, AppState, transport, slash, SSE parser, HTTP client
 cargo run -- gateway start         # terminal A: long-lived backend
 cargo run -- tui                   # terminal B: HTTP+SSE client
 ```

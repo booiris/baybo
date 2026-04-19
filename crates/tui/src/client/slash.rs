@@ -10,17 +10,17 @@
 //! with `shell-words`, dispatches by name, and formats results as
 //! plain text. Structured pretty-printing lives in `aura-cli`; bringing
 //! it over would require that crate's formatter types (which we don't
-//! want to drag into `aura-channels`).
+//! want to drag into `aura-tui`).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aura_channels::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
 use aura_model::ContentBlock;
 use aura_tools::ApprovalDecision;
 
-use crate::slash::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
-use crate::tui::client::dto::ClientError;
-use crate::tui::client::http::GatewayClient;
+use crate::client::dto::ClientError;
+use crate::client::http::GatewayClient;
 
 /// [`SlashHandler`] that dispatches supported commands against an
 /// `aura gateway`.
@@ -274,7 +274,7 @@ fn err(msg: &str) -> SlashOutcome {
     SlashOutcome::Handled(vec![ContentBlock::Text(format!("error: {msg}"))])
 }
 
-fn format_status(s: crate::tui::client::dto::StatusResponse) -> String {
+fn format_status(s: crate::client::dto::StatusResponse) -> String {
     format!(
         "gateway {version}\n  bind={bind}\n  sessions={sessions}\n  jobs_in_flight={jobs}",
         version = s.version,

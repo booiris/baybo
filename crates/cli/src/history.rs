@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use aura_channels::InputHistoryStore;
 use aura_security::SecretVault;
+use aura_tui::InputHistoryStore;
 
 /// Vault key under which the TUI input history is stored.
 const TUI_HISTORY_SECRET_NAME: &str = "aura.tui.input_history";

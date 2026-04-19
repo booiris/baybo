@@ -5,10 +5,10 @@ mod singleton;
 mod tui_cmd;
 mod tui_log;
 
-use aura_channels::TuiLogSink;
 use aura_cli::cli::ShellKind;
 use aura_cli::{Cli, Commands, ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_security::{LeakDetector, RedactingMakeWriter};
+use aura_tui::TuiLogSink;
 use clap::CommandFactory;
 use clap::Parser;
 use std::path::{Path, PathBuf};

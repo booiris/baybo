@@ -18,6 +18,7 @@ aura-security = { workspace = true }
 aura-tools = { workspace = true }
 aura-trace = { workspace = true }
 aura-llm = { workspace = true }
+aura-tui = { workspace = true }
 aura-workspace = { workspace = true }
 
 async-trait = { workspace = true }

@@ -6,7 +6,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::tui::app::ViewMode;
+use crate::app::ViewMode;
 
 /// Logical action produced by interpreting a key press in the current mode.
 #[derive(Debug, PartialEq, Eq)]
@@ -186,8 +186,8 @@ fn translate_approval(key: KeyEvent) -> Action {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DashboardSnapshot;
-    use crate::tui::app::AppState;
+    use crate::app::AppState;
+    use aura_channels::DashboardSnapshot;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -253,7 +253,7 @@ mod tests {
             Action::Nothing
         );
         app.enter_dashboard(
-            crate::ViewKind::Skills,
+            aura_channels::ViewKind::Skills,
             DashboardSnapshot {
                 title: "s".into(),
                 columns: vec![],
@@ -319,7 +319,7 @@ mod tests {
     fn up_arrow_scrolls_rows_in_dashboard_not_history() {
         let mut app = AppState::new();
         app.enter_dashboard(
-            crate::ViewKind::Skills,
+            aura_channels::ViewKind::Skills,
             DashboardSnapshot {
                 title: "s".into(),
                 columns: vec![],

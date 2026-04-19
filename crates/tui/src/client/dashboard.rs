@@ -9,10 +9,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aura_channels::{DashboardProvider, DashboardSnapshot, ViewKind};
 
-use crate::slash::{DashboardProvider, DashboardSnapshot, ViewKind};
-use crate::tui::client::dto::{JobSummary, MemorySummary};
-use crate::tui::client::http::GatewayClient;
+use crate::client::dto::{JobSummary, MemorySummary};
+use crate::client::http::GatewayClient;
 
 /// [`DashboardProvider`] that pulls live data off an `aura gateway`.
 pub struct GatewayDashboardProvider {

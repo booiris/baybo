@@ -10,11 +10,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aura_channels::{IncomingMessage, NoticeLevel, Result};
 use aura_model::ContentBlock;
 use aura_tools::{ApprovalDecision, ApprovalQueue};
 use futures::Stream;
-
-use crate::{IncomingMessage, NoticeLevel, Result};
 
 /// Public event shape produced by a [`TuiTransport`]. The adapter
 /// translates these into its internal `AppEvent` variants; keeping the

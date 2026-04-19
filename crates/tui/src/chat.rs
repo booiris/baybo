@@ -11,8 +11,8 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::app::{AppState, ApprovalChatState, ChatLine};
-use crate::tui::event::LogLevel;
+use crate::app::{AppState, ApprovalChatState, ChatLine};
+use crate::event::LogLevel;
 
 /// Maximum rows the input box grows to before it clips. Beyond this, the
 /// cursor may scroll off-screen; that's acceptable for a chat-style input
@@ -294,10 +294,7 @@ fn render_completion_popup(frame: &mut Frame, input_area: Rect, state: &AppState
 /// entry is expanded with tool info, resource accesses, params, and
 /// selectable options. When resolved, it collapses to a single summary
 /// line.
-fn render_approval_inline(
-    entry: &crate::tui::app::ApprovalChatEntry,
-    out: &mut Vec<Line<'static>>,
-) {
+fn render_approval_inline(entry: &crate::app::ApprovalChatEntry, out: &mut Vec<Line<'static>>) {
     match entry.state {
         ApprovalChatState::Pending { selected } => {
             // Title

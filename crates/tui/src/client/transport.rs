@@ -9,16 +9,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aura_channels::{ChannelError, IncomingMessage, NoticeLevel, Result};
 use aura_model::ContentBlock;
 use aura_tools::{ApprovalQueue, ApprovalRequest};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use tracing::{debug, warn};
 
-use crate::tui::client::dto::{ApprovalEvent, SseEvent};
-use crate::tui::client::http::GatewayClient;
-use crate::tui::transport::{TransportEvent, TransportEventStream, TuiTransport};
-use crate::{ChannelError, IncomingMessage, NoticeLevel, Result};
+use crate::client::dto::{ApprovalEvent, SseEvent};
+use crate::client::http::GatewayClient;
+use crate::transport::{TransportEvent, TransportEventStream, TuiTransport};
 
 /// HTTP+SSE-backed [`TuiTransport`] implementation backed by a
 /// [`GatewayClient`].

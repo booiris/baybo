@@ -6,10 +6,9 @@
 //! tasks, warn/error log records echoed from the tracing subscriber, and
 //! explicit shutdown requests.
 
+use aura_channels::{DashboardSnapshot, ViewKind};
 use aura_model::ContentBlock;
 use tokio::sync::mpsc;
-
-use crate::ViewKind;
 
 /// Events consumed by the TUI's main loop (non-terminal sources).
 pub(crate) enum AppEvent {
@@ -22,7 +21,7 @@ pub(crate) enum AppEvent {
     /// scrollback until `Outgoing` finalises it.
     StreamDelta(String),
     /// A dashboard snapshot (re-)fetched after an OpenView or refresh.
-    DashboardReady(ViewKind, crate::DashboardSnapshot),
+    DashboardReady(ViewKind, DashboardSnapshot),
     /// A warn/error tracing event, forwarded from the subscriber for display
     /// inline with chat scrollback.
     Log(LogRecord),
@@ -37,8 +36,7 @@ pub(crate) enum AppEvent {
 /// A single log entry surfaced in the chat scrollback.
 ///
 /// Populated by a tracing `Layer`; see `src/tui_log.rs`. Kept as a flat value
-/// type so the `channels` crate does not need to depend on `tracing`
-/// internals.
+/// type so the crate does not need to depend on `tracing` internals.
 #[derive(Debug, Clone)]
 pub struct LogRecord {
     pub level: LogLevel,

@@ -376,4 +376,3 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     tracing::info!("gateway shutdown complete");
     Ok(())
 }
-

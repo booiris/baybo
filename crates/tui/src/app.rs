@@ -7,14 +7,13 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use aura_channels::{DashboardSnapshot, SlashCommand, ViewKind};
 use aura_model::ContentBlock;
 use ratatui::widgets::TableState;
 
 use aura_tools::{ApprovalDecision, ApprovalQueue, ResourceAccess};
 
-use crate::SlashCommand;
-use crate::tui::event::LogRecord;
-use crate::{DashboardSnapshot, ViewKind};
+use crate::event::LogRecord;
 
 const SCROLLBACK_CAP: usize = 5000;
 const HISTORY_CAP: usize = 500;

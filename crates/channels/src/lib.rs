@@ -1,7 +1,6 @@
 mod error;
 mod registry;
 mod slash;
-mod tui;
 mod types;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -12,10 +11,6 @@ pub use registry::ChannelRegistry;
 pub use slash::{
     DashboardProvider, DashboardSnapshot, SlashCommand, SlashHandler, SlashOutcome, ViewKind,
 };
-pub use tui::client as tui_client;
-pub use tui::event::{LogLevel, LogRecord, TuiLogSink};
-pub use tui::transport::{SharedTransport, TransportEvent, TransportEventStream, TuiTransport};
-pub use tui::{InputHistoryStore, OnExit, TuiAdapter};
 pub use types::{
     AgentOutput, ChannelStatus, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
 };
