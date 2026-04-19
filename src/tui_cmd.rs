@@ -16,20 +16,22 @@
 //! as a subprocess — compiled in only under `cfg(debug_assertions)`,
 //! so release builds never see it.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use aura_agent::service::ShutdownSignal;
 use aura_cli::CliInputHistoryStore;
 use aura_config::AuraConfig;
 use aura_gateway::GatewayToken;
 use aura_tui::TuiAdapter;
+use aura_tui::TuiLogSink;
 use aura_tui::client::{
     GatewayClient, GatewayDashboardProvider, GatewaySlashHandler, GatewayTransport,
 };
 use tracing::{info, warn};
 
+use crate::runtime::force_exit_watchdog;
 use crate::runtime::{build_secret_vault, install_signal_handler};
-use crate::{ChatTracing, runtime::force_exit_watchdog};
+use crate::tracing_init::{TracingMode, init_tracing};
 
 /// Resolved options passed from `main.rs` after parsing the clap
 /// struct-variant.
@@ -42,11 +44,13 @@ pub struct Options {
 /// Run the interactive TUI to completion. Returns once the event loop
 /// exits (user typed `/quit`, adapter closed) or the shared shutdown
 /// signal fires (SIGINT/SIGTERM).
-pub async fn run(
-    config: Arc<AuraConfig>,
-    chat_tracing: Option<ChatTracing>,
-    opts: Options,
-) -> anyhow::Result<()> {
+pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
+    let tui_log_sink: Arc<OnceLock<TuiLogSink>> = Arc::new(OnceLock::new());
+    let _tracing_guards = init_tracing(TracingMode::Tui {
+        tui_sink: Arc::clone(&tui_log_sink),
+    });
+    info!("Aura - Intelligent Assistant Framework starting");
+
     let endpoint = resolve_endpoint(&config);
     let token = resolve_token(&config).await?;
 
@@ -129,9 +133,7 @@ pub async fn run(
         .with_input_history(history_store)
         .with_on_exit(Arc::new(move || tui_shutdown.trigger()));
 
-    if let Some(tracing) = chat_tracing.as_ref() {
-        let _ = tracing.tui_sink.set(tui.log_sink());
-    }
+    let _ = tui_log_sink.set(tui.log_sink());
 
     tui.start().await?;
 

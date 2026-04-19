@@ -2,121 +2,19 @@ mod boot;
 mod gateway_cmd;
 mod runtime;
 mod singleton;
+mod tracing_init;
 mod tui_cmd;
 mod tui_log;
 
 use aura_cli::cli::ShellKind;
 use aura_cli::{Cli, Commands, ContextBuilder, Invocation, OutputFormat, dispatch};
-use aura_security::{LeakDetector, RedactingMakeWriter};
-use aura_tui::TuiLogSink;
 use clap::CommandFactory;
 use clap::Parser;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::time::FormatTime;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::runtime::build_leak_detector;
-use crate::tui_log::TuiLogLayer;
-
-struct SecondPrecisionTimer;
-
-impl FormatTime for SecondPrecisionTimer {
-    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
-        write!(w, "{}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"))
-    }
-}
-
-enum TracingMode<'a> {
-    /// argv / one-shot command path: everything to stdout, no TUI echo.
-    Stdout,
-    /// Chat path: fmt layer writes rolling file under `<log_dir>/aura.log`,
-    /// plus a warn/error echo layer feeding the TUI scrollback via the
-    /// returned `OnceLock<TuiLogSink>`. The file writer is wrapped in a
-    /// leak-detector redactor so secrets matched by `LeakAction::Replace`
-    /// rules are masked before landing on disk.
-    Chat {
-        log_dir: &'a Path,
-        leak_detector: Arc<LeakDetector>,
-    },
-}
-
-pub struct ChatTracing {
-    _file_guard: WorkerGuard,
-    pub tui_sink: Arc<OnceLock<TuiLogSink>>,
-}
-
-fn init_tracing(mode: TracingMode<'_>) -> Option<ChatTracing> {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aura=info"));
-    let json = std::env::var("AURA_LOG_FORMAT").unwrap_or_default() == "json";
-
-    match mode {
-        TracingMode::Stdout => {
-            let fmt_layer = fmt::layer()
-                .with_timer(SecondPrecisionTimer)
-                .with_target(true)
-                .with_file(true)
-                .with_line_number(true);
-            if json {
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(fmt_layer.json().with_span_list(true))
-                    .init();
-            } else {
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(fmt_layer)
-                    .init();
-            }
-            None
-        }
-        TracingMode::Chat {
-            log_dir,
-            leak_detector,
-        } => {
-            if let Err(e) = std::fs::create_dir_all(log_dir) {
-                eprintln!(
-                    "warning: could not create log dir {}: {e}. Falling back to stdout logging.",
-                    log_dir.display()
-                );
-                return init_tracing(TracingMode::Stdout);
-            }
-            let appender = tracing_appender::rolling::daily(log_dir, "aura.log");
-            let (writer, guard) = tracing_appender::non_blocking(appender);
-            let writer = RedactingMakeWriter::new(leak_detector, writer);
-            let tui_sink: Arc<OnceLock<TuiLogSink>> = Arc::new(OnceLock::new());
-            let tui_layer = TuiLogLayer::new(Arc::clone(&tui_sink));
-            let fmt_layer = fmt::layer()
-                .with_writer(writer)
-                .with_ansi(false)
-                .with_timer(SecondPrecisionTimer)
-                .with_target(true)
-                .with_file(true)
-                .with_line_number(true);
-            if json {
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(fmt_layer.json().with_span_list(true))
-                    .with(tui_layer)
-                    .init();
-            } else {
-                tracing_subscriber::registry()
-                    .with(env_filter)
-                    .with(fmt_layer)
-                    .with(tui_layer)
-                    .init();
-            }
-            Some(ChatTracing {
-                _file_guard: guard,
-                tui_sink,
-            })
-        }
-    }
-}
+use crate::tracing_init::{TracingMode, init_tracing};
 
 /// Resolve the effective aura.json path, if any, for display in
 /// diagnostics. Thin wrapper so existing callers keep working; the real
@@ -188,19 +86,12 @@ async fn main() -> anyhow::Result<()> {
         dev_auto_gateway,
     }) = cli.command.as_ref()
     {
-        let log_dir = workspace_root.join("logs");
-        let leak_detector = build_leak_detector(&config.security, None);
-        let chat_tracing = init_tracing(TracingMode::Chat {
-            log_dir: &log_dir,
-            leak_detector: Arc::clone(&leak_detector),
-        });
-        info!("Aura - Intelligent Assistant Framework starting");
         let opts = tui_cmd::Options {
             session: session.clone(),
             #[cfg(debug_assertions)]
             dev_auto_gateway: *dev_auto_gateway,
         };
-        return tui_cmd::run(config, chat_tracing, opts).await;
+        return tui_cmd::run(config, opts).await;
     }
 
     // ---------------- argv dispatch (one-shot command + exit) ----------------

@@ -14,7 +14,7 @@
 //! registry, and drives the router and [`GatewayServer`] side by side
 //! under a shared `ShutdownSignal`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aura_agent::service::{ShutdownSignal, TaskTracker};
@@ -22,13 +22,11 @@ use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
 use aura_gateway::{GatewayDeps, GatewayServer, GatewayToken, HttpAdapter, RuntimeGatewayConfig};
-use aura_security::{LeakDetector, RedactingMakeWriter};
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::boot;
 use crate::runtime;
 use crate::singleton;
+use crate::tracing_init::{TracingMode, init_tracing};
 
 /// Entry point — routes the parsed subcommand to the right handler.
 pub async fn run(cmd: GatewayCmd) -> anyhow::Result<()> {
@@ -207,66 +205,6 @@ async fn token_rotate(config: &AuraConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- tracing init for `start` ----
-
-/// Install a tracing subscriber for the gateway process.
-///
-/// Writes to `<log_dir>/aura-gateway.log` through a
-/// [`RedactingMakeWriter`] so tokens/secrets matching any detector rule
-/// are masked before landing on disk. `AURA_LOG_FORMAT=json` produces
-/// structured output; any other value uses the default text format.
-/// Tracing is `init()`-ed here because the `start` subcommand is
-/// intercepted in `main.rs` before the TUI's `init_tracing` runs — so
-/// without this the server would emit zero logs.
-///
-/// The returned [`WorkerGuard`] must be held for the lifetime of the
-/// process: dropping it flushes and stops the non-blocking appender.
-fn init_gateway_tracing(log_dir: &Path, leak_detector: Arc<LeakDetector>) -> Option<WorkerGuard> {
-    if let Err(e) = std::fs::create_dir_all(log_dir) {
-        eprintln!(
-            "warning: could not create gateway log dir {}: {e}. Logs will go to stderr only.",
-            log_dir.display()
-        );
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aura=info"));
-        if let Err(e) = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt::layer().with_ansi(false))
-            .try_init()
-        {
-            eprintln!("warning: tracing subscriber already initialized: {e}");
-        }
-        return None;
-    }
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aura=info"));
-    let json = std::env::var("AURA_LOG_FORMAT").unwrap_or_default() == "json";
-    let appender = tracing_appender::rolling::daily(log_dir, "aura-gateway.log");
-    let (writer, guard) = tracing_appender::non_blocking(appender);
-    let writer = RedactingMakeWriter::new(leak_detector, writer);
-    let fmt_layer = fmt::layer()
-        .with_writer(writer)
-        .with_ansi(false)
-        .with_target(true)
-        .with_file(true)
-        .with_line_number(true);
-    let result = if json {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer.json().with_span_list(true))
-            .try_init()
-    } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .try_init()
-    };
-    if let Err(e) = result {
-        eprintln!("warning: tracing subscriber already initialized: {e}");
-    }
-    Some(guard)
-}
-
 // ---- start (long-running) ----
 
 async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
@@ -292,8 +230,11 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // the same `Arc<LeakDetector>` into `build_managers` so the runtime
     // graph's SecurityGateway uses the same rule set.
     let leak_detector = runtime::build_leak_detector(&config.security, Some(&token));
-    let _tracing_guard =
-        init_gateway_tracing(&workspace_root.join("logs"), Arc::clone(&leak_detector));
+    let log_dir = workspace_root.join("logs");
+    let _tracing_guards = init_tracing(TracingMode::File {
+        log_dir: &log_dir,
+        leak_detector: Arc::clone(&leak_detector),
+    });
     tracing::info!(token_len = token.len(), "gateway token loaded from vault");
 
     // Resolve the runtime gateway config up front so a bad `bind_address`
