@@ -182,7 +182,7 @@ entry: a resolution POSTed by one client is broadcast as
 `ApprovalEvent::Resolved` so other connected clients drop the entry
 from their UI.
 
-### Gateway owns its own DTOs
+### Gateway owns its own DTOs — utoipa stays in the gateway
 
 Route handlers call the manager `pub async fn` methods directly
 (`SessionManager`, `JobManager`, `CronScheduler`, `MemoryManager`,
@@ -192,6 +192,65 @@ reused — those are built around `CommandContext` + `OutputFormat` and
 would force a cross-crate refactor of every `crates/cli/src/commands/`
 module. The duplicated surface is small and the independence is worth
 more than the line count saved.
+
+`api/dto.rs` is also the **only** place in the workspace that depends
+on `utoipa`. Domain crates (`aura-model`, `aura-job`, `aura-cron`,
+`aura-tools`) stay HTTP-framework-agnostic — no `#[derive(ToSchema)]`,
+no `#[schema(...)]` attributes leaking into them. The gateway defines
+a mirror type for every domain type that appears on the wire and
+provides `From<Domain>` conversions; handlers build DTOs at the seam
+via `.map(DomainDto::from)`. Mirror types keep their bare name
+(`Job`, `CronJob`, `MemoryEntry`, `ChannelType`, …) so the generated
+OpenAPI schemas — and the TypeScript types downstream — are stable
+across the refactor. Adding a field to a domain type now requires an
+explicit edit in `dto.rs` to surface it on HTTP; that's a feature, not
+a bug, because the drift test below will force the question.
+
+A small exception: `MemoryCategory` is an adjacent-tagged unit-variant
+enum (`#[serde(tag = "type", content = "value")]`), which the utoipa
+derive macro currently can't generate. The mirror has a hand-rolled
+`PartialSchema + ToSchema` impl inline in `dto.rs`. Any similar enum
+shape added later should follow the same pattern rather than
+regressing the domain crate to depend on utoipa.
+
+### OpenAPI spec generation and the TypeScript client
+
+`admin/mod.rs::v1_router_and_spec()` returns `(Router<AdminState>,
+OpenApi)` in one call: the submodules each expose `OpenApiRouter`s
+carrying their `#[utoipa::path]`-annotated handlers, `AdminApiDoc`
+seeds the `info` + `tags` block, and `split_for_parts()` emits both
+the axum `Router` and the finished `OpenApi` document. `server.rs`
+wires state and auth; `api/openapi.rs` mounts `GET /v1/openapi.json`
+as a last step so the same document the test below writes to disk is
+also served live.
+
+The document is checked in at `docs/openapi.json` and kept honest by
+`crates/gateway/tests/openapi_spec_sync.rs`: the test regenerates the
+spec from `v1_router_and_spec()` and compares byte-for-byte. On
+intentional surface changes, run with `UPDATE_OPENAPI=1 cargo test -p
+aura-gateway --test openapi_spec_sync` to rewrite the snapshot. A
+drifted spec fails CI, which guarantees the frontend can regenerate
+types without hitting a stale file.
+
+The frontend consumes the spec through two tools:
+
+- `openapi-typescript` (`npm run gen:api`, also wired into `npm run
+  build`) reads `docs/openapi.json` and writes
+  `web/src/api/schema.d.ts` — a pure `.d.ts` with `paths` and
+  `components` maps. No runtime code is emitted.
+- `openapi-fetch` consumes that schema type at runtime. The thin
+  wrapper in `web/src/api/client.ts` (`createAdminClient({ baseUrl,
+  token })`) returns a typed `Client<paths>` with Bearer auth
+  pre-applied. Every admin call the UI makes therefore has request
+  paths, params, body shape, and response variants checked by `tsc`
+  against whatever the Rust router actually exposes.
+
+This gives a two-step drift alarm: (1) Rust test fails if the spec
+drifted from the router; (2) `tsc` fails in the web build if
+`schema.d.ts` was regenerated but a caller still uses the old shape.
+The web bundle is unauthenticated by design (see "WebUI" below), so
+the generated client is only a convenience for the operator's
+browser — `/v1/*` still enforces `require_admin_token`.
 
 ### WebUI — embedded React dashboard, no `rust-embed`
 
@@ -216,6 +275,12 @@ no server-side capability, and every privileged data path still goes
 through `/v1/*` behind `require_admin_token`. Treating the webui as a
 static inert asset rather than a privileged surface keeps the bearer-
 token contract simple — tokens gate data, not pages.
+
+Admin API calls from the web bundle go through the typed client at
+`web/src/api/client.ts`, which wraps `openapi-fetch` with a
+`Client<paths>` derived from the checked-in OpenAPI document. See the
+"OpenAPI spec generation and the TypeScript client" design note above
+for the regeneration flow.
 
 Release flow:
 
@@ -346,6 +411,8 @@ GET    /v1/skills
 GET    /v1/tools
 GET    /v1/channels                     read-only registry list
 GET    /v1/llm
+
+GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin surface
 ```
 
 **Channel listener (UDS, peer-cred + PSK/token)** —
@@ -501,10 +568,12 @@ crates/gateway/
 │   ├── test_support.rs      # cfg(test-support) build_test_deps + TestGateway
 │   ├── api/
 │   │   ├── mod.rs           # health::routes()
+│   │   ├── dto.rs           # mirror DTOs + From<Domain> conversions — the only utoipa user
+│   │   ├── openapi.rs       # GET /v1/openapi.json handler
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
-│   │   ├── admin/           # mod.rs exposes v1_router() mounted on the admin TCP listener
-│   │   │   └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm,dto}.rs
+│   │   ├── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
+│   │   │   └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm}.rs
 │   │   └── channel/         # mod.rs exposes v1_router() mounted on the channel UDS listener
 │   │       └── {sessions,messages,approvals,dto}.rs
 │   └── installer/
@@ -513,10 +582,11 @@ crates/gateway/
 │       ├── systemd.rs       # cfg(all(target_os = "linux",  feature = "linux"))
 │       └── launchd.rs       # cfg(all(target_os = "macos",  feature = "macos"))
 └── tests/
-    ├── auth.rs              # admin bearer auth
-    ├── sse.rs               # HttpAdapter fan-out
-    ├── admin_has_no_channels.rs  # /v1/sessions et al. are 404 on admin
-    └── uds.rs               # full UDS round-trip via hyper client
+    ├── auth.rs                  # admin bearer auth
+    ├── sse.rs                   # HttpAdapter fan-out
+    ├── admin_has_no_channels.rs # /v1/sessions et al. are 404 on admin
+    ├── openapi_spec_sync.rs     # asserts router spec == docs/openapi.json (UPDATE_OPENAPI=1 to rewrite)
+    └── uds.rs                   # full UDS round-trip via hyper client
 ```
 
 The frontend sources live outside the crate at `web/` (npm workspace,

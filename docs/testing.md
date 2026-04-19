@@ -95,6 +95,29 @@ The integration-tests crate composes these into higher-level builders:
    gated behind an opt-in cargo feature. Same-crate helpers stay
    `#[cfg(test)]`. Never leave a test-only `pub` helper ungated.
 
+## Spec-drift tests
+
+Snapshot files committed to the repo are kept honest by a dedicated
+crate-level test that regenerates the file from the source of truth and
+compares byte-for-byte. The convention:
+
+- Test sets an `UPDATE_<THING>=1` env var escape hatch that rewrites the
+  snapshot instead of asserting.
+- Failure prints the exact command a developer should run to regenerate.
+- The regenerated file is checked in, so CI (which does not set the env
+  var) fails whenever the snapshot and the code disagree.
+
+Current drift tests:
+
+| Test                                            | Snapshot                | Regenerate with                                                            |
+| ----------------------------------------------- | ----------------------- | -------------------------------------------------------------------------- |
+| `crates/gateway/tests/openapi_spec_sync.rs`     | `docs/openapi.json`     | `UPDATE_OPENAPI=1 cargo test -p aura-gateway --test openapi_spec_sync`     |
+
+The OpenAPI snapshot is the contract that `web/`'s
+`openapi-typescript` codegen reads to produce `web/src/api/schema.d.ts`;
+keeping it in lockstep with the Rust router is what lets the frontend
+`tsc` step catch API drift.
+
 ## End-to-end suite layout
 
 `crates/integration-tests/tests/` currently hosts:
