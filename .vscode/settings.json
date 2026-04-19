@@ -76,6 +76,7 @@
         "inlines",
         "ironclaw",
         "journaling",
+        "KEEPALIVE",
         "keymap",
         "keypresses",
         "Libsql",
