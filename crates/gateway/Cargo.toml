@@ -14,7 +14,7 @@ linux = []
 macos = []
 # Exposes test helpers to downstream crate-level tests. Never enabled in
 # release builds.
-test-support = []
+test-support = ["dep:tempfile"]
 
 [dependencies]
 aura-agent = { workspace = true }
@@ -48,10 +48,18 @@ rand = { workspace = true }
 hex = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
+libc = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
 tower = { workspace = true }
+# Test-support-only deps. `test-support` feature wires them in; release
+# builds never include them.
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 aura-gateway = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
+bytes = { workspace = true }
 tempfile = { workspace = true }

@@ -85,6 +85,9 @@ aes-gcm = "0.10"
 rand = "0.10"
 libsql = "0.9"
 axum = "0.8"
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client-legacy", "http1"] }
+http-body-util = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
 teloxide = { version = "0.17", features = ["macros"] }
 serenity = { version = "0.12", features = ["client", "gateway", "model"] }
@@ -106,6 +109,7 @@ unicode-width = "0.2"
 tempfile = "3"
 glob = "0.3"
 walkdir = "2"
+libc = "0.2"
 
 [package]
 name = "aura"
@@ -132,6 +136,7 @@ aura-skills-assessor = { workspace = true }
 aura-config = { workspace = true }
 aura-cli = { workspace = true }
 aura-gateway = { workspace = true }
+aura-gateway-auth = { workspace = true }
 aura-tui = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

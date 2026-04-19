@@ -1,4 +1,25 @@
 //! Build-time PSK + per-install salt derivation for TUI authentication.
+//!
+//! # Threat model
+//!
+//! The effective TUI PSK is a **workspace-binding token**, not a defence
+//! against a same-UID hostile process. It usefully rejects:
+//!
+//! * connections from a different Unix user (already gated by UDS
+//!   `0o600` perms + `SO_PEERCRED`; the PSK is the belt on top of those
+//!   suspenders);
+//! * connections that crossed a workspace boundary (a TUI built against
+//!   workspace A will not authenticate against the gateway running in
+//!   workspace B, because the per-install salt file diverges);
+//! * stale reconnects from an older build or a different on-disk install
+//!   (different embedded PSK bytes).
+//!
+//! It explicitly does **not** defend against a malicious process running
+//! as the same UID as the gateway. Such a process can read the salt file
+//! and the installed binary, recompute the effective PSK, and present
+//! it. Treat "same-UID adversary" as outside the scope of this
+//! mechanism — file permissions, service-manager sandboxing, and OS-
+//! level isolation are the tools for that threat.
 
 use std::fs;
 use std::io;
@@ -15,8 +36,7 @@ pub const TUI_PSK_HEADER: &str = "x-aura-tui-secret";
 ///
 /// Direct use is discouraged — call [`effective_tui_psk`] instead so the
 /// per-install salt is mixed in.
-pub const EMBEDDED_TUI_PSK: &[u8; 32] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/tui_psk.bin"));
+pub const EMBEDDED_TUI_PSK: &[u8; 32] = include_bytes!(concat!(env!("OUT_DIR"), "/tui_psk.bin"));
 
 const SALT_FILE_NAME: &str = "tui_psk.salt";
 const HKDF_INFO: &[u8] = b"aura-gateway tui psk v1";
@@ -73,10 +93,9 @@ fn create_salt(path: &Path) -> io::Result<[u8; 32]> {
     Ok(bytes)
 }
 
-#[cfg(unix)]
 fn write_mode_0600(path: &Path, data: &[u8]) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
 
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -86,11 +105,6 @@ fn write_mode_0600(path: &Path, data: &[u8]) -> io::Result<()> {
     f.write_all(data)?;
     f.sync_all()?;
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_mode_0600(path: &Path, data: &[u8]) -> io::Result<()> {
-    fs::write(path, data)
 }
 
 #[cfg(test)]
@@ -130,7 +144,6 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    #[cfg(unix)]
     #[test]
     fn salt_file_is_mode_0600() {
         use std::os::unix::fs::MetadataExt;

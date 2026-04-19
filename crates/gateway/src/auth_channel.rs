@@ -149,11 +149,7 @@ mod tests {
     fn mk_state(uid: u32) -> (ChannelAuthState, ChannelTokenTable, [u8; 32]) {
         let psk = [7u8; 32];
         let table = ChannelTokenTable::new();
-        (
-            ChannelAuthState::new(psk, table.clone(), uid),
-            table,
-            psk,
-        )
+        (ChannelAuthState::new(psk, table.clone(), uid), table, psk)
     }
 
     fn empty_req() -> Request<Body> {
@@ -204,7 +200,10 @@ mod tests {
             pid: Some(1234),
         };
         let out = check_child_token(&req, &state, peer).unwrap();
-        assert!(matches!(out, Some(AuthedClient::Subprocess { pid: 1234, .. })));
+        assert!(matches!(
+            out,
+            Some(AuthedClient::Subprocess { pid: 1234, .. })
+        ));
     }
 
     #[test]

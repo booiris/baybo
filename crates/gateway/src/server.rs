@@ -208,10 +208,7 @@ pub fn build_channel_router(
     auth_state: crate::auth_channel::ChannelAuthState,
 ) -> Router {
     let state = ChannelState::from_deps(deps);
-    let v1 = crate::auth_channel::attach(
-        api::channel::v1_router().with_state(state),
-        auth_state,
-    );
+    let v1 = crate::auth_channel::attach(api::channel::v1_router().with_state(state), auth_state);
     Router::new()
         .merge(api::health::routes())
         .nest("/v1", v1)

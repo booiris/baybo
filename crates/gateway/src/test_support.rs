@@ -1,0 +1,120 @@
+//! Test-only helpers for gateway crate-level tests.
+//!
+//! Builds a minimal [`GatewayDeps`] wired against an in-memory libsql
+//! store, plus the primitives that the `uds`, `admin_has_no_channels`,
+//! and spawn-lifecycle tests share.
+//!
+//! Gated behind the `test-support` feature so the helpers are available
+//! to downstream crate-level tests (`tests/*.rs`) without shipping in
+//! release builds. See the per-crate test-support pattern in `CLAUDE.md`.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use aura_agent::service::ShutdownSignal;
+use aura_agent::{CronScheduler, JobManager, MemoryManager, SessionManager};
+use aura_channels::ChannelRegistry;
+use aura_config::AuraConfig;
+use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
+use aura_skills::SkillRegistry;
+use aura_storage::{Store, TraceStore};
+use aura_tools::ToolRegistry;
+use tempfile::TempDir;
+use tokio::sync::{RwLock, mpsc};
+
+use crate::config::RuntimeGatewayConfig;
+use crate::http_adapter::HttpAdapter;
+use crate::server::GatewayDeps;
+
+/// Bearer token every test gateway is wired with. Exposed so callers
+/// that talk to the admin listener can authenticate without duplicating
+/// the constant.
+pub const TEST_ADMIN_TOKEN: &str = "test-admin-token-fixed-32-bytes!!";
+
+/// Bundle returned by [`build_test_deps`]. Holds the deps plus the
+/// auxiliary handles tests need to keep alive (the tempdir backing
+/// libsql, the `HttpAdapter` for pushing SSE events, the shared
+/// shutdown signal for orderly teardown).
+pub struct TestGateway {
+    pub deps: GatewayDeps,
+    pub adapter: Arc<HttpAdapter>,
+    pub shutdown: ShutdownSignal,
+    pub _tempdir: TempDir,
+}
+
+/// Construct a fully-wired `GatewayDeps` against in-memory storage.
+///
+/// `admin_bind` is baked into the runtime config so
+/// `AdminState::bind_display` matches what the `/v1/status` handler
+/// returns. Use `127.0.0.1:0` when the bind address doesn't matter.
+pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let db_path = tempdir.path().join("gateway-test.db");
+    let storage = Store::open(&db_path).await.expect("open in-memory store");
+
+    let config = Arc::new(AuraConfig::default());
+    let session_manager = Arc::new(SessionManager::new(
+        storage.session,
+        chrono::Duration::seconds(300),
+    ));
+    let job_manager = Arc::new(JobManager::new(storage.job));
+
+    let shutdown = ShutdownSignal::new();
+    let (cron_tx, _cron_rx) = mpsc::channel(16);
+    let cron_scheduler = Arc::new(CronScheduler::new(
+        storage.cron,
+        cron_tx,
+        Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
+    ));
+
+    let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
+    let trace_store: Arc<dyn TraceStore> = Arc::from(storage.trace);
+    let skill_registry = Arc::new(SkillRegistry::new());
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let channel_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
+
+    let registry = LlmProviderRegistry::with_default_providers();
+    let llm_client = Arc::new(
+        registry
+            .create_client(&LlmProviderConfig {
+                provider: "openai".into(),
+                api_key: Some("sk-test-placeholder".into()),
+                base_url: None,
+                model: "gpt-4o-mini".into(),
+            })
+            .expect("stub LLM client"),
+    );
+
+    let adapter = Arc::new(HttpAdapter::new());
+
+    let runtime_config = RuntimeGatewayConfig {
+        admin_bind,
+        cors_allowed_origins: Vec::new(),
+        shutdown_grace: Duration::from_millis(250),
+    };
+
+    let deps = GatewayDeps {
+        config,
+        config_path: None,
+        runtime_config,
+        adapter: Arc::clone(&adapter),
+        session_manager,
+        job_manager,
+        cron_scheduler,
+        memory_manager,
+        trace_store,
+        skill_registry,
+        tool_registry,
+        channel_registry,
+        llm_client,
+        admin_token: TEST_ADMIN_TOKEN.to_string(),
+    };
+
+    TestGateway {
+        deps,
+        adapter,
+        shutdown,
+        _tempdir: tempdir,
+    }
+}

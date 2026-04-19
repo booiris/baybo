@@ -21,7 +21,10 @@ use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
-use aura_gateway::{GatewayDeps, GatewayServer, AdminToken, HttpAdapter, RuntimeGatewayConfig};
+use aura_gateway::{
+    AdminToken, ChannelServer, GatewayDeps, GatewayServer, HttpAdapter, RuntimeGatewayConfig,
+};
+use aura_gateway_auth::{ChannelTokenTable, effective_tui_psk};
 
 use crate::boot;
 use crate::runtime;
@@ -285,21 +288,43 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         llm_client: Arc::clone(&graph.llm_client),
         admin_token: token.clone(),
     };
-    let server = GatewayServer::new(deps);
 
+    // Channel UDS listener — lives under the same workspace identity dir
+    // as the singleton lockfile. The PSK is derived with a per-install
+    // salt so two copies of the same release binary don't share an
+    // effective PSK across machines.
+    let channel_server = {
+        let psk = effective_tui_psk(workspace_root.as_path())
+            .map_err(|e| anyhow::anyhow!("derive channel PSK: {e}"))?;
+        let tokens = ChannelTokenTable::new();
+        let socket_path = workspace_root.join("channel.sock");
+        ChannelServer::bind(&deps, socket_path.clone(), psk, tokens)
+            .map_err(|e| anyhow::anyhow!("bind channel UDS: {e}"))?
+    };
+
+    let server = GatewayServer::new(deps);
     let banner_bind = server.bind();
     println!("Aura gateway listening on http://{banner_bind}");
     println!("  Quick URL: http://{banner_bind}/v1/status?token={token}");
 
     tracing::info!(bind = %banner_bind, "gateway start: all components initialized");
 
-    let server_shutdown = shutdown.clone();
+    let admin_shutdown = shutdown.clone();
+    let channel_shutdown = shutdown.clone();
     let router_shutdown = shutdown.clone();
     tokio::select! {
-        res = server.run(server_shutdown) => {
+        res = server.run(admin_shutdown) => {
             if let Err(e) = res {
-                tracing::error!(error = %e, "gateway server exited with error");
+                tracing::error!(error = %e, "admin gateway server exited with error");
+                shutdown.trigger();
                 return Err(anyhow::anyhow!("gateway server error: {e}"));
+            }
+        }
+        res = channel_server.run(channel_shutdown) => {
+            if let Err(e) = res {
+                tracing::error!(error = %e, "channel gateway server exited with error");
+                shutdown.trigger();
+                return Err(anyhow::anyhow!("channel server error: {e}"));
             }
         }
         _ = run_handle.router.run(run_handle.incoming_rx, run_handle.response_rx) => {

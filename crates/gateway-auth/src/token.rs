@@ -42,9 +42,24 @@ impl ChannelTokenTable {
     /// Mint a new token and register it against `identity`. The returned
     /// [`TokenHandle`] removes the token on drop.
     pub fn mint(&self, identity: ClientIdentity) -> Result<TokenHandle, ChannelTokenError> {
-        let token = generate_token();
+        self.register(generate_token(), identity)
+    }
+
+    /// Register a pre-generated token against `identity`. Used by the
+    /// subprocess spawn flow: callers generate the token with
+    /// [`generate_token`], pass it to the child via env var, and only
+    /// after the child has a PID call back here to register. Returns a
+    /// [`TokenHandle`] that revokes on drop.
+    pub fn register(
+        &self,
+        token: String,
+        identity: ClientIdentity,
+    ) -> Result<TokenHandle, ChannelTokenError> {
         {
-            let mut guard = self.inner.write().map_err(|_| ChannelTokenError::Poisoned)?;
+            let mut guard = self
+                .inner
+                .write()
+                .map_err(|_| ChannelTokenError::Poisoned)?;
             guard.insert(token.clone(), identity);
         }
         Ok(TokenHandle {
@@ -63,7 +78,10 @@ impl ChannelTokenTable {
     /// Remove `token` from the table. Idempotent — unknown tokens do
     /// nothing.
     pub fn revoke(&self, token: &str) -> Result<(), ChannelTokenError> {
-        let mut guard = self.inner.write().map_err(|_| ChannelTokenError::Poisoned)?;
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| ChannelTokenError::Poisoned)?;
         guard.remove(token);
         Ok(())
     }
@@ -101,7 +119,10 @@ impl Drop for TokenHandle {
     }
 }
 
-fn generate_token() -> String {
+/// Generate a fresh 256-bit token, hex-encoded. Exposed so the
+/// subprocess spawn helper can hand the token to the child via env var
+/// *before* calling [`ChannelTokenTable::register`].
+pub fn generate_token() -> String {
     let mut bytes = [0u8; TOKEN_BYTES];
     rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)

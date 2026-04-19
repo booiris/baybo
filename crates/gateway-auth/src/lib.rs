@@ -20,8 +20,8 @@
 pub mod psk;
 pub mod token;
 
-pub use psk::{effective_tui_psk, EMBEDDED_TUI_PSK, TUI_PSK_HEADER};
+pub use psk::{EMBEDDED_TUI_PSK, TUI_PSK_HEADER, effective_tui_psk};
 pub use token::{
-    constant_time_eq, ChannelTokenError, ChannelTokenTable, ClientIdentity, TokenHandle,
-    CHANNEL_TOKEN_HEADER,
+    CHANNEL_TOKEN_HEADER, ChannelTokenError, ChannelTokenTable, ClientIdentity, TokenHandle,
+    constant_time_eq, generate_token,
 };
