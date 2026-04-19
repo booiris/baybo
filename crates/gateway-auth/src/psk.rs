@@ -2,7 +2,7 @@
 //!
 //! # Threat model
 //!
-//! The effective TUI PSK is a **workspace-binding token**, not a defence
+//! The effective TUI PSK is a **workspace-binding token**, not a defense
 //! against a same-UID hostile process. It usefully rejects:
 //!
 //! * connections from a different Unix user (already gated by UDS

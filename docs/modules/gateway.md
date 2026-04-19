@@ -2,19 +2,28 @@
 
 ## Overview
 
-`aura-gateway` is Aura's headless backend. One axum server plays two roles:
+`aura-gateway` is Aura's headless backend. It runs **two listeners** side
+by side against the same manager graph:
 
-1. **Chat transport** — it implements [`aura_channels::ChannelAdapter`] for
-   `ChannelType::Http` so chat traffic flows through the exact same Router
-   path used by the TUI. No parallel agent pipeline.
-2. **Admin REST + SSE API** — it exposes the operator surface (sessions,
-   messages, jobs, cron, memory, traces, skills, tools, channels, llm,
-   config, status) over HTTP, mirroring the CLI command families.
+1. **Admin listener** — TCP, bearer-token authenticated. Surfaces the
+   operator controls (config, jobs, cron, memory, traces, skills, tools,
+   channels-list, llm, status) that mirror the CLI command families. No
+   chat content or session data flows here.
+2. **Channel listener** — Unix domain socket, authenticated by either the
+   TUI pre-shared key or a per-subprocess token (subprocess pid pinned).
+   Serves session CRUD, message submit, per-session SSE, and tool
+   approvals. This is the listener the TUI and future sidecar channel
+   plugins talk to.
+
+The gateway also implements [`aura_channels::ChannelAdapter`] for
+`ChannelType::Http` so messages submitted over the channel listener flow
+through the same router path as TUI/telegram/discord — no parallel agent
+pipeline.
 
 The gateway is driven by the `aura gateway …` command tree. `start` runs
-the server in the foreground; `install` / `enable` / `disable` /
+both listeners in the foreground; `install` / `enable` / `disable` /
 `uninstall` / `status` manage the platform service unit; `token
-{show|rotate}` manages the dynamic auth token. The binary entrypoint
+{show|rotate}` manages the admin bearer token. The binary entrypoint
 intercepts `Commands::Gateway` in `src/main.rs` before the CLI dispatcher
 and routes it to `src/gateway_cmd.rs` — same pattern as `Commands::Tui`.
 
@@ -25,57 +34,119 @@ compatibility but is no longer read; the gateway owns its own settings.
 
 ## Design Decisions
 
-### Single server, two surfaces
+### Two listeners, one router graph
 
-The gateway fills the existing `HttpChannelConfig` stub rather than
-running as a detached worker. Doing so keeps the adapter contract
-(`send_response`, `send_stream_delta`, `send_notice`, `approval_gate`)
-honest: any message the LLM emits over the HTTP channel goes through
-the same `ChannelRegistry` dispatch as TUI/telegram/discord, and the
-router picks the outgoing adapter by `message.channel`
-(`crates/agent/src/router.rs:417`). Mis-tagging the channel would route
-responses to the wrong adapter, which is why `POST
-/v1/sessions/:id/messages` always rebuilds the `User` with
-`ChannelType::Http` before submission.
+Splitting the gateway isolates blast radius: a leaked admin bearer
+token cannot read chat content or message sessions, and a sidecar
+channel plugin running as a child of the gateway has no admin surface
+to hit even if compromised. Both listeners share the same manager
+graph (`SessionManager`, `JobManager`, …) and the same
+`HttpAdapter` — routing and observability stay uniform. The adapter
+contract (`send_response`, `send_stream_delta`, `send_notice`,
+`approval_gate`) goes through `ChannelRegistry` dispatch exactly as
+TUI/telegram/discord do; `POST /v1/sessions/:id/messages` rebuilds the
+`User` with `ChannelType::Http` before submission so outgoing events
+route back through the same channel.
 
-### Dynamic per-install token, stored in `SecretVault`
+### Admin token, stored in `SecretVault`
 
-There is no shared-secret or config-file token. On `aura gateway enable`,
-`GatewayToken::mint_if_absent` either reads the current token or
-generates a fresh 32-byte random value (hex-encoded) and writes it under
-the vault key `gateway.auth_token` — the same AES-256-GCM store the rest
-of Aura uses. `token show` reads, `token rotate` overwrites. `uninstall`
-removes the service unit but leaves the token in the vault, so re-
-installing on the same workspace keeps working; `token rotate` is the
-explicit way to invalidate a leaked token. Because the vault requires
-the master encryption key,
-the token's confidentiality rides on the same root secret as every other
-credential in the project.
+On `aura gateway enable`, `GatewayToken::mint_if_absent` either reads
+the current token or generates a fresh 32-byte random value (hex-
+encoded) and writes it under the vault key `gateway.admin_token` — the
+same AES-256-GCM store the rest of Aura uses. Vault loads also accept
+the legacy `gateway.auth_token` key for backwards compatibility with
+installs that pre-date the listener split. `token show` reads,
+`token rotate` overwrites. `uninstall` removes the service unit but
+leaves the token in the vault; `token rotate` is the explicit way to
+invalidate a leaked token. Because the vault requires the master
+encryption key, the token's confidentiality rides on the same root
+secret as every other credential in the project.
 
-### Constant-time compare, URI sanitisation before tracing
+### Channel auth — peer-cred + PSK / subprocess token
 
-The auth middleware (`crates/gateway/src/auth.rs`) accepts
-`Authorization: Bearer <token>` first and falls back to `?token=<token>`
-for embedded links (SSE streams opened from a browser, quick-copy
-`curl`s). Comparisons run through a small explicit `constant_time_eq`
-helper — no `subtle` dependency, but the loop never short-circuits on
-mismatch length. After a successful compare, the middleware **strips
-`?token=` from the request URI in place** so `tower_http::trace::TraceLayer`
-never sees the token in structured logs. `/healthz` and `/readyz` skip
-the middleware entirely.
+The channel listener enforces two stacked checks on every request:
+
+1. **SO_PEERCRED** (Linux) / `getpeereid` (macOS) extracts the peer
+   `(uid, pid)` on accept. Requests from a uid other than
+   `geteuid()` are rejected before middleware runs.
+2. **Header auth** — exactly one of:
+   - `x-aura-tui-secret: <hex>` matching the effective TUI PSK (see
+     below). Used by `aura tui`.
+   - `x-aura-channel-token: <hex>` matching an entry in the in-memory
+     `ChannelTokenTable`, provided the connecting peer's pid matches
+     the pid recorded when the token was minted. Used by subprocess
+     channel plugins spawned via `ChannelSpawner`.
+
+The TUI PSK lives in `aura-gateway-auth` as a 32-byte value generated
+at build time (`build.rs` writes `$OUT_DIR/tui_psk.bin`) plus an
+optional per-install salt: on first start the gateway writes 32 random
+bytes to `{workspace_identity_dir}/tui_psk.salt` (mode 0600) and
+derives the effective PSK via `HKDF-SHA256(EMBEDDED_PSK, salt)`. TUI
+reads the same salt file. Two users running the same release binary
+end up with different effective PSKs.
+
+#### TUI PSK threat model — what it is and isn't
+
+The effective TUI PSK is a **workspace-binding token**, *not* a defence
+against a same-UID hostile process. Being explicit about the boundary:
+
+*Designed to reject*
+- connections from a different Unix user (already covered by UDS
+  `0o600` perms + `SO_PEERCRED`; the PSK is the belt on top of those
+  suspenders);
+- cross-workspace mix-ups — a TUI built against workspace A cannot
+  authenticate to a gateway in workspace B because the per-install
+  salt diverges;
+- stale reconnects from an older build / a different on-disk install
+  (different embedded PSK bytes).
+
+*Not designed to defend against*
+- a malicious process running as the same UID as the gateway. Such a
+  process can read the salt file and the installed binary, recompute
+  the effective PSK, and present it. Treat "same-UID local adversary"
+  as out of scope for this mechanism.
+
+The practical tools for the same-UID threat are file permissions on
+the binary + salt file, service-manager sandboxing, and OS-level
+isolation (seccomp, sandbox-exec, etc.) — not an application-layer
+PSK.
+
+Per-subprocess tokens are minted by `ChannelSpawner::spawn` before
+`Command::spawn`, inserted into `ChannelTokenTable` keyed by the hash
+of the token plus the child pid, and removed in the `ChildHandle`
+`Drop`. Pid reuse is bounded by the child's lifetime. The same
+threat-model caveat applies: a same-UID process can read
+`/proc/<pid>/environ` on Linux and lift the token, so subprocess
+tokens are also workspace/lifetime binding, not hostile-process
+resistance.
+
+All header compares are constant-time via `subtle::ConstantTimeEq`.
+`/healthz` and `/readyz` skip auth on both listeners.
+
+### Admin auth — bearer token, URI sanitisation before tracing
+
+`auth_admin::require_admin_token` accepts `Authorization: Bearer
+<token>` first and falls back to `?token=<token>` for embedded links
+(SSE streams opened from a browser, quick-copy `curl`s). Comparisons
+run through `constant_time_eq`. After a successful compare the
+middleware strips `?token=` from the request URI in place so
+`tower_http::trace::TraceLayer` never sees the token in structured
+logs.
 
 ### `LeakDetector` rule is attached at construction, not at mint
 
 `LeakDetector::add_rule` takes `&mut self`; the detector is shared as
 `Arc<LeakDetector>` across every manager once the runtime is wired, so
 there is no way to register a new redaction rule after construction.
-The workable option is to **read the vault-stored token in
+The workable option is to **read the vault-stored admin token in
 `runtime::build_managers` before the detector is built** and add it as a
-rule on the fresh detector. If the vault has not been seeded yet (first
-`start` before `enable`), the runtime fails fast with a message telling
-the user to run `aura gateway enable` first. This means `enable` needs
-the full storage init path (open `Store`, open `SecretVault`), not just
-a one-shot file write.
+rule on the fresh detector, then also register the effective TUI PSK and
+any active channel tokens after `ChannelTokenTable` is created. If the
+vault has not been seeded yet (first `start` before `enable`), the
+runtime fails fast with a message telling the user to run
+`aura gateway enable` first. This means `enable` needs the full storage
+init path (open `Store`, open `SecretVault`), not just a one-shot file
+write.
 
 ### Adapter owns SSE fan-out
 
@@ -125,10 +196,10 @@ more than the line count saved.
 ### Platform installers behind Cargo features
 
 ```
-default = ["linux", "macos"]
-linux        = []   # systemd installer — renders ~/.config/systemd/user/aura-gateway.service
-macos        = []   # launchd installer — renders ~/Library/LaunchAgents/com.aura.gateway.plist
-test-support = []   # cross-crate test helpers (CLAUDE.md gating rule)
+default      = ["linux", "macos"]
+linux        = []              # systemd installer — renders ~/.config/systemd/user/aura-gateway.service
+macos        = []              # launchd installer — renders ~/Library/LaunchAgents/com.aura.gateway.plist
+test-support = ["dep:tempfile"] # cross-crate test helpers (CLAUDE.md gating rule)
 ```
 
 One feature per OS. Any future OS-specific gateway code (beyond the
@@ -204,8 +275,11 @@ runtime extraction tracked in the follow-up todo
 
 ## HTTP API
 
-Mounted under `/v1`. Every authenticated route goes through
-`require_token` middleware.
+Routes are split between the two listeners. `/healthz` and `/readyz`
+live on both; every other authenticated route goes through the
+listener-specific auth middleware.
+
+**Admin listener (TCP, bearer token)** — `auth_admin::require_admin_token`:
 
 ```
 GET    /healthz                         liveness (no auth)
@@ -214,15 +288,6 @@ GET    /v1/status                       aura status mirror
 GET    /v1/config                       redacted config snapshot (read-only)
 PUT    /v1/config                       { path, value } → 200 { path, written_to, requires_restart }
 DELETE /v1/config                       { path } → 200 { path, written_to, requires_restart }
-
-GET    /v1/sessions
-POST   /v1/sessions                     { user_id?, name? }
-GET    /v1/sessions/:id
-DELETE /v1/sessions/:id                 soft-delete
-GET    /v1/sessions/:id/messages        history
-
-POST   /v1/sessions/:id/messages        { text } → 202 { message_id }
-GET    /v1/sessions/:id/stream          SSE: delta | response | notice | end
 
 GET    /v1/jobs                         ?status=pending|in_progress|completed|failed|stuck
 GET    /v1/jobs/:id
@@ -241,13 +306,34 @@ GET    /v1/traces/:session_id
 
 GET    /v1/skills
 GET    /v1/tools
-GET    /v1/channels
+GET    /v1/channels                     read-only registry list
 GET    /v1/llm
+```
+
+**Channel listener (UDS, peer-cred + PSK/token)** —
+`auth_channel::require_channel_client`:
+
+```
+GET    /healthz                         liveness (no auth)
+GET    /readyz                          managers ready (no auth)
+
+GET    /v1/sessions
+POST   /v1/sessions                     { user_id?, name? }
+GET    /v1/sessions/:id
+DELETE /v1/sessions/:id                 soft-delete
+GET    /v1/sessions/:id/messages        history
+
+POST   /v1/sessions/:id/messages        { text } → 202 { message_id }
+GET    /v1/sessions/:id/stream          SSE: delta | response | notice | end
 
 GET    /v1/approvals                    list pending approvals
 POST   /v1/approvals/:call_id           { decision: "approve" | "deny" } → 200 { call_id, decision }
 GET    /v1/approvals/stream             SSE: added | resolved | end
 ```
+
+Hitting a channel route on the admin listener returns `404` — the route
+is not mounted there at all, so a leaked admin token yields nothing. The
+`admin_has_no_channels` integration test enforces this.
 
 ### SSE event schema
 
@@ -315,11 +401,14 @@ pub async fn build_secret_vault(config: &AuraConfig) -> Result<Arc<SecretVault>>
 ```
 
 `gateway_cmd::start` is now the **only** caller of `build_managers` +
-`wire_router` — the TUI talks to the gateway over HTTP and holds no
+`wire_router` — the TUI talks to the gateway over UDS and holds no
 manager graph of its own. The gateway registers the `HttpAdapter` into
 `graph.channels_registry`, builds a `GatewayServer` from
-`GatewayDeps`, and drives the axum server in parallel with the router
-via `tokio::select!` on `shutdown.wait`.
+`GatewayDeps`, binds both the admin `TcpListener` and the channel
+`UnixListener`, and drives them in parallel with the router via
+`tokio::select!` on `shutdown.wait`. The channel UDS is `chmod 0o600`
+after bind and unlinked on shutdown (plus a `Drop` guard covers panic
+exits).
 
 `build_secret_vault` is a narrow helper that only opens the libsql
 store far enough to construct a `SecretVault`. The TUI's remote boot
@@ -329,20 +418,29 @@ subcommands use it for the same reason.
 
 ## Security and Observability
 
-- **Token never logged unredacted.** Two layers: (a) the `LeakDetector`
-  rule registered at detector construction redacts any log line that
-  happens to echo the token; (b) the auth middleware strips `?token=`
-  from the URI before the `TraceLayer` span is emitted.
+- **Secrets never logged unredacted.** Three layers: (a) `LeakDetector`
+  rules registered at detector construction redact any log line that
+  echoes the admin token, the effective TUI PSK, or an active channel
+  token; (b) the admin auth middleware strips `?token=` from the URI
+  before the `TraceLayer` span is emitted; (c) the channel auth
+  middleware never echoes header values.
+- **UDS is same-UID only.** The socket is `srw-------` (0o600) and
+  `SO_PEERCRED` rejects non-matching uids before any header is looked
+  at. A process running as a different local user cannot connect even
+  with a valid PSK. The PSK layer above is a *workspace binding*, not a
+  defence against same-UID hostile processes — see the PSK threat
+  model note under "Channel auth" for the boundary.
 - **All gateway logs pass through `RedactingMakeWriter`** — the same
   writer wrapper the TUI uses (`src/logging.rs`). `AURA_LOG_FORMAT=json`
-  is honoured.
+  is honoured. Request spans carry a `listener` field (`admin` /
+  `channel`) so the origin of each request is obvious in logs.
 - **Every mutation goes through a manager.** Route handlers call
   `SessionManager`, `JobManager`, `CronScheduler`, `MemoryManager` and
   friends directly; there are no side-channel writes that bypass
   Trace/Job observability.
 - **Singleton lock applies only to the gateway.** `start` acquires
-  the per-workspace lock on `<workspace>/aura.lock`. `aura tui` is an
-  HTTP+SSE client (see [`tui.md`](./tui.md)) and **does not** take
+  the per-workspace lock on `<workspace>/aura.lock`. `aura tui` is a
+  UDS+SSE client (see [`tui.md`](./tui.md)) and **does not** take
   the lock, so one long-lived `aura gateway` can serve many
   concurrent TUI sessions in the same workspace.
 
@@ -352,24 +450,39 @@ subcommands use it for the same reason.
 crates/gateway/
 ├── Cargo.toml               # features above, all deps via workspace = true
 ├── src/
-│   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, GatewayToken, …
-│   ├── config.rs            # RuntimeGatewayConfig (resolves SocketAddr + shutdown grace)
-│   ├── server.rs            # GatewayDeps, ApiState, GatewayServer
+│   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, ChannelServer, …
+│   ├── config.rs            # RuntimeGatewayConfig (admin bind + channel socket path + shutdown grace)
+│   ├── server.rs            # GatewayDeps, AdminState, GatewayServer (admin TCP)
+│   ├── uds.rs               # cfg(unix) ChannelServer (channel UDS + accept loop)
+│   ├── spawn.rs             # cfg(unix) ChannelSpawner — spawn a subprocess client with a channel token
 │   ├── http_adapter.rs      # HttpAdapter : ChannelAdapter + SseEvent
-│   ├── auth.rs              # GatewayToken, AuthState, require_token, constant_time_eq
+│   ├── auth_admin.rs        # AdminAuthState, require_admin_token
+│   ├── auth_channel.rs      # ChannelAuthState, require_channel_client (peer-cred + PSK/token)
 │   ├── error.rs             # GatewayError : IntoResponse
+│   ├── test_support.rs      # cfg(test-support) build_test_deps + TestGateway
 │   ├── api/
-│   │   ├── mod.rs           # v1_router()
-│   │   ├── dto.rs           # request/response DTOs
-│   │   ├── {sessions,messages,jobs,cron,memory,traces,skills,tools,channels,llm,config,status,health}.rs
+│   │   ├── mod.rs           # health::routes()
+│   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
+│   │   ├── admin/           # mod.rs exposes v1_router() mounted on the admin TCP listener
+│   │   │   └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm,dto}.rs
+│   │   └── channel/         # mod.rs exposes v1_router() mounted on the channel UDS listener
+│   │       └── {sessions,messages,approvals,dto}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start
 │       ├── systemd.rs       # cfg(all(target_os = "linux",  feature = "linux"))
 │       └── launchd.rs       # cfg(all(target_os = "macos",  feature = "macos"))
 └── tests/
-    └── …                    # router assembly, auth middleware, SSE fan-out, installer snapshots
+    ├── auth.rs              # admin bearer auth
+    ├── sse.rs               # HttpAdapter fan-out
+    ├── admin_has_no_channels.rs  # /v1/sessions et al. are 404 on admin
+    └── uds.rs               # full UDS round-trip via hyper client
 ```
+
+The companion crate `aura-gateway-auth` exposes the PSK material, the
+channel header constants (`TUI_PSK_HEADER`, `CHANNEL_TOKEN_HEADER`), and
+the `ChannelTokenTable` type shared by both the gateway and the TUI
+client.
 
 ## Collaboration
 
@@ -379,20 +492,27 @@ crates/gateway/
 - **channels** — the `ChannelAdapter`, `Message`, `IncomingMessage`,
   `OutgoingMessage`, `NoticeLevel`, and `ChannelRegistry` types the
   `HttpAdapter` implements and the POST route constructs.
-- **security** — `SecretVault` for token persistence; `LeakDetector` for
-  log redaction; `SecurityGateway` for the outgoing reveal path when
-  outbound handlers materialise credentials. The token is registered as
-  a `LeakDetector` rule at detector-construction time.
-- **config** — `AuraConfig::gateway` (new) drives bind address, port,
-  CORS origins, and shutdown grace.
+- **gateway-auth** — embeds the build-time PSK, defines the
+  `ChannelTokenTable` + `ClientIdentity` types, and owns the channel
+  header constants. Shared between the gateway server and the TUI
+  client so both agree on the wire protocol.
+- **security** — `SecretVault` for admin-token persistence;
+  `LeakDetector` for log redaction; `SecurityGateway` for the outgoing
+  reveal path. The admin token, effective TUI PSK, and live channel
+  tokens are all registered as `LeakDetector` rules at detector-
+  construction time.
+- **config** — `AuraConfig::gateway` drives admin bind address, channel
+  socket path, CORS origins, and shutdown grace.
 - **storage** — `Store::open` for vault bootstrap in `gateway_cmd`; the
   `TraceStore` trait behind `/v1/traces/:session_id`.
+- **tui** — the TUI's `GatewayClient` connects over the channel UDS
+  using the effective PSK; admin endpoints are not reached from the TUI.
 - **cli** — `Commands::Gateway { cmd: GatewayCmd }` is defined in
   `crates/cli/src/cli.rs`; the dispatcher explicitly returns
   `UnknownCommand` because `src/main.rs` intercepts the variant before
   it reaches dispatch.
 - **bootstrap** — `src/main.rs` intercepts `Commands::Gateway` and calls
-  `gateway_cmd::run`; the long-running `start` path is pending the
-  `runtime::` module extraction.
+  `gateway_cmd::run`; the long-running `start` path spins up both
+  listeners against the same manager graph.
 
 [`aura_channels::ChannelAdapter`]: ./channels.md

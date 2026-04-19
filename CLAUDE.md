@@ -54,6 +54,10 @@ corpora live under `crates/security/fuzz/corpus/<target>/`.
   - Consumed by another crate's tests → gate with `#[cfg(any(test, feature = "test-support"))]` and add a `test-support = []` feature in `Cargo.toml`. Downstream crates pull them in via `aura-<crate> = { workspace = true, features = ["test-support"] }` in `[dev-dependencies]`.
   - Never leave a test-only item plain `pub` — "it's named `Never...`" is not a gate.
 
+## Platform Support
+
+Aura targets **Unix only** (Linux and macOS — see `default = ["linux", "macos"]` in `crates/gateway/Cargo.toml`). Don't write `#[cfg(unix)]` / `#[cfg(not(unix))]` branches or stub shims for Windows. Call `libc::getuid`, `std::os::unix::fs::PermissionsExt`, `tokio::net::UnixStream`, etc. directly. A non-Unix build failing is intentional.
+
 ## Dependency Management
 
 - All dependency versions are managed centrally in the root `Cargo.toml` under `[workspace.dependencies]`.

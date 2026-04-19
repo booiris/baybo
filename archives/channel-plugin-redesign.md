@@ -1,5 +1,28 @@
 # Channel Plugin Redesign — Sidecar Model
 
+## Status update (2026-04-19)
+
+The transport prerequisites for this design have landed. The gateway now
+runs a second listener — a Unix domain socket authenticated with
+peer-cred + per-subprocess token (`x-aura-channel-token`) — and ships a
+`ChannelSpawner` helper in `crates/gateway/src/spawn.rs` that mints a
+token, pins it to the child pid in `ChannelTokenTable`, and hands the
+socket path + token to the child via `AURA_CHANNEL_SOCKET` /
+`AURA_CHANNEL_TOKEN` env vars. `ChildHandle::Drop` removes the token
+from the table, so token lifetime is bounded by child lifetime. The
+adjacent `admin` listener stays TCP+bearer for operator routes and
+serves no channel functionality.
+
+What's left is the plugin layer on top of that transport: the
+`RemoteChannelProxy : ChannelAdapter`, a `PluginManager` that reads
+manifests and registers proxies, and the `Supervisor` that shells out to
+`ChannelSpawner::spawn`. Sections below that describe a WebSocket-based
+RPC are superseded by "forward calls over the existing channel HTTP+SSE
+surface" — plugins are already the canonical clients of that surface, so
+adding a separate WebSocket channel is redundant. Treat this doc as
+background motivation plus the manifest/CLI surface that is still valid;
+the transport sections are historical.
+
 ## Problem
 
 The current `ChannelAdapter` trait was designed for compile-time-linked
