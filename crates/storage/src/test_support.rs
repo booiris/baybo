@@ -6,35 +6,18 @@
 //! sibling modules) so changing the trait forces an update.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use async_trait::async_trait;
-use aura_job::{Job, JobError, JobStatus, JobTransition};
+use aura_job::{Job, JobStatus, JobTransition};
 use aura_model::MemoryEntry;
-use aura_trace::{SessionTrace, TraceError, TraceFilter, TraceNode, TraceNodeId};
+use aura_trace::{SessionTrace, TraceFilter, TraceNode, TraceNodeId};
+use parking_lot::Mutex;
 
-use crate::cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
-use crate::error::StorageError;
+use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 use crate::job::{JobStore, Result as JobStoreResult};
 use crate::memory::{MemoryStore, Result as MemoryStoreResult};
 use crate::secret::{Result as SecretResult, SecretStore};
 use crate::trace::{Result as TraceStoreResult, TraceStore};
-
-fn poison<E: std::fmt::Display>(e: E) -> StorageError {
-    StorageError::Storage(format!("mutex poisoned: {e}"))
-}
-
-fn job_poison<E: std::fmt::Display>(e: E) -> JobError {
-    JobError::Storage(format!("mutex poisoned: {e}"))
-}
-
-fn cost_poison<E: std::fmt::Display>(e: E) -> CostError {
-    CostError::Storage(format!("mutex poisoned: {e}"))
-}
-
-fn trace_poison<E: std::fmt::Display>(e: E) -> TraceError {
-    TraceError::Storage(format!("mutex poisoned: {e}"))
-}
 
 /// In-memory `SecretStore` for tests. Stores raw `(name, encrypted_value)`
 /// pairs in a `Mutex<HashMap>`. No encryption performed here — the bytes
@@ -53,7 +36,7 @@ impl MemorySecretStore {
     /// Number of live entries. Useful for asserting deterministic-mint
     /// invariants ("same secret minted twice → vault holds one entry").
     pub fn len(&self) -> usize {
-        self.data.lock().map(|m| m.len()).unwrap_or(0)
+        self.data.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -66,17 +49,16 @@ impl SecretStore for MemorySecretStore {
     async fn store(&self, name: &str, encrypted_value: &[u8]) -> SecretResult<()> {
         self.data
             .lock()
-            .map_err(poison)?
             .insert(name.to_owned(), encrypted_value.to_vec());
         Ok(())
     }
 
     async fn retrieve(&self, name: &str) -> SecretResult<Option<Vec<u8>>> {
-        Ok(self.data.lock().map_err(poison)?.get(name).cloned())
+        Ok(self.data.lock().get(name).cloned())
     }
 
     async fn list(&self) -> SecretResult<Vec<String>> {
-        Ok(self.data.lock().map_err(poison)?.keys().cloned().collect())
+        Ok(self.data.lock().keys().cloned().collect())
     }
 }
 
@@ -94,7 +76,7 @@ impl MemoryJobStore {
     }
 
     pub fn len(&self) -> usize {
-        self.jobs.lock().map(|m| m.len()).unwrap_or(0)
+        self.jobs.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -105,22 +87,16 @@ impl MemoryJobStore {
 #[async_trait]
 impl JobStore for MemoryJobStore {
     async fn create(&self, job: &Job) -> JobStoreResult<()> {
-        self.jobs
-            .lock()
-            .map_err(job_poison)?
-            .insert(job.id.clone(), job.clone());
+        self.jobs.lock().insert(job.id.clone(), job.clone());
         Ok(())
     }
 
     async fn get(&self, job_id: &str) -> JobStoreResult<Option<Job>> {
-        Ok(self.jobs.lock().map_err(job_poison)?.get(job_id).cloned())
+        Ok(self.jobs.lock().get(job_id).cloned())
     }
 
     async fn save(&self, job: &Job) -> JobStoreResult<()> {
-        self.jobs
-            .lock()
-            .map_err(job_poison)?
-            .insert(job.id.clone(), job.clone());
+        self.jobs.lock().insert(job.id.clone(), job.clone());
         Ok(())
     }
 
@@ -128,7 +104,6 @@ impl JobStore for MemoryJobStore {
         Ok(self
             .jobs
             .lock()
-            .map_err(job_poison)?
             .values()
             .filter(|j| j.session_id == session_id)
             .cloned()
@@ -139,7 +114,6 @@ impl JobStore for MemoryJobStore {
         Ok(self
             .jobs
             .lock()
-            .map_err(job_poison)?
             .values()
             .filter(|j| j.status == status)
             .cloned()
@@ -150,7 +124,6 @@ impl JobStore for MemoryJobStore {
         Ok(self
             .jobs
             .lock()
-            .map_err(job_poison)?
             .values()
             .filter(|j| j.parent_job_id.as_deref() == Some(parent_job_id))
             .cloned()
@@ -158,19 +131,12 @@ impl JobStore for MemoryJobStore {
     }
 
     async fn list_all(&self) -> JobStoreResult<Vec<Job>> {
-        Ok(self
-            .jobs
-            .lock()
-            .map_err(job_poison)?
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.jobs.lock().values().cloned().collect())
     }
 
     async fn record_transition(&self, transition: &JobTransition) -> JobStoreResult<()> {
         self.transitions
             .lock()
-            .map_err(job_poison)?
             .entry(transition.job_id.clone())
             .or_default()
             .push(transition.clone());
@@ -181,7 +147,6 @@ impl JobStore for MemoryJobStore {
         Ok(self
             .transitions
             .lock()
-            .map_err(job_poison)?
             .get(job_id)
             .cloned()
             .unwrap_or_default())
@@ -201,7 +166,7 @@ impl MemoryCostStore {
     }
 
     pub fn len(&self) -> usize {
-        self.records.lock().map(|v| v.len()).unwrap_or(0)
+        self.records.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -216,10 +181,7 @@ fn in_range(record: &CostRecord, range: &TimeRange) -> bool {
 #[async_trait]
 impl CostStore for MemoryCostStore {
     async fn record(&self, record: &CostRecord) -> CostResult<()> {
-        self.records
-            .lock()
-            .map_err(cost_poison)?
-            .push(record.clone());
+        self.records.lock().push(record.clone());
         Ok(())
     }
 
@@ -227,7 +189,6 @@ impl CostStore for MemoryCostStore {
         Ok(self
             .records
             .lock()
-            .map_err(cost_poison)?
             .iter()
             .filter(|r| r.user_id == user_id && in_range(r, &range))
             .cloned()
@@ -236,13 +197,7 @@ impl CostStore for MemoryCostStore {
 
     async fn query_global(&self, range: TimeRange) -> CostResult<CostSummary> {
         let mut summary = CostSummary::default();
-        for r in self
-            .records
-            .lock()
-            .map_err(cost_poison)?
-            .iter()
-            .filter(|r| in_range(r, &range))
-        {
+        for r in self.records.lock().iter().filter(|r| in_range(r, &range)) {
             summary.total_cost_usd += r.cost_usd;
             summary.total_input_tokens += r.input_tokens;
             summary.total_output_tokens += r.output_tokens;
@@ -255,7 +210,6 @@ impl CostStore for MemoryCostStore {
         Ok(self
             .records
             .lock()
-            .map_err(cost_poison)?
             .iter()
             .filter(|r| r.user_id == user_id && in_range(r, &range))
             .map(|r| r.cost_usd)
@@ -277,7 +231,7 @@ impl MemoryTraceStore {
     }
 
     pub fn len(&self) -> usize {
-        self.traces.lock().map(|m| m.len()).unwrap_or(0)
+        self.traces.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -290,22 +244,16 @@ impl TraceStore for MemoryTraceStore {
     async fn save_trace(&self, trace: &SessionTrace) -> TraceStoreResult<()> {
         self.traces
             .lock()
-            .map_err(trace_poison)?
             .insert(trace.session_id.clone(), trace.clone());
         Ok(())
     }
 
     async fn load_trace(&self, session_id: &str) -> TraceStoreResult<Option<SessionTrace>> {
-        Ok(self
-            .traces
-            .lock()
-            .map_err(trace_poison)?
-            .get(session_id)
-            .cloned())
+        Ok(self.traces.lock().get(session_id).cloned())
     }
 
     async fn query_traces(&self, filter: TraceFilter) -> TraceStoreResult<Vec<SessionTrace>> {
-        let traces = self.traces.lock().map_err(trace_poison)?;
+        let traces = self.traces.lock();
         Ok(traces
             .values()
             .filter(|t| {
@@ -326,7 +274,6 @@ impl TraceStore for MemoryTraceStore {
         Ok(self
             .traces
             .lock()
-            .map_err(trace_poison)?
             .get(session_id)
             .and_then(|t| t.nodes.get(node_id).cloned()))
     }
@@ -346,7 +293,7 @@ impl MemoryMemoryStore {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().map(|m| m.len()).unwrap_or(0)
+        self.entries.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -357,10 +304,7 @@ impl MemoryMemoryStore {
 #[async_trait]
 impl MemoryStore for MemoryMemoryStore {
     async fn store(&self, entry: &MemoryEntry) -> MemoryStoreResult<()> {
-        self.entries
-            .lock()
-            .map_err(poison)?
-            .insert(entry.id.clone(), entry.clone());
+        self.entries.lock().insert(entry.id.clone(), entry.clone());
         Ok(())
     }
 
@@ -368,7 +312,6 @@ impl MemoryStore for MemoryMemoryStore {
         Ok(self
             .entries
             .lock()
-            .map_err(poison)?
             .values()
             .find(|e| e.user_id == user_id && e.id == key)
             .cloned())
@@ -384,7 +327,6 @@ impl MemoryStore for MemoryMemoryStore {
         Ok(self
             .entries
             .lock()
-            .map_err(poison)?
             .values()
             .filter(|e| e.user_id == user_id && e.content.to_ascii_lowercase().contains(&q))
             .take(limit)
@@ -393,7 +335,7 @@ impl MemoryStore for MemoryMemoryStore {
     }
 
     async fn delete(&self, id: &str) -> MemoryStoreResult<()> {
-        self.entries.lock().map_err(poison)?.remove(id);
+        self.entries.lock().remove(id);
         Ok(())
     }
 
@@ -401,7 +343,6 @@ impl MemoryStore for MemoryMemoryStore {
         Ok(self
             .entries
             .lock()
-            .map_err(poison)?
             .values()
             .filter(|e| e.user_id == user_id)
             .cloned()
@@ -409,16 +350,10 @@ impl MemoryStore for MemoryMemoryStore {
     }
 
     async fn list_all(&self) -> MemoryStoreResult<Vec<MemoryEntry>> {
-        Ok(self
-            .entries
-            .lock()
-            .map_err(poison)?
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.entries.lock().values().cloned().collect())
     }
 
     async fn get_by_id(&self, id: &str) -> MemoryStoreResult<Option<MemoryEntry>> {
-        Ok(self.entries.lock().map_err(poison)?.get(id).cloned())
+        Ok(self.entries.lock().get(id).cloned())
     }
 }

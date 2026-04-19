@@ -7,10 +7,11 @@
 //! actually handed to the tool (critical for tool-arg reveal/sanitize
 //! boundary tests).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_model::TrustLevel;
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext, ToolManifest, ToolOutput};
@@ -79,17 +80,12 @@ impl RecordingTool {
     /// Override what the next (and any subsequent) `execute()` call
     /// returns. Idempotent — keeps the latest setting.
     pub fn set_response(&self, output: ToolOutput) {
-        if let Ok(mut r) = self.response.lock() {
-            *r = output;
-        }
+        *self.response.lock() = output;
     }
 
     /// All `params` values seen so far, in arrival order.
     pub fn invocations(&self) -> Vec<Value> {
-        self.invocations
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default()
+        self.invocations.lock().to_vec()
     }
 
     pub fn manifest(&self) -> ToolManifest {
@@ -115,14 +111,8 @@ impl Tool for RecordingTool {
         json!({"type": "object", "additionalProperties": true})
     }
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
-        if let Ok(mut v) = self.invocations.lock() {
-            v.push(params);
-        }
-        Ok(self
-            .response
-            .lock()
-            .map(|r| r.clone())
-            .unwrap_or_else(|_| ToolOutput::Text(String::new())))
+        self.invocations.lock().push(params);
+        Ok(self.response.lock().clone())
     }
 }
 

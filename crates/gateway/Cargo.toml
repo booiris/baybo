@@ -33,6 +33,8 @@ aura-tools = { workspace = true }
 aura-trace = { workspace = true }
 aura-workspace = { workspace = true }
 
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }

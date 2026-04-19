@@ -68,8 +68,7 @@ pub async fn handle(ctx: &CommandContext) -> Result<CommandOutput> {
     }
 
     // 4. At least one channel registered.
-    let channels = ctx.channels.read().await;
-    if channels.is_empty() {
+    if ctx.channels.is_empty() {
         rows.push(row(
             "channels.registered",
             CheckStatus::Warn,
@@ -80,10 +79,9 @@ pub async fn handle(ctx: &CommandContext) -> Result<CommandOutput> {
         rows.push(row(
             "channels.registered",
             CheckStatus::Ok,
-            format!("{} channel(s) registered", channels.len()),
+            format!("{} channel(s) registered", ctx.channels.len()),
         ));
     }
-    drop(channels);
 
     let value = json!({
         "status": worst.as_str(),

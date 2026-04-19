@@ -122,9 +122,7 @@ async fn main() -> anyhow::Result<()> {
     let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
         workspace_root.clone(),
     ));
-    let channels_registry = Arc::new(tokio::sync::RwLock::new(
-        aura_channels::ChannelRegistry::new(),
-    ));
+    let channels_registry = Arc::new(aura_channels::ChannelRegistry::new());
     let llm_client = match boot::build_llm_client(&config.llm) {
         Ok(c) => Some(Arc::new(c)),
         Err(e) => {

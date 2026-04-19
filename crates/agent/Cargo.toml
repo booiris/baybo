@@ -19,6 +19,7 @@ aura-security = { workspace = true }
 aura-storage = { workspace = true }
 aura-hook = { workspace = true }
 aura-channels = { workspace = true }
+parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }

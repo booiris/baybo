@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -27,7 +27,7 @@ pub struct SkillCandidate {
 /// layers, and `reload()` needs to rewrite state without demanding a
 /// `RwLock<SkillRegistry>` wrapping at every call site.
 pub struct SkillRegistry {
-    skills: RwLock<HashMap<String, SkillDefinition>>,
+    skills: DashMap<String, SkillDefinition>,
     /// Directories passed to `load_dir`, in first-seen order, so `reload`
     /// can replay the same scans without callers tracking paths.
     load_dirs: RwLock<Vec<PathBuf>>,
@@ -42,7 +42,7 @@ impl Default for SkillRegistry {
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
-            skills: RwLock::new(HashMap::new()),
+            skills: DashMap::new(),
             load_dirs: RwLock::new(Vec::new()),
         }
     }
@@ -51,9 +51,7 @@ impl SkillRegistry {
     /// same name.
     pub fn register(&self, skill: SkillDefinition) {
         debug!(name = %skill.name, "registering skill");
-        if let Ok(mut map) = self.skills.write() {
-            map.insert(skill.name.clone(), skill);
-        }
+        self.skills.insert(skill.name.clone(), skill);
     }
 
     /// Load every `<dir>/<name>/SKILL.md` under `dir` (one directory per
@@ -67,10 +65,11 @@ impl SkillRegistry {
     ///
     /// The directory is remembered so `reload` can replay the scan.
     pub fn load_dir(&self, dir: &Path) -> usize {
-        if let Ok(mut dirs) = self.load_dirs.write()
-            && !dirs.iter().any(|d| d == dir)
         {
-            dirs.push(dir.to_path_buf());
+            let mut dirs = self.load_dirs.write();
+            if !dirs.iter().any(|d| d == dir) {
+                dirs.push(dir.to_path_buf());
+            }
         }
         self.scan_dir(dir)
     }
@@ -118,41 +117,32 @@ impl SkillRegistry {
     /// Skills registered programmatically (not via `load_dir`) are cleared
     /// as well — reload is "authoritative disk state wins."
     pub fn reload(&self) -> usize {
-        let dirs: Vec<PathBuf> = self.load_dirs.read().map(|g| g.clone()).unwrap_or_default();
-        if let Ok(mut map) = self.skills.write() {
-            map.clear();
-        }
+        let dirs: Vec<PathBuf> = self.load_dirs.read().clone();
+        self.skills.clear();
         for dir in &dirs {
             self.scan_dir(dir);
         }
-        self.skills.read().map(|m| m.len()).unwrap_or(0)
+        self.skills.len()
     }
 
     /// Remove a skill by name.
     pub fn remove(&self, name: &str) -> Option<SkillDefinition> {
-        self.skills.write().ok().and_then(|mut m| m.remove(name))
+        self.skills.remove(name).map(|(_, v)| v)
     }
 
     /// Look up a skill by name, returning a cloned definition.
     pub fn get(&self, name: &str) -> Option<SkillDefinition> {
-        self.skills.read().ok().and_then(|m| m.get(name).cloned())
+        self.skills.get(name).map(|e| e.value().clone())
     }
 
     /// List all registered skill names.
     pub fn list(&self) -> Vec<String> {
-        self.skills
-            .read()
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default()
+        self.skills.iter().map(|e| e.key().clone()).collect()
     }
 
     /// Return every registered skill, sorted by name for stable operator output.
     pub fn all_sorted(&self) -> Vec<SkillDefinition> {
-        let mut out: Vec<SkillDefinition> = self
-            .skills
-            .read()
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default();
+        let mut out: Vec<SkillDefinition> = self.skills.iter().map(|e| e.value().clone()).collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -161,12 +151,11 @@ impl SkillRegistry {
     /// the `/command` string. An empty query matches every skill.
     pub fn search(&self, query: &str) -> Vec<SkillDefinition> {
         let needle = query.trim().to_ascii_lowercase();
-        let Ok(map) = self.skills.read() else {
-            return Vec::new();
-        };
-        let mut hits: Vec<SkillDefinition> = map
-            .values()
-            .filter(|s| {
+        let mut hits: Vec<SkillDefinition> = self
+            .skills
+            .iter()
+            .filter(|e| {
+                let s = e.value();
                 if needle.is_empty() {
                     return true;
                 }
@@ -182,7 +171,7 @@ impl SkillRegistry {
                 }
                 false
             })
-            .cloned()
+            .map(|e| e.value().clone())
             .collect();
         hits.sort_by(|a, b| a.name.cmp(&b.name));
         hits
@@ -197,20 +186,18 @@ impl SkillRegistry {
     /// informational note since the registry has no authoritative list
     /// of "known" models to reject against.
     pub fn validate_all(&self) -> Vec<SkillValidation> {
-        let Ok(map) = self.skills.read() else {
-            return Vec::new();
-        };
-        let mut results: Vec<SkillValidation> = map.values().map(validate_one).collect();
+        let mut results: Vec<SkillValidation> = self
+            .skills
+            .iter()
+            .map(|e| validate_one(e.value()))
+            .collect();
         results.sort_by(|a, b| a.name.cmp(&b.name));
         results
     }
 
     /// Validate a single skill by name.
     pub fn validate(&self, name: &str) -> Option<SkillValidation> {
-        self.skills
-            .read()
-            .ok()
-            .and_then(|m| m.get(name).map(validate_one))
+        self.skills.get(name).map(|e| validate_one(e.value()))
     }
 
     /// Select skills for a given user message.
@@ -229,11 +216,9 @@ impl SkillRegistry {
     /// bias which skill loads next.
     pub fn select(&self, message_text: &str) -> Vec<SkillCandidate> {
         let trimmed = message_text.trim_start();
-        let Ok(map) = self.skills.read() else {
-            return Vec::new();
-        };
         let mut candidates: Vec<SkillCandidate> = Vec::new();
-        for skill in map.values() {
+        for entry in self.skills.iter() {
+            let skill = entry.value();
             let command_hit = skill.command.as_ref().is_some_and(|cmd| {
                 let full = format!("/{cmd}");
                 trimmed == full

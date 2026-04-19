@@ -276,9 +276,7 @@ mod tests {
     use hyper_util::server::conn::auto::Builder as AutoBuilder;
     use serde_json::json;
     use std::convert::Infallible;
-    use std::sync::Arc as StdArc;
     use tokio::net::UnixListener;
-    use tokio::sync::Mutex;
     use tower::Service;
 
     /// Bind a UDS, serve `router`, return (tempdir, socket_path). The
@@ -296,13 +294,11 @@ mod tests {
                 let router = router.clone();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
-                    let svc = StdArc::new(Mutex::new(router));
                     let service = hyper::service::service_fn(
                         move |req: hyper::Request<hyper::body::Incoming>| {
-                            let svc = StdArc::clone(&svc);
+                            let mut router = router.clone();
                             async move {
-                                let mut guard = svc.lock().await;
-                                let resp = guard.call(req).await?;
+                                let resp = router.call(req).await?;
                                 Ok::<_, Infallible>(resp)
                             }
                         },

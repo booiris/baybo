@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,8 +9,10 @@ use aura_model::ChannelType;
 use aura_tools::{
     ApprovalDecision, ApprovalGate, ApprovalQueue, ChannelApprovalGate, ResourceAccess,
 };
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc};
 
 /// How long the approval gate waits for a REST client to `POST
 /// /v1/approvals/:id` before failing closed. Matches the TUI's 5-minute
@@ -86,7 +87,7 @@ pub struct HttpAdapter {
     incoming_tx: RwLock<Option<mpsc::Sender<IncomingMessage>>>,
     /// Per-session broadcast channels. Lazily created on first
     /// [`subscribe`] or first outbound message.
-    sessions: RwLock<HashMap<String, broadcast::Sender<SseEvent>>>,
+    sessions: DashMap<String, broadcast::Sender<SseEvent>>,
     /// Pending tool-approval queue. Fed by [`approval_gate`]'s
     /// [`ChannelApprovalGate`]; drained by the `/v1/approvals` REST
     /// handlers.
@@ -108,7 +109,7 @@ impl HttpAdapter {
         let (approval_stream, _rx) = broadcast::channel(APPROVAL_STREAM_CAPACITY);
         Self {
             incoming_tx: RwLock::new(None),
-            sessions: RwLock::new(HashMap::new()),
+            sessions: DashMap::new(),
             approval_queue: ApprovalQueue::new(),
             approval_stream,
         }
@@ -117,12 +118,12 @@ impl HttpAdapter {
     /// Subscribe to the SSE stream for a session. Creates the broadcast
     /// channel if this is the first subscriber.
     pub async fn subscribe(&self, session_id: &str) -> broadcast::Receiver<SseEvent> {
-        let mut map = self.sessions.write().await;
-        match map.get(session_id) {
-            Some(tx) => tx.subscribe(),
-            None => {
+        use dashmap::mapref::entry::Entry;
+        match self.sessions.entry(session_id.to_owned()) {
+            Entry::Occupied(e) => e.get().subscribe(),
+            Entry::Vacant(e) => {
                 let (tx, rx) = broadcast::channel(BROADCAST_CAPACITY);
-                map.insert(session_id.to_owned(), tx);
+                e.insert(tx);
                 rx
             }
         }
@@ -152,22 +153,22 @@ impl HttpAdapter {
     /// Push an inbound user message into the router. Fails if the
     /// adapter has not been started.
     pub async fn submit(&self, msg: IncomingMessage) -> Result<()> {
-        let guard = self.incoming_tx.read().await;
-        let tx = guard
-            .as_ref()
-            .ok_or_else(|| ChannelError::Config("adapter not started".into()))?;
+        let tx = {
+            let guard = self.incoming_tx.read();
+            guard.clone()
+        };
+        let tx = tx.ok_or_else(|| ChannelError::Config("adapter not started".into()))?;
         tx.send(msg)
             .await
             .map_err(|e| ChannelError::Config(format!("router intake closed: {e}")))
     }
 
-    async fn broadcast(&self, session_id: &str, event: SseEvent) {
-        let map = self.sessions.read().await;
-        if let Some(tx) = map.get(session_id) {
+    fn broadcast(&self, session_id: &str, event: SseEvent) {
+        if let Some(entry) = self.sessions.get(session_id) {
             // `send` errors when there are no subscribers — that's not
             // fatal, and the broadcast channel keeps recent events
             // buffered for the next subscriber.
-            let _ = tx.send(event);
+            let _ = entry.send(event);
         }
     }
 }
@@ -209,15 +210,14 @@ impl ChannelAdapter for HttpAdapter {
     }
 
     async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
-        let mut slot = self.incoming_tx.write().await;
+        let mut slot = self.incoming_tx.write();
         *slot = Some(sender);
         Ok(())
     }
 
     async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
         let text = flatten_content(&response.content);
-        self.broadcast(&response.session_id, SseEvent::Response { text })
-            .await;
+        self.broadcast(&response.session_id, SseEvent::Response { text });
         Ok(())
     }
 
@@ -227,8 +227,7 @@ impl ChannelAdapter for HttpAdapter {
             SseEvent::Delta {
                 text: delta.to_owned(),
             },
-        )
-        .await;
+        );
         Ok(())
     }
 
@@ -243,17 +242,17 @@ impl ChannelAdapter for HttpAdapter {
                 level: level.to_owned(),
                 text: text.to_owned(),
             },
-        )
-        .await;
+        );
         Ok(())
     }
 
     async fn stop(&self) -> Result<()> {
-        let mut slot = self.incoming_tx.write().await;
-        *slot = None;
+        {
+            let mut slot = self.incoming_tx.write();
+            *slot = None;
+        }
         // Dropping broadcast senders signals EOF to all subscribers.
-        let mut sessions = self.sessions.write().await;
-        sessions.clear();
+        self.sessions.clear();
         Ok(())
     }
 }

@@ -30,7 +30,8 @@ use aura_storage::test_support::{
 };
 use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use chrono::Utc;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use parking_lot::Mutex;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::fixtures::{SessionBuilder, master_key_for_tests};
@@ -221,7 +222,7 @@ impl AgentTestHarnessBuilder {
 
         let job_manager = Arc::new(JobManager::new(box_clone_job_store(&job_store)));
         let cost_tracker = Arc::new(CostTracker::new(box_clone_cost_store(&cost_store)));
-        let trace_collector = Arc::new(AsyncMutex::new(TraceCollector::new(
+        let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
             &session.id,
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
             false,

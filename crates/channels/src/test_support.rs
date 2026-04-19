@@ -4,10 +4,11 @@
 //! and notice the router pushes; tests then assert against the captured
 //! sequence. Construction is cheap and thread-safe.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_model::ChannelType;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::types::{IncomingMessage, NoticeLevel, OutgoingMessage};
@@ -49,24 +50,22 @@ impl RecordingChannel {
     }
 
     pub fn responses(&self) -> Vec<OutgoingMessage> {
-        self.responses.lock().map(|v| v.clone()).unwrap_or_default()
+        self.responses.lock().to_vec()
     }
 
     pub fn deltas(&self) -> Vec<DeltaRecord> {
-        self.deltas.lock().map(|v| v.clone()).unwrap_or_default()
+        self.deltas.lock().to_vec()
     }
 
     /// Concatenated delta text in arrival order. Useful to assert the
     /// full streamed response (placeholder-form) without splicing.
     pub fn delta_text(&self) -> String {
-        self.deltas
-            .lock()
-            .map(|v| v.iter().map(|d| d.text.as_str()).collect::<String>())
-            .unwrap_or_default()
+        let guard = self.deltas.lock();
+        guard.iter().map(|d| d.text.as_str()).collect::<String>()
     }
 
     pub fn notices(&self) -> Vec<NoticeRecord> {
-        self.notices.lock().map(|v| v.clone()).unwrap_or_default()
+        self.notices.lock().to_vec()
     }
 }
 
@@ -81,30 +80,24 @@ impl ChannelAdapter for RecordingChannel {
     }
 
     async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
-        if let Ok(mut v) = self.responses.lock() {
-            v.push(response);
-        }
+        self.responses.lock().push(response);
         Ok(())
     }
 
     async fn send_stream_delta(&self, session_id: &str, delta: &str) -> Result<()> {
-        if let Ok(mut v) = self.deltas.lock() {
-            v.push(DeltaRecord {
-                session_id: session_id.to_owned(),
-                text: delta.to_owned(),
-            });
-        }
+        self.deltas.lock().push(DeltaRecord {
+            session_id: session_id.to_owned(),
+            text: delta.to_owned(),
+        });
         Ok(())
     }
 
     async fn send_notice(&self, session_id: &str, level: NoticeLevel, text: &str) -> Result<()> {
-        if let Ok(mut v) = self.notices.lock() {
-            v.push(NoticeRecord {
-                session_id: session_id.to_owned(),
-                level,
-                text: text.to_owned(),
-            });
-        }
+        self.notices.lock().push(NoticeRecord {
+            session_id: session_id.to_owned(),
+            level,
+            text: text.to_owned(),
+        });
         Ok(())
     }
 

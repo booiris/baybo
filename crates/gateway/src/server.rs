@@ -34,7 +34,6 @@ use aura_storage::TraceStore;
 use aura_tools::ToolRegistry;
 use axum::Router;
 use axum::middleware;
-use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -69,7 +68,7 @@ pub struct GatewayDeps {
     pub trace_store: Arc<dyn TraceStore>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
-    pub channel_registry: Arc<RwLock<ChannelRegistry>>,
+    pub channel_registry: Arc<ChannelRegistry>,
     pub llm_client: Arc<LlmClient>,
     /// Bearer token for the admin TCP listener. Stored in the vault as
     /// `gateway.admin_token`.
@@ -91,7 +90,7 @@ pub struct AdminState {
     pub trace_store: Arc<dyn TraceStore>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
-    pub channel_registry: Arc<RwLock<ChannelRegistry>>,
+    pub channel_registry: Arc<ChannelRegistry>,
     pub llm_client: Arc<LlmClient>,
     pub log_buffer: Arc<LogBuffer>,
     /// Pretty form of the admin bind address for `/v1/status`.

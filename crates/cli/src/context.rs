@@ -11,7 +11,6 @@ use aura_skills_assessor::SkillAssessor;
 use aura_storage::TraceStore;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
-use tokio::sync::RwLock;
 
 use crate::format::OutputFormat;
 
@@ -33,7 +32,7 @@ pub struct CommandContext {
     pub config_path: Option<PathBuf>,
     pub skills: Arc<SkillRegistry>,
     pub tools: Arc<ToolRegistry>,
-    pub channels: Arc<RwLock<ChannelRegistry>>,
+    pub channels: Arc<ChannelRegistry>,
     pub llm: Option<Arc<LlmClient>>,
     pub workspace: Arc<WorkspaceManager>,
     pub session: Option<Arc<SessionManager>>,
@@ -75,7 +74,7 @@ pub struct ContextBuilder {
     config_path: Option<PathBuf>,
     skills: Option<Arc<SkillRegistry>>,
     tools: Option<Arc<ToolRegistry>>,
-    channels: Option<Arc<RwLock<ChannelRegistry>>>,
+    channels: Option<Arc<ChannelRegistry>>,
     llm: Option<Arc<LlmClient>>,
     workspace: Option<Arc<WorkspaceManager>>,
     session: Option<Arc<SessionManager>>,
@@ -124,7 +123,7 @@ impl ContextBuilder {
         self
     }
 
-    pub fn channels(mut self, channels: Arc<RwLock<ChannelRegistry>>) -> Self {
+    pub fn channels(mut self, channels: Arc<ChannelRegistry>) -> Self {
         self.channels = Some(channels);
         self
     }
@@ -189,7 +188,7 @@ impl ContextBuilder {
             tools: self.tools.unwrap_or_else(|| Arc::new(ToolRegistry::new())),
             channels: self
                 .channels
-                .unwrap_or_else(|| Arc::new(RwLock::new(ChannelRegistry::new()))),
+                .unwrap_or_else(|| Arc::new(ChannelRegistry::new())),
             llm: self.llm,
             workspace: self
                 .workspace

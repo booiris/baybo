@@ -104,6 +104,14 @@ impl TraceCollector {
         self.store.save_trace(&self.session_trace).await
     }
 
+    /// Snapshot the store handle and the current `SessionTrace` for async
+    /// flushing. Used by callers that hold the collector behind a sync lock
+    /// (e.g. `ObservabilityRecorder`) to avoid awaiting while the guard
+    /// is held.
+    pub fn flush_snapshot(&self) -> (Arc<dyn TraceStore>, SessionTrace) {
+        (Arc::clone(&self.store), self.session_trace.clone())
+    }
+
     pub fn should_auto_snapshot(&self) -> bool {
         self.auto_snapshot
             && aura_trace::snapshot::should_snapshot(
@@ -162,7 +170,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use aura_trace::{SpanResult, TraceFilter, TraceNode};
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     struct MemoryTraceStore {
         traces: Mutex<HashMap<String, SessionTrace>>,
@@ -179,28 +187,18 @@ mod tests {
     #[async_trait]
     impl TraceStore for MemoryTraceStore {
         async fn save_trace(&self, trace: &SessionTrace) -> Result<()> {
-            let mut map = self
-                .traces
+            self.traces
                 .lock()
-                .map_err(|e| TraceError::Storage(e.to_string()))?;
-            map.insert(trace.session_id.clone(), trace.clone());
+                .insert(trace.session_id.clone(), trace.clone());
             Ok(())
         }
 
         async fn load_trace(&self, session_id: &str) -> Result<Option<SessionTrace>> {
-            let map = self
-                .traces
-                .lock()
-                .map_err(|e| TraceError::Storage(e.to_string()))?;
-            Ok(map.get(session_id).cloned())
+            Ok(self.traces.lock().get(session_id).cloned())
         }
 
         async fn query_traces(&self, _filter: TraceFilter) -> Result<Vec<SessionTrace>> {
-            let map = self
-                .traces
-                .lock()
-                .map_err(|e| TraceError::Storage(e.to_string()))?;
-            Ok(map.values().cloned().collect())
+            Ok(self.traces.lock().values().cloned().collect())
         }
 
         async fn load_node(
@@ -208,11 +206,9 @@ mod tests {
             session_id: &str,
             node_id: &TraceNodeId,
         ) -> Result<Option<TraceNode>> {
-            let map = self
+            Ok(self
                 .traces
                 .lock()
-                .map_err(|e| TraceError::Storage(e.to_string()))?;
-            Ok(map
                 .get(session_id)
                 .and_then(|t| t.nodes.get(node_id).cloned()))
         }

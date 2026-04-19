@@ -10,7 +10,7 @@ use aura_cron::CronTriggerEvent;
 use crate::cost::CostGuard;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::actor::AgentMessage;
@@ -67,7 +67,7 @@ pub type ActorSpawner =
 pub struct Router {
     session_manager: Arc<SessionManager>,
     supervisor: AgentSupervisor,
-    channels: Arc<RwLock<ChannelRegistry>>,
+    channels: Arc<ChannelRegistry>,
     security_gateway: Arc<SecurityGateway>,
     cost_guard: Option<Arc<CostGuard>>,
     rate_limiter: RateLimiter,
@@ -83,7 +83,7 @@ impl Router {
     pub fn new(
         session_manager: Arc<SessionManager>,
         supervisor: AgentSupervisor,
-        channels: Arc<RwLock<ChannelRegistry>>,
+        channels: Arc<ChannelRegistry>,
         security_gateway: Arc<SecurityGateway>,
     ) -> Self {
         Self {
@@ -131,7 +131,7 @@ impl Router {
         mut incoming_rx: mpsc::Receiver<IncomingMessage>,
         mut response_rx: mpsc::Receiver<AgentOutput>,
     ) {
-        let channel_count = self.channels.read().await.len();
+        let channel_count = self.channels.len();
         info!(channel_count, "router starting");
 
         let mut cron_rx = self.cron_trigger_rx.take();
@@ -321,8 +321,8 @@ impl Router {
                 channel,
                 text,
             } => {
-                let channels = self.channels.read().await;
-                match channels.get(channel) {
+                let adapter = self.channels.get_adapter(channel);
+                match adapter {
                     Some(adapter) => {
                         if let Err(e) = adapter.send_stream_delta(&session_id, &text).await {
                             error!(
@@ -348,8 +348,8 @@ impl Router {
                 level,
                 text,
             } => {
-                let channels = self.channels.read().await;
-                match channels.get(channel) {
+                let adapter = self.channels.get_adapter(channel);
+                match adapter {
                     Some(adapter) => {
                         if let Err(e) = adapter.send_notice(&session_id, level, &text).await {
                             error!(
@@ -415,8 +415,8 @@ impl Router {
 
     async fn send_to_channel(&self, outgoing: OutgoingMessage) {
         let channel_type = outgoing.channel;
-        let channels = self.channels.read().await;
-        match channels.get(channel_type) {
+        let adapter = self.channels.get_adapter(channel_type);
+        match adapter {
             Some(adapter) => {
                 if let Err(e) = adapter.send_response(outgoing).await {
                     error!(

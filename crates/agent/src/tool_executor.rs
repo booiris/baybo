@@ -1,5 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use aura_job::OperationKind;
 use aura_model::TrustLevel;
@@ -136,7 +138,7 @@ impl ToolExecutor {
             .unwrap_or_default();
 
         let uncovered: Vec<ResourceAccess> = {
-            let approved = approved_resources.lock().unwrap_or_else(|e| e.into_inner());
+            let approved = approved_resources.lock();
             accesses
                 .iter()
                 .filter(|acc| {
@@ -167,7 +169,7 @@ impl ToolExecutor {
                 }
                 ApprovalDecision::ApproveAlways => {
                     info!(tool = tool_name, "tool call approved always");
-                    let mut approved = approved_resources.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut approved = approved_resources.lock();
                     for access in &uncovered {
                         let entry = access.to_approved();
                         if !approved.iter().any(|existing| existing == &entry) {

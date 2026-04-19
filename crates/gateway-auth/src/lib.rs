@@ -22,6 +22,6 @@ pub mod token;
 
 pub use psk::{EMBEDDED_TUI_PSK, TUI_PSK_HEADER, effective_tui_psk};
 pub use token::{
-    CHANNEL_TOKEN_HEADER, ChannelTokenError, ChannelTokenTable, ClientIdentity, TokenHandle,
-    constant_time_eq, generate_token,
+    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TokenHandle, constant_time_eq,
+    generate_token,
 };

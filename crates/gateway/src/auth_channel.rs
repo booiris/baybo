@@ -123,11 +123,7 @@ fn check_child_token(
         return Ok(None);
     };
     let token = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let identity = state
-        .tokens
-        .lookup(token)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let identity = state.tokens.lookup(token).ok_or(StatusCode::UNAUTHORIZED)?;
     // PID must match the recorded child so a stolen token can't be
     // replayed from a different process in the same UID.
     match peer.pid {
@@ -186,12 +182,10 @@ mod tests {
     #[test]
     fn child_token_accepts_matching_pid() {
         let (state, tokens, _psk) = mk_state(1000);
-        let handle = tokens
-            .mint(ClientIdentity {
-                pid: 1234,
-                label: "telegram".into(),
-            })
-            .unwrap();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 1234,
+            label: "telegram".into(),
+        });
         let mut req = empty_req();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, handle.token().parse().unwrap());
@@ -209,12 +203,10 @@ mod tests {
     #[test]
     fn child_token_rejects_wrong_pid() {
         let (state, tokens, _psk) = mk_state(1000);
-        let handle = tokens
-            .mint(ClientIdentity {
-                pid: 1234,
-                label: "telegram".into(),
-            })
-            .unwrap();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 1234,
+            label: "telegram".into(),
+        });
         let mut req = empty_req();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, handle.token().parse().unwrap());

@@ -21,7 +21,7 @@ use aura_skills::SkillRegistry;
 use aura_storage::{Store, TraceStore};
 use aura_tools::ToolRegistry;
 use tempfile::TempDir;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 use crate::config::RuntimeGatewayConfig;
 use crate::http_adapter::HttpAdapter;
@@ -73,7 +73,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let trace_store: Arc<dyn TraceStore> = Arc::from(storage.trace);
     let skill_registry = Arc::new(SkillRegistry::new());
     let tool_registry = Arc::new(ToolRegistry::new());
-    let channel_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
+    let channel_registry = Arc::new(ChannelRegistry::new());
 
     let registry = LlmProviderRegistry::with_default_providers();
     let llm_client = Arc::new(

@@ -3,9 +3,10 @@
 //! production log line ever carries an unredacted secret.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aura_security::{LeakDetector, RedactingMakeWriter};
+use parking_lot::Mutex;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::prelude::*;
@@ -19,13 +20,13 @@ impl SharedBuf {
     }
 
     fn contents(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
     }
 }
 
 impl Write for SharedBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        self.0.lock().extend_from_slice(buf);
         Ok(buf.len())
     }
 

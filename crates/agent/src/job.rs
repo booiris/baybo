@@ -167,10 +167,9 @@ impl JobManager {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use async_trait::async_trait;
+    use parking_lot::Mutex;
 
     struct InMemoryJobStore {
         jobs: Mutex<Vec<Job>>,
@@ -189,17 +188,16 @@ mod tests {
     #[async_trait]
     impl JobStore for InMemoryJobStore {
         async fn create(&self, job: &Job) -> Result<()> {
-            self.jobs.lock().map_err(lock_err)?.push(job.clone());
+            self.jobs.lock().push(job.clone());
             Ok(())
         }
 
         async fn get(&self, job_id: &str) -> Result<Option<Job>> {
-            let jobs = self.jobs.lock().map_err(lock_err)?;
-            Ok(jobs.iter().find(|j| j.id == job_id).cloned())
+            Ok(self.jobs.lock().iter().find(|j| j.id == job_id).cloned())
         }
 
         async fn save(&self, job: &Job) -> Result<()> {
-            let mut jobs = self.jobs.lock().map_err(lock_err)?;
+            let mut jobs = self.jobs.lock();
             let stored = jobs
                 .iter_mut()
                 .find(|j| j.id == job.id)
@@ -209,8 +207,9 @@ mod tests {
         }
 
         async fn list_by_session(&self, session_id: &str) -> Result<Vec<Job>> {
-            let jobs = self.jobs.lock().map_err(lock_err)?;
-            Ok(jobs
+            Ok(self
+                .jobs
+                .lock()
                 .iter()
                 .filter(|j| j.session_id == session_id)
                 .cloned()
@@ -218,8 +217,9 @@ mod tests {
         }
 
         async fn list_by_status(&self, status: JobStatus) -> Result<Vec<Job>> {
-            let jobs = self.jobs.lock().map_err(lock_err)?;
-            Ok(jobs
+            Ok(self
+                .jobs
+                .lock()
                 .iter()
                 .filter(|j| j.status == status)
                 .cloned()
@@ -227,8 +227,9 @@ mod tests {
         }
 
         async fn list_children(&self, parent_job_id: &str) -> Result<Vec<Job>> {
-            let jobs = self.jobs.lock().map_err(lock_err)?;
-            Ok(jobs
+            Ok(self
+                .jobs
+                .lock()
                 .iter()
                 .filter(|j| j.parent_job_id.as_deref() == Some(parent_job_id))
                 .cloned()
@@ -236,30 +237,23 @@ mod tests {
         }
 
         async fn list_all(&self) -> Result<Vec<Job>> {
-            let jobs = self.jobs.lock().map_err(lock_err)?;
-            Ok(jobs.clone())
+            Ok(self.jobs.lock().clone())
         }
 
         async fn record_transition(&self, transition: &JobTransition) -> Result<()> {
-            self.transitions
-                .lock()
-                .map_err(lock_err)?
-                .push(transition.clone());
+            self.transitions.lock().push(transition.clone());
             Ok(())
         }
 
         async fn get_transitions(&self, job_id: &str) -> Result<Vec<JobTransition>> {
-            let transitions = self.transitions.lock().map_err(lock_err)?;
-            Ok(transitions
+            Ok(self
+                .transitions
+                .lock()
                 .iter()
                 .filter(|t| t.job_id == job_id)
                 .cloned()
                 .collect())
         }
-    }
-
-    fn lock_err<T>(_: T) -> JobError {
-        JobError::Internal(anyhow::anyhow!("lock poisoned"))
     }
 
     fn test_kind() -> OperationKind {

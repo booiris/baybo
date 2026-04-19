@@ -52,9 +52,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
+use parking_lot::Mutex;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Notify, mpsc};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -203,7 +204,6 @@ impl TuiAdapter {
         let event_rx = self
             .event_rx
             .lock()
-            .await
             .take()
             .ok_or_else(|| ChannelError::Send("TuiAdapter::start called twice".into()))?;
 

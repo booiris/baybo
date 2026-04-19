@@ -76,16 +76,13 @@ impl ChannelSpawner {
                 ));
             }
         };
-        let token_handle = self
-            .tokens
-            .register(
-                token,
-                ClientIdentity {
-                    pid,
-                    label: label.clone(),
-                },
-            )
-            .map_err(|e| GatewayError::Internal(format!("register channel token: {e}")))?;
+        let token_handle = self.tokens.register(
+            token,
+            ClientIdentity {
+                pid,
+                label: label.clone(),
+            },
+        );
         Ok(ChildHandle {
             child,
             _token: token_handle,
@@ -145,8 +142,7 @@ mod tests {
             ChannelSpawner::new(PathBuf::from("/tmp/unused-channel.sock"), tokens.clone());
         let handle = spawner.spawn(Command::new("true"), "test").unwrap();
         assert!(!tokens.is_empty());
-        let table_len = tokens.len().unwrap();
-        assert_eq!(table_len, 1);
+        assert_eq!(tokens.len(), 1);
         let pid = handle.pid();
         drop(handle);
         // Drop revokes the token.

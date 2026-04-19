@@ -428,7 +428,7 @@ mod tests {
     use async_trait::async_trait;
     use aura_storage::memory::MemoryStore;
     use aura_storage::memory::Result as StoreResult;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// Minimal `MemoryStore` implementation used by the unit tests below.
     struct InMemoryStore {
@@ -446,7 +446,7 @@ mod tests {
     #[async_trait]
     impl MemoryStore for InMemoryStore {
         async fn store(&self, entry: &MemoryEntry) -> StoreResult<()> {
-            let mut lock = self.entries.lock().expect("poisoned");
+            let mut lock = self.entries.lock();
             if let Some(slot) = lock.iter_mut().find(|e| e.id == entry.id) {
                 *slot = entry.clone();
             } else {
@@ -456,7 +456,7 @@ mod tests {
         }
 
         async fn retrieve(&self, user_id: &str, key: &str) -> StoreResult<Option<MemoryEntry>> {
-            let lock = self.entries.lock().expect("poisoned");
+            let lock = self.entries.lock();
             Ok(lock
                 .iter()
                 .find(|e| e.user_id == user_id && e.id == key)
@@ -470,7 +470,7 @@ mod tests {
             limit: usize,
         ) -> StoreResult<Vec<MemoryEntry>> {
             let needle = query.to_lowercase();
-            let lock = self.entries.lock().expect("poisoned");
+            let lock = self.entries.lock();
             let mut out: Vec<MemoryEntry> = lock
                 .iter()
                 .filter(|e| e.user_id == user_id && e.content.to_lowercase().contains(&needle))
@@ -481,13 +481,13 @@ mod tests {
         }
 
         async fn delete(&self, id: &str) -> StoreResult<()> {
-            let mut lock = self.entries.lock().expect("poisoned");
+            let mut lock = self.entries.lock();
             lock.retain(|e| e.id != id);
             Ok(())
         }
 
         async fn list_by_user(&self, user_id: &str) -> StoreResult<Vec<MemoryEntry>> {
-            let lock = self.entries.lock().expect("poisoned");
+            let lock = self.entries.lock();
             Ok(lock
                 .iter()
                 .filter(|e| e.user_id == user_id)
@@ -496,12 +496,12 @@ mod tests {
         }
 
         async fn list_all(&self) -> StoreResult<Vec<MemoryEntry>> {
-            let lock = self.entries.lock().expect("poisoned");
+            let lock = self.entries.lock();
             Ok(lock.clone())
         }
 
         async fn get_by_id(&self, id: &str) -> StoreResult<Option<MemoryEntry>> {
-            let lock = self.entries.lock().expect("poisoned");
+            let lock = self.entries.lock();
             Ok(lock.iter().find(|e| e.id == id).cloned())
         }
     }

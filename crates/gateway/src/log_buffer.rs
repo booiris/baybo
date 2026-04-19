@@ -10,9 +10,10 @@
 //! not durable storage. Oldest-wins eviction keeps memory bounded.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -171,10 +172,7 @@ impl LogBuffer {
         fields: Vec<(String, String)>,
     ) {
         let record = {
-            let mut inner = match self.inner.lock() {
-                Ok(g) => g,
-                Err(poison) => poison.into_inner(),
-            };
+            let mut inner = self.inner.lock();
             let id = inner.next_id;
             inner.next_id = inner.next_id.wrapping_add(1);
             if inner.records.len() == inner.capacity {
@@ -211,10 +209,7 @@ impl LogBuffer {
 
     /// Return records matching `q`, newest first, honouring limit/offset.
     pub fn query(&self, q: &LogQuery) -> LogPage {
-        let inner = match self.inner.lock() {
-            Ok(g) => g,
-            Err(poison) => poison.into_inner(),
-        };
+        let inner = self.inner.lock();
         let limit = if q.limit == 0 { usize::MAX } else { q.limit };
 
         let mut matched = 0usize;

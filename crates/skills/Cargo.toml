@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }

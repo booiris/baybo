@@ -257,11 +257,13 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     // Register the HTTP adapter and start channel background tasks.
     let http_adapter = Arc::new(HttpAdapter::new());
-    {
-        let mut reg = graph.channels_registry.write().await;
-        reg.register(Arc::clone(&http_adapter) as Arc<dyn aura_channels::ChannelAdapter>)?;
-        reg.start_all(run_handle.incoming_tx.clone()).await?;
-    }
+    graph
+        .channels_registry
+        .register(Arc::clone(&http_adapter) as Arc<dyn aura_channels::ChannelAdapter>)?;
+    graph
+        .channels_registry
+        .start_all(run_handle.incoming_tx.clone())
+        .await?;
 
     let mut task_tracker = TaskTracker::new();
     runtime::install_signal_handler(&mut task_tracker, shutdown.clone());

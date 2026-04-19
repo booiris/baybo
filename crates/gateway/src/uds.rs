@@ -17,7 +17,6 @@
 //!   parent gateway arms a force-exit watchdog alongside this).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::service::ShutdownSignal;
@@ -162,13 +161,9 @@ where
         + 'static,
     R::Future: Send + 'static,
 {
-    let router = Arc::new(tokio::sync::Mutex::new(router));
     let service = service_fn(move |req: hyper::Request<Incoming>| {
-        let router = Arc::clone(&router);
-        async move {
-            let mut guard = router.lock().await;
-            guard.call(req).await
-        }
+        let mut router = router.clone();
+        async move { router.call(req).await }
     });
     let builder = AutoBuilder::new(TokioExecutor::new());
     if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {

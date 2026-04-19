@@ -45,8 +45,9 @@ use aura_skills_assessor::SkillAssessor;
 use aura_storage::{Store, TraceStore};
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
+use parking_lot::Mutex;
 use regex::Regex;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::boot;
@@ -143,7 +144,7 @@ pub struct ManagerGraph {
     pub tool_executor: Arc<ToolExecutor>,
     pub llm_client: Arc<LlmClient>,
     pub workspace: Arc<WorkspaceManager>,
-    pub channels_registry: Arc<RwLock<ChannelRegistry>>,
+    pub channels_registry: Arc<ChannelRegistry>,
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
 
@@ -182,7 +183,7 @@ pub async fn build_managers(
     };
     let mut tool_registry = Arc::new(ToolRegistry::with_defaults());
     let workspace = Arc::new(WorkspaceManager::new(workspace_root.clone()));
-    let channels_registry = Arc::new(RwLock::new(ChannelRegistry::new()));
+    let channels_registry = Arc::new(ChannelRegistry::new());
 
     let llm_client = {
         let client = boot::build_llm_client(&config.llm)?;
@@ -259,7 +260,7 @@ pub async fn build_managers(
         Arc::clone(&leak_detector),
         Arc::clone(&secret_vault),
     ));
-    let gate_map = channels_registry.read().await.approval_gates();
+    let gate_map = channels_registry.approval_gates();
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         boot::to_tool_timeout(&config.tools),

@@ -571,7 +571,7 @@ mod tests {
     use super::*;
     use crate::shutdown::NeverShutdown;
     use async_trait::async_trait;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// In-memory CronStore for testing.
     struct InMemoryCronStore {
@@ -591,22 +591,16 @@ mod tests {
     #[async_trait]
     impl CronStore for InMemoryCronStore {
         async fn create(&self, row: &CronJobRow) -> aura_storage::cron::Result<()> {
-            self.jobs.lock().unwrap().push(row.clone());
+            self.jobs.lock().push(row.clone());
             Ok(())
         }
 
         async fn get(&self, job_id: &str) -> aura_storage::cron::Result<Option<CronJobRow>> {
-            Ok(self
-                .jobs
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|r| r.id == job_id)
-                .cloned())
+            Ok(self.jobs.lock().iter().find(|r| r.id == job_id).cloned())
         }
 
         async fn save(&self, row: &CronJobRow) -> aura_storage::cron::Result<()> {
-            let mut jobs = self.jobs.lock().unwrap();
+            let mut jobs = self.jobs.lock();
             if let Some(existing) = jobs.iter_mut().find(|r| r.id == row.id) {
                 *existing = row.clone();
                 Ok(())
@@ -616,7 +610,7 @@ mod tests {
         }
 
         async fn delete(&self, job_id: &str) -> aura_storage::cron::Result<()> {
-            let mut jobs = self.jobs.lock().unwrap();
+            let mut jobs = self.jobs.lock();
             let len_before = jobs.len();
             jobs.retain(|r| r.id != job_id);
             if jobs.len() == len_before {
@@ -630,7 +624,6 @@ mod tests {
             Ok(self
                 .jobs
                 .lock()
-                .unwrap()
                 .iter()
                 .filter(|r| r.user_id == user_id)
                 .cloned()
@@ -638,14 +631,13 @@ mod tests {
         }
 
         async fn list_all(&self) -> aura_storage::cron::Result<Vec<CronJobRow>> {
-            Ok(self.jobs.lock().unwrap().clone())
+            Ok(self.jobs.lock().to_vec())
         }
 
         async fn list_enabled(&self) -> aura_storage::cron::Result<Vec<CronJobRow>> {
             Ok(self
                 .jobs
                 .lock()
-                .unwrap()
                 .iter()
                 .filter(|r| r.status == "enabled")
                 .cloned()
@@ -656,7 +648,6 @@ mod tests {
             Ok(self
                 .jobs
                 .lock()
-                .unwrap()
                 .iter()
                 .filter(|r| {
                     r.status == "enabled"
@@ -668,7 +659,7 @@ mod tests {
         }
 
         async fn record_execution(&self, row: &CronExecutionRow) -> aura_storage::cron::Result<()> {
-            self.executions.lock().unwrap().push(row.clone());
+            self.executions.lock().push(row.clone());
             Ok(())
         }
 
@@ -679,7 +670,6 @@ mod tests {
             Ok(self
                 .executions
                 .lock()
-                .unwrap()
                 .iter()
                 .filter(|r| r.job_id == job_id)
                 .cloned()
@@ -693,7 +683,6 @@ mod tests {
             Ok(self
                 .executions
                 .lock()
-                .unwrap()
                 .iter()
                 .filter(|r| r.user_id == user_id)
                 .cloned()
@@ -708,7 +697,6 @@ mod tests {
             Ok(self
                 .executions
                 .lock()
-                .unwrap()
                 .iter()
                 .any(|r| r.job_id == job_id && r.scheduled_fire_time == scheduled_fire_time))
         }
@@ -718,7 +706,7 @@ mod tests {
             execution_id: &str,
             status: &str,
         ) -> aura_storage::cron::Result<()> {
-            let mut execs = self.executions.lock().unwrap();
+            let mut execs = self.executions.lock();
             if let Some(exec) = execs.iter_mut().find(|r| r.id == execution_id) {
                 exec.status = status.to_string();
                 Ok(())
@@ -734,7 +722,6 @@ mod tests {
             Ok(self
                 .executions
                 .lock()
-                .unwrap()
                 .iter()
                 .filter(|r| r.status == status)
                 .cloned()

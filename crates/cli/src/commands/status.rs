@@ -7,9 +7,7 @@ use crate::format::CommandOutput;
 pub async fn handle(ctx: &CommandContext) -> Result<CommandOutput> {
     let skills_count = ctx.skills.list().len();
     let tools_count = ctx.tools.tool_definitions().len();
-    let channels = ctx.channels.read().await;
-    let channels_count = channels.len();
-    drop(channels);
+    let channels_count = ctx.channels.len();
     let (provider, model) = match ctx.llm.as_ref() {
         Some(c) => (c.model_info().provider.clone(), c.model_id().to_string()),
         None => ("(not configured)".into(), "(not configured)".into()),

@@ -8,7 +8,7 @@ use aura_job::OperationKind;
 use aura_storage::CostRecord;
 use aura_trace::{ExecutionProvenance, SpanHandle, SpanInput, SpanResult, TraceNodeId};
 use chrono::Utc;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 use tracing::warn;
 
 /// Unified wrapper for Job + Trace + Cost recording.
@@ -56,7 +56,7 @@ impl ObservabilityRecorder {
         self.job_manager.start(&job.id).await?;
 
         let span_handle = {
-            let mut collector = self.trace_collector.lock().await;
+            let mut collector = self.trace_collector.lock();
             collector.begin_span(kind, Some(&job.id), provenance, input)
         };
 
@@ -74,7 +74,7 @@ impl ObservabilityRecorder {
         result: SpanResult,
     ) -> anyhow::Result<()> {
         {
-            let mut collector = self.trace_collector.lock().await;
+            let mut collector = self.trace_collector.lock();
             collector.end_span(handle.span_handle, result);
         }
         self.job_manager.complete(&handle.job_id, output).await?;
@@ -86,7 +86,7 @@ impl ObservabilityRecorder {
     /// Record a failure.
     pub async fn fail(&self, handle: OperationHandle, error: &str) -> anyhow::Result<()> {
         {
-            let mut collector = self.trace_collector.lock().await;
+            let mut collector = self.trace_collector.lock();
             collector.end_span(
                 handle.span_handle,
                 SpanResult::Error {
@@ -129,8 +129,12 @@ impl ObservabilityRecorder {
 
     /// Flush trace data to the store.
     pub async fn flush(&self) -> anyhow::Result<()> {
-        let collector = self.trace_collector.lock().await;
-        Ok(collector.flush().await?)
+        let (store, trace) = {
+            let collector = self.trace_collector.lock();
+            collector.flush_snapshot()
+        };
+        store.save_trace(&trace).await?;
+        Ok(())
     }
 
     /// Check whether the auto-snapshot policy says a snapshot should be taken now.
@@ -138,7 +142,7 @@ impl ObservabilityRecorder {
     /// Returns the active leaf node id when a snapshot is due, so the caller
     /// can create a `ContextSnapshot` and pass it to `attach_snapshot`.
     pub async fn maybe_snapshot(&self) -> Option<TraceNodeId> {
-        let collector = self.trace_collector.lock().await;
+        let collector = self.trace_collector.lock();
         if collector.should_auto_snapshot() {
             Some(collector.active_leaf().clone())
         } else {
@@ -152,7 +156,7 @@ impl ObservabilityRecorder {
         node_id: &TraceNodeId,
         snapshot: ContextSnapshot,
     ) -> anyhow::Result<()> {
-        let mut collector = self.trace_collector.lock().await;
+        let mut collector = self.trace_collector.lock();
         Ok(collector.attach_snapshot(node_id, snapshot)?)
     }
 
@@ -162,7 +166,7 @@ impl ObservabilityRecorder {
     /// Returns the snapshot that was found.  The caller uses it to restore
     /// the session's message history and context budget.
     pub async fn rollback_to(&self, target_node: &TraceNodeId) -> anyhow::Result<ContextSnapshot> {
-        let mut collector = self.trace_collector.lock().await;
+        let mut collector = self.trace_collector.lock();
         let snapshot = collector.find_snapshot_at(target_node)?;
         collector.fork_from(target_node.clone())?;
         Ok(snapshot)

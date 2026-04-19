@@ -5,9 +5,8 @@
 //! next item. Failing assertions ("queue empty") surface as
 //! `LlmError::Provider` so tests stay on the normal error path.
 
-use std::sync::Mutex;
-
 use async_trait::async_trait;
+use parking_lot::Mutex;
 
 use crate::{
     ChatRequest, LlmCompletion, LlmError, LlmResponse, LlmStream, ModelInfo, ModelPricing,
@@ -62,36 +61,28 @@ impl StubLlm {
     /// Configure UTF-8-char-bounded chunking for queued `Text` stream
     /// events. `n = 1` produces single-char chunks; `None` disables.
     pub fn with_text_chunk_size(self, n: Option<usize>) -> Self {
-        if let Ok(mut guard) = self.text_chunk_size.lock() {
-            *guard = n;
-        }
+        *self.text_chunk_size.lock() = n;
         self
     }
 
     pub fn push_response(&self, response: LlmResponse) {
-        if let Ok(mut q) = self.chat_queue.lock() {
-            q.push_back(Ok(response));
-        }
+        self.chat_queue.lock().push_back(Ok(response));
     }
 
     pub fn push_response_err(&self, err: LlmError) {
-        if let Ok(mut q) = self.chat_queue.lock() {
-            q.push_back(Err(err));
-        }
+        self.chat_queue.lock().push_back(Err(err));
     }
 
     /// Queue one streaming response. Each call to `chat_stream()` pops
     /// one whole vector and emits its events in order.
     pub fn push_stream(&self, events: Vec<StreamEvent>) {
-        if let Ok(mut q) = self.stream_queue.lock() {
-            q.push_back(events.into_iter().map(Ok).collect());
-        }
+        self.stream_queue
+            .lock()
+            .push_back(events.into_iter().map(Ok).collect());
     }
 
     pub fn push_stream_results(&self, events: Vec<crate::Result<StreamEvent>>) {
-        if let Ok(mut q) = self.stream_queue.lock() {
-            q.push_back(events);
-        }
+        self.stream_queue.lock().push_back(events);
     }
 }
 
@@ -119,27 +110,19 @@ fn split_text_chunks(text: &str, n: usize) -> Vec<String> {
 #[async_trait]
 impl LlmCompletion for StubLlm {
     async fn chat(&self, _request: &ChatRequest) -> crate::Result<LlmResponse> {
-        let mut q = self
-            .chat_queue
+        self.chat_queue
             .lock()
-            .map_err(|_| LlmError::Provider("StubLlm: chat queue mutex poisoned".into()))?;
-        q.pop_front()
+            .pop_front()
             .ok_or_else(|| LlmError::Provider("StubLlm: chat queue empty".into()))?
     }
 
     async fn chat_stream(&self, _request: &ChatRequest) -> crate::Result<LlmStream> {
-        let raw = {
-            let mut q = self
-                .stream_queue
-                .lock()
-                .map_err(|_| LlmError::Provider("StubLlm: stream queue mutex poisoned".into()))?;
-            q.pop_front()
-                .ok_or_else(|| LlmError::Provider("StubLlm: stream queue empty".into()))?
-        };
-        let chunk_size = *self
-            .text_chunk_size
+        let raw = self
+            .stream_queue
             .lock()
-            .map_err(|_| LlmError::Provider("StubLlm: chunk-size mutex poisoned".into()))?;
+            .pop_front()
+            .ok_or_else(|| LlmError::Provider("StubLlm: stream queue empty".into()))?;
+        let chunk_size = *self.text_chunk_size.lock();
         let expanded: Vec<crate::Result<StreamEvent>> = match chunk_size {
             None => raw,
             Some(n) => raw

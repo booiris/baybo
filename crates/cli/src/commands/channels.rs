@@ -12,8 +12,8 @@ pub async fn handle(ctx: &CommandContext, cmd: ChannelsCmd) -> Result<CommandOut
 }
 
 async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
-    let registry = ctx.channels.read().await;
-    let entries: Vec<_> = registry
+    let entries: Vec<_> = ctx
+        .channels
         .list()
         .into_iter()
         .map(|(ct, status)| (ct.to_string(), format!("{:?}", status)))

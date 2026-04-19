@@ -168,7 +168,7 @@ impl AgentActor {
         params: serde_json::Value,
         pre_approved: Vec<ApprovedResource>,
     ) -> anyhow::Result<()> {
-        let approved = std::sync::Mutex::new(pre_approved);
+        let approved = parking_lot::Mutex::new(pre_approved);
 
         let tool_result = self
             .tool_executor

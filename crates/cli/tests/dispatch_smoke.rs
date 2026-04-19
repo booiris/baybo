@@ -31,16 +31,16 @@ use aura_trace::{
 };
 use aura_workspace::WorkspaceManager;
 use chrono::{DateTime, Duration, Utc};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 fn context() -> aura_cli::CommandContext {
     let config = Arc::new(AuraConfig::default());
     ContextBuilder::new(config)
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .build()
         .with_invocation(Invocation::Argv)
@@ -62,19 +62,16 @@ impl MemorySessionStore {
 #[async_trait::async_trait]
 impl SessionStore for MemorySessionStore {
     async fn get(&self, session_id: &str) -> SessionResult<Option<Session>> {
-        Ok(self.data.lock().unwrap().get(session_id).cloned())
+        Ok(self.data.lock().get(session_id).cloned())
     }
 
     async fn save(&self, session: &Session) -> SessionResult<()> {
-        self.data
-            .lock()
-            .unwrap()
-            .insert(session.id.clone(), session.clone());
+        self.data.lock().insert(session.id.clone(), session.clone());
         Ok(())
     }
 
     async fn delete(&self, session_id: &str) -> SessionResult<()> {
-        self.data.lock().unwrap().remove(session_id);
+        self.data.lock().remove(session_id);
         Ok(())
     }
 
@@ -82,7 +79,6 @@ impl SessionStore for MemorySessionStore {
         Ok(self
             .data
             .lock()
-            .unwrap()
             .values()
             .filter(|s| s.last_active < before)
             .map(|s| s.id.clone())
@@ -90,7 +86,7 @@ impl SessionStore for MemorySessionStore {
     }
 
     async fn list_all(&self) -> SessionResult<Vec<Session>> {
-        Ok(self.data.lock().unwrap().values().cloned().collect())
+        Ok(self.data.lock().values().cloned().collect())
     }
 }
 
@@ -114,7 +110,6 @@ fn seeded_session_manager(ids: &[&str]) -> (Arc<SessionManager>, Vec<String>) {
         store
             .data
             .lock()
-            .unwrap()
             .insert(session.id.clone(), session.clone());
         populated.push(session.id);
     }
@@ -127,7 +122,7 @@ fn context_with_sessions(ids: &[&str]) -> (aura_cli::CommandContext, Vec<String>
     let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .session(mgr)
         .build()
@@ -153,22 +148,16 @@ impl MemoryJobStore {
 #[async_trait::async_trait]
 impl JobStore for MemoryJobStore {
     async fn create(&self, job: &Job) -> Result<(), JobError> {
-        self.jobs.lock().unwrap().push(job.clone());
+        self.jobs.lock().push(job.clone());
         Ok(())
     }
 
     async fn get(&self, job_id: &str) -> Result<Option<Job>, JobError> {
-        Ok(self
-            .jobs
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|j| j.id == job_id)
-            .cloned())
+        Ok(self.jobs.lock().iter().find(|j| j.id == job_id).cloned())
     }
 
     async fn save(&self, job: &Job) -> Result<(), JobError> {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = self.jobs.lock();
         let stored = jobs
             .iter_mut()
             .find(|j| j.id == job.id)
@@ -181,7 +170,6 @@ impl JobStore for MemoryJobStore {
         Ok(self
             .jobs
             .lock()
-            .unwrap()
             .iter()
             .filter(|j| j.session_id == session_id)
             .cloned()
@@ -192,7 +180,6 @@ impl JobStore for MemoryJobStore {
         Ok(self
             .jobs
             .lock()
-            .unwrap()
             .iter()
             .filter(|j| j.status == status)
             .cloned()
@@ -203,7 +190,6 @@ impl JobStore for MemoryJobStore {
         Ok(self
             .jobs
             .lock()
-            .unwrap()
             .iter()
             .filter(|j| j.parent_job_id.as_deref() == Some(parent_job_id))
             .cloned()
@@ -211,11 +197,11 @@ impl JobStore for MemoryJobStore {
     }
 
     async fn list_all(&self) -> Result<Vec<Job>, JobError> {
-        Ok(self.jobs.lock().unwrap().clone())
+        Ok(self.jobs.lock().to_vec())
     }
 
     async fn record_transition(&self, t: &JobTransition) -> Result<(), JobError> {
-        self.transitions.lock().unwrap().push(t.clone());
+        self.transitions.lock().push(t.clone());
         Ok(())
     }
 
@@ -223,7 +209,6 @@ impl JobStore for MemoryJobStore {
         Ok(self
             .transitions
             .lock()
-            .unwrap()
             .iter()
             .filter(|t| t.job_id == job_id)
             .cloned()
@@ -262,7 +247,7 @@ async fn context_with_jobs() -> (aura_cli::CommandContext, Vec<(String, JobStatu
     let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .job(mgr)
         .build()
@@ -288,22 +273,16 @@ impl MemoryCronStore {
 #[async_trait::async_trait]
 impl CronStore for MemoryCronStore {
     async fn create(&self, row: &CronJobRow) -> CronResult<()> {
-        self.jobs.lock().unwrap().push(row.clone());
+        self.jobs.lock().push(row.clone());
         Ok(())
     }
 
     async fn get(&self, id: &str) -> CronResult<Option<CronJobRow>> {
-        Ok(self
-            .jobs
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|r| r.id == id)
-            .cloned())
+        Ok(self.jobs.lock().iter().find(|r| r.id == id).cloned())
     }
 
     async fn save(&self, row: &CronJobRow) -> CronResult<()> {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = self.jobs.lock();
         if let Some(existing) = jobs.iter_mut().find(|r| r.id == row.id) {
             *existing = row.clone();
             Ok(())
@@ -313,7 +292,7 @@ impl CronStore for MemoryCronStore {
     }
 
     async fn delete(&self, id: &str) -> CronResult<()> {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = self.jobs.lock();
         let before = jobs.len();
         jobs.retain(|r| r.id != id);
         if jobs.len() == before {
@@ -327,7 +306,6 @@ impl CronStore for MemoryCronStore {
         Ok(self
             .jobs
             .lock()
-            .unwrap()
             .iter()
             .filter(|r| r.user_id == user)
             .cloned()
@@ -335,14 +313,13 @@ impl CronStore for MemoryCronStore {
     }
 
     async fn list_all(&self) -> CronResult<Vec<CronJobRow>> {
-        Ok(self.jobs.lock().unwrap().clone())
+        Ok(self.jobs.lock().to_vec())
     }
 
     async fn list_enabled(&self) -> CronResult<Vec<CronJobRow>> {
         Ok(self
             .jobs
             .lock()
-            .unwrap()
             .iter()
             .filter(|r| r.status == "enabled")
             .cloned()
@@ -353,7 +330,6 @@ impl CronStore for MemoryCronStore {
         Ok(self
             .jobs
             .lock()
-            .unwrap()
             .iter()
             .filter(|r| {
                 r.status == "enabled"
@@ -365,7 +341,7 @@ impl CronStore for MemoryCronStore {
     }
 
     async fn record_execution(&self, row: &CronExecutionRow) -> CronResult<()> {
-        self.executions.lock().unwrap().push(row.clone());
+        self.executions.lock().push(row.clone());
         Ok(())
     }
 
@@ -373,7 +349,6 @@ impl CronStore for MemoryCronStore {
         Ok(self
             .executions
             .lock()
-            .unwrap()
             .iter()
             .filter(|r| r.job_id == job_id)
             .cloned()
@@ -384,7 +359,6 @@ impl CronStore for MemoryCronStore {
         Ok(self
             .executions
             .lock()
-            .unwrap()
             .iter()
             .filter(|r| r.user_id == user)
             .cloned()
@@ -399,13 +373,12 @@ impl CronStore for MemoryCronStore {
         Ok(self
             .executions
             .lock()
-            .unwrap()
             .iter()
             .any(|r| r.job_id == job_id && r.scheduled_fire_time == scheduled_fire_time))
     }
 
     async fn update_execution_status(&self, id: &str, status: &str) -> CronResult<()> {
-        let mut execs = self.executions.lock().unwrap();
+        let mut execs = self.executions.lock();
         if let Some(e) = execs.iter_mut().find(|r| r.id == id) {
             e.status = status.into();
             Ok(())
@@ -418,7 +391,6 @@ impl CronStore for MemoryCronStore {
         Ok(self
             .executions
             .lock()
-            .unwrap()
             .iter()
             .filter(|r| r.status == status)
             .cloned()
@@ -451,7 +423,7 @@ async fn context_with_cron() -> (
     let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .cron(Arc::clone(&sched))
         .build()
@@ -580,7 +552,7 @@ fn context_with_workspace(root: PathBuf) -> aura_cli::CommandContext {
     ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(root)))
         .build()
         .with_invocation(Invocation::Argv)
@@ -868,7 +840,7 @@ async fn job_list_reports_empty_when_no_jobs() {
     let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .job(mgr)
         .build()
@@ -1098,7 +1070,7 @@ impl MemoryMemStore {
 #[async_trait::async_trait]
 impl MemoryStore for MemoryMemStore {
     async fn store(&self, entry: &MemoryEntry) -> MemoryResult<()> {
-        let mut lock = self.entries.lock().unwrap();
+        let mut lock = self.entries.lock();
         if let Some(slot) = lock.iter_mut().find(|e| e.id == entry.id) {
             *slot = entry.clone();
         } else {
@@ -1108,7 +1080,7 @@ impl MemoryStore for MemoryMemStore {
     }
 
     async fn retrieve(&self, user_id: &str, key: &str) -> MemoryResult<Option<MemoryEntry>> {
-        let lock = self.entries.lock().unwrap();
+        let lock = self.entries.lock();
         Ok(lock
             .iter()
             .find(|e| e.user_id == user_id && e.id == key)
@@ -1122,7 +1094,7 @@ impl MemoryStore for MemoryMemStore {
         limit: usize,
     ) -> MemoryResult<Vec<MemoryEntry>> {
         let needle = query.to_lowercase();
-        let lock = self.entries.lock().unwrap();
+        let lock = self.entries.lock();
         let mut out: Vec<MemoryEntry> = lock
             .iter()
             .filter(|e| e.user_id == user_id && e.content.to_lowercase().contains(&needle))
@@ -1133,13 +1105,13 @@ impl MemoryStore for MemoryMemStore {
     }
 
     async fn delete(&self, id: &str) -> MemoryResult<()> {
-        let mut lock = self.entries.lock().unwrap();
+        let mut lock = self.entries.lock();
         lock.retain(|e| e.id != id);
         Ok(())
     }
 
     async fn list_by_user(&self, user_id: &str) -> MemoryResult<Vec<MemoryEntry>> {
-        let lock = self.entries.lock().unwrap();
+        let lock = self.entries.lock();
         Ok(lock
             .iter()
             .filter(|e| e.user_id == user_id)
@@ -1148,11 +1120,11 @@ impl MemoryStore for MemoryMemStore {
     }
 
     async fn list_all(&self) -> MemoryResult<Vec<MemoryEntry>> {
-        Ok(self.entries.lock().unwrap().clone())
+        Ok(self.entries.lock().to_vec())
     }
 
     async fn get_by_id(&self, id: &str) -> MemoryResult<Option<MemoryEntry>> {
-        let lock = self.entries.lock().unwrap();
+        let lock = self.entries.lock();
         Ok(lock.iter().find(|e| e.id == id).cloned())
     }
 }
@@ -1163,7 +1135,7 @@ fn context_with_memory() -> (aura_cli::CommandContext, Arc<MemoryManager>) {
     let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .memory(Arc::clone(&mgr))
         .build()
@@ -1393,7 +1365,7 @@ async fn memory_clear_requires_yes_in_slash_mode() {
     let slash_ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .memory(Arc::clone(&mgr))
         .build()
@@ -1463,17 +1435,16 @@ impl TraceStore for TraceMemStore {
     async fn save_trace(&self, trace: &SessionTrace) -> TraceResult<()> {
         self.traces
             .lock()
-            .unwrap()
             .insert(trace.session_id.clone(), trace.clone());
         Ok(())
     }
 
     async fn load_trace(&self, session_id: &str) -> TraceResult<Option<SessionTrace>> {
-        Ok(self.traces.lock().unwrap().get(session_id).cloned())
+        Ok(self.traces.lock().get(session_id).cloned())
     }
 
     async fn query_traces(&self, filter: TraceFilter) -> TraceResult<Vec<SessionTrace>> {
-        let lock = self.traces.lock().unwrap();
+        let lock = self.traces.lock();
         let values: Vec<SessionTrace> = match filter.session_id {
             Some(sid) => lock.get(&sid).cloned().into_iter().collect(),
             None => lock.values().cloned().collect(),
@@ -1486,7 +1457,7 @@ impl TraceStore for TraceMemStore {
         session_id: &str,
         node_id: &TraceNodeId,
     ) -> TraceResult<Option<TraceNode>> {
-        let lock = self.traces.lock().unwrap();
+        let lock = self.traces.lock();
         Ok(lock
             .get(session_id)
             .and_then(|t| t.nodes.get(node_id).cloned()))
@@ -1528,7 +1499,7 @@ fn context_with_trace() -> (aura_cli::CommandContext, Arc<TraceMemStore>) {
     let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .trace(Arc::clone(&store) as Arc<dyn TraceStore>)
         .build()
@@ -1991,7 +1962,7 @@ fn context_with_config_path(path: PathBuf) -> aura_cli::CommandContext {
         .config_path(Some(path))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .build()
         .with_invocation(Invocation::Argv)
@@ -2108,7 +2079,7 @@ async fn config_unset_persists_and_resets() {
         .config_path(Some(tmp.clone()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .build()
         .with_invocation(Invocation::Argv)
@@ -2171,7 +2142,7 @@ fn context_with_skills(registry: SkillRegistry) -> aura_cli::CommandContext {
     ContextBuilder::new(config)
         .skills(Arc::new(registry))
         .tools(Arc::new(ToolRegistry::new()))
-        .channels(Arc::new(RwLock::new(ChannelRegistry::new())))
+        .channels(Arc::new(ChannelRegistry::new()))
         .workspace(Arc::new(WorkspaceManager::new(PathBuf::from("."))))
         .build()
         .with_invocation(Invocation::Argv)

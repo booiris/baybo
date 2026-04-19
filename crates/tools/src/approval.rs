@@ -20,12 +20,14 @@
 //! queue-and-oneshot pattern so each channel only provides a sync waker
 //! callback instead of reimplementing the full gate.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::ChannelType;
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -93,28 +95,27 @@ impl ApprovalGate for AutoDenyGate {
 /// `ChannelRegistry` (populates at registration time) and `ToolExecutor`
 /// (reads at execution time). Channels without a gate get `AutoDenyGate`.
 pub struct ApprovalGateMap {
-    inner: RwLock<HashMap<ChannelType, Arc<dyn ApprovalGate>>>,
+    inner: DashMap<ChannelType, Arc<dyn ApprovalGate>>,
 }
 
 impl ApprovalGateMap {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: DashMap::new(),
         }
     }
 
     /// Register a gate for a channel type. Called by `ChannelRegistry::register`.
     pub fn insert(&self, channel: ChannelType, gate: Arc<dyn ApprovalGate>) {
-        let mut m = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        m.insert(channel, gate);
+        self.inner.insert(channel, gate);
     }
 
     /// Look up the gate for a channel. Returns `AutoDenyGate` when no gate
     /// is registered (fail-closed).
     pub fn get(&self, channel: ChannelType) -> Arc<dyn ApprovalGate> {
-        let m = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        m.get(&channel)
-            .cloned()
+        self.inner
+            .get(&channel)
+            .map(|e| Arc::clone(e.value()))
             .unwrap_or_else(|| Arc::new(AutoDenyGate))
     }
 }
@@ -172,26 +173,20 @@ impl ApprovalQueue {
     /// decision back to the gateway's `/v1/approvals/:id` endpoint.
     /// Replaces any previously-installed resolver.
     pub fn set_resolver(&self, resolver: ResolveFn) {
-        let mut slot = self.resolver.lock().unwrap_or_else(|e| e.into_inner());
-        *slot = Some(resolver);
+        *self.resolver.lock() = Some(resolver);
     }
 
     fn resolver(&self) -> Option<ResolveFn> {
-        self.resolver
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.resolver.lock().clone()
     }
 
     fn push(&self, entry: PendingApproval) {
-        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        q.push_back(entry);
+        self.inner.lock().push_back(entry);
     }
 
     /// Snapshot the head request for rendering. Returns `None` when empty.
     pub fn peek_head(&self) -> Option<ApprovalRequest> {
-        let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        q.front().map(|e| e.req.clone())
+        self.inner.lock().front().map(|e| e.req.clone())
     }
 
     /// Resolve the head entry with the given decision, firing its
@@ -202,10 +197,7 @@ impl ApprovalQueue {
     /// responder (remote mirrors) pop silently; the caller handles
     /// the actual resolution out-of-band.
     pub fn resolve_head(&self, decision: ApprovalDecision) -> bool {
-        let popped = {
-            let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            q.pop_front()
-        };
+        let popped = self.inner.lock().pop_front();
         let Some(pending) = popped else {
             return false;
         };
@@ -227,7 +219,7 @@ impl ApprovalQueue {
     /// wire is not guaranteed and the UI may resolve approvals out
     /// of submission order. Returns `true` when an entry matched.
     pub fn resolve_by_call_id(&self, call_id: &str, decision: ApprovalDecision) -> bool {
-        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.inner.lock();
         if let Some(pos) = q.iter().position(|e| e.req.call_id == call_id)
             && let Some(pending) = q.remove(pos)
         {
@@ -257,7 +249,7 @@ impl ApprovalQueue {
     /// another client resolved the same approval, so we drop the
     /// local mirror without second-guessing the decision.
     pub fn drop_call(&self, call_id: &str) -> bool {
-        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.inner.lock();
         if let Some(pos) = q.iter().position(|e| e.req.call_id == call_id) {
             q.remove(pos);
             return true;
@@ -268,13 +260,11 @@ impl ApprovalQueue {
     /// Snapshot the full queue for listing via a REST endpoint. Order
     /// matches insertion order.
     pub fn list(&self) -> Vec<ApprovalRequest> {
-        let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        q.iter().map(|e| e.req.clone()).collect()
+        self.inner.lock().iter().map(|e| e.req.clone()).collect()
     }
 
     pub fn len(&self) -> usize {
-        let q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        q.len()
+        self.inner.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -6,8 +6,9 @@
 //! the test has driven its work. The capture is dropped at end of
 //! scope and the previous dispatch is restored.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -71,14 +72,12 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
             fields: Vec::new(),
         };
         event.record(&mut visitor);
-        if let Ok(mut v) = self.events.lock() {
-            v.push(CapturedEvent {
-                level: *metadata.level(),
-                target: metadata.target().to_string(),
-                message: visitor.message,
-                fields: visitor.fields,
-            });
-        }
+        self.events.lock().push(CapturedEvent {
+            level: *metadata.level(),
+            target: metadata.target().to_string(),
+            message: visitor.message,
+            fields: visitor.fields,
+        });
     }
 }
 
@@ -91,7 +90,7 @@ pub struct TracingCapture {
 
 impl TracingCapture {
     pub fn events(&self) -> Vec<CapturedEvent> {
-        self.events.lock().map(|v| v.clone()).unwrap_or_default()
+        self.events.lock().to_vec()
     }
 
     pub fn at_level(&self, level: Level) -> Vec<CapturedEvent> {

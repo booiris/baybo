@@ -1,10 +1,9 @@
 //! One-shot tokens for subprocess-spawned channel clients.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use rand::Rng;
-use thiserror::Error;
 
 /// HTTP header the child sends to present its one-shot token.
 pub const CHANNEL_TOKEN_HEADER: &str = "x-aura-channel-token";
@@ -20,18 +19,12 @@ pub struct ClientIdentity {
     pub label: String,
 }
 
-#[derive(Debug, Error)]
-pub enum ChannelTokenError {
-    #[error("channel token table lock poisoned")]
-    Poisoned,
-}
-
 /// In-memory registry of active subprocess tokens keyed by the token
 /// itself. Tokens are hex-encoded 256-bit values so they can be passed
 /// through environment variables without escaping.
 #[derive(Clone, Default)]
 pub struct ChannelTokenTable {
-    inner: Arc<RwLock<HashMap<String, ClientIdentity>>>,
+    inner: Arc<DashMap<String, ClientIdentity>>,
 }
 
 impl ChannelTokenTable {
@@ -41,7 +34,7 @@ impl ChannelTokenTable {
 
     /// Mint a new token and register it against `identity`. The returned
     /// [`TokenHandle`] removes the token on drop.
-    pub fn mint(&self, identity: ClientIdentity) -> Result<TokenHandle, ChannelTokenError> {
+    pub fn mint(&self, identity: ClientIdentity) -> TokenHandle {
         self.register(generate_token(), identity)
     }
 
@@ -50,50 +43,33 @@ impl ChannelTokenTable {
     /// [`generate_token`], pass it to the child via env var, and only
     /// after the child has a PID call back here to register. Returns a
     /// [`TokenHandle`] that revokes on drop.
-    pub fn register(
-        &self,
-        token: String,
-        identity: ClientIdentity,
-    ) -> Result<TokenHandle, ChannelTokenError> {
-        {
-            let mut guard = self
-                .inner
-                .write()
-                .map_err(|_| ChannelTokenError::Poisoned)?;
-            guard.insert(token.clone(), identity);
-        }
-        Ok(TokenHandle {
+    pub fn register(&self, token: String, identity: ClientIdentity) -> TokenHandle {
+        self.inner.insert(token.clone(), identity);
+        TokenHandle {
             token,
             table: self.clone(),
-        })
+        }
     }
 
     /// Look up the identity for a presented token. Returns `None` when
     /// the token is unknown (revoked, never minted, or tampered with).
-    pub fn lookup(&self, token: &str) -> Result<Option<ClientIdentity>, ChannelTokenError> {
-        let guard = self.inner.read().map_err(|_| ChannelTokenError::Poisoned)?;
-        Ok(guard.get(token).cloned())
+    pub fn lookup(&self, token: &str) -> Option<ClientIdentity> {
+        self.inner.get(token).map(|e| e.value().clone())
     }
 
     /// Remove `token` from the table. Idempotent — unknown tokens do
     /// nothing.
-    pub fn revoke(&self, token: &str) -> Result<(), ChannelTokenError> {
-        let mut guard = self
-            .inner
-            .write()
-            .map_err(|_| ChannelTokenError::Poisoned)?;
-        guard.remove(token);
-        Ok(())
+    pub fn revoke(&self, token: &str) {
+        self.inner.remove(token);
     }
 
     /// Count of currently-live tokens. Exposed for diagnostics.
-    pub fn len(&self) -> Result<usize, ChannelTokenError> {
-        let guard = self.inner.read().map_err(|_| ChannelTokenError::Poisoned)?;
-        Ok(guard.len())
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().is_ok_and(|g| g.is_empty())
+        self.inner.is_empty()
     }
 }
 
@@ -111,11 +87,7 @@ impl TokenHandle {
 
 impl Drop for TokenHandle {
     fn drop(&mut self) {
-        // Revocation may fail if the RwLock is poisoned; log and move on
-        // rather than panicking in a Drop.
-        if let Err(e) = self.table.revoke(&self.token) {
-            tracing::warn!(error = %e, "channel token revoke on drop failed");
-        }
+        self.table.revoke(&self.token);
     }
 }
 
@@ -155,8 +127,8 @@ mod tests {
     #[test]
     fn mint_and_lookup_round_trip() {
         let t = ChannelTokenTable::new();
-        let h = t.mint(ident(42, "tg")).unwrap();
-        let got = t.lookup(h.token()).unwrap().unwrap();
+        let h = t.mint(ident(42, "tg"));
+        let got = t.lookup(h.token()).unwrap();
         assert_eq!(got.pid, 42);
         assert_eq!(got.label, "tg");
     }
@@ -164,7 +136,7 @@ mod tests {
     #[test]
     fn token_is_hex_64() {
         let t = ChannelTokenTable::new();
-        let h = t.mint(ident(1, "x")).unwrap();
+        let h = t.mint(ident(1, "x"));
         assert_eq!(h.token().len(), 64);
         assert!(h.token().chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -173,20 +145,20 @@ mod tests {
     fn drop_handle_revokes_token() {
         let t = ChannelTokenTable::new();
         let token_str = {
-            let h = t.mint(ident(7, "c")).unwrap();
+            let h = t.mint(ident(7, "c"));
             h.token().to_owned()
         };
-        assert!(t.lookup(&token_str).unwrap().is_none());
+        assert!(t.lookup(&token_str).is_none());
         assert!(t.is_empty());
     }
 
     #[test]
     fn explicit_revoke_removes_entry() {
         let t = ChannelTokenTable::new();
-        let h = t.mint(ident(3, "c")).unwrap();
+        let h = t.mint(ident(3, "c"));
         let token_str = h.token().to_owned();
-        t.revoke(&token_str).unwrap();
-        assert!(t.lookup(&token_str).unwrap().is_none());
+        t.revoke(&token_str);
+        assert!(t.lookup(&token_str).is_none());
         // Drop is now a no-op.
         drop(h);
     }
@@ -202,9 +174,9 @@ mod tests {
     #[test]
     fn distinct_mints_produce_distinct_tokens() {
         let t = ChannelTokenTable::new();
-        let h1 = t.mint(ident(1, "a")).unwrap();
-        let h2 = t.mint(ident(2, "b")).unwrap();
+        let h1 = t.mint(ident(1, "a"));
+        let h2 = t.mint(ident(2, "b"));
         assert_ne!(h1.token(), h2.token());
-        assert_eq!(t.len().unwrap(), 2);
+        assert_eq!(t.len(), 2);
     }
 }

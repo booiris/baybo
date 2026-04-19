@@ -9,6 +9,7 @@ build = "build.rs"
 test-support = []
 
 [dependencies]
+dashmap = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 sha2 = { workspace = true }

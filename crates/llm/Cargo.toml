@@ -12,6 +12,7 @@ test-support = []
 
 [dependencies]
 aura-model = { workspace = true }
+parking_lot = { workspace = true }
 rig-core = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

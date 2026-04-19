@@ -1,24 +1,26 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use aura_model::ChannelType;
 use aura_tools::ApprovalGateMap;
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::{ChannelAdapter, ChannelError, ChannelStatus, IncomingMessage, Result};
 
 struct ChannelEntry {
     adapter: Arc<dyn ChannelAdapter>,
-    status: ChannelStatus,
+    status: Mutex<ChannelStatus>,
 }
 
 /// Central registry for channel adapters.
 ///
 /// Manages registration, lookup, and lifecycle (start/stop) of all channel
-/// adapters. Replaces the raw `Vec<Box<dyn ChannelAdapter>>` that was
-/// previously passed directly to the router.
+/// adapters. Uses interior mutability so callers hold `Arc<ChannelRegistry>`
+/// directly — no outer `RwLock` is needed, which avoids holding a lock
+/// guard across the `.await` inside `start_all`/`stop_all`.
 pub struct ChannelRegistry {
-    channels: HashMap<ChannelType, ChannelEntry>,
+    channels: DashMap<ChannelType, ChannelEntry>,
     /// Per-channel approval gates, populated at registration time from
     /// [`ChannelAdapter::approval_gate`]. Shared with `ToolExecutor` so
     /// it can resolve the right gate per-call without touching this
@@ -29,7 +31,7 @@ pub struct ChannelRegistry {
 impl ChannelRegistry {
     pub fn new() -> Self {
         Self {
-            channels: HashMap::new(),
+            channels: DashMap::new(),
             gate_map: Arc::new(ApprovalGateMap::new()),
         }
     }
@@ -47,7 +49,7 @@ impl ChannelRegistry {
     /// callers can keep their own handle to the adapter (e.g. route
     /// handlers calling methods directly) without needing a newtype
     /// wrapper just to satisfy the registry.
-    pub fn register(&mut self, adapter: Arc<dyn ChannelAdapter>) -> Result<()> {
+    pub fn register(&self, adapter: Arc<dyn ChannelAdapter>) -> Result<()> {
         let channel_type = adapter.channel_type();
         if self.channels.contains_key(&channel_type) {
             return Err(ChannelError::DuplicateChannel(channel_type.to_string()));
@@ -59,7 +61,7 @@ impl ChannelRegistry {
             channel_type,
             ChannelEntry {
                 adapter,
-                status: ChannelStatus::Registered,
+                status: Mutex::new(ChannelStatus::Registered),
             },
         );
         tracing::info!(%channel_type, "channel registered");
@@ -67,40 +69,50 @@ impl ChannelRegistry {
     }
 
     /// Remove a channel adapter. Stops it first if it is running.
-    pub async fn unregister(&mut self, channel_type: ChannelType) -> Result<()> {
-        let entry = self
+    pub async fn unregister(&self, channel_type: ChannelType) -> Result<()> {
+        let (_, entry) = self
             .channels
             .remove(&channel_type)
             .ok_or_else(|| ChannelError::NotFound(channel_type.to_string()))?;
 
-        if entry.status == ChannelStatus::Running
-            && let Err(e) = entry.adapter.stop().await
-        {
+        let was_running = *entry.status.lock() == ChannelStatus::Running;
+        if was_running && let Err(e) = entry.adapter.stop().await {
             tracing::warn!(%channel_type, error = %e, "error stopping channel during unregister");
         }
         tracing::info!(%channel_type, "channel unregistered");
         Ok(())
     }
 
-    /// Look up a running adapter by channel type.
-    pub fn get(&self, channel_type: ChannelType) -> Option<&dyn ChannelAdapter> {
-        self.channels.get(&channel_type).map(|e| &*e.adapter)
+    /// Look up an owned `Arc` handle for the adapter, so callers can
+    /// release the registry guard before awaiting on the adapter.
+    pub fn get_adapter(&self, channel_type: ChannelType) -> Option<Arc<dyn ChannelAdapter>> {
+        self.channels
+            .get(&channel_type)
+            .map(|e| Arc::clone(&e.adapter))
     }
 
     /// Start all registered channels that are not already running.
-    pub async fn start_all(&mut self, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
-        for (channel_type, entry) in &mut self.channels {
-            if entry.status == ChannelStatus::Running {
-                continue;
-            }
-            match entry.adapter.start(sender.clone()).await {
+    pub async fn start_all(&self, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
+        let to_start: Vec<(ChannelType, Arc<dyn ChannelAdapter>)> = self
+            .channels
+            .iter()
+            .filter(|e| *e.value().status.lock() != ChannelStatus::Running)
+            .map(|e| (*e.key(), Arc::clone(&e.value().adapter)))
+            .collect();
+
+        for (channel_type, adapter) in to_start {
+            match adapter.start(sender.clone()).await {
                 Ok(()) => {
-                    entry.status = ChannelStatus::Running;
+                    if let Some(entry) = self.channels.get(&channel_type) {
+                        *entry.status.lock() = ChannelStatus::Running;
+                    }
                     tracing::info!(%channel_type, "channel started");
                 }
                 Err(e) => {
                     let reason = e.to_string();
-                    entry.status = ChannelStatus::Error(reason);
+                    if let Some(entry) = self.channels.get(&channel_type) {
+                        *entry.status.lock() = ChannelStatus::Error(reason);
+                    }
                     tracing::error!(%channel_type, error = %e, "failed to start channel");
                     return Err(e);
                 }
@@ -110,18 +122,27 @@ impl ChannelRegistry {
     }
 
     /// Stop all running channels. Continues on individual failures.
-    pub async fn stop_all(&mut self) {
-        for (channel_type, entry) in &mut self.channels {
-            if entry.status != ChannelStatus::Running {
-                continue;
-            }
-            match entry.adapter.stop().await {
+    pub async fn stop_all(&self) {
+        let to_stop: Vec<(ChannelType, Arc<dyn ChannelAdapter>)> = self
+            .channels
+            .iter()
+            .filter(|e| *e.value().status.lock() == ChannelStatus::Running)
+            .map(|e| (*e.key(), Arc::clone(&e.value().adapter)))
+            .collect();
+
+        for (channel_type, adapter) in to_stop {
+            match adapter.stop().await {
                 Ok(()) => {
-                    entry.status = ChannelStatus::Stopped;
+                    if let Some(entry) = self.channels.get(&channel_type) {
+                        *entry.status.lock() = ChannelStatus::Stopped;
+                    }
                     tracing::info!(%channel_type, "channel stopped");
                 }
                 Err(e) => {
-                    entry.status = ChannelStatus::Error(e.to_string());
+                    let reason = e.to_string();
+                    if let Some(entry) = self.channels.get(&channel_type) {
+                        *entry.status.lock() = ChannelStatus::Error(reason);
+                    }
                     tracing::error!(%channel_type, error = %e, "failed to stop channel");
                 }
             }
@@ -129,10 +150,10 @@ impl ChannelRegistry {
     }
 
     /// Return the status of all registered channels.
-    pub fn list(&self) -> Vec<(ChannelType, &ChannelStatus)> {
+    pub fn list(&self) -> Vec<(ChannelType, ChannelStatus)> {
         self.channels
             .iter()
-            .map(|(ct, entry)| (*ct, &entry.status))
+            .map(|e| (*e.key(), e.value().status.lock().clone()))
             .collect()
     }
 
@@ -205,15 +226,15 @@ mod tests {
 
     #[test]
     fn register_and_get() {
-        let mut reg = ChannelRegistry::new();
+        let reg = ChannelRegistry::new();
         reg.register(fake(ChannelType::Tui)).unwrap();
-        assert!(reg.get(ChannelType::Tui).is_some());
-        assert!(reg.get(ChannelType::Http).is_none());
+        assert!(reg.get_adapter(ChannelType::Tui).is_some());
+        assert!(reg.get_adapter(ChannelType::Http).is_none());
     }
 
     #[test]
     fn duplicate_register_fails() {
-        let mut reg = ChannelRegistry::new();
+        let reg = ChannelRegistry::new();
         reg.register(fake(ChannelType::Tui)).unwrap();
         let err = reg.register(fake(ChannelType::Tui)).unwrap_err();
         assert!(matches!(err, ChannelError::DuplicateChannel(_)));
@@ -221,23 +242,23 @@ mod tests {
 
     #[tokio::test]
     async fn unregister_removes_adapter() {
-        let mut reg = ChannelRegistry::new();
+        let reg = ChannelRegistry::new();
         reg.register(fake(ChannelType::Http)).unwrap();
         reg.unregister(ChannelType::Http).await.unwrap();
-        assert!(reg.get(ChannelType::Http).is_none());
+        assert!(reg.get_adapter(ChannelType::Http).is_none());
         assert!(reg.is_empty());
     }
 
     #[tokio::test]
     async fn unregister_not_found() {
-        let mut reg = ChannelRegistry::new();
+        let reg = ChannelRegistry::new();
         let err = reg.unregister(ChannelType::Tui).await.unwrap_err();
         assert!(matches!(err, ChannelError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn start_all_and_stop_all() {
-        let mut reg = ChannelRegistry::new();
+        let reg = ChannelRegistry::new();
         reg.register(fake(ChannelType::Tui)).unwrap();
         reg.register(fake(ChannelType::Http)).unwrap();
 
@@ -245,17 +266,17 @@ mod tests {
         reg.start_all(tx).await.unwrap();
 
         let statuses = reg.list();
-        assert!(statuses.iter().all(|(_, s)| **s == ChannelStatus::Running));
+        assert!(statuses.iter().all(|(_, s)| *s == ChannelStatus::Running));
 
         reg.stop_all().await;
 
         let statuses = reg.list();
-        assert!(statuses.iter().all(|(_, s)| **s == ChannelStatus::Stopped));
+        assert!(statuses.iter().all(|(_, s)| *s == ChannelStatus::Stopped));
     }
 
     #[test]
     fn list_returns_all_registered() {
-        let mut reg = ChannelRegistry::new();
+        let reg = ChannelRegistry::new();
         reg.register(fake(ChannelType::Tui)).unwrap();
         reg.register(fake(ChannelType::Http)).unwrap();
         assert_eq!(reg.len(), 2);

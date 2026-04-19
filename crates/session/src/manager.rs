@@ -141,12 +141,12 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
 
     use async_trait::async_trait;
     use aura_model::{ChannelType, Session, User};
     use aura_storage::session::Result as StoreResult;
     use chrono::{DateTime, Duration, Utc};
+    use parking_lot::Mutex;
 
     use super::{SessionError, SessionManager, SessionStore};
 
@@ -165,24 +165,24 @@ mod tests {
     #[async_trait]
     impl SessionStore for MemorySessionStore {
         async fn get(&self, session_id: &str) -> StoreResult<Option<Session>> {
-            let data = self.data.lock().unwrap();
+            let data = self.data.lock();
             Ok(data.get(session_id).cloned())
         }
 
         async fn save(&self, session: &Session) -> StoreResult<()> {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock();
             data.insert(session.id.clone(), session.clone());
             Ok(())
         }
 
         async fn delete(&self, session_id: &str) -> StoreResult<()> {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock();
             data.remove(session_id);
             Ok(())
         }
 
         async fn list_expired(&self, before: DateTime<Utc>) -> StoreResult<Vec<String>> {
-            let data = self.data.lock().unwrap();
+            let data = self.data.lock();
             let expired = data
                 .values()
                 .filter(|s| s.last_active < before)
@@ -192,7 +192,7 @@ mod tests {
         }
 
         async fn list_all(&self) -> StoreResult<Vec<Session>> {
-            let data = self.data.lock().unwrap();
+            let data = self.data.lock();
             Ok(data.values().cloned().collect())
         }
     }

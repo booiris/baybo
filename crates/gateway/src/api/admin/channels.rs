@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use tokio::sync::RwLock;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -32,13 +31,12 @@ pub fn routes() -> OpenApiRouter<AdminState> {
 async fn list_channels(
     State(state): State<AdminState>,
 ) -> Result<Json<ListResponse<ChannelEntry>>> {
-    let items = snapshot(&state.channel_registry).await;
+    let items = snapshot(&state.channel_registry);
     Ok(Json(ListResponse::new(items)))
 }
 
-async fn snapshot(registry: &Arc<RwLock<ChannelRegistry>>) -> Vec<ChannelEntry> {
-    let guard = registry.read().await;
-    guard
+fn snapshot(registry: &Arc<ChannelRegistry>) -> Vec<ChannelEntry> {
+    registry
         .list()
         .into_iter()
         .map(|(ct, status)| ChannelEntry {
