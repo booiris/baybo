@@ -10,16 +10,16 @@ use aura_cron::{CronJob, CronSchedule, TriggerAction};
 use aura_model::ChannelType;
 
 use crate::api::dto::{CreateCronRequest, ListResponse};
-use crate::server::ApiState;
+use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/cron", get(list_cron).post(create_cron))
         .route("/cron/{id}", get(get_cron).delete(delete_cron))
 }
 
-async fn list_cron(State(state): State<ApiState>) -> Result<Json<ListResponse<CronJob>>> {
+async fn list_cron(State(state): State<AdminState>) -> Result<Json<ListResponse<CronJob>>> {
     let items = state
         .cron_scheduler
         .list_all_jobs()
@@ -29,7 +29,7 @@ async fn list_cron(State(state): State<ApiState>) -> Result<Json<ListResponse<Cr
 }
 
 async fn create_cron(
-    State(state): State<ApiState>,
+    State(state): State<AdminState>,
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronJob>)> {
     let schedule = CronSchedule::cron(&req.schedule);
@@ -49,7 +49,10 @@ async fn create_cron(
     Ok((StatusCode::CREATED, Json(job)))
 }
 
-async fn get_cron(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Json<CronJob>> {
+async fn get_cron(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<CronJob>> {
     let job = state
         .cron_scheduler
         .get_job(&id)
@@ -59,7 +62,10 @@ async fn get_cron(State(state): State<ApiState>, Path(id): Path<String>) -> Resu
     Ok(Json(job))
 }
 
-async fn delete_cron(State(state): State<ApiState>, Path(id): Path<String>) -> Result<StatusCode> {
+async fn delete_cron(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
     state
         .cron_scheduler
         .delete_job(&id)

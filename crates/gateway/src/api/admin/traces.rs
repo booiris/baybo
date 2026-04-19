@@ -5,15 +5,15 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::routing::get;
 
-use crate::server::ApiState;
+use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<AdminState> {
     Router::new().route("/traces/{session_id}", get(get_trace))
 }
 
 async fn get_trace(
-    State(state): State<ApiState>,
+    State(state): State<AdminState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let trace = state

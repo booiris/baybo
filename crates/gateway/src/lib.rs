@@ -1,25 +1,31 @@
 //! Aura HTTP gateway.
 //!
-//! Runs an axum server that both
+//! Exposes two listeners:
 //!
-//! 1. implements [`aura_channels::ChannelAdapter`] for `ChannelType::Http`
-//!    so chat traffic flows through the normal Router path, and
-//! 2. exposes an admin REST + SSE API mirroring the CLI surface.
+//! * **Admin** — TCP, bearer-token authenticated. Config / status /
+//!   jobs / cron / memory / traces / skills / tools / llm and a
+//!   read-only channel list. Surfaces the same data the CLI does; no
+//!   chat content flows through.
+//! * **Channel** — Unix domain socket, peer-credential +
+//!   PSK/token authenticated. Session CRUD, message submit + SSE, and
+//!   tool approvals. This is the listener the TUI and future sidecar
+//!   channel plugins talk to.
 //!
 //! The gateway is driven by the CLI command tree `aura gateway ...`:
-//! `start` runs the server in the foreground, `install` writes a platform
-//! service unit, `enable` mints the auth token (if absent) and marks the
-//! service to autostart at boot.
+//! `start` runs both listeners in the foreground; `install` writes a
+//! platform service unit; `enable` mints the admin token (if absent) and
+//! marks the service to autostart at boot.
 
 pub mod api;
-pub mod auth;
+pub mod auth_admin;
+pub mod auth_channel;
 pub mod config;
 pub mod error;
 pub mod http_adapter;
 pub mod installer;
 pub mod server;
 
-pub use crate::auth::GatewayToken;
+pub use crate::auth_admin::AdminToken;
 pub use crate::config::RuntimeGatewayConfig;
 pub use crate::error::{GatewayError, Result};
 pub use crate::http_adapter::{ApprovalEvent, HttpAdapter, SseEvent};

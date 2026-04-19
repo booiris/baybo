@@ -5,7 +5,7 @@
 //! singleton, the manager graph, and the router.
 //!
 //! Endpoint and token are read from the workspace config / vault:
-//! `config.gateway.bind_address:port` for the URL, `GatewayToken::get`
+//! `config.gateway.bind_address:port` for the URL, `AdminToken::get`
 //! for the bearer token. There are no CLI or env overrides — the TUI
 //! and the gateway share the same workspace, so the same config is
 //! authoritative for both.
@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use aura_agent::service::ShutdownSignal;
 use aura_cli::CliInputHistoryStore;
 use aura_config::AuraConfig;
-use aura_gateway::GatewayToken;
+use aura_gateway::AdminToken;
 use aura_tui::TuiAdapter;
 use aura_tui::TuiLogSink;
 use aura_tui::client::{
@@ -168,7 +168,7 @@ fn resolve_endpoint(config: &AuraConfig) -> String {
 /// Read the bearer token from the workspace vault.
 async fn resolve_token(config: &AuraConfig) -> anyhow::Result<String> {
     let vault = build_secret_vault(config).await?;
-    let token = GatewayToken::new(vault)
+    let token = AdminToken::new(vault)
         .get()
         .await?
         .ok_or_else(|| anyhow::anyhow!("no gateway token available; run `aura gateway start`"))?;

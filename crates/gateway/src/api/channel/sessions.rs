@@ -9,17 +9,17 @@ use axum::{Json, response::IntoResponse};
 use aura_model::{ChannelType, Session, User};
 
 use crate::api::dto::{CreateSessionRequest, ListResponse};
-use crate::server::ApiState;
+use crate::server::ChannelState;
 use crate::{GatewayError, Result};
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<ChannelState> {
     Router::new()
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/messages", get(list_messages))
 }
 
-async fn list_sessions(State(state): State<ApiState>) -> Result<Json<ListResponse<Session>>> {
+async fn list_sessions(State(state): State<ChannelState>) -> Result<Json<ListResponse<Session>>> {
     let items = state
         .session_manager
         .list()
@@ -29,7 +29,7 @@ async fn list_sessions(State(state): State<ApiState>) -> Result<Json<ListRespons
 }
 
 async fn create_session(
-    State(state): State<ApiState>,
+    State(state): State<ChannelState>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse> {
     let channel = req.channel.unwrap_or(ChannelType::Http);
@@ -49,7 +49,7 @@ async fn create_session(
 }
 
 async fn get_session(
-    State(state): State<ApiState>,
+    State(state): State<ChannelState>,
     Path(id): Path<String>,
 ) -> Result<Json<Session>> {
     let session = state
@@ -62,7 +62,7 @@ async fn get_session(
 }
 
 async fn delete_session(
-    State(state): State<ApiState>,
+    State(state): State<ChannelState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode> {
     state
@@ -74,7 +74,7 @@ async fn delete_session(
 }
 
 async fn list_messages(
-    State(state): State<ApiState>,
+    State(state): State<ChannelState>,
     Path(id): Path<String>,
 ) -> Result<Json<ListResponse<aura_model::ChatMessage>>> {
     let items = state

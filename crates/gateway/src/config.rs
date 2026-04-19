@@ -10,7 +10,7 @@ use crate::{GatewayError, Result};
 /// front.
 #[derive(Debug, Clone)]
 pub struct RuntimeGatewayConfig {
-    pub bind: SocketAddr,
+    pub admin_bind: SocketAddr,
     pub cors_allowed_origins: Vec<String>,
     pub shutdown_grace: Duration,
 }
@@ -24,7 +24,7 @@ impl RuntimeGatewayConfig {
                 reason: format!("invalid socket address: {e}"),
             })?;
         Ok(Self {
-            bind: addr,
+            admin_bind: addr,
             cors_allowed_origins: config.cors_allowed_origins.clone(),
             shutdown_grace: Duration::from_secs(config.shutdown_grace_secs),
         })

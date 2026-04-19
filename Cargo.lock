@@ -368,6 +368,7 @@ dependencies = [
  "aura-config",
  "aura-cron",
  "aura-gateway",
+ "aura-gateway-auth",
  "aura-job",
  "aura-llm",
  "aura-model",
@@ -394,6 +395,20 @@ dependencies = [
  "tower-http 0.6.8",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aura-gateway-auth"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hkdf",
+ "rand 0.10.0",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

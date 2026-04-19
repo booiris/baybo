@@ -7,9 +7,9 @@ use axum::routing::get;
 use serde::Serialize;
 
 use crate::Result;
-use crate::server::ApiState;
+use crate::server::AdminState;
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<AdminState> {
     Router::new().route("/llm", get(get_llm))
 }
 
@@ -19,7 +19,7 @@ pub struct LlmInfo {
     pub provider: String,
 }
 
-async fn get_llm(State(state): State<ApiState>) -> Result<Json<LlmInfo>> {
+async fn get_llm(State(state): State<AdminState>) -> Result<Json<LlmInfo>> {
     let info = state.llm_client.model_info();
     Ok(Json(LlmInfo {
         model_id: info.id.clone(),

@@ -1,14 +1,4 @@
 //! `/v1/approvals` — list, resolve, and stream pending tool approvals.
-//!
-//! Tool calls that trigger the approval gate block until a client
-//! resolves them via `POST /v1/approvals/:call_id`. Clients learn about
-//! new approvals either by polling `GET /v1/approvals` or by
-//! subscribing to the SSE stream at `GET /v1/approvals/stream` —
-//! lifecycle events (added / resolved) are broadcast there.
-//!
-//! Approvals key on `ChannelType::Http`, not on a specific chat session,
-//! so this lives on a standalone stream rather than on the per-session
-//! SSE at `/v1/sessions/:id/stream`.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -30,10 +20,10 @@ use aura_tools::{ApprovalDecision, ApprovalRequest};
 
 use crate::api::dto::ListResponse;
 use crate::http_adapter::ApprovalEvent;
-use crate::server::ApiState;
+use crate::server::ChannelState;
 use crate::{GatewayError, Result};
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<ChannelState> {
     Router::new()
         .route("/approvals", get(list_approvals))
         .route("/approvals/stream", get(stream_approvals))
@@ -52,14 +42,14 @@ struct ResolveResponse {
 }
 
 async fn list_approvals(
-    State(state): State<ApiState>,
+    State(state): State<ChannelState>,
 ) -> Result<Json<ListResponse<ApprovalRequest>>> {
     let items = state.adapter.approval_queue().list();
     Ok(Json(ListResponse::new(items)))
 }
 
 async fn resolve_approval(
-    State(state): State<ApiState>,
+    State(state): State<ChannelState>,
     Path(call_id): Path<String>,
     Json(req): Json<ResolveRequest>,
 ) -> Result<impl IntoResponse> {
@@ -83,7 +73,7 @@ async fn resolve_approval(
 }
 
 async fn stream_approvals(
-    State(state): State<ApiState>,
+    State(state): State<ChannelState>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
     let rx = state.adapter.subscribe_approvals();
     let broadcast = BroadcastStream::new(rx);

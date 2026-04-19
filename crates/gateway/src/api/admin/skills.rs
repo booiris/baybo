@@ -7,13 +7,13 @@ use axum::routing::get;
 
 use crate::Result;
 use crate::api::dto::ListResponse;
-use crate::server::ApiState;
+use crate::server::AdminState;
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<AdminState> {
     Router::new().route("/skills", get(list_skills))
 }
 
-async fn list_skills(State(state): State<ApiState>) -> Result<Json<ListResponse<String>>> {
+async fn list_skills(State(state): State<AdminState>) -> Result<Json<ListResponse<String>>> {
     let items = state.skill_registry.list();
     Ok(Json(ListResponse::new(items)))
 }

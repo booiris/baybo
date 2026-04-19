@@ -5,17 +5,6 @@
 //! through to the same on-disk `aura.json` that `aura config set/unset`
 //! targets: we do not mutate the running process's `Arc<AuraConfig>` in
 //! place, so callers must restart the gateway to pick the change up.
-//! This matches the CLI's semantics (see `crates/cli/src/commands/config.rs`)
-//! and sidesteps having to wrap every manager's config snapshot behind
-//! an `ArcSwap`.
-//!
-//! Both mutation endpoints fail with `BadRequest` when the gateway was
-//! started without a config file (pure-default boot) — there is no
-//! destination to write the change to.
-//!
-//! The body shape matches the CLI:
-//!   * `PUT  { "path": "llm.model", "value": "gpt-5" }`
-//!   * `DELETE { "path": "llm.model" }`
 
 use axum::Json;
 use axum::Router;
@@ -24,9 +13,9 @@ use axum::routing::{delete, get, put};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
-use crate::server::ApiState;
+use crate::server::AdminState;
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/config", get(get_config))
         .route("/config", put(set_config))
@@ -48,19 +37,17 @@ struct UnsetRequest {
 struct MutateResponse {
     path: String,
     written_to: String,
-    /// Always `true`: the gateway keeps its in-memory snapshot and
-    /// requires a restart for the new value to take effect.
     requires_restart: bool,
 }
 
-async fn get_config(State(state): State<ApiState>) -> Result<axum::Json<serde_json::Value>> {
+async fn get_config(State(state): State<AdminState>) -> Result<axum::Json<serde_json::Value>> {
     let value = serde_json::to_value(&*state.config)
         .map_err(|e| crate::GatewayError::Internal(e.to_string()))?;
     Ok(axum::Json(value))
 }
 
 async fn set_config(
-    State(state): State<ApiState>,
+    State(state): State<AdminState>,
     Json(req): Json<SetRequest>,
 ) -> Result<Json<MutateResponse>> {
     let target = state.config_path.as_ref().ok_or_else(|| {
@@ -88,7 +75,7 @@ async fn set_config(
 }
 
 async fn unset_config(
-    State(state): State<ApiState>,
+    State(state): State<AdminState>,
     Json(req): Json<UnsetRequest>,
 ) -> Result<Json<MutateResponse>> {
     let target = state.config_path.as_ref().ok_or_else(|| {

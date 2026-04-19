@@ -6,9 +6,9 @@ use axum::routing::get;
 use serde::Serialize;
 
 use crate::Result;
-use crate::server::ApiState;
+use crate::server::AdminState;
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<AdminState> {
     Router::new().route("/status", get(status))
 }
 
@@ -20,7 +20,7 @@ pub struct StatusResponse {
     pub jobs_in_flight: usize,
 }
 
-async fn status(State(state): State<ApiState>) -> Result<axum::Json<StatusResponse>> {
+async fn status(State(state): State<AdminState>) -> Result<axum::Json<StatusResponse>> {
     let sessions = state
         .session_manager
         .list()

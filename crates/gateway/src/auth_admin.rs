@@ -1,3 +1,10 @@
+//! Admin TCP bearer-token auth.
+//!
+//! The admin listener hosts config / status / jobs / cron / memory /
+//! traces / skills / tools / llm and a read-only channel list — no chat
+//! content. A single bearer token stored in the secret vault under
+//! `gateway.admin_token` guards every `/v1/*` route.
+
 use std::sync::Arc;
 
 use aura_security::SecretVault;
@@ -10,20 +17,20 @@ use rand::Rng;
 
 use crate::{GatewayError, Result};
 
-const TOKEN_SECRET_NAME: &str = "gateway.auth_token";
+const TOKEN_SECRET_NAME: &str = "gateway.admin_token";
 const TOKEN_BYTE_LEN: usize = 32;
 
 /// Token lifecycle manager backed by [`SecretVault`].
-pub struct GatewayToken {
+pub struct AdminToken {
     vault: Arc<SecretVault>,
 }
 
-impl GatewayToken {
+impl AdminToken {
     pub fn new(vault: Arc<SecretVault>) -> Self {
         Self { vault }
     }
 
-    /// Read the current token, returning `None` if it has not been minted yet.
+    /// Read the current token, or `None` if none is stored.
     pub async fn get(&self) -> Result<Option<String>> {
         match self
             .vault
@@ -38,8 +45,8 @@ impl GatewayToken {
         }
     }
 
-    /// Mint a new 256-bit token if one is not already present. Returns the
-    /// current token either way.
+    /// Mint a new 256-bit token if one is not already present. Returns
+    /// the current token either way.
     pub async fn mint_if_absent(&self) -> Result<String> {
         if let Some(existing) = self.get().await? {
             return Ok(existing);
@@ -69,13 +76,13 @@ fn generate_token() -> String {
     hex::encode(bytes)
 }
 
-/// State shared with the auth middleware.
+/// State shared with the admin auth middleware.
 #[derive(Clone)]
-pub struct AuthState {
-    pub(crate) expected: Arc<String>,
+pub struct AdminAuthState {
+    expected: Arc<String>,
 }
 
-impl AuthState {
+impl AdminAuthState {
     pub fn new(token: String) -> Self {
         Self {
             expected: Arc::new(token),
@@ -84,22 +91,20 @@ impl AuthState {
 }
 
 /// Axum middleware: extracts the token (Authorization header preferred,
-/// `?token=` query fallback), constant-time compares it against the
+/// `?token=` query fallback), constant-time compares against the
 /// vault-stored value, and strips `token` from the URI before passing
-/// the request on — so `tower_http::trace::TraceLayer` does not log it.
-pub async fn require_token(
-    State(state): State<AuthState>,
+/// the request on so `tower_http::trace::TraceLayer` does not log it.
+pub async fn require_admin_token(
+    State(state): State<AdminAuthState>,
     mut req: Request<Body>,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
-    let presented = extract_token(&req);
-    let Some(presented) = presented else {
+    let Some(presented) = extract_token(&req) else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    if !constant_time_eq(state.expected.as_bytes(), presented.as_bytes()) {
+    if !aura_gateway_auth::constant_time_eq(state.expected.as_bytes(), presented.as_bytes()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    // Sanitise the URI so tracing/access logs never see the token.
     if let Some(sanitised) = sanitise_uri(req.uri()) {
         *req.uri_mut() = sanitised;
     }
@@ -107,14 +112,12 @@ pub async fn require_token(
 }
 
 fn extract_token(req: &Request<Body>) -> Option<String> {
-    // Authorization: Bearer <token>
     if let Some(value) = req.headers().get(axum::http::header::AUTHORIZATION)
         && let Ok(s) = value.to_str()
         && let Some(rest) = s.strip_prefix("Bearer ")
     {
         return Some(rest.trim().to_owned());
     }
-    // ?token=<token>
     if let Some(query) = req.uri().query() {
         for pair in query.split('&') {
             if let Some(rest) = pair.strip_prefix("token=") {
@@ -123,17 +126,6 @@ fn extract_token(req: &Request<Body>) -> Option<String> {
         }
     }
     None
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 fn sanitise_uri(uri: &Uri) -> Option<Uri> {
@@ -153,9 +145,6 @@ fn sanitise_uri(uri: &Uri) -> Option<Uri> {
 }
 
 fn urlencoding_decode(s: &str) -> String {
-    // Minimal decoder — %XX sequences and '+' → ' '. Sufficient for token
-    // bytes (ASCII hex from `generate_token`) but also forgiving if a user
-    // URL-encodes it.
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -200,13 +189,6 @@ fn from_hex(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn constant_time_eq_detects_mismatch() {
-        assert!(constant_time_eq(b"abcd", b"abcd"));
-        assert!(!constant_time_eq(b"abcd", b"abce"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-    }
 
     #[test]
     fn sanitise_uri_strips_token() {

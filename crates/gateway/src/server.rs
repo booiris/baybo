@@ -1,16 +1,23 @@
 //! axum server assembly and shared state for the gateway.
 //!
-//! The server is split into two concerns:
+//! The gateway exposes two listeners:
 //!
-//! * [`ApiState`] — the handle each route handler needs. Cloned into
-//!   every request via axum's `State` extractor; all fields are `Arc`
-//!   or thin cloneable types so cloning is cheap.
-//! * [`GatewayServer`] — lifecycle wrapper that binds the socket,
-//!   attaches middleware, and drives `axum::serve` to completion.
+//! * **Admin** — TCP, bearer-token authenticated. Hosts config,
+//!   status, jobs, cron, memory, traces, skills, tools, llm, and a
+//!   read-only channel list. No chat content flows through these
+//!   endpoints.
+//! * **Channel** — Unix domain socket, peer-credential +
+//!   PSK/token authenticated (see `uds` and `auth_channel` modules).
+//!   Hosts session CRUD, message submit/stream, and approvals — the
+//!   routes the TUI and future sidecar channel plugins talk to.
 //!
-//! `GatewayDeps` is the caller-facing input: the runtime builds the
-//! managers and passes them here; the gateway doesn't reach into the
-//! runtime or construct anything else.
+//! [`AdminState`] and [`ChannelState`] split the old monolithic
+//! `ApiState` so each listener only sees the managers it needs. Both
+//! are cheap to clone — every field is an `Arc` or a small value.
+//!
+//! [`GatewayServer`] owns the admin listener. The UDS half lives in
+//! [`crate::uds`] and is driven by the gateway CLI alongside the
+//! admin server.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -32,7 +39,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::api;
-use crate::auth::{AuthState, require_token};
+use crate::auth_admin::{AdminAuthState, require_admin_token};
 use crate::config::RuntimeGatewayConfig;
 use crate::http_adapter::HttpAdapter;
 use crate::{GatewayError, Result};
@@ -41,8 +48,9 @@ use crate::{GatewayError, Result};
 ///
 /// Built by the runtime (`src/runtime.rs`) and handed to
 /// [`GatewayServer::new`]. The gateway takes references (cloning Arcs)
-/// into [`ApiState`]; the caller keeps the originals so the same
-/// managers can be shared with the router / TUI / cron loop.
+/// into [`AdminState`] / [`ChannelState`]; the caller keeps the
+/// originals so the same managers can be shared with the router / TUI
+/// / cron loop.
 pub struct GatewayDeps {
     pub config: Arc<AuraConfig>,
     /// Path to the on-disk `aura.json` the gateway was loaded from, if
@@ -62,19 +70,16 @@ pub struct GatewayDeps {
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<RwLock<ChannelRegistry>>,
     pub llm_client: Arc<LlmClient>,
-    pub auth_token: String,
+    /// Bearer token for the admin TCP listener. Stored in the vault as
+    /// `gateway.admin_token`.
+    pub admin_token: String,
 }
 
-/// Per-request shared state. Cheap to clone — every field is an `Arc`
-/// or small owned value.
+/// State shared with admin TCP handlers. Cheap to clone.
 #[derive(Clone)]
-pub struct ApiState {
+pub struct AdminState {
     pub config: Arc<AuraConfig>,
-    /// See [`GatewayDeps::config_path`]. Threaded into handlers so
-    /// config-mutation routes can write back to the same file the
-    /// server booted from.
     pub config_path: Option<PathBuf>,
-    pub adapter: Arc<HttpAdapter>,
     pub session_manager: Arc<SessionManager>,
     pub job_manager: Arc<JobManager>,
     pub cron_scheduler: Arc<CronScheduler>,
@@ -84,18 +89,22 @@ pub struct ApiState {
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<RwLock<ChannelRegistry>>,
     pub llm_client: Arc<LlmClient>,
-    /// Pretty form of the bind address for status output. We don't
-    /// expose the parsed `SocketAddr` so handlers can't reach through
-    /// and mutate it.
+    /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
 
-impl ApiState {
+/// State shared with channel UDS handlers. Cheap to clone.
+#[derive(Clone)]
+pub struct ChannelState {
+    pub adapter: Arc<HttpAdapter>,
+    pub session_manager: Arc<SessionManager>,
+}
+
+impl AdminState {
     fn from_deps(deps: &GatewayDeps) -> Self {
         Self {
             config: Arc::clone(&deps.config),
             config_path: deps.config_path.clone(),
-            adapter: Arc::clone(&deps.adapter),
             session_manager: Arc::clone(&deps.session_manager),
             job_manager: Arc::clone(&deps.job_manager),
             cron_scheduler: Arc::clone(&deps.cron_scheduler),
@@ -105,11 +114,23 @@ impl ApiState {
             tool_registry: Arc::clone(&deps.tool_registry),
             channel_registry: Arc::clone(&deps.channel_registry),
             llm_client: Arc::clone(&deps.llm_client),
-            bind_display: deps.runtime_config.bind.to_string(),
+            bind_display: deps.runtime_config.admin_bind.to_string(),
         }
     }
 }
 
+impl ChannelState {
+    pub fn from_deps(deps: &GatewayDeps) -> Self {
+        Self {
+            adapter: Arc::clone(&deps.adapter),
+            session_manager: Arc::clone(&deps.session_manager),
+        }
+    }
+}
+
+/// TCP admin server. Long-lived; owns its own axum `Router` built from
+/// the caller-supplied [`GatewayDeps`]. The companion UDS listener is
+/// started separately (see `crate::uds::serve`) with the same deps.
 pub struct GatewayServer {
     bind: SocketAddr,
     router: Router,
@@ -118,9 +139,9 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     pub fn new(deps: GatewayDeps) -> Self {
-        let bind = deps.runtime_config.bind;
+        let bind = deps.runtime_config.admin_bind;
         let shutdown_grace = deps.runtime_config.shutdown_grace;
-        let router = build_router(deps);
+        let router = build_admin_router(deps);
         Self {
             bind,
             router,
@@ -128,18 +149,18 @@ impl GatewayServer {
         }
     }
 
-    /// Resolve the bind address the server was configured with.
+    /// Admin TCP bind address.
     pub fn bind(&self) -> SocketAddr {
         self.bind
     }
 
-    /// Configured grace period for in-flight requests on shutdown.
     pub fn shutdown_grace(&self) -> std::time::Duration {
         self.shutdown_grace
     }
 
-    /// Run the server to completion. Returns once [`ShutdownSignal`] is
-    /// triggered and axum has drained in-flight requests.
+    /// Run the admin server to completion. Returns once
+    /// [`ShutdownSignal`] fires and axum has drained in-flight
+    /// requests.
     pub async fn run(self, shutdown: ShutdownSignal) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(self.bind)
             .await
@@ -147,7 +168,7 @@ impl GatewayServer {
                 addr: self.bind.to_string(),
                 reason: e.to_string(),
             })?;
-        tracing::info!(bind = %self.bind, "gateway listening");
+        tracing::info!(bind = %self.bind, listener = "admin", "gateway listening");
         let shutdown_fut = async move {
             shutdown.wait().await;
         };
@@ -158,20 +179,42 @@ impl GatewayServer {
     }
 }
 
-fn build_router(deps: GatewayDeps) -> Router {
-    let state = ApiState::from_deps(&deps);
-    let auth_state = AuthState::new(deps.auth_token.clone());
+fn build_admin_router(deps: GatewayDeps) -> Router {
+    let state = AdminState::from_deps(&deps);
+    let auth_state = AdminAuthState::new(deps.admin_token.clone());
 
     let cors = build_cors(&deps.runtime_config.cors_allowed_origins);
 
-    let v1 = api::v1_router()
+    let v1 = api::admin::v1_router()
         .with_state(state)
-        .layer(middleware::from_fn_with_state(auth_state, require_token));
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            require_admin_token,
+        ));
 
     Router::new()
         .merge(api::health::routes())
         .nest("/v1", v1)
         .layer(cors)
+        .layer(TraceLayer::new_for_http())
+}
+
+/// Build the router served on the channel UDS. Called by
+/// [`crate::uds::serve`]. The auth middleware is applied to the `/v1`
+/// routes only — health lives outside so orchestrators can poll it
+/// without an auth handshake.
+pub fn build_channel_router(
+    deps: &GatewayDeps,
+    auth_state: crate::auth_channel::ChannelAuthState,
+) -> Router {
+    let state = ChannelState::from_deps(deps);
+    let v1 = crate::auth_channel::attach(
+        api::channel::v1_router().with_state(state),
+        auth_state,
+    );
+    Router::new()
+        .merge(api::health::routes())
+        .nest("/v1", v1)
         .layer(TraceLayer::new_for_http())
 }
 

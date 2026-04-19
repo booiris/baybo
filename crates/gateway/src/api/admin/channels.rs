@@ -1,4 +1,6 @@
-//! `/v1/channels` — list registered channels and their statuses.
+//! `/v1/channels` — read-only list of registered channels and their
+//! statuses. Lives on the admin listener so operators can see channel
+//! registrations; messaging/session routes live on the channel UDS.
 
 use std::sync::Arc;
 
@@ -14,9 +16,9 @@ use aura_model::ChannelType;
 
 use crate::Result;
 use crate::api::dto::ListResponse;
-use crate::server::ApiState;
+use crate::server::AdminState;
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<AdminState> {
     Router::new().route("/channels", get(list_channels))
 }
 
@@ -26,7 +28,9 @@ pub struct ChannelEntry {
     pub status: String,
 }
 
-async fn list_channels(State(state): State<ApiState>) -> Result<Json<ListResponse<ChannelEntry>>> {
+async fn list_channels(
+    State(state): State<AdminState>,
+) -> Result<Json<ListResponse<ChannelEntry>>> {
     let items = snapshot(&state.channel_registry).await;
     Ok(Json(ListResponse::new(items)))
 }

@@ -21,7 +21,7 @@ use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
-use aura_gateway::{GatewayDeps, GatewayServer, GatewayToken, HttpAdapter, RuntimeGatewayConfig};
+use aura_gateway::{GatewayDeps, GatewayServer, AdminToken, HttpAdapter, RuntimeGatewayConfig};
 
 use crate::boot;
 use crate::runtime;
@@ -165,7 +165,7 @@ async fn uninstall(_config: &AuraConfig) -> anyhow::Result<()> {
 
 async fn enable(config: &AuraConfig) -> anyhow::Result<()> {
     let vault = runtime::build_secret_vault(config).await?;
-    let token_mgr = GatewayToken::new(vault);
+    let token_mgr = AdminToken::new(vault);
     let token = token_mgr.mint_if_absent().await?;
 
     // Best-effort mark the unit enabled — not fatal if the service
@@ -185,7 +185,7 @@ async fn enable(config: &AuraConfig) -> anyhow::Result<()> {
 
 async fn token_show(config: &AuraConfig) -> anyhow::Result<()> {
     let vault = runtime::build_secret_vault(config).await?;
-    let token_mgr = GatewayToken::new(vault);
+    let token_mgr = AdminToken::new(vault);
     match token_mgr.get().await? {
         Some(t) => println!("{t}"),
         None => {
@@ -199,7 +199,7 @@ async fn token_show(config: &AuraConfig) -> anyhow::Result<()> {
 
 async fn token_rotate(config: &AuraConfig) -> anyhow::Result<()> {
     let vault = runtime::build_secret_vault(config).await?;
-    let token_mgr = GatewayToken::new(vault);
+    let token_mgr = AdminToken::new(vault);
     let token = token_mgr.rotate().await?;
     println!("{token}");
     Ok(())
@@ -221,7 +221,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // workspace can `aura gateway start` without a prior `enable`.
     let token = {
         let vault = runtime::build_secret_vault(&config).await?;
-        GatewayToken::new(vault).mint_if_absent().await?
+        AdminToken::new(vault).mint_if_absent().await?
     };
 
     // Build the leak detector (with the auth token registered as a
@@ -283,7 +283,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         tool_registry: Arc::clone(&graph.tool_registry),
         channel_registry: Arc::clone(&graph.channels_registry),
         llm_client: Arc::clone(&graph.llm_client),
-        auth_token: token.clone(),
+        admin_token: token.clone(),
     };
     let server = GatewayServer::new(deps);
 

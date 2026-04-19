@@ -9,17 +9,17 @@ use axum::routing::{delete, get};
 use aura_model::{MemoryCategory, MemoryEntry};
 
 use crate::api::dto::{ListResponse, MemoryListQuery, StoreMemoryRequest};
-use crate::server::ApiState;
+use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
-pub fn routes() -> Router<ApiState> {
+pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/memory", get(list_memory).post(store_memory))
         .route("/memory/{id}", delete(delete_memory))
 }
 
 async fn list_memory(
-    State(state): State<ApiState>,
+    State(state): State<AdminState>,
     Query(q): Query<MemoryListQuery>,
 ) -> Result<Json<ListResponse<MemoryEntry>>> {
     let items = if let Some(query) = q.q.as_deref() {
@@ -35,7 +35,7 @@ async fn list_memory(
 }
 
 async fn store_memory(
-    State(state): State<ApiState>,
+    State(state): State<AdminState>,
     Json(req): Json<StoreMemoryRequest>,
 ) -> Result<Json<MemoryEntry>> {
     let entry = MemoryEntry::new(
@@ -53,7 +53,7 @@ async fn store_memory(
 }
 
 async fn delete_memory(
-    State(state): State<ApiState>,
+    State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode> {
     state

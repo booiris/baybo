@@ -20,6 +20,7 @@ members = [
     "crates/config",
     "crates/cli",
     "crates/gateway",
+    "crates/gateway-auth",
     "crates/tui",
     "crates/integration-tests",
 ]
@@ -51,6 +52,7 @@ aura-cron = { path = "crates/cron" }
 aura-config = { path = "crates/config" }
 aura-cli = { path = "crates/cli" }
 aura-gateway = { path = "crates/gateway" }
+aura-gateway-auth = { path = "crates/gateway-auth" }
 aura-tui = { path = "crates/tui" }
 aura-integration-tests = { path = "crates/integration-tests" }
 # External dependencies

@@ -52,21 +52,21 @@ use tracing::{error, info};
 use crate::boot;
 
 /// Build a [`LeakDetector`] seeded from config, optionally registering an
-/// extra `LeakAction::Replace` rule for the gateway auth token so any log
-/// line that happens to echo it is masked on disk. The same `Arc` is
+/// extra `LeakAction::Replace` rule for the gateway admin token so any
+/// log line that happens to echo it is masked on disk. The same `Arc` is
 /// then shared between the tracing file redactor and [`build_managers`],
 /// keeping redaction coverage consistent across every log surface.
 pub fn build_leak_detector(
     security: &aura_config::SecurityConfig,
-    gateway_auth_token: Option<&str>,
+    gateway_admin_token: Option<&str>,
 ) -> Arc<LeakDetector> {
     let mut detector = boot::build_leak_detector(security);
-    if let Some(token) = gateway_auth_token
+    if let Some(token) = gateway_admin_token
         && !token.is_empty()
     {
         match Regex::new(&regex::escape(token)) {
             Ok(pattern) => detector.add_rule(LeakDetectionRule {
-                name: "gateway.auth_token".into(),
+                name: "gateway.admin_token".into(),
                 pattern,
                 action: aura_security::LeakAction::Replace,
             }),
