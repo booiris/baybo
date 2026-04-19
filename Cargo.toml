@@ -86,7 +86,13 @@ rand = "0.10"
 libsql = "0.9"
 axum = "0.8"
 hyper = { version = "1", features = ["http1", "server", "client"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client-legacy", "http1"] }
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "server",
+    "server-auto",
+    "client-legacy",
+    "http1",
+] }
 http-body-util = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
 teloxide = { version = "0.17", features = ["macros"] }
@@ -149,3 +155,10 @@ async-trait = { workspace = true }
 hex = { workspace = true }
 clap = { workspace = true }
 regex = { workspace = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
