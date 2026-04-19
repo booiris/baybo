@@ -1,33 +1,33 @@
 //! CLI entrypoint for the interactive chat loop (`aura tui`).
 //!
-//! `aura tui` is a thin UI on top of an HTTP+SSE [`GatewayTransport`]
-//! pointed at `aura gateway` — the gateway holds the workspace
-//! singleton, the manager graph, and the router.
+//! `aura tui` is a thin UI on top of a UDS-backed [`GatewayTransport`]
+//! pointed at `aura gateway`'s channel listener — the gateway holds the
+//! workspace singleton, the manager graph, and the router.
 //!
-//! Endpoint and token are read from the workspace config / vault:
-//! `config.gateway.bind_address:port` for the URL, `AdminToken::get`
-//! for the bearer token. There are no CLI or env overrides — the TUI
-//! and the gateway share the same workspace, so the same config is
-//! authoritative for both.
+//! The socket path is fixed at `<workspace>/channel.sock` so both
+//! gateway and TUI resolve it identically. The TUI authenticates with
+//! a per-install PSK derived via `aura_gateway_auth::effective_tui_psk`;
+//! both ends read the same on-disk salt to arrive at the same key.
 //!
-//! If `/healthz` is unreachable the command prints a concrete block
-//! telling the operator how to start a gateway and exits. The dev-only
-//! `--dev-auto-gateway` flag short-circuits that error by spawning one
-//! as a subprocess — compiled in only under `cfg(debug_assertions)`,
-//! so release builds never see it.
+//! If `/healthz` on the channel socket is unreachable the command
+//! prints a concrete block telling the operator how to start a gateway
+//! and exits. The dev-only `--dev-auto-gateway` flag short-circuits
+//! that error by spawning one as a subprocess — compiled in only under
+//! `cfg(debug_assertions)`, so release builds never see it.
 
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use aura_agent::service::ShutdownSignal;
 use aura_cli::CliInputHistoryStore;
 use aura_config::AuraConfig;
-use aura_gateway::AdminToken;
+use aura_gateway_auth::effective_tui_psk;
 use aura_tui::TuiAdapter;
 use aura_tui::TuiLogSink;
 use aura_tui::client::{
     GatewayClient, GatewayDashboardProvider, GatewaySlashHandler, GatewayTransport,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::runtime::force_exit_watchdog;
 use crate::runtime::{build_secret_vault, install_signal_handler};
@@ -51,13 +51,9 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     });
     info!("Aura - Intelligent Assistant Framework starting");
 
-    let endpoint = resolve_endpoint(&config);
-    let token = resolve_token(&config).await?;
+    let (channel_socket, psk) = resolve_channel_auth(&config)?;
 
-    let client = Arc::new(
-        GatewayClient::new(&endpoint, &token)
-            .map_err(|e| anyhow::anyhow!("build gateway client: {e}"))?,
-    );
+    let client = Arc::new(GatewayClient::new(channel_socket.clone(), psk));
 
     // Keep the auto-spawned child alive for the lifetime of the TUI.
     // Dropping the guard sends SIGTERM (with a SIGKILL fallback) so we
@@ -71,20 +67,21 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
             // Propagate the parent's resolved config path so the
             // spawned gateway reads the same workspace — otherwise a
             // `--config` flag on the TUI would point the child at a
-            // different vault, and they'd disagree on the token.
+            // different vault, and they'd disagree on the socket path.
             let config_path = crate::boot::resolve_config_path();
             _auto_gateway = Some(
-                dev_auto::spawn_and_wait_ready(&endpoint, Arc::clone(&client), config_path).await?,
+                dev_auto::spawn_and_wait_ready(&channel_socket, Arc::clone(&client), config_path)
+                    .await?,
             );
         } else {
-            return Err(unreachable_gateway_error(&endpoint, &e.to_string()));
+            return Err(unreachable_gateway_error(&channel_socket, &e.to_string()));
         }
         #[cfg(not(debug_assertions))]
         {
-            return Err(unreachable_gateway_error(&endpoint, &e.to_string()));
+            return Err(unreachable_gateway_error(&channel_socket, &e.to_string()));
         }
     }
-    info!(endpoint = %endpoint, "connected to gateway");
+    info!(socket = %channel_socket.display(), "connected to gateway");
 
     // Resolve the session id: either resume the one the operator
     // passed, or create a fresh one so the SSE stream has something to
@@ -108,14 +105,8 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
         }
     };
 
-    // Slash-command allow-list needs the skill catalog up front.
-    let skills = client.list_skills().await.unwrap_or_else(|e| {
-        warn!("could not list skills from gateway: {e}");
-        Vec::new()
-    });
-
     let transport = Arc::new(GatewayTransport::new(Arc::clone(&client)));
-    let slash_handler = Arc::new(GatewaySlashHandler::new(Arc::clone(&client), skills));
+    let slash_handler = Arc::new(GatewaySlashHandler::new(Arc::clone(&client)));
     let dashboard_provider = Arc::new(GatewayDashboardProvider::new(Arc::clone(&client)));
 
     // Input history stays local to the host — it's personal and
@@ -147,37 +138,31 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     // A TUI redraw loop won't block tokio, but the SSE pump holds a
     // long-lived HTTP response — bound teardown so the process always
-    // exits even if reqwest can't be persuaded to close promptly.
+    // exits even if hyper can't be persuaded to close promptly.
     force_exit_watchdog(std::time::Duration::from_secs(5));
 
     task_tracker.shutdown().await;
     Ok(())
 }
 
-/// Resolve the gateway base URL from workspace config. `0.0.0.0` is
-/// a bind wildcard, not a dial target, so rewrite it to loopback.
-fn resolve_endpoint(config: &AuraConfig) -> String {
-    let bind = if config.gateway.bind_address == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        &config.gateway.bind_address
-    };
-    format!("http://{}:{}", bind, config.gateway.port)
+/// Derive the channel UDS socket path and effective TUI PSK from the
+/// workspace config. The path is fixed at `<workspace>/channel.sock` —
+/// not configurable, so both gateway and TUI resolve it identically.
+/// The PSK is mixed with the per-install salt file the gateway writes
+/// on its first start; if the salt is missing we fall back to creating
+/// it here so `aura tui --dev-auto-gateway` works on a fresh workspace.
+fn resolve_channel_auth(config: &AuraConfig) -> anyhow::Result<(PathBuf, [u8; 32])> {
+    let workspace_root = PathBuf::from(&config.workspace.path);
+    let socket_path = workspace_root.join("channel.sock");
+    let psk = effective_tui_psk(workspace_root.as_path())
+        .map_err(|e| anyhow::anyhow!("derive channel PSK: {e}"))?;
+    Ok((socket_path, psk))
 }
 
-/// Read the bearer token from the workspace vault.
-async fn resolve_token(config: &AuraConfig) -> anyhow::Result<String> {
-    let vault = build_secret_vault(config).await?;
-    let token = AdminToken::new(vault)
-        .get()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no gateway token available; run `aura gateway start`"))?;
-    Ok(token)
-}
-
-fn unreachable_gateway_error(endpoint: &str, underlying: &str) -> anyhow::Error {
+fn unreachable_gateway_error(socket: &std::path::Path, underlying: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "no aura gateway reachable at {endpoint}\n  - start it with:       aura gateway start\n  (underlying error: {underlying})"
+        "no aura gateway reachable at {socket}\n  - start it with:       aura gateway start\n  (underlying error: {underlying})",
+        socket = socket.display()
     )
 }
 
@@ -188,7 +173,7 @@ mod dev_auto {
     //! Deliberately isolated in its own module so stripping the
     //! feature also strips the `std::process::Command` call site.
 
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::sync::Arc;
     use std::time::Duration;
@@ -215,11 +200,11 @@ mod dev_auto {
         }
     }
 
-    /// Spawn `aura gateway start` as a subprocess and poll `/healthz`
-    /// until it responds (or the timeout elapses). Returns a guard
-    /// that kills the child on drop.
+    /// Spawn `aura gateway start` as a subprocess and poll the channel
+    /// socket's `/healthz` until it responds (or the timeout elapses).
+    /// Returns a guard that kills the child on drop.
     pub async fn spawn_and_wait_ready(
-        endpoint: &str,
+        socket: &Path,
         client: Arc<GatewayClient>,
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<AutoGatewayGuard> {
@@ -250,13 +235,16 @@ mod dev_auto {
         let mut wait = Duration::from_millis(100);
         loop {
             if client.healthz().await.is_ok() {
-                info!(endpoint, "auto-gateway ready");
+                info!(socket = %socket.display(), "auto-gateway ready");
                 return Ok(guard);
             }
             if tokio::time::Instant::now() >= deadline {
                 // Drop guard kills the child as we bail.
                 let _ = guard.child.take().map(|mut c| c.start_kill());
-                anyhow::bail!("auto-gateway did not become reachable at {endpoint} within 15s");
+                anyhow::bail!(
+                    "auto-gateway did not become reachable at {} within 15s",
+                    socket.display()
+                );
             }
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(Duration::from_secs(1));

@@ -1,17 +1,17 @@
 //! [`DashboardProvider`] backed by a [`GatewayClient`].
 //!
-//! Each view kind fans out to a single `/v1/...` list endpoint and
-//! flattens the response into a [`DashboardSnapshot`]. The client-side
-//! fan-out means no new aggregate endpoint is needed on the gateway.
-//! Errors from the gateway surface as an empty-rows snapshot with an
-//! error footer so the TUI renders gracefully.
+//! The TUI talks to the gateway's channel UDS only, which exposes
+//! session state but not skills / jobs / memory (those live on the
+//! admin TCP surface). The Sessions view fetches live data; the other
+//! three variants of [`ViewKind`] return a static "admin-only"
+//! snapshot so the TUI renders a clear message rather than silently
+//! failing.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_channels::{DashboardProvider, DashboardSnapshot, ViewKind};
 
-use crate::client::dto::{JobSummary, MemorySummary};
 use crate::client::http::GatewayClient;
 
 /// [`DashboardProvider`] that pulls live data off an `aura gateway`.
@@ -29,59 +29,28 @@ impl GatewayDashboardProvider {
 impl DashboardProvider for GatewayDashboardProvider {
     async fn snapshot(&self, kind: ViewKind) -> DashboardSnapshot {
         match kind {
-            ViewKind::Skills => skills_snapshot(&self.client).await,
-            ViewKind::Jobs => jobs_snapshot(&self.client).await,
             ViewKind::Sessions => sessions_snapshot(&self.client).await,
-            ViewKind::Memory => memory_snapshot(&self.client).await,
+            ViewKind::Skills => admin_only_snapshot("Skills", vec!["NAME".into()]),
+            ViewKind::Jobs => admin_only_snapshot(
+                "Jobs",
+                vec![
+                    "ID".into(),
+                    "SESSION".into(),
+                    "STATUS".into(),
+                    "CREATED".into(),
+                ],
+            ),
+            ViewKind::Memory => admin_only_snapshot(
+                "Memory",
+                vec![
+                    "ID".into(),
+                    "USER".into(),
+                    "CATEGORY".into(),
+                    "IMPORTANCE".into(),
+                    "CONTENT".into(),
+                ],
+            ),
         }
-    }
-}
-
-async fn skills_snapshot(client: &GatewayClient) -> DashboardSnapshot {
-    match client.list_skills().await {
-        Ok(mut names) => {
-            names.sort();
-            let total = names.len();
-            let rows: Vec<Vec<String>> = names.into_iter().map(|n| vec![n]).collect();
-            DashboardSnapshot {
-                title: "Skills".into(),
-                columns: vec!["NAME".into()],
-                rows,
-                footer: Some(format!("{total} skill(s) · from gateway")),
-            }
-        }
-        Err(e) => error_snapshot("Skills", vec!["NAME".into()], &e.to_string()),
-    }
-}
-
-async fn jobs_snapshot(client: &GatewayClient) -> DashboardSnapshot {
-    let columns = vec![
-        "ID".into(),
-        "SESSION".into(),
-        "STATUS".into(),
-        "CREATED".into(),
-    ];
-    match client.list_jobs().await {
-        Ok(jobs) => {
-            let rows: Vec<Vec<String>> = jobs
-                .iter()
-                .map(|j: &JobSummary| {
-                    vec![
-                        j.id.clone(),
-                        j.session_id.clone(),
-                        j.status.clone(),
-                        j.created_at.to_rfc3339(),
-                    ]
-                })
-                .collect();
-            DashboardSnapshot {
-                title: "Jobs".into(),
-                columns,
-                rows,
-                footer: None,
-            }
-        }
-        Err(e) => error_snapshot("Jobs", columns, &e.to_string()),
     }
 }
 
@@ -112,75 +81,20 @@ async fn sessions_snapshot(client: &GatewayClient) -> DashboardSnapshot {
                 footer: None,
             }
         }
-        Err(e) => error_snapshot("Sessions", columns, &e.to_string()),
+        Err(e) => DashboardSnapshot {
+            title: "Sessions".into(),
+            columns,
+            rows: Vec::new(),
+            footer: Some(format!("error: {e}")),
+        },
     }
 }
 
-async fn memory_snapshot(client: &GatewayClient) -> DashboardSnapshot {
-    let columns = vec![
-        "ID".into(),
-        "USER".into(),
-        "CATEGORY".into(),
-        "IMPORTANCE".into(),
-        "CONTENT".into(),
-    ];
-    match client.list_memory().await {
-        Ok(mut entries) => {
-            entries.sort_by(|a, b| {
-                b.importance
-                    .partial_cmp(&a.importance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let rows: Vec<Vec<String>> = entries
-                .iter()
-                .map(|e: &MemorySummary| {
-                    vec![
-                        e.id.clone(),
-                        e.user_id.clone(),
-                        category_label(&e.category).into(),
-                        format!("{:.2}", e.importance),
-                        truncate(&e.content, 80),
-                    ]
-                })
-                .collect();
-            DashboardSnapshot {
-                title: "Memory".into(),
-                columns,
-                rows,
-                footer: None,
-            }
-        }
-        Err(e) => error_snapshot("Memory", columns, &e.to_string()),
-    }
-}
-
-fn error_snapshot(title: &str, columns: Vec<String>, err: &str) -> DashboardSnapshot {
+fn admin_only_snapshot(title: &str, columns: Vec<String>) -> DashboardSnapshot {
     DashboardSnapshot {
         title: title.into(),
         columns,
         rows: Vec::new(),
-        footer: Some(format!("error: {err}")),
-    }
-}
-
-fn category_label(s: &str) -> &'static str {
-    match s {
-        "UserPreference" => "preference",
-        "KeyFact" => "fact",
-        _ => "other",
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.replace('\n', " ")
-    } else {
-        let mut out: String = s
-            .replace('\n', " ")
-            .chars()
-            .take(max.saturating_sub(1))
-            .collect();
-        out.push('…');
-        out
+        footer: Some("admin surface — use `aura cli` (not reachable over channel UDS)".into()),
     }
 }

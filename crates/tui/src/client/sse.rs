@@ -1,4 +1,4 @@
-//! Minimal Server-Sent Events reader over a `reqwest` byte stream.
+//! Minimal Server-Sent Events reader over a transport byte stream.
 //!
 //! The gateway emits frames of the form:
 //!
@@ -15,9 +15,10 @@
 //! pairs; comments and unknown fields are skipped per the WHATWG SSE
 //! grammar.
 //!
-//! We don't pull in an SSE crate because the parser is tiny and the
-//! reqwest `stream` feature already gives us `Bytes` chunks — the only
-//! extra mechanic is a ring buffer to glue split frames back together.
+//! The parser is transport-agnostic — it consumes any
+//! `Stream<Item = ClientResult<Bytes>>`, so the UDS-backed hyper body
+//! (the TUI's only transport today) and any future byte stream reuse
+//! the same frame reassembly.
 
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -37,12 +38,17 @@ struct SseFrame {
     data: String,
 }
 
+/// Byte stream feeding an [`SseStream`]. Abstracted over the transport
+/// (reqwest response body, hyper UDS body) so the frame parser is
+/// reused.
+pub type SseByteStream = Pin<Box<dyn Stream<Item = ClientResult<Bytes>> + Send>>;
+
 /// Stream of deserialized events from an SSE endpoint.
 ///
 /// Parameterized over `T` so both the session stream (`SseEvent`) and
 /// the approval stream (`ApprovalEvent`) reuse the same transport.
 pub struct SseStream<T> {
-    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    inner: SseByteStream,
     buffer: BytesMut,
     /// In-flight frame accumulator, reset on each blank line.
     current_event: String,
@@ -64,10 +70,12 @@ impl<T> SseStream<T>
 where
     T: DeserializeOwned + 'static,
 {
-    /// Wrap the byte stream of a `reqwest::Response`.
-    pub fn from_response(resp: reqwest::Response) -> Self {
+    /// Wrap any transport-level `Bytes` stream (hyper, …). Errors are
+    /// already in [`ClientError`] shape so the transport glue does the
+    /// mapping, not this parser.
+    pub fn from_bytes_stream(inner: SseByteStream) -> Self {
         Self {
-            inner: Box::pin(resp.bytes_stream()),
+            inner,
             buffer: BytesMut::new(),
             current_event: String::new(),
             current_data: String::new(),
@@ -179,7 +187,7 @@ where
                     this.buffer.extend_from_slice(&chunk);
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(ClientError::Transport(e.to_string()))));
+                    return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(None) => {
                     if this.has_fields {
@@ -214,22 +222,16 @@ mod tests {
     use futures::stream;
 
     fn stream_from_chunks(chunks: Vec<&'static [u8]>) -> SseStream<SseEvent> {
-        // Build a stream of Bytes chunks that looks like reqwest's
-        // bytes_stream output. We can't call `from_response` directly
-        // without a live HTTP server, so substitute the internals.
+        // Build a stream of Bytes chunks that looks like the reqwest or
+        // hyper body stream output. We can't call `from_response`
+        // directly without a live HTTP server, so feed
+        // `from_bytes_stream` a synthetic stream.
         let inner = stream::iter(
             chunks
                 .into_iter()
-                .map(|c| Ok::<Bytes, reqwest::Error>(Bytes::from_static(c))),
+                .map(|c| Ok::<Bytes, ClientError>(Bytes::from_static(c))),
         );
-        SseStream {
-            inner: Box::pin(inner),
-            buffer: BytesMut::new(),
-            current_event: String::new(),
-            current_data: String::new(),
-            has_fields: false,
-            _marker: PhantomData,
-        }
+        SseStream::from_bytes_stream(Box::pin(inner))
     }
 
     #[tokio::test]

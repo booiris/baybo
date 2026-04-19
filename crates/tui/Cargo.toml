@@ -7,7 +7,11 @@ edition.workspace = true
 aura-model = { workspace = true }
 aura-tools = { workspace = true }
 aura-channels = { workspace = true }
-reqwest = { workspace = true, features = ["json", "stream"] }
+aura-gateway-auth = { workspace = true }
+hyper = { workspace = true }
+http-body-util = { workspace = true }
+hyper-util = { workspace = true }
+hex = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -26,3 +30,5 @@ shell-words = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true }
