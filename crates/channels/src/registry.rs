@@ -177,7 +177,7 @@ impl Default for ChannelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OutgoingMessage, Result as ChannelResult};
+    use crate::{AgentOutput, Result as ChannelResult};
     use async_trait::async_trait;
 
     struct FakeAdapter {
@@ -194,20 +194,7 @@ mod tests {
             Ok(())
         }
 
-        async fn send_response(&self, _response: OutgoingMessage) -> ChannelResult<()> {
-            Ok(())
-        }
-
-        async fn send_stream_delta(&self, _session_id: &str, _delta: &str) -> ChannelResult<()> {
-            Ok(())
-        }
-
-        async fn send_notice(
-            &self,
-            _session_id: &str,
-            _level: crate::NoticeLevel,
-            _text: &str,
-        ) -> ChannelResult<()> {
+        async fn send(&self, _output: AgentOutput) -> ChannelResult<()> {
             Ok(())
         }
 

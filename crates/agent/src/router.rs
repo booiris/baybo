@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage, OutgoingMessage};
+use aura_channels::{
+    AgentOutput, ChannelAdapter, ChannelRegistry, IncomingMessage, OutgoingMessage,
+};
 use aura_model::{Session, User};
 
 use aura_cron::CronTriggerEvent;
@@ -315,84 +317,74 @@ impl Router {
     }
 
     async fn handle_agent_output(&self, output: AgentOutput) {
-        match output {
+        let (session_id, channel) = match &output {
             AgentOutput::Delta {
                 session_id,
                 channel,
-                text,
-            } => {
-                let adapter = self.channels.get_adapter(channel);
-                match adapter {
-                    Some(adapter) => {
-                        if let Err(e) = adapter.send_stream_delta(&session_id, &text).await {
-                            error!(
-                                channel = %channel,
-                                session_id = %session_id,
-                                error = %e,
-                                "failed to forward stream delta"
-                            );
-                        }
-                    }
-                    None => {
-                        debug!(
-                            channel = %channel,
-                            "no adapter registered for streaming delta"
-                        );
-                    }
-                }
+                ..
             }
-            AgentOutput::Message(outgoing) => self.handle_outgoing(outgoing).await,
-            AgentOutput::Notice {
+            | AgentOutput::Notice {
                 session_id,
                 channel,
-                level,
-                text,
-            } => {
-                let adapter = self.channels.get_adapter(channel);
-                match adapter {
-                    Some(adapter) => {
-                        if let Err(e) = adapter.send_notice(&session_id, level, &text).await {
-                            error!(
-                                channel = %channel,
-                                session_id = %session_id,
-                                error = %e,
-                                "failed to deliver notice"
-                            );
-                        }
-                    }
-                    None => {
-                        debug!(
-                            channel = %channel,
-                            "no adapter registered for notice"
-                        );
-                    }
-                }
+                ..
+            } => (session_id.clone(), *channel),
+            AgentOutput::Message(outgoing) => (outgoing.session_id.clone(), outgoing.channel),
+        };
+
+        // `Message` is the only variant that carries user-visible prose
+        // subject to policy egress — sanitize it in place before dispatch.
+        // `Delta` chunks are intentionally exempt (incremental streaming;
+        // the final `Message` is the authoritative sanitized egress per
+        // `docs/modules/security.md`), and `Notice` is system-authored.
+        let output = match output {
+            AgentOutput::Message(outgoing) => {
+                AgentOutput::Message(self.sanitize_outgoing(outgoing).await)
             }
-        }
+            other => other,
+        };
+
+        let Some(adapter) = self.channels.get_adapter(channel) else {
+            debug!(
+                channel = %channel,
+                session_id = %session_id,
+                "no adapter registered for agent output"
+            );
+            return;
+        };
+
+        self.send_to_adapter(adapter, output, session_id, channel)
+            .await;
     }
 
-    async fn handle_outgoing(&self, mut outgoing: OutgoingMessage) {
+    /// Run the security gateway over an outgoing message. Returns the
+    /// (possibly mutated) message — if the session vanished or the gateway
+    /// errored, the message is forwarded as-is; the gateway mutates in
+    /// place even on error (redaction notice replaces the content) so we
+    /// still send what it produced rather than the original.
+    async fn sanitize_outgoing(&self, mut outgoing: OutgoingMessage) -> OutgoingMessage {
         let span = tracing::info_span!(
-            "handle_outgoing",
+            "sanitize_outgoing",
             session_id = %outgoing.session_id,
             channel = %outgoing.channel,
         );
         let _guard = span.enter();
 
-        // Sanitize output through the security gateway before sending.
-        let session_id = outgoing.session_id.clone();
-        let session = match self.session_manager.get(&session_id).await {
+        let session = match self.session_manager.get(&outgoing.session_id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
-                // If session is gone, create a minimal one for sanitization.
-                warn!(session_id = %session_id, "session not found for outgoing sanitization, skipping security scan");
-                self.send_to_channel(outgoing).await;
-                return;
+                warn!(
+                    session_id = %outgoing.session_id,
+                    "session not found for outgoing sanitization, skipping security scan"
+                );
+                return outgoing;
             }
             Err(e) => {
-                error!(session_id = %session_id, error = %e, "failed to load session for output sanitization");
-                self.send_to_channel(outgoing).await;
-                return;
+                error!(
+                    session_id = %outgoing.session_id,
+                    error = %e,
+                    "failed to load session for output sanitization"
+                );
+                return outgoing;
             }
         };
 
@@ -402,36 +394,28 @@ impl Router {
             .await
         {
             warn!(
-                session_id = %session_id,
+                session_id = %outgoing.session_id,
                 error = %e,
                 "security gateway blocked or modified outgoing message"
             );
-            // Even if sanitization errors, we do not send the original — it was
-            // already mutated by the gateway (content replaced with redaction notice).
         }
-
-        self.send_to_channel(outgoing).await;
+        outgoing
     }
 
-    async fn send_to_channel(&self, outgoing: OutgoingMessage) {
-        let channel_type = outgoing.channel;
-        let adapter = self.channels.get_adapter(channel_type);
-        match adapter {
-            Some(adapter) => {
-                if let Err(e) = adapter.send_response(outgoing).await {
-                    error!(
-                        channel = %channel_type,
-                        error = %e,
-                        "failed to send response through channel"
-                    );
-                }
-            }
-            None => {
-                error!(
-                    channel = %channel_type,
-                    "no adapter found for channel type"
-                );
-            }
+    async fn send_to_adapter(
+        &self,
+        adapter: std::sync::Arc<dyn ChannelAdapter>,
+        output: AgentOutput,
+        session_id: String,
+        channel: aura_model::ChannelType,
+    ) {
+        if let Err(e) = adapter.send(output).await {
+            error!(
+                channel = %channel,
+                session_id = %session_id,
+                error = %e,
+                "failed to deliver agent output"
+            );
         }
     }
 }

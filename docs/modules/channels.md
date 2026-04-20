@@ -23,28 +23,38 @@ This crate contains the `ChannelAdapter` trait and built-in adapters that requir
 
 Channels contain no routing, rate limiting, or security logic. They depend only on `model` and `session`. Business logic belongs to `agent` and `security`.
 
-### Optional streaming output
+### Single outbound entrypoint
 
-Adapters may opt into incremental rendering by overriding `send_stream_delta`.
-The default implementation is a no-op, so channels that only support one-shot
-delivery (HTTP responses, webhook posts) ignore deltas and wait for the final
-`send_response` call. Adapters that can paint partial output — the built-in
-`TuiAdapter`, for instance — accumulate deltas as they arrive and reconcile
-against the canonical `OutgoingMessage` when the turn finishes. Delivery
-ordering per `session_id` is the caller's responsibility; adapters assume
-chunks arrive in the order the LLM emitted them.
+All outbound traffic goes through one trait method:
+`ChannelAdapter::send(&self, output: AgentOutput) -> Result<()>`. The
+adapter dispatches on the `AgentOutput` variant itself (`Delta`,
+`Message`, `Notice`) — the router no longer fans out by variant, it just
+looks up the adapter by `ChannelType` and forwards the event. This
+keeps the trait surface small and makes it trivial to add new variants
+without touching the router: add a variant to `AgentOutput` and a match
+arm per adapter.
+
+### Streaming vs. final output
+
+`AgentOutput::Delta` carries incremental text chunks; `AgentOutput::Message`
+carries the final, canonical response. Adapters that can render partial
+output — the built-in `TuiAdapter`, for instance — accumulate deltas as
+they arrive and reconcile against the `Message` when the turn finishes.
+Transports that only support one-shot delivery (HTTP one-shot, webhook
+posts) may drop deltas in their `send` match arm and act only on
+`Message`. Delivery ordering per `session_id` is the caller's
+responsibility; adapters assume chunks arrive in the order the LLM
+emitted them.
 
 ### Out-of-band notices
 
-`AgentOutput` carries three variants (`Delta`, `Message`, `Notice`).
-`Notice { level: NoticeLevel, text }` is the path for events the user
-didn't prompt for but should see — e.g. "a skill you invoked was rated
-suspicious and was kept with a warning" or "…was blocked". The router
-fans notices out to the per-session channel adapter via
-`ChannelAdapter::send_notice`; the default trait method is a no-op so
-transports without a side-channel (one-shot HTTP) can drop them. The
-built-in TUI forwards notices into the same scrollback surface it uses
-for `warn!` / `error!` tracing events, preserving colour coding.
+`AgentOutput::Notice { level: NoticeLevel, text, … }` is the path for
+events the user didn't prompt for but should see — e.g. "a skill you
+invoked was rated suspicious and was kept with a warning" or "…was
+blocked". Adapters without a side-channel for this (one-shot HTTP) may
+drop it in their `send` match arm. The built-in TUI forwards notices
+into the same scrollback surface it uses for `warn!` / `error!` tracing
+events, preserving colour coding.
 
 ### Unified message mapping
 

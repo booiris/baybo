@@ -268,7 +268,7 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 
 ## Constraints
 
-- Each `send_response` produces exactly one persisted chat line. Deltas may precede it, but they are ephemeral — the final message supersedes whatever was streamed and is the canonical record.
+- Each `AgentOutput::Message` delivered to the TUI produces exactly one persisted chat line. `AgentOutput::Delta` chunks may precede it, but they are ephemeral — the final message supersedes whatever was streamed and is the canonical record.
 - Renderer state (`AppState`) is mutated only on the event-loop task. External code uses the mpsc event channel; there is no shared `Mutex<AppState>`.
 - Input/state mutation in `app.rs` and key translation in `keymap.rs` are pure — unit tests exercise them without a terminal. Renderer tests use Ratatui's `TestBackend` when needed.
 - Dashboard providers must not block; all built-in providers are `async` and call manager methods directly on `tokio`.

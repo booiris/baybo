@@ -42,9 +42,9 @@ channel plugin running as a child of the gateway has no admin surface
 to hit even if compromised. Both listeners share the same manager
 graph (`SessionManager`, `JobManager`, …) and the same
 `HttpAdapter` — routing and observability stay uniform. The adapter
-contract (`send_response`, `send_stream_delta`, `send_notice`,
-`approval_gate`) goes through `ChannelRegistry` dispatch exactly as
-TUI/telegram/discord do; `POST /v1/sessions/:id/messages` rebuilds the
+contract (`send(AgentOutput)`, `approval_gate`) goes through
+`ChannelRegistry` dispatch exactly as TUI/telegram/discord do;
+`POST /v1/sessions/:id/messages` rebuilds the
 `User` with `ChannelType::Http` before submission so outgoing events
 route back through the same channel.
 
@@ -150,16 +150,19 @@ write.
 
 ### Adapter owns SSE fan-out
 
-`HttpAdapter` keeps a `RwLock<HashMap<SessionId, broadcast::Sender<SseEvent>>>`.
-`subscribe` returns a receiver (creating the broadcast channel on
-first use); `submit` pushes an `IncomingMessage` into the router's
-`incoming_tx` captured during `ChannelAdapter::start`. Outgoing hooks
-(`send_response`, `send_stream_delta`, `send_notice`) fan out to the
-matching sender via `broadcast::Sender::send`, which is lossy only when
-a subscriber is lagging past the buffer — in that case
-`BroadcastStream` surfaces `Lagged` to the SSE handler, which emits an
-`error` event and continues. `stop` clears the map, which drops all
-senders and signals EOF on every live stream.
+`HttpAdapter` keeps a `DashMap<SessionId, broadcast::Sender<SseEvent>>`
+plus a `OnceLock<mpsc::Sender<IncomingMessage>>` captured during
+`ChannelAdapter::start`. `subscribe` returns a receiver (creating the
+broadcast channel on first use); `submit` reads the `OnceLock` to push
+an `IncomingMessage` into the router. The single outbound entrypoint
+`ChannelAdapter::send(AgentOutput)` matches the variant (`Delta`,
+`Message`, `Notice`) and fans out to the matching broadcast sender.
+`broadcast::Sender::send` is lossy only when a subscriber is lagging
+past the buffer — in that case `BroadcastStream` surfaces `Lagged` to
+the SSE handler, which emits an `error` event and continues. `stop`
+clears the map, which drops all senders and signals EOF on every live
+stream; the `incoming_tx` slot stays set for the adapter's lifetime
+(mpsc EOF propagates when the adapter itself is dropped).
 
 ### Approval over HTTP
 

@@ -1,15 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_channels::{
-    ApprovalEvent, ChannelAdapter, ChannelError, IncomingMessage, NoticeLevel, OutgoingMessage,
-    Result, SseEvent,
+    AgentOutput, ApprovalEvent, ChannelAdapter, ChannelError, IncomingMessage, NoticeLevel, Result,
+    SseEvent,
 };
 use aura_model::ChannelType;
 use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ChannelApprovalGate};
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
 
 /// How long the approval gate waits for a REST client to `POST
@@ -40,8 +39,12 @@ const BROADCAST_CAPACITY: usize = 64;
 /// a specific session, so they live here rather than in `sessions`.
 pub struct HttpAdapter {
     /// Populated on [`start`]; cloned by [`submit`] to push new user
-    /// messages into the router.
-    incoming_tx: RwLock<Option<mpsc::Sender<IncomingMessage>>>,
+    /// messages into the router. `OnceLock` models the real lifecycle —
+    /// set exactly once at `start()` — without paying for a `RwLock`.
+    /// `stop()` can no longer clear this slot; closing the mpsc sender
+    /// happens when the adapter itself is dropped, which matches how
+    /// the registry handles shutdown today.
+    incoming_tx: OnceLock<mpsc::Sender<IncomingMessage>>,
     /// Per-session broadcast channels. Lazily created on first
     /// [`subscribe`] or first outbound message.
     sessions: DashMap<String, broadcast::Sender<SseEvent>>,
@@ -65,7 +68,7 @@ impl HttpAdapter {
     pub fn new() -> Self {
         let (approval_stream, _rx) = broadcast::channel(APPROVAL_STREAM_CAPACITY);
         Self {
-            incoming_tx: RwLock::new(None),
+            incoming_tx: OnceLock::new(),
             sessions: DashMap::new(),
             approval_queue: ApprovalQueue::new(),
             approval_stream,
@@ -110,11 +113,10 @@ impl HttpAdapter {
     /// Push an inbound user message into the router. Fails if the
     /// adapter has not been started.
     pub async fn submit(&self, msg: IncomingMessage) -> Result<()> {
-        let tx = {
-            let guard = self.incoming_tx.read();
-            guard.clone()
-        };
-        let tx = tx.ok_or_else(|| ChannelError::Config("adapter not started".into()))?;
+        let tx = self
+            .incoming_tx
+            .get()
+            .ok_or_else(|| ChannelError::Config("adapter not started".into()))?;
         tx.send(msg)
             .await
             .map_err(|e| ChannelError::Config(format!("router intake closed: {e}")))
@@ -167,48 +169,47 @@ impl ChannelAdapter for HttpAdapter {
     }
 
     async fn start(&self, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
-        let mut slot = self.incoming_tx.write();
-        *slot = Some(sender);
-        Ok(())
+        self.incoming_tx
+            .set(sender)
+            .map_err(|_| ChannelError::Config("adapter already started".into()))
     }
 
-    async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
-        let text = flatten_content(&response.content);
-        self.broadcast(&response.session_id, SseEvent::Response { text });
-        Ok(())
-    }
-
-    async fn send_stream_delta(&self, session_id: &str, delta: &str) -> Result<()> {
-        self.broadcast(
-            session_id,
-            SseEvent::Delta {
-                text: delta.to_owned(),
-            },
-        );
-        Ok(())
-    }
-
-    async fn send_notice(&self, session_id: &str, level: NoticeLevel, text: &str) -> Result<()> {
-        let level = match level {
-            NoticeLevel::Warn => "warn",
-            NoticeLevel::Error => "error",
-        };
-        self.broadcast(
-            session_id,
-            SseEvent::Notice {
-                level: level.to_owned(),
-                text: text.to_owned(),
-            },
-        );
+    async fn send(&self, output: AgentOutput) -> Result<()> {
+        match output {
+            AgentOutput::Delta {
+                session_id, text, ..
+            } => {
+                self.broadcast(&session_id, SseEvent::Delta { text });
+            }
+            AgentOutput::Message(response) => {
+                let text = flatten_content(&response.content);
+                self.broadcast(&response.session_id, SseEvent::Response { text });
+            }
+            AgentOutput::Notice {
+                session_id,
+                level,
+                text,
+                ..
+            } => {
+                let level = match level {
+                    NoticeLevel::Warn => "warn",
+                    NoticeLevel::Error => "error",
+                };
+                self.broadcast(
+                    &session_id,
+                    SseEvent::Notice {
+                        level: level.to_owned(),
+                        text,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
     async fn stop(&self) -> Result<()> {
-        {
-            let mut slot = self.incoming_tx.write();
-            *slot = None;
-        }
         // Dropping broadcast senders signals EOF to all subscribers.
+        // `incoming_tx` stays set — see the field doc for why.
         self.sessions.clear();
         Ok(())
     }

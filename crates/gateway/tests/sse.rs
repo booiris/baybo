@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use aura_channels::{
-    ChannelAdapter, ChannelError, IncomingMessage, Message, NoticeLevel, OutgoingMessage, SseEvent,
+    AgentOutput, ChannelAdapter, ChannelError, IncomingMessage, Message, NoticeLevel,
+    OutgoingMessage, SseEvent,
 };
 use aura_gateway::HttpAdapter;
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
@@ -47,21 +48,29 @@ async fn stream_delta_and_response_fan_out_in_order() {
     let mut rx = adapter.subscribe("sess-1").await;
 
     adapter
-        .send_stream_delta("sess-1", "hello ")
+        .send(AgentOutput::Delta {
+            session_id: "sess-1".into(),
+            channel: ChannelType::Http,
+            text: "hello ".into(),
+        })
         .await
         .expect("delta");
     adapter
-        .send_stream_delta("sess-1", "world")
+        .send(AgentOutput::Delta {
+            session_id: "sess-1".into(),
+            channel: ChannelType::Http,
+            text: "world".into(),
+        })
         .await
         .expect("delta");
     adapter
-        .send_response(OutgoingMessage {
+        .send(AgentOutput::Message(OutgoingMessage {
             session_id: "sess-1".into(),
             channel: ChannelType::Http,
             content: vec![ContentBlock::Text("hello world".into())],
             reply_to: None,
             metadata: MessageMetadata::default(),
-        })
+        }))
         .await
         .expect("response");
 
@@ -85,11 +94,21 @@ async fn notice_levels_serialise_to_strings() {
     let mut rx = adapter.subscribe("sess-1").await;
 
     adapter
-        .send_notice("sess-1", NoticeLevel::Warn, "heads up")
+        .send(AgentOutput::Notice {
+            session_id: "sess-1".into(),
+            channel: ChannelType::Http,
+            level: NoticeLevel::Warn,
+            text: "heads up".into(),
+        })
         .await
         .expect("warn");
     adapter
-        .send_notice("sess-1", NoticeLevel::Error, "blocked")
+        .send(AgentOutput::Notice {
+            session_id: "sess-1".into(),
+            channel: ChannelType::Http,
+            level: NoticeLevel::Error,
+            text: "blocked".into(),
+        })
         .await
         .expect("error");
 
@@ -116,11 +135,19 @@ async fn outbound_for_other_session_is_not_seen() {
 
     // Fan-out to a different session id must not reach this subscriber.
     adapter
-        .send_stream_delta("sess-OTHER", "should not appear")
+        .send(AgentOutput::Delta {
+            session_id: "sess-OTHER".into(),
+            channel: ChannelType::Http,
+            text: "should not appear".into(),
+        })
         .await
         .expect("delta");
     adapter
-        .send_stream_delta("sess-1", "visible")
+        .send(AgentOutput::Delta {
+            session_id: "sess-1".into(),
+            channel: ChannelType::Http,
+            text: "visible".into(),
+        })
         .await
         .expect("delta");
 

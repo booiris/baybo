@@ -4,16 +4,17 @@
 //! the session/message/stream flow from a hyper UDS client that
 //! authenticates with the TUI PSK. Exercises the full stack: peer-cred
 //! extraction, `auth_channel` middleware, the channel router, and the
-//! SSE fan-out `HttpAdapter::send_stream_delta` publishes through.
+//! SSE fan-out `HttpAdapter::send` publishes through.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::service::ShutdownSignal;
-use aura_channels::{ChannelAdapter, NoticeLevel};
+use aura_channels::{AgentOutput, ChannelAdapter, NoticeLevel};
 use aura_gateway::test_support::build_test_deps;
 use aura_gateway::uds::ChannelServer;
 use aura_gateway_auth::{ChannelTokenTable, TUI_PSK_HEADER};
+use aura_model::ChannelType;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -188,11 +189,20 @@ async fn session_create_message_and_stream_round_trip() {
     //    the interesting contract is that `send_stream_delta` reaches
     //    the UDS subscriber.
     fx.adapter
-        .send_stream_delta(&session_id, "hello from test")
+        .send(AgentOutput::Delta {
+            session_id: session_id.clone(),
+            channel: ChannelType::Http,
+            text: "hello from test".into(),
+        })
         .await
         .expect("delta");
     fx.adapter
-        .send_notice(&session_id, NoticeLevel::Warn, "world")
+        .send(AgentOutput::Notice {
+            session_id: session_id.clone(),
+            channel: ChannelType::Http,
+            level: NoticeLevel::Warn,
+            text: "world".into(),
+        })
         .await
         .expect("notice");
 

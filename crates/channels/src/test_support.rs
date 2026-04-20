@@ -11,7 +11,7 @@ use aura_model::ChannelType;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::types::{IncomingMessage, NoticeLevel, OutgoingMessage};
+use crate::types::{AgentOutput, IncomingMessage, NoticeLevel, OutgoingMessage};
 use crate::{ChannelAdapter, Result};
 
 /// Snapshot of one delta call.
@@ -79,25 +79,29 @@ impl ChannelAdapter for RecordingChannel {
         Ok(())
     }
 
-    async fn send_response(&self, response: OutgoingMessage) -> Result<()> {
-        self.responses.lock().push(response);
-        Ok(())
-    }
-
-    async fn send_stream_delta(&self, session_id: &str, delta: &str) -> Result<()> {
-        self.deltas.lock().push(DeltaRecord {
-            session_id: session_id.to_owned(),
-            text: delta.to_owned(),
-        });
-        Ok(())
-    }
-
-    async fn send_notice(&self, session_id: &str, level: NoticeLevel, text: &str) -> Result<()> {
-        self.notices.lock().push(NoticeRecord {
-            session_id: session_id.to_owned(),
-            level,
-            text: text.to_owned(),
-        });
+    async fn send(&self, output: AgentOutput) -> Result<()> {
+        match output {
+            AgentOutput::Message(response) => {
+                self.responses.lock().push(response);
+            }
+            AgentOutput::Delta {
+                session_id, text, ..
+            } => {
+                self.deltas.lock().push(DeltaRecord { session_id, text });
+            }
+            AgentOutput::Notice {
+                session_id,
+                level,
+                text,
+                ..
+            } => {
+                self.notices.lock().push(NoticeRecord {
+                    session_id,
+                    level,
+                    text,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -125,15 +129,30 @@ mod tests {
         }
     }
 
+    fn delta(session: &str, text: &str) -> AgentOutput {
+        AgentOutput::Delta {
+            session_id: session.into(),
+            channel: ChannelType::Tui,
+            text: text.into(),
+        }
+    }
+
     #[tokio::test]
     async fn captures_responses_deltas_notices() {
         let ch = RecordingChannel::new(ChannelType::Tui);
-        ch.send_response(outgoing("s1", "hello")).await.unwrap();
-        ch.send_stream_delta("s1", "he").await.unwrap();
-        ch.send_stream_delta("s1", "llo").await.unwrap();
-        ch.send_notice("s1", NoticeLevel::Warn, "careful")
+        ch.send(AgentOutput::Message(outgoing("s1", "hello")))
             .await
             .unwrap();
+        ch.send(delta("s1", "he")).await.unwrap();
+        ch.send(delta("s1", "llo")).await.unwrap();
+        ch.send(AgentOutput::Notice {
+            session_id: "s1".into(),
+            channel: ChannelType::Tui,
+            level: NoticeLevel::Warn,
+            text: "careful".into(),
+        })
+        .await
+        .unwrap();
 
         assert_eq!(ch.responses().len(), 1);
         assert_eq!(ch.delta_text(), "hello");
