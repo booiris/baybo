@@ -24,6 +24,16 @@ client = [
     "dep:futures",
     "dep:serde_json",
 ]
+# WebSocket + MessagePack SDK for Rust sidecars: wire types, `Client`,
+# and the native transport (tokio-tungstenite over `UnixStream`). This
+# is the only consumer surface — TS / JS sidecars speak the same wire
+# protocol through the hand-written `sdks/channel-ts/` package.
+sdk = ["dep:rmp-serde", "dep:futures", "dep:tokio-tungstenite"]
+# Enables the `export_ts_bindings` test that writes ts-rs-generated
+# TypeScript definitions for `Message` / `Frame` / `ChannelTypeV2`
+# into `sdks/channel-ts/src/generated/`. Kept behind a feature so
+# CI / release builds don't depend on ts-rs.
+ts-export = ["sdk", "dep:ts-rs"]
 
 [dependencies]
 aura-model = { workspace = true }
@@ -48,8 +58,19 @@ bytes = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
+# Optional — shared by `sdk` feature family.
+rmp-serde = { workspace = true, optional = true }
+
+# Optional — only pulled in for the `ts-export` feature so that
+# release builds don't have to compile ts-rs.
+ts-rs = { workspace = true, optional = true }
+
+tokio-tungstenite = { workspace = true, optional = true }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 axum = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }

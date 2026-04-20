@@ -7,6 +7,9 @@ mod wire;
 #[cfg(feature = "client")]
 pub mod client;
 
+#[cfg(feature = "sdk")]
+pub mod sdk;
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 

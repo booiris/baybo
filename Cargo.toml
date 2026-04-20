@@ -120,6 +120,11 @@ utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-axum = "0.2"
 parking_lot = "0.12"
 dashmap = "6"
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+    "handshake",
+] }
+rmp-serde = "1"
+ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
 
 [package]
 name = "aura"
