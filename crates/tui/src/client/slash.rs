@@ -20,8 +20,7 @@ use aura_channels::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
 use aura_model::ContentBlock;
 use aura_tools::ApprovalDecision;
 
-use crate::client::dto::ClientError;
-use crate::client::http::GatewayClient;
+use aura_channels::client::{ClientError, GatewayClient};
 
 /// [`SlashHandler`] that dispatches supported commands against an
 /// `aura gateway`.

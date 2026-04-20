@@ -7,8 +7,8 @@
 //! (messages + long-lived SSE) so keep-alive would be a minor win at a
 //! large code-complexity cost.
 //!
-//! The TUI presents its per-install effective PSK on every request via
-//! the [`TUI_PSK_HEADER`] header; the gateway side is implemented in
+//! The client presents its per-install effective PSK on every request
+//! via the [`TUI_PSK_HEADER`] header; the gateway side is implemented in
 //! `aura_gateway::auth_channel`.
 
 use std::path::{Path, PathBuf};
@@ -394,12 +394,12 @@ mod tests {
         let (_dir, socket) = spawn_uds(app).await;
         let t = transport(socket);
         let mut s = t
-            .subscribe::<crate::client::dto::SseEvent>("/v1/stream")
+            .subscribe::<crate::SseEvent>("/v1/stream")
             .await
             .expect("subscribe");
         let first = s.next().await.expect("first frame").expect("decode");
         match first {
-            crate::client::dto::SseEvent::Delta { text } => assert_eq!(text, "hi"),
+            crate::SseEvent::Delta { text } => assert_eq!(text, "hi"),
             other => panic!("expected Delta, got {other:?}"),
         }
     }

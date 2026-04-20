@@ -17,8 +17,8 @@
 //!
 //! The parser is transport-agnostic — it consumes any
 //! `Stream<Item = ClientResult<Bytes>>`, so the UDS-backed hyper body
-//! (the TUI's only transport today) and any future byte stream reuse
-//! the same frame reassembly.
+//! (today's only transport) and any future byte stream reuse the same
+//! frame reassembly.
 
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -216,7 +216,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::dto::SseEvent;
+    use crate::SseEvent;
+
     use super::*;
     use futures::StreamExt;
     use futures::stream;

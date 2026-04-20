@@ -1,11 +1,11 @@
-//! Gateway client for the TUI — channel surface only.
+//! Gateway client for plugin consumers — channel surface only.
 //!
-//! The TUI talks exclusively to the gateway's channel listener over a
-//! Unix domain socket. Admin routes (status, config, jobs, cron, memory,
-//! traces, skills, tools, llm, channels) are deliberately out of reach:
-//! the TUI doesn't need them, and surfacing them would require a second
-//! transport (TCP + bearer token) that doubles the wire surface for no
-//! present user-visible gain.
+//! Plugins (and the bundled TUI) talk to the gateway's channel listener
+//! over a Unix domain socket. Admin routes (status, config, jobs, cron,
+//! memory, traces, skills, tools, llm, channels) are deliberately out of
+//! reach: plugins don't need them, and surfacing them would require a
+//! second transport (TCP + bearer token) that doubles the wire surface
+//! for no present user-visible gain.
 //!
 //! `GatewayClient` is a thin, DTO-shaped facade over [`UdsTransport`].
 //! Each method maps one-to-one onto a channel route. SSE endpoints
@@ -16,6 +16,8 @@ use std::path::PathBuf;
 
 use aura_model::{ChatMessage, Session};
 use aura_tools::{ApprovalDecision, ApprovalRequest};
+
+use crate::{ApprovalEvent, SseEvent};
 
 use super::dto::{
     ClientResult, CreateSessionRequest, ListResponse, ResolveApprovalRequest,
@@ -90,10 +92,7 @@ impl GatewayClient {
 
     /// Subscribe to `GET /v1/sessions/:id/stream`. Returns a stream that
     /// yields `SseEvent`s until the server closes the connection.
-    pub async fn subscribe_session(
-        &self,
-        session_id: &str,
-    ) -> ClientResult<SseStream<super::dto::SseEvent>> {
+    pub async fn subscribe_session(&self, session_id: &str) -> ClientResult<SseStream<SseEvent>> {
         self.channel
             .subscribe(&format!("/v1/sessions/{session_id}/stream"))
             .await
@@ -117,7 +116,7 @@ impl GatewayClient {
             .await
     }
 
-    pub async fn subscribe_approvals(&self) -> ClientResult<SseStream<super::dto::ApprovalEvent>> {
+    pub async fn subscribe_approvals(&self) -> ClientResult<SseStream<ApprovalEvent>> {
         self.channel.subscribe("/v1/approvals/stream").await
     }
 }

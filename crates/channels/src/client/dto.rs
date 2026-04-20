@@ -1,12 +1,13 @@
-//! Wire types for the gateway client.
+//! Request/response DTOs for the gateway client.
 //!
-//! Defined locally rather than re-exported from `aura-gateway` because
-//! `aura-channels` cannot depend on `aura-gateway` without creating a
-//! dependency cycle (the gateway depends on the channels crate).
-//! Shapes must match the server's serde representation byte-for-byte.
+//! The shared SSE/approval event shapes (`SseEvent`, `ApprovalEvent`)
+//! live in [`crate::wire`] so server and client compile against a
+//! single canonical definition; the remaining types in this module are
+//! request bodies and response envelopes specific to channel-plugin
+//! calls against the gateway.
 
 use aura_model::ChannelType;
-use aura_tools::{ApprovalDecision, ResourceAccess};
+use aura_tools::ApprovalDecision;
 use serde::{Deserialize, Serialize};
 
 /// Error from a gateway client call.
@@ -138,32 +139,4 @@ pub struct StatusResponse {
     pub bind_address: String,
     pub sessions: usize,
     pub jobs_in_flight: usize,
-}
-
-/// SSE payload on `GET /v1/sessions/:id/stream`. Must mirror
-/// `aura_gateway::SseEvent` — kept in sync via the round-trip tests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SseEvent {
-    Delta { text: String },
-    Response { text: String },
-    Notice { level: String, text: String },
-}
-
-/// SSE payload on `GET /v1/approvals/stream`. Must mirror
-/// `aura_gateway::ApprovalEvent`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ApprovalEvent {
-    Added {
-        call_id: String,
-        session_id: String,
-        tool: String,
-        accesses: Vec<ResourceAccess>,
-        params_preview: String,
-    },
-    Resolved {
-        call_id: String,
-        decision: ApprovalDecision,
-    },
 }

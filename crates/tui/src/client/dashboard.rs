@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aura_channels::{DashboardProvider, DashboardSnapshot, ViewKind};
 
-use crate::client::http::GatewayClient;
+use aura_channels::client::GatewayClient;
 
 /// [`DashboardProvider`] that pulls live data off an `aura gateway`.
 pub struct GatewayDashboardProvider {

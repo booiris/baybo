@@ -11,10 +11,9 @@
 use std::sync::Arc;
 
 use aura_channels::{
-    ChannelAdapter, ChannelError, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
+    ChannelAdapter, ChannelError, IncomingMessage, Message, NoticeLevel, OutgoingMessage, SseEvent,
 };
 use aura_gateway::HttpAdapter;
-use aura_gateway::http_adapter::SseEvent;
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
 use chrono::Utc;
 use tokio::sync::mpsc;

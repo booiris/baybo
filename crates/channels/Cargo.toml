@@ -9,6 +9,21 @@ edition.workspace = true
 #   aura-channels = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
 test-support = []
+# Exposes the plugin-side SDK (`aura_channels::client`) — UDS transport,
+# SSE parser, and a typed `GatewayClient`. Pulled in by the TUI and by
+# future third-party channel plugin binaries. Kept out of the default
+# build so agent/gateway/cli consumers stay free of the HTTP-client
+# dependency chain.
+client = [
+    "dep:aura-gateway-auth",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:hex",
+    "dep:bytes",
+    "dep:futures",
+    "dep:serde_json",
+]
 
 [dependencies]
 aura-model = { workspace = true }
@@ -22,3 +37,19 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
+
+# Optional — only compiled when the `client` feature is on.
+aura-gateway-auth = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+axum = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true }

@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
+use aura_channels::ApprovalEvent;
 use aura_tools::{ApprovalDecision, ApprovalRequest};
 
 use crate::api::dto::ListResponse;
-use crate::http_adapter::ApprovalEvent;
 use crate::server::ChannelState;
 use crate::{GatewayError, Result};
 

@@ -3,15 +3,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_channels::{
-    ChannelAdapter, ChannelError, IncomingMessage, NoticeLevel, OutgoingMessage, Result,
+    ApprovalEvent, ChannelAdapter, ChannelError, IncomingMessage, NoticeLevel, OutgoingMessage,
+    Result, SseEvent,
 };
 use aura_model::ChannelType;
-use aura_tools::{
-    ApprovalDecision, ApprovalGate, ApprovalQueue, ChannelApprovalGate, ResourceAccess,
-};
+use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ChannelApprovalGate};
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 /// How long the approval gate waits for a REST client to `POST
@@ -29,47 +27,6 @@ const APPROVAL_STREAM_CAPACITY: usize = 32;
 /// Broadcast capacity per session. Each SSE subscriber keeps a lagging
 /// buffer of this many events.
 const BROADCAST_CAPACITY: usize = 64;
-
-/// SSE event payload pushed to clients subscribed to a session stream.
-///
-/// Serde is derived so route handlers can serialise directly to axum SSE
-/// events without touching raw JSON strings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SseEvent {
-    /// Incremental assistant text chunk.
-    Delta { text: String },
-    /// Final assistant response for the turn (content as rendered text).
-    Response { text: String },
-    /// Out-of-band notice surfaced by the agent.
-    Notice { level: String, text: String },
-}
-
-/// Event pushed on the gateway-wide approval stream.
-///
-/// Separate type (not a `SseEvent` variant) because approvals live on
-/// their own SSE endpoint — `GET /v1/approvals/stream` — keyed by
-/// channel type rather than chat session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ApprovalEvent {
-    /// A new approval was queued. Clients should re-fetch
-    /// `GET /v1/approvals` to see the full list.
-    Added {
-        call_id: String,
-        session_id: String,
-        tool: String,
-        accesses: Vec<ResourceAccess>,
-        params_preview: String,
-    },
-    /// An approval was resolved by any client; remove `call_id` from
-    /// the local UI (decisions other than the current client's also
-    /// land here so multiple frontends stay in sync).
-    Resolved {
-        call_id: String,
-        decision: ApprovalDecision,
-    },
-}
 
 /// HTTP channel adapter.
 ///

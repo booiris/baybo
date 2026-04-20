@@ -16,11 +16,10 @@ use futures::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-use aura_channels::{IncomingMessage, Message};
+use aura_channels::{IncomingMessage, Message, SseEvent};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
 
 use crate::api::dto::{SendMessageRequest, SendMessageResponse};
-use crate::http_adapter::SseEvent;
 use crate::server::ChannelState;
 use crate::{GatewayError, Result};
 

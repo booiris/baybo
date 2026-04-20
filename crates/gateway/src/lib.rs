@@ -33,7 +33,7 @@ pub mod uds;
 pub use crate::auth_admin::AdminToken;
 pub use crate::config::RuntimeGatewayConfig;
 pub use crate::error::{GatewayError, Result};
-pub use crate::http_adapter::{ApprovalEvent, HttpAdapter, SseEvent};
+pub use crate::http_adapter::HttpAdapter;
 pub use crate::installer::{
     InstallContext, InstallerError, ServiceInstaller, ServiceStatus, for_current_platform,
 };
@@ -41,3 +41,4 @@ pub use crate::log_buffer::{LogBuffer, LogBufferLayer, LogLevel, LogPage, LogQue
 pub use crate::server::{GatewayDeps, GatewayServer};
 pub use crate::spawn::{ChannelSpawner, ChildHandle};
 pub use crate::uds::ChannelServer;
+pub use aura_channels::{ApprovalEvent, SseEvent};

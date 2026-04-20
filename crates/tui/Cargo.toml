@@ -6,13 +6,7 @@ edition.workspace = true
 [dependencies]
 aura-model = { workspace = true }
 aura-tools = { workspace = true }
-aura-channels = { workspace = true }
-aura-gateway-auth = { workspace = true }
-hyper = { workspace = true }
-http-body-util = { workspace = true }
-hyper-util = { workspace = true }
-hex = { workspace = true }
-bytes = { workspace = true }
+aura-channels = { workspace = true, features = ["client"] }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
@@ -20,7 +14,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
@@ -28,8 +21,3 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 shell-words = { workspace = true }
-
-[dev-dependencies]
-axum = { workspace = true }
-tempfile = { workspace = true }
-tower = { workspace = true }

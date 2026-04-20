@@ -16,8 +16,9 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use tracing::{debug, warn};
 
-use crate::client::dto::{ApprovalEvent, SseEvent};
-use crate::client::http::GatewayClient;
+use aura_channels::client::GatewayClient;
+use aura_channels::{ApprovalEvent, SseEvent};
+
 use crate::transport::{TransportEvent, TransportEventStream, TuiTransport};
 
 /// HTTP+SSE-backed [`TuiTransport`] implementation backed by a

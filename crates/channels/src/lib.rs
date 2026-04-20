@@ -2,6 +2,10 @@ mod error;
 mod registry;
 mod slash;
 mod types;
+mod wire;
+
+#[cfg(feature = "client")]
+pub mod client;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -14,6 +18,7 @@ pub use slash::{
 pub use types::{
     AgentOutput, ChannelStatus, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
 };
+pub use wire::{ApprovalEvent, SseEvent};
 
 use std::sync::Arc;
 
