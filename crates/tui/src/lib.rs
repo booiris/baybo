@@ -16,7 +16,6 @@
 //!   loop; rendering happens on the loop task.
 
 mod app;
-mod approval;
 mod chat;
 pub mod client;
 mod dashboard;
