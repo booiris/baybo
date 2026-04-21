@@ -91,7 +91,7 @@ Anything with additional tokens (e.g. `/skills info foo`) dispatches to the corr
 
 ### Gateway slash handler
 
-`GatewaySlashHandler` (`crates/tui/src/client/slash.rs`) is the TUI's `SlashHandler` implementation. It ships an **allow-list** of commands that have an HTTP equivalent — bare dashboard openers, `/sessions`, `/jobs`, `/memory`, `/skills`, `/tools`, `/channels`, `/status`, `/llm`, `/trace`, `/config {get,set,unset}`, `/approve`, `/deny`, `/clear`, `/quit`, `/exit`. Anything not on the list (workspace-only `/doctor`, host-local `/workspace`) is hidden from completion and produces an "unknown command" error on submit, rather than half-working against the gateway.
+`TuiSlashHandler` (`crates/tui/src/client/slash.rs`) is the TUI's `SlashHandler` implementation. The WS channel surface is narrow, so the handler only ships what it can actually satisfy: `/clear`, `/quit`, `/exit`, and the dashboard shortcuts (`/sessions`, `/jobs`, `/memory`, `/skills`). Tool approvals are handled through the modal keybindings (`a` / `A` / `d`), not a slash command. Any other `/<name>` falls through as `SlashOutcome::PassThrough` so skill invocations keep working without a client-side allow-list.
 
 Skill names from the gateway's `/v1/skills` response are appended as `SlashOutcome::PassThrough` entries at startup — `TuiAdapter` forwards the raw line to the gateway for normal skill selection, same as before.
 

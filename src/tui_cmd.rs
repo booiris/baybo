@@ -92,7 +92,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let slash_handler = Arc::new(TuiSlashHandler::new(transport.approval_queue()));
+    let slash_handler = Arc::new(TuiSlashHandler::new());
     let dashboard_provider = Arc::new(TuiDashboardProvider::new());
 
     // Input history stays local to the host — it's personal and

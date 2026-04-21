@@ -48,9 +48,9 @@ impl WsTransport {
         let client = Arc::new(client);
 
         let approval_queue = ApprovalQueue::new();
-        // Local resolver: echo /approve|/deny and the modal's decision
-        // back to the gateway as a ResolveApproval frame so the tool
-        // gate releases server-side.
+        // Local resolver: echo the modal's decision back to the gateway
+        // as a ResolveApproval frame so the tool gate releases
+        // server-side.
         let client_for_resolver: Arc<WsClient> = Arc::clone(&client);
         approval_queue.set_resolver(Arc::new(move |call_id, decision| {
             let client = Arc::clone(&client_for_resolver);

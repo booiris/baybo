@@ -14,7 +14,6 @@
 //! Not currently exposed:
 //! * **Streaming delta frames** — `AgentOutput::Delta` is coalesced into
 //!   a single `Message` frame on the wire.
-//! * **Sidecar-driven tool approval** — `approval_gate()` is `None`.
 
 pub(crate) mod adapter;
 pub(crate) mod handshake;

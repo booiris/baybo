@@ -13,8 +13,9 @@
 //! * [`WsTransport`] — [`TuiTransport`](crate::transport::TuiTransport)
 //!   driven by the channel WS.
 //! * [`TuiSlashHandler`] — slash commands that the WS surface can
-//!   satisfy (`/approve`, `/deny`, `/clear`, `/quit`, …); other slashes
-//!   pass through to the agent.
+//!   satisfy (`/clear`, `/quit`, dashboard shortcuts); other slashes
+//!   pass through to the agent. Tool approvals are handled by the
+//!   modal keybindings, not slash commands.
 //! * [`TuiDashboardProvider`] — dashboard views rendered as admin-only
 //!   placeholders, so keybindings keep working without misleading data.
 
