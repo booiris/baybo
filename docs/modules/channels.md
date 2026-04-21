@@ -21,7 +21,11 @@ Core responsibilities of this crate:
 - Expose the sidecar wire format under `wire::{Frame, Message}`
   (MessagePack, named fields) so the gateway's WS server, the built-in
   TUI's private WS client, and the third-party TypeScript SDK all
-  speak the same protocol
+  speak the same protocol. `Frame` includes `HistorySnapshot` /
+  `HistoryAppend` variants used exclusively by session-scoped TUI
+  clients to load and persist their input ring over the same WS the
+  chat frames ride on (see [`gateway.md`](./gateway.md) and
+  [`tui.md`](./tui.md)); sidecars ignore them.
 
 ## Design Decisions
 
@@ -109,39 +113,73 @@ client, and the server is authoritative on the wire format.
 
 ## Channel Registry
 
-`ChannelRegistry` holds one `Arc<Channel>` per `ChannelType` behind a
-`DashMap` and keeps a shared `ApprovalGateMap` populated from each
-registered channel's `approval_gate()`:
+`ChannelRegistry` keeps two disjoint views of live channels plus a
+shared `ApprovalGateMap` populated from each registered channel's
+`approval_gate()`:
+
+- **Sidecars** — one `Arc<Channel>` per `ChannelType`. A Telegram
+  sidecar serves every Telegram user from a single process, so the 1:1
+  `ChannelType → Channel` mapping is correct for that flavor.
+- **Session-scoped clients** — many per `ChannelType`, keyed by
+  `session_id`. Used by the built-in TUI so multiple TUI processes can
+  each pin their own session without racing over the channel-type slot.
 
 ```rust
-pub struct ChannelRegistry { /* DashMap<ChannelType, Arc<Channel>> + Arc<ApprovalGateMap> */ }
+pub struct ChannelRegistry {
+    // DashMap<ChannelType, Arc<Channel>>  — sidecars
+    // DashMap<String, Arc<Channel>>       — session_clients keyed by session_id
+    // Arc<ApprovalGateMap>                — gate fan-in (type- and session-level)
+}
 
 impl ChannelRegistry {
     pub fn new() -> Self;
     pub fn approval_gates(&self) -> Arc<ApprovalGateMap>;
     pub fn register(&self, channel: Arc<Channel>) -> Result<()>;
-    pub fn unregister(&self, channel_type: ChannelType) -> Result<()>;
-    pub fn get(&self, channel_type: ChannelType) -> Option<Arc<Channel>>;
-    pub fn list(&self) -> Vec<ChannelType>;
+    pub fn unregister_sidecar(&self, channel_type: ChannelType) -> Result<()>;
+    pub fn unregister_session(&self, session_id: &str) -> Result<()>;
+    pub fn get_for(&self, channel_type: &ChannelType, session_id: &str) -> Option<Arc<Channel>>;
+    pub fn get_sidecar(&self, channel_type: ChannelType) -> Option<Arc<Channel>>;
+    pub fn list(&self) -> Vec<ChannelType>;                // sidecar channel types
+    pub fn list_session_clients(&self) -> Vec<String>;     // session ids
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
 }
 ```
 
-`register` and `unregister` are sync (no `async`): they only touch the
-registry's own maps. Bootstrap hands the same `Arc<ApprovalGateMap>`
-to `ToolExecutor` so gates registered later are visible immediately
-without re-plumbing.
+`register` dispatches on `Channel::owned_session()`:
+
+- `None` → sidecar slot. Fails with `ChannelError::DuplicateChannel`
+  if another sidecar already owns the channel type.
+- `Some(sid)` → session-scoped slot. Fails with
+  `ChannelError::DuplicateSessionClient` if another client is already
+  attached to that session id (regardless of channel type).
+
+`get_for(channel_type, session_id)` hides the split: it prefers a
+session-scoped match when the session has an attached client and falls
+back to the type-level sidecar otherwise. The agent router uses this
+to route `AgentOutput` so a TUI pinned to a session always receives
+its own stream even if a type-level sidecar also happens to be
+registered.
+
+Bootstrap hands the same `Arc<ApprovalGateMap>` to `ToolExecutor` so
+gates registered later are visible immediately without re-plumbing.
+The gate map mirrors the registry's two-table split: per-channel-type
+gates are consulted for sidecars and per-`(channel, session)` gates
+win for session-scoped clients, so the TUI's approval modal on one
+instance never resolves a different instance's pending tool call.
 
 Design rules:
 
-- One channel per `ChannelType` — duplicate registration returns
+- Sidecars: 1:1 per `ChannelType`. Duplicate registration returns
   `ChannelError::DuplicateChannel`.
-- `unregister` drops the channel handle and evicts its approval gate;
-  tool calls that arrive after disconnect fall back to the
-  fail-closed `AutoDenyGate` for that channel type.
-- The `agent` Router owns `Arc<ChannelRegistry>` and uses `get()` for
-  O(1) dispatch by `ChannelType`.
+- Session-scoped clients: 1:1 per `session_id`. Duplicate registration
+  returns `ChannelError::DuplicateSessionClient`.
+- `unregister_sidecar` / `unregister_session` drop the handle and
+  evict its approval gate; tool calls that arrive after disconnect
+  fall back to the fail-closed `AutoDenyGate` for the appropriate
+  scope.
+- The `agent` Router owns `Arc<ChannelRegistry>` and calls `get_for()`
+  for O(1) dispatch by `(ChannelType, session_id)`.
 
 ## Constraints
 

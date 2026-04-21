@@ -36,15 +36,38 @@ pub struct WsTransport {
     // Hold subscribe()'s pump handles so a second subscribe on a new
     // session doesn't race the previous one on the shared source.
     subscribe_lock: Arc<Mutex<()>>,
+    /// Pinned session this TUI registered against. Used as the frame
+    /// `session_id` on [`WsTransport::append_history`] so the gateway
+    /// can attribute writes and enforce per-session auth invariants.
+    session_id: String,
+    /// One-shot history ring the gateway pushed right after
+    /// `RegisterAck`. The TUI consumes it once during bootstrap — see
+    /// [`WsTransport::take_history_snapshot`].
+    initial_history: Mutex<Option<Vec<String>>>,
 }
 
 impl WsTransport {
     /// Dial the channel UDS with the TUI PSK and register as the
-    /// built-in `"tui"` channel. Returns a ready transport.
-    pub async fn connect(socket_path: PathBuf, psk: [u8; 32]) -> Result<Self> {
-        let client = WsClient::connect_tui(&socket_path, &psk, ChannelType::from("tui"))
-            .await
-            .map_err(|e| ChannelError::Config(format!("tui ws connect: {e}")))?;
+    /// built-in `"tui"` channel. `session_id` pins this TUI instance to
+    /// one session so multiple concurrent TUI processes can share the
+    /// same gateway — the gateway routes events for that session to
+    /// this connection only.
+    pub async fn connect(socket_path: PathBuf, psk: [u8; 32], session_id: String) -> Result<Self> {
+        let (client, initial_history) = WsClient::connect_tui(
+            &socket_path,
+            &psk,
+            ChannelType::from("tui"),
+            session_id.clone(),
+        )
+        .await
+        .map_err(|e| match e {
+            // Only true "nothing's listening on the socket" failures
+            // should trigger the auto-spawn gateway path upstream.
+            // Handshake / protocol errors mean a gateway is alive
+            // and we should surface the real reason instead.
+            WsClientError::UdsDial(_) => ChannelError::NotReachable(format!("tui ws connect: {e}")),
+            _ => ChannelError::Config(format!("tui ws connect: {e}")),
+        })?;
         let client = Arc::new(client);
 
         let approval_queue = ApprovalQueue::new();
@@ -69,6 +92,8 @@ impl WsTransport {
             client,
             approval_queue,
             subscribe_lock: Arc::new(Mutex::new(())),
+            session_id,
+            initial_history: Mutex::new(Some(initial_history)),
         })
     }
 }
@@ -145,6 +170,28 @@ impl WsTransport {
     pub fn approval_queue(&self) -> ApprovalQueue {
         self.approval_queue.clone()
     }
+
+    /// Consume the one-shot history ring the gateway pushed right after
+    /// register. Returns `None` on subsequent calls — the ring is meant
+    /// to be consumed once during TUI bootstrap.
+    pub async fn take_history_snapshot(&self) -> Option<Vec<String>> {
+        self.initial_history.lock().await.take()
+    }
+
+    /// Fire-and-forget: persist one submitted input line on the
+    /// gateway-side history store. The server does not ack per-append
+    /// — any send failure is surfaced as a returned error so the caller
+    /// can decide whether to log or retry.
+    pub async fn append_history(&self, entry: &str) -> Result<()> {
+        let frame = Frame::HistoryAppend {
+            session_id: self.session_id.clone(),
+            entry: entry.to_owned(),
+        };
+        self.client
+            .send_raw(&frame)
+            .await
+            .map_err(|e| ChannelError::Send(format!("tui ws history append: {e}")))
+    }
 }
 
 fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Option<TransportEvent> {
@@ -207,7 +254,13 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
-        Frame::Register { .. } | Frame::RegisterAck { .. } | Frame::ResolveApproval { .. } => {
+        Frame::Register { .. }
+        | Frame::RegisterAck { .. }
+        | Frame::ResolveApproval { .. }
+        | Frame::HistoryAppend { .. }
+        | Frame::HistorySnapshot { .. } => {
+            // HistorySnapshot is drained during `connect_tui`; any
+            // stray instance post-handshake is a protocol violation.
             warn!("unexpected frame from gateway; dropping");
             None
         }

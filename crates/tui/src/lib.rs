@@ -21,13 +21,11 @@ mod chat;
 pub mod client;
 mod dashboard;
 pub(crate) mod event;
-mod history;
 mod keymap;
 pub mod transport;
 
 pub use aura_tools::ApprovalQueue;
 pub use event::{LogLevel, LogRecord, TuiLogSink};
-pub use history::InputHistoryStore;
 pub use transport::{TransportEvent, TransportEventStream};
 
 use std::io;
@@ -82,7 +80,6 @@ pub struct TuiAdapter {
     slash_handler: Option<Arc<dyn SlashHandler>>,
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
     on_exit: Option<OnExit>,
-    input_history: Option<Arc<dyn InputHistoryStore>>,
     /// Event channel: the sender is cloned to `send_response`, the tracing
     /// bridge, and the event loop; the receiver is taken out once at
     /// `start()`. The channel is created eagerly in `new()` so boot-time log
@@ -122,7 +119,6 @@ impl TuiAdapter {
             slash_handler: None,
             dashboard_provider: None,
             on_exit: None,
-            input_history: None,
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
             approval_queue: ApprovalQueue::new(),
@@ -177,15 +173,6 @@ impl TuiAdapter {
         self
     }
 
-    /// Attach a persistent input-history backend. When set, prior submissions
-    /// are loaded at the start of the event loop and every accepted submission
-    /// is saved asynchronously. Without one, the history remains in-memory
-    /// and is lost on exit.
-    pub fn with_input_history(mut self, store: Arc<dyn InputHistoryStore>) -> Self {
-        self.input_history = Some(store);
-        self
-    }
-
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -235,7 +222,6 @@ impl TuiAdapter {
             slash_handler: self.slash_handler.clone(),
             dashboard_provider: self.dashboard_provider.clone(),
             on_exit: self.on_exit.clone(),
-            input_history: self.input_history.clone(),
             approval_queue: self.approval_queue.clone(),
         };
 
@@ -261,7 +247,6 @@ struct LoopCtx {
     slash_handler: Option<Arc<dyn SlashHandler>>,
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
     on_exit: Option<OnExit>,
-    input_history: Option<Arc<dyn InputHistoryStore>>,
     approval_queue: ApprovalQueue,
 }
 
@@ -396,11 +381,12 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     if let Some(handler) = ctx.slash_handler.as_ref() {
         state.set_commands(handler.commands());
     }
-    if let Some(store) = ctx.input_history.as_ref() {
-        match store.load().await {
-            Ok(entries) => state.set_history(entries),
-            Err(e) => warn!("failed to load TUI input history: {e}"),
-        }
+    // Initial input-history ring comes from the gateway-owned store over
+    // the WS handshake — the TUI never opens the vault itself. Missing
+    // snapshot (second call, or caller opted out) is expected and
+    // yields an empty ring.
+    if let Some(entries) = ctx.input.take_history_snapshot().await {
+        state.set_history(entries);
     }
     let mut term_events = EventStream::new();
     let mut mouse_captured = true;
@@ -545,12 +531,27 @@ async fn handle_key(
     ctx: &mut LoopCtx,
     key: KeyEvent,
 ) -> anyhow::Result<KeyOutcome> {
+    let completion_open = !state.completion_candidates().is_empty();
     let key_ctx = KeyContext {
         input_empty: state.input.is_empty(),
-        completion_open: !state.completion_candidates().is_empty(),
+        completion_open,
+        in_history_mode: state.history_cursor.is_some(),
         approval_open: state.approval_pending(),
     };
     let action = translate(&state.mode, key, key_ctx);
+    // Terminal-style history gate: once the user starts typing their own
+    // content, any non-navigation key exits history mode and resets the
+    // cursor to the newest slot. Up/Down keep walking the ring; `Nothing`
+    // is ignored so an unbound key (modifier release etc.) can't silently
+    // dump the loaded entry.
+    if state.history_cursor.is_some()
+        && !matches!(
+            action,
+            Action::HistoryPrev | Action::HistoryNext | Action::Nothing
+        )
+    {
+        state.history_cursor = None;
+    }
     // Any action other than ConfirmExit / Nothing cancels a pending
     // Ctrl-D confirmation so the gate doesn't linger across unrelated
     // keypresses (bash/zsh do the same with `set -o ignoreeof`).
@@ -645,7 +646,7 @@ async fn handle_key(
         }
         Action::Submit => {
             if let Some(text) = state.take_input() {
-                persist_history(state, ctx);
+                persist_history_entry(ctx, text.clone());
                 if text == "/quit" || text == "/exit" {
                     return Ok(KeyOutcome::Exit);
                 }
@@ -708,19 +709,17 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
     }
 }
 
-/// Snapshot the current input-history ring and persist it via the
-/// configured [`InputHistoryStore`]. No-op if no store is attached.
-/// Runs in a detached task so disk/encryption latency never blocks the
-/// key-handling path; failures log at warn level.
-fn persist_history(state: &AppState, ctx: &LoopCtx) {
-    let Some(store) = ctx.input_history.as_ref() else {
-        return;
-    };
-    let snapshot = state.history_snapshot();
-    let store = Arc::clone(store);
+/// Ship the just-submitted `entry` to the gateway's `TuiHistoryStore`
+/// as a fire-and-forget `Frame::HistoryAppend`. Runs in a detached task
+/// so WS round-trip latency never blocks the key-handling path;
+/// failures log at warn level. Zsh-style semantics (single writer per
+/// entry + consecutive-duplicate dedup) live server-side so concurrent
+/// TUIs on one gateway never clobber each other.
+fn persist_history_entry(ctx: &LoopCtx, entry: String) {
+    let transport = Arc::clone(&ctx.input);
     tokio::spawn(async move {
-        if let Err(e) = store.save(&snapshot).await {
-            warn!("failed to save TUI input history: {e}");
+        if let Err(e) = transport.append_history(&entry).await {
+            warn!("failed to append TUI input history: {e}");
         }
     });
 }

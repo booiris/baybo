@@ -42,7 +42,11 @@ server side.
 
 - When the input starts with `/` and the cursor sits on the command token (no whitespace between `/` and cursor), a popup renders above the input box listing matching commands.
 - Candidates come from `SlashHandler::commands()`; `CliSlashHandler` derives them from clap's subcommand tree, every user-invocable skill in `SkillRegistry` (name surfaces as `/<skill>`, description — prefixed with the `argument-hint` when present — surfaces as the popup hint), plus adapter-reserved tokens (`/quit`, `/exit`, `/clear`). Clap wins on name collisions so a workspace skill cannot shadow `/config` or `/skills`.
-- `Up`/`Down` cycle the selection; `Tab` accepts the highlighted candidate, rewriting the prefix up to the next whitespace and appending a trailing space so arguments can follow. `Enter` submits without accepting the completion.
+- `Tab` accepts the highlighted candidate, rewriting the prefix up to the next whitespace and appending a trailing space so arguments can follow. `Enter` submits without accepting the completion.
+- `Up`/`Down` follow zsh/bash conventions, which also cleanly resolves the popup ambiguity:
+    - **Empty input** — `Up`/`Down` walk the input-history ring. A slash popup never opens on an empty line, so there is no conflict.
+    - **Non-empty input** — the user is actively drafting, so `Up`/`Down` drive the popup selection (or are inert if no popup is open). History is gated off until the draft clears or is submitted. This matches shell behavior: once you've typed content, pressing `Up` doesn't silently replace it with a history entry.
+    - **While already walking history** — `Up`/`Down` keep walking even if the loaded entry makes the input non-empty and opens a popup. The first non-`Up`/`Down` key exits history mode and snaps the cursor back to the newest slot, so the entry stays on screen and further edits treat the ring as idle.
 
 ### Inline approval prompt
 
@@ -65,14 +69,14 @@ server side.
 
 The input history ring survives across TUI sessions. Because users routinely
 paste API keys, tokens, and other secrets into prompts, the ring is stored
-encrypted at rest rather than in a plaintext history file.
+encrypted at rest rather than in a plaintext history file — but the TUI
+process itself never opens the vault. The gateway is the single writer,
+and the TUI exchanges the ring over the channel WS like any other state.
 
-- The trait `aura_tui::InputHistoryStore` (`crates/tui/src/history.rs`) defines the contract: `load() -> Vec<String>` runs once at start-of-loop; `save(&[String])` runs after every accepted submission.
-- The TUI itself does not depend on `aura-security`. The production wiring is `aura_cli::CliInputHistoryStore`, which wraps `Arc<SecretVault>` and serializes the chronological ring as JSON under the fixed key `aura.tui.input_history` (see [`security.md`](./security.md)). Plaintext only ever exists in `AppState.history` — on disk it is AES-256-GCM ciphertext under the same master key the rest of the vault uses.
-- Load happens before the first `terminal.draw`, so the prior ring is already populated when the input box first renders.
-- Save runs from `Action::Submit` immediately after `take_input()`, in a detached `tokio::spawn`. The full history snapshot is persisted every time (no diffing); the disk/encryption latency therefore never blocks the key-handling path.
-- Failures (missing master key, corrupt JSON, libsql write error) log a `warn!` and are non-fatal: load failures yield an empty ring; save failures drop the persistence for that submission only. The TUI continues to function with the in-memory history.
-- `TuiAdapter::with_input_history` is optional. Tests construct adapters without a store; in-memory history then behaves exactly as before.
+- Wire protocol: two `aura_channels::wire::Frame` variants carry the history end-to-end. `Frame::HistorySnapshot { session_id, entries }` is pushed from the server once, right after `Frame::RegisterAck { ok: true }`, for session-scoped TUI clients only — sidecars never see it. `Frame::HistoryAppend { session_id, entry }` is sent by the TUI after every accepted submission.
+- Gateway side: `aura_gateway::channel::TuiHistoryStore` (`crates/gateway/src/channel/history.rs`) wraps `Arc<SecretVault>` behind a `tokio::sync::Mutex`, so concurrent appends from multiple TUIs on the same gateway serialize into the same vault blob. It reads the current ring from the fixed key `aura.tui.input_history`, pushes the new entry (de-duping consecutive duplicates), caps the ring at 500 newest entries, and writes it back (see [`security.md`](./security.md)). Load failures or write errors are logged `warn!` and are non-fatal.
+- TUI side: `WsTransport` (`crates/tui/src/client/ws.rs`, `transport.rs`) buffers the one-shot snapshot inside `initial_history: Mutex<Option<Vec<String>>>` during `connect_tui`. The main loop calls `ctx.input.take_history_snapshot().await` before the first `terminal.draw`, so the prior ring is populated when the input box first renders. `Action::Submit` calls `ctx.input.append_history(&entry)` in a detached `tokio::spawn` — no vault handle, no lock file, no local `aura-security` dependency.
+- The TUI crate no longer carries an `InputHistoryStore` trait or any history builder on `TuiAdapter`. The store is implicit in the transport; tests that construct an adapter without a live gateway just get no snapshot and no-op appends.
 
 ## Slash Commands
 
@@ -183,16 +187,23 @@ none of those exist on the TUI side.
 5. **Connect the WS channel** — dial `/v1/channel-ws` with the
    `x-aura-tui-secret` header carrying the effective PSK, send
    `Frame::Register { channel_type: "tui", protocol_version, token:
-   "" }`, and wait for `RegisterAck { ok: true }`. The TUI's
-   `GatewayTransport` owns the connection and surfaces inbound
+   "", session_id: Some(<this-process-session>) }`, and wait for
+   `RegisterAck { ok: true }`. Pinning the TUI's session into the
+   handshake is what lets multiple `aura tui` processes coexist on
+   the same gateway — the `ChannelRegistry` routes events for that
+   session to this connection only. The gateway rejects a TUI
+   handshake without a `session_id` (it's only optional for sidecars,
+   which register type-level). The TUI's `GatewayTransport` owns the
+   connection and surfaces inbound
    `Frame::{Message, Delta, Notice, ApprovalRequested, ApprovalResolved}`
    as `TransportEvent`s.
 6. **Wire the gateway providers** — construct `GatewayTransport`,
    `GatewaySlashHandler` (seeded with the skill catalog from
-   `/v1/skills`), `GatewayDashboardProvider`, and the vault-backed
-   `CliInputHistoryStore`. Attach them to `TuiAdapter` via the
-   `with_transport`, `with_slash_handler`, `with_dashboard_provider`,
-   and `with_input_history` builders.
+   `/v1/skills`), and `GatewayDashboardProvider`. Attach them to
+   `TuiAdapter` via the `with_transport`, `with_slash_handler`, and
+   `with_dashboard_provider` builders. Input history is delivered over
+   the WS itself (see [Persistent input history](#persistent-input-history)),
+   so no history store is wired in.
 7. **Start the adapter**. There is no local `ChannelRegistry` and no
    cron trigger receiver: the TUI has no router. User input is
    framed as `Frame::Message` and sent through the transport; the
@@ -295,8 +306,7 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 | ---------- | -------------------------------------------------------------------------------------------- |
 | `model`    | `ContentBlock` for rendering assistant messages                                              |
 | `session`  | `ChannelType::Tui`, `User` used when constructing `IncomingMessage`                          |
-| `cli`      | `CliInputHistoryStore` for vault-encrypted input history (host-local; works without the gateway) |
-| `gateway`  | Server-side owner of sessions, approvals, and outbound frame fan-out. The TUI talks to it over `/v1/channel-ws` (WebSocket + MessagePack) |
+| `gateway`  | Server-side owner of sessions, approvals, outbound frame fan-out, and the vault-encrypted input-history store. The TUI talks to it over `/v1/channel-ws` (WebSocket + MessagePack) |
 | `channels` | Trait definitions only: `SlashHandler`, `SlashOutcome`, `ViewKind`, `DashboardProvider`, `DashboardSnapshot`, `IncomingMessage`, `NoticeLevel`, `ChannelError`. No TUI code. |
 
 ## Verification

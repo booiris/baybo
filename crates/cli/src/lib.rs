@@ -20,7 +20,6 @@ pub mod dashboard;
 pub mod dispatch;
 pub mod error;
 pub mod format;
-pub mod history;
 pub mod slash;
 
 pub use cli::{Cli, Commands, GlobalArgs};
@@ -29,7 +28,6 @@ pub use dashboard::CliDashboardProvider;
 pub use dispatch::run;
 pub use error::{CliError, Result};
 pub use format::{CommandOutput, OutputFormat};
-pub use history::CliInputHistoryStore;
 pub use slash::CliSlashHandler;
 
 /// Emit a shell completion script without needing a `CommandContext`.

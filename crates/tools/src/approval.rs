@@ -91,37 +91,81 @@ impl ApprovalGate for AutoDenyGate {
 // ApprovalGateMap — per-channel gate resolution
 // ---------------------------------------------------------------------------
 
-/// Sync-accessible map of `ChannelType` → `ApprovalGate`. Shared between
+/// Sync-accessible map of approval gates, shared between
 /// `ChannelRegistry` (populates at registration time) and `ToolExecutor`
-/// (reads at execution time). Channels without a gate get `AutoDenyGate`.
+/// (reads at execution time).
+///
+/// Two tiers, matching the sidecar vs session-scoped client split in the
+/// registry:
+///
+/// * **Type-level** gates, keyed by `ChannelType`. Populated by sidecar
+///   registrations (e.g. one Telegram sidecar serving every session).
+/// * **Session-level** gates, keyed by `(ChannelType, SessionId)`.
+///   Populated by session-scoped client registrations (e.g. per-TUI
+///   gates so each TUI only prompts its own user).
+///
+/// [`get`](Self::get) tries the session-level entry first and falls
+/// back to the type-level gate; when neither is present it returns
+/// `AutoDenyGate` (fail-closed).
 pub struct ApprovalGateMap {
-    inner: DashMap<ChannelType, Arc<dyn ApprovalGate>>,
+    type_level: DashMap<ChannelType, Arc<dyn ApprovalGate>>,
+    session_level: DashMap<(ChannelType, String), Arc<dyn ApprovalGate>>,
 }
 
 impl ApprovalGateMap {
     pub fn new() -> Self {
         Self {
-            inner: DashMap::new(),
+            type_level: DashMap::new(),
+            session_level: DashMap::new(),
         }
     }
 
-    /// Register a gate for a channel type. Called by `ChannelRegistry::register`.
+    /// Register a type-level gate for a channel. Used for sidecar
+    /// registrations.
     pub fn insert(&self, channel: ChannelType, gate: Arc<dyn ApprovalGate>) {
-        self.inner.insert(channel, gate);
+        self.type_level.insert(channel, gate);
     }
 
-    /// Evict a gate. Called by `ChannelRegistry::unregister` so tool
+    /// Register a session-scoped gate for one `(ChannelType,
+    /// SessionId)` pair. Used for session-scoped client registrations
+    /// (e.g. a specific TUI instance).
+    pub fn insert_session(
+        &self,
+        channel: ChannelType,
+        session_id: String,
+        gate: Arc<dyn ApprovalGate>,
+    ) {
+        self.session_level.insert((channel, session_id), gate);
+    }
+
+    /// Evict a type-level gate. Called on sidecar unregister so tool
     /// calls scheduled after the channel disconnects fall back to the
     /// fail-closed `AutoDenyGate` instead of timing out against a dead
     /// transport.
     pub fn remove(&self, channel: &ChannelType) {
-        self.inner.remove(channel);
+        self.type_level.remove(channel);
     }
 
-    /// Look up the gate for a channel. Returns `AutoDenyGate` when no gate
-    /// is registered (fail-closed).
-    pub fn get(&self, channel: &ChannelType) -> Arc<dyn ApprovalGate> {
-        self.inner
+    /// Evict a session-scoped gate. Called on session-scoped client
+    /// unregister. Cheap no-op if the entry is already gone.
+    pub fn remove_session(&self, channel: &ChannelType, session_id: &str) {
+        self.session_level
+            .remove(&(channel.clone(), session_id.to_owned()));
+    }
+
+    /// Resolve the gate for one tool call. Tries the session-scoped
+    /// entry first (a specific TUI instance answering for its own
+    /// session) and falls back to the type-level gate (a sidecar that
+    /// answers for every session). When neither is registered returns
+    /// `AutoDenyGate` (fail-closed).
+    pub fn get(&self, channel: &ChannelType, session_id: &str) -> Arc<dyn ApprovalGate> {
+        if let Some(entry) = self
+            .session_level
+            .get(&(channel.clone(), session_id.to_owned()))
+        {
+            return Arc::clone(entry.value());
+        }
+        self.type_level
             .get(channel)
             .map(|e| Arc::clone(e.value()))
             .unwrap_or_else(|| Arc::new(AutoDenyGate))

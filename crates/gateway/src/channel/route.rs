@@ -44,9 +44,9 @@ async fn ws_handler(
 async fn run_connection(socket: WebSocket, state: WsChannelState, authed: AuthedClient) {
     let (mut sink, mut source) = socket.split();
 
-    let channel_type = match receive_register(&mut source).await {
+    let outcome = match receive_register(&mut source).await {
         Ok(frame) => match validate_register(frame, &authed, &state.tokens) {
-            Ok(ct) => ct,
+            Ok(outcome) => outcome,
             Err(reason) => {
                 send_ack_and_close(&mut sink, false, Some(reason.clone())).await;
                 tracing::warn!(reason = %reason, "channel-ws register rejected");
@@ -60,7 +60,10 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         }
     };
 
-    let sidecar = Sidecar::build(channel_type.clone(), sink);
+    let channel_type = outcome.channel_type;
+    let session_id = outcome.session_id;
+
+    let sidecar = Sidecar::build(channel_type.clone(), session_id.clone(), sink);
 
     if let Err(err) = state
         .registry
@@ -68,6 +71,9 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     {
         let reason = match &err {
             ChannelError::DuplicateChannel(ct) => format!("channel '{ct}' already registered"),
+            ChannelError::DuplicateSessionClient(sid) => {
+                format!("another client is already attached to session '{sid}'")
+            }
             other => format!("registration failed: {other}"),
         };
         if let Err(e) = sidecar
@@ -84,7 +90,11 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         return;
     }
 
-    tracing::info!(channel_type = %channel_type, "channel-ws sidecar registered");
+    tracing::info!(
+        channel_type = %channel_type,
+        session_id = ?session_id,
+        "channel-ws client registered"
+    );
 
     if let Err(e) = sidecar
         .send_frame(Frame::RegisterAck {
@@ -94,18 +104,63 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         .await
     {
         tracing::warn!(error = %e, "failed to send RegisterAck");
-        let _ = state.registry.unregister(channel_type);
+        unregister_best_effort(&state, &channel_type, session_id.as_deref());
         let _ = sidecar.into_pump().await;
         return;
     }
 
+    // Session-scoped TUI clients get a one-shot history ring from the
+    // gateway-owned vault so they can rehydrate their scrollback without
+    // opening the vault themselves. Sidecars (session_id = None) never
+    // receive this frame. Any failure here is surfaced as an empty ring
+    // — a broken history store must not keep the user from chatting.
+    if channel_type.as_str() == ChannelType::TUI
+        && let Some(sid) = session_id.as_deref()
+    {
+        let entries = match state.tui_history.load().await {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "load tui input history; sending empty snapshot");
+                Vec::new()
+            }
+        };
+        if let Err(e) = sidecar
+            .send_frame(Frame::HistorySnapshot {
+                session_id: sid.to_owned(),
+                entries,
+            })
+            .await
+        {
+            tracing::warn!(error = %e, "failed to send HistorySnapshot");
+            unregister_best_effort(&state, &channel_type, session_id.as_deref());
+            let _ = sidecar.into_pump().await;
+            return;
+        }
+    }
+
     run_inbound_loop(source, &state, &channel_type, &sidecar).await;
 
-    if let Err(e) = state.registry.unregister(channel_type.clone()) {
-        tracing::debug!(error = %e, %channel_type, "unregister after ws drop");
-    }
+    unregister_best_effort(&state, &channel_type, session_id.as_deref());
     let _ = sidecar.into_pump().await;
-    tracing::info!(%channel_type, "channel-ws sidecar disconnected");
+    tracing::info!(
+        %channel_type,
+        session_id = ?session_id,
+        "channel-ws client disconnected"
+    );
+}
+
+fn unregister_best_effort(
+    state: &WsChannelState,
+    channel_type: &ChannelType,
+    session_id: Option<&str>,
+) {
+    let result = match session_id {
+        Some(sid) => state.registry.unregister_session(sid),
+        None => state.registry.unregister_sidecar(channel_type.clone()),
+    };
+    if let Err(e) = result {
+        tracing::debug!(error = %e, %channel_type, session_id = ?session_id, "unregister after ws drop");
+    }
 }
 
 async fn receive_register(
@@ -195,6 +250,26 @@ async fn run_inbound_loop(
                             tracing::debug!(
                                 call_id = %call_id,
                                 "ResolveApproval for unknown call_id; ignored"
+                            );
+                        }
+                    }
+                    Frame::HistoryAppend { session_id, entry } => {
+                        // Fire-and-forget: zsh-style history shouldn't
+                        // block the submit path. Rejecting non-TUI
+                        // channel types keeps sidecars from sneaking
+                        // writes into the TUI's vault key.
+                        if channel_type.as_str() != ChannelType::TUI {
+                            tracing::warn!(
+                                %channel_type,
+                                "HistoryAppend from non-tui channel type; dropping"
+                            );
+                            continue;
+                        }
+                        if let Err(e) = state.tui_history.append(&entry).await {
+                            tracing::warn!(
+                                error = %format!("{e:#}"),
+                                %session_id,
+                                "append tui input history"
                             );
                         }
                     }

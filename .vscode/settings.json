@@ -194,7 +194,5 @@
         "**/dist": true,
         "**/package-lock.json": true
     },
-    "rust-analyzer.cargo.features": [
-        "sdk",
-    ]
+    "rust-analyzer.cargo.features": []
 }

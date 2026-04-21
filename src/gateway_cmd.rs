@@ -289,6 +289,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         log_buffer: Arc::clone(&log_buffer),
         incoming_tx: run_handle.incoming_tx.clone(),
         channel_tokens: channel_tokens.clone(),
+        secret_vault: Arc::clone(&graph.secret_vault),
     };
 
     // Channel UDS listener — lives under the same workspace identity dir

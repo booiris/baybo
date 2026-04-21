@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use aura_agent::service::ShutdownSignal;
-use aura_cli::CliInputHistoryStore;
+use aura_channels::ChannelError;
 use aura_config::AuraConfig;
 use aura_gateway_auth::effective_tui_psk;
 use aura_tui::client::{TuiDashboardProvider, TuiSlashHandler, WsTransport};
@@ -27,7 +27,7 @@ use aura_tui::{TuiAdapter, TuiLogSink};
 use tracing::info;
 
 use crate::runtime::force_exit_watchdog;
-use crate::runtime::{build_secret_vault, install_signal_handler};
+use crate::runtime::install_signal_handler;
 use crate::tracing_init::{TracingMode, init_tracing};
 
 /// Resolved options passed from `main.rs` after parsing the clap
@@ -50,14 +50,24 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     let (channel_socket, psk) = resolve_channel_auth(&config)?;
 
+    let session_id = opts
+        .session
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     // Keep the auto-spawned child alive for the lifetime of the TUI.
     // Dropping the guard sends SIGTERM (with a SIGKILL fallback) so we
     // don't leak a background gateway when the TUI exits.
     #[cfg(debug_assertions)]
     let mut _auto_gateway: Option<dev_auto::AutoGatewayGuard> = None;
 
-    let transport = match WsTransport::connect(channel_socket.clone(), psk).await {
+    let transport = match WsTransport::connect(channel_socket.clone(), psk, session_id.clone())
+        .await
+    {
         Ok(t) => Arc::new(t),
+        Err(err) if !matches!(err, ChannelError::NotReachable(_)) => {
+            return Err(unreachable_gateway_error(&channel_socket, &err.to_string()));
+        }
         Err(err) => {
             #[cfg(debug_assertions)]
             if opts.dev_auto_gateway {
@@ -69,7 +79,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
                 _auto_gateway =
                     Some(dev_auto::spawn_and_wait_ready(&channel_socket, config_path).await?);
                 Arc::new(
-                    WsTransport::connect(channel_socket.clone(), psk)
+                    WsTransport::connect(channel_socket.clone(), psk, session_id.clone())
                         .await
                         .map_err(|e| unreachable_gateway_error(&channel_socket, &e.to_string()))?,
                 )
@@ -84,21 +94,8 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     };
     info!(socket = %channel_socket.display(), "connected to gateway");
 
-    // Session IDs are now client-generated: the router's SessionManager
-    // calls `get_or_create` on first message, so the TUI can use either
-    // the operator-supplied id or a fresh UUID without a server round-trip.
-    let session_id = opts
-        .session
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
     let slash_handler = Arc::new(TuiSlashHandler::new());
     let dashboard_provider = Arc::new(TuiDashboardProvider::new());
-
-    // Input history stays local to the host — it's personal and
-    // contains secrets. Reuse the vault-backed store from the CLI.
-    let vault = build_secret_vault(&config).await?;
-    let history_store = Arc::new(CliInputHistoryStore::new(vault));
 
     let shutdown = ShutdownSignal::new();
     let tui_shutdown = shutdown.clone();
@@ -107,7 +104,6 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
         .with_session_id(session_id.clone())
         .with_slash_handler(slash_handler)
         .with_dashboard_provider(dashboard_provider)
-        .with_input_history(history_store)
         .with_on_exit(Arc::new(move || tui_shutdown.trigger()));
 
     let _ = tui_log_sink.set(tui.log_sink());

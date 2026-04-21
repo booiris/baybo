@@ -343,7 +343,7 @@ impl Router {
             other => other,
         };
 
-        let Some(channel_handle) = self.channels.get(channel.clone()) else {
+        let Some(channel_handle) = self.channels.get_for(&channel, &session_id) else {
             debug!(
                 channel = %channel,
                 session_id = %session_id,

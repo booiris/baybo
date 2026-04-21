@@ -6,7 +6,7 @@
 //!   [`aura_channels::Channel`] (agent output), the approval-gate waker
 //!   (`ApprovalRequested`), and the inbound loop's `resolve_approval`
 //!   path (`ApprovalResolved`) — pushes a [`Frame`] here; one pump task
-//!   drains the receiver and serialises each frame onto the WS sink.
+//!   drains the receiver and serializes each frame onto the WS sink.
 //! * The approval queue shared with the [`ChannelApprovalGate`]; the
 //!   inbound loop resolves entries by `call_id` when the client echoes
 //!   a [`Frame::ResolveApproval`].
@@ -53,7 +53,17 @@ impl Sidecar {
     /// the WS sink and exits cleanly once every `frame_tx` clone has
     /// dropped — the caller achieves this by unregistering the channel
     /// (clears the approval gate map) and dropping this struct.
-    pub(crate) fn build(channel_type: ChannelType, sink: WsSink) -> Self {
+    ///
+    /// `session_id` picks the flavor of the resulting `Channel`:
+    /// * `None` — sidecar that serves every session of `channel_type`
+    ///   (Telegram sidecar, etc.).
+    /// * `Some(sid)` — session-scoped client pinned to one session
+    ///   (the built-in TUI).
+    pub(crate) fn build(
+        channel_type: ChannelType,
+        session_id: Option<String>,
+        sink: WsSink,
+    ) -> Self {
         let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(OUTBOUND_BUFFER);
         let (output_tx, mut output_rx) = mpsc::channel::<AgentOutput>(OUTBOUND_BUFFER);
         let approval_queue = ApprovalQueue::new();
@@ -74,7 +84,12 @@ impl Sidecar {
         let gate = build_approval_gate(approval_queue.clone(), frame_tx.clone());
         let approval_gate: Arc<dyn ApprovalGate> = Arc::new(gate);
 
-        let channel = Arc::new(Channel::new(channel_type, output_tx, Some(approval_gate)));
+        let channel = Arc::new(match session_id {
+            Some(sid) => {
+                Channel::new_session_scoped(channel_type, sid, output_tx, Some(approval_gate))
+            }
+            None => Channel::new(channel_type, output_tx, Some(approval_gate)),
+        });
 
         let pump = tokio::spawn(async move {
             let mut sink = sink;

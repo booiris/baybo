@@ -224,11 +224,6 @@ impl AppState {
         self.history_cursor = None;
     }
 
-    /// Clone the current input-history ring in chronological order.
-    pub(crate) fn history_snapshot(&self) -> Vec<String> {
-        self.history.iter().cloned().collect()
-    }
-
     pub(crate) fn set_banner(&mut self, text: String) {
         self.banner = text;
     }
@@ -277,9 +272,9 @@ impl AppState {
         self.completion_cursor = (self.completion_cursor + 1) % n;
     }
 
-    /// Accept the current completion candidate. Replaces the prefix up to
-    /// the first whitespace with the candidate name + trailing space, so
-    /// arguments can follow naturally.
+    /// Accept the highlighted completion candidate. Replaces the prefix
+    /// up to the first whitespace with the candidate name + trailing
+    /// space, so arguments can follow naturally.
     pub(crate) fn completion_accept(&mut self) -> bool {
         let candidates = self.completion_candidates();
         if candidates.is_empty() {
@@ -463,6 +458,14 @@ impl AppState {
 
     pub(crate) fn history_prev(&mut self) {
         if self.history.is_empty() {
+            return;
+        }
+        // Shell-like gate: history is only loadable from a clean prompt.
+        // Once the user has typed anything of their own, Up is inert for
+        // history until the draft is cleared or submitted. While already
+        // walking history (`history_cursor` is `Some`), keep walking so
+        // repeated Up presses flow through the ring.
+        if self.history_cursor.is_none() && !self.input.is_empty() {
             return;
         }
         let new_cursor = match self.history_cursor {
@@ -725,6 +728,37 @@ mod tests {
         app.history_prev();
         assert_eq!(app.input, "b");
         app.history_prev();
+        app.history_prev();
+        assert_eq!(app.input, "a");
+    }
+
+    #[test]
+    fn history_prev_is_inert_with_nonempty_draft() {
+        // Shell-style: once the user has typed content, Up is a no-op for
+        // history until the draft clears (or they submit it).
+        let mut app = AppState::new();
+        app.input = "past".to_string();
+        app.cursor = app.input.len();
+        app.take_input();
+        app.input = "drafting".to_string();
+        app.cursor = app.input.len();
+        app.history_prev();
+        assert_eq!(app.input, "drafting");
+        assert!(app.history_cursor.is_none());
+    }
+
+    #[test]
+    fn history_prev_keeps_walking_once_in_history_mode() {
+        let mut app = AppState::new();
+        for cmd in ["a", "b"] {
+            app.input = cmd.to_string();
+            app.cursor = app.input.len();
+            app.take_input();
+        }
+        app.history_prev();
+        assert_eq!(app.input, "b");
+        // input is no longer empty, but we're already walking — guard
+        // should not block further presses.
         app.history_prev();
         assert_eq!(app.input, "a");
     }

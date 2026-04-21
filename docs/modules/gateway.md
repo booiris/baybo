@@ -495,6 +495,18 @@ ids are client-generated UUIDs: the router resolves or creates the
 session on first message via `SessionManager::get_or_create`, so no
 client has to pre-provision one.
 
+For session-scoped TUI clients only, two additional frames carry the
+persistent input-history ring: `HistorySnapshot { session_id, entries }`
+is pushed once by the server immediately after a successful
+`RegisterAck` (sidecars never see it), and `HistoryAppend { session_id,
+entry }` is sent by the client after every accepted submission. The
+gateway owns the encrypted ring via `channel::TuiHistoryStore` (vault
+key `aura.tui.input_history`, 500-entry cap, consecutive-duplicate
+dedup); concurrent appends from multiple TUIs on the same gateway
+serialise through a `tokio::sync::Mutex` on the store. TUI clients
+never open the vault themselves. See [`tui.md`](./tui.md) and
+[`security.md`](./security.md).
+
 Mutation endpoints (`PUT /v1/config`, `DELETE /v1/config`) write
 through to the same on-disk `aura.json` that `aura config set/unset`
 targets. The in-memory `Arc<AuraConfig>` held by managers is **not**

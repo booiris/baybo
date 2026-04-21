@@ -64,11 +64,23 @@ pub enum Frame {
     /// and its declared channel type. For the built-in TUI the token
     /// field is left empty — PSK auth already happened on the WS
     /// upgrade request.
+    ///
+    /// `session_id` distinguishes two flavors of client:
+    /// * `None` — **sidecar**. One process serves every user of this
+    ///   channel type; the registry enforces a 1:1 `ChannelType →
+    ///   Channel` mapping.
+    /// * `Some(sid)` — **session-scoped client** (the built-in TUI
+    ///   today). Multiple such clients of the same channel type may
+    ///   coexist as long as their session ids differ. Agent output for
+    ///   `sid` is routed back to this specific connection.
     Register {
         token: String,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         channel_type: ChannelType,
         protocol_version: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        session_id: Option<String>,
     },
     /// Server response to `Register`. `ok: false` carries a
     /// human-readable reason.
@@ -117,6 +129,21 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         decision: ApprovalDecision,
     },
+    /// Client -> server: persist one submitted input line to the
+    /// server-side history store. Used by the built-in TUI to get
+    /// zsh-style history without the client holding any encryption key
+    /// itself — the gateway's [`aura_security::SecretVault`] is the
+    /// single writer. Fire-and-forget; the server does not ack
+    /// per-append.
+    HistoryAppend { session_id: String, entry: String },
+    /// Server -> client: the full history ring the TUI should rehydrate
+    /// its in-memory scrollback from. Sent exactly once right after
+    /// `RegisterAck { ok: true }` for session-scoped TUI clients.
+    /// Sidecars never receive this.
+    HistorySnapshot {
+        session_id: String,
+        entries: Vec<String>,
+    },
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -155,10 +182,41 @@ mod tests {
             token: "deadbeef".into(),
             channel_type: ChannelType::from("slack"),
             protocol_version: PROTOCOL_VERSION,
+            session_id: None,
         };
         let bytes = encode(&frame).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn round_trip_register_session_scoped() {
+        let frame = Frame::Register {
+            token: String::new(),
+            channel_type: ChannelType::from("tui"),
+            protocol_version: PROTOCOL_VERSION,
+            session_id: Some("sess-abc".into()),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn register_without_session_field_decodes_with_none() {
+        // Old sidecars that predate `session_id` encode only three
+        // fields. The additive schema must still deserialize — treating
+        // the missing field as None keeps the wire protocol at v1 for
+        // backward compatibility.
+        let frame = Frame::Register {
+            token: "deadbeef".into(),
+            channel_type: ChannelType::from("slack"),
+            protocol_version: PROTOCOL_VERSION,
+            session_id: None,
+        };
+        let encoded = encode(&frame).unwrap();
+        // The encoded form should not contain a session_id key because
+        // `skip_serializing_if` omits it when None.
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(frame, decoded);
     }
 
     #[test]
@@ -230,6 +288,24 @@ mod tests {
         let frame = Frame::ResolveApproval {
             call_id: "c1".into(),
             decision: ApprovalDecision::Deny,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_history_append() {
+        let frame = Frame::HistoryAppend {
+            session_id: "sess-1".into(),
+            entry: "echo hello".into(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_history_snapshot() {
+        let frame = Frame::HistorySnapshot {
+            session_id: "sess-1".into(),
+            entries: vec!["one".into(), "two".into(), "three".into()],
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

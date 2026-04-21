@@ -147,6 +147,7 @@ pub struct ManagerGraph {
     pub channels_registry: Arc<ChannelRegistry>,
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
+    pub secret_vault: Arc<SecretVault>,
 
     /// Consumed by [`wire_router`]. Stored in the graph so the caller
     /// cannot forget to plumb it through — a silently-missing receiver
@@ -288,6 +289,7 @@ pub async fn build_managers(
         channels_registry,
         cost_tracker,
         hook_manager,
+        secret_vault,
         cron_trigger_rx: Some(cron_trigger_rx),
     })
 }

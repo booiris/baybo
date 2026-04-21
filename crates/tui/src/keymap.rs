@@ -64,12 +64,15 @@ pub(crate) enum Action {
 }
 
 /// Flags that steer key translation. `input_empty` drives the Ctrl-C /
-/// Ctrl-D semantics; `completion_open` reroutes Up/Down/Tab onto the
-/// completion popup while it is visible.
+/// Ctrl-D semantics and gates history entry (zsh-style: Up only loads
+/// history from a clean prompt). `in_history_mode` means the user is
+/// currently walking the history ring — set whenever `history_cursor`
+/// is `Some(_)` and cleared by the first non-navigation key.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct KeyContext {
     pub input_empty: bool,
     pub completion_open: bool,
+    pub in_history_mode: bool,
     /// An approval modal is overlaying the current view. When set, the
     /// modal eats input before any other bindings fire.
     pub approval_open: bool,
@@ -110,10 +113,28 @@ pub(crate) fn translate(mode: &ViewMode, key: KeyEvent, ctx: KeyContext) -> Acti
         _ => {}
     }
 
-    match mode {
+    let action = match mode {
         ViewMode::Chat => translate_chat(key, ctx.completion_open),
         ViewMode::Dashboard { .. } => translate_dashboard(key),
+    };
+
+    // Popup + no-history-access override. History is only reachable
+    // from an empty prompt (zsh-style); once the input has content the
+    // user is editing, not navigating. When the popup is open on top
+    // of that edited input, Up/Down drive the completion list instead
+    // of silently doing nothing. While the user is *already* walking
+    // history, leave Up/Down alone so repeat presses keep walking — the
+    // fact that the loaded entry may trigger the popup doesn't eject
+    // them from history mode.
+    let history_available = ctx.in_history_mode || ctx.input_empty;
+    if ctx.completion_open && !history_available {
+        return match action {
+            Action::HistoryPrev => Action::CompletionPrev,
+            Action::HistoryNext => Action::CompletionNext,
+            other => other,
+        };
     }
+    action
 }
 
 fn translate_chat(key: KeyEvent, completion_open: bool) -> Action {
@@ -138,8 +159,6 @@ fn translate_chat(key: KeyEvent, completion_open: bool) -> Action {
         KeyCode::Right => Action::MoveRight,
         KeyCode::Home => Action::MoveHome,
         KeyCode::End => Action::MoveEnd,
-        KeyCode::Up if completion_open => Action::CompletionPrev,
-        KeyCode::Down if completion_open => Action::CompletionNext,
         KeyCode::Up => Action::HistoryPrev,
         KeyCode::Down => Action::HistoryNext,
         KeyCode::PageUp => Action::ScrollPageUp,
@@ -205,6 +224,7 @@ mod tests {
         KeyContext {
             input_empty,
             completion_open: false,
+            in_history_mode: false,
             approval_open: false,
         }
     }
@@ -289,11 +309,69 @@ mod tests {
     }
 
     #[test]
+    fn up_down_walk_history_when_input_empty_even_with_popup() {
+        let app = AppState::new();
+        let open = KeyContext {
+            input_empty: true,
+            completion_open: true,
+            in_history_mode: false,
+            approval_open: false,
+        };
+        assert_eq!(
+            translate(&app.mode, press(KeyCode::Up), open),
+            Action::HistoryPrev
+        );
+        assert_eq!(
+            translate(&app.mode, press(KeyCode::Down), open),
+            Action::HistoryNext
+        );
+    }
+
+    #[test]
+    fn up_down_walk_history_while_already_navigating() {
+        let app = AppState::new();
+        let open = KeyContext {
+            input_empty: false,
+            completion_open: true,
+            in_history_mode: true,
+            approval_open: false,
+        };
+        assert_eq!(
+            translate(&app.mode, press(KeyCode::Up), open),
+            Action::HistoryPrev
+        );
+        assert_eq!(
+            translate(&app.mode, press(KeyCode::Down), open),
+            Action::HistoryNext
+        );
+    }
+
+    #[test]
+    fn up_down_select_completion_when_input_has_content() {
+        let app = AppState::new();
+        let open = KeyContext {
+            input_empty: false,
+            completion_open: true,
+            in_history_mode: false,
+            approval_open: false,
+        };
+        assert_eq!(
+            translate(&app.mode, press(KeyCode::Up), open),
+            Action::CompletionPrev
+        );
+        assert_eq!(
+            translate(&app.mode, press(KeyCode::Down), open),
+            Action::CompletionNext
+        );
+    }
+
+    #[test]
     fn shift_enter_overrides_completion_accept() {
         let app = AppState::new();
         let open = KeyContext {
             input_empty: false,
             completion_open: true,
+            in_history_mode: true,
             approval_open: false,
         };
         assert_eq!(

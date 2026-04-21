@@ -17,8 +17,10 @@
 
 pub(crate) mod adapter;
 pub(crate) mod handshake;
+pub(crate) mod history;
 pub mod route;
 pub mod state;
 
+pub use history::TuiHistoryStore;
 pub use route::routes;
 pub use state::WsChannelState;

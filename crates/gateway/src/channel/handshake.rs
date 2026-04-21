@@ -24,15 +24,28 @@ const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP];
 /// same identity that the header-based auth already validated. The
 /// built-in TUI authenticates via PSK, so its `Register.token` is
 /// ignored and it must claim the `"tui"` channel type.
+/// Outcome of a successful Register handshake.
+///
+/// `session_id` is `Some` only for session-scoped clients (today: the
+/// built-in TUI). Sidecars leave it `None` and register as
+/// type-level channels — the registry enforces the historical 1:1
+/// `ChannelType → Channel` mapping for those.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegisterOutcome {
+    pub channel_type: ChannelType,
+    pub session_id: Option<String>,
+}
+
 pub(crate) fn validate_register(
     frame: Frame,
     authed: &AuthedClient,
     tokens: &ChannelTokenTable,
-) -> Result<ChannelType, String> {
+) -> Result<RegisterOutcome, String> {
     let Frame::Register {
         token,
         channel_type,
         protocol_version,
+        session_id,
     } = frame
     else {
         return Err("expected Register frame".to_string());
@@ -60,6 +73,11 @@ pub(crate) fn validate_register(
                     ChannelType::TUI
                 ));
             }
+            if session_id.as_deref().is_none_or(str::is_empty) {
+                return Err(
+                    "tui psk clients must declare a session_id in the Register frame".to_string(),
+                );
+            }
         }
         AuthedClient::Subprocess { pid, label } => {
             let identity = tokens
@@ -77,7 +95,19 @@ pub(crate) fn validate_register(
         }
     }
 
-    Ok(ChannelType::from(normalized))
+    let session_id = session_id.and_then(|s| {
+        let trimmed = s.trim().to_owned();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+
+    Ok(RegisterOutcome {
+        channel_type: ChannelType::from(normalized),
+        session_id,
+    })
 }
 
 #[cfg(test)]
@@ -94,10 +124,20 @@ mod tests {
     }
 
     fn register(token: &str, channel_type: &str, version: u16) -> Frame {
+        register_with_session(token, channel_type, version, None)
+    }
+
+    fn register_with_session(
+        token: &str,
+        channel_type: &str,
+        version: u16,
+        session_id: Option<&str>,
+    ) -> Frame {
         Frame::Register {
             token: token.to_string(),
             channel_type: ChannelType::from(channel_type),
             protocol_version: version,
+            session_id: session_id.map(ToOwned::to_owned),
         }
     }
 
@@ -110,8 +150,9 @@ mod tests {
         });
         let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
         let authed = subprocess(42, "slack");
-        let ct = validate_register(frame, &authed, &tokens).unwrap();
-        assert_eq!(ct.as_str(), "slack");
+        let outcome = validate_register(frame, &authed, &tokens).unwrap();
+        assert_eq!(outcome.channel_type.as_str(), "slack");
+        assert!(outcome.session_id.is_none(), "sidecars register type-level");
     }
 
     #[test]
@@ -165,9 +206,18 @@ mod tests {
     #[test]
     fn accepts_tui_auth_claiming_tui_channel() {
         let tokens = ChannelTokenTable::new();
+        let frame = register_with_session("", ChannelType::TUI, PROTOCOL_VERSION, Some("sess-123"));
+        let outcome = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap();
+        assert_eq!(outcome.channel_type.as_str(), ChannelType::TUI);
+        assert_eq!(outcome.session_id.as_deref(), Some("sess-123"));
+    }
+
+    #[test]
+    fn rejects_tui_auth_without_session_id() {
+        let tokens = ChannelTokenTable::new();
         let frame = register("", ChannelType::TUI, PROTOCOL_VERSION);
-        let ct = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap();
-        assert_eq!(ct.as_str(), ChannelType::TUI);
+        let err = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap_err();
+        assert!(err.contains("must declare a session_id"));
     }
 
     #[test]

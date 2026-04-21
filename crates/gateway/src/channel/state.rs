@@ -13,6 +13,8 @@ use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_gateway_auth::ChannelTokenTable;
 use tokio::sync::mpsc;
 
+use super::history::TuiHistoryStore;
+
 /// State passed to the `/v1/channel-ws` handler. Cheap to clone — every
 /// field is an `Arc` or a clone-cheap handle.
 #[derive(Clone)]
@@ -21,4 +23,10 @@ pub struct WsChannelState {
     pub incoming_tx: mpsc::Sender<IncomingMessage>,
     pub tokens: ChannelTokenTable,
     pub session_manager: Arc<SessionManager>,
+    /// Vault-backed TUI input-history store. Shared across every
+    /// concurrent TUI client on this gateway — the server is the single
+    /// writer of the `aura.tui.input_history` vault key, so an
+    /// in-process `tokio::sync::Mutex` inside the store is enough to
+    /// serialise concurrent appends.
+    pub tui_history: Arc<TuiHistoryStore>,
 }

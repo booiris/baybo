@@ -32,6 +32,7 @@ use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::LlmClient;
+use aura_security::SecretVault;
 use aura_skills::SkillRegistry;
 use aura_storage::TraceStore;
 use aura_tools::ToolRegistry;
@@ -84,6 +85,11 @@ pub struct GatewayDeps {
     /// Per-install capability tokens. The channel UDS listener passes
     /// this to the WS server for Register-frame verification.
     pub channel_tokens: ChannelTokenTable,
+    /// Vault handle shared with the channel server so the WS route can
+    /// build a [`crate::channel::TuiHistoryStore`] without re-opening
+    /// libsql. The gateway is the only process that writes the TUI
+    /// input-history key; the TUI itself never touches the vault.
+    pub secret_vault: Arc<SecretVault>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -232,11 +238,15 @@ pub fn build_channel_router(
     auth_state: crate::auth_channel::ChannelAuthState,
 ) -> Router {
     let _channel_state = ChannelState::from_deps(deps);
+    let tui_history = Arc::new(crate::channel::TuiHistoryStore::new(Arc::clone(
+        &deps.secret_vault,
+    )));
     let ws_state = crate::channel::WsChannelState {
         registry: Arc::clone(&deps.channel_registry),
         incoming_tx: deps.incoming_tx.clone(),
         tokens: deps.channel_tokens.clone(),
         session_manager: Arc::clone(&deps.session_manager),
+        tui_history,
     };
     let v1 = crate::auth_channel::attach(crate::channel::routes().with_state(ws_state), auth_state);
     Router::new()

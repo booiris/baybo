@@ -77,12 +77,21 @@ impl WsClient {
     /// Connect using the bundled-TUI PSK flow: the handshake carries the
     /// hex-encoded PSK in `x-aura-tui-secret`, and the `Register` frame
     /// leaves the capability `token` empty because auth already happened
-    /// on the upgrade request.
+    /// on the upgrade request. `session_id` pins this TUI instance to a
+    /// specific session — the gateway routes approvals/output for that
+    /// session to this WS only, so multiple TUIs can coexist on the same
+    /// gateway without collision.
+    ///
+    /// Returns the client plus the server-side input-history snapshot
+    /// the gateway pushes right after `RegisterAck` — consuming it here
+    /// means the caller's `recv_*` loop sees a clean stream of turn
+    /// frames afterward and never has to know the snapshot exists.
     pub async fn connect_tui(
         socket_path: impl AsRef<Path>,
         psk: &[u8; 32],
         channel_type: ChannelType,
-    ) -> Result<Self, WsClientError> {
+        session_id: String,
+    ) -> Result<(Self, Vec<String>), WsClientError> {
         let psk_hex = hex::encode(psk);
         Self::connect_inner(
             socket_path.as_ref().to_path_buf(),
@@ -90,6 +99,7 @@ impl WsClient {
             &psk_hex,
             String::new(),
             channel_type,
+            Some(session_id),
         )
         .await
     }
@@ -100,7 +110,8 @@ impl WsClient {
         header_value: &str,
         register_token: String,
         channel_type: ChannelType,
-    ) -> Result<Self, WsClientError> {
+        session_id: Option<String>,
+    ) -> Result<(Self, Vec<String>), WsClientError> {
         let stream = UnixStream::connect(&socket_path)
             .await
             .map_err(WsClientError::UdsDial)?;
@@ -121,19 +132,28 @@ impl WsClient {
             sink: Arc::new(Mutex::new(sink)),
             source: Arc::new(Mutex::new(source)),
         };
-        client.register(register_token, channel_type).await?;
-        Ok(client)
+        client
+            .register(register_token, channel_type, session_id.clone())
+            .await?;
+        let history = if session_id.is_some() {
+            client.recv_history_snapshot().await?
+        } else {
+            Vec::new()
+        };
+        Ok((client, history))
     }
 
     async fn register(
         &self,
         token: String,
         channel_type: ChannelType,
+        session_id: Option<String>,
     ) -> Result<(), WsClientError> {
         self.send_frame(&Frame::Register {
             token,
             channel_type,
             protocol_version: PROTOCOL_VERSION,
+            session_id,
         })
         .await?;
 
@@ -143,6 +163,18 @@ impl WsClient {
                 reason.unwrap_or_else(|| "no reason given".to_string()),
             )),
             _ => Err(WsClientError::ProtocolViolation("expected RegisterAck")),
+        }
+    }
+
+    /// Read the one-shot `HistorySnapshot` frame the gateway sends right
+    /// after `RegisterAck` for session-scoped TUI clients. Sidecars
+    /// never receive this and must not call it.
+    async fn recv_history_snapshot(&self) -> Result<Vec<String>, WsClientError> {
+        match self.recv_frame().await? {
+            Frame::HistorySnapshot { entries, .. } => Ok(entries),
+            _ => Err(WsClientError::ProtocolViolation(
+                "expected HistorySnapshot after RegisterAck",
+            )),
         }
     }
 

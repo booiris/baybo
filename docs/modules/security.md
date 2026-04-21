@@ -86,12 +86,20 @@ records:
 | Vault key                 | Owner                    | Format                        | Purpose                                                         |
 | ------------------------- | ------------------------ | ----------------------------- | --------------------------------------------------------------- |
 | `[{REDACTED_SECRET_<hex>}]` | `SecurityGateway` reveal | raw secret bytes              | Plaintext for placeholder reveal at the tool-argument boundary  |
-| `aura.tui.input_history`  | `CliInputHistoryStore`   | UTF-8 JSON `Vec<String>`      | Persistent TUI input ring (see [`tui.md`](./tui.md))            |
+| `aura.tui.input_history`  | `TuiHistoryStore` (gateway) | UTF-8 JSON `Vec<String>`   | Persistent TUI input ring (see [`tui.md`](./tui.md))            |
 
-`CliInputHistoryStore` (in `aura-cli`) wraps `Arc<SecretVault>` to load and
-save the TUI input history under that key. The history is encrypted with the
-same master key as everything else in the vault, so commands or pasted
-credentials typed into the TUI never appear as plaintext on disk.
+`aura_gateway::channel::TuiHistoryStore` wraps `Arc<SecretVault>` behind a
+`tokio::sync::Mutex` to load and append the TUI input history under that
+key. The mutex serialises the read-modify-write inside the gateway process,
+so concurrent `aura tui` clients connected to the same gateway never lose
+each other's entries — and because the gateway is the *only* writer, no
+cross-process file lock is needed. TUI clients never open the vault
+themselves; they exchange the ring over the channel WS via
+`Frame::HistorySnapshot` (server→client, once after register) and
+`Frame::HistoryAppend` (client→server, one per submission). The history is
+encrypted with the same master key as everything else in the vault, so
+commands or pasted credentials typed into the TUI never appear as
+plaintext on disk.
 
 ### Least-privilege injection (deferred)
 

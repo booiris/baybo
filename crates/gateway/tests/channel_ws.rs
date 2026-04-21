@@ -17,7 +17,7 @@ use aura_channels::wire::{self, Frame, Message as WireMessage, PROTOCOL_VERSION}
 use aura_channels::{AgentOutput, OutgoingMessage};
 use aura_gateway::test_support::build_test_deps;
 use aura_gateway::uds::ChannelServer;
-use aura_gateway_auth::{CHANNEL_TOKEN_HEADER, ClientIdentity};
+use aura_gateway_auth::{CHANNEL_TOKEN_HEADER, ClientIdentity, TUI_PSK_HEADER};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata};
 use futures::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -69,7 +69,7 @@ async fn channel_ws_end_to_end() {
         .expect("sidecar handshake");
     assert!(
         wait_until(Duration::from_secs(2), || channel_registry
-            .get(slack.clone())
+            .get_sidecar(slack.clone())
             .is_some())
         .await,
         "sidecar not registered with ChannelRegistry",
@@ -100,7 +100,7 @@ async fn channel_ws_end_to_end() {
 
     // 3. Agent → sidecar delivery via the registered channel.
     let channel_handle = channel_registry
-        .get(slack.clone())
+        .get_sidecar(slack.clone())
         .expect("channel present after registration");
     channel_handle
         .send(AgentOutput::Message(OutgoingMessage {
@@ -138,7 +138,7 @@ async fn channel_ws_end_to_end() {
     drop(client);
     assert!(
         wait_until(Duration::from_secs(2), || channel_registry
-            .get(slack.clone())
+            .get_sidecar(slack.clone())
             .is_none())
         .await,
         "channel not cleaned up after sidecar disconnect",
@@ -199,6 +199,7 @@ async fn connect_register(
             token: token.to_string(),
             channel_type,
             protocol_version: PROTOCOL_VERSION,
+            session_id: None,
         },
     )
     .await?;
@@ -243,8 +244,12 @@ async fn recv_message(ws: &mut WsStream) -> Result<WireMessage, ConnectError> {
             Frame::Delta { .. }
             | Frame::Notice { .. }
             | Frame::ApprovalRequested { .. }
-            | Frame::ApprovalResolved { .. } => continue,
-            Frame::Register { .. } | Frame::RegisterAck { .. } | Frame::ResolveApproval { .. } => {
+            | Frame::ApprovalResolved { .. }
+            | Frame::HistorySnapshot { .. } => continue,
+            Frame::Register { .. }
+            | Frame::RegisterAck { .. }
+            | Frame::ResolveApproval { .. }
+            | Frame::HistoryAppend { .. } => {
                 return Err(ConnectError::ProtocolViolation(
                     "unexpected frame kind post-handshake",
                 ));
@@ -262,4 +267,304 @@ async fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     check()
+}
+
+/// Two concurrent TUI processes on one gateway, pinned to different
+/// session ids. Each receives only its own session's output and
+/// disconnecting one leaves the other intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_tui_clients_same_gateway_different_sessions() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let socket_path = tempdir.path().join("channel.sock");
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let channel_registry = Arc::clone(&tg.deps.channel_registry);
+    let channel_tokens = tg.channel_tokens.clone();
+    let shutdown = tg.shutdown.clone();
+
+    let server = ChannelServer::bind(
+        &tg.deps,
+        socket_path.clone(),
+        TEST_PSK,
+        channel_tokens.clone(),
+    )
+    .expect("bind ChannelServer");
+
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    let tui = ChannelType::from(ChannelType::TUI);
+
+    // Two TUIs pin distinct session ids.
+    let mut alice = connect_register_tui(&socket_path, &TEST_PSK, "sess-alice")
+        .await
+        .expect("alice handshake");
+    let mut bob = connect_register_tui(&socket_path, &TEST_PSK, "sess-bob")
+        .await
+        .expect("bob handshake");
+
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            let clients = channel_registry.list_session_clients();
+            clients.iter().any(|s| s == "sess-alice") && clients.iter().any(|s| s == "sess-bob")
+        })
+        .await,
+        "both session-scoped TUI clients should be registered",
+    );
+
+    // Duplicate registration of an already-claimed session id is rejected.
+    match connect_register_tui(&socket_path, &TEST_PSK, "sess-alice").await {
+        Ok(_) => panic!("duplicate session register unexpectedly succeeded"),
+        Err(ConnectError::RegistrationRejected(msg)) => {
+            assert!(msg.contains("already"), "unexpected reason: {msg}",);
+        }
+        Err(other) => panic!("expected RegistrationRejected, got {other:?}"),
+    }
+
+    // Route a message to Alice's session and verify only Alice sees it.
+    let alice_channel = channel_registry
+        .get_for(&tui, "sess-alice")
+        .expect("alice channel present");
+    alice_channel
+        .send(AgentOutput::Message(OutgoingMessage {
+            session_id: "sess-alice".into(),
+            channel: tui.clone(),
+            content: vec![ContentBlock::Text("hello alice".into())],
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+        }))
+        .await
+        .expect("send to alice");
+
+    let got = tokio::time::timeout(Duration::from_secs(2), recv_message(&mut alice))
+        .await
+        .expect("alice recv timeout")
+        .expect("alice recv");
+    assert_eq!(got.content, "hello alice");
+    assert_eq!(got.session_id, "sess-alice");
+
+    // Same routing call for Bob picks a different channel handle.
+    let bob_channel = channel_registry
+        .get_for(&tui, "sess-bob")
+        .expect("bob channel present");
+    assert!(
+        !Arc::ptr_eq(&alice_channel, &bob_channel),
+        "alice and bob must resolve to distinct channel handles",
+    );
+    bob_channel
+        .send(AgentOutput::Message(OutgoingMessage {
+            session_id: "sess-bob".into(),
+            channel: tui.clone(),
+            content: vec![ContentBlock::Text("hey bob".into())],
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+        }))
+        .await
+        .expect("send to bob");
+
+    let got = tokio::time::timeout(Duration::from_secs(2), recv_message(&mut bob))
+        .await
+        .expect("bob recv timeout")
+        .expect("bob recv");
+    assert_eq!(got.content, "hey bob");
+    assert_eq!(got.session_id, "sess-bob");
+
+    // Drop Alice. Bob should remain registered and functional.
+    drop(alice_channel);
+    drop(alice);
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            let clients = channel_registry.list_session_clients();
+            !clients.iter().any(|s| s == "sess-alice") && clients.iter().any(|s| s == "sess-bob")
+        })
+        .await,
+        "alice should be cleaned up while bob remains",
+    );
+
+    bob_channel
+        .send(AgentOutput::Message(OutgoingMessage {
+            session_id: "sess-bob".into(),
+            channel: tui.clone(),
+            content: vec![ContentBlock::Text("still there?".into())],
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+        }))
+        .await
+        .expect("send to bob after alice drop");
+    let got = tokio::time::timeout(Duration::from_secs(2), recv_message(&mut bob))
+        .await
+        .expect("bob recv-2 timeout")
+        .expect("bob recv-2");
+    assert_eq!(got.content, "still there?");
+
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+}
+
+/// Server-side history acts like a zsh ring shared across every TUI
+/// process attached to this gateway: entries one TUI writes become part
+/// of the snapshot a subsequent TUI sees, with consecutive duplicates
+/// deduped and no vault contention between the two clients.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_history_round_trips_across_clients() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let socket_path = tempdir.path().join("channel.sock");
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let channel_tokens = tg.channel_tokens.clone();
+    let shutdown = tg.shutdown.clone();
+
+    let server = ChannelServer::bind(
+        &tg.deps,
+        socket_path.clone(),
+        TEST_PSK,
+        channel_tokens.clone(),
+    )
+    .expect("bind ChannelServer");
+
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    // Alice connects first — fresh vault, empty snapshot.
+    let (mut alice, alice_snapshot) =
+        connect_register_tui_with_snapshot(&socket_path, &TEST_PSK, "sess-alice")
+            .await
+            .expect("alice handshake");
+    assert!(alice_snapshot.is_empty(), "fresh vault: snapshot is empty");
+
+    // Alice appends three entries, with one consecutive duplicate that
+    // the server-side store should collapse.
+    for entry in ["one", "two", "two", "three"] {
+        send_frame(
+            &mut alice,
+            &Frame::HistoryAppend {
+                session_id: "sess-alice".into(),
+                entry: entry.into(),
+            },
+        )
+        .await
+        .expect("alice append");
+    }
+
+    // Bob connects on a fresh session. The gateway is the single writer
+    // of the vault key, so Bob's snapshot must contain Alice's entries
+    // (consecutive duplicate collapsed).
+    let bob_snapshot = wait_for_snapshot(&socket_path, &TEST_PSK, "bob-", &["one", "two", "three"])
+        .await
+        .expect("bob snapshot reflects alice's appends");
+    assert_eq!(bob_snapshot, vec!["one", "two", "three"]);
+
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+}
+
+/// Repeatedly open a TUI connection and return the first snapshot that
+/// matches `expected`. Appends over the WS are fire-and-forget so a new
+/// client may observe the store before the gateway has persisted the
+/// latest append — polling is the simplest way to stay deterministic
+/// without reaching into the store directly. Each attempt uses a fresh
+/// session id so the registry's per-session guard doesn't reject the
+/// re-register while the previous connection is still being torn down.
+async fn wait_for_snapshot(
+    socket_path: &std::path::Path,
+    psk: &[u8; 32],
+    session_prefix: &str,
+    expected: &[&str],
+) -> Option<Vec<String>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut attempt = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        let sid = format!("{session_prefix}{attempt}");
+        attempt += 1;
+        if let Ok((_ws, snapshot)) =
+            connect_register_tui_with_snapshot(socket_path, psk, &sid).await
+            && snapshot.len() == expected.len()
+            && snapshot.iter().zip(expected).all(|(a, b)| a == b)
+        {
+            return Some(snapshot);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    None
+}
+
+async fn connect_register_tui(
+    socket_path: &std::path::Path,
+    psk: &[u8; 32],
+    session_id: &str,
+) -> Result<WsStream, ConnectError> {
+    let (ws, _) = connect_register_tui_with_snapshot(socket_path, psk, session_id).await?;
+    Ok(ws)
+}
+
+/// Same as [`connect_register_tui`] but also returns the history
+/// snapshot the server pushes right after `RegisterAck`. Used by the
+/// history round-trip tests; the regular session-routing tests ignore
+/// the snapshot.
+async fn connect_register_tui_with_snapshot(
+    socket_path: &std::path::Path,
+    psk: &[u8; 32],
+    session_id: &str,
+) -> Result<(WsStream, Vec<String>), ConnectError> {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(ConnectError::Dial)?;
+    let mut request = HANDSHAKE_URL
+        .into_client_request()
+        .map_err(|e| ConnectError::Upgrade(e.to_string()))?;
+    let psk_hex = hex::encode(psk);
+    request.headers_mut().insert(
+        TUI_PSK_HEADER,
+        psk_hex
+            .parse()
+            .map_err(|_| ConnectError::Upgrade("invalid psk header".into()))?,
+    );
+    let (mut ws, _) = client_async(request, stream)
+        .await
+        .map_err(|e| ConnectError::Upgrade(e.to_string()))?;
+
+    send_frame(
+        &mut ws,
+        &Frame::Register {
+            token: String::new(),
+            channel_type: ChannelType::from(ChannelType::TUI),
+            protocol_version: PROTOCOL_VERSION,
+            session_id: Some(session_id.to_owned()),
+        },
+    )
+    .await?;
+
+    match recv_frame(&mut ws).await? {
+        Frame::RegisterAck { ok: true, .. } => {}
+        Frame::RegisterAck { ok: false, reason } => {
+            return Err(ConnectError::RegistrationRejected(
+                reason.unwrap_or_else(|| "no reason given".to_string()),
+            ));
+        }
+        _ => return Err(ConnectError::ProtocolViolation("expected RegisterAck")),
+    }
+
+    // Session-scoped TUI clients receive a HistorySnapshot right after
+    // RegisterAck. Drain it so the caller sees a clean stream of
+    // agent-output frames afterward.
+    match recv_frame(&mut ws).await? {
+        Frame::HistorySnapshot {
+            session_id: sid,
+            entries,
+        } => {
+            if sid != session_id {
+                return Err(ConnectError::ProtocolViolation(
+                    "HistorySnapshot session_id mismatch",
+                ));
+            }
+            Ok((ws, entries))
+        }
+        _ => Err(ConnectError::ProtocolViolation(
+            "expected HistorySnapshot after RegisterAck",
+        )),
+    }
 }

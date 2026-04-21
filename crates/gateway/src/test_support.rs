@@ -18,6 +18,7 @@ use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
+use aura_security::{EncryptionKey, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_storage::{Store, TraceStore};
 use aura_tools::ToolRegistry;
@@ -65,6 +66,13 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         chrono::Duration::seconds(300),
     ));
     let job_manager = Arc::new(JobManager::new(storage.job));
+
+    let secret_store = Arc::from(storage.secret);
+    let secret_vault = Arc::new(SecretVault::new(
+        EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("build test encryption key"),
+        secret_store,
+    ));
 
     let shutdown = ShutdownSignal::new();
     let (cron_tx, _cron_rx) = mpsc::channel(16);
@@ -121,6 +129,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         log_buffer: LogBuffer::new(256),
         incoming_tx,
         channel_tokens: channel_tokens.clone(),
+        secret_vault,
     };
 
     TestGateway {
