@@ -6,10 +6,11 @@ edition.workspace = true
 [dependencies]
 aura-model = { workspace = true }
 aura-tools = { workspace = true }
-aura-channels = { workspace = true, features = ["sdk"] }
+aura-channels = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
@@ -17,6 +18,7 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 tokio-stream = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

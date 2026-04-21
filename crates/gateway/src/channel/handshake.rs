@@ -2,7 +2,7 @@
 //! the route handler so it can be unit-tested without spinning a
 //! TCP/UDS listener.
 
-use aura_channels::sdk::wire::{Frame, PROTOCOL_VERSION};
+use aura_channels::wire::{Frame, PROTOCOL_VERSION};
 use aura_gateway_auth::ChannelTokenTable;
 use aura_model::ChannelType;
 
@@ -83,7 +83,7 @@ pub(crate) fn validate_register(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_channels::sdk::wire::Message as WireMessage;
+    use aura_channels::wire::Message as WireMessage;
     use aura_gateway_auth::ClientIdentity;
 
     fn subprocess(pid: u32, label: &str) -> AuthedClient {

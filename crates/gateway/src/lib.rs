@@ -9,7 +9,7 @@
 //! * **Channel** — Unix domain socket, peer-credential +
 //!   PSK/token authenticated. Hosts a single WebSocket endpoint
 //!   (`/v1/channel-ws`) over which the bundled TUI and sidecar channel
-//!   plugins exchange [`aura_channels::sdk::wire::Frame`]s (MessagePack).
+//!   plugins exchange [`aura_channels::wire::Frame`]s (MessagePack).
 //!
 //! The gateway is driven by the CLI command tree `aura gateway ...`:
 //! `start` runs both listeners in the foreground; `install` writes a

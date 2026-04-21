@@ -17,7 +17,7 @@
     "src"
   ],
   "scripts": {
-    "gen:types": "cd ../.. && cargo test -p aura-channels --features ts-export --lib sdk::wire::export",
+    "gen:types": "cd ../.. && cargo test -p aura-channels --features ts-export --lib wire::export",
     "build": "tsc",
     "check": "tsc --noEmit"
   },

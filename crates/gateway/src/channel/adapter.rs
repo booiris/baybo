@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::sdk::wire::{self, Frame, Message as WireMessage};
+use aura_channels::wire::{self, Frame, Message as WireMessage};
 use aura_channels::{AgentOutput, Channel, ChannelError, NoticeLevel};
 use aura_model::{ChannelType, ContentBlock};
 use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ChannelApprovalGate};

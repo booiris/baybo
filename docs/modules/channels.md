@@ -18,9 +18,10 @@ Core responsibilities of this crate:
 - Define error types (`ChannelError`)
 - Provide [`ChannelRegistry`] for `Arc<Channel>` registration, lookup,
   and approval-gate fan-in
-- Expose the sidecar SDK wire format under `sdk::wire::{Frame,
-  Message}` (MessagePack, named fields) plus a Rust [`Client`] for
-  out-of-process sidecar plugins
+- Expose the sidecar wire format under `wire::{Frame, Message}`
+  (MessagePack, named fields) so the gateway's WS server, the built-in
+  TUI's private WS client, and the third-party TypeScript SDK all
+  speak the same protocol
 
 ## Design Decisions
 
@@ -100,9 +101,11 @@ same endpoint:
 | Sidecars | `<name>_` | `/v1/channel-ws` (subprocess token, claims its own `channel_type`)       |
 
 See [`tui.md`](./tui.md) for the TUI client side and
-[`gateway.md`](./gateway.md) for the server side. The TypeScript SDK
-for third-party sidecars lives at `sdks/channel-ts/` and consumes the
-same `sdk::wire` types via ts-rs bindings.
+[`gateway.md`](./gateway.md) for the server side. The only public SDK
+for third-party sidecars is the TypeScript package at
+`sdks/channel-ts/`, which consumes the same `wire` types via ts-rs
+bindings. There is no Rust SDK — the TUI has its own private WS
+client, and the server is authoritative on the wire format.
 
 ## Channel Registry
 
@@ -145,9 +148,10 @@ Design rules:
 - `channels` stays independent of `agent`, `llm`, `tools`, and all other
   business crates (depends only on `model` and `session`; `aura-tools`
   is pulled in only for the `ApprovalGate` + `ApprovalGateMap` types)
-- Transports — not this crate — own wire formats. The optional `sdk`
-  module is behind a feature flag for consumers that want the
-  MessagePack frame shape and the Rust client.
+- Transports own framing and encoding. This crate only defines the
+  neutral `wire::{Frame, Message}` shapes (MessagePack-named) and the
+  `encode` / `decode` helpers both sides call; the gateway route and
+  the TUI's private WS client each own their own WebSocket plumbing.
 
 ## Collaboration
 

@@ -1,9 +1,9 @@
 //! WebSocket + MessagePack-backed TUI transport.
 //!
-//! Wraps [`aura_channels::sdk::Client`] and a local [`ApprovalQueue`].
-//! User input is sent as [`wire::Message`] frames; streaming deltas,
-//! final responses, notices, and approval events flow back as typed
-//! [`wire::Frame`]s and are mapped onto the TUI's [`TransportEvent`].
+//! Wraps [`WsClient`] and a local [`ApprovalQueue`]. User input is
+//! sent as [`wire::Message`] frames; streaming deltas, final responses,
+//! notices, and approval events flow back as typed [`wire::Frame`]s
+//! and are mapped onto the TUI's [`TransportEvent`].
 //!
 //! Outbound approvals — driven by the TUI's modal — travel over the
 //! same socket as [`wire::Frame::ResolveApproval`] so the gateway's
@@ -12,8 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_channels::sdk::wire::{Frame, Message as WireMessage};
-use aura_channels::sdk::{Client as WsClient, SdkError};
+use aura_channels::wire::{Frame, Message as WireMessage};
 use aura_channels::{ChannelError, IncomingMessage, NoticeLevel, Result};
 use aura_model::{ChannelType, ContentBlock};
 use aura_tools::{ApprovalQueue, ApprovalRequest};
@@ -21,6 +20,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
+use super::ws::{WsClient, WsClientError};
 use crate::transport::{TransportEvent, TransportEventStream};
 
 /// Channel capacity for the subscribe pump. Deep enough to absorb a
@@ -51,7 +51,7 @@ impl WsTransport {
         // Local resolver: echo /approve|/deny and the modal's decision
         // back to the gateway as a ResolveApproval frame so the tool
         // gate releases server-side.
-        let client_for_resolver = Arc::clone(&client);
+        let client_for_resolver: Arc<WsClient> = Arc::clone(&client);
         approval_queue.set_resolver(Arc::new(move |call_id, decision| {
             let client = Arc::clone(&client_for_resolver);
             tokio::spawn(async move {
@@ -104,7 +104,7 @@ impl WsTransport {
     /// `session_id`. The returned stream ends when the peer closes.
     pub async fn subscribe(&self, session_id: &str) -> Result<TransportEventStream> {
         let (tx, rx) = mpsc::channel::<Result<TransportEvent>>(EVENT_CHAN_CAPACITY);
-        let client = Arc::clone(&self.client);
+        let client: Arc<WsClient> = Arc::clone(&self.client);
         let queue = self.approval_queue.clone();
         let target = session_id.to_owned();
         let subscribe_lock = Arc::clone(&self.subscribe_lock);
@@ -117,7 +117,7 @@ impl WsTransport {
             loop {
                 let frame = match client.recv_any().await {
                     Ok(f) => f,
-                    Err(SdkError::PeerClosed) => {
+                    Err(WsClientError::PeerClosed) => {
                         debug!("tui ws peer closed; subscribe pump exiting");
                         return;
                     }

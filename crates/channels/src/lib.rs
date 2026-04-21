@@ -4,8 +4,7 @@ mod registry;
 mod slash;
 mod types;
 
-#[cfg(feature = "sdk")]
-pub mod sdk;
+pub mod wire;
 
 pub use channel::Channel;
 pub use error::ChannelError;

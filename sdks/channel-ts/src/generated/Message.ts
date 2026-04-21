@@ -2,7 +2,7 @@
 
 /**
  * The canonical sidecar-to-aura (or aura-to-sidecar) message. A single
- * SDK connection may carry messages for many `user_id`s — the sidecar
+ * connection may carry messages for many `user_id`s — the sidecar
  * multiplexes its users onto one WebSocket.
  *
  * `channel_type` holds an [`aura_model::ChannelType`] but exports to

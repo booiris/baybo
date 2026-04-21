@@ -2,7 +2,7 @@
 
 ## Overview
 
-`TuiAdapter` is the interactive channel for Aura, launched via `aura tui`. Bare `aura` prints `--help`; the TUI is an explicit opt-in to avoid surprising users with a full-screen app. It is implemented with [Ratatui] over a [Crossterm] async event stream and lives in its own crate (`crates/tui/`, published as `aura-tui`). It depends on `aura-channels` for shared type definitions (`SlashHandler`, `DashboardProvider`, `IncomingMessage`, `sdk::wire`) but nothing in `aura-channels` depends back on it.
+`TuiAdapter` is the interactive channel for Aura, launched via `aura tui`. Bare `aura` prints `--help`; the TUI is an explicit opt-in to avoid surprising users with a full-screen app. It is implemented with [Ratatui] over a [Crossterm] async event stream and lives in its own crate (`crates/tui/`, published as `aura-tui`). It depends on `aura-channels` for shared type definitions (`SlashHandler`, `DashboardProvider`, `IncomingMessage`, `wire`) but nothing in `aura-channels` depends back on it.
 
 The layout is intentionally minimal:
 
@@ -14,7 +14,10 @@ No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands
 
 `aura tui` is a thin `/v1/channel-ws` client of `aura gateway`,
 speaking the same WebSocket + MessagePack protocol every out-of-process
-sidecar uses (`aura_channels::sdk`). It does **not** take the
+sidecar uses ([`aura_channels::wire`]). The TUI ships its own private
+`WsClient` (`crates/tui/src/client/ws.rs`); the only public-SDK form
+of this protocol is the TypeScript package under `sdks/channel-ts/`.
+It does **not** take the
 workspace singleton lock, does **not** build a manager graph, and does
 **not** own a local `Router`. One workspace runs a long-lived `aura
 gateway` as a service and opens `aura tui` against it — the gateway is

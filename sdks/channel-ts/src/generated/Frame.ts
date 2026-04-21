@@ -7,4 +7,4 @@ import type { Message } from "./Message";
  * [`rmp_serde::to_vec_named`](rmp_serde::to_vec_named) so field names
  * round-trip — makes it trivial to hand-write a TypeScript decoder.
  */
-export type Frame = { "kind": "register", token: string, channel_type: string, protocol_version: number, } | { "kind": "register_ack", ok: boolean, reason: string | null, } | { "kind": "message" } & Message;
+export type Frame = { "kind": "register", token: string, channel_type: string, protocol_version: number, } | { "kind": "register_ack", ok: boolean, reason: string | null, } | { "kind": "message" } & Message | { "kind": "delta", session_id: string, text: string, } | { "kind": "notice", session_id: string, level: string, text: string, } | { "kind": "approval_requested", call_id: string, session_id: string, tool: string, accesses: unknown[], params_preview: string, } | { "kind": "approval_resolved", call_id: string, decision: string, } | { "kind": "resolve_approval", call_id: string, decision: string, };

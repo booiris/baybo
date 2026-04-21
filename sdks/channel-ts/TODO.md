@@ -1,6 +1,6 @@
 # channel-ts SDK — drift prevention
 
-Rust (`crates/channels/src/sdk/`) and TS (`sdks/channel-ts/src/`)
+Rust (`crates/channels/src/wire.rs`) and TS (`sdks/channel-ts/src/`)
 implement the same wire protocol. Types and `PROTOCOL_VERSION` are
 already single-sourced from Rust via `ts-rs` (see `ts-export` feature
 in `crates/channels/Cargo.toml`). Remaining drift gaps:

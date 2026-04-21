@@ -1,14 +1,32 @@
+//! Wire protocol shared by the gateway channel server and every
+//! channel sidecar client.
+//!
+//! The only out-of-tree consumer is the TypeScript package under
+//! `sdks/channel-ts/`, which reuses the ts-rs-generated bindings below
+//! and the MessagePack encoding to speak the same protocol. The
+//! built-in TUI has a private Rust WS client (`crates/tui/src/client/
+//! ws.rs`) that rides on these same types.
+
 use aura_model::{ChannelType, ResourceAccess};
 use aura_tools::ApprovalDecision;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-use super::error::SdkError;
-
-/// Wire-format version this SDK speaks. Bump on breaking frame changes.
+/// Wire-format version this protocol speaks. Bump on breaking frame changes.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Error surface for frame encode/decode.
+#[derive(Debug, Error)]
+pub enum WireError {
+    #[error("encode: {0}")]
+    Encode(#[from] rmp_serde::encode::Error),
+
+    #[error("decode: {0}")]
+    Decode(#[from] rmp_serde::decode::Error),
+}
+
 /// The canonical sidecar-to-aura (or aura-to-sidecar) message. A single
-/// SDK connection may carry messages for many `user_id`s — the sidecar
+/// connection may carry messages for many `user_id`s — the sidecar
 /// multiplexes its users onto one WebSocket.
 ///
 /// `channel_type` holds an [`aura_model::ChannelType`] but exports to
@@ -53,8 +71,7 @@ pub enum Frame {
         protocol_version: u16,
     },
     /// Server response to `Register`. `ok: false` carries a
-    /// human-readable reason; the SDK surfaces it as
-    /// [`SdkError::RegistrationRejected`](super::error::SdkError::RegistrationRejected).
+    /// human-readable reason.
     RegisterAck { ok: bool, reason: Option<String> },
     /// A user-visible message flowing in either direction. Inbound
     /// from a channel it is user input; outbound it is the agent's
@@ -66,7 +83,7 @@ pub enum Frame {
     Delta { session_id: String, text: String },
     /// Server -> client: out-of-band notice surfaced by the agent
     /// (skill warnings, degraded-mode banners). `level` is a lower-
-    /// case string (`"warn"` / `"error"`) so third-party SDKs don't
+    /// case string (`"warn"` / `"error"`) so third-party clients don't
     /// need a typed enum to render it.
     Notice {
         session_id: String,
@@ -103,13 +120,13 @@ pub enum Frame {
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
-pub fn encode(frame: &Frame) -> Result<Vec<u8>, SdkError> {
-    rmp_serde::to_vec_named(frame).map_err(SdkError::from)
+pub fn encode(frame: &Frame) -> Result<Vec<u8>, WireError> {
+    rmp_serde::to_vec_named(frame).map_err(WireError::from)
 }
 
 /// Deserialize a frame.
-pub fn decode(bytes: &[u8]) -> Result<Frame, SdkError> {
-    rmp_serde::from_slice(bytes).map_err(SdkError::from)
+pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
+    rmp_serde::from_slice(bytes).map_err(WireError::from)
 }
 
 /// Regenerates `sdks/channel-ts/src/generated/constants.ts` with

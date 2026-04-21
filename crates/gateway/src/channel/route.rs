@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use aura_channels::sdk::wire::{self, Frame};
+use aura_channels::wire::{self, Frame};
 use aura_channels::{ChannelError, IncomingMessage, Message as AgentMessage};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
 use axum::Router;

@@ -22,7 +22,7 @@ builds the [`aura_channels::Channel`] handle the registry sees, owns an
 outbound frame mpsc, and spawns one pump task that drains the receiver
 onto the WS sink. The agent's [`AgentOutput`] stream, the
 [`ApprovalGate`] waker, and the inbound loop's `resolve_approval` path
-all push [`Frame`](aura_channels::sdk::wire::Frame)s through the same
+all push [`Frame`](aura_channels::wire::Frame)s through the same
 mpsc, so the pump is the single serialisation point onto the wire.
 
 The gateway is driven by the `aura gateway …` command tree. `start` runs
@@ -164,7 +164,7 @@ to `ChannelRegistry::register`; the registry then populates the
 shared `ApprovalGateMap` from `Channel::approval_gate()` so tool
 approvals resolve to this connection. A single pump task drains the
 receiver and writes each frame to the WS sink with
-[`rmp_serde::to_vec_named`](aura_channels::sdk::wire::encode) —
+[`rmp_serde::to_vec_named`](aura_channels::wire::encode) —
 everything fans *in* to the mpsc, the pump is the only thing that
 touches the socket. When the registry `unregister`s on disconnect the
 gate map eviction and `Sidecar::into_pump()` drop the last
@@ -479,7 +479,7 @@ Hitting a channel route on the admin listener returns `404` — the route
 is not mounted there at all, so a leaked admin token yields nothing. The
 `admin_has_no_channels` integration test enforces this.
 
-The WS protocol is defined by [`aura_channels::sdk::wire::Frame`]
+The WS protocol is defined by [`aura_channels::wire::Frame`]
 (tagged on `kind`, MessagePack-named). The client opens with a
 `Register { token, channel_type, protocol_version }` frame; the server
 validates it via `channel::handshake::validate_register` against the
@@ -625,7 +625,7 @@ client.
   TaskTracker}` used by the server's graceful shutdown path.
 - **channels** — the `Channel` handle, `IncomingMessage`,
   `OutgoingMessage`, `NoticeLevel`, `ChannelRegistry`, and the
-  `sdk::wire::{Frame, Message}` MessagePack types the WS route speaks.
+  `wire::{Frame, Message}` MessagePack types the WS route speaks.
   Every accepted `/v1/channel-ws` connection registers its
   `Arc<Channel>` on the shared registry and unregisters on disconnect.
 - **gateway-auth** — embeds the build-time PSK, defines the
