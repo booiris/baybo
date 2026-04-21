@@ -115,7 +115,7 @@ impl TuiAdapter {
             user: User {
                 id: user_id,
                 name: None,
-                channel: ChannelType::Tui,
+                channel: ChannelType::tui(),
             },
             shutdown: Arc::new(Notify::new()),
             slash_handler: None,
@@ -694,7 +694,7 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
         message: Message {
             id: Uuid::new_v4().to_string(),
             session_id: ctx.session_id.clone(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             sender: ctx.user.clone(),
             content: vec![ContentBlock::Text(text)],
             timestamp: Utc::now(),

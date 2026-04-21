@@ -1,3 +1,4 @@
+use aura_model::ChannelType;
 use serde::{Deserialize, Serialize};
 
 use super::error::SdkError;
@@ -5,39 +6,14 @@ use super::error::SdkError;
 /// Wire-format version this SDK speaks. Bump on breaking frame changes.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Open-ended channel identifier used by the sidecar SDK. Distinct from
-/// `aura_model::ChannelType` (a closed enum) because sidecars identify
-/// themselves with arbitrary names (`"slack"`, `"wechat"`, …) the core
-/// doesn't need to know about at compile time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(
-    feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
-)]
-pub struct ChannelTypeV2(pub String);
-
-impl From<&str> for ChannelTypeV2 {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<String> for ChannelTypeV2 {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl std::fmt::Display for ChannelTypeV2 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// The canonical sidecar-to-aura (or aura-to-sidecar) message. A single
 /// SDK connection may carry messages for many `user_id`s — the sidecar
 /// multiplexes its users onto one WebSocket.
+///
+/// `channel_type` holds an [`aura_model::ChannelType`] but exports to
+/// TypeScript as a plain `string` — the domain type is a transparent
+/// newtype over `String`, and we don't want ts-rs to pull the domain
+/// crate into its generated schema.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
@@ -48,7 +24,8 @@ pub struct Message {
     pub content: String,
     pub session_id: String,
     pub user_id: String,
-    pub channel_type: ChannelTypeV2,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+    pub channel_type: ChannelType,
 }
 
 /// Frame envelope. Tagged on the `kind` field so the receive side
@@ -68,7 +45,8 @@ pub enum Frame {
     /// and its declared channel type.
     Register {
         token: String,
-        channel_type: ChannelTypeV2,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        channel_type: ChannelType,
         protocol_version: u16,
     },
     /// Server response to `Register`. `ok: false` carries a
@@ -113,7 +91,7 @@ mod tests {
     fn round_trip_register() {
         let frame = Frame::Register {
             token: "deadbeef".into(),
-            channel_type: ChannelTypeV2("slack".into()),
+            channel_type: ChannelType::from("slack"),
             protocol_version: PROTOCOL_VERSION,
         };
         let bytes = encode(&frame).unwrap();
@@ -127,7 +105,7 @@ mod tests {
             content: "hi".into(),
             session_id: "s1".into(),
             user_id: "u1".into(),
-            channel_type: "slack".into(),
+            channel_type: ChannelType::from("slack"),
         });
         let bytes = encode(&frame).unwrap();
         assert_eq!(frame, decode(&bytes).unwrap());

@@ -8,12 +8,22 @@ use std::path::PathBuf;
 use futures::{SinkExt, StreamExt};
 use tempfile::NamedTempFile;
 use tokio::net::UnixListener;
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+};
 
-use super::client::{Client, ENV_CHANNEL_SOCKET, ENV_CHANNEL_TOKEN};
-use super::wire::{self, ChannelTypeV2, Frame, Message};
+use aura_model::ChannelType;
 
+use super::client::{CHANNEL_TOKEN_HEADER, Client, ENV_CHANNEL_SOCKET, ENV_CHANNEL_TOKEN};
+use super::wire::{self, Frame, Message};
+
+// The tungstenite `accept_hdr_async` callback returns
+// `Result<_, ErrorResponse>`, where `ErrorResponse` is a large hyper
+// `Response`. We never produce the Err path, so the size of the unused
+// variant is not worth boxing around.
+#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn register_and_roundtrip() {
     let socket_path = {
@@ -36,7 +46,19 @@ async fn register_and_roundtrip() {
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let ws = accept_async(stream).await.unwrap();
+        let callback = |req: &HandshakeRequest,
+                        resp: HandshakeResponse|
+         -> Result<HandshakeResponse, ErrorResponse> {
+            let token = req
+                .headers()
+                .get(CHANNEL_TOKEN_HEADER)
+                .expect("channel token header present")
+                .to_str()
+                .expect("channel token header ascii");
+            assert_eq!(token, "secret-token");
+            Ok(resp)
+        };
+        let ws = accept_hdr_async(stream, callback).await.unwrap();
         let (mut sink, mut source) = ws.split();
 
         // Expect Register frame with the token we set.
@@ -53,7 +75,7 @@ async fn register_and_roundtrip() {
                 protocol_version,
             } => {
                 assert_eq!(token, "secret-token");
-                assert_eq!(channel_type, ChannelTypeV2("slack".into()));
+                assert_eq!(channel_type, ChannelType::from("slack"));
                 assert_eq!(protocol_version, wire::PROTOCOL_VERSION);
             }
             other => panic!("expected Register, got {:?}", other),
@@ -76,15 +98,13 @@ async fn register_and_roundtrip() {
         sink.send(WsMessage::Binary(echo_bytes)).await.unwrap();
     });
 
-    let client = Client::connect(ChannelTypeV2("slack".into()))
-        .await
-        .unwrap();
+    let client = Client::connect(ChannelType::from("slack")).await.unwrap();
 
     let msg = Message {
         content: "hello aura".into(),
         session_id: "sess-1".into(),
         user_id: "user-1".into(),
-        channel_type: ChannelTypeV2("slack".into()),
+        channel_type: ChannelType::from("slack"),
     };
     client.send(msg.clone()).await.unwrap();
 

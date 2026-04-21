@@ -1390,13 +1390,7 @@
       },
       "ChannelType": {
         "type": "string",
-        "description": "Admin-surface mirror of [`aura_model::ChannelType`]. Matches the\n`snake_case` wire format exactly; conversions below round-trip.",
-        "enum": [
-          "telegram",
-          "discord",
-          "http",
-          "tui"
-        ]
+        "description": "Admin-surface mirror of [`aura_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
       },
       "CreateCronRequest": {
         "type": "object",

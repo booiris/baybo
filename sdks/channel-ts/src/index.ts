@@ -5,4 +5,4 @@ export {
   encodeFrame,
   decodeFrame,
 } from "./wire.js";
-export type { ChannelTypeV2, Frame, Message } from "./wire.js";
+export type { Frame, Message } from "./wire.js";

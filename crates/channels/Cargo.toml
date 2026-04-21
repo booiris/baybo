@@ -30,9 +30,12 @@ client = [
 # protocol through the hand-written `sdks/channel-ts/` package.
 sdk = ["dep:rmp-serde", "dep:futures", "dep:tokio-tungstenite"]
 # Enables the `export_ts_bindings` test that writes ts-rs-generated
-# TypeScript definitions for `Message` / `Frame` / `ChannelTypeV2`
-# into `sdks/channel-ts/src/generated/`. Kept behind a feature so
-# CI / release builds don't depend on ts-rs.
+# TypeScript definitions for `Message` / `Frame` into
+# `sdks/channel-ts/src/generated/`. Kept behind a feature so CI /
+# release builds don't depend on ts-rs. The embedded
+# `aura_model::ChannelType` is emitted as plain `string` via a
+# field-level `#[ts(type = "string")]` override so ts-rs doesn't
+# chase the domain crate.
 ts-export = ["sdk", "dep:ts-rs"]
 
 [dependencies]

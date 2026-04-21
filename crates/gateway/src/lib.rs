@@ -19,6 +19,7 @@
 pub mod api;
 pub mod auth_admin;
 pub mod auth_channel;
+pub mod channel;
 pub mod config;
 pub mod error;
 pub mod http_adapter;

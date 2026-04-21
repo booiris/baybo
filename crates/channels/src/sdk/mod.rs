@@ -20,7 +20,7 @@ pub mod wire;
 
 pub use client::{Client, ENV_CHANNEL_SOCKET, ENV_CHANNEL_TOKEN};
 pub use error::SdkError;
-pub use wire::{ChannelTypeV2, Frame, Message, PROTOCOL_VERSION, decode, encode};
+pub use wire::{Frame, Message, PROTOCOL_VERSION, decode, encode};
 
 #[cfg(test)]
 mod tests;

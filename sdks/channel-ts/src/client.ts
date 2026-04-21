@@ -1,4 +1,4 @@
-import type { ChannelTypeV2, Frame, Message } from "./wire.js";
+import type { Frame, Message } from "./wire.js";
 import { PROTOCOL_VERSION, decodeFrame, encodeFrame } from "./wire.js";
 
 export class SdkError extends Error {
@@ -59,7 +59,7 @@ class FrameQueue {
 export interface ConnectOptions {
   wsUrl: string;
   token: string;
-  channelType: ChannelTypeV2;
+  channelType: string;
 }
 
 /**

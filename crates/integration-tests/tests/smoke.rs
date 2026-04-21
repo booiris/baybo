@@ -17,10 +17,10 @@ async fn fixtures_compose() {
 
     let session = SessionBuilder::new()
         .id("smoke")
-        .channel(ChannelType::Tui)
+        .channel(ChannelType::tui())
         .build();
     assert_eq!(session.id, "smoke");
-    assert_eq!(session.channel, ChannelType::Tui);
+    assert_eq!(session.channel, ChannelType::tui());
 }
 
 #[test]

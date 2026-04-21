@@ -1,15 +1,17 @@
 use std::env;
 use std::sync::Arc;
 
+use aura_model::ChannelType;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
 use super::error::SdkError;
-use super::wire::{self, ChannelTypeV2, Frame, Message, PROTOCOL_VERSION};
+use super::wire::{self, Frame, Message, PROTOCOL_VERSION};
 
 /// Env var: path of the channel UDS the sidecar must dial. Matches
 /// the name Aura's gateway sets in `crates/gateway/src/spawn.rs`.
@@ -18,6 +20,12 @@ pub const ENV_CHANNEL_SOCKET: &str = "AURA_CHANNEL_SOCKET";
 /// Env var: hex-encoded capability token the sidecar presents in the
 /// [`Register`](super::wire::Frame::Register) frame.
 pub const ENV_CHANNEL_TOKEN: &str = "AURA_CHANNEL_TOKEN";
+
+/// HTTP header carrying the capability token on the WS upgrade request.
+/// Mirrors `aura_gateway_auth::CHANNEL_TOKEN_HEADER` — duplicated here
+/// as a plain `const` so the SDK stays free of a runtime dep on the
+/// gateway-auth crate.
+pub const CHANNEL_TOKEN_HEADER: &str = "x-aura-channel-token";
 
 /// Nominal WebSocket URL. The UDS is the real transport, but
 /// `tokio-tungstenite::client_async` still needs a syntactically valid
@@ -44,7 +52,7 @@ impl Client {
     /// Dial `$AURA_CHANNEL_SOCKET`, upgrade to WebSocket, run the
     /// Register/RegisterAck handshake with `$AURA_CHANNEL_TOKEN`, and
     /// return a ready `Client`.
-    pub async fn connect(channel_type: ChannelTypeV2) -> Result<Self, SdkError> {
+    pub async fn connect(channel_type: ChannelType) -> Result<Self, SdkError> {
         let socket_path =
             env::var(ENV_CHANNEL_SOCKET).map_err(|_| SdkError::MissingEnv(ENV_CHANNEL_SOCKET))?;
         let token =
@@ -53,7 +61,16 @@ impl Client {
         let stream = UnixStream::connect(&socket_path)
             .await
             .map_err(SdkError::UdsDial)?;
-        let (ws, _) = client_async(HANDSHAKE_URL, stream)
+        let mut request = HANDSHAKE_URL
+            .into_client_request()
+            .map_err(|e| SdkError::WsUpgrade(e.to_string()))?;
+        request.headers_mut().insert(
+            CHANNEL_TOKEN_HEADER,
+            token
+                .parse()
+                .map_err(|_| SdkError::WsUpgrade("channel token is not a valid header".into()))?,
+        );
+        let (ws, _) = client_async(request, stream)
             .await
             .map_err(|e| SdkError::WsUpgrade(e.to_string()))?;
         let (sink, source) = ws.split();
@@ -65,11 +82,7 @@ impl Client {
         Ok(client)
     }
 
-    async fn register(
-        &self,
-        token: String,
-        channel_type: ChannelTypeV2,
-    ) -> Result<(), SdkError> {
+    async fn register(&self, token: String, channel_type: ChannelType) -> Result<(), SdkError> {
         self.send_frame(&Frame::Register {
             token,
             channel_type,

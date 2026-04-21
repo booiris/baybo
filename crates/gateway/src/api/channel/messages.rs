@@ -44,14 +44,14 @@ async fn send_message(
     let sender = User {
         id: session.user.id.clone(),
         name: session.user.name.clone(),
-        channel: ChannelType::Http,
+        channel: ChannelType::http(),
     };
     let message_id = uuid::Uuid::new_v4().to_string();
     let msg = IncomingMessage {
         message: Message {
             id: message_id.clone(),
             session_id: session.id.clone(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             sender,
             content: vec![ContentBlock::Text(req.text)],
             timestamp: Utc::now(),

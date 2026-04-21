@@ -14,24 +14,62 @@ pub struct User {
     pub channel: ChannelType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChannelType {
-    Telegram,
-    Discord,
-    Http,
-    #[serde(alias = "cli")]
-    Tui,
+/// Open-ended channel identifier, stored as a snake_case string.
+///
+/// Well-known channels have associated constants (`HTTP`, `TUI`,
+/// `TELEGRAM`, `DISCORD`) but the type is deliberately not a closed enum
+/// so runtime-registered sidecars can declare arbitrary names (`"slack"`,
+/// `"wechat"`, …) without a core enum extension.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChannelType(pub String);
+
+impl ChannelType {
+    pub const HTTP: &'static str = "http";
+    pub const TUI: &'static str = "tui";
+    pub const TELEGRAM: &'static str = "telegram";
+    pub const DISCORD: &'static str = "discord";
+
+    pub fn http() -> Self {
+        Self(Self::HTTP.to_owned())
+    }
+
+    pub fn tui() -> Self {
+        Self(Self::TUI.to_owned())
+    }
+
+    pub fn telegram() -> Self {
+        Self(Self::TELEGRAM.to_owned())
+    }
+
+    pub fn discord() -> Self {
+        Self(Self::DISCORD.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for ChannelType {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<String> for ChannelType {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
 }
 
 impl std::fmt::Display for ChannelType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Telegram => write!(f, "telegram"),
-            Self::Discord => write!(f, "discord"),
-            Self::Http => write!(f, "http"),
-            Self::Tui => write!(f, "tui"),
-        }
+        f.write_str(&self.0)
     }
 }
 
@@ -81,15 +119,18 @@ mod tests {
 
     #[test]
     fn channel_type_tui_round_trip() {
-        let s = serde_json::to_string(&ChannelType::Tui).unwrap();
+        let s = serde_json::to_string(&ChannelType::tui()).unwrap();
         assert_eq!(s, "\"tui\"");
         let back: ChannelType = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, ChannelType::Tui);
+        assert_eq!(back, ChannelType::tui());
     }
 
     #[test]
-    fn channel_type_deserializes_legacy_cli_alias() {
-        let back: ChannelType = serde_json::from_str("\"cli\"").unwrap();
-        assert_eq!(back, ChannelType::Tui);
+    fn channel_type_open_string_round_trip() {
+        let ct = ChannelType::from("slack");
+        let s = serde_json::to_string(&ct).unwrap();
+        assert_eq!(s, "\"slack\"");
+        let back: ChannelType = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ct);
     }
 }

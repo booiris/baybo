@@ -165,7 +165,7 @@ mod tests {
             user: User {
                 id: "u".into(),
                 name: None,
-                channel: ChannelType::Tui,
+                channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),

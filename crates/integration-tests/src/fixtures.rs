@@ -35,7 +35,7 @@ pub fn gateway_with_memory_vault() -> (
 
 /// Builder for `Session` so tests don't repeat the field list.
 ///
-/// Defaults: id `"sess-it"`, user `"user-it"` on `ChannelType::Tui`,
+/// Defaults: id `"sess-it"`, user `"user-it"` on `ChannelType::tui()`,
 /// no messages, `created_at == last_active == Utc::now()`, default
 /// `SessionState`. Override only what the test cares about.
 pub struct SessionBuilder {
@@ -52,7 +52,7 @@ impl Default for SessionBuilder {
             id: "sess-it".into(),
             user_id: "user-it".into(),
             user_name: Some("integration-test-user".into()),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             messages: Vec::new(),
         }
     }
@@ -91,7 +91,7 @@ impl SessionBuilder {
             user: User {
                 id: self.user_id,
                 name: self.user_name,
-                channel: self.channel,
+                channel: self.channel.clone(),
             },
             channel: self.channel,
             messages: self.messages,

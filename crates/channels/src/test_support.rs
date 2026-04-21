@@ -72,7 +72,7 @@ impl RecordingChannel {
 #[async_trait]
 impl ChannelAdapter for RecordingChannel {
     fn channel_type(&self) -> ChannelType {
-        self.channel_type
+        self.channel_type.clone()
     }
 
     async fn start(&self, _sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
@@ -122,7 +122,7 @@ mod tests {
     fn outgoing(session: &str, text: &str) -> OutgoingMessage {
         OutgoingMessage {
             session_id: session.into(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             content: vec![ContentBlock::Text(text.into())],
             reply_to: None,
             metadata: MessageMetadata::default(),
@@ -132,14 +132,14 @@ mod tests {
     fn delta(session: &str, text: &str) -> AgentOutput {
         AgentOutput::Delta {
             session_id: session.into(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             text: text.into(),
         }
     }
 
     #[tokio::test]
     async fn captures_responses_deltas_notices() {
-        let ch = RecordingChannel::new(ChannelType::Tui);
+        let ch = RecordingChannel::new(ChannelType::tui());
         ch.send(AgentOutput::Message(outgoing("s1", "hello")))
             .await
             .unwrap();
@@ -147,7 +147,7 @@ mod tests {
         ch.send(delta("s1", "llo")).await.unwrap();
         ch.send(AgentOutput::Notice {
             session_id: "s1".into(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             level: NoticeLevel::Warn,
             text: "careful".into(),
         })

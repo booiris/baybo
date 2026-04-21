@@ -128,7 +128,7 @@ mod tests {
             user: User {
                 id: "u1".into(),
                 name: Some("tester".into()),
-                channel: ChannelType::Tui,
+                channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(5),
             cancellation_token: tokio_util::sync::CancellationToken::new(),

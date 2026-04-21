@@ -19,7 +19,7 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Broadcast capacity for the gateway-wide approval event stream.
 /// Separate from per-session SSE because approvals are keyed by
-/// `ChannelType::Http`, not by session; every HTTP subscriber sees the
+/// `ChannelType::http()`, not by session; every HTTP subscriber sees the
 /// same approval lifecycle.
 const APPROVAL_STREAM_CAPACITY: usize = 32;
 
@@ -35,7 +35,7 @@ const BROADCAST_CAPACITY: usize = 64;
 /// [`HttpAdapter::submit`] from the `POST .../messages` handler.
 ///
 /// Also owns the channel-wide approval queue + broadcast stream used
-/// by `/v1/approvals*` — approvals key on `ChannelType::Http`, not on
+/// by `/v1/approvals*` — approvals key on `ChannelType::http()`, not on
 /// a specific session, so they live here rather than in `sessions`.
 pub struct HttpAdapter {
     /// Populated on [`start`]; cloned by [`submit`] to push new user
@@ -135,7 +135,7 @@ impl HttpAdapter {
 #[async_trait]
 impl ChannelAdapter for HttpAdapter {
     fn channel_type(&self) -> ChannelType {
-        ChannelType::Http
+        ChannelType::http()
     }
 
     fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>> {

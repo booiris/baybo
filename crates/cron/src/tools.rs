@@ -146,7 +146,7 @@ impl Tool for CronCreateTool {
             .scheduler
             .create_job(
                 &ctx.user.id,
-                ctx.user.channel,
+                ctx.user.channel.clone(),
                 schedule,
                 action,
                 Some(ctx.session_id.clone()),

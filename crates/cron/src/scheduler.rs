@@ -275,7 +275,7 @@ impl CronScheduler {
             id: uuid::Uuid::new_v4().to_string(),
             job_id: job.id.clone(),
             user_id: job.user_id.clone(),
-            channel: job.channel,
+            channel: job.channel.clone(),
             schedule: job.schedule.clone(),
             action: job.action.clone(),
             scheduled_fire_time: now,
@@ -292,7 +292,7 @@ impl CronScheduler {
         let event = CronTriggerEvent {
             job_id: execution.job_id.clone(),
             user_id: execution.user_id.clone(),
-            channel: execution.channel,
+            channel: execution.channel.clone(),
             action: execution.action.clone(),
         };
 
@@ -458,7 +458,7 @@ impl CronScheduler {
                 id: uuid::Uuid::new_v4().to_string(),
                 job_id: job.id.clone(),
                 user_id: job.user_id.clone(),
-                channel: job.channel,
+                channel: job.channel.clone(),
                 schedule: job.schedule.clone(),
                 action: job.action.clone(),
                 scheduled_fire_time,
@@ -747,7 +747,7 @@ mod tests {
         scheduler
             .create_job(
                 user_id,
-                ChannelType::Tui,
+                ChannelType::tui(),
                 CronSchedule::cron(expr),
                 TriggerAction::Prompt {
                     prompt: prompt.to_string(),
@@ -775,7 +775,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Tui,
+                ChannelType::tui(),
                 CronSchedule::at(fire_at),
                 TriggerAction::Prompt {
                     prompt: "later".into(),
@@ -795,7 +795,7 @@ mod tests {
         let err = scheduler
             .create_job(
                 "u1",
-                ChannelType::Tui,
+                ChannelType::tui(),
                 CronSchedule::at(past),
                 TriggerAction::Prompt {
                     prompt: "too late".into(),
@@ -813,7 +813,7 @@ mod tests {
         let err = scheduler
             .create_job(
                 "u1",
-                ChannelType::Tui,
+                ChannelType::tui(),
                 CronSchedule::cron("not a cron"),
                 TriggerAction::Prompt {
                     prompt: "test".to_string(),
@@ -848,7 +848,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Tui,
+                ChannelType::tui(),
                 CronSchedule::at(fire_at),
                 TriggerAction::Prompt {
                     prompt: "later".into(),
@@ -947,7 +947,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Tui,
+                ChannelType::tui(),
                 CronSchedule::at(fire_at),
                 TriggerAction::Prompt {
                     prompt: "run once".into(),
@@ -986,7 +986,7 @@ mod tests {
         let job = CronJob {
             id: "cj-rt".to_string(),
             user_id: "u1".to_string(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             schedule: CronSchedule::cron("0 9 * * *"),
             action: TriggerAction::Prompt {
                 prompt: "test".to_string(),
@@ -1053,7 +1053,7 @@ mod tests {
             id: "ce-pending".to_string(),
             job_id: "cj-1".to_string(),
             user_id: "u1".to_string(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             schedule: CronSchedule::cron("* * * * *"),
             action: TriggerAction::Prompt {
                 prompt: "recover me".to_string(),
@@ -1158,7 +1158,7 @@ mod tests {
         let job = scheduler
             .create_job(
                 "u1",
-                ChannelType::Tui,
+                ChannelType::tui(),
                 CronSchedule::at(fire_at),
                 TriggerAction::Prompt {
                     prompt: "manual one-shot".into(),
@@ -1191,7 +1191,7 @@ mod tests {
             id: "ce-rt".to_string(),
             job_id: "cj-1".to_string(),
             user_id: "u1".to_string(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             schedule: CronSchedule::cron("0 9 * * *"),
             action: TriggerAction::Prompt {
                 prompt: "test".to_string(),

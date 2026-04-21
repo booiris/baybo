@@ -178,7 +178,7 @@ impl Router {
         let user = User {
             id: event.user_id.clone(),
             name: None,
-            channel: event.channel,
+            channel: event.channel.clone(),
         };
 
         debug!(
@@ -189,7 +189,7 @@ impl Router {
 
         let session = self
             .session_manager
-            .get_or_create(&session_id, user, event.channel)
+            .get_or_create(&session_id, user, event.channel.clone())
             .await?;
 
         self.session_manager.touch(&session_id).await?;
@@ -230,7 +230,7 @@ impl Router {
 
         let session_id = incoming.message.session_id.clone();
         let user = incoming.message.sender.clone();
-        let channel = incoming.message.channel;
+        let channel = incoming.message.channel.clone();
 
         debug!(session_id = %session_id, user_id = %user.id, "routing message");
 
@@ -327,8 +327,10 @@ impl Router {
                 session_id,
                 channel,
                 ..
-            } => (session_id.clone(), *channel),
-            AgentOutput::Message(outgoing) => (outgoing.session_id.clone(), outgoing.channel),
+            } => (session_id.clone(), channel.clone()),
+            AgentOutput::Message(outgoing) => {
+                (outgoing.session_id.clone(), outgoing.channel.clone())
+            }
         };
 
         // `Message` is the only variant that carries user-visible prose
@@ -343,7 +345,7 @@ impl Router {
             other => other,
         };
 
-        let Some(adapter) = self.channels.get_adapter(channel) else {
+        let Some(adapter) = self.channels.get_adapter(channel.clone()) else {
             debug!(
                 channel = %channel,
                 session_id = %session_id,

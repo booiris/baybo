@@ -153,7 +153,7 @@ impl ToolExecutor {
         };
 
         if !uncovered.is_empty() {
-            let gate = self.gate_map.get(user.channel);
+            let gate = self.gate_map.get(&user.channel);
             let decision = gate
                 .request(ApprovalRequest {
                     call_id: Uuid::new_v4().to_string(),

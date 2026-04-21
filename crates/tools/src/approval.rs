@@ -112,9 +112,9 @@ impl ApprovalGateMap {
 
     /// Look up the gate for a channel. Returns `AutoDenyGate` when no gate
     /// is registered (fail-closed).
-    pub fn get(&self, channel: ChannelType) -> Arc<dyn ApprovalGate> {
+    pub fn get(&self, channel: &ChannelType) -> Arc<dyn ApprovalGate> {
         self.inner
-            .get(&channel)
+            .get(channel)
             .map(|e| Arc::clone(e.value()))
             .unwrap_or_else(|| Arc::new(AutoDenyGate))
     }

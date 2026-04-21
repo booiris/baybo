@@ -55,8 +55,9 @@ impl ChannelRegistry {
             return Err(ChannelError::DuplicateChannel(channel_type.to_string()));
         }
         if let Some(gate) = adapter.approval_gate() {
-            self.gate_map.insert(channel_type, gate);
+            self.gate_map.insert(channel_type.clone(), gate);
         }
+        let key = channel_type.clone();
         self.channels.insert(
             channel_type,
             ChannelEntry {
@@ -64,7 +65,7 @@ impl ChannelRegistry {
                 status: Mutex::new(ChannelStatus::Registered),
             },
         );
-        tracing::info!(%channel_type, "channel registered");
+        tracing::info!(channel_type = %key, "channel registered");
         Ok(())
     }
 
@@ -97,7 +98,7 @@ impl ChannelRegistry {
             .channels
             .iter()
             .filter(|e| *e.value().status.lock() != ChannelStatus::Running)
-            .map(|e| (*e.key(), Arc::clone(&e.value().adapter)))
+            .map(|e| (e.key().clone(), Arc::clone(&e.value().adapter)))
             .collect();
 
         for (channel_type, adapter) in to_start {
@@ -127,7 +128,7 @@ impl ChannelRegistry {
             .channels
             .iter()
             .filter(|e| *e.value().status.lock() == ChannelStatus::Running)
-            .map(|e| (*e.key(), Arc::clone(&e.value().adapter)))
+            .map(|e| (e.key().clone(), Arc::clone(&e.value().adapter)))
             .collect();
 
         for (channel_type, adapter) in to_stop {
@@ -153,7 +154,7 @@ impl ChannelRegistry {
     pub fn list(&self) -> Vec<(ChannelType, ChannelStatus)> {
         self.channels
             .iter()
-            .map(|e| (*e.key(), e.value().status.lock().clone()))
+            .map(|e| (e.key().clone(), e.value().status.lock().clone()))
             .collect()
     }
 
@@ -187,7 +188,7 @@ mod tests {
     #[async_trait]
     impl ChannelAdapter for FakeAdapter {
         fn channel_type(&self) -> ChannelType {
-            self.channel_type
+            self.channel_type.clone()
         }
 
         async fn start(&self, _sender: mpsc::Sender<IncomingMessage>) -> ChannelResult<()> {
@@ -214,40 +215,40 @@ mod tests {
     #[test]
     fn register_and_get() {
         let reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Tui)).unwrap();
-        assert!(reg.get_adapter(ChannelType::Tui).is_some());
-        assert!(reg.get_adapter(ChannelType::Http).is_none());
+        reg.register(fake(ChannelType::tui())).unwrap();
+        assert!(reg.get_adapter(ChannelType::tui()).is_some());
+        assert!(reg.get_adapter(ChannelType::http()).is_none());
     }
 
     #[test]
     fn duplicate_register_fails() {
         let reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Tui)).unwrap();
-        let err = reg.register(fake(ChannelType::Tui)).unwrap_err();
+        reg.register(fake(ChannelType::tui())).unwrap();
+        let err = reg.register(fake(ChannelType::tui())).unwrap_err();
         assert!(matches!(err, ChannelError::DuplicateChannel(_)));
     }
 
     #[tokio::test]
     async fn unregister_removes_adapter() {
         let reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Http)).unwrap();
-        reg.unregister(ChannelType::Http).await.unwrap();
-        assert!(reg.get_adapter(ChannelType::Http).is_none());
+        reg.register(fake(ChannelType::http())).unwrap();
+        reg.unregister(ChannelType::http()).await.unwrap();
+        assert!(reg.get_adapter(ChannelType::http()).is_none());
         assert!(reg.is_empty());
     }
 
     #[tokio::test]
     async fn unregister_not_found() {
         let reg = ChannelRegistry::new();
-        let err = reg.unregister(ChannelType::Tui).await.unwrap_err();
+        let err = reg.unregister(ChannelType::tui()).await.unwrap_err();
         assert!(matches!(err, ChannelError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn start_all_and_stop_all() {
         let reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Tui)).unwrap();
-        reg.register(fake(ChannelType::Http)).unwrap();
+        reg.register(fake(ChannelType::tui())).unwrap();
+        reg.register(fake(ChannelType::http())).unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
         reg.start_all(tx).await.unwrap();
@@ -264,8 +265,8 @@ mod tests {
     #[test]
     fn list_returns_all_registered() {
         let reg = ChannelRegistry::new();
-        reg.register(fake(ChannelType::Tui)).unwrap();
-        reg.register(fake(ChannelType::Http)).unwrap();
+        reg.register(fake(ChannelType::tui())).unwrap();
+        reg.register(fake(ChannelType::http())).unwrap();
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.list().len(), 2);
     }

@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use aura_agent::service::ShutdownSignal;
 use aura_agent::{CronScheduler, JobManager, MemoryManager, SessionManager};
-use aura_channels::ChannelRegistry;
+use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
+use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
 use aura_skills::SkillRegistry;
 use aura_storage::{Store, TraceStore};
@@ -41,6 +42,13 @@ pub struct TestGateway {
     pub deps: GatewayDeps,
     pub adapter: Arc<HttpAdapter>,
     pub shutdown: ShutdownSignal,
+    /// Receiver paired with `deps.incoming_tx`. Exposed so tests that
+    /// exercise the router-intake path (e.g. the WS channel server)
+    /// can assert on frames forwarded by the gateway.
+    pub incoming_rx: mpsc::Receiver<IncomingMessage>,
+    /// Capability table shared with `deps.channel_tokens`. Tests mint
+    /// tokens here to authenticate sidecar clients.
+    pub channel_tokens: ChannelTokenTable,
     pub _tempdir: TempDir,
 }
 
@@ -95,6 +103,12 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         shutdown_grace: Duration::from_millis(250),
     };
 
+    // Tests that need to observe router intake (e.g. the WS channel
+    // server round-trip) pull `incoming_rx` off `TestGateway`; others
+    // just drop it.
+    let (incoming_tx, incoming_rx) = mpsc::channel(16);
+    let channel_tokens = ChannelTokenTable::new();
+
     let deps = GatewayDeps {
         config,
         config_path: None,
@@ -111,12 +125,16 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         llm_client,
         admin_token: TEST_ADMIN_TOKEN.to_string(),
         log_buffer: LogBuffer::new(256),
+        incoming_tx,
+        channel_tokens: channel_tokens.clone(),
     };
 
     TestGateway {
         deps,
         adapter,
         shutdown,
+        incoming_rx,
+        channel_tokens,
         _tempdir: tempdir,
     }
 }

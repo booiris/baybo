@@ -82,7 +82,7 @@ impl AgentTestHarness {
         let message = Message {
             id: format!("msg-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
             session_id: self.session.id.clone(),
-            channel: self.session.channel,
+            channel: self.session.channel.clone(),
             sender: self.session.user.clone(),
             content: vec![ContentBlock::Text(text.into())],
             timestamp: Utc::now(),
@@ -142,7 +142,7 @@ impl AgentTestHarness {
 
 /// Builder for [`AgentTestHarness`].
 ///
-/// Defaults: a `Session` with `id = "sess-it"` on `ChannelType::Tui`,
+/// Defaults: a `Session` with `id = "sess-it"` on `ChannelType::tui()`,
 /// the standard `LeakDetector::with_default_rules()` security stack
 /// pointed at an in-memory `SecretStore`, an empty `ToolRegistry` and
 /// `SkillRegistry`, the soul `"You are Aura, a test assistant."`, and

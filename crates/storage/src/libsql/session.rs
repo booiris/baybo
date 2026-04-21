@@ -136,9 +136,9 @@ mod tests {
             user: User {
                 id: "u1".to_string(),
                 name: Some("Test".to_string()),
-                channel: ChannelType::Tui,
+                channel: ChannelType::tui(),
             },
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),

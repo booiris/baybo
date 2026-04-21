@@ -61,7 +61,7 @@ async fn create_cron(
     let channel: ChannelTypeModel = req
         .channel
         .map(Into::into)
-        .unwrap_or(ChannelTypeModel::Http);
+        .unwrap_or(ChannelTypeModel::http());
     let job = state
         .cron_scheduler
         .create_job(

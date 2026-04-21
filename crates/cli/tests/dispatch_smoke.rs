@@ -99,9 +99,9 @@ fn seeded_session_manager(ids: &[&str]) -> (Arc<SessionManager>, Vec<String>) {
             user: User {
                 id: "user-1".to_string(),
                 name: Some("Alice".to_string()),
-                channel: ChannelType::Tui,
+                channel: ChannelType::tui(),
             },
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),
@@ -1024,7 +1024,7 @@ async fn cron_list_returns_all_scheduled_jobs() {
     sched
         .create_job(
             "alice",
-            ChannelType::Tui,
+            ChannelType::tui(),
             CronSchedule::cron("0 9 * * *"),
             TriggerAction::Prompt {
                 prompt: "morning".into(),
@@ -1036,7 +1036,7 @@ async fn cron_list_returns_all_scheduled_jobs() {
     sched
         .create_job(
             "bob",
-            ChannelType::Tui,
+            ChannelType::tui(),
             CronSchedule::cron("0 18 * * *"),
             TriggerAction::Prompt {
                 prompt: "evening".into(),

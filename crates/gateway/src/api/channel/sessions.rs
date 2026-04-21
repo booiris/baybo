@@ -32,13 +32,13 @@ async fn create_session(
     State(state): State<ChannelState>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse> {
-    let channel: ChannelType = req.channel.map(Into::into).unwrap_or(ChannelType::Http);
+    let channel: ChannelType = req.channel.map(Into::into).unwrap_or(ChannelType::http());
     let user = User {
         id: req
             .user_id
             .unwrap_or_else(|| format!("http:{}", uuid::Uuid::new_v4())),
         name: req.user_name,
-        channel,
+        channel: channel.clone(),
     };
     let session = state
         .session_manager

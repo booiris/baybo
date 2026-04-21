@@ -23,7 +23,7 @@ fn sample_user() -> User {
     User {
         id: "u-1".into(),
         name: Some("tester".into()),
-        channel: ChannelType::Http,
+        channel: ChannelType::http(),
     }
 }
 
@@ -32,7 +32,7 @@ fn sample_incoming(session_id: &str) -> IncomingMessage {
         message: Message {
             id: "m-1".into(),
             session_id: session_id.into(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             sender: sample_user(),
             content: vec![ContentBlock::Text("hi".into())],
             timestamp: Utc::now(),
@@ -50,7 +50,7 @@ async fn stream_delta_and_response_fan_out_in_order() {
     adapter
         .send(AgentOutput::Delta {
             session_id: "sess-1".into(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             text: "hello ".into(),
         })
         .await
@@ -58,7 +58,7 @@ async fn stream_delta_and_response_fan_out_in_order() {
     adapter
         .send(AgentOutput::Delta {
             session_id: "sess-1".into(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             text: "world".into(),
         })
         .await
@@ -66,7 +66,7 @@ async fn stream_delta_and_response_fan_out_in_order() {
     adapter
         .send(AgentOutput::Message(OutgoingMessage {
             session_id: "sess-1".into(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             content: vec![ContentBlock::Text("hello world".into())],
             reply_to: None,
             metadata: MessageMetadata::default(),
@@ -96,7 +96,7 @@ async fn notice_levels_serialise_to_strings() {
     adapter
         .send(AgentOutput::Notice {
             session_id: "sess-1".into(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             level: NoticeLevel::Warn,
             text: "heads up".into(),
         })
@@ -105,7 +105,7 @@ async fn notice_levels_serialise_to_strings() {
     adapter
         .send(AgentOutput::Notice {
             session_id: "sess-1".into(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             level: NoticeLevel::Error,
             text: "blocked".into(),
         })
@@ -137,7 +137,7 @@ async fn outbound_for_other_session_is_not_seen() {
     adapter
         .send(AgentOutput::Delta {
             session_id: "sess-OTHER".into(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             text: "should not appear".into(),
         })
         .await
@@ -145,7 +145,7 @@ async fn outbound_for_other_session_is_not_seen() {
     adapter
         .send(AgentOutput::Delta {
             session_id: "sess-1".into(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             text: "visible".into(),
         })
         .await
@@ -183,7 +183,7 @@ async fn submit_after_start_reaches_router_intake() {
 
     let got = rx.recv().await.expect("router intake");
     assert_eq!(got.message.session_id, "sess-1");
-    assert_eq!(got.message.channel, ChannelType::Http);
+    assert_eq!(got.message.channel, ChannelType::http());
 }
 
 #[tokio::test]

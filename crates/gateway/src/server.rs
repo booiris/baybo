@@ -26,14 +26,16 @@ use std::sync::Arc;
 use aura_agent::{
     CronScheduler, JobManager, MemoryManager, SessionManager, service::ShutdownSignal,
 };
-use aura_channels::ChannelRegistry;
+use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
+use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::LlmClient;
 use aura_skills::SkillRegistry;
 use aura_storage::TraceStore;
 use aura_tools::ToolRegistry;
 use axum::Router;
 use axum::middleware;
+use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -76,6 +78,12 @@ pub struct GatewayDeps {
     /// Shared ring buffer of recent tracing events surfaced by
     /// `/v1/logs`. Installed as a `tracing::Layer` at process init.
     pub log_buffer: Arc<LogBuffer>,
+    /// Router intake. Cloned into the WS channel server so sidecar
+    /// frames can be forwarded as `IncomingMessage`s.
+    pub incoming_tx: mpsc::Sender<IncomingMessage>,
+    /// Per-install capability tokens. The channel UDS listener passes
+    /// this to the WS server for Register-frame verification.
+    pub channel_tokens: ChannelTokenTable,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -102,6 +110,9 @@ pub struct AdminState {
 pub struct ChannelState {
     pub adapter: Arc<HttpAdapter>,
     pub session_manager: Arc<SessionManager>,
+    pub channel_registry: Arc<ChannelRegistry>,
+    pub incoming_tx: mpsc::Sender<IncomingMessage>,
+    pub channel_tokens: ChannelTokenTable,
 }
 
 impl AdminState {
@@ -129,6 +140,9 @@ impl ChannelState {
         Self {
             adapter: Arc::clone(&deps.adapter),
             session_manager: Arc::clone(&deps.session_manager),
+            channel_registry: Arc::clone(&deps.channel_registry),
+            incoming_tx: deps.incoming_tx.clone(),
+            channel_tokens: deps.channel_tokens.clone(),
         }
     }
 }
@@ -214,8 +228,19 @@ pub fn build_channel_router(
     deps: &GatewayDeps,
     auth_state: crate::auth_channel::ChannelAuthState,
 ) -> Router {
-    let state = ChannelState::from_deps(deps);
-    let v1 = crate::auth_channel::attach(api::channel::v1_router().with_state(state), auth_state);
+    let channel_state = ChannelState::from_deps(deps);
+    let ws_state = crate::channel::WsChannelState {
+        registry: Arc::clone(&deps.channel_registry),
+        incoming_tx: deps.incoming_tx.clone(),
+        tokens: deps.channel_tokens.clone(),
+        session_manager: Arc::clone(&deps.session_manager),
+    };
+    let v1 = crate::auth_channel::attach(
+        api::channel::v1_router()
+            .with_state(channel_state)
+            .merge(crate::channel::routes().with_state(ws_state)),
+        auth_state,
+    );
     Router::new()
         .merge(api::health::routes())
         .nest("/v1", v1)

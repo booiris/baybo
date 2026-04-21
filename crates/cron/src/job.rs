@@ -145,7 +145,7 @@ mod tests {
         let job = CronJob {
             id: "cj-1".to_string(),
             user_id: "u-1".to_string(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             schedule: CronSchedule::cron("0 9 * * *"),
             action: TriggerAction::Prompt {
                 prompt: "push news".to_string(),
@@ -172,7 +172,7 @@ mod tests {
         let job = CronJob {
             id: "cj-at".to_string(),
             user_id: "u-1".to_string(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             schedule: CronSchedule::at(fire_at),
             action: TriggerAction::Prompt {
                 prompt: "one shot".to_string(),
@@ -198,7 +198,7 @@ mod tests {
         let job = CronJob {
             id: "cj-2".to_string(),
             user_id: "u-1".to_string(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             schedule: CronSchedule::cron("*/5 * * * *"),
             action: TriggerAction::ToolCall {
                 tool_name: "web_fetch".to_string(),
@@ -252,7 +252,7 @@ mod tests {
             id: "ce-1".to_string(),
             job_id: "cj-1".to_string(),
             user_id: "u-1".to_string(),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
             schedule: CronSchedule::at(Utc::now()),
             action: TriggerAction::Prompt {
                 prompt: "push news".to_string(),

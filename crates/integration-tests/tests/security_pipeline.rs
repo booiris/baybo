@@ -26,11 +26,11 @@ fn message_with(text: &str) -> Message {
     Message {
         id: "msg-it".into(),
         session_id: "sess-it".into(),
-        channel: ChannelType::Tui,
+        channel: ChannelType::tui(),
         sender: User {
             id: "user-it".into(),
             name: Some("test".into()),
-            channel: ChannelType::Tui,
+            channel: ChannelType::tui(),
         },
         content: vec![ContentBlock::Text(text.into())],
         timestamp: Utc::now(),
@@ -42,7 +42,7 @@ fn message_with(text: &str) -> Message {
 fn outgoing_with(text: &str) -> OutgoingMessage {
     OutgoingMessage {
         session_id: "sess-it".into(),
-        channel: ChannelType::Tui,
+        channel: ChannelType::tui(),
         content: vec![ContentBlock::Text(text.into())],
         reply_to: None,
         metadata: MessageMetadata::default(),

@@ -2,7 +2,6 @@ import { encode as msgpackEncode, decode as msgpackDecode } from "@msgpack/msgpa
 
 import type { Frame } from "./generated/Frame.js";
 
-export type { ChannelTypeV2 } from "./generated/ChannelTypeV2.js";
 export type { Frame } from "./generated/Frame.js";
 export type { Message } from "./generated/Message.js";
 export { PROTOCOL_VERSION } from "./generated/constants.js";

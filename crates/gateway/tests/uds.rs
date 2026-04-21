@@ -13,7 +13,7 @@ use aura_agent::service::ShutdownSignal;
 use aura_channels::{AgentOutput, ChannelAdapter, NoticeLevel};
 use aura_gateway::test_support::build_test_deps;
 use aura_gateway::uds::ChannelServer;
-use aura_gateway_auth::{ChannelTokenTable, TUI_PSK_HEADER};
+use aura_gateway_auth::TUI_PSK_HEADER;
 use aura_model::ChannelType;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -32,7 +32,7 @@ async fn spawn_channel_server() -> ChannelServerFixture {
     // server only long enough for cleanup.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let socket_path = tempdir.path().join("channel.sock");
-    let tokens = ChannelTokenTable::new();
+    let tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
     let server = ChannelServer::bind(&tg.deps, socket_path.clone(), TEST_PSK, tokens)
         .expect("bind ChannelServer");
@@ -191,7 +191,7 @@ async fn session_create_message_and_stream_round_trip() {
     fx.adapter
         .send(AgentOutput::Delta {
             session_id: session_id.clone(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             text: "hello from test".into(),
         })
         .await
@@ -199,7 +199,7 @@ async fn session_create_message_and_stream_round_trip() {
     fx.adapter
         .send(AgentOutput::Notice {
             session_id: session_id.clone(),
-            channel: ChannelType::Http,
+            channel: ChannelType::http(),
             level: NoticeLevel::Warn,
             text: "world".into(),
         })

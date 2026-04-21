@@ -52,36 +52,30 @@ pub struct ErrorBody {
 
 // ── ChannelType ──────────────────────────────────────────────────────
 
-/// Admin-surface mirror of [`aura_model::ChannelType`]. Matches the
-/// `snake_case` wire format exactly; conversions below round-trip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ChannelType {
-    Telegram,
-    Discord,
-    Http,
-    Tui,
-}
+/// Admin-surface mirror of [`aura_model::ChannelType`]. Transparent
+/// wrapper around a snake_case string so the OpenAPI surface stays
+/// stable while the core type is open-ended (runtime-registered
+/// sidecars like `"slack"` pass through unchanged).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(transparent)]
+#[schema(value_type = String)]
+pub struct ChannelType(pub String);
 
 impl From<aura_model::ChannelType> for ChannelType {
     fn from(v: aura_model::ChannelType) -> Self {
-        match v {
-            aura_model::ChannelType::Telegram => Self::Telegram,
-            aura_model::ChannelType::Discord => Self::Discord,
-            aura_model::ChannelType::Http => Self::Http,
-            aura_model::ChannelType::Tui => Self::Tui,
-        }
+        Self(v.into_string())
     }
 }
 
 impl From<ChannelType> for aura_model::ChannelType {
     fn from(v: ChannelType) -> Self {
-        match v {
-            ChannelType::Telegram => Self::Telegram,
-            ChannelType::Discord => Self::Discord,
-            ChannelType::Http => Self::Http,
-            ChannelType::Tui => Self::Tui,
-        }
+        aura_model::ChannelType::from(v.0)
+    }
+}
+
+impl std::fmt::Display for ChannelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 

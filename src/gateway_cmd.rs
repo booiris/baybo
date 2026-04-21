@@ -274,6 +274,11 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         cron_handle.run().await;
     }));
 
+    // Shared capability table — the channel UDS listener consumes it
+    // for auth, and the WS channel server re-reads it in the
+    // Register-frame handshake via `GatewayDeps`.
+    let channel_tokens = ChannelTokenTable::new();
+
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),
@@ -291,6 +296,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         llm_client: Arc::clone(&graph.llm_client),
         admin_token: token.clone(),
         log_buffer: Arc::clone(&log_buffer),
+        incoming_tx: run_handle.incoming_tx.clone(),
+        channel_tokens: channel_tokens.clone(),
     };
 
     // Channel UDS listener — lives under the same workspace identity dir
@@ -300,9 +307,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let channel_server = {
         let psk = effective_tui_psk(workspace_root.as_path())
             .map_err(|e| anyhow::anyhow!("derive channel PSK: {e}"))?;
-        let tokens = ChannelTokenTable::new();
         let socket_path = workspace_root.join("channel.sock");
-        ChannelServer::bind(&deps, socket_path.clone(), psk, tokens)
+        ChannelServer::bind(&deps, socket_path.clone(), psk, channel_tokens)
             .map_err(|e| anyhow::anyhow!("bind channel UDS: {e}"))?
     };
 
