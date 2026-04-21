@@ -3,15 +3,13 @@
 //! Split along the two-listener contract:
 //!
 //! * [`admin`] — TCP, bearer-token authenticated. No chat content.
-//! * [`channel`] — UDS, peer-credential + PSK/token authenticated.
-//!   Session CRUD, messages, approvals, SSE streams.
 //! * [`health`] — `/healthz` + `/readyz`, served by both listeners with
-//!   no auth.
+//!   no auth. (The channel UDS listener's chat surface is the WS
+//!   endpoint in [`crate::channel`] — not a REST router.)
 //! * [`webui`] — embedded React dashboard. Admin-listener fallback.
 //! * [`dto`] — shared request/response envelopes.
 
 pub mod admin;
-pub mod channel;
 pub mod dto;
 pub mod health;
 pub mod openapi;

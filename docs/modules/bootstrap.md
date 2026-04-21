@@ -65,7 +65,7 @@ ToolRegistry / ToolExecutor / MemoryManager / LlmClient
 WorkspaceManager / Soul / ExecutionPolicy / HookManager / LeakDetector / SecurityGateway
   │
   ▼
-ChannelRegistry.register(TuiAdapter).start_all()
+ChannelRegistry::new()            ── empty at boot; populated by WS sidecars
   │
   ▼
 Router::new(…).with_actor_spawner(closure).with_cron_triggers(…)
@@ -92,7 +92,7 @@ The dev fallback for the encryption key is intentional but explicit: a fresh che
 ## What boot does NOT do
 
 - **No MCP server registration** — MCP support (and the `tools.mcp_servers[]` config surface) is temporarily removed; see `docs/todo/reintroduce-mcp-support.md`.
-- **No optional channel adapters** — `channels.{http, telegram, discord}` are validated but only `cli` is wired.
+- **No compiled-in channel adapters.** `ChannelRegistry` starts empty. Every channel — the bundled TUI and any sidecar plugin — arrives at runtime as a `/v1/channel-ws` client and registers itself from the gateway's route task. `channels.{http, telegram, discord}` in `aura.json` are validated but not yet wired.
 - **No cost guard or rate limiter** — `cost.*` is validated but not yet consumed by the running router.
 
 These are spec'd in `config.md` and are future wiring work; `validate()` already rejects inconsistent configurations for them so later wiring can trust the shapes.

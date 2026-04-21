@@ -12,7 +12,7 @@ RUST_LOG=aura=debug cargo run                                  # run with loggin
 ```
 
 Test layout, `test-support` feature gating, and the shared fixture inventory
-(`MemorySecretStore`, `RecordingChannel`, `StubLlm`, `gateway_with_memory_vault`,
+(`MemorySecretStore`, `StubLlm`, `gateway_with_memory_vault`,
 `SessionBuilder`, `capture_tracing`, …) are documented in
 [`docs/testing.md`](docs/testing.md). Read it before adding tests that cross
 crate boundaries.

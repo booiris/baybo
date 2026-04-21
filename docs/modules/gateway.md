@@ -11,14 +11,19 @@ by side against the same manager graph:
    chat content or session data flows here.
 2. **Channel listener** — Unix domain socket, authenticated by either the
    TUI pre-shared key or a per-subprocess token (subprocess pid pinned).
-   Serves session CRUD, message submit, per-session SSE, and tool
-   approvals. This is the listener the TUI and future sidecar channel
-   plugins talk to.
+   Hosts a single `GET /v1/channel-ws` endpoint that upgrades authed
+   requests to a WebSocket. Each connection registers itself as a live
+   [`aura_channels::Channel`] on the workspace [`ChannelRegistry`] and
+   exchanges MessagePack-framed events with the agent. The built-in
+   TUI and every out-of-process sidecar plugin speak this one protocol.
 
-The gateway also implements [`aura_channels::ChannelAdapter`] for
-`ChannelType::Http` so messages submitted over the channel listener flow
-through the same router path as TUI/telegram/discord — no parallel agent
-pipeline.
+Per-connection state lives in `src/channel/adapter.rs::Sidecar`: it
+builds the [`aura_channels::Channel`] handle the registry sees, owns an
+outbound frame mpsc, and spawns one pump task that drains the receiver
+onto the WS sink. The agent's [`AgentOutput`] stream, the
+[`ApprovalGate`] waker, and the inbound loop's `resolve_approval` path
+all push [`Frame`](aura_channels::sdk::wire::Frame)s through the same
+mpsc, so the pump is the single serialisation point onto the wire.
 
 The gateway is driven by the `aura gateway …` command tree. `start` runs
 both listeners in the foreground; `install` / `enable` / `disable` /
@@ -40,13 +45,13 @@ Splitting the gateway isolates blast radius: a leaked admin bearer
 token cannot read chat content or message sessions, and a sidecar
 channel plugin running as a child of the gateway has no admin surface
 to hit even if compromised. Both listeners share the same manager
-graph (`SessionManager`, `JobManager`, …) and the same
-`HttpAdapter` — routing and observability stay uniform. The adapter
-contract (`send(AgentOutput)`, `approval_gate`) goes through
-`ChannelRegistry` dispatch exactly as TUI/telegram/discord do;
-`POST /v1/sessions/:id/messages` rebuilds the
-`User` with `ChannelType::Http` before submission so outgoing events
-route back through the same channel.
+graph (`SessionManager`, `JobManager`, …); the channel listener hosts
+the `GET /v1/channel-ws` upgrade path and nothing else, so the router
+sees a single `IncomingMessage` stream regardless of whether a given
+frame came from the built-in TUI or an out-of-process sidecar. Each
+accepted WS connection registers an [`aura_channels::Channel`] against
+the workspace registry, which the router then dispatches to by
+`ChannelType` — no parallel agent pipeline.
 
 ### Admin token, stored in `SecretVault`
 
@@ -148,42 +153,41 @@ runtime fails fast with a message telling the user to run
 init path (open `Store`, open `SecretVault`), not just a one-shot file
 write.
 
-### Adapter owns SSE fan-out
+### Sidecar owns the outbound pump
 
-`HttpAdapter` keeps a `DashMap<SessionId, broadcast::Sender<SseEvent>>`
-plus a `OnceLock<mpsc::Sender<IncomingMessage>>` captured during
-`ChannelAdapter::start`. `subscribe` returns a receiver (creating the
-broadcast channel on first use); `submit` reads the `OnceLock` to push
-an `IncomingMessage` into the router. The single outbound entrypoint
-`ChannelAdapter::send(AgentOutput)` matches the variant (`Delta`,
-`Message`, `Notice`) and fans out to the matching broadcast sender.
-`broadcast::Sender::send` is lossy only when a subscriber is lagging
-past the buffer — in that case `BroadcastStream` surfaces `Lagged` to
-the SSE handler, which emits an `error` event and continues. `stop`
-clears the map, which drops all senders and signals EOF on every live
-stream; the `incoming_tx` slot stays set for the adapter's lifetime
-(mpsc EOF propagates when the adapter itself is dropped).
+Each accepted WS upgrade builds one `Sidecar`
+(`src/channel/adapter.rs`). The struct owns a
+`mpsc::Sender<Frame>` (the outbound frame mpsc) plus a translator task
+that converts `AgentOutput` → `Frame` and forwards it onto the same
+mpsc. `Sidecar::build` returns the `Arc<Channel>` the route task hands
+to `ChannelRegistry::register`; the registry then populates the
+shared `ApprovalGateMap` from `Channel::approval_gate()` so tool
+approvals resolve to this connection. A single pump task drains the
+receiver and writes each frame to the WS sink with
+[`rmp_serde::to_vec_named`](aura_channels::sdk::wire::encode) —
+everything fans *in* to the mpsc, the pump is the only thing that
+touches the socket. When the registry `unregister`s on disconnect the
+gate map eviction and `Sidecar::into_pump()` drop the last
+`frame_tx` clones, so the pump exits cleanly without a separate stop
+signal.
 
-### Approval over HTTP
+### Tool approval over the sidecar WS
 
-`HttpAdapter::approval_gate()` returns a `ChannelApprovalGate` backed by
-a gateway-scoped `ApprovalQueue` shared with the `/v1/approvals*` REST
-handlers. When a tool call hits the gate, the entry is queued and a
-`ApprovalEvent::Added` is broadcast on the gateway-wide approval
-stream; clients read the pending list from `GET /v1/approvals` and
-resolve individual entries via `POST /v1/approvals/:call_id { decision }`.
-The waker closure captured at gate construction fires synchronously
-after the push, so the SSE notification is enqueued before the gate's
-wait-for-decision future starts blocking. The timeout mirrors the
-TUI's 5 minutes — long enough for a human, short enough that forgotten
-prompts don't pin tool executors forever.
+`Channel::approval_gate()` returns a `ChannelApprovalGate` backed by a
+per-connection `ApprovalQueue`. When a tool call hits the gate the
+entry is pushed on the queue and the waker closure sends an
+`ApprovalRequested` frame through the outbound mpsc. The client echoes
+a `ResolveApproval { call_id, decision }` frame; the inbound loop
+calls `Sidecar::resolve_approval`, which pops the matching entry off
+the queue and sends an `ApprovalResolved` frame back through the same
+mpsc so the client can drop any optimistic UI. The 5-minute timeout
+mirrors the TUI's original budget — long enough for a human, short
+enough that forgotten prompts don't pin tool executors forever.
 
-Approvals key on `ChannelType::Http`, not on a specific chat session,
-so they live on a standalone SSE endpoint (`/v1/approvals/stream`)
-rather than the per-session stream. Any frontend can resolve any
-entry: a resolution POSTed by one client is broadcast as
-`ApprovalEvent::Resolved` so other connected clients drop the entry
-from their UI.
+Approvals are *per-connection*, not per-session: a leaked or
+disconnected sidecar simply evicts its gate, and `ToolExecutor` falls
+back to the registry-wide fail-closed `AutoDenyGate` for that
+`ChannelType` until a fresh connection registers.
 
 ### Gateway owns its own DTOs — utoipa stays in the gateway
 
@@ -468,56 +472,28 @@ GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin 
 GET    /healthz                         liveness (no auth)
 GET    /readyz                          managers ready (no auth)
 
-GET    /v1/sessions
-POST   /v1/sessions                     { user_id?, name? }
-GET    /v1/sessions/:id
-DELETE /v1/sessions/:id                 soft-delete
-GET    /v1/sessions/:id/messages        history
-
-POST   /v1/sessions/:id/messages        { text } → 202 { message_id }
-GET    /v1/sessions/:id/stream          SSE: delta | response | notice | end
-
-GET    /v1/approvals                    list pending approvals
-POST   /v1/approvals/:call_id           { decision: "approve" | "deny" } → 200 { call_id, decision }
-GET    /v1/approvals/stream             SSE: added | resolved | end
+GET    /v1/channel-ws                   WebSocket upgrade (MessagePack frames)
 ```
 
 Hitting a channel route on the admin listener returns `404` — the route
 is not mounted there at all, so a leaked admin token yields nothing. The
 `admin_has_no_channels` integration test enforces this.
 
-### SSE event schema
-
-Per-session stream (`/v1/sessions/:id/stream`):
-
-```
-event: delta
-data: { "kind": "delta",    "text": "partial assistant text" }
-
-event: response
-data: { "kind": "response", "text": "final assistant text for the turn" }
-
-event: notice
-data: { "kind": "notice",   "level": "warn" | "error", "text": "..." }
-
-event: end
-data:
-```
-
-Approval stream (`/v1/approvals/stream`):
-
-```
-event: added
-data: { "kind": "added",    "call_id": "...", "session_id": "...",
-        "tool": "...", "accesses": [...], "params_preview": "..." }
-
-event: resolved
-data: { "kind": "resolved", "call_id": "...",
-        "decision": "approve" | "deny" }
-
-event: end
-data:
-```
+The WS protocol is defined by [`aura_channels::sdk::wire::Frame`]
+(tagged on `kind`, MessagePack-named). The client opens with a
+`Register { token, channel_type, protocol_version }` frame; the server
+validates it via `channel::handshake::validate_register` against the
+[`auth_channel::AuthedClient`] the middleware already attached (PSK
+→ must claim `"tui"`; subprocess token → must match the minted
+identity's `(pid, label)` and claim a non-reserved channel type).
+`RegisterAck { ok, reason? }` closes the handshake; subsequent frames
+are `Message` (user input in, final assistant response out), `Delta`
+(streaming assistant text, server → client), `Notice` (out-of-band
+warn/error, server → client), `ApprovalRequested` / `ApprovalResolved`
+(server → client), and `ResolveApproval` (client → server). Session
+ids are client-generated UUIDs: the router resolves or creates the
+session on first message via `SessionManager::get_or_create`, so no
+client has to pre-provision one.
 
 Mutation endpoints (`PUT /v1/config`, `DELETE /v1/config`) write
 through to the same on-disk `aura.json` that `aura config set/unset`
@@ -526,10 +502,6 @@ swapped; `requires_restart: true` in the response signals that the
 gateway must be restarted for the change to take effect. If the
 gateway was booted without a config path (pure-default boot), both
 endpoints return `400 Bad Request`.
-
-`KeepAlive` sends `ping` comments every 15 s so browser/proxy buffers
-don't reset the connection. A lagged consumer receives a single `error`
-event and the stream continues.
 
 ## Runtime Assembly
 
@@ -553,13 +525,14 @@ pub async fn build_secret_vault(config: &AuraConfig) -> Result<Arc<SecretVault>>
 
 `gateway_cmd::start` is now the **only** caller of `build_managers` +
 `wire_router` — the TUI talks to the gateway over UDS and holds no
-manager graph of its own. The gateway registers the `HttpAdapter` into
-`graph.channels_registry`, builds a `GatewayServer` from
+manager graph of its own. The gateway builds a `GatewayServer` from
 `GatewayDeps`, binds both the admin `TcpListener` and the channel
 `UnixListener`, and drives them in parallel with the router via
 `tokio::select!` on `shutdown.wait`. The channel UDS is `chmod 0o600`
 after bind and unlinked on shutdown (plus a `Drop` guard covers panic
-exits).
+exits). `graph.channels_registry` starts empty at boot — every
+registered channel (including the bundled TUI) arrives later as a
+`/v1/channel-ws` client and registers itself from its route task.
 
 `build_secret_vault` is a narrow helper that only opens the libsql
 store far enough to construct a `SecretVault`. The TUI's remote boot
@@ -591,8 +564,8 @@ subcommands use it for the same reason.
   Trace/Job observability.
 - **Singleton lock applies only to the gateway.** `start` acquires
   the per-workspace lock on `<workspace>/aura.lock`. `aura tui` is a
-  UDS+SSE client (see [`tui.md`](./tui.md)) and **does not** take
-  the lock, so one long-lived `aura gateway` can serve many
+  `/v1/channel-ws` client (see [`tui.md`](./tui.md)) and **does not**
+  take the lock, so one long-lived `aura gateway` can serve many
   concurrent TUI sessions in the same workspace.
 
 ## Crate Layout
@@ -607,7 +580,12 @@ crates/gateway/
 │   ├── server.rs            # GatewayDeps, AdminState, GatewayServer (admin TCP)
 │   ├── uds.rs               # cfg(unix) ChannelServer (channel UDS + accept loop)
 │   ├── spawn.rs             # cfg(unix) ChannelSpawner — spawn a subprocess client with a channel token
-│   ├── http_adapter.rs      # HttpAdapter : ChannelAdapter + SseEvent
+│   ├── channel/             # /v1/channel-ws WS server for sidecar plugins + the TUI
+│   │   ├── mod.rs           #   module glue; re-exports route + state
+│   │   ├── adapter.rs       #   Sidecar — per-connection Channel + outbound frame pump
+│   │   ├── handshake.rs     #   validate_register (PSK / subprocess-token gating)
+│   │   ├── route.rs         #   ws_handler + inbound loop
+│   │   └── state.rs         #   WsChannelState (registry, incoming_tx, tokens, sessions)
 │   ├── auth_admin.rs        # AdminAuthState, require_admin_token
 │   ├── auth_channel.rs      # ChannelAuthState, require_channel_client (peer-cred + PSK/token)
 │   ├── error.rs             # GatewayError : IntoResponse
@@ -618,10 +596,8 @@ crates/gateway/
 │   │   ├── openapi.rs       # GET /v1/openapi.json handler
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
-│   │   ├── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
-│   │   │   └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm}.rs
-│   │   └── channel/         # mod.rs exposes v1_router() mounted on the channel UDS listener
-│   │       └── {sessions,messages,approvals,dto}.rs
+│   │   └── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
+│   │       └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start
@@ -629,8 +605,7 @@ crates/gateway/
 │       └── launchd.rs       # cfg(all(target_os = "macos",  feature = "macos"))
 └── tests/
     ├── auth.rs                  # admin bearer auth
-    ├── sse.rs                   # HttpAdapter fan-out
-    ├── admin_has_no_channels.rs # /v1/sessions et al. are 404 on admin
+    ├── admin_has_no_channels.rs # /v1/channel-ws is 404 on the admin listener
     ├── openapi_spec_sync.rs     # asserts router spec == docs/openapi.json (UPDATE_OPENAPI=1 to rewrite)
     └── uds.rs                   # full UDS round-trip via hyper client
 ```
@@ -648,9 +623,11 @@ client.
 - **agent** — provides `SessionManager`, `JobManager`, `CronScheduler`,
   `MemoryManager`, `SecurityGateway`, `service::{ShutdownSignal,
   TaskTracker}` used by the server's graceful shutdown path.
-- **channels** — the `ChannelAdapter`, `Message`, `IncomingMessage`,
-  `OutgoingMessage`, `NoticeLevel`, and `ChannelRegistry` types the
-  `HttpAdapter` implements and the POST route constructs.
+- **channels** — the `Channel` handle, `IncomingMessage`,
+  `OutgoingMessage`, `NoticeLevel`, `ChannelRegistry`, and the
+  `sdk::wire::{Frame, Message}` MessagePack types the WS route speaks.
+  Every accepted `/v1/channel-ws` connection registers its
+  `Arc<Channel>` on the shared registry and unregisters on disconnect.
 - **gateway-auth** — embeds the build-time PSK, defines the
   `ChannelTokenTable` + `ClientIdentity` types, and owns the channel
   header constants. Shared between the gateway server and the TUI
@@ -664,8 +641,11 @@ client.
   socket path, CORS origins, and shutdown grace.
 - **storage** — `Store::open` for vault bootstrap in `gateway_cmd`; the
   `TraceStore` trait behind `/v1/traces/:session_id`.
-- **tui** — the TUI's `GatewayClient` connects over the channel UDS
-  using the effective PSK; admin endpoints are not reached from the TUI.
+- **tui** — the TUI is a `/v1/channel-ws` client like any other
+  sidecar. It authenticates with the effective PSK via the
+  `x-aura-tui-secret` header, registers as `channel_type = "tui"`, and
+  client-generates session UUIDs. Admin endpoints are not reached from
+  the TUI.
 - **cli** — `Commands::Gateway { cmd: GatewayCmd }` is defined in
   `crates/cli/src/cli.rs`; the dispatcher explicitly returns
   `UnknownCommand` because `src/main.rs` intercepts the variant before
@@ -674,4 +654,4 @@ client.
   `gateway_cmd::run`; the long-running `start` path spins up both
   listeners against the same manager graph.
 
-[`aura_channels::ChannelAdapter`]: ./channels.md
+[`aura_channels::Channel`]: ./channels.md

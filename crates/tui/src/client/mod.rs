@@ -1,22 +1,25 @@
-//! Gateway client used by the TUI.
+//! WS-backed glue the TUI uses to talk to the gateway.
 //!
-//! The TUI talks exclusively to the gateway's channel UDS listener —
-//! sessions, messages, approvals, and the SSE streams that carry model
-//! output. Admin routes (status, config, jobs, …) are deliberately out
-//! of reach; `aura cli` is the tool for those.
+//! The TUI reaches the gateway's channel WebSocket endpoint exclusively
+//! — messages, deltas, notices, and tool approvals all travel over a
+//! single [`aura_channels::sdk::Client`]. Admin-shaped resources (skills,
+//! jobs, memory, sessions CRUD) live on the admin TCP surface and are
+//! only reachable through `aura cli`.
 //!
-//! The HTTP+SSE transport and its DTOs live in [`aura_channels::client`]
-//! so third-party channel plugins share the same client. This module
-//! only holds the TUI-facing glue ([`GatewayTransport`],
-//! [`GatewaySlashHandler`], [`GatewayDashboardProvider`]) that adapts
-//! that client onto the TUI's transport / slash / dashboard traits.
+//! This module holds the TUI-facing adapters:
+//!
+//! * [`WsTransport`] — [`TuiTransport`](crate::transport::TuiTransport)
+//!   driven by the channel WS.
+//! * [`TuiSlashHandler`] — slash commands that the WS surface can
+//!   satisfy (`/approve`, `/deny`, `/clear`, `/quit`, …); other slashes
+//!   pass through to the agent.
+//! * [`TuiDashboardProvider`] — dashboard views rendered as admin-only
+//!   placeholders, so keybindings keep working without misleading data.
 
 pub mod dashboard;
 pub mod slash;
 pub mod transport;
 
-pub use aura_channels::client::{ClientError, ClientResult, GatewayClient, SseStream};
-pub use aura_channels::{ApprovalEvent, SseEvent};
-pub use dashboard::GatewayDashboardProvider;
-pub use slash::GatewaySlashHandler;
-pub use transport::GatewayTransport;
+pub use dashboard::TuiDashboardProvider;
+pub use slash::TuiSlashHandler;
+pub use transport::WsTransport;

@@ -110,6 +110,14 @@ impl ApprovalGateMap {
         self.inner.insert(channel, gate);
     }
 
+    /// Evict a gate. Called by `ChannelRegistry::unregister` so tool
+    /// calls scheduled after the channel disconnects fall back to the
+    /// fail-closed `AutoDenyGate` instead of timing out against a dead
+    /// transport.
+    pub fn remove(&self, channel: &ChannelType) {
+        self.inner.remove(channel);
+    }
+
     /// Look up the gate for a channel. Returns `AutoDenyGate` when no gate
     /// is registered (fail-closed).
     pub fn get(&self, channel: &ChannelType) -> Arc<dyn ApprovalGate> {

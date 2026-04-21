@@ -76,7 +76,7 @@ async fn channel_ws_end_to_end() {
         .expect("sidecar handshake");
     assert!(
         wait_until(Duration::from_secs(2), || channel_registry
-            .get_adapter(slack.clone())
+            .get(slack.clone())
             .is_some())
         .await,
         "sidecar not registered with ChannelRegistry",
@@ -103,11 +103,11 @@ async fn channel_ws_end_to_end() {
         other => panic!("expected text block, got {other:?}"),
     }
 
-    // 3. Agent → sidecar delivery via the registered adapter.
-    let adapter = channel_registry
-        .get_adapter(slack.clone())
-        .expect("adapter present after registration");
-    adapter
+    // 3. Agent → sidecar delivery via the registered channel.
+    let channel_handle = channel_registry
+        .get(slack.clone())
+        .expect("channel present after registration");
+    channel_handle
         .send(AgentOutput::Message(OutgoingMessage {
             session_id: "sess-1".into(),
             channel: slack.clone(),
@@ -116,7 +116,7 @@ async fn channel_ws_end_to_end() {
             metadata: MessageMetadata::default(),
         }))
         .await
-        .expect("adapter send");
+        .expect("channel send");
 
     let recv = tokio::time::timeout(Duration::from_secs(2), client.recv())
         .await
@@ -138,14 +138,15 @@ async fn channel_ws_end_to_end() {
         Err(other) => panic!("expected RegistrationRejected, got {other:?}"),
     }
 
-    // 5. Dropping the first client tears the adapter out of the registry.
+    // 5. Dropping the first client tears the channel out of the registry.
+    drop(channel_handle);
     drop(client);
     assert!(
         wait_until(Duration::from_secs(2), || channel_registry
-            .get_adapter(slack.clone())
+            .get(slack.clone())
             .is_none())
         .await,
-        "adapter not cleaned up after sidecar disconnect",
+        "channel not cleaned up after sidecar disconnect",
     );
 
     // Teardown.

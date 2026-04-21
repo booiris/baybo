@@ -18,7 +18,9 @@ pub mod client;
 pub mod error;
 pub mod wire;
 
-pub use client::{Client, ENV_CHANNEL_SOCKET, ENV_CHANNEL_TOKEN};
+pub use client::{
+    CHANNEL_TOKEN_HEADER, Client, ENV_CHANNEL_SOCKET, ENV_CHANNEL_TOKEN, TUI_PSK_HEADER,
+};
 pub use error::SdkError;
 pub use wire::{Frame, Message, PROTOCOL_VERSION, decode, encode};
 

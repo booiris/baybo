@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 aura-model = { workspace = true }
 aura-tools = { workspace = true }
-aura-channels = { workspace = true, features = ["client"] }
+aura-channels = { workspace = true, features = ["sdk"] }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
@@ -17,6 +17,7 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
+tokio-stream = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }

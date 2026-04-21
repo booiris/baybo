@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aura_channels::{
-    AgentOutput, ChannelAdapter, ChannelRegistry, IncomingMessage, OutgoingMessage,
-};
+use aura_channels::{AgentOutput, Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use aura_model::{Session, User};
 
 use aura_cron::CronTriggerEvent;
@@ -345,16 +343,16 @@ impl Router {
             other => other,
         };
 
-        let Some(adapter) = self.channels.get_adapter(channel.clone()) else {
+        let Some(channel_handle) = self.channels.get(channel.clone()) else {
             debug!(
                 channel = %channel,
                 session_id = %session_id,
-                "no adapter registered for agent output"
+                "no channel registered for agent output"
             );
             return;
         };
 
-        self.send_to_adapter(adapter, output, session_id, channel)
+        self.send_to_channel(channel_handle, output, session_id, channel)
             .await;
     }
 
@@ -404,14 +402,14 @@ impl Router {
         outgoing
     }
 
-    async fn send_to_adapter(
+    async fn send_to_channel(
         &self,
-        adapter: std::sync::Arc<dyn ChannelAdapter>,
+        channel_handle: Arc<Channel>,
         output: AgentOutput,
         session_id: String,
         channel: aura_model::ChannelType,
     ) {
-        if let Err(e) = adapter.send(output).await {
+        if let Err(e) = channel_handle.send(output).await {
             error!(
                 channel = %channel,
                 session_id = %session_id,

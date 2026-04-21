@@ -1,4 +1,5 @@
-use aura_model::ChannelType;
+use aura_model::{ChannelType, ResourceAccess};
+use aura_tools::ApprovalDecision;
 use serde::{Deserialize, Serialize};
 
 use super::error::SdkError;
@@ -42,7 +43,9 @@ pub struct Message {
 pub enum Frame {
     /// First frame after the WebSocket handshake. Carries the
     /// sidecar's capability token (injected via `AURA_CHANNEL_TOKEN`)
-    /// and its declared channel type.
+    /// and its declared channel type. For the built-in TUI the token
+    /// field is left empty — PSK auth already happened on the WS
+    /// upgrade request.
     Register {
         token: String,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
@@ -53,8 +56,50 @@ pub enum Frame {
     /// human-readable reason; the SDK surfaces it as
     /// [`SdkError::RegistrationRejected`](super::error::SdkError::RegistrationRejected).
     RegisterAck { ok: bool, reason: Option<String> },
-    /// A user-visible message flowing in either direction.
+    /// A user-visible message flowing in either direction. Inbound
+    /// from a channel it is user input; outbound it is the agent's
+    /// final response for a turn.
     Message(Message),
+    /// Server -> client: incremental assistant text chunk for the
+    /// in-flight response on a session. Channels without a partial
+    /// surface may drop this.
+    Delta { session_id: String, text: String },
+    /// Server -> client: out-of-band notice surfaced by the agent
+    /// (skill warnings, degraded-mode banners). `level` is a lower-
+    /// case string (`"warn"` / `"error"`) so third-party SDKs don't
+    /// need a typed enum to render it.
+    Notice {
+        session_id: String,
+        level: String,
+        text: String,
+    },
+    /// Server -> client: a tool call is blocked waiting for the
+    /// channel's user to approve or deny. Clients with an approval UX
+    /// should echo a [`Frame::ResolveApproval`] back; clients without
+    /// one can ignore, and the gate will time out server-side.
+    ApprovalRequested {
+        call_id: String,
+        session_id: String,
+        tool: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "unknown[]"))]
+        accesses: Vec<ResourceAccess>,
+        params_preview: String,
+    },
+    /// Server -> client: any client (including ours) resolved the
+    /// approval — drop it from the local UI so concurrent frontends
+    /// stay consistent.
+    ApprovalResolved {
+        call_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        decision: ApprovalDecision,
+    },
+    /// Client -> server: resolve a pending approval the client
+    /// previously saw in an [`Frame::ApprovalRequested`].
+    ResolveApproval {
+        call_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        decision: ApprovalDecision,
+    },
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -116,6 +161,58 @@ mod tests {
         let frame = Frame::RegisterAck {
             ok: false,
             reason: Some("bad token".into()),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_delta() {
+        let frame = Frame::Delta {
+            session_id: "s1".into(),
+            text: "hel".into(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_notice() {
+        let frame = Frame::Notice {
+            session_id: "s1".into(),
+            level: "warn".into(),
+            text: "heads up".into(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_approval_requested() {
+        use std::path::PathBuf;
+        let frame = Frame::ApprovalRequested {
+            call_id: "c1".into(),
+            session_id: "s1".into(),
+            tool: "fs.read".into(),
+            accesses: vec![ResourceAccess::ReadFile {
+                path: PathBuf::from("/tmp/x"),
+            }],
+            params_preview: "{}".into(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_approval_resolved() {
+        let frame = Frame::ApprovalResolved {
+            call_id: "c1".into(),
+            decision: ApprovalDecision::Approve,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_resolve_approval() {
+        let frame = Frame::ResolveApproval {
+            call_id: "c1".into(),
+            decision: ApprovalDecision::Deny,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

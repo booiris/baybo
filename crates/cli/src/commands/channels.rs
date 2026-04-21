@@ -12,18 +12,18 @@ pub async fn handle(ctx: &CommandContext, cmd: ChannelsCmd) -> Result<CommandOut
 }
 
 async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
-    let entries: Vec<_> = ctx
+    let entries: Vec<String> = ctx
         .channels
         .list()
         .into_iter()
-        .map(|(ct, status)| (ct.to_string(), format!("{:?}", status)))
+        .map(|ct| ct.to_string())
         .collect();
     let human = if entries.is_empty() {
         "(no channels registered)".to_string()
     } else {
-        let mut buf = String::from("CHANNEL\tSTATUS\n");
-        for (ct, st) in &entries {
-            buf.push_str(&format!("{ct}\t{st}\n"));
+        let mut buf = String::from("CHANNEL\n");
+        for ct in &entries {
+            buf.push_str(&format!("{ct}\n"));
         }
         buf.trim_end().to_string()
     };
@@ -32,7 +32,7 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
         &json!({
             "channels": entries
                 .iter()
-                .map(|(ct, st)| json!({ "channel": ct, "status": st }))
+                .map(|ct| json!({ "channel": ct }))
                 .collect::<Vec<_>>(),
         }),
     ))

@@ -4,31 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# Exposes `RecordingChannel` (a spy `ChannelAdapter`) to downstream
-# crates' tests. Pull in via:
-#   aura-channels = { workspace = true, features = ["test-support"] }
-# inside the consumer's `[dev-dependencies]`.
-test-support = []
-# Exposes the plugin-side SDK (`aura_channels::client`) — UDS transport,
-# SSE parser, and a typed `GatewayClient`. Pulled in by the TUI and by
-# future third-party channel plugin binaries. Kept out of the default
-# build so agent/gateway/cli consumers stay free of the HTTP-client
-# dependency chain.
-client = [
-    "dep:aura-gateway-auth",
-    "dep:hyper",
-    "dep:hyper-util",
-    "dep:http-body-util",
-    "dep:hex",
-    "dep:bytes",
-    "dep:futures",
-    "dep:serde_json",
-]
 # WebSocket + MessagePack SDK for Rust sidecars: wire types, `Client`,
 # and the native transport (tokio-tungstenite over `UnixStream`). This
 # is the only consumer surface — TS / JS sidecars speak the same wire
 # protocol through the hand-written `sdks/channel-ts/` package.
-sdk = ["dep:rmp-serde", "dep:futures", "dep:tokio-tungstenite"]
+sdk = ["dep:rmp-serde", "dep:futures", "dep:tokio-tungstenite", "dep:hex"]
 # Enables the `export_ts_bindings` test that writes ts-rs-generated
 # TypeScript definitions for `Message` / `Frame` into
 # `sdks/channel-ts/src/generated/`. Kept behind a feature so CI /
@@ -51,18 +31,10 @@ chrono = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 
-# Optional — only compiled when the `client` feature is on.
-aura-gateway-auth = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-http-body-util = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
-
 # Optional — shared by `sdk` feature family.
 rmp-serde = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 # Optional — only pulled in for the `ts-export` feature so that
 # release builds don't have to compile ts-rs.

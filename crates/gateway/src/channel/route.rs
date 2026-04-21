@@ -1,26 +1,24 @@
 //! `GET /v1/channel-ws` route — upgrades a channel-auth'd request into
 //! a WebSocket, runs the Register handshake, registers a
-//! [`super::adapter::SidecarAdapter`] with the workspace
-//! [`ChannelRegistry`], and drives the per-connection inbound loop until
-//! either side closes.
+//! [`super::adapter::Sidecar`]'s [`aura_channels::Channel`] with the
+//! workspace [`ChannelRegistry`], and drives the per-connection
+//! inbound loop until either side closes.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::sdk::wire::{self, Frame};
-use aura_channels::{ChannelAdapter, ChannelError, IncomingMessage, Message as AgentMessage};
+use aura_channels::{ChannelError, IncomingMessage, Message as AgentMessage};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
 use axum::Router;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
-use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use chrono::Utc;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 
-use super::adapter::SidecarAdapter;
+use super::adapter::Sidecar;
 use super::handshake::validate_register;
 use super::state::WsChannelState;
 use crate::auth_channel::AuthedClient;
@@ -39,12 +37,6 @@ async fn ws_handler(
     Extension(authed): Extension<AuthedClient>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    match authed {
-        AuthedClient::Subprocess { .. } => {}
-        AuthedClient::Tui => {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-    }
     ws.on_upgrade(move |socket| run_connection(socket, state, authed))
         .into_response()
 }
@@ -68,19 +60,17 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         }
     };
 
-    let adapter = Arc::new(SidecarAdapter::new(channel_type.clone(), sink));
+    let sidecar = Sidecar::build(channel_type.clone(), sink);
 
     if let Err(err) = state
         .registry
-        .register(Arc::clone(&adapter) as Arc<dyn ChannelAdapter>)
+        .register(std::sync::Arc::clone(&sidecar.channel))
     {
         let reason = match &err {
-            ChannelError::DuplicateChannel(ct) => {
-                format!("channel '{ct}' already registered")
-            }
+            ChannelError::DuplicateChannel(ct) => format!("channel '{ct}' already registered"),
             other => format!("registration failed: {other}"),
         };
-        if let Err(e) = adapter
+        if let Err(e) = sidecar
             .send_frame(Frame::RegisterAck {
                 ok: false,
                 reason: Some(reason.clone()),
@@ -90,13 +80,13 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
             tracing::debug!(error = %e, "failed to send duplicate-register ack");
         }
         tracing::warn!(reason = %reason, "channel-ws register rejected");
-        let _ = adapter.stop().await;
+        let _ = sidecar.into_pump().await;
         return;
     }
 
     tracing::info!(channel_type = %channel_type, "channel-ws sidecar registered");
 
-    if let Err(e) = adapter
+    if let Err(e) = sidecar
         .send_frame(Frame::RegisterAck {
             ok: true,
             reason: None,
@@ -104,13 +94,18 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         .await
     {
         tracing::warn!(error = %e, "failed to send RegisterAck");
-        cleanup(&state, &channel_type, &adapter).await;
+        let _ = state.registry.unregister(channel_type);
+        let _ = sidecar.into_pump().await;
         return;
     }
 
-    run_inbound_loop(source, &state, &channel_type).await;
+    run_inbound_loop(source, &state, &channel_type, &sidecar).await;
 
-    cleanup(&state, &channel_type, &adapter).await;
+    if let Err(e) = state.registry.unregister(channel_type.clone()) {
+        tracing::debug!(error = %e, %channel_type, "unregister after ws drop");
+    }
+    let _ = sidecar.into_pump().await;
+    tracing::info!(%channel_type, "channel-ws sidecar disconnected");
 }
 
 async fn receive_register(
@@ -151,6 +146,7 @@ async fn run_inbound_loop(
     mut source: SplitStream<WebSocket>,
     state: &WsChannelState,
     channel_type: &ChannelType,
+    sidecar: &Sidecar,
 ) {
     while let Some(msg) = source.next().await {
         let msg = match msg {
@@ -169,30 +165,46 @@ async fn run_inbound_loop(
                         continue;
                     }
                 };
-                let Frame::Message(wire_msg) = frame else {
-                    tracing::warn!("unexpected non-Message frame post-handshake; closing");
-                    break;
-                };
-                let sender = User {
-                    id: wire_msg.user_id.clone(),
-                    name: None,
-                    channel: channel_type.clone(),
-                };
-                let incoming = IncomingMessage {
-                    message: AgentMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        session_id: wire_msg.session_id,
-                        channel: channel_type.clone(),
-                        sender,
-                        content: vec![ContentBlock::Text(wire_msg.content)],
-                        timestamp: Utc::now(),
-                        reply_to: None,
-                        metadata: MessageMetadata::default(),
-                    },
-                };
-                if let Err(e) = state.incoming_tx.send(incoming).await {
-                    tracing::error!(error = %e, "router intake closed; tearing down");
-                    break;
+                match frame {
+                    Frame::Message(wire_msg) => {
+                        let sender = User {
+                            id: wire_msg.user_id.clone(),
+                            name: None,
+                            channel: channel_type.clone(),
+                        };
+                        let incoming = IncomingMessage {
+                            message: AgentMessage {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                session_id: wire_msg.session_id,
+                                channel: channel_type.clone(),
+                                sender,
+                                content: vec![ContentBlock::Text(wire_msg.content)],
+                                timestamp: Utc::now(),
+                                reply_to: None,
+                                metadata: MessageMetadata::default(),
+                            },
+                        };
+                        if let Err(e) = state.incoming_tx.send(incoming).await {
+                            tracing::error!(error = %e, "router intake closed; tearing down");
+                            break;
+                        }
+                    }
+                    Frame::ResolveApproval { call_id, decision } => {
+                        let resolved = sidecar.resolve_approval(&call_id, decision).await;
+                        if !resolved {
+                            tracing::debug!(
+                                call_id = %call_id,
+                                "ResolveApproval for unknown call_id; ignored"
+                            );
+                        }
+                    }
+                    other => {
+                        tracing::warn!(
+                            kind = ?std::mem::discriminant(&other),
+                            "unexpected frame post-handshake; closing",
+                        );
+                        break;
+                    }
                 }
             }
             AxumWsMessage::Close(_) => break,
@@ -203,16 +215,4 @@ async fn run_inbound_loop(
             }
         }
     }
-}
-
-async fn cleanup(
-    state: &WsChannelState,
-    channel_type: &ChannelType,
-    adapter: &Arc<SidecarAdapter>,
-) {
-    adapter.mark_closed();
-    if let Err(e) = state.registry.unregister(channel_type.clone()).await {
-        tracing::debug!(error = %e, %channel_type, "unregister after ws drop");
-    }
-    tracing::info!(%channel_type, "channel-ws sidecar disconnected");
 }

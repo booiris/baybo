@@ -1,145 +1,206 @@
-//! `ChannelAdapter` implementation for a single connected WS sidecar.
+//! Per-connection gateway state for a live `/v1/channel-ws` sidecar.
 //!
-//! One instance per live `/v1/channel-ws` connection. The route owns
-//! the inbound half (reading frames and pushing `IncomingMessage`s into
-//! the router); this adapter owns the outbound half (forwarding
-//! `AgentOutput` back through the WebSocket sink).
+//! One [`Sidecar`] per connected WS client. The gateway owns:
 //!
-//! Limitations carried forward from the v1 wire protocol:
-//! * `AgentOutput::Delta` is coalesced into a single `Message` frame —
-//!   sidecars needing per-token rendering must wait for a dedicated
-//!   delta frame kind.
-//! * `approval_gate()` returns `None`; interactive approval from
-//!   sidecars is out of scope for v1 and arrives separately.
+//! * An outbound frame mpsc. Every producer — the registered
+//!   [`aura_channels::Channel`] (agent output), the approval-gate waker
+//!   (`ApprovalRequested`), and the inbound loop's `resolve_approval`
+//!   path (`ApprovalResolved`) — pushes a [`Frame`] here; one pump task
+//!   drains the receiver and serialises each frame onto the WS sink.
+//! * The approval queue shared with the [`ChannelApprovalGate`]; the
+//!   inbound loop resolves entries by `call_id` when the client echoes
+//!   a [`Frame::ResolveApproval`].
+//!
+//! Collapsing the old `ChannelAdapter` trait into a concrete type +
+//! mpsc fan-in keeps `aura-channels` free of any wire-format knowledge.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use async_trait::async_trait;
 use aura_channels::sdk::wire::{self, Frame, Message as WireMessage};
-use aura_channels::{
-    AgentOutput, ChannelAdapter, ChannelError, IncomingMessage, NoticeLevel, Result,
-};
+use aura_channels::{AgentOutput, Channel, ChannelError, NoticeLevel};
 use aura_model::{ChannelType, ContentBlock};
-use aura_tools::ApprovalGate;
+use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ChannelApprovalGate};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket};
 use futures::SinkExt;
 use futures::stream::SplitSink;
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 pub(crate) type WsSink = SplitSink<WebSocket, AxumWsMessage>;
 
-pub(crate) struct SidecarAdapter {
-    channel_type: ChannelType,
-    sink: Arc<tokio::sync::Mutex<WsSink>>,
-    closed: AtomicBool,
-    /// Session-id tags we inject into `Delta`/`Notice` frames the
-    /// sidecar can't otherwise carry. Stored so `send` can attribute
-    /// to the right session when a frame doesn't already have one.
-    last_session: Mutex<Option<String>>,
+/// Matches the old HTTP adapter so operator muscle memory around
+/// approval timing carries over.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Outbound mpsc buffer. Large enough to absorb a short burst of
+/// deltas without back-pressuring the agent loop; small enough that a
+/// dead WS sink drops frames rather than piling up unbounded.
+const OUTBOUND_BUFFER: usize = 64;
+
+/// Live state for one connected WS sidecar. Returned from
+/// [`Sidecar::build`] alongside the spawned pump handle so the route
+/// task can await / abort the pump on teardown.
+pub(crate) struct Sidecar {
+    pub channel: Arc<Channel>,
+    approval_queue: ApprovalQueue,
+    frame_tx: mpsc::Sender<Frame>,
+    pump: JoinHandle<()>,
 }
 
-impl SidecarAdapter {
-    pub(crate) fn new(channel_type: ChannelType, sink: WsSink) -> Self {
-        Self {
-            channel_type,
-            sink: Arc::new(tokio::sync::Mutex::new(sink)),
-            closed: AtomicBool::new(false),
-            last_session: Mutex::new(None),
-        }
-    }
+impl Sidecar {
+    /// Build the sidecar and spawn the outbound pump. The pump owns
+    /// the WS sink and exits cleanly once every `frame_tx` clone has
+    /// dropped — the caller achieves this by unregistering the channel
+    /// (clears the approval gate map) and dropping this struct.
+    pub(crate) fn build(channel_type: ChannelType, sink: WsSink) -> Self {
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(OUTBOUND_BUFFER);
+        let (output_tx, mut output_rx) = mpsc::channel::<AgentOutput>(OUTBOUND_BUFFER);
+        let approval_queue = ApprovalQueue::new();
 
-    pub(crate) fn mark_closed(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-    }
-
-    pub(crate) async fn send_frame(&self, frame: Frame) -> Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(ChannelError::Config("ws sidecar closed".into()));
-        }
-        let bytes =
-            wire::encode(&frame).map_err(|e| ChannelError::Config(format!("encode frame: {e}")))?;
-        let mut sink = self.sink.lock().await;
-        sink.send(AxumWsMessage::Binary(bytes.into()))
-            .await
-            .map_err(|e| {
-                self.closed.store(true, Ordering::SeqCst);
-                ChannelError::Config(format!("ws sink: {e}"))
-            })
-    }
-}
-
-#[async_trait]
-impl ChannelAdapter for SidecarAdapter {
-    fn channel_type(&self) -> ChannelType {
-        self.channel_type.clone()
-    }
-
-    async fn start(&self, _sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
-        // Inbound plumbing is owned by the WS route task because the
-        // connection already exists by the time `register()` runs.
-        tracing::debug!(
-            channel_type = %self.channel_type,
-            "sidecar adapter started (route task owns inbound loop)",
-        );
-        Ok(())
-    }
-
-    async fn send(&self, output: AgentOutput) -> Result<()> {
-        let channel_type = self.channel_type.clone();
-        let frame = match output {
-            AgentOutput::Delta {
-                session_id, text, ..
-            } => {
-                *self.last_session.lock() = Some(session_id.clone());
-                Frame::Message(WireMessage {
-                    content: text,
-                    session_id,
-                    user_id: String::new(),
-                    channel_type,
-                })
+        // Translator: AgentOutput → Frame. Exits when every Arc<Channel>
+        // drops (which closes `output_tx`).
+        let translator_tx = frame_tx.clone();
+        let translator_ct = channel_type.clone();
+        tokio::spawn(async move {
+            while let Some(output) = output_rx.recv().await {
+                let frame = agent_output_to_frame(output, &translator_ct);
+                if translator_tx.send(frame).await.is_err() {
+                    break;
+                }
             }
-            AgentOutput::Message(response) => {
-                let content = flatten_content(&response.content);
-                *self.last_session.lock() = Some(response.session_id.clone());
-                Frame::Message(WireMessage {
-                    content,
-                    session_id: response.session_id,
-                    user_id: String::new(),
-                    channel_type,
-                })
-            }
-            AgentOutput::Notice {
-                session_id,
-                level,
-                text,
-                ..
-            } => {
-                let tag = match level {
-                    NoticeLevel::Warn => "warn",
-                    NoticeLevel::Error => "error",
+        });
+
+        let gate = build_approval_gate(approval_queue.clone(), frame_tx.clone());
+        let approval_gate: Arc<dyn ApprovalGate> = Arc::new(gate);
+
+        let channel = Arc::new(Channel::new(channel_type, output_tx, Some(approval_gate)));
+
+        let pump = tokio::spawn(async move {
+            let mut sink = sink;
+            while let Some(frame) = frame_rx.recv().await {
+                let bytes = match wire::encode(&frame) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "encode outbound frame");
+                        continue;
+                    }
                 };
-                Frame::Message(WireMessage {
-                    content: format!("[{tag}] {text}"),
-                    session_id,
-                    user_id: String::new(),
-                    channel_type,
-                })
+                if let Err(e) = sink.send(AxumWsMessage::Binary(bytes.into())).await {
+                    tracing::debug!(error = %e, "ws sink error; pump exiting");
+                    break;
+                }
             }
-        };
-        self.send_frame(frame).await
+            let _ = sink.close().await;
+        });
+
+        Self {
+            channel,
+            approval_queue,
+            frame_tx,
+            pump,
+        }
     }
 
-    fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>> {
-        None
+    /// Push a frame directly to the outbound pump. Used for RegisterAck
+    /// echoes during the handshake.
+    pub(crate) async fn send_frame(&self, frame: Frame) -> Result<(), ChannelError> {
+        self.frame_tx
+            .send(frame)
+            .await
+            .map_err(|_| ChannelError::Config("outbound pump closed".into()))
     }
 
-    async fn stop(&self) -> Result<()> {
-        self.closed.store(true, Ordering::SeqCst);
-        let mut sink = self.sink.lock().await;
-        let _ = sink.close().await;
-        Ok(())
+    /// Resolve a pending approval and echo `ApprovalResolved`. Called
+    /// from the inbound loop when the client sends `ResolveApproval`.
+    pub(crate) async fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> bool {
+        let resolved = self.approval_queue.resolve_by_call_id(call_id, decision);
+        if resolved {
+            let frame = Frame::ApprovalResolved {
+                call_id: call_id.to_owned(),
+                decision,
+            };
+            if self.frame_tx.send(frame).await.is_err() {
+                tracing::debug!(call_id, "ApprovalResolved send failed; pump closed");
+            }
+        }
+        resolved
+    }
+
+    /// Split the pump off so the caller can await it after dropping
+    /// the sidecar struct (which releases the internal `frame_tx`
+    /// clone, letting the pump exit).
+    pub(crate) fn into_pump(self) -> JoinHandle<()> {
+        // Drop frame_tx explicitly so the outbound buffer is no longer
+        // held by us — translator and approval-gate clones still exist
+        // but will drop naturally as `channel` ref-count hits zero and
+        // the gate map evicts the gate.
+        drop(self.frame_tx);
+        drop(self.channel);
+        drop(self.approval_queue);
+        self.pump
+    }
+}
+
+fn build_approval_gate(queue: ApprovalQueue, frame_tx: mpsc::Sender<Frame>) -> ChannelApprovalGate {
+    let waker_queue = queue.clone();
+    let waker_tx = frame_tx;
+    ChannelApprovalGate::new(
+        queue,
+        Arc::new(move || {
+            // Snapshot the just-pushed entry. The waker fires
+            // synchronously right after the enqueue so this is
+            // guaranteed present unless a concurrent resolver drained
+            // it already.
+            let Some(entry) = waker_queue.list().into_iter().next_back() else {
+                return;
+            };
+            let tx = waker_tx.clone();
+            tokio::spawn(async move {
+                let frame = Frame::ApprovalRequested {
+                    call_id: entry.call_id,
+                    session_id: entry.session_id,
+                    tool: entry.tool,
+                    accesses: entry.accesses,
+                    params_preview: entry.params_preview,
+                };
+                let _ = tx.send(frame).await;
+            });
+        }),
+        APPROVAL_TIMEOUT,
+    )
+}
+
+fn agent_output_to_frame(output: AgentOutput, channel_type: &ChannelType) -> Frame {
+    match output {
+        AgentOutput::Delta {
+            session_id, text, ..
+        } => Frame::Delta { session_id, text },
+        AgentOutput::Message(response) => {
+            let content = flatten_content(&response.content);
+            Frame::Message(WireMessage {
+                content,
+                session_id: response.session_id,
+                user_id: String::new(),
+                channel_type: channel_type.clone(),
+            })
+        }
+        AgentOutput::Notice {
+            session_id,
+            level,
+            text,
+            ..
+        } => {
+            let level = match level {
+                NoticeLevel::Warn => "warn",
+                NoticeLevel::Error => "error",
+            };
+            Frame::Notice {
+                session_id,
+                level: level.to_owned(),
+                text,
+            }
+        }
     }
 }
 

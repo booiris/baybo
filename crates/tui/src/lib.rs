@@ -1,10 +1,10 @@
 //! Ratatui-based TUI for `aura tui`.
 //!
 //! The TUI is a thin client on top of an `aura-gateway` reached over
-//! HTTP+SSE. Layout is minimal by design: a scrollback pane plus an
-//! input line. Slash commands that map to [`ViewKind`] open a dedicated
-//! dashboard view; other slash commands render as text into the
-//! scrollback.
+//! a WS+MessagePack channel socket (see [`client::WsTransport`]).
+//! Layout is minimal by design: a scrollback pane plus an input line.
+//! Slash commands that map to [`ViewKind`] open a dedicated dashboard
+//! view; other slash commands render as text into the scrollback.
 //!
 //! I/O architecture:
 //! - stdin is driven by [`crossterm::event::EventStream`]; do **not** read
@@ -28,7 +28,7 @@ pub mod transport;
 pub use aura_tools::ApprovalQueue;
 pub use event::{LogLevel, LogRecord, TuiLogSink};
 pub use history::InputHistoryStore;
-pub use transport::{SharedTransport, TransportEvent, TransportEventStream, TuiTransport};
+pub use transport::{TransportEvent, TransportEventStream};
 
 use std::io;
 use std::panic;
@@ -62,6 +62,7 @@ use uuid::Uuid;
 use std::time::Instant;
 
 use crate::app::{AppState, CONFIRM_EXIT_WINDOW, ViewMode};
+use crate::client::WsTransport;
 use crate::event::AppEvent;
 use crate::keymap::{Action, KeyContext, translate};
 
@@ -95,7 +96,7 @@ pub struct TuiAdapter {
     /// Transport driving the loop: `start` subscribes to its event
     /// stream and publishes user input via `transport.submit`. Wired in
     /// before `start` via `with_transport` — `start` errors if absent.
-    transport: Option<SharedTransport>,
+    transport: Option<Arc<WsTransport>>,
 }
 
 impl Default for TuiAdapter {
@@ -141,7 +142,7 @@ impl TuiAdapter {
     ///
     /// Must be called before `start()`. The transport's approval queue
     /// replaces the default in-memory one.
-    pub fn with_transport(mut self, transport: SharedTransport) -> Self {
+    pub fn with_transport(mut self, transport: Arc<WsTransport>) -> Self {
         self.approval_queue = transport.approval_queue();
         self.transport = Some(transport);
         self
@@ -254,7 +255,7 @@ struct LoopCtx {
     session_id: String,
     user: User,
     shutdown: Arc<Notify>,
-    input: SharedTransport,
+    input: Arc<WsTransport>,
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: mpsc::Receiver<AppEvent>,
     slash_handler: Option<Arc<dyn SlashHandler>>,
@@ -269,7 +270,7 @@ struct LoopCtx {
 /// internal variants so the run loop can keep consuming the same
 /// `AppEvent` enum as before.
 async fn spawn_transport_pump(
-    transport: SharedTransport,
+    transport: Arc<WsTransport>,
     session_id: String,
     event_tx: mpsc::Sender<AppEvent>,
 ) {

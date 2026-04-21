@@ -25,7 +25,6 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 use crate::config::RuntimeGatewayConfig;
-use crate::http_adapter::HttpAdapter;
 use crate::log_buffer::LogBuffer;
 use crate::server::GatewayDeps;
 
@@ -36,11 +35,9 @@ pub const TEST_ADMIN_TOKEN: &str = "test-admin-token-fixed-32-bytes!!";
 
 /// Bundle returned by [`build_test_deps`]. Holds the deps plus the
 /// auxiliary handles tests need to keep alive (the tempdir backing
-/// libsql, the `HttpAdapter` for pushing SSE events, the shared
-/// shutdown signal for orderly teardown).
+/// libsql, the shared shutdown signal for orderly teardown).
 pub struct TestGateway {
     pub deps: GatewayDeps,
-    pub adapter: Arc<HttpAdapter>,
     pub shutdown: ShutdownSignal,
     /// Receiver paired with `deps.incoming_tx`. Exposed so tests that
     /// exercise the router-intake path (e.g. the WS channel server)
@@ -95,8 +92,6 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
             .expect("stub LLM client"),
     );
 
-    let adapter = Arc::new(HttpAdapter::new());
-
     let runtime_config = RuntimeGatewayConfig {
         admin_bind,
         cors_allowed_origins: Vec::new(),
@@ -113,7 +108,6 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         config,
         config_path: None,
         runtime_config,
-        adapter: Arc::clone(&adapter),
         session_manager,
         job_manager,
         cron_scheduler,
@@ -131,7 +125,6 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
 
     TestGateway {
         deps,
-        adapter,
         shutdown,
         incoming_rx,
         channel_tokens,

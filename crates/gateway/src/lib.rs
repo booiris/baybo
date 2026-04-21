@@ -7,9 +7,9 @@
 //!   read-only channel list. Surfaces the same data the CLI does; no
 //!   chat content flows through.
 //! * **Channel** — Unix domain socket, peer-credential +
-//!   PSK/token authenticated. Session CRUD, message submit + SSE, and
-//!   tool approvals. This is the listener the TUI and future sidecar
-//!   channel plugins talk to.
+//!   PSK/token authenticated. Hosts a single WebSocket endpoint
+//!   (`/v1/channel-ws`) over which the bundled TUI and sidecar channel
+//!   plugins exchange [`aura_channels::sdk::wire::Frame`]s (MessagePack).
 //!
 //! The gateway is driven by the CLI command tree `aura gateway ...`:
 //! `start` runs both listeners in the foreground; `install` writes a
@@ -22,7 +22,6 @@ pub mod auth_channel;
 pub mod channel;
 pub mod config;
 pub mod error;
-pub mod http_adapter;
 pub mod installer;
 pub mod log_buffer;
 pub mod server;
@@ -34,7 +33,6 @@ pub mod uds;
 pub use crate::auth_admin::AdminToken;
 pub use crate::config::RuntimeGatewayConfig;
 pub use crate::error::{GatewayError, Result};
-pub use crate::http_adapter::HttpAdapter;
 pub use crate::installer::{
     InstallContext, InstallerError, ServiceInstaller, ServiceStatus, for_current_platform,
 };
@@ -42,4 +40,3 @@ pub use crate::log_buffer::{LogBuffer, LogBufferLayer, LogLevel, LogPage, LogQue
 pub use crate::server::{GatewayDeps, GatewayServer};
 pub use crate::spawn::{ChannelSpawner, ChildHandle};
 pub use crate::uds::ChannelServer;
-pub use aura_channels::{ApprovalEvent, SseEvent};

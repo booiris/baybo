@@ -226,6 +226,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -270,18 +271,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-gateway-auth",
  "aura-model",
  "aura-tools",
  "axum 0.8.9",
- "bytes",
  "chrono",
  "dashmap",
  "futures",
  "hex",
- "http-body-util",
- "hyper 1.8.1",
- "hyper-util",
  "parking_lot",
  "rmp-serde",
  "serde",
@@ -684,6 +680,7 @@ dependencies = [
  "shell-words",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tracing",
  "unicode-width",
  "uuid",

@@ -49,7 +49,6 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 | ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `aura-storage`     | `MemorySecretStore`                                                     | In-memory `SecretStore` impl with `len()` / `is_empty()` for vault-state assertions.          |
 | `aura-storage`     | `MemoryJobStore`, `MemoryCostStore`, `MemoryTraceStore`, `MemoryMemoryStore` | In-memory backends for the remaining `Store` traits. Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. |
-| `aura-channels`    | `RecordingChannel`                                                      | `ChannelAdapter` spy that captures every response, stream delta, and notice.                  |
 | `aura-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
 | `aura-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
 
@@ -74,10 +73,10 @@ The integration-tests crate composes these into higher-level builders:
    addition doesn't fan out across every test file. `SessionBuilder`
    in `aura-integration-tests` is the reference pattern.
 
-3. **Spy over mock.** Prefer recording fakes (`RecordingChannel`,
-   `RecordingTool`) that capture all interactions and let the test
-   assert on the actual call history. Avoid expectation-style mocks —
-   they couple tests to call ordering.
+3. **Spy over mock.** Prefer recording fakes (e.g. `RecordingTool`)
+   that capture all interactions and let the test assert on the actual
+   call history. Avoid expectation-style mocks — they couple tests to
+   call ordering.
 
 4. **Per-test tracing capture.** Use `capture_tracing()` rather than
    the global subscriber so tests don't trample each other and don't

@@ -1,44 +1,40 @@
-//! [`SlashHandler`] backed by a [`GatewayClient`].
+//! Minimal [`SlashHandler`] for the WS-backed TUI.
 //!
-//! The TUI only reaches the gateway's channel surface (sessions +
-//! approvals), so slash commands here are limited to what that surface
-//! can serve: `/sessions` lists, `/approve` and `/deny` resolve tool
-//! approvals, plus a handful of client-local commands (`/clear`,
-//! `/quit`, `/exit`). Admin-only commands (`/status`, `/config`, …)
-//! live in `aura cli`.
+//! The WS channel surface carries messages and approval frames but no
+//! admin-style CRUD — there is no `/sessions` listing and no channel
+//! REST. This handler therefore ships only:
 //!
-//! The handler is intentionally shallow: it parses `/<name> <args>`
-//! with `shell-words`, dispatches by name, and formats results as
-//! plain text. Unknown `/<name>` is passed through to the agent so
-//! skill invocations continue to work without the gateway having to
-//! hand the TUI a skill allow-list.
-
-use std::sync::Arc;
+//! * `/approve <id>` and `/deny <id>` — resolve a pending tool call via
+//!   the local [`ApprovalQueue`], which forwards the decision back to
+//!   the gateway as a `Frame::ResolveApproval`.
+//! * `/clear` — clear the chat scrollback (client-local).
+//! * `/quit`, `/exit` — close the TUI.
+//! * `/skills`, `/jobs`, `/memory`, `/sessions` — dashboard shortcuts;
+//!   the admin-only views render an "admin surface" footer.
+//!
+//! Unknown `/<name>` falls through to the agent so skill invocations
+//! keep working without a client-side allow-list.
 
 use async_trait::async_trait;
 use aura_channels::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
 use aura_model::ContentBlock;
-use aura_tools::ApprovalDecision;
+use aura_tools::{ApprovalDecision, ApprovalQueue};
 
-use aura_channels::client::{ClientError, GatewayClient};
-
-/// [`SlashHandler`] that dispatches supported commands against an
-/// `aura gateway`.
-pub struct GatewaySlashHandler {
-    client: Arc<GatewayClient>,
+/// Bundled slash handler used by the TUI.
+pub struct TuiSlashHandler {
+    approval_queue: ApprovalQueue,
 }
 
-impl GatewaySlashHandler {
-    pub fn new(client: Arc<GatewayClient>) -> Self {
-        Self { client }
+impl TuiSlashHandler {
+    pub fn new(approval_queue: ApprovalQueue) -> Self {
+        Self { approval_queue }
     }
 }
 
 #[async_trait]
-impl SlashHandler for GatewaySlashHandler {
+impl SlashHandler for TuiSlashHandler {
     fn commands(&self) -> Vec<SlashCommand> {
         let mut out = vec![
-            SlashCommand::new("/sessions", "List sessions on the gateway."),
             SlashCommand::new("/approve", "Approve a pending tool call (/approve <id>)."),
             SlashCommand::new("/deny", "Deny a pending tool call (/deny <id>)."),
             SlashCommand::new("/clear", "Clear the chat scrollback."),
@@ -54,9 +50,6 @@ impl SlashHandler for GatewaySlashHandler {
             return SlashOutcome::PassThrough;
         };
 
-        // Bare dashboard commands → open view. `Sessions` is the only
-        // channel-surface view; the others render an admin-only footer
-        // when opened.
         if args.is_empty()
             && let Some(kind) = dashboard_shortcut(&name)
         {
@@ -66,21 +59,6 @@ impl SlashHandler for GatewaySlashHandler {
         match name.as_str() {
             "clear" => SlashOutcome::Handled(Vec::new()),
             "quit" | "exit" => SlashOutcome::Exit,
-            "sessions" => run(self.client.list_sessions().await.map(|items| {
-                let lines: Vec<String> = items
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{}  {:>4} msgs  last={}  channel={}",
-                            s.id,
-                            s.messages.len(),
-                            s.last_active.to_rfc3339(),
-                            s.channel
-                        )
-                    })
-                    .collect();
-                list_block("sessions", lines)
-            })),
             "approve" | "deny" => {
                 let Some(id) = args.first() else {
                     return err(&format!("usage: /{name} <call_id>"));
@@ -90,25 +68,20 @@ impl SlashHandler for GatewaySlashHandler {
                 } else {
                     ApprovalDecision::Deny
                 };
-                run(self
-                    .client
-                    .resolve_approval(id, decision)
-                    .await
-                    .map(|r| format!("resolved {} as {:?}", r.call_id, r.decision)))
+                if self.approval_queue.resolve_by_call_id(id, decision) {
+                    SlashOutcome::Handled(vec![ContentBlock::Text(format!(
+                        "resolved {id} as {decision:?}"
+                    ))])
+                } else {
+                    err(&format!("no pending approval with call_id {id}"))
+                }
             }
             "help" => SlashOutcome::Handled(vec![ContentBlock::Text(help_text())]),
-            // Anything else — unknown slash — falls through to the
-            // agent so skill invocations keep working without a
-            // client-side allow-list.
             _ => SlashOutcome::PassThrough,
         }
     }
 }
 
-/// Bare `/sessions` / `/skills` / `/jobs` / `/memory` with no args open
-/// the corresponding dashboard view. The admin-only views render a
-/// footer telling the user to use `aura cli`, but the TUI still honours
-/// the shortcut so keybindings stay consistent with the CLI surface.
 fn dashboard_shortcut(name: &str) -> Option<ViewKind> {
     match name {
         "skills" => Some(ViewKind::Skills),
@@ -119,9 +92,6 @@ fn dashboard_shortcut(name: &str) -> Option<ViewKind> {
     }
 }
 
-/// Split `/name arg1 arg2` into `(name, [arg1, arg2])`. Returns `None`
-/// if the line isn't a slash command (no leading `/`, empty name, or
-/// unparseable quoting).
 fn parse_line(raw: &str) -> Option<(String, Vec<String>)> {
     let trimmed = raw.trim().strip_prefix('/')?;
     let tokens = shell_words::split(trimmed).ok()?;
@@ -133,35 +103,21 @@ fn parse_line(raw: &str) -> Option<(String, Vec<String>)> {
     Some((name, iter.collect()))
 }
 
-fn run(result: Result<String, ClientError>) -> SlashOutcome {
-    match result {
-        Ok(text) => SlashOutcome::Handled(vec![ContentBlock::Text(text)]),
-        Err(e) => err(&e.to_string()),
-    }
-}
-
 fn err(msg: &str) -> SlashOutcome {
     SlashOutcome::Handled(vec![ContentBlock::Text(format!("error: {msg}"))])
-}
-
-fn list_block(title: &str, lines: Vec<String>) -> String {
-    if lines.is_empty() {
-        return format!("no {title}");
-    }
-    format!("{title}:\n{}", lines.join("\n"))
 }
 
 fn help_text() -> String {
     String::from(
         "Slash commands:\n\
-         /sessions        list sessions\n\
          /approve <id>    approve a pending tool call\n\
          /deny <id>       deny a pending tool call\n\
          /clear           clear chat scrollback\n\
          /quit, /exit     close the session\n\
          \n\
-         Admin commands (status, config, jobs, skills, tools, memory, …)\n\
-         live in `aura cli` and are not reachable from the TUI.\n",
+         Admin commands (status, config, jobs, skills, tools, memory,\n\
+         sessions, …) live in `aura cli` and are not reachable from the\n\
+         TUI.\n",
     )
 }
 

@@ -8,8 +8,10 @@
 //!   endpoints.
 //! * **Channel** — Unix domain socket, peer-credential +
 //!   PSK/token authenticated (see `uds` and `auth_channel` modules).
-//!   Hosts session CRUD, message submit/stream, and approvals — the
-//!   routes the TUI and future sidecar channel plugins talk to.
+//!   Hosts the WebSocket endpoint (`/v1/channel-ws`) — the only surface
+//!   the TUI and sidecar channel plugins talk to. Session CRUD lives
+//!   on the admin surface; the router creates sessions lazily on first
+//!   message frame.
 //!
 //! [`AdminState`] and [`ChannelState`] split the old monolithic
 //! `ApiState` so each listener only sees the managers it needs. Both
@@ -42,7 +44,6 @@ use tower_http::trace::TraceLayer;
 use crate::api;
 use crate::auth_admin::{AdminAuthState, require_admin_token};
 use crate::config::RuntimeGatewayConfig;
-use crate::http_adapter::HttpAdapter;
 use crate::log_buffer::LogBuffer;
 use crate::{GatewayError, Result};
 
@@ -62,7 +63,6 @@ pub struct GatewayDeps {
     /// endpoints then reject with `ConfigPathUnset`.
     pub config_path: Option<PathBuf>,
     pub runtime_config: RuntimeGatewayConfig,
-    pub adapter: Arc<HttpAdapter>,
     pub session_manager: Arc<SessionManager>,
     pub job_manager: Arc<JobManager>,
     pub cron_scheduler: Arc<CronScheduler>,
@@ -106,9 +106,13 @@ pub struct AdminState {
 }
 
 /// State shared with channel UDS handlers. Cheap to clone.
+///
+/// After the HTTP+SSE surface was retired, all live chat traffic flows
+/// through the WS endpoint and its [`WsChannelState`](crate::channel::WsChannelState).
+/// `ChannelState` stays around so non-WS channel-listener handlers
+/// (`/healthz` is the only one at the moment) have a place to grow.
 #[derive(Clone)]
 pub struct ChannelState {
-    pub adapter: Arc<HttpAdapter>,
     pub session_manager: Arc<SessionManager>,
     pub channel_registry: Arc<ChannelRegistry>,
     pub incoming_tx: mpsc::Sender<IncomingMessage>,
@@ -138,7 +142,6 @@ impl AdminState {
 impl ChannelState {
     pub fn from_deps(deps: &GatewayDeps) -> Self {
         Self {
-            adapter: Arc::clone(&deps.adapter),
             session_manager: Arc::clone(&deps.session_manager),
             channel_registry: Arc::clone(&deps.channel_registry),
             incoming_tx: deps.incoming_tx.clone(),
@@ -228,19 +231,14 @@ pub fn build_channel_router(
     deps: &GatewayDeps,
     auth_state: crate::auth_channel::ChannelAuthState,
 ) -> Router {
-    let channel_state = ChannelState::from_deps(deps);
+    let _channel_state = ChannelState::from_deps(deps);
     let ws_state = crate::channel::WsChannelState {
         registry: Arc::clone(&deps.channel_registry),
         incoming_tx: deps.incoming_tx.clone(),
         tokens: deps.channel_tokens.clone(),
         session_manager: Arc::clone(&deps.session_manager),
     };
-    let v1 = crate::auth_channel::attach(
-        api::channel::v1_router()
-            .with_state(channel_state)
-            .merge(crate::channel::routes().with_state(ws_state)),
-        auth_state,
-    );
+    let v1 = crate::auth_channel::attach(crate::channel::routes().with_state(ws_state), auth_state);
     Router::new()
         .merge(api::health::routes())
         .nest("/v1", v1)

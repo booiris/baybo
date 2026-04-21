@@ -39,9 +39,9 @@ fn snapshot(registry: &Arc<ChannelRegistry>) -> Vec<ChannelEntry> {
     registry
         .list()
         .into_iter()
-        .map(|(ct, status)| ChannelEntry {
+        .map(|ct| ChannelEntry {
             channel_type: ct.into(),
-            status: format!("{status:?}"),
+            status: "running".to_string(),
         })
         .collect()
 }

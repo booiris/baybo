@@ -2,7 +2,7 @@
 
 ## Overview
 
-`TuiAdapter` is the interactive channel for Aura, launched via `aura tui`. Bare `aura` prints `--help`; the TUI is an explicit opt-in to avoid surprising users with a full-screen app. It is implemented with [Ratatui] over a [Crossterm] async event stream and lives in its own crate (`crates/tui/`, published as `aura-tui`). It depends on `aura-channels` for shared trait definitions (`SlashHandler`, `DashboardProvider`, `IncomingMessage`) but nothing in `aura-channels` depends back on it.
+`TuiAdapter` is the interactive channel for Aura, launched via `aura tui`. Bare `aura` prints `--help`; the TUI is an explicit opt-in to avoid surprising users with a full-screen app. It is implemented with [Ratatui] over a [Crossterm] async event stream and lives in its own crate (`crates/tui/`, published as `aura-tui`). It depends on `aura-channels` for shared type definitions (`SlashHandler`, `DashboardProvider`, `IncomingMessage`, `sdk::wire`) but nothing in `aura-channels` depends back on it.
 
 The layout is intentionally minimal:
 
@@ -12,13 +12,15 @@ The layout is intentionally minimal:
 
 No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands; the TUI only hosts the conversation and a handful of read-only views.
 
-`aura tui` is a thin HTTP+SSE client of `aura gateway`. It does
-**not** take the workspace singleton lock, does **not** build a
-manager graph, and does **not** own a local `Router`. One workspace
-runs a long-lived `aura gateway` as a service and opens `aura tui`
-against it — the gateway is the only process that holds state. See
-[Boot flow](#boot-flow) for endpoint and token resolution; see
-[`gateway.md`](./gateway.md) for the server side.
+`aura tui` is a thin `/v1/channel-ws` client of `aura gateway`,
+speaking the same WebSocket + MessagePack protocol every out-of-process
+sidecar uses (`aura_channels::sdk`). It does **not** take the
+workspace singleton lock, does **not** build a manager graph, and does
+**not** own a local `Router`. One workspace runs a long-lived `aura
+gateway` as a service and opens `aura tui` against it — the gateway is
+the only process that holds state. See [Boot flow](#boot-flow) for
+endpoint and token resolution; see [`gateway.md`](./gateway.md) for the
+server side.
 
 [Ratatui]: https://docs.rs/ratatui
 [Crossterm]: https://docs.rs/crossterm
@@ -44,7 +46,7 @@ against it — the gateway is the only process that holds state. See
 - Approval requests are rendered **inline in the scrollback** as a `ChatLine::Approval(ApprovalChatEntry)` entry — no overlay modal.
 - When pending, the entry is expanded: tool name, resource accesses, params preview, and three selectable options (`Approve` / `Always approve` / `Deny`). The user navigates options with `Up`/`Down` (or `k`/`j`) and confirms with `Enter`, or presses a direct shortcut (`a`/`A`/`d`).
 - After resolution the entry collapses to a single `aura>` line with the decision, tool name, and the first resource access detail — e.g. `aura> approved: Bash (echo hello)` or `aura> denied: Read (/etc/shadow)`. Normal input resumes immediately.
-- Approvals originate on the gateway. `GatewayTransport` subscribes to `/v1/approvals/stream`; on an `ApprovalEvent::Added` frame it mirrors the entry into a *local* `ApprovalQueue` so the existing TUI modal logic picks it up unchanged. The queue's resolver callback (installed by `GatewayTransport::new`) wraps the TUI's "approve/deny" decision in a `POST /v1/approvals/:call_id` that runs on a background `tokio::spawn`, so the gateway-side gate unblocks. Gateway-authored `ApprovalEvent::Resolved` frames drop any stale local mirror — useful when a second frontend resolves the same entry.
+- Approvals originate on the gateway. The WS transport observes `Frame::ApprovalRequested` and mirrors the entry into a *local* `ApprovalQueue` so the existing TUI modal logic picks it up unchanged. The queue's resolver callback (installed by `GatewayTransport::new`) wraps the TUI's "approve/deny" decision in a `Frame::ResolveApproval` echoed back over the same socket, so the gateway-side gate unblocks. Inbound `Frame::ApprovalResolved` frames drop any stale local mirror — useful when a second frontend resolves the same entry.
 - Dropping the responder (e.g. loop shutdown) still surfaces as `ApprovalDecision::Deny` on the local side; the gateway's own 5-minute timeout covers the server side.
 - If multiple approvals are queued (concurrent tool calls), resolving one auto-surfaces the next into the scrollback.
 
@@ -169,23 +171,32 @@ none of those exist on the TUI side.
      - (dev only) retry with --dev-auto-gateway to spawn one inline
      (underlying error: ...)
    ```
-4. **Session resolution** — `--session <id>` resumes an existing
-   session via `GET /v1/sessions/:id` (surfaces typos early); with no
-   flag, `POST /v1/sessions` mints a fresh one. The id is pinned into
-   the `TuiAdapter` via `with_session_id`.
-5. **Wire the gateway providers** — construct `GatewayClient`,
-   `GatewayTransport`, `GatewaySlashHandler` (seeded with the skill
-   catalog from `/v1/skills`), `GatewayDashboardProvider`, and the
-   vault-backed `CliInputHistoryStore`. Attach them to `TuiAdapter`
-   via the `with_transport`, `with_slash_handler`,
-   `with_dashboard_provider`, and `with_input_history` builders.
-6. **Start the adapter**. There is no `ChannelRegistry` registration
-   and no cron trigger receiver: the TUI has no router. The
-   `incoming` mpsc passed to `ChannelAdapter::start` is a dead-letter
-   — the transport routes user input directly to the gateway.
-7. **Graceful shutdown** — a stripped-down `install_signal_handler`
+4. **Session resolution** — `--session <id>` pins an explicit id (for
+   resuming a workspace session across restarts); without the flag the
+   TUI mints a fresh `tui-{uuid}` client-side and pins it via
+   `with_session_id`. The gateway's router auto-creates the session on
+   the first inbound frame via `SessionManager::get_or_create`, so no
+   REST round-trip is needed to provision one.
+5. **Connect the WS channel** — dial `/v1/channel-ws` with the
+   `x-aura-tui-secret` header carrying the effective PSK, send
+   `Frame::Register { channel_type: "tui", protocol_version, token:
+   "" }`, and wait for `RegisterAck { ok: true }`. The TUI's
+   `GatewayTransport` owns the connection and surfaces inbound
+   `Frame::{Message, Delta, Notice, ApprovalRequested, ApprovalResolved}`
+   as `TransportEvent`s.
+6. **Wire the gateway providers** — construct `GatewayTransport`,
+   `GatewaySlashHandler` (seeded with the skill catalog from
+   `/v1/skills`), `GatewayDashboardProvider`, and the vault-backed
+   `CliInputHistoryStore`. Attach them to `TuiAdapter` via the
+   `with_transport`, `with_slash_handler`, `with_dashboard_provider`,
+   and `with_input_history` builders.
+7. **Start the adapter**. There is no local `ChannelRegistry` and no
+   cron trigger receiver: the TUI has no router. User input is
+   framed as `Frame::Message` and sent through the transport; the
+   gateway registers the connection on its side.
+8. **Graceful shutdown** — a stripped-down `install_signal_handler`
    wires SIGINT/SIGTERM into the adapter's `ShutdownSignal`. A 5 s
-   `force_exit_watchdog` bounds teardown so a stalled SSE pump never
+   `force_exit_watchdog` bounds teardown so a stalled WS pump never
    pins the process.
 
 ### `--dev-auto-gateway`
@@ -206,29 +217,31 @@ compile it in.
 
 The loop multiplexes three sources with `tokio::select!`:
 
-1. **Shutdown** — `Arc<Notify>` toggled by `TuiAdapter::stop` (invoked by the `ChannelRegistry` during teardown).
+1. **Shutdown** — `Arc<Notify>` toggled by `TuiAdapter::stop` or the WS pump's teardown guard.
 2. **Terminal input** — a `crossterm::event::EventStream`. Raw reads are required because the terminal is in raw-mode + alternate screen; a `tokio::io::stdin` reader would fight crossterm for `/dev/tty`.
-3. **Internal events** — `AppEvent` sent by the `TuiTransport` pump (SSE deltas, responses, approval events) and by the background dashboard-fetch task.
+3. **Internal events** — `AppEvent` sent by the `WsTransport` pump (streaming deltas, responses, approval events) and by the background dashboard-fetch task.
 
 ### Transport
 
-`TuiTransport` (`crates/tui/src/transport.rs`) abstracts the
-outbound message path from the inbound event source. The adapter
-holds an `Arc<dyn TuiTransport>` and calls three things on it:
+`WsTransport` (`crates/tui/src/client/transport.rs`) is the single
+concrete transport used by the TUI. The adapter holds an
+`Arc<WsTransport>` and calls three methods on it:
 
-- `submit(msg)` — handle a user-typed `IncomingMessage`.
-  `GatewayTransport` flattens the text blocks and `POST`s to
-  `/v1/sessions/:id/messages`.
-- `subscribe(session_id) -> BoxStream<Result<TransportEvent>>` —
-  opens both the session stream (`/v1/sessions/:id/stream`) and the
-  gateway-wide approval stream (`/v1/approvals/stream`) and merges
-  them via `futures::stream::select`. SSE frames are decoded into
+- `submit(msg)` — flatten an `IncomingMessage`'s text blocks and
+  send a `Frame::Message` over the WS.
+- `subscribe(session_id) -> TransportEventStream` — decode inbound
+  frames from the same WS and translate them into
   `TransportEvent::{StreamDelta, Response, Notice, ApprovalRequested, ApprovalResolved}`.
 - `approval_queue()` — returns the transport's local `ApprovalQueue`.
-  On construction, `GatewayTransport::new` installs a resolver so
-  `queue.resolve_head(decision)` also fires a background
-  `POST /v1/approvals/:id` back to the gateway. Without that hook the
-  local modal would "work" but the server-side gate would time out.
+  On construction, `WsTransport::connect` installs a resolver so
+  `queue.resolve_head(decision)` also sends a
+  `Frame::ResolveApproval { call_id, decision }` back over the WS.
+  Without that hook the local modal would "work" but the server-side
+  gate would time out.
+
+The old `TuiTransport` trait was collapsed away — there was only
+ever one production impl, no mocks used it, and the wire path always
+went through the channel WS socket.
 
 ### Output path
 
@@ -241,7 +254,7 @@ does not need to know about the transport:
 - `Notice { level, text }` → `AppEvent::Log(LogRecord { level, target: "agent", message })`. Reuses the log surface.
 - `ApprovalRequested` / `ApprovalResolved` — see [Inline approval prompt](#inline-approval-prompt).
 
-Single-consumer ordering on the mpsc keeps delta/response ordering correct as SSE frames are fed in.
+Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS frames are fed in.
 
 ### Raw-mode discipline
 
@@ -280,15 +293,15 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 | `model`    | `ContentBlock` for rendering assistant messages                                              |
 | `session`  | `ChannelType::Tui`, `User` used when constructing `IncomingMessage`                          |
 | `cli`      | `CliInputHistoryStore` for vault-encrypted input history (host-local; works without the gateway) |
-| `gateway`  | Server-side owner of sessions, approvals, and SSE fan-out. The TUI talks to it over HTTP+SSE |
+| `gateway`  | Server-side owner of sessions, approvals, and outbound frame fan-out. The TUI talks to it over `/v1/channel-ws` (WebSocket + MessagePack) |
 | `channels` | Trait definitions only: `SlashHandler`, `SlashOutcome`, `ViewKind`, `DashboardProvider`, `DashboardSnapshot`, `IncomingMessage`, `NoticeLevel`, `ChannelError`. No TUI code. |
 
 ## Verification
 
 ```bash
-cargo test -p aura-tui             # keymap, AppState, transport, slash, SSE parser, HTTP client
+cargo test -p aura-tui             # keymap, AppState, transport, slash, frame codec, WS client
 cargo run -- gateway start         # terminal A: long-lived backend
-cargo run -- tui                   # terminal B: HTTP+SSE client
+cargo run -- tui                   # terminal B: WS+MessagePack client
 ```
 
 Manual smoke:
@@ -296,8 +309,8 @@ Manual smoke:
 - `aura tui` against a running `aura gateway` opens the Ratatui UI and the chat pane is live. Bare `aura` prints help instead.
 - With no gateway reachable, `aura tui` exits with the concrete "no aura gateway reachable at <url>" block.
 - `cargo run -- tui --dev-auto-gateway` (debug build) in a fresh workspace with no gateway running spawns the backend inline, prints the banner, and connects.
-- Typing + `Enter` appends a user line and `POST`s to the gateway; SSE deltas render live, the final response replaces the streaming buffer.
+- Typing + `Enter` appends a user line and sends a `Frame::Message` to the gateway; inbound `Frame::Delta`s render live, the final `Frame::Message` replaces the streaming buffer.
 - `/skills` opens the skills dashboard (fan-out to `/v1/skills`); `r` refreshes; `Esc` returns to chat.
 - A tool call that requires approval queues an inline prompt; `a` resolves it, the gateway-side gate unblocks, and the tool result renders.
-- Killing the gateway mid-session surfaces the next SSE frame as an error notice rather than crashing the TUI.
+- Killing the gateway mid-session surfaces the next inbound frame as an error notice rather than crashing the TUI.
 - `Ctrl-C` on an empty input line exits cleanly with the terminal restored.

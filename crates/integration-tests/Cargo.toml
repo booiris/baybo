@@ -13,7 +13,7 @@ publish = false
 
 [dependencies]
 aura-agent = { workspace = true }
-aura-channels = { workspace = true, features = ["test-support"] }
+aura-channels = { workspace = true }
 aura-context = { workspace = true }
 aura-hook = { workspace = true }
 aura-job = { workspace = true }

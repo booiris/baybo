@@ -95,7 +95,7 @@ Core responsibilities:
 | `ConfigChange` | Configuration or workspace settings change | Config source | Yes — prevents config reload |
 | `FileChanged` | Watched workspace file changes | — (always fires) | No |
 | `SkillReloaded` | Skill hot-reloaded, loaded, or unloaded | Skill name | Yes — prevents skill reload |
-| `ChannelStatusChanged` | Channel adapter status changes | Channel type | No |
+| `ChannelStatusChanged` | Channel connects or disconnects (connect/disconnect, not start/stop — WS sidecars own their own lifecycle) | Channel type | No |
 
 ### Hook Lifecycle Diagram
 
@@ -387,6 +387,6 @@ Higher-priority sources can override or disable lower-priority hooks. Admin poli
 | `context` | `ContextManager` triggers `PreCompact` / `PostCompact` around compression | Hook points defined, not yet triggered in code |
 | `job` | `JobManager` triggers `JobStatusChanged` after state transitions | Hook point defined, not yet triggered in code |
 | `cost` | `CostGuard` triggers `CostLimitReached` on spending limit hits | Hook point defined, not yet triggered in code |
-| `channels` | `ChannelRegistry` triggers `ChannelStatusChanged` on adapter status changes; channel delivery triggers `PreResponse` / `PostResponse` | Hook points defined, not yet triggered in code |
+| `channels` | `ChannelRegistry` triggers `ChannelStatusChanged` on channel register/unregister (connect/disconnect); channel delivery triggers `PreResponse` / `PostResponse` | Hook points defined, not yet triggered in code |
 | `skills` | `SkillRegistry` triggers `SkillReloaded` on hot reload | Hook point defined, not yet triggered in code |
 | `workspace` | `WorkspaceManager` triggers `InstructionsLoaded` on identity file load | Hook point defined, not yet triggered in code |

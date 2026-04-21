@@ -83,7 +83,7 @@ Typical rules:
 
 `ChannelApprovalGate` + `ApprovalQueue` (`crates/tools/src/approval.rs`) extract the common queue-and-oneshot pattern so each channel only supplies a sync waker callback (e.g. `|| event_tx.try_send(WakeUp)`). The queue exposes `peek_head` / `resolve_head` / `len` so the channel's event loop can render and dismiss inline prompts without touching oneshot internals.
 
-`ApprovalGateMap` is a sync `HashMap<ChannelType, Arc<dyn ApprovalGate>>` behind a `std::sync::RwLock`. `ChannelRegistry` populates it at `register()` time by calling `ChannelAdapter::approval_gate()`; `ToolExecutor` reads it per-call. Both hold an `Arc` to the same map, so gates registered after `ToolExecutor` construction are visible immediately. Adding a new channel with approval support requires only implementing `fn approval_gate() -> Option<Arc<dyn ApprovalGate>>` on the adapter — no changes to `ToolExecutor` or bootstrap code.
+`ApprovalGateMap` is a sync `HashMap<ChannelType, Arc<dyn ApprovalGate>>` behind a `std::sync::RwLock`. `ChannelRegistry` populates it at `register()` time by reading `Channel::approval_gate()` on the newly-registered handle and evicts the entry on `unregister()`; `ToolExecutor` reads it per-call. Both hold an `Arc` to the same map, so gates registered after `ToolExecutor` construction are visible immediately. Adding a new channel with approval support requires only wiring an `Arc<dyn ApprovalGate>` into the `Channel` at construction time — no changes to `ToolExecutor` or bootstrap code.
 
 ### LLM visibility boundary
 
@@ -97,7 +97,7 @@ Tool output should prefer structured `Json`, use `LargeText` for long text with 
 
 - Depends on `model`, `session`, `registry` (the `rmcp` dep returns with MCP support)
 - Does not install third-party artifacts (that's `registry`)
-- Defines the `ApprovalGate` trait but never implements the user-facing UX — that lives in `channels` (`TuiApprovalGate`)
+- Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-connection gate is built by the gateway's WS sidecar (`ChannelApprovalGate` backed by an `ApprovalQueue`), and the TUI renders the resulting prompts inline in its scrollback
 - `artifact_hash` must be recorded in `trace::ExecutionProvenance`
 
 ## Collaboration

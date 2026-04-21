@@ -58,7 +58,7 @@ After `ToolExecutor::execute` returns, `AgentLoop` renders the result into a tex
 
 ### Approval gate wiring
 
-`ToolExecutor` holds an `Arc<ApprovalGateMap>` shared with `ChannelRegistry`. The map is populated automatically when channels register via `ChannelAdapter::approval_gate()`. For every call:
+`ToolExecutor` holds an `Arc<ApprovalGateMap>` shared with `ChannelRegistry`. The map is populated automatically when channels register — `ChannelRegistry::register` reads `Channel::approval_gate()` and inserts the returned `Arc<dyn ApprovalGate>` keyed by the channel's `ChannelType`, and evicts it on `unregister`. For every call:
 
 1. Resolve the gate for the session's channel via `gate_map.get(user.channel)`.
 2. Compute `ResourceAccess` list via the tool's `accessed_resources(params)`.
@@ -115,6 +115,6 @@ Before a message enters an actor, Router completes: session identification/creat
 | `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |
 | `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
-| `channels` | `ChannelRegistry` and adapters (e.g. `TuiAdapter`); Router owns the registry for dispatch |
+| `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |
 | `storage` | Provides all Store traits and libsql implementations; injected into managers |
 | `hook` | `AgentActor` triggers `PreMessage` and `PreResponse` hooks at lifecycle points |

@@ -4,8 +4,8 @@
 //! same manager graph, router, and signal handler. Keeping the wiring
 //! here lets each entry point stay focused on what is genuinely
 //! different — TUI adds `TuiAdapter` + slash + dashboard, the gateway
-//! adds `HttpAdapter` + `GatewayServer` — while the common backbone
-//! stays in one place.
+//! adds `GatewayServer` and the channel UDS listener — while the
+//! common backbone stays in one place.
 //!
 //! Contract:
 //!
@@ -294,9 +294,10 @@ pub async fn build_managers(
 
 /// Router + channel handles a chat loop needs to drive.
 ///
-/// `incoming_tx` is cloned into the channel registry at
-/// `start_all(...)` time; `incoming_rx` and `response_rx` feed
-/// [`Router::run`]. Dropping the handle before calling `.run` leaks the
+/// `incoming_tx` is handed to each channel transport at registration
+/// time (the WS sidecar pulls it via `ChannelServerDeps`); `incoming_rx`
+/// and `response_rx` feed [`Router::run`]. Dropping the handle before
+/// calling `.run` leaks the
 /// router's background actor spawner, so callers should either drive it
 /// or drop the whole graph together.
 pub struct RouterRunHandle {

@@ -162,6 +162,7 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }

@@ -1,4 +1,5 @@
 use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aura_model::ChannelType;
@@ -27,6 +28,11 @@ pub const ENV_CHANNEL_TOKEN: &str = "AURA_CHANNEL_TOKEN";
 /// gateway-auth crate.
 pub const CHANNEL_TOKEN_HEADER: &str = "x-aura-channel-token";
 
+/// HTTP header carrying the per-install TUI PSK (hex-encoded) on the WS
+/// upgrade request. Mirrors `aura_gateway_auth::TUI_PSK_HEADER`; kept
+/// as a plain const for the same reason as [`CHANNEL_TOKEN_HEADER`].
+pub const TUI_PSK_HEADER: &str = "x-aura-tui-secret";
+
 /// Nominal WebSocket URL. The UDS is the real transport, but
 /// `tokio-tungstenite::client_async` still needs a syntactically valid
 /// URL for the HTTP upgrade line; the host part is never resolved.
@@ -51,13 +57,50 @@ pub struct Client {
 impl Client {
     /// Dial `$AURA_CHANNEL_SOCKET`, upgrade to WebSocket, run the
     /// Register/RegisterAck handshake with `$AURA_CHANNEL_TOKEN`, and
-    /// return a ready `Client`.
+    /// return a ready `Client`. Intended for subprocess sidecars that
+    /// Aura spawned and injected env vars into.
     pub async fn connect(channel_type: ChannelType) -> Result<Self, SdkError> {
         let socket_path =
             env::var(ENV_CHANNEL_SOCKET).map_err(|_| SdkError::MissingEnv(ENV_CHANNEL_SOCKET))?;
         let token =
             env::var(ENV_CHANNEL_TOKEN).map_err(|_| SdkError::MissingEnv(ENV_CHANNEL_TOKEN))?;
+        Self::connect_inner(
+            PathBuf::from(socket_path),
+            CHANNEL_TOKEN_HEADER,
+            &token,
+            token.clone(),
+            channel_type,
+        )
+        .await
+    }
 
+    /// Connect using the bundled-TUI PSK flow: the handshake carries the
+    /// hex-encoded PSK in `x-aura-tui-secret`, and the `Register` frame
+    /// leaves the capability `token` empty because auth already happened
+    /// on the upgrade request.
+    pub async fn connect_tui(
+        socket_path: impl AsRef<Path>,
+        psk: &[u8; 32],
+        channel_type: ChannelType,
+    ) -> Result<Self, SdkError> {
+        let psk_hex = hex::encode(psk);
+        Self::connect_inner(
+            socket_path.as_ref().to_path_buf(),
+            TUI_PSK_HEADER,
+            &psk_hex,
+            String::new(),
+            channel_type,
+        )
+        .await
+    }
+
+    async fn connect_inner(
+        socket_path: PathBuf,
+        header_name: &'static str,
+        header_value: &str,
+        register_token: String,
+        channel_type: ChannelType,
+    ) -> Result<Self, SdkError> {
         let stream = UnixStream::connect(&socket_path)
             .await
             .map_err(SdkError::UdsDial)?;
@@ -65,10 +108,10 @@ impl Client {
             .into_client_request()
             .map_err(|e| SdkError::WsUpgrade(e.to_string()))?;
         request.headers_mut().insert(
-            CHANNEL_TOKEN_HEADER,
-            token
+            header_name,
+            header_value
                 .parse()
-                .map_err(|_| SdkError::WsUpgrade("channel token is not a valid header".into()))?,
+                .map_err(|_| SdkError::WsUpgrade(format!("{header_name} is not a valid header")))?,
         );
         let (ws, _) = client_async(request, stream)
             .await
@@ -78,7 +121,7 @@ impl Client {
             sink: Arc::new(Mutex::new(sink)),
             source: Arc::new(Mutex::new(source)),
         };
-        client.register(token, channel_type).await?;
+        client.register(register_token, channel_type).await?;
         Ok(client)
     }
 
@@ -95,9 +138,7 @@ impl Client {
             Frame::RegisterAck { ok: false, reason } => Err(SdkError::RegistrationRejected(
                 reason.unwrap_or_else(|| "no reason given".to_string()),
             )),
-            Frame::Register { .. } | Frame::Message(_) => {
-                Err(SdkError::ProtocolViolation("expected RegisterAck"))
-            }
+            _ => Err(SdkError::ProtocolViolation("expected RegisterAck")),
         }
     }
 
@@ -106,17 +147,46 @@ impl Client {
         self.send_frame(&Frame::Message(msg)).await
     }
 
+    /// Send a raw wire frame. Used by the bundled TUI to issue
+    /// [`Frame::ResolveApproval`] — sidecars that only exchange user
+    /// messages should prefer [`Self::send`].
+    pub async fn send_raw(&self, frame: &Frame) -> Result<(), SdkError> {
+        self.send_frame(frame).await
+    }
+
+    /// Await the next raw wire frame from Aura. Exposes the full frame
+    /// surface (`Delta`, `Notice`, approval events, …) so callers that
+    /// need streaming or approval-flow data — the TUI in particular —
+    /// can reconstruct them directly. Sidecars that only want the final
+    /// per-turn `Message` should call [`Self::recv`] instead.
+    pub async fn recv_any(&self) -> Result<Frame, SdkError> {
+        self.recv_frame().await
+    }
+
     /// Await the next message from Aura.
     ///
-    /// Returns [`SdkError::ProtocolViolation`] if a non-`Message` frame
-    /// is received mid-session — a well-behaved server won't do that,
-    /// and silently dropping would paper over contract breakage.
+    /// Silently skips non-`Message` server-to-client frames (`Delta`,
+    /// `Notice`, approval events) so sidecars that only care about the
+    /// final turn output keep seeing one message per turn, as they did
+    /// when `AgentOutput::Delta` was still coalesced into `Message`.
+    /// Handshake frames mid-session are a contract break and surface as
+    /// [`SdkError::ProtocolViolation`].
     pub async fn recv(&self) -> Result<Message, SdkError> {
-        match self.recv_frame().await? {
-            Frame::Message(msg) => Ok(msg),
-            Frame::Register { .. } | Frame::RegisterAck { .. } => Err(SdkError::ProtocolViolation(
-                "expected Message post-handshake",
-            )),
+        loop {
+            match self.recv_frame().await? {
+                Frame::Message(msg) => return Ok(msg),
+                Frame::Delta { .. }
+                | Frame::Notice { .. }
+                | Frame::ApprovalRequested { .. }
+                | Frame::ApprovalResolved { .. } => continue,
+                Frame::Register { .. }
+                | Frame::RegisterAck { .. }
+                | Frame::ResolveApproval { .. } => {
+                    return Err(SdkError::ProtocolViolation(
+                        "unexpected frame kind post-handshake",
+                    ));
+                }
+            }
         }
     }
 

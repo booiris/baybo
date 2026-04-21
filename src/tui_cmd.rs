@@ -1,6 +1,6 @@
 //! CLI entrypoint for the interactive chat loop (`aura tui`).
 //!
-//! `aura tui` is a thin UI on top of a UDS-backed [`GatewayTransport`]
+//! `aura tui` is a thin UI on top of a WS+MessagePack [`WsTransport`]
 //! pointed at `aura gateway`'s channel listener — the gateway holds the
 //! workspace singleton, the manager graph, and the router.
 //!
@@ -9,11 +9,11 @@
 //! a per-install PSK derived via `aura_gateway_auth::effective_tui_psk`;
 //! both ends read the same on-disk salt to arrive at the same key.
 //!
-//! If `/healthz` on the channel socket is unreachable the command
-//! prints a concrete block telling the operator how to start a gateway
-//! and exits. The dev-only `--dev-auto-gateway` flag short-circuits
-//! that error by spawning one as a subprocess — compiled in only under
-//! `cfg(debug_assertions)`, so release builds never see it.
+//! If the WS connect fails the command prints a concrete block telling
+//! the operator how to start a gateway and exits. The dev-only
+//! `--dev-auto-gateway` flag short-circuits that error by spawning one
+//! as a subprocess — compiled in only under `cfg(debug_assertions)`, so
+//! release builds never see it.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -22,11 +22,8 @@ use aura_agent::service::ShutdownSignal;
 use aura_cli::CliInputHistoryStore;
 use aura_config::AuraConfig;
 use aura_gateway_auth::effective_tui_psk;
-use aura_tui::TuiAdapter;
-use aura_tui::TuiLogSink;
-use aura_tui::client::{
-    GatewayClient, GatewayDashboardProvider, GatewaySlashHandler, GatewayTransport,
-};
+use aura_tui::client::{TuiDashboardProvider, TuiSlashHandler, WsTransport};
+use aura_tui::{TuiAdapter, TuiLogSink};
 use tracing::info;
 
 use crate::runtime::force_exit_watchdog;
@@ -53,61 +50,50 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     let (channel_socket, psk) = resolve_channel_auth(&config)?;
 
-    let client = Arc::new(GatewayClient::new(channel_socket.clone(), psk));
-
     // Keep the auto-spawned child alive for the lifetime of the TUI.
     // Dropping the guard sends SIGTERM (with a SIGKILL fallback) so we
     // don't leak a background gateway when the TUI exits.
     #[cfg(debug_assertions)]
     let mut _auto_gateway: Option<dev_auto::AutoGatewayGuard> = None;
 
-    if let Err(e) = client.healthz().await {
-        #[cfg(debug_assertions)]
-        if opts.dev_auto_gateway {
-            // Propagate the parent's resolved config path so the
-            // spawned gateway reads the same workspace — otherwise a
-            // `--config` flag on the TUI would point the child at a
-            // different vault, and they'd disagree on the socket path.
-            let config_path = crate::boot::resolve_config_path();
-            _auto_gateway = Some(
-                dev_auto::spawn_and_wait_ready(&channel_socket, Arc::clone(&client), config_path)
-                    .await?,
-            );
-        } else {
-            return Err(unreachable_gateway_error(&channel_socket, &e.to_string()));
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            return Err(unreachable_gateway_error(&channel_socket, &e.to_string()));
-        }
-    }
-    info!(socket = %channel_socket.display(), "connected to gateway");
-
-    // Resolve the session id: either resume the one the operator
-    // passed, or create a fresh one so the SSE stream has something to
-    // attach to.
-    let session_id = match opts.session.clone() {
-        Some(id) => {
-            // Touch the session to surface a typo early; ignore the
-            // returned payload.
-            client
-                .get_session(&id)
-                .await
-                .map_err(|e| anyhow::anyhow!("resume session {id}: {e}"))?;
-            id
-        }
-        None => {
-            let s = client
-                .create_session(Default::default())
-                .await
-                .map_err(|e| anyhow::anyhow!("create session: {e}"))?;
-            s.id
+    let transport = match WsTransport::connect(channel_socket.clone(), psk).await {
+        Ok(t) => Arc::new(t),
+        Err(err) => {
+            #[cfg(debug_assertions)]
+            if opts.dev_auto_gateway {
+                // Propagate the parent's resolved config path so the
+                // spawned gateway reads the same workspace — otherwise a
+                // `--config` flag on the TUI would point the child at a
+                // different vault, and they'd disagree on the socket path.
+                let config_path = crate::boot::resolve_config_path();
+                _auto_gateway =
+                    Some(dev_auto::spawn_and_wait_ready(&channel_socket, config_path).await?);
+                Arc::new(
+                    WsTransport::connect(channel_socket.clone(), psk)
+                        .await
+                        .map_err(|e| unreachable_gateway_error(&channel_socket, &e.to_string()))?,
+                )
+            } else {
+                return Err(unreachable_gateway_error(&channel_socket, &err.to_string()));
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                return Err(unreachable_gateway_error(&channel_socket, &err.to_string()));
+            }
         }
     };
+    info!(socket = %channel_socket.display(), "connected to gateway");
 
-    let transport = Arc::new(GatewayTransport::new(Arc::clone(&client)));
-    let slash_handler = Arc::new(GatewaySlashHandler::new(Arc::clone(&client)));
-    let dashboard_provider = Arc::new(GatewayDashboardProvider::new(Arc::clone(&client)));
+    // Session IDs are now client-generated: the router's SessionManager
+    // calls `get_or_create` on first message, so the TUI can use either
+    // the operator-supplied id or a fresh UUID without a server round-trip.
+    let session_id = opts
+        .session
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let slash_handler = Arc::new(TuiSlashHandler::new(transport.approval_queue()));
+    let dashboard_provider = Arc::new(TuiDashboardProvider::new());
 
     // Input history stays local to the host — it's personal and
     // contains secrets. Reuse the vault-backed store from the CLI.
@@ -136,9 +122,9 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     shutdown.wait().await;
     info!("shutdown signal received, stopping TUI");
 
-    // A TUI redraw loop won't block tokio, but the SSE pump holds a
-    // long-lived HTTP response — bound teardown so the process always
-    // exits even if hyper can't be persuaded to close promptly.
+    // A TUI redraw loop won't block tokio, but the WS pump holds a
+    // long-lived read on the channel socket — bound teardown so the
+    // process always exits even if the read can't be cancelled promptly.
     force_exit_watchdog(std::time::Duration::from_secs(5));
 
     task_tracker.shutdown().await;
@@ -175,10 +161,9 @@ mod dev_auto {
 
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use aura_tui::client::GatewayClient;
+    use tokio::net::UnixStream;
     use tokio::process::{Child, Command};
     use tracing::info;
 
@@ -201,11 +186,12 @@ mod dev_auto {
     }
 
     /// Spawn `aura gateway start` as a subprocess and poll the channel
-    /// socket's `/healthz` until it responds (or the timeout elapses).
-    /// Returns a guard that kills the child on drop.
+    /// socket with a UDS connect until it responds (or the timeout
+    /// elapses). A successful `UnixStream::connect` is enough evidence
+    /// that the listener is accepting — the caller follows up with the
+    /// real WS handshake after this returns.
     pub async fn spawn_and_wait_ready(
         socket: &Path,
-        client: Arc<GatewayClient>,
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<AutoGatewayGuard> {
         // Loud banner so nobody mistakes the dev convenience for a real
@@ -234,7 +220,7 @@ mod dev_auto {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut wait = Duration::from_millis(100);
         loop {
-            if client.healthz().await.is_ok() {
+            if UnixStream::connect(socket).await.is_ok() {
                 info!(socket = %socket.display(), "auto-gateway ready");
                 return Ok(guard);
             }

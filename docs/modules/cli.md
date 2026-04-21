@@ -51,7 +51,7 @@ Commands return `CommandOutput`, not `String`. The sink decides how to render:
 
 ### `SlashHandler` lives in `channels`
 
-The trait that lets a channel adapter intercept `/` input is defined in `aura-channels` (not `aura-cli`). `aura-cli` _implements_ the trait but does not own it. This matters for dependency direction: future `HttpAdapter`, `TelegramAdapter`, `DiscordAdapter` can accept a `SlashHandler` without any of them depending on `aura-cli`.
+The trait that lets a channel adapter intercept `/` input is defined in `aura-channels` (not `aura-cli`). `aura-cli` _implements_ the trait but does not own it. This matters for dependency direction: the gateway WS transport and any future telegram/discord sidecar can accept an `Arc<dyn SlashHandler>` without any of them depending on `aura-cli`.
 
 ## Command Reference
 

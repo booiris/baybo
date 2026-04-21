@@ -10,9 +10,10 @@
 //! `start` is a long-running server: it acquires the per-workspace
 //! singleton, builds the full manager graph via [`crate::runtime`]
 //! (passing [`BootMode::Gateway`] so the auth token is registered as a
-//! log redaction rule), registers an `HttpAdapter` into the channel
-//! registry, and drives the router and [`GatewayServer`] side by side
-//! under a shared `ShutdownSignal`.
+//! log redaction rule), and drives the router, admin [`GatewayServer`],
+//! and [`ChannelServer`] UDS listener side by side under a shared
+//! `ShutdownSignal`. Sidecars register themselves with the channel
+//! registry from the WS route task when they connect.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,9 +22,7 @@ use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
-use aura_gateway::{
-    AdminToken, ChannelServer, GatewayDeps, GatewayServer, HttpAdapter, RuntimeGatewayConfig,
-};
+use aura_gateway::{AdminToken, ChannelServer, GatewayDeps, GatewayServer, RuntimeGatewayConfig};
 use aura_gateway_auth::{ChannelTokenTable, effective_tui_psk};
 
 use crate::boot;
@@ -255,15 +254,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     .await?;
     let run_handle = runtime::wire_router(&mut graph).await;
 
-    // Register the HTTP adapter and start channel background tasks.
-    let http_adapter = Arc::new(HttpAdapter::new());
-    graph
-        .channels_registry
-        .register(Arc::clone(&http_adapter) as Arc<dyn aura_channels::ChannelAdapter>)?;
-    graph
-        .channels_registry
-        .start_all(run_handle.incoming_tx.clone())
-        .await?;
+    // WS-backed sidecars register themselves from the route task when a
+    // client connects; nothing to pre-register here.
 
     let mut task_tracker = TaskTracker::new();
     runtime::install_signal_handler(&mut task_tracker, shutdown.clone());
@@ -284,7 +276,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         config: Arc::clone(&graph.config),
         config_path: boot::resolve_config_path(),
         runtime_config: runtime_cfg.clone(),
-        adapter: Arc::clone(&http_adapter),
         session_manager: Arc::clone(&graph.session_manager),
         job_manager: Arc::clone(&graph.job_manager),
         cron_scheduler: Arc::clone(&graph.cron_scheduler),

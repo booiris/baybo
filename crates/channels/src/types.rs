@@ -35,9 +35,9 @@ pub struct OutgoingMessage {
 ///
 /// Actors emit streaming deltas as they receive text from the LLM, then a
 /// final `Message` once the full turn is assembled. The router forwards
-/// each variant to the appropriate `ChannelAdapter` call site — channels
-/// without a partial surface ignore deltas and only act on the final
-/// message.
+/// each variant to the appropriate [`crate::Channel::send`] site —
+/// channels without a partial surface ignore deltas and only act on the
+/// final message.
 #[derive(Debug, Clone)]
 pub enum AgentOutput {
     /// Incremental text chunk for the in-flight response on a session.
@@ -75,17 +75,4 @@ pub enum NoticeLevel {
     /// Action was blocked or degraded (e.g. dangerous skill filtered
     /// out; tools the user asked for are unavailable this turn).
     Error,
-}
-
-/// Lifecycle status of a registered channel adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelStatus {
-    /// Registered but not yet started.
-    Registered,
-    /// Actively listening for messages.
-    Running,
-    /// Gracefully stopped.
-    Stopped,
-    /// Encountered an error during start or runtime.
-    Error(String),
 }

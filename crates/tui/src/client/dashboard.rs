@@ -1,37 +1,46 @@
-//! [`DashboardProvider`] backed by a [`GatewayClient`].
+//! [`DashboardProvider`] for the WS-backed TUI.
 //!
-//! The TUI talks to the gateway's channel UDS only, which exposes
-//! session state but not skills / jobs / memory (those live on the
-//! admin TCP surface). The Sessions view fetches live data; the other
-//! three variants of [`ViewKind`] return a static "admin-only"
-//! snapshot so the TUI renders a clear message rather than silently
-//! failing.
-
-use std::sync::Arc;
+//! The TUI's channel-surface no longer carries session CRUD (it's been
+//! folded back into `aura cli`), so every view here is rendered as an
+//! "admin-only" snapshot with a footer pointing the operator at the
+//! CLI. The provider still exists so dashboard keybindings keep working
+//! and the user sees a clear message rather than an empty pane.
 
 use async_trait::async_trait;
 use aura_channels::{DashboardProvider, DashboardSnapshot, ViewKind};
 
-use aura_channels::client::GatewayClient;
+/// [`DashboardProvider`] that renders the admin-only placeholder for
+/// every view. Kept as a type (rather than a bare function) to match
+/// the trait-object plumbing the TUI uses for its dashboard surface.
+pub struct TuiDashboardProvider;
 
-/// [`DashboardProvider`] that pulls live data off an `aura gateway`.
-pub struct GatewayDashboardProvider {
-    client: Arc<GatewayClient>,
+impl TuiDashboardProvider {
+    pub fn new() -> Self {
+        Self
+    }
 }
 
-impl GatewayDashboardProvider {
-    pub fn new(client: Arc<GatewayClient>) -> Self {
-        Self { client }
+impl Default for TuiDashboardProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[async_trait]
-impl DashboardProvider for GatewayDashboardProvider {
+impl DashboardProvider for TuiDashboardProvider {
     async fn snapshot(&self, kind: ViewKind) -> DashboardSnapshot {
-        match kind {
-            ViewKind::Sessions => sessions_snapshot(&self.client).await,
-            ViewKind::Skills => admin_only_snapshot("Skills", vec!["NAME".into()]),
-            ViewKind::Jobs => admin_only_snapshot(
+        let (title, columns) = match kind {
+            ViewKind::Sessions => (
+                "Sessions",
+                vec![
+                    "ID".into(),
+                    "CHANNEL".into(),
+                    "MESSAGES".into(),
+                    "LAST_ACTIVE".into(),
+                ],
+            ),
+            ViewKind::Skills => ("Skills", vec!["NAME".into()]),
+            ViewKind::Jobs => (
                 "Jobs",
                 vec![
                     "ID".into(),
@@ -40,7 +49,7 @@ impl DashboardProvider for GatewayDashboardProvider {
                     "CREATED".into(),
                 ],
             ),
-            ViewKind::Memory => admin_only_snapshot(
+            ViewKind::Memory => (
                 "Memory",
                 vec![
                     "ID".into(),
@@ -50,51 +59,12 @@ impl DashboardProvider for GatewayDashboardProvider {
                     "CONTENT".into(),
                 ],
             ),
-        }
-    }
-}
-
-async fn sessions_snapshot(client: &GatewayClient) -> DashboardSnapshot {
-    let columns = vec![
-        "ID".into(),
-        "CHANNEL".into(),
-        "MESSAGES".into(),
-        "LAST_ACTIVE".into(),
-    ];
-    match client.list_sessions().await {
-        Ok(sessions) => {
-            let rows: Vec<Vec<String>> = sessions
-                .iter()
-                .map(|s| {
-                    vec![
-                        s.id.clone(),
-                        s.channel.to_string(),
-                        s.messages.len().to_string(),
-                        s.last_active.to_rfc3339(),
-                    ]
-                })
-                .collect();
-            DashboardSnapshot {
-                title: "Sessions".into(),
-                columns,
-                rows,
-                footer: None,
-            }
-        }
-        Err(e) => DashboardSnapshot {
-            title: "Sessions".into(),
+        };
+        DashboardSnapshot {
+            title: title.into(),
             columns,
             rows: Vec::new(),
-            footer: Some(format!("error: {e}")),
-        },
-    }
-}
-
-fn admin_only_snapshot(title: &str, columns: Vec<String>) -> DashboardSnapshot {
-    DashboardSnapshot {
-        title: title.into(),
-        columns,
-        rows: Vec::new(),
-        footer: Some("admin surface — use `aura cli` (not reachable over channel UDS)".into()),
+            footer: Some("admin surface — use `aura cli` (not reachable over channel ws)".into()),
+        }
     }
 }
