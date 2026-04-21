@@ -1,6 +1,6 @@
 //! TUI-facing event shape for the WS transport pump.
 //!
-//! [`TransportEvent`] is the normalised stream item the TUI's event
+//! [`TransportEvent`] is the normalized stream item the TUI's event
 //! loop consumes — the concrete [`crate::client::WsTransport`] maps
 //! `aura-channels` wire frames onto these variants so the run loop
 //! doesn't need to know about the underlying MessagePack protocol.
