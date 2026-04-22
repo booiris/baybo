@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aura_model::{ChannelType, ChatMessage, Session, SessionState, User};
 use aura_storage::{SessionStore, StorageError};
 use chrono::{Duration, Utc};
@@ -13,12 +15,12 @@ fn wrap(e: StorageError) -> SessionError {
 
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
-    store: Box<dyn SessionStore>,
+    store: Arc<dyn SessionStore>,
     session_timeout: Duration,
 }
 
 impl SessionManager {
-    pub fn new(store: Box<dyn SessionStore>, session_timeout: Duration) -> Self {
+    pub fn new(store: Arc<dyn SessionStore>, session_timeout: Duration) -> Self {
         Self {
             store,
             session_timeout,
@@ -141,6 +143,7 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use aura_model::{ChannelType, Session, User};
@@ -207,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_returns_valid_session() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
@@ -223,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_or_create_returns_existing_session() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
@@ -241,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_or_create_creates_new_when_missing() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
@@ -256,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn touch_updates_last_active() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
@@ -278,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn touch_nonexistent_returns_not_found() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let result = mgr.touch("nonexistent").await;
@@ -287,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_expired_removes_old_sessions() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::seconds(1));
 
         mgr.create_session(test_user(), ChannelType::tui())
@@ -305,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_all_sessions_newest_first() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let first = mgr
@@ -326,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_returns_messages_for_existing_session() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
@@ -340,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_errors_for_missing_session() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let err = mgr.history("nonexistent").await.unwrap_err();
@@ -349,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_existing_session() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let session = mgr
@@ -363,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_errors_for_missing_session() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let err = mgr.delete("nonexistent").await.unwrap_err();
@@ -372,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_or_create_replaces_expired_session() {
-        let store = Box::new(MemorySessionStore::new());
+        let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::seconds(1));
 
         let session = mgr

@@ -280,7 +280,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // alongside the cron loop and axum servers.
     let bot_reconciler = Arc::new(aura_gateway::channel::ChannelBotReconciler::new(
         Arc::clone(&channel_control),
-        Arc::clone(&graph.channel_bot_store),
+        graph.stores.channel_bot.clone(),
         Arc::clone(&graph.secret_vault),
     ));
     {
@@ -300,7 +300,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         job_manager: Arc::clone(&graph.job_manager),
         cron_scheduler: Arc::clone(&graph.cron_scheduler),
         memory_manager: Arc::clone(&graph.memory_manager),
-        trace_store: Arc::clone(&graph.trace_store),
         skill_registry: Arc::clone(&graph.skill_registry),
         tool_registry: Arc::clone(&graph.tool_registry),
         channel_registry: Arc::clone(&graph.channels_registry),
@@ -310,11 +309,9 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         incoming_tx: run_handle.incoming_tx.clone(),
         channel_tokens: channel_tokens.clone(),
         secret_vault: Arc::clone(&graph.secret_vault),
-        channel_session_store: Arc::clone(&graph.channel_session_store),
-        channel_bot_store: Arc::clone(&graph.channel_bot_store),
+        stores: graph.stores.clone(),
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
-        channel_pairing_store: Arc::clone(&graph.channel_pairing_store),
     };
 
     // Channel UDS listener — lives under the same workspace identity dir

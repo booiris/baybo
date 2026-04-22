@@ -35,7 +35,7 @@ use aura_llm::LlmClient;
 use aura_pairing::PairingService;
 use aura_security::SecretVault;
 use aura_skills::SkillRegistry;
-use aura_storage::{ChannelBotStore, ChannelPairingStore, ChannelSessionStore, TraceStore};
+use aura_storage::{ChannelBotStore, Store, TraceStore};
 use aura_tools::ToolRegistry;
 use axum::Router;
 use axum::middleware;
@@ -69,7 +69,6 @@ pub struct GatewayDeps {
     pub job_manager: Arc<JobManager>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub memory_manager: Arc<MemoryManager>,
-    pub trace_store: Arc<dyn TraceStore>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
@@ -91,16 +90,12 @@ pub struct GatewayDeps {
     /// libsql. The gateway is the only process that writes the TUI
     /// input-history key; the TUI itself never touches the vault.
     pub secret_vault: Arc<SecretVault>,
-    /// Mapping of `(channel_type, user_id)` → aura `session_id`.
-    /// Owned by the gateway because the libsql store is already open
-    /// here; channel sidecars that send `Frame::Message` with empty
-    /// `session_id` resolve through this store via
-    /// [`crate::channel::ChannelSessionResolver`].
-    pub channel_session_store: Arc<dyn ChannelSessionStore>,
-    /// Per-tenant credential registry: `(channel_type, bot_id)` rows
-    /// describing the bots a sidecar should run. Tokens live in the
-    /// vault keyed as `channel.<channel_type>.bot.<bot_id>.token`.
-    pub channel_bot_store: Arc<dyn ChannelBotStore>,
+    /// Cloneable bundle of every libsql-backed store (trace, channel
+    /// session/bot/pairing, …). Exposing the whole [`Store`] here means
+    /// adding a new store to the gateway only touches [`Store`] itself,
+    /// not every `GatewayDeps`-style wrapper. Handlers read the specific
+    /// handle they need via `deps.stores.<name>.clone()`.
+    pub stores: Store,
     /// Shared handle the CLI-driven reconciler uses to push control-
     /// plane frames (`StartBot` / `StopBot`) into the WS sidecar pump.
     /// The WS route task registers each sidecar on successful
@@ -111,9 +106,6 @@ pub struct GatewayDeps {
     /// (avoiding a double-send on the first tick) and so the
     /// disconnect path can `forget` the cached bots.
     pub bot_reconciler: Arc<crate::channel::ChannelBotReconciler>,
-    /// Per-user pairing gate. Consulted on every inbound
-    /// `Frame::Message` from a sidecar before the router intake.
-    pub channel_pairing_store: Arc<dyn ChannelPairingStore>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -161,13 +153,13 @@ impl AdminState {
             job_manager: Arc::clone(&deps.job_manager),
             cron_scheduler: Arc::clone(&deps.cron_scheduler),
             memory_manager: Arc::clone(&deps.memory_manager),
-            trace_store: Arc::clone(&deps.trace_store),
+            trace_store: deps.stores.trace.clone(),
             skill_registry: Arc::clone(&deps.skill_registry),
             tool_registry: Arc::clone(&deps.tool_registry),
             channel_registry: Arc::clone(&deps.channel_registry),
             llm_client: Arc::clone(&deps.llm_client),
             log_buffer: Arc::clone(&deps.log_buffer),
-            channel_bot_store: Arc::clone(&deps.channel_bot_store),
+            channel_bot_store: deps.stores.channel_bot.clone(),
             channel_control: Arc::clone(&deps.channel_control),
             secret_vault: Arc::clone(&deps.secret_vault),
             bind_display: deps.runtime_config.admin_bind.to_string(),
@@ -273,9 +265,9 @@ pub fn build_channel_router(
     )));
     let session_resolver = Arc::new(crate::channel::ChannelSessionResolver::new(
         Arc::clone(&deps.session_manager),
-        Arc::clone(&deps.channel_session_store),
+        deps.stores.channel_session.clone(),
     ));
-    let pairing = Arc::new(PairingService::new(Arc::clone(&deps.channel_pairing_store)));
+    let pairing = Arc::new(PairingService::new(deps.stores.channel_pairing.clone()));
     let ws_state = crate::channel::WsChannelState {
         registry: Arc::clone(&deps.channel_registry),
         incoming_tx: deps.incoming_tx.clone(),
@@ -285,7 +277,7 @@ pub fn build_channel_router(
         log_buffer: Arc::clone(&deps.log_buffer),
         session_resolver,
         control: Arc::clone(&deps.channel_control),
-        channel_bot_store: Arc::clone(&deps.channel_bot_store),
+        channel_bot_store: deps.stores.channel_bot.clone(),
         secret_vault: Arc::clone(&deps.secret_vault),
         bot_reconciler: Arc::clone(&deps.bot_reconciler),
         pairing,

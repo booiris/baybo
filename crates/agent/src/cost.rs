@@ -130,11 +130,11 @@ impl CostGuard {
 /// `CostTracker` is a thin coordination layer over a `CostStore`.
 /// It does **not** make limit decisions — that responsibility belongs to `CostGuard`.
 pub struct CostTracker {
-    store: Box<dyn CostStore>,
+    store: std::sync::Arc<dyn CostStore>,
 }
 
 impl CostTracker {
-    pub fn new(store: Box<dyn CostStore>) -> Self {
+    pub fn new(store: std::sync::Arc<dyn CostStore>) -> Self {
         Self { store }
     }
 

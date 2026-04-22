@@ -99,7 +99,7 @@ mod tests {
 
     async fn build() -> ChannelSessionResolver {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let session_store = Box::new(LibsqlSessionStore::new(pool.clone()));
+        let session_store = Arc::new(LibsqlSessionStore::new(pool.clone()));
         let session_mgr = Arc::new(SessionManager::new(
             session_store,
             chrono::Duration::seconds(300),

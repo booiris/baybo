@@ -42,7 +42,7 @@ use aura_llm::LlmClient;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
-use aura_storage::{Store, TraceStore};
+use aura_storage::Store;
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 use parking_lot::Mutex;
@@ -118,32 +118,22 @@ pub fn load_master_key(security: &aura_config::SecurityConfig) -> anyhow::Result
 pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<SecretVault>> {
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
     let master_key = load_master_key(&config.security)?;
-    Ok(Arc::new(SecretVault::new(
-        master_key,
-        Arc::from(storage.secret),
-    )))
+    Ok(Arc::new(SecretVault::new(master_key, storage.secret)))
 }
 
-/// Open the libsql store and wrap the vault + channel-bot metadata
-/// store + channel-pairing store for CLI subcommands that manage
-/// per-channel credentials (`aura channels bot add/remove/list`) or
-/// per-user pairings (`aura pair list/approve/revoke`). All three
-/// handles share a single libsql connection so the CLI writes land
+/// Open the libsql store and return the vault + full [`Store`] handle
+/// for CLI subcommands that manage per-channel credentials
+/// (`aura channels bot add/remove/list`) or per-user pairings
+/// (`aura pair list/approve/revoke`). The returned [`Store`] is clonable
+/// and its fields share a single libsql connection, so CLI writes land
 /// atomically in the same file the gateway reads from.
 pub async fn build_bot_registry_deps(
     config: &AuraConfig,
-) -> anyhow::Result<(
-    Arc<SecretVault>,
-    Arc<dyn aura_storage::ChannelBotStore>,
-    Arc<dyn aura_storage::ChannelPairingStore>,
-)> {
+) -> anyhow::Result<(Arc<SecretVault>, Store)> {
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
     let master_key = load_master_key(&config.security)?;
-    let vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
-    let bot_store: Arc<dyn aura_storage::ChannelBotStore> = Arc::from(storage.channel_bot);
-    let pairing_store: Arc<dyn aura_storage::ChannelPairingStore> =
-        Arc::from(storage.channel_pairing);
-    Ok((vault, bot_store, pairing_store))
+    let vault = Arc::new(SecretVault::new(master_key, storage.secret.clone()));
+    Ok((vault, storage))
 }
 
 /// Fully-wired manager graph shared between the TUI and gateway boot
@@ -158,7 +148,6 @@ pub struct ManagerGraph {
     pub job_manager: Arc<JobManager>,
     pub memory_manager: Arc<MemoryManager>,
     pub cron_scheduler: Arc<CronScheduler>,
-    pub trace_store: Arc<dyn TraceStore>,
     pub security_gateway: Arc<SecurityGateway>,
     pub skill_registry: Arc<SkillRegistry>,
     pub skill_assessor: Arc<SkillAssessor>,
@@ -167,12 +156,14 @@ pub struct ManagerGraph {
     pub llm_client: Arc<LlmClient>,
     pub workspace: Arc<WorkspaceManager>,
     pub channels_registry: Arc<ChannelRegistry>,
-    pub channel_session_store: Arc<dyn aura_storage::ChannelSessionStore>,
-    pub channel_bot_store: Arc<dyn aura_storage::ChannelBotStore>,
-    pub channel_pairing_store: Arc<dyn aura_storage::ChannelPairingStore>,
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
+    /// Clonable bundle of every libsql-backed store handle. Keeping the
+    /// whole [`Store`] in one field means adding a new store only
+    /// touches [`Store`] itself — the graph and its downstream consumers
+    /// pick it up via `stores.xxx` without a new field here.
+    pub stores: Store,
 
     /// Consumed by [`wire_router`]. Stored in the graph so the caller
     /// cannot forget to plumb it through — a silently-missing receiver
@@ -222,14 +213,15 @@ pub async fn build_managers(
         client
     };
 
-    // --- storage + domain managers
-    let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
+    // --- storage + domain managers. `stores` is kept whole: every Arc
+    // handed to a manager is a cheap `stores.xxx.clone()` so the bundle
+    // itself stays intact for the graph + downstream consumers.
+    let stores = Store::open(boot::storage_db_path(&config.workspace)).await?;
 
-    let risk_store: Arc<dyn aura_storage::SkillRiskStore> = Arc::from(storage.risk);
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
     let skill_assessor = Arc::new(SkillAssessor::with_background_worker(
         Arc::clone(&llm_client),
-        Arc::clone(&risk_store),
+        stores.risk.clone(),
         assessment_mode,
     ));
     {
@@ -243,11 +235,11 @@ pub async fn build_managers(
     }
 
     let session_manager = Arc::new(SessionManager::new(
-        storage.session,
+        stores.session.clone(),
         boot::to_session_timeout(&config.session),
     ));
 
-    let job_manager = JobManager::new(storage.job);
+    let job_manager = JobManager::new(stores.job.clone());
     match job_manager.recover_interrupted().await {
         Ok(0) => {}
         Ok(n) => info!(count = n, "recovered interrupted jobs from prior run"),
@@ -255,21 +247,20 @@ pub async fn build_managers(
     }
     let job_manager = Arc::new(job_manager);
 
-    let cost_tracker = Arc::new(CostTracker::new(storage.cost));
-    let trace_store: Arc<dyn TraceStore> = Arc::from(storage.trace);
+    let cost_tracker = Arc::new(CostTracker::new(stores.cost.clone()));
 
     // --- secret vault (master key optionally substituted with a dev key).
     // The store is already open here, so we can't route through
     // `build_secret_vault` (it would re-open libsql); share the
     // master-key policy via `load_master_key`.
     let master_key = load_master_key(&config.security)?;
-    let secret_vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
+    let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
 
     // --- cron scheduler (built before ToolExecutor so its tools register
     // while `tool_registry` still has a single Arc owner)
     let (cron_trigger_tx, cron_trigger_rx) = mpsc::channel(64);
     let cron_scheduler = Arc::new(CronScheduler::new(
-        storage.cron,
+        stores.cron.clone(),
         cron_trigger_tx,
         Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
     ));
@@ -294,13 +285,8 @@ pub async fn build_managers(
         Arc::clone(&security_gateway),
     ));
 
-    let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
+    let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
     let hook_manager = Arc::new(HookManager::new());
-    let channel_session_store: Arc<dyn aura_storage::ChannelSessionStore> =
-        Arc::from(storage.channel_session);
-    let channel_bot_store: Arc<dyn aura_storage::ChannelBotStore> = Arc::from(storage.channel_bot);
-    let channel_pairing_store: Arc<dyn aura_storage::ChannelPairingStore> =
-        Arc::from(storage.channel_pairing);
 
     Ok(ManagerGraph {
         config,
@@ -308,7 +294,6 @@ pub async fn build_managers(
         job_manager,
         memory_manager,
         cron_scheduler,
-        trace_store,
         security_gateway,
         skill_registry,
         skill_assessor,
@@ -317,12 +302,10 @@ pub async fn build_managers(
         llm_client,
         workspace,
         channels_registry,
-        channel_session_store,
-        channel_bot_store,
-        channel_pairing_store,
         cost_tracker,
         hook_manager,
         secret_vault,
+        stores,
         cron_trigger_rx: Some(cron_trigger_rx),
     })
 }
@@ -375,7 +358,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let actor_memory_manager = Arc::clone(&graph.memory_manager);
     let actor_tokenizer = Arc::clone(&tokenizer);
     let actor_hooks = Arc::clone(&graph.hook_manager);
-    let actor_trace_store = Arc::clone(&graph.trace_store);
+    let actor_trace_store = graph.stores.trace.clone();
     let actor_job_manager = Arc::clone(&graph.job_manager);
     let actor_cost_tracker = Arc::clone(&graph.cost_tracker);
     let actor_skill_assessor = Arc::clone(&graph.skill_assessor);

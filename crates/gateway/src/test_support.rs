@@ -20,7 +20,7 @@ use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, SecretVault};
 use aura_skills::SkillRegistry;
-use aura_storage::{ChannelBotStore, ChannelPairingStore, ChannelSessionStore, Store, TraceStore};
+use aura_storage::Store;
 use aura_tools::ToolRegistry;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -58,42 +58,37 @@ pub struct TestGateway {
 pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let db_path = tempdir.path().join("gateway-test.db");
-    let storage = Store::open(&db_path).await.expect("open in-memory store");
+    let stores = Store::open(&db_path).await.expect("open in-memory store");
 
     let config = Arc::new(AuraConfig::default());
     let session_manager = Arc::new(SessionManager::new(
-        storage.session,
+        stores.session.clone(),
         chrono::Duration::seconds(300),
     ));
-    let job_manager = Arc::new(JobManager::new(storage.job));
+    let job_manager = Arc::new(JobManager::new(stores.job.clone()));
 
-    let secret_store = Arc::from(storage.secret);
     let secret_vault = Arc::new(SecretVault::new(
         EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
             .expect("build test encryption key"),
-        secret_store,
+        stores.secret.clone(),
     ));
 
     let shutdown = ShutdownSignal::new();
     let (cron_tx, _cron_rx) = mpsc::channel(16);
     let cron_scheduler = Arc::new(CronScheduler::new(
-        storage.cron,
+        stores.cron.clone(),
         cron_tx,
         Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
     ));
 
-    let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
-    let trace_store: Arc<dyn TraceStore> = Arc::from(storage.trace);
+    let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
     let skill_registry = Arc::new(SkillRegistry::new());
     let tool_registry = Arc::new(ToolRegistry::new());
     let channel_registry = Arc::new(ChannelRegistry::new());
-    let channel_session_store: Arc<dyn ChannelSessionStore> = Arc::from(storage.channel_session);
-    let channel_bot_store: Arc<dyn ChannelBotStore> = Arc::from(storage.channel_bot);
-    let channel_pairing_store: Arc<dyn ChannelPairingStore> = Arc::from(storage.channel_pairing);
     let channel_control = Arc::new(crate::channel::ChannelControlRegistry::new());
     let bot_reconciler = Arc::new(crate::channel::ChannelBotReconciler::new(
         Arc::clone(&channel_control),
-        Arc::clone(&channel_bot_store),
+        stores.channel_bot.clone(),
         Arc::clone(&secret_vault),
     ));
 
@@ -129,7 +124,6 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         job_manager,
         cron_scheduler,
         memory_manager,
-        trace_store,
         skill_registry,
         tool_registry,
         channel_registry,
@@ -139,11 +133,9 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         incoming_tx,
         channel_tokens: channel_tokens.clone(),
         secret_vault,
-        channel_session_store,
-        channel_bot_store,
+        stores,
         channel_control,
         bot_reconciler,
-        channel_pairing_store,
     };
 
     TestGateway {

@@ -94,7 +94,7 @@ pub struct CronTriggerEvent {
 /// Manages cron job lifecycle and runs a background tick loop
 /// that fires due jobs on schedule.
 pub struct CronScheduler {
-    store: Box<dyn CronStore>,
+    store: Arc<dyn CronStore>,
     trigger_tx: mpsc::Sender<CronTriggerEvent>,
     shutdown: Arc<dyn Shutdown>,
 }
@@ -109,7 +109,7 @@ const TICK_INTERVAL: Duration = Duration::from_secs(10);
 
 impl CronScheduler {
     pub fn new(
-        store: Box<dyn CronStore>,
+        store: Arc<dyn CronStore>,
         trigger_tx: mpsc::Sender<CronTriggerEvent>,
         shutdown: Arc<dyn Shutdown>,
     ) -> Self {
@@ -733,7 +733,7 @@ mod tests {
         store: InMemoryCronStore,
     ) -> (CronScheduler, mpsc::Receiver<CronTriggerEvent>) {
         let (tx, rx) = mpsc::channel(64);
-        let scheduler = CronScheduler::new(Box::new(store), tx, Arc::new(NeverShutdown));
+        let scheduler = CronScheduler::new(Arc::new(store), tx, Arc::new(NeverShutdown));
         (scheduler, rx)
     }
 

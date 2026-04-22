@@ -220,8 +220,8 @@ impl AgentTestHarnessBuilder {
         let trace_store = Arc::new(MemoryTraceStore::new());
         let memory_store = Arc::new(MemoryMemoryStore::new());
 
-        let job_manager = Arc::new(JobManager::new(box_clone_job_store(&job_store)));
-        let cost_tracker = Arc::new(CostTracker::new(box_clone_cost_store(&cost_store)));
+        let job_manager = Arc::new(JobManager::new(share_job_store(&job_store)));
+        let cost_tracker = Arc::new(CostTracker::new(share_cost_store(&cost_store)));
         let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
             &session.id,
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
@@ -242,7 +242,7 @@ impl AgentTestHarnessBuilder {
         }
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
-        let memory_manager = Arc::new(MemoryManager::without_embedder(box_clone_memory_store(
+        let memory_manager = Arc::new(MemoryManager::without_embedder(share_memory_store(
             &memory_store,
         )));
         let approval_gates = Arc::new(ApprovalGateMap::new());
@@ -312,145 +312,22 @@ impl AgentTestHarnessBuilder {
 
 // --- Helpers to obtain `Box<dyn Trait>` handles from `Arc<Concrete>` ---
 //
-// Each in-memory store is constructed once and shared. Some `aura-agent`
-// managers (`JobManager`, `CostTracker`, `MemoryManager`) accept a
-// `Box<dyn Trait>` which they own outright. We satisfy them by handing
-// over a tiny `BoxedShared` adapter that delegates back to the shared
-// `Arc`. This keeps the test-visible store handle the *same* instance the
-// agent reads/writes through, so post-run assertions see real state.
+// Each in-memory store is constructed once as an `Arc` and shared
+// directly with the managers — `JobManager`, `CostTracker`, and
+// `MemoryManager` all accept `Arc<dyn Trait>`, so the test handle and the
+// manager-owned handle point at the same instance and post-run
+// assertions see real state.
 
-fn box_clone_job_store(arc: &Arc<MemoryJobStore>) -> Box<dyn aura_storage::JobStore> {
-    Box::new(JobStoreShared(arc.clone()))
+fn share_job_store(arc: &Arc<MemoryJobStore>) -> Arc<dyn aura_storage::JobStore> {
+    arc.clone()
 }
 
-fn box_clone_cost_store(arc: &Arc<MemoryCostStore>) -> Box<dyn aura_storage::CostStore> {
-    Box::new(CostStoreShared(arc.clone()))
+fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn aura_storage::CostStore> {
+    arc.clone()
 }
 
-fn box_clone_memory_store(arc: &Arc<MemoryMemoryStore>) -> Box<dyn aura_storage::MemoryStore> {
-    Box::new(MemoryStoreShared(arc.clone()))
-}
-
-struct JobStoreShared(Arc<MemoryJobStore>);
-
-#[async_trait::async_trait]
-impl aura_storage::JobStore for JobStoreShared {
-    async fn create(&self, job: &aura_job::Job) -> Result<(), aura_job::JobError> {
-        self.0.create(job).await
-    }
-    async fn get(&self, job_id: &str) -> Result<Option<aura_job::Job>, aura_job::JobError> {
-        self.0.get(job_id).await
-    }
-    async fn save(&self, job: &aura_job::Job) -> Result<(), aura_job::JobError> {
-        self.0.save(job).await
-    }
-    async fn list_by_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<aura_job::Job>, aura_job::JobError> {
-        self.0.list_by_session(session_id).await
-    }
-    async fn list_by_status(
-        &self,
-        status: aura_job::JobStatus,
-    ) -> Result<Vec<aura_job::Job>, aura_job::JobError> {
-        self.0.list_by_status(status).await
-    }
-    async fn list_children(
-        &self,
-        parent_job_id: &str,
-    ) -> Result<Vec<aura_job::Job>, aura_job::JobError> {
-        self.0.list_children(parent_job_id).await
-    }
-    async fn list_all(&self) -> Result<Vec<aura_job::Job>, aura_job::JobError> {
-        self.0.list_all().await
-    }
-    async fn record_transition(
-        &self,
-        transition: &aura_job::JobTransition,
-    ) -> Result<(), aura_job::JobError> {
-        self.0.record_transition(transition).await
-    }
-    async fn get_transitions(
-        &self,
-        job_id: &str,
-    ) -> Result<Vec<aura_job::JobTransition>, aura_job::JobError> {
-        self.0.get_transitions(job_id).await
-    }
-}
-
-struct CostStoreShared(Arc<MemoryCostStore>);
-
-#[async_trait::async_trait]
-impl aura_storage::CostStore for CostStoreShared {
-    async fn record(&self, record: &aura_storage::CostRecord) -> aura_storage::CostResult<()> {
-        self.0.record(record).await
-    }
-    async fn query_user(
-        &self,
-        user_id: &str,
-        range: aura_storage::TimeRange,
-    ) -> aura_storage::CostResult<Vec<aura_storage::CostRecord>> {
-        self.0.query_user(user_id, range).await
-    }
-    async fn query_global(
-        &self,
-        range: aura_storage::TimeRange,
-    ) -> aura_storage::CostResult<aura_storage::CostSummary> {
-        self.0.query_global(range).await
-    }
-    async fn sum_user(
-        &self,
-        user_id: &str,
-        range: aura_storage::TimeRange,
-    ) -> aura_storage::CostResult<f64> {
-        self.0.sum_user(user_id, range).await
-    }
-}
-
-struct MemoryStoreShared(Arc<MemoryMemoryStore>);
-
-#[async_trait::async_trait]
-impl aura_storage::MemoryStore for MemoryStoreShared {
-    async fn store(
-        &self,
-        entry: &aura_model::MemoryEntry,
-    ) -> Result<(), aura_storage::StorageError> {
-        self.0.store(entry).await
-    }
-    async fn retrieve(
-        &self,
-        user_id: &str,
-        key: &str,
-    ) -> Result<Option<aura_model::MemoryEntry>, aura_storage::StorageError> {
-        self.0.retrieve(user_id, key).await
-    }
-    async fn search(
-        &self,
-        user_id: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<aura_model::MemoryEntry>, aura_storage::StorageError> {
-        self.0.search(user_id, query, limit).await
-    }
-    async fn delete(&self, id: &str) -> Result<(), aura_storage::StorageError> {
-        self.0.delete(id).await
-    }
-    async fn list_by_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<aura_model::MemoryEntry>, aura_storage::StorageError> {
-        self.0.list_by_user(user_id).await
-    }
-    async fn list_all(&self) -> Result<Vec<aura_model::MemoryEntry>, aura_storage::StorageError> {
-        self.0.list_all().await
-    }
-    async fn get_by_id(
-        &self,
-        id: &str,
-    ) -> Result<Option<aura_model::MemoryEntry>, aura_storage::StorageError> {
-        self.0.get_by_id(id).await
-    }
+fn share_memory_store(arc: &Arc<MemoryMemoryStore>) -> Arc<dyn aura_storage::MemoryStore> {
+    arc.clone()
 }
 
 // Avoid unused-import lints when callers don't reference these types.

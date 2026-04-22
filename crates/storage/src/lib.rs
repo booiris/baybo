@@ -32,18 +32,24 @@ pub use trace::TraceStore;
 
 /// Bundles all store implementations into a single container
 /// for dependency injection by the assembly layer.
+///
+/// Each field is an `Arc<dyn XxxStore>` so the whole struct is cheap to
+/// clone and hand to multiple consumers (manager graph, gateway server,
+/// CLI helpers) without forcing each caller to maintain its own bag of
+/// store fields.
+#[derive(Clone)]
 pub struct Store {
-    pub session: Box<dyn SessionStore>,
-    pub memory: Box<dyn MemoryStore>,
-    pub trace: Box<dyn TraceStore>,
-    pub secret: Box<dyn SecretStore>,
-    pub cost: Box<dyn CostStore>,
-    pub job: Box<dyn JobStore>,
-    pub cron: Box<dyn CronStore>,
-    pub risk: Box<dyn SkillRiskStore>,
-    pub channel_session: Box<dyn ChannelSessionStore>,
-    pub channel_bot: Box<dyn ChannelBotStore>,
-    pub channel_pairing: Box<dyn ChannelPairingStore>,
+    pub session: std::sync::Arc<dyn SessionStore>,
+    pub memory: std::sync::Arc<dyn MemoryStore>,
+    pub trace: std::sync::Arc<dyn TraceStore>,
+    pub secret: std::sync::Arc<dyn SecretStore>,
+    pub cost: std::sync::Arc<dyn CostStore>,
+    pub job: std::sync::Arc<dyn JobStore>,
+    pub cron: std::sync::Arc<dyn CronStore>,
+    pub risk: std::sync::Arc<dyn SkillRiskStore>,
+    pub channel_session: std::sync::Arc<dyn ChannelSessionStore>,
+    pub channel_bot: std::sync::Arc<dyn ChannelBotStore>,
+    pub channel_pairing: std::sync::Arc<dyn ChannelPairingStore>,
 }
 
 impl Store {
@@ -63,17 +69,19 @@ impl Store {
         }
         let pool = libsql::LibsqlPool::open(path).await?;
         Ok(Self {
-            session: Box::new(libsql::LibsqlSessionStore::new(pool.clone())),
-            memory: Box::new(libsql::LibsqlMemoryStore::new(pool.clone())),
-            trace: Box::new(libsql::LibsqlTraceStore::new(pool.clone())),
-            secret: Box::new(libsql::LibsqlSecretStore::new(pool.clone())),
-            cost: Box::new(libsql::LibsqlCostStore::new(pool.clone())),
-            job: Box::new(libsql::LibsqlJobStore::new(pool.clone())),
-            cron: Box::new(libsql::LibsqlCronStore::new(pool.clone())),
-            risk: Box::new(libsql::LibsqlSkillRiskStore::new(pool.clone())),
-            channel_session: Box::new(libsql::LibsqlChannelSessionStore::new(pool.clone())),
-            channel_bot: Box::new(libsql::LibsqlChannelBotStore::new(pool.clone())),
-            channel_pairing: Box::new(libsql::LibsqlChannelPairingStore::new(pool)),
+            session: std::sync::Arc::new(libsql::LibsqlSessionStore::new(pool.clone())),
+            memory: std::sync::Arc::new(libsql::LibsqlMemoryStore::new(pool.clone())),
+            trace: std::sync::Arc::new(libsql::LibsqlTraceStore::new(pool.clone())),
+            secret: std::sync::Arc::new(libsql::LibsqlSecretStore::new(pool.clone())),
+            cost: std::sync::Arc::new(libsql::LibsqlCostStore::new(pool.clone())),
+            job: std::sync::Arc::new(libsql::LibsqlJobStore::new(pool.clone())),
+            cron: std::sync::Arc::new(libsql::LibsqlCronStore::new(pool.clone())),
+            risk: std::sync::Arc::new(libsql::LibsqlSkillRiskStore::new(pool.clone())),
+            channel_session: std::sync::Arc::new(libsql::LibsqlChannelSessionStore::new(
+                pool.clone(),
+            )),
+            channel_bot: std::sync::Arc::new(libsql::LibsqlChannelBotStore::new(pool.clone())),
+            channel_pairing: std::sync::Arc::new(libsql::LibsqlChannelPairingStore::new(pool)),
         })
     }
 }

@@ -306,7 +306,7 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let socket_path = tempdir.path().join("channel.sock");
 
     let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let pairing_store = Arc::clone(&tg.deps.channel_pairing_store);
+    let pairing_store = tg.deps.stores.channel_pairing.clone();
     let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
 

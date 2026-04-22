@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aura_job::{Job, JobError, JobStatus, JobTransition, OperationKind};
 use aura_storage::JobStore;
 
@@ -8,11 +10,11 @@ type Result<T> = std::result::Result<T, JobError>;
 /// State machine validation and timestamp management live on `Job` itself.
 /// This manager is a thin persistence orchestrator.
 pub struct JobManager {
-    store: Box<dyn JobStore>,
+    store: Arc<dyn JobStore>,
 }
 
 impl JobManager {
-    pub fn new(store: Box<dyn JobStore>) -> Self {
+    pub fn new(store: Arc<dyn JobStore>) -> Self {
         Self { store }
     }
 
@@ -263,7 +265,7 @@ mod tests {
     }
 
     fn make_manager() -> JobManager {
-        JobManager::new(Box::new(InMemoryJobStore::new()))
+        JobManager::new(Arc::new(InMemoryJobStore::new()))
     }
 
     #[tokio::test]

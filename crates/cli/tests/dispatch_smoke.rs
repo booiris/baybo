@@ -91,7 +91,7 @@ impl SessionStore for MemorySessionStore {
 }
 
 fn seeded_session_manager(ids: &[&str]) -> (Arc<SessionManager>, Vec<String>) {
-    let store = Box::new(MemorySessionStore::new());
+    let store = Arc::new(MemorySessionStore::new());
     let mut populated = Vec::with_capacity(ids.len());
     for id in ids {
         let session = Session {
@@ -223,7 +223,7 @@ fn test_kind() -> OperationKind {
 }
 
 async fn seeded_job_manager() -> (Arc<JobManager>, Vec<(String, JobStatus)>) {
-    let mgr = JobManager::new(Box::new(MemoryJobStore::new()));
+    let mgr = JobManager::new(Arc::new(MemoryJobStore::new()));
     // Pending job
     let pending = mgr.create_job("s1", test_kind(), None).await.unwrap();
     // In-progress job
@@ -407,7 +407,7 @@ fn make_cron_scheduler() -> (
 ) {
     let (tx, rx) = mpsc::channel(16);
     let scheduler = CronScheduler::new(
-        Box::new(MemoryCronStore::new()),
+        Arc::new(MemoryCronStore::new()),
         tx,
         Arc::new(aura_cron::NeverShutdown),
     );
@@ -836,7 +836,7 @@ async fn job_list_without_manager_reports_unavailable() {
 
 #[tokio::test]
 async fn job_list_reports_empty_when_no_jobs() {
-    let mgr = Arc::new(JobManager::new(Box::new(MemoryJobStore::new())));
+    let mgr = Arc::new(JobManager::new(Arc::new(MemoryJobStore::new())));
     let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))
         .tools(Arc::new(ToolRegistry::new()))
@@ -1130,7 +1130,7 @@ impl MemoryStore for MemoryMemStore {
 }
 
 fn context_with_memory() -> (aura_cli::CommandContext, Arc<MemoryManager>) {
-    let store = Box::new(MemoryMemStore::new());
+    let store = Arc::new(MemoryMemStore::new());
     let mgr = Arc::new(MemoryManager::without_embedder(store));
     let ctx = ContextBuilder::new(Arc::new(AuraConfig::default()))
         .skills(Arc::new(SkillRegistry::new()))

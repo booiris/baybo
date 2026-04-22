@@ -52,13 +52,13 @@ const FACT_INDICATORS: &[&str] = &[
 ];
 
 pub struct MemoryManager {
-    store: Box<dyn MemoryStore>,
+    store: std::sync::Arc<dyn MemoryStore>,
     embedder: Option<Box<dyn EmbeddingModel>>,
     max_entries_per_user: usize,
 }
 
 impl MemoryManager {
-    pub fn without_embedder(store: Box<dyn MemoryStore>) -> Self {
+    pub fn without_embedder(store: std::sync::Arc<dyn MemoryStore>) -> Self {
         Self {
             store,
             embedder: None,
@@ -514,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_user_subset_when_scoped() {
-        let store = Box::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(InMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         mgr.store(make_entry("u1", "a", None)).await.unwrap();
         mgr.store(make_entry("u2", "b", None)).await.unwrap();
@@ -527,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_every_entry_when_unscoped() {
-        let store = Box::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(InMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         mgr.store(make_entry("u1", "a", None)).await.unwrap();
         mgr.store(make_entry("u2", "b", None)).await.unwrap();
@@ -538,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_global_matches_across_users() {
-        let store = Box::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(InMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         mgr.store(make_entry("u1", "Rust rocks", None))
             .await
@@ -556,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_importance_clamps_and_persists() {
-        let store = Box::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(InMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         let entry = make_entry("u1", "anchor", None);
         let id = entry.id.clone();
@@ -570,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_importance_errors_when_missing() {
-        let store = Box::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(InMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         let err = mgr.set_importance("nope", 0.5).await.unwrap_err();
         assert!(matches!(err, MemoryManagerError::NotFound(_)));
@@ -578,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_for_session_removes_only_matching_entries() {
-        let store = Box::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(InMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         mgr.store(make_entry("u1", "from s1", Some("s1")))
             .await
