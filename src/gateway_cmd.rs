@@ -271,6 +271,26 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Register-frame handshake via `GatewayDeps`.
     let channel_tokens = ChannelTokenTable::new();
 
+    let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
+
+    // CLI-driven bot add/remove writes straight to libsql + vault. The
+    // reconciler polls those stores on a short tick and pushes
+    // `StartBot` / `StopBot` frames to whichever sidecars are
+    // connected. Spawning here so it rides the shared shutdown signal
+    // alongside the cron loop and axum servers.
+    let bot_reconciler = Arc::new(aura_gateway::channel::ChannelBotReconciler::new(
+        Arc::clone(&channel_control),
+        Arc::clone(&graph.channel_bot_store),
+        Arc::clone(&graph.secret_vault),
+    ));
+    {
+        let reconciler = Arc::clone(&bot_reconciler);
+        let shutdown_for_reconciler = shutdown.clone();
+        task_tracker.track(tokio::spawn(async move {
+            reconciler.run(shutdown_for_reconciler).await;
+        }));
+    }
+
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),
@@ -290,6 +310,10 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         incoming_tx: run_handle.incoming_tx.clone(),
         channel_tokens: channel_tokens.clone(),
         secret_vault: Arc::clone(&graph.secret_vault),
+        channel_session_store: Arc::clone(&graph.channel_session_store),
+        channel_bot_store: Arc::clone(&graph.channel_bot_store),
+        channel_control,
+        bot_reconciler: Arc::clone(&bot_reconciler),
     };
 
     // Channel UDS listener — lives under the same workspace identity dir

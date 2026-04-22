@@ -31,6 +31,7 @@ pub mod test_support;
 pub mod uds;
 
 pub use crate::auth_admin::AdminToken;
+pub use crate::channel::{ChannelControlError, ChannelControlRegistry};
 pub use crate::config::RuntimeGatewayConfig;
 pub use crate::error::{GatewayError, Result};
 pub use crate::installer::{

@@ -10,4 +10,9 @@ pub trait SecretStore: Send + Sync {
     async fn store(&self, name: &str, encrypted_value: &[u8]) -> Result<()>;
     async fn retrieve(&self, name: &str) -> Result<Option<Vec<u8>>>;
     async fn list(&self) -> Result<Vec<String>>;
+    /// Soft-delete the secret. Later `store` calls with the same name
+    /// revive the entry (INSERT OR REPLACE + NULL default on the
+    /// `deleted_at` column). Idempotent on missing / already-deleted
+    /// names.
+    async fn delete(&self, name: &str) -> Result<()>;
 }

@@ -57,6 +57,12 @@ pub struct ApprovalRequest {
     /// Session the tool call runs under. Lets HTTP clients (e.g. the
     /// gateway-backed TUI) render approvals alongside the session they belong to.
     pub session_id: String,
+    /// Aura user id the tool call is running on behalf of. Sidecars
+    /// that route prompts by platform user (Telegram chat, Discord DM)
+    /// use this instead of reverse-mapping from `session_id`. Empty
+    /// string when no user context applies.
+    #[serde(default)]
+    pub user_id: String,
     pub tool: String,
     pub accesses: Vec<ResourceAccess>,
     /// Short truncated JSON preview of the parameters, for UI display only.
@@ -414,6 +420,7 @@ mod tests {
             .request(ApprovalRequest {
                 call_id: "x".into(),
                 session_id: "s".into(),
+                user_id: "u".into(),
                 tool: "t".into(),
                 accesses: vec![],
                 params_preview: String::new(),
@@ -446,6 +453,7 @@ mod tests {
         let req = ApprovalRequest {
             call_id: "c1".into(),
             session_id: "s".into(),
+            user_id: "u".into(),
             tool: "read".into(),
             accesses: vec![],
             params_preview: String::new(),

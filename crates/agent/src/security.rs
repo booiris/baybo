@@ -801,6 +801,7 @@ mod tests {
 
         let mut response = OutgoingMessage {
             session_id: "sess-1".into(),
+            user_id: "u1".into(),
             channel: ChannelType::tui(),
             content: vec![ContentBlock::Text(
                 "Here is the key: AKIAIOSFODNN7EXAMPLE".into(),

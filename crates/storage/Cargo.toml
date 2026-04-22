@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 libsql = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 aura-context = { workspace = true }

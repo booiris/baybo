@@ -11,9 +11,15 @@ use std::sync::Arc;
 use aura_agent::SessionManager;
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_gateway_auth::ChannelTokenTable;
+use aura_security::SecretVault;
+use aura_storage::ChannelBotStore;
 use tokio::sync::mpsc;
 
+use super::bot_reconciler::ChannelBotReconciler;
+use super::control::ChannelControlRegistry;
 use super::history::TuiHistoryStore;
+use super::session_resolver::ChannelSessionResolver;
+use crate::log_buffer::LogBuffer;
 
 /// State passed to the `/v1/channel-ws` handler. Cheap to clone — every
 /// field is an `Arc` or a clone-cheap handle.
@@ -29,4 +35,29 @@ pub struct WsChannelState {
     /// in-process `tokio::sync::Mutex` inside the store is enough to
     /// serialise concurrent appends.
     pub tui_history: Arc<TuiHistoryStore>,
+    /// Shared ring buffer of recent tracing events. Sidecars forward
+    /// their own log lines over the wire as `Frame::SidecarLog`; the
+    /// WS route pushes them here so the admin `/v1/logs` view can
+    /// surface sidecar output alongside gateway-internal tracing.
+    pub log_buffer: Arc<LogBuffer>,
+    /// Resolves `(channel_type, user_id)` → aura `session_id` for
+    /// sidecars that send `Frame::Message` with an empty `session_id`.
+    /// The TUI (which picks its own UUID) bypasses this path entirely.
+    pub session_resolver: Arc<ChannelSessionResolver>,
+    /// Per-channel-type control-plane handle. The admin thread pushes
+    /// `Frame::StartBot` / `Frame::StopBot` frames through this to the
+    /// currently-connected sidecar. The WS route task inserts the
+    /// entry on successful register and removes it on disconnect.
+    pub control: Arc<ChannelControlRegistry>,
+    /// Registry of per-channel bot credentials (the token itself lives
+    /// in the vault). The WS route reads this on register to stream
+    /// `StartBot` for every live bot to the newly-connected sidecar.
+    pub channel_bot_store: Arc<dyn ChannelBotStore>,
+    /// Shared vault for decrypting bot tokens before shipping them
+    /// to a sidecar over the (already-authenticated) WS.
+    pub secret_vault: Arc<SecretVault>,
+    /// Reconciler handle. The WS route uses its `seed` / `forget`
+    /// methods to keep the reconciler's per-sidecar tracked sets in
+    /// sync with the initial-register push and disconnect cleanup.
+    pub bot_reconciler: Arc<ChannelBotReconciler>,
 }

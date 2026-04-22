@@ -5,10 +5,10 @@ use aura_agent::{CronScheduler, JobManager, MemoryManager, SecurityGateway, Sess
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
-use aura_security::LeakDetector;
+use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
-use aura_storage::TraceStore;
+use aura_storage::{ChannelBotStore, TraceStore};
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 
@@ -43,6 +43,15 @@ pub struct CommandContext {
     pub security: Option<Arc<SecurityGateway>>,
     pub leak_detector: Option<Arc<LeakDetector>>,
     pub skill_assessor: Option<Arc<SkillAssessor>>,
+    /// Per-tenant credential metadata. Populated for one-shot argv
+    /// commands that need to mutate or read the roster (`aura
+    /// channels bot …`); `None` during TUI / slash dispatch so those
+    /// paths can't accidentally rotate tokens.
+    pub channel_bot_store: Option<Arc<dyn ChannelBotStore>>,
+    /// Shared vault — populated for the same subset of commands as
+    /// `channel_bot_store`. Used to read/write bot tokens keyed as
+    /// `channel.<channel_type>.bot.<bot_id>.token`.
+    pub secret_vault: Option<Arc<SecretVault>>,
     pub format: OutputFormat,
     pub invocation: Invocation,
     pub confirmed: bool,
@@ -85,6 +94,8 @@ pub struct ContextBuilder {
     security: Option<Arc<SecurityGateway>>,
     leak_detector: Option<Arc<LeakDetector>>,
     skill_assessor: Option<Arc<SkillAssessor>>,
+    channel_bot_store: Option<Arc<dyn ChannelBotStore>>,
+    secret_vault: Option<Arc<SecretVault>>,
 }
 
 impl ContextBuilder {
@@ -105,6 +116,8 @@ impl ContextBuilder {
             security: None,
             leak_detector: None,
             skill_assessor: None,
+            channel_bot_store: None,
+            secret_vault: None,
         }
     }
 
@@ -178,6 +191,16 @@ impl ContextBuilder {
         self
     }
 
+    pub fn channel_bot_store(mut self, store: Arc<dyn ChannelBotStore>) -> Self {
+        self.channel_bot_store = Some(store);
+        self
+    }
+
+    pub fn secret_vault(mut self, vault: Arc<SecretVault>) -> Self {
+        self.secret_vault = Some(vault);
+        self
+    }
+
     pub fn build(self) -> CommandContext {
         CommandContext {
             config: self.config,
@@ -201,6 +224,8 @@ impl ContextBuilder {
             security: self.security,
             leak_detector: self.leak_detector,
             skill_assessor: self.skill_assessor,
+            channel_bot_store: self.channel_bot_store,
+            secret_vault: self.secret_vault,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,
             confirmed: false,

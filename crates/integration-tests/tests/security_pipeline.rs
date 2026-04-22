@@ -42,6 +42,7 @@ fn message_with(text: &str) -> Message {
 fn outgoing_with(text: &str) -> OutgoingMessage {
     OutgoingMessage {
         session_id: "sess-it".into(),
+        user_id: "u-it".into(),
         channel: ChannelType::tui(),
         content: vec![ContentBlock::Text(text.into())],
         reply_to: None,

@@ -60,6 +60,11 @@ impl SecretStore for MemorySecretStore {
     async fn list(&self) -> SecretResult<Vec<String>> {
         Ok(self.data.lock().keys().cloned().collect())
     }
+
+    async fn delete(&self, name: &str) -> SecretResult<()> {
+        self.data.lock().remove(name);
+        Ok(())
+    }
 }
 
 /// In-memory `JobStore` for tests. Keyed by `job.id`. `record_transition`

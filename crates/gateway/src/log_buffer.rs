@@ -47,6 +47,21 @@ impl LogLevel {
             Self::Trace => "trace",
         }
     }
+
+    /// Parse a case-insensitive level string, accepting `"warning"` as
+    /// an alias for `"warn"`. Returns `None` for unknown labels so
+    /// callers can pick a safe default (the channel WS route maps
+    /// unknowns to `Info`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "error" | "err" => Some(Self::Error),
+            "warn" | "warning" => Some(Self::Warn),
+            "info" => Some(Self::Info),
+            "debug" => Some(Self::Debug),
+            "trace" => Some(Self::Trace),
+            _ => None,
+        }
+    }
 }
 
 impl From<Level> for LogLevel {
@@ -205,6 +220,20 @@ impl LogBuffer {
         message: impl Into<String>,
     ) {
         self.push_record(timestamp, level, target.into(), message.into(), Vec::new());
+    }
+
+    /// Push a record captured outside the tracing layer — used by the
+    /// channel WS server to surface sidecar-forwarded log lines. The
+    /// buffer itself doesn't know what a sidecar is; the caller is
+    /// expected to scope `target` (e.g. `sidecar::<channel_type>`) so
+    /// the dashboard can filter by attribution.
+    pub fn push_external(
+        &self,
+        level: LogLevel,
+        target: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.push_record(Utc::now(), level, target.into(), message.into(), Vec::new());
     }
 
     /// Return records matching `q`, newest first, honouring limit/offset.
@@ -403,6 +432,28 @@ mod tests {
             until: Some(ts(50)),
             ..base.clone()
         }));
+    }
+
+    #[test]
+    fn parse_level_is_case_insensitive_with_aliases() {
+        assert_eq!(LogLevel::parse("ERROR"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::parse("Debug"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse("fatal"), None);
+    }
+
+    #[test]
+    fn push_external_is_visible_to_query_and_stream() {
+        let buf = LogBuffer::new(4);
+        buf.push_external(LogLevel::Warn, "sidecar::telegram", "rate limited");
+        let page = buf.query(&LogQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].target, "sidecar::telegram");
+        assert_eq!(page.items[0].message, "rate limited");
+        assert_eq!(page.items[0].level, LogLevel::Warn);
     }
 
     #[test]

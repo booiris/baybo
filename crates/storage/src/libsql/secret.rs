@@ -73,6 +73,19 @@ impl SecretStore for LibsqlSecretStore {
         }
         Ok(names)
     }
+
+    async fn delete(&self, name: &str) -> crate::secret::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.pool.conn();
+        conn.execute(
+            "UPDATE secrets SET deleted_at = ?2 \
+             WHERE name = ?1 AND deleted_at IS NULL",
+            libsql::params![name.to_string(), now],
+        )
+        .await
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete error: {e}")))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

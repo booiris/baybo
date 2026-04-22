@@ -202,6 +202,7 @@ impl AgentActor {
 
                 let response = OutgoingMessage {
                     session_id: self.session.id.clone(),
+                    user_id: self.session.user.id.clone(),
                     channel: self.session.user.channel.clone(),
                     content: vec![ContentBlock::Text(format!("[cron:{job_id}] {text}"))],
                     reply_to: None,

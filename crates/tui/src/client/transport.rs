@@ -196,7 +196,9 @@ impl WsTransport {
 
 fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Option<TransportEvent> {
     match frame {
-        Frame::Delta { session_id, text } => {
+        Frame::Delta {
+            session_id, text, ..
+        } => {
             if session_id != target_session {
                 return None;
             }
@@ -214,6 +216,7 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             session_id,
             level,
             text,
+            ..
         } => {
             if session_id != target_session {
                 return None;
@@ -227,6 +230,7 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
         Frame::ApprovalRequested {
             call_id,
             session_id,
+            user_id,
             tool,
             accesses,
             params_preview,
@@ -244,6 +248,7 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             queue.enqueue_mirror(ApprovalRequest {
                 call_id,
                 session_id,
+                user_id,
                 tool,
                 accesses,
                 params_preview,
@@ -258,9 +263,16 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
         | Frame::RegisterAck { .. }
         | Frame::ResolveApproval { .. }
         | Frame::HistoryAppend { .. }
-        | Frame::HistorySnapshot { .. } => {
+        | Frame::HistorySnapshot { .. }
+        | Frame::SidecarLog { .. }
+        | Frame::StartBot { .. }
+        | Frame::StopBot { .. }
+        | Frame::BotStatus { .. } => {
             // HistorySnapshot is drained during `connect_tui`; any
             // stray instance post-handshake is a protocol violation.
+            // SidecarLog / StartBot / StopBot / BotStatus are sidecar
+            // control-plane frames — the TUI never participates in
+            // that flow.
             warn!("unexpected frame from gateway; dropping");
             None
         }

@@ -105,6 +105,7 @@ async fn channel_ws_end_to_end() {
     channel_handle
         .send(AgentOutput::Message(OutgoingMessage {
             session_id: "sess-1".into(),
+            user_id: "user-1".into(),
             channel: slack.clone(),
             content: vec![ContentBlock::Text("pong".into())],
             reply_to: None,
@@ -245,11 +246,15 @@ async fn recv_message(ws: &mut WsStream) -> Result<WireMessage, ConnectError> {
             | Frame::Notice { .. }
             | Frame::ApprovalRequested { .. }
             | Frame::ApprovalResolved { .. }
-            | Frame::HistorySnapshot { .. } => continue,
+            | Frame::HistorySnapshot { .. }
+            | Frame::StartBot { .. }
+            | Frame::StopBot { .. } => continue,
             Frame::Register { .. }
             | Frame::RegisterAck { .. }
             | Frame::ResolveApproval { .. }
-            | Frame::HistoryAppend { .. } => {
+            | Frame::HistoryAppend { .. }
+            | Frame::SidecarLog { .. }
+            | Frame::BotStatus { .. } => {
                 return Err(ConnectError::ProtocolViolation(
                     "unexpected frame kind post-handshake",
                 ));
@@ -330,6 +335,7 @@ async fn two_tui_clients_same_gateway_different_sessions() {
     alice_channel
         .send(AgentOutput::Message(OutgoingMessage {
             session_id: "sess-alice".into(),
+            user_id: "alice".into(),
             channel: tui.clone(),
             content: vec![ContentBlock::Text("hello alice".into())],
             reply_to: None,
@@ -356,6 +362,7 @@ async fn two_tui_clients_same_gateway_different_sessions() {
     bob_channel
         .send(AgentOutput::Message(OutgoingMessage {
             session_id: "sess-bob".into(),
+            user_id: "bob".into(),
             channel: tui.clone(),
             content: vec![ContentBlock::Text("hey bob".into())],
             reply_to: None,
@@ -386,6 +393,7 @@ async fn two_tui_clients_same_gateway_different_sessions() {
     bob_channel
         .send(AgentOutput::Message(OutgoingMessage {
             session_id: "sess-bob".into(),
+            user_id: "bob".into(),
             channel: tui.clone(),
             content: vec![ContentBlock::Text("still there?".into())],
             reply_to: None,

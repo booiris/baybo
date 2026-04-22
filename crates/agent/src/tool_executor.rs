@@ -158,6 +158,7 @@ impl ToolExecutor {
                 .request(ApprovalRequest {
                     call_id: Uuid::new_v4().to_string(),
                     session_id: session_id.to_string(),
+                    user_id: user.id.clone(),
                     tool: tool_name.to_string(),
                     accesses: uncovered.clone(),
                     params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),

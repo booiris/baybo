@@ -63,6 +63,8 @@ impl CliSlashHandler {
             security: self.ctx.security.clone(),
             leak_detector: self.ctx.leak_detector.clone(),
             skill_assessor: self.ctx.skill_assessor.clone(),
+            channel_bot_store: self.ctx.channel_bot_store.clone(),
+            secret_vault: self.ctx.secret_vault.clone(),
             format,
             invocation: Invocation::Slash,
             confirmed: false,

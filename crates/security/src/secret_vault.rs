@@ -48,6 +48,13 @@ impl SecretVault {
             None => Ok(None),
         }
     }
+
+    pub async fn delete_secret(&self, name: &str) -> Result<()> {
+        self.store
+            .delete(name)
+            .await
+            .map_err(|e| SecurityError::Storage(e.to_string()))
+    }
 }
 
 #[cfg(test)]

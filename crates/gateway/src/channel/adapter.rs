@@ -126,6 +126,13 @@ impl Sidecar {
             .map_err(|_| ChannelError::Config("outbound pump closed".into()))
     }
 
+    /// Clone the outbound frame sender. Used by the channel-control
+    /// registry so the admin surface can push control frames
+    /// (`StartBot` / `StopBot` / etc.) from outside the route task.
+    pub(crate) fn frame_tx_clone(&self) -> mpsc::Sender<Frame> {
+        self.frame_tx.clone()
+    }
+
     /// Resolve a pending approval and echo `ApprovalResolved`. Called
     /// from the inbound loop when the client sends `ResolveApproval`.
     pub(crate) async fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> bool {
@@ -175,6 +182,7 @@ fn build_approval_gate(queue: ApprovalQueue, frame_tx: mpsc::Sender<Frame>) -> C
                 let frame = Frame::ApprovalRequested {
                     call_id: entry.call_id,
                     session_id: entry.session_id,
+                    user_id: entry.user_id,
                     tool: entry.tool,
                     accesses: entry.accesses,
                     params_preview: entry.params_preview,
@@ -189,19 +197,31 @@ fn build_approval_gate(queue: ApprovalQueue, frame_tx: mpsc::Sender<Frame>) -> C
 fn agent_output_to_frame(output: AgentOutput, channel_type: &ChannelType) -> Frame {
     match output {
         AgentOutput::Delta {
-            session_id, text, ..
-        } => Frame::Delta { session_id, text },
+            session_id,
+            user_id,
+            text,
+            ..
+        } => Frame::Delta {
+            session_id,
+            user_id,
+            text,
+        },
         AgentOutput::Message(response) => {
             let content = flatten_content(&response.content);
             Frame::Message(WireMessage {
                 content,
                 session_id: response.session_id,
-                user_id: String::new(),
+                // Populate with the addressee so sidecars can route by
+                // user (Telegram: `user_id → chat_id`) without having to
+                // maintain a `session_id → user_id` reverse map on their
+                // side. Empty string on non-user-addressed emissions.
+                user_id: response.user_id,
                 channel_type: channel_type.clone(),
             })
         }
         AgentOutput::Notice {
             session_id,
+            user_id,
             level,
             text,
             ..
@@ -212,6 +232,7 @@ fn agent_output_to_frame(output: AgentOutput, channel_type: &ChannelType) -> Fra
             };
             Frame::Notice {
                 session_id,
+                user_id,
                 level: level.to_owned(),
                 text,
             }

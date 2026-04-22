@@ -16,11 +16,17 @@
 //!   a single `Message` frame on the wire.
 
 pub(crate) mod adapter;
+pub mod bot_reconciler;
+pub mod control;
 pub(crate) mod handshake;
 pub(crate) mod history;
 pub mod route;
+pub(crate) mod session_resolver;
 pub mod state;
 
+pub use bot_reconciler::ChannelBotReconciler;
+pub use control::{ChannelControlError, ChannelControlRegistry};
 pub use history::TuiHistoryStore;
 pub use route::routes;
+pub use session_resolver::ChannelSessionResolver;
 pub use state::WsChannelState;

@@ -124,6 +124,21 @@ pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<Secre
     )))
 }
 
+/// Open the libsql store and wrap the vault + channel-bot metadata
+/// store for CLI subcommands that manage per-channel credentials
+/// (`aura channels bot add/remove/list`). Both handles share a
+/// single libsql connection so the CLI writes land atomically in
+/// the same file the gateway reads from.
+pub async fn build_bot_registry_deps(
+    config: &AuraConfig,
+) -> anyhow::Result<(Arc<SecretVault>, Arc<dyn aura_storage::ChannelBotStore>)> {
+    let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
+    let master_key = load_master_key(&config.security)?;
+    let vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
+    let bot_store: Arc<dyn aura_storage::ChannelBotStore> = Arc::from(storage.channel_bot);
+    Ok((vault, bot_store))
+}
+
 /// Fully-wired manager graph shared between the TUI and gateway boot
 /// paths. Every manager is an `Arc` so the caller can clone handles
 /// into adapters and background tasks freely.
@@ -145,6 +160,8 @@ pub struct ManagerGraph {
     pub llm_client: Arc<LlmClient>,
     pub workspace: Arc<WorkspaceManager>,
     pub channels_registry: Arc<ChannelRegistry>,
+    pub channel_session_store: Arc<dyn aura_storage::ChannelSessionStore>,
+    pub channel_bot_store: Arc<dyn aura_storage::ChannelBotStore>,
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
@@ -271,6 +288,9 @@ pub async fn build_managers(
 
     let memory_manager = Arc::new(MemoryManager::without_embedder(storage.memory));
     let hook_manager = Arc::new(HookManager::new());
+    let channel_session_store: Arc<dyn aura_storage::ChannelSessionStore> =
+        Arc::from(storage.channel_session);
+    let channel_bot_store: Arc<dyn aura_storage::ChannelBotStore> = Arc::from(storage.channel_bot);
 
     Ok(ManagerGraph {
         config,
@@ -287,6 +307,8 @@ pub async fn build_managers(
         llm_client,
         workspace,
         channels_registry,
+        channel_session_store,
+        channel_bot_store,
         cost_tracker,
         hook_manager,
         secret_vault,

@@ -20,7 +20,7 @@ use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, SecretVault};
 use aura_skills::SkillRegistry;
-use aura_storage::{Store, TraceStore};
+use aura_storage::{ChannelBotStore, ChannelSessionStore, Store, TraceStore};
 use aura_tools::ToolRegistry;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -87,6 +87,14 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let skill_registry = Arc::new(SkillRegistry::new());
     let tool_registry = Arc::new(ToolRegistry::new());
     let channel_registry = Arc::new(ChannelRegistry::new());
+    let channel_session_store: Arc<dyn ChannelSessionStore> = Arc::from(storage.channel_session);
+    let channel_bot_store: Arc<dyn ChannelBotStore> = Arc::from(storage.channel_bot);
+    let channel_control = Arc::new(crate::channel::ChannelControlRegistry::new());
+    let bot_reconciler = Arc::new(crate::channel::ChannelBotReconciler::new(
+        Arc::clone(&channel_control),
+        Arc::clone(&channel_bot_store),
+        Arc::clone(&secret_vault),
+    ));
 
     let registry = LlmProviderRegistry::with_default_providers();
     let llm_client = Arc::new(
@@ -130,6 +138,10 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         incoming_tx,
         channel_tokens: channel_tokens.clone(),
         secret_vault,
+        channel_session_store,
+        channel_bot_store,
+        channel_control,
+        bot_reconciler,
     };
 
     TestGateway {

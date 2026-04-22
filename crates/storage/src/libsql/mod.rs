@@ -1,3 +1,5 @@
+mod channel_bot;
+mod channel_session;
 mod cost;
 mod cron;
 mod job;
@@ -7,6 +9,8 @@ mod session;
 mod skill_risk;
 mod trace;
 
+pub use channel_bot::LibsqlChannelBotStore;
+pub use channel_session::LibsqlChannelSessionStore;
 pub use cost::LibsqlCostStore;
 pub use cron::LibsqlCronStore;
 pub use job::LibsqlJobStore;
@@ -226,7 +230,26 @@ impl LibsqlPool {
                     PRIMARY KEY (skill_name, content_hash)
                 );
                 CREATE INDEX IF NOT EXISTS idx_skill_risk_jobs_status
-                    ON skill_risk_assessment_jobs(status);",
+                    ON skill_risk_assessment_jobs(status);
+
+                CREATE TABLE IF NOT EXISTS channel_sessions (
+                    channel_type TEXT    NOT NULL,
+                    user_id      TEXT    NOT NULL,
+                    session_id   TEXT    NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    deleted_at   INTEGER,
+                    PRIMARY KEY (channel_type, user_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_channel_sessions_session
+                    ON channel_sessions(session_id) WHERE deleted_at IS NULL;
+
+                CREATE TABLE IF NOT EXISTS channel_bots (
+                    channel_type TEXT    NOT NULL,
+                    bot_id       TEXT    NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    deleted_at   INTEGER,
+                    PRIMARY KEY (channel_type, bot_id)
+                );",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;

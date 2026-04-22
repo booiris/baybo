@@ -22,6 +22,13 @@ use super::adapter::Sidecar;
 use super::handshake::validate_register;
 use super::state::WsChannelState;
 use crate::auth_channel::AuthedClient;
+use crate::log_buffer::LogLevel;
+
+/// Defensive cap on the size of a forwarded sidecar log line. The SDK
+/// enforces the same limit on the sender side; this is the belt-and-
+/// braces so a malicious sidecar can't flood the LogBuffer with
+/// arbitrarily large lines.
+const SIDECAR_LOG_MAX_BYTES: usize = 1024;
 
 /// Maximum time to wait for the client's `Register` frame after the WS
 /// upgrade completes. Keeps idle connections that never speak from
@@ -138,8 +145,27 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         }
     }
 
+    // Sidecar-flavored clients (not session-scoped TUIs) are eligible
+    // for hot bot provisioning: register their outbound pump with the
+    // control registry so the CLI-driven reconciler can push
+    // `StartBot` / `StopBot` frames, then stream one `StartBot` for
+    // every live bot in the `channel_bots` table so the sidecar picks
+    // up the current roster without waiting a reconcile tick. Seed
+    // the reconciler so it doesn't double-send on its first tick.
+    if session_id.is_none() {
+        state
+            .control
+            .register(channel_type.clone(), sidecar.frame_tx_clone());
+        let sent = push_live_bots(&state, &channel_type, &sidecar).await;
+        state.bot_reconciler.seed(channel_type.clone(), sent);
+    }
+
     run_inbound_loop(source, &state, &channel_type, &sidecar).await;
 
+    if session_id.is_none() {
+        state.control.unregister(&channel_type);
+        state.bot_reconciler.forget(&channel_type);
+    }
     unregister_best_effort(&state, &channel_type, session_id.as_deref());
     let _ = sidecar.into_pump().await;
     tracing::info!(
@@ -197,6 +223,115 @@ async fn send_ack_and_close(
     let _ = sink.close().await;
 }
 
+/// Stream `StartBot` for every live bot in the `channel_bots` table
+/// to the freshly-connected sidecar. A failure fetching the token from
+/// the vault skips just that bot (logged with its id) so one bad row
+/// doesn't keep the rest of the roster from coming online. The
+/// sidecar replies to each with a `BotStatus`; the WS inbound loop
+/// pushes those into `aura-tracing` for operator visibility.
+async fn push_live_bots(
+    state: &WsChannelState,
+    channel_type: &ChannelType,
+    sidecar: &Sidecar,
+) -> Vec<String> {
+    let mut sent = Vec::new();
+    let bots = match state.channel_bot_store.list_live(channel_type).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                %channel_type,
+                "list live bots failed; no StartBot frames sent",
+            );
+            return sent;
+        }
+    };
+    for row in bots {
+        let secret_name = bot_secret_name(channel_type, &row.bot_id);
+        let token = match state.secret_vault.get_secret(&secret_name).await {
+            Ok(Some(v)) => String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            Ok(None) => {
+                tracing::warn!(
+                    %channel_type,
+                    bot_id = %row.bot_id,
+                    secret = %secret_name,
+                    "bot metadata exists but vault secret missing; skipping StartBot",
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    %channel_type,
+                    bot_id = %row.bot_id,
+                    "decrypt bot token failed; skipping StartBot",
+                );
+                continue;
+            }
+        };
+        if let Err(e) = sidecar
+            .send_frame(Frame::StartBot {
+                bot_id: row.bot_id.clone(),
+                token,
+            })
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                %channel_type,
+                bot_id = %row.bot_id,
+                "push StartBot failed; WS pump may be closing",
+            );
+            return sent;
+        }
+        sent.push(row.bot_id);
+    }
+    sent
+}
+
+/// Deterministic vault key for a bot token. Kept in one place so the
+/// admin API and the route layer agree on where the token lives.
+pub(crate) fn bot_secret_name(channel_type: &ChannelType, bot_id: &str) -> String {
+    format!("channel.{}.bot.{}.token", channel_type.as_str(), bot_id)
+}
+
+/// Push one forwarded sidecar log line into the shared `LogBuffer`.
+///
+/// Attribution is scoped to the sidecar's `ChannelType`, with an
+/// optional sidecar-supplied `target` suffix. Unknown level strings
+/// degrade to `info` so a typo on the sidecar side never drops the
+/// record. The caller has already accepted the frame past the WS
+/// decode; any truncation we do here is purely a size safety net —
+/// the TS SDK enforces the same 1 KB cap on the sender side.
+fn push_sidecar_log(
+    state: &WsChannelState,
+    channel_type: &ChannelType,
+    level: &str,
+    text: String,
+    target: Option<&str>,
+) {
+    let level = LogLevel::parse(level).unwrap_or(LogLevel::Info);
+    let message = if text.len() > SIDECAR_LOG_MAX_BYTES {
+        // `String::truncate` panics on a non-char-boundary cut; scan
+        // back to the nearest boundary at or below the cap.
+        let mut cut = SIDECAR_LOG_MAX_BYTES;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut truncated = text;
+        truncated.truncate(cut);
+        truncated.push_str(" [...truncated]");
+        truncated
+    } else {
+        text
+    };
+    let attributed = match target {
+        Some(t) if !t.is_empty() => format!("sidecar::{channel_type}::{t}"),
+        _ => format!("sidecar::{channel_type}"),
+    };
+    state.log_buffer.push_external(level, attributed, message);
+}
+
 async fn run_inbound_loop(
     mut source: SplitStream<WebSocket>,
     state: &WsChannelState,
@@ -222,6 +357,40 @@ async fn run_inbound_loop(
                 };
                 match frame {
                     Frame::Message(wire_msg) => {
+                        // Sidecars that don't mint their own UUIDs (the
+                        // Telegram channel, future Discord / Slack, …)
+                        // send `session_id = ""` and rely on the gateway
+                        // to allocate one keyed on (channel_type,
+                        // user_id). The TUI always fills session_id in
+                        // itself so it skips this branch.
+                        let session_id = if wire_msg.session_id.is_empty() {
+                            if wire_msg.user_id.is_empty() {
+                                tracing::warn!(
+                                    %channel_type,
+                                    "inbound Message with empty session_id AND user_id; dropping",
+                                );
+                                continue;
+                            }
+                            match state
+                                .session_resolver
+                                .resolve_or_create(channel_type, &wire_msg.user_id)
+                                .await
+                            {
+                                Ok(sid) => sid,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        %channel_type,
+                                        user_id = %wire_msg.user_id,
+                                        "resolve session id for inbound message failed; dropping",
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            wire_msg.session_id
+                        };
+
                         let sender = User {
                             id: wire_msg.user_id.clone(),
                             name: None,
@@ -230,7 +399,7 @@ async fn run_inbound_loop(
                         let incoming = IncomingMessage {
                             message: AgentMessage {
                                 id: uuid::Uuid::new_v4().to_string(),
-                                session_id: wire_msg.session_id,
+                                session_id,
                                 channel: channel_type.clone(),
                                 sender,
                                 content: vec![ContentBlock::Text(wire_msg.content)],
@@ -270,6 +439,34 @@ async fn run_inbound_loop(
                                 error = %format!("{e:#}"),
                                 %session_id,
                                 "append tui input history"
+                            );
+                        }
+                    }
+                    Frame::SidecarLog {
+                        level,
+                        text,
+                        target,
+                    } => {
+                        push_sidecar_log(state, channel_type, &level, text, target.as_deref());
+                    }
+                    Frame::BotStatus {
+                        bot_id,
+                        ok,
+                        message,
+                    } => {
+                        if ok {
+                            tracing::info!(
+                                %channel_type,
+                                %bot_id,
+                                detail = message.as_deref().unwrap_or(""),
+                                "sidecar ack: bot ready",
+                            );
+                        } else {
+                            tracing::warn!(
+                                %channel_type,
+                                %bot_id,
+                                detail = message.as_deref().unwrap_or(""),
+                                "sidecar ack: bot failed",
                             );
                         }
                     }

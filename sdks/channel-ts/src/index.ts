@@ -1,8 +1,26 @@
-export { Client, SdkError } from "./client.js";
-export type { ConnectOptions } from "./client.js";
-export {
-  PROTOCOL_VERSION,
-  encodeFrame,
-  decodeFrame,
-} from "./wire.js";
-export type { Frame, Message } from "./wire.js";
+export { runChannel } from "./runner.js";
+export { runSidecar } from "./sidecar.js";
+export type { SidecarOptions } from "./sidecar.js";
+export { RunnerError } from "./channel.js";
+export type {
+  AgentDelta,
+  AgentMessage,
+  AgentNotice,
+  ApprovalDecision,
+  ApprovalRequest,
+  BotStatusReport,
+  Channel,
+  NoticeLevel,
+  ReconnectPolicy,
+  RunOptions,
+  StartBotCommand,
+  StopBotCommand,
+  UserInbound,
+} from "./channel.js";
+export { defaultLogger, hasWireSink } from "./logger.js";
+export type {
+  Logger,
+  WireCapableLogger,
+  WireLogLevel,
+  WireLogSink,
+} from "./logger.js";

@@ -107,9 +107,39 @@ same endpoint:
 See [`tui.md`](./tui.md) for the TUI client side and
 [`gateway.md`](./gateway.md) for the server side. The only public SDK
 for third-party sidecars is the TypeScript package at
-`sdks/channel-ts/`, which consumes the same `wire` types via ts-rs
-bindings. There is no Rust SDK — the TUI has its own private WS
-client, and the server is authoritative on the wire format.
+`sdks/channel-ts/`. Its primary surface is a `Channel` interface plus
+`runChannel(channel)` entry point: the sidecar author implements
+`onMessage`, `inbound(signal)`, and optionally `onApprovalRequested`
+/ `onDelta` / `onNotice`, and the SDK handles the WebSocket + MessagePack
+transport, `Register`/`Ack` handshake, UDS dial, frame dispatch,
+concurrent approval spawning, and auto-reconnect with exponential
+backoff + jitter on transient drops (disable with `reconnect: false`).
+The SDK-provided default logger also forwards its own output as
+`Frame::SidecarLog` frames while the WS is open — the gateway pushes
+them into the same `LogBuffer` that backs `/v1/logs`, so sidecar lines
+surface in the dashboard alongside gateway-internal tracing. Custom
+loggers (pino / winston) stay local; attribution uses
+`sidecar::<channel_type>[::<target>]`.
+The UDS path + token are read from `AURA_CHANNEL_SOCKET` /
+`AURA_CHANNEL_TOKEN` env vars — the contract a future sidecar
+supervisor will set. `ChannelSpawner` (`crates/gateway/src/spawn.rs`)
+is the primitive that injects these when it eventually gets wired
+into a `PluginManager` / `Supervisor`; until then the sidecar's
+launcher must export them (or call `runChannel` with explicit
+`wsUrl` / `token`).
+Raw wire types are re-exported under the `./wire` subpath for advanced
+callers. There is no Rust SDK — the TUI
+has its own private WS client, and the server is authoritative on the
+wire format.
+
+The first in-tree sidecar built on the SDK is the Telegram channel at
+`channel-src/telegram/` (package `@aura/channel-telegram`). It uses
+`grammy` for long-polling, maps Telegram `chat_id`s to stable UUIDv5
+`session_id`s, and surfaces `Frame::ApprovalRequested` as an inline-
+keyboard prompt in the originating chat. It's also the working example
+of the full `Channel` contract — `inbound(signal)` pump, `onMessage` /
+`onNotice` round-trip, concurrent `onApprovalRequested`, `onStop`
+cleanup.
 
 ## Channel Registry
 

@@ -1,9 +1,12 @@
+pub mod channel_bot;
+pub mod channel_session;
 pub mod cost;
 pub mod cron;
 pub mod error;
 pub mod job;
 pub mod libsql;
 pub mod memory;
+pub mod retry;
 pub mod secret;
 pub mod session;
 pub mod skill_risk;
@@ -12,11 +15,14 @@ pub mod trace;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use channel_bot::{ChannelBotRow, ChannelBotStore};
+pub use channel_session::ChannelSessionStore;
 pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 pub use cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 pub use error::StorageError;
 pub use job::JobStore;
 pub use memory::MemoryStore;
+pub use retry::retry_on_busy;
 pub use secret::SecretStore;
 pub use session::SessionStore;
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
@@ -33,6 +39,8 @@ pub struct Store {
     pub job: Box<dyn JobStore>,
     pub cron: Box<dyn CronStore>,
     pub risk: Box<dyn SkillRiskStore>,
+    pub channel_session: Box<dyn ChannelSessionStore>,
+    pub channel_bot: Box<dyn ChannelBotStore>,
 }
 
 impl Store {
@@ -59,7 +67,9 @@ impl Store {
             cost: Box::new(libsql::LibsqlCostStore::new(pool.clone())),
             job: Box::new(libsql::LibsqlJobStore::new(pool.clone())),
             cron: Box::new(libsql::LibsqlCronStore::new(pool.clone())),
-            risk: Box::new(libsql::LibsqlSkillRiskStore::new(pool)),
+            risk: Box::new(libsql::LibsqlSkillRiskStore::new(pool.clone())),
+            channel_session: Box::new(libsql::LibsqlChannelSessionStore::new(pool.clone())),
+            channel_bot: Box::new(libsql::LibsqlChannelBotStore::new(pool)),
         })
     }
 }

@@ -25,6 +25,13 @@ pub struct IncomingMessage {
 #[derive(Debug, Clone)]
 pub struct OutgoingMessage {
     pub session_id: String,
+    /// Aura user id this response is addressed to — the same value the
+    /// inbound `Message.sender.id` carried. Channel adapters that route
+    /// replies by user (e.g. the Telegram sidecar keying `user_id` to
+    /// `chat_id`) consume this instead of reverse-mapping from
+    /// `session_id`. Empty string when the message isn't user-addressed
+    /// (e.g. cron ticks emitted outside a live conversation).
+    pub user_id: String,
     pub channel: ChannelType,
     pub content: Vec<ContentBlock>,
     pub reply_to: Option<String>,
@@ -43,6 +50,10 @@ pub enum AgentOutput {
     /// Incremental text chunk for the in-flight response on a session.
     Delta {
         session_id: String,
+        /// Aura user id the in-flight response is addressed to. See
+        /// [`OutgoingMessage::user_id`] for the per-channel routing
+        /// rationale. Empty string when not user-addressed.
+        user_id: String,
         channel: ChannelType,
         text: String,
     },
@@ -58,6 +69,9 @@ pub enum AgentOutput {
     /// styled by `level`, transports without a banner surface may drop it.
     Notice {
         session_id: String,
+        /// Aura user id the notice is addressed to. See
+        /// [`OutgoingMessage::user_id`].
+        user_id: String,
         channel: ChannelType,
         level: NoticeLevel,
         text: String,

@@ -216,6 +216,39 @@ pub enum SkillsCmd {
 pub enum ChannelsCmd {
     /// List registered channel adapters and their current status.
     List,
+    /// Manage per-tenant credentials (e.g. Telegram bots) that the
+    /// gateway hands to sidecars at runtime.
+    Bot {
+        #[command(subcommand)]
+        cmd: ChannelBotCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChannelBotCmd {
+    /// Register a new bot for the given channel. The token is read
+    /// from `--token-env VAR` (preferred — no plaintext in shell
+    /// history) or from stdin if neither flag is supplied. Writes
+    /// directly to libsql + the vault; a running gateway picks up
+    /// the new bot within a couple of seconds via the reconciler.
+    Add {
+        /// e.g. `telegram`
+        channel_type: String,
+        /// Operator-chosen stable id. Alphanumeric + `_`/`-`.
+        bot_id: String,
+        /// Name of the env var holding the bot token.
+        #[arg(long = "token-env", value_name = "VAR")]
+        token_env: Option<String>,
+    },
+    /// Deregister a bot. Soft-deletes the row and removes its vault
+    /// secret; a running gateway's reconciler pushes a `StopBot` to
+    /// the sidecar on the next tick.
+    Remove {
+        channel_type: String,
+        bot_id: String,
+    },
+    /// List live bots for a channel.
+    List { channel_type: String },
 }
 
 #[derive(Debug, Subcommand)]

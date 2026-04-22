@@ -34,7 +34,7 @@ use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::LlmClient;
 use aura_security::SecretVault;
 use aura_skills::SkillRegistry;
-use aura_storage::TraceStore;
+use aura_storage::{ChannelBotStore, ChannelSessionStore, TraceStore};
 use aura_tools::ToolRegistry;
 use axum::Router;
 use axum::middleware;
@@ -90,6 +90,26 @@ pub struct GatewayDeps {
     /// libsql. The gateway is the only process that writes the TUI
     /// input-history key; the TUI itself never touches the vault.
     pub secret_vault: Arc<SecretVault>,
+    /// Mapping of `(channel_type, user_id)` → aura `session_id`.
+    /// Owned by the gateway because the libsql store is already open
+    /// here; channel sidecars that send `Frame::Message` with empty
+    /// `session_id` resolve through this store via
+    /// [`crate::channel::ChannelSessionResolver`].
+    pub channel_session_store: Arc<dyn ChannelSessionStore>,
+    /// Per-tenant credential registry: `(channel_type, bot_id)` rows
+    /// describing the bots a sidecar should run. Tokens live in the
+    /// vault keyed as `channel.<channel_type>.bot.<bot_id>.token`.
+    pub channel_bot_store: Arc<dyn ChannelBotStore>,
+    /// Shared handle the CLI-driven reconciler uses to push control-
+    /// plane frames (`StartBot` / `StopBot`) into the WS sidecar pump.
+    /// The WS route task registers each sidecar on successful
+    /// handshake and removes it on disconnect.
+    pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
+    /// Reconciler handle spawned at startup. Shared with the WS route
+    /// so the initial-register roster push can `seed` its tracked set
+    /// (avoiding a double-send on the first tick) and so the
+    /// disconnect path can `forget` the cached bots.
+    pub bot_reconciler: Arc<crate::channel::ChannelBotReconciler>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -107,6 +127,9 @@ pub struct AdminState {
     pub channel_registry: Arc<ChannelRegistry>,
     pub llm_client: Arc<LlmClient>,
     pub log_buffer: Arc<LogBuffer>,
+    pub channel_bot_store: Arc<dyn ChannelBotStore>,
+    pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
+    pub secret_vault: Arc<SecretVault>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
@@ -140,6 +163,9 @@ impl AdminState {
             channel_registry: Arc::clone(&deps.channel_registry),
             llm_client: Arc::clone(&deps.llm_client),
             log_buffer: Arc::clone(&deps.log_buffer),
+            channel_bot_store: Arc::clone(&deps.channel_bot_store),
+            channel_control: Arc::clone(&deps.channel_control),
+            secret_vault: Arc::clone(&deps.secret_vault),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }
     }
@@ -241,12 +267,22 @@ pub fn build_channel_router(
     let tui_history = Arc::new(crate::channel::TuiHistoryStore::new(Arc::clone(
         &deps.secret_vault,
     )));
+    let session_resolver = Arc::new(crate::channel::ChannelSessionResolver::new(
+        Arc::clone(&deps.session_manager),
+        Arc::clone(&deps.channel_session_store),
+    ));
     let ws_state = crate::channel::WsChannelState {
         registry: Arc::clone(&deps.channel_registry),
         incoming_tx: deps.incoming_tx.clone(),
         tokens: deps.channel_tokens.clone(),
         session_manager: Arc::clone(&deps.session_manager),
         tui_history,
+        log_buffer: Arc::clone(&deps.log_buffer),
+        session_resolver,
+        control: Arc::clone(&deps.channel_control),
+        channel_bot_store: Arc::clone(&deps.channel_bot_store),
+        secret_vault: Arc::clone(&deps.secret_vault),
+        bot_reconciler: Arc::clone(&deps.bot_reconciler),
     };
     let v1 = crate::auth_channel::attach(crate::channel::routes().with_state(ws_state), auth_state);
     Router::new()

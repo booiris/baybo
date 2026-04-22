@@ -304,6 +304,7 @@ impl AgentLoop {
 
                 return Ok(OutgoingMessage {
                     session_id: session.id.clone(),
+                    user_id: session.user.id.clone(),
                     channel: session.channel.clone(),
                     content: final_blocks,
                     reply_to: None,
@@ -416,6 +417,7 @@ impl AgentLoop {
         // If we exhausted iterations, return what we have
         Ok(OutgoingMessage {
             session_id: session.id.clone(),
+            user_id: session.user.id.clone(),
             channel: session.channel.clone(),
             content: vec![ContentBlock::Text(
                 "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
@@ -693,6 +695,7 @@ impl AgentLoop {
         if delta_tx
             .send(AgentOutput::Delta {
                 session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 text: sanitized,
             })
@@ -801,6 +804,7 @@ impl AgentLoop {
         if tx
             .send(AgentOutput::Notice {
                 session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 level,
                 text,

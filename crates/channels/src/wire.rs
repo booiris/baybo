@@ -91,14 +91,24 @@ pub enum Frame {
     Message(Message),
     /// Server -> client: incremental assistant text chunk for the
     /// in-flight response on a session. Channels without a partial
-    /// surface may drop this.
-    Delta { session_id: String, text: String },
+    /// surface may drop this. `user_id` mirrors the Message frame so
+    /// sidecars that route outbound by platform user (Telegram chat,
+    /// Discord DM) don't need a `session_id → user` reverse map.
+    /// Empty string for non-user-addressed emissions (cron, system).
+    Delta {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        text: String,
+    },
     /// Server -> client: out-of-band notice surfaced by the agent
     /// (skill warnings, degraded-mode banners). `level` is a lower-
     /// case string (`"warn"` / `"error"`) so third-party clients don't
     /// need a typed enum to render it.
     Notice {
         session_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
         level: String,
         text: String,
     },
@@ -106,9 +116,14 @@ pub enum Frame {
     /// channel's user to approve or deny. Clients with an approval UX
     /// should echo a [`Frame::ResolveApproval`] back; clients without
     /// one can ignore, and the gate will time out server-side.
+    /// `user_id` identifies the platform user so sidecars can post the
+    /// prompt into the right chat without maintaining a `session_id`
+    /// map.
     ApprovalRequested {
         call_id: String,
         session_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
         tool: String,
         #[cfg_attr(feature = "ts-export", ts(type = "unknown[]"))]
         accesses: Vec<ResourceAccess>,
@@ -143,6 +158,45 @@ pub enum Frame {
     HistorySnapshot {
         session_id: String,
         entries: Vec<String>,
+    },
+    /// Client -> server: a log line emitted by the sidecar itself,
+    /// forwarded so aura operators see sidecar output in the dashboard
+    /// alongside gateway-internal tracing. The server attributes the
+    /// record to the sidecar's `ChannelType` before handing it to the
+    /// `LogBuffer`.
+    ///
+    /// `level` mirrors lower-cased tracing levels (`"error"`, `"warn"`,
+    /// `"info"`, `"debug"`). Unknown values degrade to `info`. `target`
+    /// is an optional module/category the sidecar tags. Additive frame —
+    /// no `PROTOCOL_VERSION` bump.
+    SidecarLog {
+        level: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        target: Option<String>,
+    },
+    /// Server -> client: attach a new bot (or other per-tenant
+    /// credential) to a sidecar that multiplexes many tenants over
+    /// one WS. For the Telegram channel `bot_id` is an operator-chosen
+    /// stable label and `token` is the @BotFather token. Sidecars
+    /// reply with [`Frame::BotStatus`] to ack; a failure on
+    /// startup is surfaced via `ok: false + message`.
+    StartBot { bot_id: String, token: String },
+    /// Server -> client: detach a previously-attached bot. The
+    /// sidecar stops polling for that bot and drops its in-process
+    /// state. Any in-flight approval / message tied to that bot is
+    /// abandoned (aura's own side cleans up state independently).
+    StopBot { bot_id: String },
+    /// Client -> server: ack for a `StartBot`/`StopBot` command.
+    /// `ok: true` means the command ran; `ok: false` carries a
+    /// human-readable reason so aura can surface it (e.g. bad token).
+    BotStatus {
+        bot_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        message: Option<String>,
     },
 }
 
@@ -244,6 +298,7 @@ mod tests {
     fn round_trip_delta() {
         let frame = Frame::Delta {
             session_id: "s1".into(),
+            user_id: "u1".into(),
             text: "hel".into(),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -253,6 +308,7 @@ mod tests {
     fn round_trip_notice() {
         let frame = Frame::Notice {
             session_id: "s1".into(),
+            user_id: "u1".into(),
             level: "warn".into(),
             text: "heads up".into(),
         };
@@ -265,11 +321,25 @@ mod tests {
         let frame = Frame::ApprovalRequested {
             call_id: "c1".into(),
             session_id: "s1".into(),
+            user_id: "u1".into(),
             tool: "fs.read".into(),
             accesses: vec![ResourceAccess::ReadFile {
                 path: PathBuf::from("/tmp/x"),
             }],
             params_preview: "{}".into(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_delta_legacy_without_user_id_decodes() {
+        // Old server that predates the `user_id` field encodes only
+        // session_id + text. The additive schema must still decode —
+        // serde_default fills in the empty user_id.
+        let frame = Frame::Delta {
+            session_id: "s1".into(),
+            user_id: String::new(),
+            text: "chunk".into(),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
@@ -308,5 +378,65 @@ mod tests {
             entries: vec!["one".into(), "two".into(), "three".into()],
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_sidecar_log_with_target() {
+        let frame = Frame::SidecarLog {
+            level: "warn".into(),
+            text: "retry exhausted".into(),
+            target: Some("telegram::poll".into()),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_start_bot() {
+        let frame = Frame::StartBot {
+            bot_id: "prod-bot".into(),
+            token: "123:ABC".into(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_stop_bot() {
+        let frame = Frame::StopBot {
+            bot_id: "prod-bot".into(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_bot_status_ok_without_message() {
+        let frame = Frame::BotStatus {
+            bot_id: "prod-bot".into(),
+            ok: true,
+            message: None,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_bot_status_error_with_message() {
+        let frame = Frame::BotStatus {
+            bot_id: "prod-bot".into(),
+            ok: false,
+            message: Some("401 Unauthorized".into()),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_sidecar_log_without_target() {
+        let frame = Frame::SidecarLog {
+            level: "info".into(),
+            text: "startup".into(),
+            target: None,
+        };
+        let bytes = encode(&frame).unwrap();
+        // `target: None` is omitted on the wire — old peers that don't
+        // send the field must still decode into the None variant.
+        assert_eq!(frame, decode(&bytes).unwrap());
     }
 }
