@@ -275,6 +275,7 @@ mod tests {
             session_id: String::new(),
             user_id: String::new(),
             channel_type: ChannelType::from("slack"),
+            bot_id: String::new(),
         });
         let authed = subprocess(1, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();

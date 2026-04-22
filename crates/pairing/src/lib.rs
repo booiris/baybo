@@ -1,0 +1,19 @@
+//! Per-user pairing gate for channel sidecars.
+//!
+//! Sidecars forward every inbound user message to aura. Before aura
+//! admits a message into the agent loop it consults
+//! [`PairingService::check`], which looks up the `(channel_type,
+//! bot_id, user_id)` triple. Unknown or expired-pending senders get a
+//! short human-typable code back; an operator runs
+//! `aura pair approve <code>` and the next message from the same
+//! triple flows through unimpeded.
+//!
+//! See `docs/modules/pairing.md` for the full design.
+
+mod code;
+mod error;
+mod service;
+
+pub use code::{CODE_LEN, CodeError, generate_code};
+pub use error::PairingError;
+pub use service::{CheckOutcome, PairingService};

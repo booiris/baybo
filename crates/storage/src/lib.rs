@@ -1,4 +1,5 @@
 pub mod channel_bot;
+pub mod channel_pairing;
 pub mod channel_session;
 pub mod cost;
 pub mod cron;
@@ -16,6 +17,7 @@ pub mod trace;
 pub mod test_support;
 
 pub use channel_bot::{ChannelBotRow, ChannelBotStore};
+pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 pub use channel_session::ChannelSessionStore;
 pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 pub use cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
@@ -41,6 +43,7 @@ pub struct Store {
     pub risk: Box<dyn SkillRiskStore>,
     pub channel_session: Box<dyn ChannelSessionStore>,
     pub channel_bot: Box<dyn ChannelBotStore>,
+    pub channel_pairing: Box<dyn ChannelPairingStore>,
 }
 
 impl Store {
@@ -69,7 +72,8 @@ impl Store {
             cron: Box::new(libsql::LibsqlCronStore::new(pool.clone())),
             risk: Box::new(libsql::LibsqlSkillRiskStore::new(pool.clone())),
             channel_session: Box::new(libsql::LibsqlChannelSessionStore::new(pool.clone())),
-            channel_bot: Box::new(libsql::LibsqlChannelBotStore::new(pool)),
+            channel_bot: Box::new(libsql::LibsqlChannelBotStore::new(pool.clone())),
+            channel_pairing: Box::new(libsql::LibsqlChannelPairingStore::new(pool)),
         })
     }
 }

@@ -117,6 +117,8 @@ impl WsTransport {
             session_id: msg.message.session_id,
             user_id: msg.message.sender.id,
             channel_type: msg.message.channel,
+            // TUI is session-scoped and bypasses the bot-pairing gate.
+            bot_id: String::new(),
         };
 
         self.client

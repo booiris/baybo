@@ -17,6 +17,8 @@ pub struct ChannelsConfig {
     pub http: Option<HttpChannelConfig>,
     /// Size of the internal mpsc message buffer.
     pub message_buffer_size: usize,
+    /// Per-user pairing gate settings. See `docs/modules/pairing.md`.
+    pub pairing: PairingConfig,
 }
 
 impl Default for ChannelsConfig {
@@ -27,6 +29,26 @@ impl Default for ChannelsConfig {
             discord: None,
             http: None,
             message_buffer_size: 256,
+            pairing: PairingConfig::default(),
+        }
+    }
+}
+
+/// Per-user pairing gate settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PairingConfig {
+    /// How long a pending pairing code stays valid, in seconds. A user
+    /// whose row has expired will be re-minted a fresh code the next
+    /// time they message the bot; an operator trying to approve an
+    /// expired code gets `not found`. Default: 900 (15 minutes).
+    pub pending_ttl_seconds: u64,
+}
+
+impl Default for PairingConfig {
+    fn default() -> Self {
+        Self {
+            pending_ttl_seconds: 900,
         }
     }
 }

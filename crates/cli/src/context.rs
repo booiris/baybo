@@ -8,7 +8,7 @@ use aura_llm::LlmClient;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
-use aura_storage::{ChannelBotStore, TraceStore};
+use aura_storage::{ChannelBotStore, ChannelPairingStore, TraceStore};
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 
@@ -48,6 +48,10 @@ pub struct CommandContext {
     /// channels bot …`); `None` during TUI / slash dispatch so those
     /// paths can't accidentally rotate tokens.
     pub channel_bot_store: Option<Arc<dyn ChannelBotStore>>,
+    /// Per-user pairing gate store. Populated alongside
+    /// `channel_bot_store` for one-shot CLI commands that drive
+    /// `aura pair {list,approve,revoke}`.
+    pub channel_pairing_store: Option<Arc<dyn ChannelPairingStore>>,
     /// Shared vault — populated for the same subset of commands as
     /// `channel_bot_store`. Used to read/write bot tokens keyed as
     /// `channel.<channel_type>.bot.<bot_id>.token`.
@@ -95,6 +99,7 @@ pub struct ContextBuilder {
     leak_detector: Option<Arc<LeakDetector>>,
     skill_assessor: Option<Arc<SkillAssessor>>,
     channel_bot_store: Option<Arc<dyn ChannelBotStore>>,
+    channel_pairing_store: Option<Arc<dyn ChannelPairingStore>>,
     secret_vault: Option<Arc<SecretVault>>,
 }
 
@@ -117,6 +122,7 @@ impl ContextBuilder {
             leak_detector: None,
             skill_assessor: None,
             channel_bot_store: None,
+            channel_pairing_store: None,
             secret_vault: None,
         }
     }
@@ -196,6 +202,11 @@ impl ContextBuilder {
         self
     }
 
+    pub fn channel_pairing_store(mut self, store: Arc<dyn ChannelPairingStore>) -> Self {
+        self.channel_pairing_store = Some(store);
+        self
+    }
+
     pub fn secret_vault(mut self, vault: Arc<SecretVault>) -> Self {
         self.secret_vault = Some(vault);
         self
@@ -225,6 +236,7 @@ impl ContextBuilder {
             leak_detector: self.leak_detector,
             skill_assessor: self.skill_assessor,
             channel_bot_store: self.channel_bot_store,
+            channel_pairing_store: self.channel_pairing_store,
             secret_vault: self.secret_vault,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,

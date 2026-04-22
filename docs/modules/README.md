@@ -11,7 +11,7 @@ Bottom-up along the dependency graph:
 3. [llm.md](llm.md) → [security.md](security.md)
 4. [tools.md](tools.md) → [workspace.md](workspace.md) → [context.md](context.md)
 5. [trace.md](trace.md) → [hook.md](hook.md)
-6. [storage.md](storage.md) → [agent.md](agent.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md) → [tui.md](tui.md)
+6. [storage.md](storage.md) → [pairing.md](pairing.md) → [agent.md](agent.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md) → [tui.md](tui.md)
 
 ## Module Groups
 
@@ -44,7 +44,8 @@ Bottom-up along the dependency graph:
 
 ### Infrastructure and Assembly Layer
 
-- **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free.
+- **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free. `ChannelPairingStore` defines `ChannelPairingRow` / `PairingStatus` so `aura-pairing` can stay a business-logic crate.
+- **[pairing](pairing.md)** — Per-user pairing gate for sidecar-routed inbound messages. `PairingService` checks the `(channel_type, bot_id, user_id)` triple, mints 6-char codes for unknown senders, and refuses with a `Frame::Notice` until `aura pair approve <code>` flips the row to `approved`. Store trait + row lives in `storage`; `aura-pairing` is the service + code generator.
 - **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, ObservabilityRecorder, cost management (CostTracker, CostGuard), plus all domain managers (SessionManager, MemoryManager, TraceCollector, JobManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
 - **bootstrap** — Binary entry point (`src/main.rs`) and `boot` submodule. Loads `AuraConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
 - **cli** — Operator-facing command layer (`aura-cli`). One `clap` tree drives both argv-mode commands (`aura config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input that resolves to a CLI command never enters the agent's context. User-invocable skills are the one sanctioned exception: `/<skill>` is forwarded to the agent as a normal chat message so `SkillRegistry::select` can narrow on the exact-match branch.
@@ -75,8 +76,9 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
 
 storage   ──► model, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
 session   ──► model, storage (owns SessionManager; consumes SessionStore from storage)
+pairing   ──► model, storage (owns PairingService + code generator; consumes ChannelPairingStore from storage)
 agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, channels, config
-gateway   ──► agent, channels, config, cron, job, llm, model, security, session, skills, storage, tools, trace, workspace
+gateway   ──► agent, channels, config, cron, job, llm, model, pairing, security, session, skills, storage, tools, trace, workspace
 tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over HTTP+SSE)
 bootstrap ──► config + all domain crates it assembles (entry point only)
 ```

@@ -20,7 +20,7 @@ use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, SecretVault};
 use aura_skills::SkillRegistry;
-use aura_storage::{ChannelBotStore, ChannelSessionStore, Store, TraceStore};
+use aura_storage::{ChannelBotStore, ChannelPairingStore, ChannelSessionStore, Store, TraceStore};
 use aura_tools::ToolRegistry;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -89,6 +89,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let channel_registry = Arc::new(ChannelRegistry::new());
     let channel_session_store: Arc<dyn ChannelSessionStore> = Arc::from(storage.channel_session);
     let channel_bot_store: Arc<dyn ChannelBotStore> = Arc::from(storage.channel_bot);
+    let channel_pairing_store: Arc<dyn ChannelPairingStore> = Arc::from(storage.channel_pairing);
     let channel_control = Arc::new(crate::channel::ChannelControlRegistry::new());
     let bot_reconciler = Arc::new(crate::channel::ChannelBotReconciler::new(
         Arc::clone(&channel_control),
@@ -142,6 +143,11 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         channel_bot_store,
         channel_control,
         bot_reconciler,
+        channel_pairing_store,
+        // Short TTL so tests that care about expiry don't have to
+        // wait. Still long enough that the "live-fresh pending" gate
+        // is exercised in common cases.
+        pairing_pending_ttl_seconds: 60,
     };
 
     TestGateway {

@@ -10,6 +10,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Config { cmd } => commands::config::handle(ctx, cmd).await,
         Commands::Skills { cmd } => commands::skills::handle(ctx, cmd).await,
         Commands::Channels { cmd } => commands::channels::handle(ctx, cmd).await,
+        Commands::Pair { cmd } => commands::pair::handle(ctx, cmd).await,
         Commands::Llm { cmd } => commands::llm::handle(ctx, cmd).await,
         Commands::Workspace { cmd } => commands::workspace::handle(ctx, cmd).await,
         Commands::Session { cmd } => commands::session::handle(ctx, cmd).await,

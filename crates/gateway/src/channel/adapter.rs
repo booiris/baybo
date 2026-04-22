@@ -217,6 +217,9 @@ fn agent_output_to_frame(output: AgentOutput, channel_type: &ChannelType) -> Fra
                 // side. Empty string on non-user-addressed emissions.
                 user_id: response.user_id,
                 channel_type: channel_type.clone(),
+                // Outbound messages don't need `bot_id` — the sidecar
+                // recovers it from its own `user_id → bot_id` map.
+                bot_id: String::new(),
             })
         }
         AgentOutput::Notice {

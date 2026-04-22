@@ -81,6 +81,7 @@ async fn channel_ws_end_to_end() {
         session_id: "sess-1".into(),
         user_id: "user-1".into(),
         channel_type: slack.clone(),
+        bot_id: String::new(),
     };
     send_frame(&mut client, &Frame::Message(outbound.clone()))
         .await
@@ -261,6 +262,138 @@ async fn recv_message(ws: &mut WsStream) -> Result<WireMessage, ConnectError> {
             }
         }
     }
+}
+
+/// Receive the next `Notice` frame. Used by the pairing-gate test
+/// which expects aura to push a refusal notice in response to an
+/// un-paired inbound.
+async fn recv_notice(ws: &mut WsStream) -> Result<(String, String, String), ConnectError> {
+    loop {
+        match recv_frame(ws).await? {
+            Frame::Notice {
+                user_id,
+                level,
+                text,
+                ..
+            } => return Ok((user_id, level, text)),
+            Frame::Message(_) | Frame::Delta { .. } => continue,
+            Frame::ApprovalRequested { .. }
+            | Frame::ApprovalResolved { .. }
+            | Frame::HistorySnapshot { .. }
+            | Frame::StartBot { .. }
+            | Frame::StopBot { .. } => continue,
+            Frame::Register { .. }
+            | Frame::RegisterAck { .. }
+            | Frame::ResolveApproval { .. }
+            | Frame::HistoryAppend { .. }
+            | Frame::SidecarLog { .. }
+            | Frame::BotStatus { .. } => {
+                return Err(ConnectError::ProtocolViolation(
+                    "unexpected frame kind post-handshake",
+                ));
+            }
+        }
+    }
+}
+
+/// Pairing gate end-to-end: an un-paired sidecar-originated Message
+/// gets a Notice back with a 6-char code and is not forwarded to the
+/// router. Operator-side approval via the store flips the triple to
+/// approved; the next message flows through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let socket_path = tempdir.path().join("channel.sock");
+
+    let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let pairing_store = Arc::clone(&tg.deps.channel_pairing_store);
+    let channel_tokens = tg.channel_tokens.clone();
+    let shutdown = tg.shutdown.clone();
+
+    let server = ChannelServer::bind(
+        &tg.deps,
+        socket_path.clone(),
+        TEST_PSK,
+        channel_tokens.clone(),
+    )
+    .expect("bind ChannelServer");
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    let handle = channel_tokens.mint(ClientIdentity {
+        pid: std::process::id(),
+        label: "slack".into(),
+    });
+    let token = handle.token().to_string();
+    let slack = ChannelType::from("slack");
+
+    let mut client = connect_register(&socket_path, &token, slack.clone())
+        .await
+        .expect("sidecar handshake");
+
+    // 1. Un-paired triple — aura refuses with a Notice containing a code.
+    let inbound = WireMessage {
+        content: "hi".into(),
+        // Empty session_id triggers the empty-session branch that runs
+        // the pairing gate; the sidecar path also carries user_id+bot_id.
+        session_id: String::new(),
+        user_id: "alice".into(),
+        channel_type: slack.clone(),
+        bot_id: "prod-bot".into(),
+    };
+    send_frame(&mut client, &Frame::Message(inbound.clone()))
+        .await
+        .expect("send inbound");
+
+    let (notice_user, level, text) =
+        tokio::time::timeout(Duration::from_secs(2), recv_notice(&mut client))
+            .await
+            .expect("notice timeout")
+            .expect("notice recv");
+    assert_eq!(notice_user, "alice");
+    assert_eq!(level, "warn");
+    assert!(text.contains("Pairing required"), "notice text: {text}");
+
+    // Router intake must NOT have seen the message.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), tg.incoming_rx.recv())
+            .await
+            .is_err(),
+        "un-paired message reached the router intake",
+    );
+
+    // A pending row exists with the code from the Notice.
+    let row = pairing_store
+        .get(&slack, "prod-bot", "alice")
+        .await
+        .expect("get pairing")
+        .expect("pending row present");
+    assert_eq!(row.status, aura_storage::PairingStatus::Pending);
+    assert!(text.contains(&row.code), "Notice didn't echo the code");
+
+    // 2. Operator approves via the code.
+    let now = chrono::Utc::now().timestamp();
+    let approved = pairing_store
+        .approve_by_code(&row.code, now)
+        .await
+        .expect("approve")
+        .expect("approved row");
+    assert_eq!(approved.status, aura_storage::PairingStatus::Approved);
+
+    // 3. Same triple now makes it through to the router.
+    send_frame(&mut client, &Frame::Message(inbound.clone()))
+        .await
+        .expect("send after approve");
+    let incoming = tokio::time::timeout(Duration::from_secs(2), tg.incoming_rx.recv())
+        .await
+        .expect("intake timeout")
+        .expect("intake closed");
+    assert_eq!(incoming.message.sender.id, "alice");
+
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 }
 
 async fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {

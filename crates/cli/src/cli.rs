@@ -68,6 +68,13 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: ChannelsCmd,
     },
+    /// Manage per-user pairings: approve new senders, list pending
+    /// requests, revoke existing approvals. See
+    /// `docs/modules/pairing.md`.
+    Pair {
+        #[command(subcommand)]
+        cmd: PairCmd,
+    },
     /// LLM provider and model status.
     Llm {
         #[command(subcommand)]
@@ -221,6 +228,44 @@ pub enum ChannelsCmd {
     Bot {
         #[command(subcommand)]
         cmd: ChannelBotCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PairCmd {
+    /// List live pairings. With no flag, shows every row (pending,
+    /// expired, approved). Pass `--pending` or `--approved` to
+    /// restrict.
+    List {
+        /// Show only pending rows (including expired).
+        #[arg(long, conflicts_with = "approved")]
+        pending: bool,
+        /// Show only approved rows.
+        #[arg(long)]
+        approved: bool,
+    },
+    /// Approve a pending pairing by its short code. The code is
+    /// surfaced to the end-user as a chat notice the first time
+    /// they message an un-paired bot.
+    Approve {
+        /// Short pairing code (6 chars, unambiguous alphabet).
+        code: String,
+    },
+    /// Soft-delete an approved or pending pairing. Subsequent
+    /// messages from the triple trigger a fresh pending row with a
+    /// fresh code.
+    Revoke {
+        /// Channel type, e.g. `telegram`.
+        channel_type: String,
+        /// Bot id the pairing is scoped to. Pass `""` for channels
+        /// with no bot concept.
+        bot_id: String,
+        /// Platform user id (`tg_<botId>_<chatId>_<userId>` for
+        /// Telegram, matching the sidecar's composed id).
+        user_id: String,
+        /// Confirm the destructive action (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 

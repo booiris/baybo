@@ -125,18 +125,25 @@ pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<Secre
 }
 
 /// Open the libsql store and wrap the vault + channel-bot metadata
-/// store for CLI subcommands that manage per-channel credentials
-/// (`aura channels bot add/remove/list`). Both handles share a
-/// single libsql connection so the CLI writes land atomically in
-/// the same file the gateway reads from.
+/// store + channel-pairing store for CLI subcommands that manage
+/// per-channel credentials (`aura channels bot add/remove/list`) or
+/// per-user pairings (`aura pair list/approve/revoke`). All three
+/// handles share a single libsql connection so the CLI writes land
+/// atomically in the same file the gateway reads from.
 pub async fn build_bot_registry_deps(
     config: &AuraConfig,
-) -> anyhow::Result<(Arc<SecretVault>, Arc<dyn aura_storage::ChannelBotStore>)> {
+) -> anyhow::Result<(
+    Arc<SecretVault>,
+    Arc<dyn aura_storage::ChannelBotStore>,
+    Arc<dyn aura_storage::ChannelPairingStore>,
+)> {
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
     let master_key = load_master_key(&config.security)?;
     let vault = Arc::new(SecretVault::new(master_key, Arc::from(storage.secret)));
     let bot_store: Arc<dyn aura_storage::ChannelBotStore> = Arc::from(storage.channel_bot);
-    Ok((vault, bot_store))
+    let pairing_store: Arc<dyn aura_storage::ChannelPairingStore> =
+        Arc::from(storage.channel_pairing);
+    Ok((vault, bot_store, pairing_store))
 }
 
 /// Fully-wired manager graph shared between the TUI and gateway boot
@@ -162,6 +169,7 @@ pub struct ManagerGraph {
     pub channels_registry: Arc<ChannelRegistry>,
     pub channel_session_store: Arc<dyn aura_storage::ChannelSessionStore>,
     pub channel_bot_store: Arc<dyn aura_storage::ChannelBotStore>,
+    pub channel_pairing_store: Arc<dyn aura_storage::ChannelPairingStore>,
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
@@ -291,6 +299,8 @@ pub async fn build_managers(
     let channel_session_store: Arc<dyn aura_storage::ChannelSessionStore> =
         Arc::from(storage.channel_session);
     let channel_bot_store: Arc<dyn aura_storage::ChannelBotStore> = Arc::from(storage.channel_bot);
+    let channel_pairing_store: Arc<dyn aura_storage::ChannelPairingStore> =
+        Arc::from(storage.channel_pairing);
 
     Ok(ManagerGraph {
         config,
@@ -309,6 +319,7 @@ pub async fn build_managers(
         channels_registry,
         channel_session_store,
         channel_bot_store,
+        channel_pairing_store,
         cost_tracker,
         hook_manager,
         secret_vault,

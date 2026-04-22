@@ -384,6 +384,7 @@ dependencies = [
  "aura-job",
  "aura-llm",
  "aura-model",
+ "aura-pairing",
  "aura-security",
  "aura-session",
  "aura-skills",
@@ -518,6 +519,19 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "aura-pairing"
+version = "0.1.0"
+dependencies = [
+ "aura-model",
+ "aura-storage",
+ "chrono",
+ "rand 0.10.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

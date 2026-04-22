@@ -35,6 +35,13 @@ export interface UserInbound {
   sessionId: string;
   userId: string;
   content: string;
+  /**
+   * Per-tenant credential that produced this inbound event, for
+   * channels that multiplex many bots (Telegram, future Discord).
+   * Omit / empty string for channels without a bot concept. Aura's
+   * pairing gate uses `(channelType, botId, userId)` as the triple.
+   */
+  botId?: string;
 }
 
 export interface ApprovalRequest {

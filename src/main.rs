@@ -140,8 +140,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref client) = llm_client {
         builder = builder.llm(Arc::clone(client));
     }
-    if let Ok((vault, bot_store)) = runtime::build_bot_registry_deps(&config).await {
-        builder = builder.secret_vault(vault).channel_bot_store(bot_store);
+    if let Ok((vault, bot_store, pairing_store)) = runtime::build_bot_registry_deps(&config).await {
+        builder = builder
+            .secret_vault(vault)
+            .channel_bot_store(bot_store)
+            .channel_pairing_store(pairing_store);
     }
     let ctx = builder
         .build()

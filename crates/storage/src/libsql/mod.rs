@@ -1,4 +1,5 @@
 mod channel_bot;
+mod channel_pairing;
 mod channel_session;
 mod cost;
 mod cron;
@@ -10,6 +11,7 @@ mod skill_risk;
 mod trace;
 
 pub use channel_bot::LibsqlChannelBotStore;
+pub use channel_pairing::LibsqlChannelPairingStore;
 pub use channel_session::LibsqlChannelSessionStore;
 pub use cost::LibsqlCostStore;
 pub use cron::LibsqlCronStore;
@@ -249,7 +251,22 @@ impl LibsqlPool {
                     created_at   INTEGER NOT NULL,
                     deleted_at   INTEGER,
                     PRIMARY KEY (channel_type, bot_id)
-                );",
+                );
+
+                CREATE TABLE IF NOT EXISTS channel_pairings (
+                    channel_type TEXT    NOT NULL,
+                    bot_id       TEXT    NOT NULL,
+                    user_id      TEXT    NOT NULL,
+                    code         TEXT    NOT NULL,
+                    status       TEXT    NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    expires_at   INTEGER,
+                    approved_at  INTEGER,
+                    deleted_at   INTEGER,
+                    PRIMARY KEY (channel_type, bot_id, user_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_pairings_code
+                    ON channel_pairings(code) WHERE deleted_at IS NULL;",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;

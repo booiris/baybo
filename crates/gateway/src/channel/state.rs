@@ -11,8 +11,10 @@ use std::sync::Arc;
 use aura_agent::SessionManager;
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_gateway_auth::ChannelTokenTable;
+use aura_pairing::PairingService;
 use aura_security::SecretVault;
 use aura_storage::ChannelBotStore;
+
 use tokio::sync::mpsc;
 
 use super::bot_reconciler::ChannelBotReconciler;
@@ -60,4 +62,9 @@ pub struct WsChannelState {
     /// methods to keep the reconciler's per-sidecar tracked sets in
     /// sync with the initial-register push and disconnect cleanup.
     pub bot_reconciler: Arc<ChannelBotReconciler>,
+    /// Gate that decides whether an inbound sidecar message can reach
+    /// the agent loop. Unpaired `(channel_type, bot_id, user_id)`
+    /// triples get a short code back via [`aura_channels::wire::Frame::Notice`]
+    /// and their message is dropped. See `docs/modules/pairing.md`.
+    pub pairing: Arc<PairingService>,
 }

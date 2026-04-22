@@ -314,6 +314,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         channel_bot_store: Arc::clone(&graph.channel_bot_store),
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
+        channel_pairing_store: Arc::clone(&graph.channel_pairing_store),
+        pairing_pending_ttl_seconds: graph.config.channels.pairing.pending_ttl_seconds,
     };
 
     // Channel UDS listener — lives under the same workspace identity dir

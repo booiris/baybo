@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod job;
 pub mod llm;
 pub mod memory;
+pub mod pair;
 pub mod session;
 pub mod skills;
 pub mod status;

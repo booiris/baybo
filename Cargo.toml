@@ -22,6 +22,7 @@ members = [
     "crates/gateway",
     "crates/gateway-auth",
     "crates/tui",
+    "crates/pairing",
     "crates/integration-tests",
 ]
 exclude = ["crates/security/fuzz"]
@@ -54,6 +55,7 @@ aura-cli = { path = "crates/cli" }
 aura-gateway = { path = "crates/gateway" }
 aura-gateway-auth = { path = "crates/gateway-auth" }
 aura-tui = { path = "crates/tui" }
+aura-pairing = { path = "crates/pairing" }
 aura-integration-tests = { path = "crates/integration-tests" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }

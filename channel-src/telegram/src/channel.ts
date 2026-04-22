@@ -13,7 +13,6 @@ import type {
 import { Bot } from "grammy";
 
 import { ApprovalBroker } from "./approvals.js";
-import type { TelegramConfig } from "./config.js";
 
 /**
  * Bounded in-process queue feeding `inbound()`. grammy's handlers run
@@ -49,7 +48,6 @@ export class TelegramChannel implements Channel {
 
   private readonly bots = new Map<string, RunningBot>();
   private readonly approvals: ApprovalBroker;
-  private readonly allowedUserIds: Set<number>;
   private readonly logger: Logger;
 
   /**
@@ -72,8 +70,7 @@ export class TelegramChannel implements Channel {
   private waiter: ((value: IteratorResult<UserInbound>) => void) | null = null;
   private closed = false;
 
-  constructor(config: TelegramConfig, logger: Logger) {
-    this.allowedUserIds = config.allowedUserIds;
+  constructor(logger: Logger) {
     this.logger = logger;
     this.approvals = new ApprovalBroker(
       this.botByUser,
@@ -269,30 +266,10 @@ export class TelegramChannel implements Channel {
     const text = ctx.message?.text;
     if (!chat || !from || text === undefined) return;
 
-    if (!this.isAuthorized(from.id)) {
-      void this.refuseStranger(ctx);
-      return;
-    }
-
     const userId = userIdFor(botId, chat.id, from.id);
     this.chatByUser.set(userId, chat.id);
     this.botByUser.set(userId, botId);
-    this.pushInbound({ sessionId: "", userId, content: text });
-  }
-
-  private isAuthorized(tgUserId: number): boolean {
-    if (this.allowedUserIds.size === 0) return true;
-    return this.allowedUserIds.has(tgUserId);
-  }
-
-  private async refuseStranger(ctx: import("grammy").Context): Promise<void> {
-    try {
-      await ctx.reply(
-        "Sorry — this Aura bot is gated to a specific allowlist of Telegram accounts.",
-      );
-    } catch (err) {
-      this.logger.debug("reply to stranger failed", err);
-    }
+    this.pushInbound({ sessionId: "", userId, content: text, botId });
   }
 
   private pushInbound(msg: UserInbound): void {

@@ -9,5 +9,13 @@
  * TypeScript as a plain `string` — the domain type is a transparent
  * newtype over `String`, and we don't want ts-rs to pull the domain
  * crate into its generated schema.
+ *
+ * `bot_id` identifies the per-tenant credential that originated an
+ * inbound message (for channels that multiplex many bots — Telegram,
+ * future Discord). Empty string for channels or flows without a bot
+ * concept (the TUI, or a single-bot sidecar). Consumed by the
+ * pairing gate so the `(channel_type, bot_id, user_id)` triple can
+ * gate messages per-bot. Additive; default empty keeps old sidecars
+ * wire-compatible.
  */
-export type Message = { content: string, session_id: string, user_id: string, channel_type: string, };
+export type Message = { content: string, session_id: string, user_id: string, channel_type: string, bot_id?: string, };

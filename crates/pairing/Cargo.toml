@@ -1,0 +1,16 @@
+[package]
+name = "aura-pairing"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-model = { workspace = true }
+aura-storage = { workspace = true }
+
+chrono = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

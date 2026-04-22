@@ -25,6 +25,7 @@ aura-gateway-auth = { workspace = true }
 aura-job = { workspace = true }
 aura-llm = { workspace = true }
 aura-model = { workspace = true }
+aura-pairing = { workspace = true }
 aura-security = { workspace = true }
 aura-session = { workspace = true }
 aura-skills = { workspace = true }
@@ -69,5 +70,6 @@ tempfile = { workspace = true, optional = true }
 aura-gateway = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
 bytes = { workspace = true }
+chrono = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }

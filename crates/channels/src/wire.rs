@@ -33,6 +33,14 @@ pub enum WireError {
 /// TypeScript as a plain `string` — the domain type is a transparent
 /// newtype over `String`, and we don't want ts-rs to pull the domain
 /// crate into its generated schema.
+///
+/// `bot_id` identifies the per-tenant credential that originated an
+/// inbound message (for channels that multiplex many bots — Telegram,
+/// future Discord). Empty string for channels or flows without a bot
+/// concept (the TUI, or a single-bot sidecar). Consumed by the
+/// pairing gate so the `(channel_type, bot_id, user_id)` triple can
+/// gate messages per-bot. Additive; default empty keeps old sidecars
+/// wire-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
@@ -45,6 +53,8 @@ pub struct Message {
     pub user_id: String,
     #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub channel_type: ChannelType,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_id: String,
 }
 
 /// Frame envelope. Tagged on the `kind` field so the receive side
@@ -280,9 +290,25 @@ mod tests {
             session_id: "s1".into(),
             user_id: "u1".into(),
             channel_type: ChannelType::from("slack"),
+            bot_id: "prod-bot".into(),
         });
         let bytes = encode(&frame).unwrap();
         assert_eq!(frame, decode(&bytes).unwrap());
+    }
+
+    #[test]
+    fn round_trip_message_without_bot_id_decodes_empty() {
+        // Old sidecars that predate `bot_id` encode four fields.
+        // The additive schema must still decode — serde_default fills
+        // in the empty string.
+        let frame = Frame::Message(Message {
+            content: "hi".into(),
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            channel_type: ChannelType::from("slack"),
+            bot_id: String::new(),
+        });
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
 
     #[test]

@@ -32,9 +32,10 @@ use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::LlmClient;
+use aura_pairing::PairingService;
 use aura_security::SecretVault;
 use aura_skills::SkillRegistry;
-use aura_storage::{ChannelBotStore, ChannelSessionStore, TraceStore};
+use aura_storage::{ChannelBotStore, ChannelPairingStore, ChannelSessionStore, TraceStore};
 use aura_tools::ToolRegistry;
 use axum::Router;
 use axum::middleware;
@@ -110,6 +111,11 @@ pub struct GatewayDeps {
     /// (avoiding a double-send on the first tick) and so the
     /// disconnect path can `forget` the cached bots.
     pub bot_reconciler: Arc<crate::channel::ChannelBotReconciler>,
+    /// Per-user pairing gate. Consulted on every inbound
+    /// `Frame::Message` from a sidecar before the router intake.
+    pub channel_pairing_store: Arc<dyn ChannelPairingStore>,
+    /// TTL applied to freshly-minted pending pairing codes (seconds).
+    pub pairing_pending_ttl_seconds: u64,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -271,6 +277,10 @@ pub fn build_channel_router(
         Arc::clone(&deps.session_manager),
         Arc::clone(&deps.channel_session_store),
     ));
+    let pairing = Arc::new(PairingService::new(
+        Arc::clone(&deps.channel_pairing_store),
+        deps.pairing_pending_ttl_seconds,
+    ));
     let ws_state = crate::channel::WsChannelState {
         registry: Arc::clone(&deps.channel_registry),
         incoming_tx: deps.incoming_tx.clone(),
@@ -283,6 +293,7 @@ pub fn build_channel_router(
         channel_bot_store: Arc::clone(&deps.channel_bot_store),
         secret_vault: Arc::clone(&deps.secret_vault),
         bot_reconciler: Arc::clone(&deps.bot_reconciler),
+        pairing,
     };
     let v1 = crate::auth_channel::attach(crate::channel::routes().with_state(ws_state), auth_state);
     Router::new()

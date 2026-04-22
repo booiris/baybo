@@ -362,13 +362,29 @@ async fn run_inbound_loop(
                         // send `session_id = ""` and rely on the gateway
                         // to allocate one keyed on (channel_type,
                         // user_id). The TUI always fills session_id in
-                        // itself so it skips this branch.
+                        // itself so it skips this branch (and the
+                        // pairing gate below).
                         let session_id = if wire_msg.session_id.is_empty() {
                             if wire_msg.user_id.is_empty() {
                                 tracing::warn!(
                                     %channel_type,
                                     "inbound Message with empty session_id AND user_id; dropping",
                                 );
+                                continue;
+                            }
+                            // Pairing gate: unknown / expired-pending
+                            // triples get a short code back via Notice
+                            // and the message is dropped before any
+                            // session is created.
+                            if !enforce_pairing(
+                                state,
+                                sidecar,
+                                channel_type,
+                                &wire_msg.bot_id,
+                                &wire_msg.user_id,
+                            )
+                            .await
+                            {
                                 continue;
                             }
                             match state
@@ -487,4 +503,67 @@ async fn run_inbound_loop(
             }
         }
     }
+}
+
+/// Pairing gate. Returns `true` if the inbound can proceed, `false`
+/// if it was dropped (refused or errored). On refusal the pairing
+/// code is posted back as a `Frame::Notice` with `level = "warn"` so
+/// the sidecar surfaces it to the end-user through its existing
+/// notice routing.
+async fn enforce_pairing(
+    state: &WsChannelState,
+    sidecar: &Sidecar,
+    channel_type: &ChannelType,
+    bot_id: &str,
+    user_id: &str,
+) -> bool {
+    use aura_pairing::CheckOutcome;
+
+    match state.pairing.check(channel_type, bot_id, user_id).await {
+        Ok(CheckOutcome::Approved) => true,
+        Ok(CheckOutcome::Pending { code }) => {
+            tracing::warn!(
+                %channel_type,
+                %bot_id,
+                user_id_hash = %short_hash(user_id),
+                "pairing required; returning code and dropping message",
+            );
+            let text = format!(
+                "🔐 Pairing required. Run:\n\
+                 `aura pair approve {code}`\n\
+                 Messages won't reach aura until this pairing is approved."
+            );
+            let notice = Frame::Notice {
+                session_id: String::new(),
+                user_id: user_id.to_owned(),
+                level: "warn".to_owned(),
+                text,
+            };
+            if let Err(e) = sidecar.send_frame(notice).await {
+                tracing::debug!(error = %e, "send pairing notice failed");
+            }
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                %channel_type,
+                %bot_id,
+                user_id_hash = %short_hash(user_id),
+                "pairing check failed; dropping message",
+            );
+            false
+        }
+    }
+}
+
+/// Deterministic short hash of an identifier for log attribution.
+/// Four hex chars is enough to distinguish concurrent pendings in a
+/// tracing log without leaking the raw id.
+fn short_hash(raw: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    raw.hash(&mut h);
+    format!("{:04x}", (h.finish() & 0xFFFF) as u16)
 }

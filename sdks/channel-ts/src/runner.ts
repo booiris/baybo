@@ -439,6 +439,7 @@ async function pumpOutbound(
           session_id: msg.sessionId,
           user_id: msg.userId,
           channel_type: channel.channelType,
+          ...(msg.botId ? { bot_id: msg.botId } : {}),
         }),
       );
     }
