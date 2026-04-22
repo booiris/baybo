@@ -1,0 +1,26 @@
+{
+  "name": "@aura/channel-telegram",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Telegram channel sidecar for the Aura gateway",
+  "type": "module",
+  "bin": {
+    "aura-channel-telegram": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@aura/channel-sdk": "workspace:*",
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=21"
+  }
+}
