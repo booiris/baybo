@@ -123,12 +123,21 @@ async fn main() -> anyhow::Result<()> {
         workspace_root.clone(),
     ));
     let channels_registry = Arc::new(aura_channels::ChannelRegistry::new());
-    let llm_client = match boot::build_llm_client(&config.llm) {
-        Ok(c) => Some(Arc::new(c)),
-        Err(e) => {
-            tracing::warn!(error = %e, "LLM client unavailable for this command");
-            None
+    // Only `llm`, `doctor`, and `status` touch `ctx.llm` in the argv
+    // path. Building the client unconditionally meant every run of
+    // `aura channel add` / `aura config get` / etc. emitted a warn-level
+    // "LLM client unavailable" message when no API key was configured,
+    // which users reasonably interpreted as a hard error.
+    let llm_client = if needs_llm(&cmd) {
+        match boot::build_llm_client(&config.llm) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                tracing::warn!(error = %e, "LLM client unavailable for this command");
+                None
+            }
         }
+    } else {
+        None
     };
 
     let mut builder = ContextBuilder::new(Arc::clone(&config))
@@ -164,6 +173,17 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// Subcommands whose handlers actually read `ctx.llm`. Everything
+/// else (channel/config/memory/session/skills/…) can boot without an
+/// LLM provider configured — they must not trip the bootstrap warning
+/// just by running.
+fn needs_llm(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Llm { .. } | Commands::Doctor | Commands::Status
+    )
 }
 
 fn pick_format(cli: &Cli) -> OutputFormat {

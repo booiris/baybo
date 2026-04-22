@@ -85,30 +85,46 @@ fn channels_list_parses() {
 }
 
 #[test]
-fn channels_bot_add_prompts_after_channel_type_only() {
-    let cli = parse(&["channel", "add", "telegram"]);
-    match cli.command {
+fn channels_bot_add_takes_no_args() {
+    let cli = parse(&["channel", "add"]);
+    assert!(matches!(
+        cli.command,
         Some(Commands::Channel {
-            cmd: ChannelCmd::Add { channel_type },
-        }) => assert_eq!(channel_type, "telegram"),
-        other => panic!("unexpected: {other:?}"),
-    }
+            cmd: ChannelCmd::Add
+        })
+    ));
 
-    assert!(Cli::try_parse_from(["aura", "channel", "add"]).is_err());
-    assert!(Cli::try_parse_from(["aura", "channel", "add", "telegram", "bot-1"]).is_err());
+    // The positional `telegram` form was removed in favour of an
+    // interactive picker; clap should reject any extra positional.
+    assert!(Cli::try_parse_from(["aura", "channel", "add", "telegram"]).is_err());
 }
 
 #[test]
-fn channel_bots_requires_channel_type() {
-    let cli = parse(&["channel", "bots", "telegram"]);
-    match cli.command {
+fn channel_bots_takes_no_args() {
+    let cli = parse(&["channel", "bots"]);
+    assert!(matches!(
+        cli.command,
         Some(Commands::Channel {
-            cmd: ChannelCmd::Bots { channel_type },
-        }) => assert_eq!(channel_type, "telegram"),
-        other => panic!("unexpected: {other:?}"),
-    }
+            cmd: ChannelCmd::Bots
+        })
+    ));
 
-    assert!(Cli::try_parse_from(["aura", "channel", "bots"]).is_err());
+    // Positional args were removed in favour of the interactive picker.
+    assert!(Cli::try_parse_from(["aura", "channel", "bots", "telegram"]).is_err());
+}
+
+#[test]
+fn channel_remove_takes_no_args() {
+    let cli = parse(&["channel", "remove"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Channel {
+            cmd: ChannelCmd::Remove
+        })
+    ));
+
+    assert!(Cli::try_parse_from(["aura", "channel", "remove", "telegram"]).is_err());
+    assert!(Cli::try_parse_from(["aura", "channel", "remove", "telegram", "bot-1"]).is_err());
 }
 
 #[test]

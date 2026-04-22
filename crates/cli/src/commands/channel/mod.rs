@@ -2,6 +2,9 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
+use aura_channels::registration::{
+    Prompter, RegistrationFlow, RegistrationResult, builtin_registration_flows,
+};
 use aura_model::ChannelType;
 use aura_security::SecretVault;
 use aura_storage::{ChannelBotStore, retry_on_busy};
@@ -12,15 +15,14 @@ use crate::context::CommandContext;
 use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
+mod select;
+
 pub async fn handle(ctx: &CommandContext, cmd: ChannelCmd) -> Result<CommandOutput> {
     match cmd {
         ChannelCmd::List => list(ctx).await,
-        ChannelCmd::Add { channel_type } => add_bot(ctx, channel_type).await,
-        ChannelCmd::Remove {
-            channel_type,
-            bot_id,
-        } => remove_bot(ctx, channel_type, bot_id).await,
-        ChannelCmd::Bots { channel_type } => list_bots(ctx, channel_type).await,
+        ChannelCmd::Add => add_bot(ctx).await,
+        ChannelCmd::Remove => remove_bot(ctx).await,
+        ChannelCmd::Bots => list_bots(ctx).await,
     }
 }
 
@@ -196,23 +198,45 @@ fn read_masked_secret<R: Read, W: Write>(
     String::from_utf8(buf).map_err(|e| CliError::Config(format!("token must be valid utf-8: {e}")))
 }
 
-fn prompt_bot_registration() -> Result<(String, String)> {
-    let stdin = io::stdin();
-    let stderr = io::stderr();
-    if !stdin.is_terminal() || !stderr.is_terminal() {
-        return Err(CliError::Config(
-            "interactive bot registration requires a terminal".into(),
-        ));
-    }
-
-    let mut reader = stdin.lock();
-    let mut writer = stderr.lock();
-    let bot_id = prompt_line(&mut reader, &mut writer, "bot_id: ")?;
-    let _raw_mode = RawModeGuard::new(reader.as_raw_fd())?;
-    let token = read_masked_secret(&mut reader, &mut writer, "token (empty for \"\"): ")?;
-    Ok((bot_id, token))
+struct CliPrompter<'a, R, W> {
+    reader: &'a mut R,
+    writer: &'a mut W,
+    tty_fd: i32,
 }
 
+impl<R: BufRead, W: Write> Prompter for CliPrompter<'_, R, W> {
+    fn input(&mut self, label: &str, required: bool) -> anyhow::Result<String> {
+        loop {
+            let value = prompt_line(self.reader, self.writer, label)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if value.is_empty() && required {
+                writeln!(self.writer, "required")?;
+                continue;
+            }
+            return Ok(value);
+        }
+    }
+
+    fn password(&mut self, label: &str, required: bool) -> anyhow::Result<String> {
+        loop {
+            let _raw =
+                RawModeGuard::new(self.tty_fd).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let value = read_masked_secret(self.reader, self.writer, label)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            drop(_raw);
+            if value.is_empty() && required {
+                writeln!(self.writer, "required")?;
+                continue;
+            }
+            return Ok(value);
+        }
+    }
+}
+
+// Vault naming for the *remove* path. The add path lets each channel
+// compose its own secret keys via `RegistrationResult::secrets`; when the
+// remove path grows beyond a single hardcoded key, push this down into
+// the channel trait too.
 fn secret_name(channel_type: &ChannelType, bot_id: &str) -> String {
     format!("channel.{}.bot.{}.token", channel_type.as_str(), bot_id)
 }
@@ -221,10 +245,9 @@ async fn persist_bot_registration(
     vault: &Arc<SecretVault>,
     store: &Arc<dyn ChannelBotStore>,
     ct: &ChannelType,
-    bot_id: &str,
-    token: &str,
+    result: &RegistrationResult,
 ) -> Result<()> {
-    validate_bot_id(bot_id)?;
+    validate_bot_id(&result.bot_id)?;
 
     // Vault first — if encryption fails we want to know before
     // advertising the bot in libsql. On success libsql picks up the
@@ -235,15 +258,16 @@ async fn persist_bot_registration(
     // `database is locked` should be a warn-logged retry rather than
     // an operator-facing failure. Real lock pathology escapes after
     // ~200ms with the original error so we don't silently swallow bugs.
-    let secret_name_owned = secret_name(ct, bot_id);
-    retry_on_busy("vault.store_secret", || {
-        vault.store_secret(&secret_name_owned, token.as_bytes())
-    })
-    .await
-    .map_err(|e| CliError::Manager(format!("store token in vault: {e}")))?;
+    for (key, value) in &result.secrets {
+        retry_on_busy("vault.store_secret", || {
+            vault.store_secret(key, value.as_bytes())
+        })
+        .await
+        .map_err(|e| CliError::Manager(format!("store secret '{key}' in vault: {e}")))?;
+    }
 
-    let bot_id_owned = bot_id.to_string();
     let ct_for_put = ct.clone();
+    let bot_id_owned = result.bot_id.clone();
     retry_on_busy("channel_bots.put", || {
         let ct = ct_for_put.clone();
         let id = bot_id_owned.clone();
@@ -255,46 +279,134 @@ async fn persist_bot_registration(
     Ok(())
 }
 
-async fn add_bot(ctx: &CommandContext, channel_type: String) -> Result<CommandOutput> {
+async fn add_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     let (vault, store) = require_bot_deps(ctx)?;
-    let ct = ChannelType::from(channel_type.as_str());
-    let (bot_id, token) = prompt_bot_registration()?;
 
-    persist_bot_registration(vault, store, &ct, &bot_id, &token).await?;
+    let flows = builtin_registration_flows();
+    let labels: Vec<&str> = flows.iter().map(|f| f.display_name()).collect();
+    let idx = select::select_one("Channel:", &labels)?;
+    let flow: Arc<dyn RegistrationFlow> = flows[idx].clone();
+    let ct = flow.channel_type();
 
-    let human = if token.is_empty() {
-        format!(
-            "Registered {} bot '{}'. Stored an empty token; a running gateway will push that empty token to the sidecar within a few seconds.",
-            ct.as_str(),
-            bot_id
-        )
-    } else {
-        format!(
-            "Registered {} bot '{}'. A running gateway will start it within a few seconds.",
-            ct.as_str(),
-            bot_id
-        )
+    let stdin = io::stdin();
+    let stderr = io::stderr();
+    if !stdin.is_terminal() || !stderr.is_terminal() {
+        return Err(CliError::Config(
+            "interactive bot registration requires a terminal".into(),
+        ));
+    }
+
+    let result = {
+        let mut reader = stdin.lock();
+        let mut writer = stderr.lock();
+        let fd = reader.as_raw_fd();
+        let mut prompter = CliPrompter {
+            reader: &mut reader,
+            writer: &mut writer,
+            tty_fd: fd,
+        };
+        flow.prompt(&mut prompter)
+            .map_err(|e| CliError::Config(e.to_string()))?
     };
+
+    persist_bot_registration(vault, store, &ct, &result).await?;
+
+    let human = format!(
+        "Registered {} bot '{}'. A running gateway will start it within a few seconds.",
+        ct.as_str(),
+        result.bot_id
+    );
 
     Ok(CommandOutput::structured(
         human,
         &json!({
             "channel_type": ct.as_str(),
-            "bot_id": bot_id,
+            "bot_id": result.bot_id,
             "action": "added",
-            "token_is_empty": token.is_empty(),
         }),
     ))
 }
 
-async fn remove_bot(
-    ctx: &CommandContext,
-    channel_type: String,
-    bot_id: String,
-) -> Result<CommandOutput> {
-    validate_bot_id(&bot_id)?;
+/// Returns `None` when no bots are registered at all — callers render
+/// that as a friendly success, not an error.
+async fn pick_channel_with_bots(store: &Arc<dyn ChannelBotStore>) -> Result<Option<ChannelType>> {
+    // Enumerate via the builtin add-flow catalog so the picker stays
+    // in sync with what's registrable. A bot registered for an unknown
+    // channel type would be unreachable here — acceptable while the
+    // catalog is the source of truth.
+    let flows = builtin_registration_flows();
+    let mut populated: Vec<(String, ChannelType)> = Vec::new();
+    for flow in &flows {
+        let ct = flow.channel_type();
+        let rows = store
+            .list_live(&ct)
+            .await
+            .map_err(|e| CliError::Manager(format!("list live bots: {e}")))?;
+        if !rows.is_empty() {
+            populated.push((flow.display_name().to_string(), ct));
+        }
+    }
+
+    if populated.is_empty() {
+        return Ok(None);
+    }
+
+    let labels: Vec<&str> = populated.iter().map(|(n, _)| n.as_str()).collect();
+    let idx = select::select_one("Channel:", &labels)?;
+    Ok(Some(populated.swap_remove(idx).1))
+}
+
+async fn pick_bot(store: &Arc<dyn ChannelBotStore>, ct: &ChannelType) -> Result<String> {
+    let rows = store
+        .list_live(ct)
+        .await
+        .map_err(|e| CliError::Manager(format!("list live bots: {e}")))?;
+    if rows.is_empty() {
+        return Err(CliError::Config(format!("no bots for '{}'", ct.as_str())));
+    }
+    let labels: Vec<&str> = rows.iter().map(|r| r.bot_id.as_str()).collect();
+    let idx = select::select_one("Bot:", &labels)?;
+    Ok(rows[idx].bot_id.clone())
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    let stdin = io::stdin();
+    let stderr = io::stderr();
+    if !stdin.is_terminal() || !stderr.is_terminal() {
+        return Err(CliError::Config(
+            "interactive confirmation requires a terminal".into(),
+        ));
+    }
+    let mut reader = stdin.lock();
+    let mut writer = stderr.lock();
+    let label = format!("{question} [y/N]: ");
+    let ans = prompt_line(&mut reader, &mut writer, &label)?;
+    Ok(matches!(ans.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+}
+
+async fn remove_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     let (vault, store) = require_bot_deps(ctx)?;
-    let ct = ChannelType::from(channel_type.as_str());
+    let Some(ct) = pick_channel_with_bots(store).await? else {
+        return Ok(CommandOutput::structured(
+            "no bots to remove".to_string(),
+            &json!({ "bots": [], "action": "noop" }),
+        ));
+    };
+    let bot_id = pick_bot(store, &ct).await?;
+
+    let question = format!("Delete {}/{}?", ct.as_str(), bot_id);
+    if !confirm(&question)? {
+        return Ok(CommandOutput::structured(
+            format!("Cancelled: {}/{} not removed.", ct.as_str(), bot_id),
+            &json!({
+                "channel_type": ct.as_str(),
+                "bot_id": bot_id,
+                "action": "cancelled",
+            }),
+        ));
+    }
+
+    validate_bot_id(&bot_id)?;
 
     // Retry both writes on transient libsql BUSY (see `add_bot` for
     // why). Metadata goes first so a running reconciler sees the bot
@@ -330,15 +442,20 @@ async fn remove_bot(
     ))
 }
 
-async fn list_bots(ctx: &CommandContext, channel_type: String) -> Result<CommandOutput> {
+async fn list_bots(ctx: &CommandContext) -> Result<CommandOutput> {
     let (_vault, store) = require_bot_deps(ctx)?;
-    let ct = ChannelType::from(channel_type.as_str());
+    let Some(ct) = pick_channel_with_bots(store).await? else {
+        return Ok(CommandOutput::structured(
+            "no bots registered".to_string(),
+            &json!({ "bots": [] }),
+        ));
+    };
     let rows = store
         .list_live(&ct)
         .await
         .map_err(|e| CliError::Manager(format!("list live bots: {e}")))?;
     let human = if rows.is_empty() {
-        format!("(no bots registered for '{}')", ct.as_str())
+        format!("(no bots for '{}')", ct.as_str())
     } else {
         let mut buf = String::from("BOT_ID\tCREATED_AT\n");
         for r in &rows {
@@ -390,7 +507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_registration_stores_empty_token_string() {
+    async fn persist_registration_writes_every_secret_and_bot_row() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store: Arc<dyn ChannelBotStore> = Arc::new(LibsqlChannelBotStore::new(pool));
         let vault = Arc::new(SecretVault::new(
@@ -399,19 +516,31 @@ mod tests {
         ));
         let channel_type = ChannelType::telegram();
 
-        persist_bot_registration(&vault, &store, &channel_type, "bot_alpha", "")
+        let result = RegistrationResult {
+            bot_id: "123456789".into(),
+            secrets: vec![
+                (
+                    "channel.telegram.bot.123456789.token".into(),
+                    "123456789:hunter2".into(),
+                ),
+                (
+                    "channel.telegram.bot.123456789.webhook".into(),
+                    "https://example.test/hook".into(),
+                ),
+            ],
+        };
+
+        persist_bot_registration(&vault, &store, &channel_type, &result)
             .await
             .unwrap();
 
-        let saved = vault
-            .get_secret(&secret_name(&channel_type, "bot_alpha"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(saved.as_bytes().is_empty());
+        for (key, value) in &result.secrets {
+            let saved = vault.get_secret(key).await.unwrap().unwrap();
+            assert_eq!(saved.as_bytes(), value.as_bytes());
+        }
         assert!(
             store
-                .get(&channel_type, "bot_alpha")
+                .get(&channel_type, "123456789")
                 .await
                 .unwrap()
                 .is_some()

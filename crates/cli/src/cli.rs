@@ -224,28 +224,23 @@ pub enum SkillsCmd {
 pub enum ChannelCmd {
     /// List registered channel adapters and their current status.
     List,
-    /// Register a new bot for the given channel. After `channel_type`
-    /// is provided, the CLI interactively prompts for `bot_id` and
-    /// `token`; pressing Enter on the token prompt stores an empty
-    /// string. Writes directly to libsql + the vault; a running
+    /// Register a new bot. Opens an interactive single-select over the
+    /// supported channel types, then dispatches into that channel's
+    /// registration flow (e.g. telegram prompts once for a masked bot
+    /// token). Writes directly to libsql + the vault; a running
     /// gateway picks up the new bot within a couple of seconds via
     /// the reconciler.
-    Add {
-        /// e.g. `telegram`
-        channel_type: String,
-    },
-    /// Deregister a bot. Soft-deletes the row and removes its vault
-    /// secret; a running gateway's reconciler pushes a `StopBot` to
-    /// the sidecar on the next tick.
-    Remove {
-        channel_type: String,
-        bot_id: String,
-    },
-    /// List live bots registered for one channel type.
-    Bots {
-        /// e.g. `telegram`
-        channel_type: String,
-    },
+    Add,
+    /// Deregister a bot. Opens an interactive picker over channels
+    /// that currently have live bots, then over bots within that
+    /// channel, then asks for y/N confirmation. Soft-deletes the row
+    /// and removes its vault secret; a running gateway's reconciler
+    /// pushes a `StopBot` to the sidecar on the next tick.
+    Remove,
+    /// List live bots. Opens an interactive picker over channels that
+    /// currently have live bots and prints the bot list for the
+    /// selected channel.
+    Bots,
 }
 
 #[derive(Debug, Subcommand)]

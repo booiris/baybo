@@ -311,6 +311,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "crossterm",
  "libc",
  "parking_lot",
  "serde",
