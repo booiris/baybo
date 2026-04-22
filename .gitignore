@@ -6,5 +6,7 @@ index.scip
 .env
 .aura
 aura.json
-sdks/channel-ts/dist/
-sdks/channel-ts/node_modules/
+**/node_modules/
+sdks/*/dist/
+channel-src/*/dist/
+web/dist/
