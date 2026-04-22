@@ -517,7 +517,7 @@ async fn channels_list_on_empty_registry_returns_placeholder() {
     let ctx = context();
     let out = dispatch::run(
         &ctx,
-        Commands::Channels {
+        Commands::Channel {
             cmd: ChannelsCmd::List,
         },
     )

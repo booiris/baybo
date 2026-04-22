@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    AgentCmd, ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd,
-    MemoryCmd, SessionCmd, ShellKind, SkillsCmd, TraceCmd, WorkspaceCmd,
+    AgentCmd, ChannelBotCmd, ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg,
+    LlmCmd, MemoryCmd, SessionCmd, ShellKind, SkillsCmd, TraceCmd, WorkspaceCmd,
 };
 use clap::Parser;
 
@@ -75,10 +75,38 @@ fn skills_info_requires_name() {
 
 #[test]
 fn channels_list_parses() {
+    let cli = parse(&["channel", "list"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Channel {
+            cmd: ChannelsCmd::List
+        })
+    ));
+}
+
+#[test]
+fn channels_bot_add_prompts_after_channel_type_only() {
+    let cli = parse(&["channel", "bot", "add", "telegram"]);
+    match cli.command {
+        Some(Commands::Channel {
+            cmd:
+                ChannelsCmd::Bot {
+                    cmd: ChannelBotCmd::Add { channel_type },
+                },
+        }) => assert_eq!(channel_type, "telegram"),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    assert!(Cli::try_parse_from(["aura", "channel", "bot", "add"]).is_err());
+    assert!(Cli::try_parse_from(["aura", "channel", "bot", "add", "telegram", "bot-1"]).is_err());
+}
+
+#[test]
+fn channels_alias_still_parses() {
     let cli = parse(&["channels", "list"]);
     assert!(matches!(
         cli.command,
-        Some(Commands::Channels {
+        Some(Commands::Channel {
             cmd: ChannelsCmd::List
         })
     ));

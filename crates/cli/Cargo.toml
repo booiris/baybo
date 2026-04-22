@@ -34,6 +34,7 @@ tracing = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 shell-words = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 aura-context = { workspace = true }

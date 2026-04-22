@@ -64,7 +64,7 @@ pub enum Commands {
         cmd: SkillsCmd,
     },
     /// Inspect channel adapters.
-    Channels {
+    Channel {
         #[command(subcommand)]
         cmd: ChannelsCmd,
     },
@@ -271,19 +271,15 @@ pub enum PairCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ChannelBotCmd {
-    /// Register a new bot for the given channel. The token is read
-    /// from `--token-env VAR` (preferred — no plaintext in shell
-    /// history) or from stdin if neither flag is supplied. Writes
-    /// directly to libsql + the vault; a running gateway picks up
-    /// the new bot within a couple of seconds via the reconciler.
+    /// Register a new bot for the given channel. After `channel_type`
+    /// is provided, the CLI interactively prompts for `bot_id` and
+    /// `token`; pressing Enter on the token prompt stores an empty
+    /// string. Writes directly to libsql + the vault; a running
+    /// gateway picks up the new bot within a couple of seconds via
+    /// the reconciler.
     Add {
         /// e.g. `telegram`
         channel_type: String,
-        /// Operator-chosen stable id. Alphanumeric + `_`/`-`.
-        bot_id: String,
-        /// Name of the env var holding the bot token.
-        #[arg(long = "token-env", value_name = "VAR")]
-        token_env: Option<String>,
     },
     /// Deregister a bot. Soft-deletes the row and removes its vault
     /// secret; a running gateway's reconciler pushes a `StopBot` to

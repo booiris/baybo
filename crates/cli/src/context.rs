@@ -45,7 +45,7 @@ pub struct CommandContext {
     pub skill_assessor: Option<Arc<SkillAssessor>>,
     /// Per-tenant credential metadata. Populated for one-shot argv
     /// commands that need to mutate or read the roster (`aura
-    /// channels bot …`); `None` during TUI / slash dispatch so those
+    /// channel bot …`); `None` during TUI / slash dispatch so those
     /// paths can't accidentally rotate tokens.
     pub channel_bot_store: Option<Arc<dyn ChannelBotStore>>,
     /// Per-user pairing gate store. Populated alongside
