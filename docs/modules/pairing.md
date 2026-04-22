@@ -71,10 +71,11 @@ Soft-delete matches the rest of the libsql tables (see
 ### Expiry
 
 A pending row carries an `expires_at` stamp computed at insert time:
-`created_at + config.channels.pairing.pending_ttl_seconds`. Default
-TTL is **15 minutes** — long enough for a human operator to notice a
-Telegram buzz and run `aura pair approve`, short enough that a
-one-time curious user's code doesn't linger in libsql for days.
+`created_at + 15 minutes`. The TTL is a hardcoded constant
+(`PENDING_TTL_SECONDS` in `crates/pairing/src/service.rs`) — long
+enough for a human operator to notice a Telegram buzz and run `aura
+pair approve`, short enough that a one-time curious user's code
+doesn't linger in libsql for days.
 
 Expiry only applies to `pending` rows. On approval, `status` flips
 to `approved` and `expires_at` is cleared (`NULL`) — approved
@@ -229,10 +230,9 @@ nothing does today.
   (`level: "warn"`) and drops the inbound; on `CheckOutcome::Approved`
   it falls through.
 - `crates/gateway/src/server.rs` — `GatewayDeps` carries
-  `channel_pairing_store` + `pairing_pending_ttl_seconds`, wired
-  from `Store::channel_pairing` and
-  `config.channels.pairing.pending_ttl_seconds`. `build_channel_router`
-  constructs the `PairingService`.
+  `channel_pairing_store`, wired from `Store::channel_pairing`.
+  `build_channel_router` constructs the `PairingService`, which owns
+  the hardcoded TTL.
 - `src/runtime.rs` — `ManagerGraph` carries `channel_pairing_store`;
   `build_bot_registry_deps` returns it too so the CLI can reach it.
 - `src/main.rs` / `src/gateway_cmd.rs` — plumb the store through

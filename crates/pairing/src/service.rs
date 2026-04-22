@@ -14,6 +14,13 @@ use crate::error::PairingError;
 /// the store is completely wedged.
 const CODE_MINT_RETRIES: u32 = 8;
 
+/// How long a freshly-minted pending pairing code stays valid before
+/// the service overwrites it with a new one on the next inbound.
+/// 15 minutes — long enough for a human operator to notice a Telegram
+/// buzz and run `aura pair approve`, short enough that a curious
+/// one-time user's code doesn't linger in libsql for days.
+const PENDING_TTL_SECONDS: i64 = 900;
+
 /// Outcome of [`PairingService::check`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -31,18 +38,11 @@ pub enum CheckOutcome {
 /// and expiry semantics.
 pub struct PairingService {
     store: Arc<dyn ChannelPairingStore>,
-    pending_ttl_seconds: i64,
 }
 
 impl PairingService {
-    pub fn new(store: Arc<dyn ChannelPairingStore>, pending_ttl_seconds: u64) -> Self {
-        Self {
-            store,
-            // `i64` so we can add to Unix seconds without casts later.
-            // `u64::MAX` would overflow, but realistic TTLs (<<1 year)
-            // fit comfortably in `i64::MAX / 2`, so saturating is safe.
-            pending_ttl_seconds: pending_ttl_seconds.min(i64::MAX as u64) as i64,
-        }
+    pub fn new(store: Arc<dyn ChannelPairingStore>) -> Self {
+        Self { store }
     }
 
     /// Check whether `(channel_type, bot_id, user_id)` can send
@@ -72,7 +72,7 @@ impl PairingService {
             }
         }
         let code = self.mint_unique_code().await?;
-        let expires_at = now.saturating_add(self.pending_ttl_seconds);
+        let expires_at = now.saturating_add(PENDING_TTL_SECONDS);
         let row = self
             .store
             .upsert_pending(channel_type, bot_id, user_id, &code, now, expires_at)

@@ -144,10 +144,6 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         channel_control,
         bot_reconciler,
         channel_pairing_store,
-        // Short TTL so tests that care about expiry don't have to
-        // wait. Still long enough that the "live-fresh pending" gate
-        // is exercised in common cases.
-        pairing_pending_ttl_seconds: 60,
     };
 
     TestGateway {

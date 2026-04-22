@@ -114,8 +114,6 @@ pub struct GatewayDeps {
     /// Per-user pairing gate. Consulted on every inbound
     /// `Frame::Message` from a sidecar before the router intake.
     pub channel_pairing_store: Arc<dyn ChannelPairingStore>,
-    /// TTL applied to freshly-minted pending pairing codes (seconds).
-    pub pairing_pending_ttl_seconds: u64,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -277,10 +275,7 @@ pub fn build_channel_router(
         Arc::clone(&deps.session_manager),
         Arc::clone(&deps.channel_session_store),
     ));
-    let pairing = Arc::new(PairingService::new(
-        Arc::clone(&deps.channel_pairing_store),
-        deps.pairing_pending_ttl_seconds,
-    ));
+    let pairing = Arc::new(PairingService::new(Arc::clone(&deps.channel_pairing_store)));
     let ws_state = crate::channel::WsChannelState {
         registry: Arc::clone(&deps.channel_registry),
         incoming_tx: deps.incoming_tx.clone(),
