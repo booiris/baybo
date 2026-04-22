@@ -9,6 +9,7 @@ import {
   RiInformationFill,
   RiPulseLine,
   RiRefreshLine,
+  RiLoader4Line,
 } from 'react-icons/ri';
 import type { IconType } from 'react-icons';
 import { Button } from '../components/Button';
@@ -21,7 +22,9 @@ import type { components } from '../api/schema';
 type LogEntry = components['schemas']['LogEntry'];
 type ApiLogLevel = components['schemas']['LogLevel'];
 
-const PAGE_SIZE = 50;
+// Default page size for logs
+const DEFAULT_PAGE_SIZE = 50;
+const PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500];
 
 const LEVEL_META: Record<ApiLogLevel, { className: string; Icon: IconType }> = {
   error: { className: 'bg-err text-white', Icon: RiCloseCircleFill },
@@ -32,15 +35,23 @@ const LEVEL_META: Record<ApiLogLevel, { className: string; Icon: IconType }> = {
 };
 
 const thCell =
-  'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black';
+  'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black sticky top-0 z-10 bg-white';
 
 function splitTimestamp(iso: string): { date: string; time: string } {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return { date: iso, time: '' };
-  return {
-    date: d.toISOString().slice(0, 10),
-    time: d.toISOString().slice(11, 23),
-  };
+  
+  // Format as YYYY-MM-DD in local time
+  const date = d.toLocaleDateString('sv-SE'); 
+  // Format as HH:mm:ss in local time
+  const time = d.toLocaleTimeString([], { 
+    hour: '2-digit', 
+    minute: '2-digit', 
+    second: '2-digit',
+    hour12: false 
+  });
+
+  return { date, time };
 }
 
 function triggerDownload(filename: string, mime: string, body: string): void {
@@ -62,8 +73,8 @@ export function LogsPage() {
   const [filter, setFilter] = useState('');
   const [debouncedFilter, setDebouncedFilter] = useState('');
   const [level, setLevel] = useState<'all' | ApiLogLevel>('all');
-  const [last24h, setLast24h] = useState(true);
   const [offset, setOffset] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [items, setItems] = useState<LogEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -71,6 +82,7 @@ export function LogsPage() {
   const [selected, setSelected] = useState<LogEntry | null>(null);
   const [live, setLive] = useState(false);
   const [liveConnected, setLiveConnected] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Debounce the filter input so we don't hammer the gateway on every keystroke.
   useEffect(() => {
@@ -86,45 +98,53 @@ export function LogsPage() {
       return;
     }
     setOffset(0);
-  }, [debouncedFilter, level, last24h]);
+  }, [debouncedFilter, level, pageSize]);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    const query: Record<string, string | number> = {
-      limit: PAGE_SIZE,
-      offset,
-    };
-    if (level !== 'all') query.level = level;
-    if (debouncedFilter.trim()) query.q = debouncedFilter.trim();
-    if (last24h) {
-      query.since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    }
-    try {
-      const { data, error: apiError, response } = await client.GET('/v1/logs', {
-        params: { query },
-      });
-      if (apiError) {
-        setError(apiError.error);
-        if (response.status === 401) logout();
-        return;
-      }
-      setItems(data?.items ?? []);
-      setTotal(data?.total ?? 0);
-    } catch (e) {
-      setError(
-        e instanceof Error
-          ? `Network error: ${e.message}`
-          : 'Network error contacting gateway',
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [client, debouncedFilter, last24h, level, logout, offset]);
+  // For the manual refresh button, we'll use a refresh counter.
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    let canceled = false;
+    async function fetchData() {
+      setLoading(true);
+      setError(null);
+      const query: Record<string, string | number> = {
+        limit: pageSize,
+        offset,
+      };
+      if (level !== 'all') query.level = level;
+      if (debouncedFilter.trim()) query.q = debouncedFilter.trim();
+      query.since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+      try {
+        const { data, error: apiError, response } = await client.GET('/v1/logs', {
+          params: { query },
+        });
+        if (canceled) return;
+        if (apiError) {
+          setError(apiError.error);
+          if (response.status === 401) logout();
+          return;
+        }
+        setItems(data?.items ?? []);
+        setTotal(data?.total ?? 0);
+      } catch (e) {
+        if (canceled) return;
+        setError(e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway');
+      } finally {
+        if (!canceled) setLoading(false);
+      }
+    }
+    void fetchData();
+    return () => { canceled = true; };
+  }, [client, debouncedFilter, level, logout, offset, pageSize, refreshKey]);
+
+  // Reset scroll on page change
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = 0;
+    }
+  }, [offset, pageSize]);
 
   // Live tail: subscribe to /v1/logs/stream while Live is on and we're
   // on page 1. EventSource can't carry an Authorization header, so the
@@ -138,12 +158,10 @@ export function LogsPage() {
     params.set('token', token);
     if (level !== 'all') params.set('level', level);
     if (debouncedFilter.trim()) params.set('q', debouncedFilter.trim());
-    if (last24h) {
-      params.set(
-        'since',
-        new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
-      );
-    }
+    params.set(
+      'since',
+      new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    );
     const base = baseUrl.replace(/\/$/, '');
     const url = `${base}/v1/logs/stream?${params.toString()}`;
     const es = new EventSource(url);
@@ -156,7 +174,7 @@ export function LogsPage() {
         setItems((prev) => {
           if (prev.some((e) => e.id === entry.id)) return prev;
           const next = [entry, ...prev];
-          return next.length > PAGE_SIZE ? next.slice(0, PAGE_SIZE) : next;
+          return next.length > pageSize ? next.slice(0, pageSize) : next;
         });
         setTotal((t) => t + 1);
       } catch {
@@ -182,7 +200,7 @@ export function LogsPage() {
       es.close();
       setLiveConnected(false);
     };
-  }, [live, offset, token, baseUrl, level, debouncedFilter, last24h]);
+  }, [live, offset, token, baseUrl, level, debouncedFilter]);
 
   // Pagination away from page 1 implicitly drops the user out of live
   // mode — the stream only makes sense at the head of the list.
@@ -218,20 +236,19 @@ export function LogsPage() {
   );
 
   return (
-    <div className="p-8">
-      <div className="flex justify-between items-start mb-8">
+    <div className="p-5 h-full flex flex-col overflow-hidden">
+      <div className="flex justify-between items-start mb-5">
         <div>
-          <h2 className="text-[2.5rem] font-bold uppercase -tracking-[0.05em] mb-2">
+          <h2 className="text-[1.8rem] font-bold uppercase -tracking-[0.05em] mb-1">
             SYSTEM LOGS
           </h2>
-          <p className="text-ink-soft">Real-time event and error tracking.</p>
         </div>
         <Button variant="primary" onClick={handleExport} disabled={items.length === 0}>
           <RiDownloadLine /> Export
         </Button>
       </div>
 
-      <div className="flex items-center gap-3 mb-6">
+      <div className="flex items-center gap-3 mb-4">
         <SearchBox
           placeholder="Filter by message or source..."
           value={filter}
@@ -248,13 +265,7 @@ export function LogsPage() {
           <option value="debug">Debug</option>
           <option value="trace">Trace</option>
         </SelectBox>
-        <Button
-          variant={last24h ? 'primary' : 'default'}
-          onClick={() => setLast24h((v) => !v)}
-          aria-pressed={last24h}
-        >
-          Last 24 Hours
-        </Button>
+
         <Button
           variant={live ? 'primary' : 'default'}
           onClick={() => setLive((v) => !v)}
@@ -266,12 +277,16 @@ export function LogsPage() {
               : 'Stream new log records as they arrive'
           }
         >
-          <RiBroadcastLine
-            className={live && liveConnected ? 'animate-pulse' : undefined}
-          />
-          {live ? (liveConnected ? 'Live' : 'Connecting…') : 'Live'}
+          {live && !liveConnected ? (
+            <RiLoader4Line className="animate-spin" />
+          ) : (
+            <RiBroadcastLine
+              className={live && liveConnected ? 'animate-pulse' : undefined}
+            />
+          )}
+          Live
         </Button>
-        <Button onClick={() => void load()} disabled={loading}>
+        <Button onClick={() => setRefreshKey((k) => k + 1)} disabled={loading}>
           <RiRefreshLine /> Refresh
         </Button>
       </div>
@@ -282,15 +297,16 @@ export function LogsPage() {
         </div>
       )}
 
-      <div className="bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden">
-        <table className="w-full border-collapse">
+      <div className="flex-1 flex flex-col min-h-0 bg-white border-[3px] border-black rounded-md shadow-brutal">
+        <div ref={scrollRef} className="flex-1 overflow-auto">
+          <table className="w-full border-collapse">
           <thead>
             <tr>
-              <th className={thCell}>Timestamp</th>
-              <th className={thCell}>Level</th>
-              <th className={thCell}>Source</th>
+              <th className={`${thCell} w-[160px]`}>Timestamp</th>
+              <th className={`${thCell} w-[160px]`}>Level</th>
+              <th className={`${thCell} w-[400px]`}>Source</th>
               <th className={thCell}>Message</th>
-              <th className={`${thCell} text-right`}>Action</th>
+              <th className={`${thCell} w-[100px] text-right`}>Action</th>
             </tr>
           </thead>
           <tbody>
@@ -311,7 +327,7 @@ export function LogsPage() {
               return (
                 <tr key={log.id} className="hover:bg-gray-50">
                   <td className={cell}>
-                    <div className="text-ink-soft text-[0.85rem] leading-snug">
+                    <div className="text-ink-soft text-[0.85rem] leading-snug whitespace-nowrap">
                       {date}
                       <br />
                       {time}
@@ -319,7 +335,7 @@ export function LogsPage() {
                   </td>
                   <td className={cell}>{badge({ level: log.level })}</td>
                   <td className={cell}>
-                    <code className="font-mono text-[0.9rem]">{log.target}</code>
+                    <code className="font-mono text-[0.9rem] break-all">{log.target}</code>
                   </td>
                   <td className={cell}>
                     <span className="text-[0.9rem] break-words">{log.message}</span>
@@ -337,28 +353,49 @@ export function LogsPage() {
             })}
           </tbody>
         </table>
+      </div>
 
         <div className="flex justify-between items-center px-6 py-4 border-t-2 border-black bg-white">
-          <span className="text-[0.85rem] text-ink-soft">
-            {total === 0
-              ? loading
-                ? 'Loading...'
-                : 'No logs'
-              : `Showing ${pageStart} to ${pageEnd} of ${total.toLocaleString()} logs`}
+          <span className="text-[0.85rem] text-ink-soft min-w-[200px]">
+            {loading ? (
+              <span className="flex items-center gap-2">
+                <RiLoader4Line className="animate-spin" /> Loading logs...
+              </span>
+            ) : total === 0 ? (
+              'No logs'
+            ) : (
+              `Showing ${pageStart} to ${pageEnd} of ${total.toLocaleString()} logs`
+            )}
           </span>
-          <div className="flex gap-2">
-            <Button
-              onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
-              disabled={!hasPrev || loading}
-            >
-              Prev
-            </Button>
-            <Button
-              onClick={() => setOffset((o) => o + PAGE_SIZE)}
-              disabled={!hasNext || loading}
-            >
-              Next
-            </Button>
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <span className="text-[0.85rem] text-ink-soft whitespace-nowrap">Per page:</span>
+              <SelectBox
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
+                className="!py-1 !px-2 !pr-8 text-[0.85rem] h-8"
+              >
+                {PAGE_SIZE_OPTIONS.map((opt) => (
+                  <option key={opt} value={opt}>
+                    {opt}
+                  </option>
+                ))}
+              </SelectBox>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                onClick={() => setOffset((o) => Math.max(0, o - pageSize))}
+                disabled={!hasPrev || loading}
+              >
+                Prev
+              </Button>
+              <Button
+                onClick={() => setOffset((o) => o + pageSize)}
+                disabled={!hasNext || loading}
+              >
+                Next
+              </Button>
+            </div>
           </div>
         </div>
       </div>
@@ -395,7 +432,7 @@ function LogDetailModal({ entry, onClose }: { entry: LogEntry; onClose: () => vo
           <button
             type="button"
             onClick={onClose}
-            className="text-[0.85rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink"
+            className="text-[0.85rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink cursor-pointer"
           >
             Close
           </button>

@@ -9,7 +9,7 @@ interface TopNavProps {
 export function TopNav({ breadcrumbs }: TopNavProps) {
   const { logout } = useAuth();
   return (
-    <header className="px-8 py-5 border-b-2 border-black bg-white shrink-0 flex items-center justify-between gap-6">
+    <header className="sticky top-0 z-10 px-8 py-3 border-b-2 border-black bg-white shrink-0 flex items-center justify-between gap-6">
       <nav className="text-[0.9rem] font-semibold text-ink-soft flex items-center gap-2">
         <RiHomeLine className="text-base" />
         {breadcrumbs.map((label, i) => {
@@ -25,7 +25,7 @@ export function TopNav({ breadcrumbs }: TopNavProps) {
       <button
         type="button"
         onClick={logout}
-        className="inline-flex items-center gap-1.5 text-[0.85rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink"
+        className="inline-flex items-center gap-1.5 text-[0.85rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink cursor-pointer"
         aria-label="Logout"
       >
         <RiLogoutBoxRLine /> Logout

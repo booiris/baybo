@@ -286,11 +286,12 @@ export interface components {
             kind: "exec_command";
         };
         /**
-         * @description Admin-surface mirror of [`aura_model::ChannelType`]. Matches the
-         *     `snake_case` wire format exactly; conversions below round-trip.
-         * @enum {string}
+         * @description Admin-surface mirror of [`aura_model::ChannelType`]. Transparent
+         *     wrapper around a snake_case string so the OpenAPI surface stays
+         *     stable while the core type is open-ended (runtime-registered
+         *     sidecars like `"slack"` pass through unchanged).
          */
-        ChannelType: "telegram" | "discord" | "http" | "tui";
+        ChannelType: string;
         /**
          * @description `POST /v1/cron` body. Schedule format is the standard 5-field cron
          *     string accepted by [`aura_cron`].
