@@ -7,15 +7,20 @@ use aura_security::SecretVault;
 use aura_storage::{ChannelBotStore, retry_on_busy};
 use serde_json::json;
 
-use crate::cli::{ChannelBotCmd, ChannelsCmd};
+use crate::cli::ChannelCmd;
 use crate::context::CommandContext;
 use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
-pub async fn handle(ctx: &CommandContext, cmd: ChannelsCmd) -> Result<CommandOutput> {
+pub async fn handle(ctx: &CommandContext, cmd: ChannelCmd) -> Result<CommandOutput> {
     match cmd {
-        ChannelsCmd::List => list(ctx).await,
-        ChannelsCmd::Bot { cmd } => handle_bot(ctx, cmd).await,
+        ChannelCmd::List => list(ctx).await,
+        ChannelCmd::Add { channel_type } => add_bot(ctx, channel_type).await,
+        ChannelCmd::Remove {
+            channel_type,
+            bot_id,
+        } => remove_bot(ctx, channel_type, bot_id).await,
+        ChannelCmd::Bots { channel_type } => list_bots(ctx, channel_type).await,
     }
 }
 
@@ -44,17 +49,6 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
                 .collect::<Vec<_>>(),
         }),
     ))
-}
-
-async fn handle_bot(ctx: &CommandContext, cmd: ChannelBotCmd) -> Result<CommandOutput> {
-    match cmd {
-        ChannelBotCmd::Add { channel_type } => add_bot(ctx, channel_type).await,
-        ChannelBotCmd::Remove {
-            channel_type,
-            bot_id,
-        } => remove_bot(ctx, channel_type, bot_id).await,
-        ChannelBotCmd::List { channel_type } => list_bots(ctx, channel_type).await,
-    }
 }
 
 fn require_bot_deps(

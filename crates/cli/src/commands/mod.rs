@@ -1,5 +1,5 @@
 pub mod agent;
-pub mod channels;
+pub mod channel;
 pub mod completion;
 pub mod config;
 pub mod cron;

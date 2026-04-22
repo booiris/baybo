@@ -11,7 +11,7 @@ use std::sync::Arc;
 use aura_agent::{CronScheduler, JobManager, MemoryManager, SessionManager};
 use aura_channels::ChannelRegistry;
 use aura_cli::cli::{
-    AgentCmd, ChannelsCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd,
+    AgentCmd, ChannelCmd, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, MemoryCmd,
     SessionCmd, SkillsCmd, TraceCmd, WorkspaceCmd,
 };
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
@@ -518,7 +518,7 @@ async fn channels_list_on_empty_registry_returns_placeholder() {
     let out = dispatch::run(
         &ctx,
         Commands::Channel {
-            cmd: ChannelsCmd::List,
+            cmd: ChannelCmd::List,
         },
     )
     .await

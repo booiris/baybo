@@ -64,9 +64,10 @@ pub enum Commands {
         cmd: SkillsCmd,
     },
     /// Inspect channel adapters.
+    #[command(name = "channel")]
     Channel {
         #[command(subcommand)]
-        cmd: ChannelsCmd,
+        cmd: ChannelCmd,
     },
     /// Manage per-user pairings: approve new senders, list pending
     /// requests, revoke existing approvals. See
@@ -220,14 +221,30 @@ pub enum SkillsCmd {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum ChannelsCmd {
+pub enum ChannelCmd {
     /// List registered channel adapters and their current status.
     List,
-    /// Manage per-tenant credentials (e.g. Telegram bots) that the
-    /// gateway hands to sidecars at runtime.
-    Bot {
-        #[command(subcommand)]
-        cmd: ChannelBotCmd,
+    /// Register a new bot for the given channel. After `channel_type`
+    /// is provided, the CLI interactively prompts for `bot_id` and
+    /// `token`; pressing Enter on the token prompt stores an empty
+    /// string. Writes directly to libsql + the vault; a running
+    /// gateway picks up the new bot within a couple of seconds via
+    /// the reconciler.
+    Add {
+        /// e.g. `telegram`
+        channel_type: String,
+    },
+    /// Deregister a bot. Soft-deletes the row and removes its vault
+    /// secret; a running gateway's reconciler pushes a `StopBot` to
+    /// the sidecar on the next tick.
+    Remove {
+        channel_type: String,
+        bot_id: String,
+    },
+    /// List live bots registered for one channel type.
+    Bots {
+        /// e.g. `telegram`
+        channel_type: String,
     },
 }
 
@@ -267,29 +284,6 @@ pub enum PairCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ChannelBotCmd {
-    /// Register a new bot for the given channel. After `channel_type`
-    /// is provided, the CLI interactively prompts for `bot_id` and
-    /// `token`; pressing Enter on the token prompt stores an empty
-    /// string. Writes directly to libsql + the vault; a running
-    /// gateway picks up the new bot within a couple of seconds via
-    /// the reconciler.
-    Add {
-        /// e.g. `telegram`
-        channel_type: String,
-    },
-    /// Deregister a bot. Soft-deletes the row and removes its vault
-    /// secret; a running gateway's reconciler pushes a `StopBot` to
-    /// the sidecar on the next tick.
-    Remove {
-        channel_type: String,
-        bot_id: String,
-    },
-    /// List live bots for a channel.
-    List { channel_type: String },
 }
 
 #[derive(Debug, Subcommand)]

@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    AgentCmd, ChannelBotCmd, ChannelsCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg,
-    LlmCmd, MemoryCmd, SessionCmd, ShellKind, SkillsCmd, TraceCmd, WorkspaceCmd,
+    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd,
+    MemoryCmd, SessionCmd, ShellKind, SkillsCmd, TraceCmd, WorkspaceCmd,
 };
 use clap::Parser;
 
@@ -79,37 +79,36 @@ fn channels_list_parses() {
     assert!(matches!(
         cli.command,
         Some(Commands::Channel {
-            cmd: ChannelsCmd::List
+            cmd: ChannelCmd::List
         })
     ));
 }
 
 #[test]
 fn channels_bot_add_prompts_after_channel_type_only() {
-    let cli = parse(&["channel", "bot", "add", "telegram"]);
+    let cli = parse(&["channel", "add", "telegram"]);
     match cli.command {
         Some(Commands::Channel {
-            cmd:
-                ChannelsCmd::Bot {
-                    cmd: ChannelBotCmd::Add { channel_type },
-                },
+            cmd: ChannelCmd::Add { channel_type },
         }) => assert_eq!(channel_type, "telegram"),
         other => panic!("unexpected: {other:?}"),
     }
 
-    assert!(Cli::try_parse_from(["aura", "channel", "bot", "add"]).is_err());
-    assert!(Cli::try_parse_from(["aura", "channel", "bot", "add", "telegram", "bot-1"]).is_err());
+    assert!(Cli::try_parse_from(["aura", "channel", "add"]).is_err());
+    assert!(Cli::try_parse_from(["aura", "channel", "add", "telegram", "bot-1"]).is_err());
 }
 
 #[test]
-fn channels_alias_still_parses() {
-    let cli = parse(&["channels", "list"]);
-    assert!(matches!(
-        cli.command,
+fn channel_bots_requires_channel_type() {
+    let cli = parse(&["channel", "bots", "telegram"]);
+    match cli.command {
         Some(Commands::Channel {
-            cmd: ChannelsCmd::List
-        })
-    ));
+            cmd: ChannelCmd::Bots { channel_type },
+        }) => assert_eq!(channel_type, "telegram"),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    assert!(Cli::try_parse_from(["aura", "channel", "bots"]).is_err());
 }
 
 #[test]
