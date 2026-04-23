@@ -1,37 +1,37 @@
 //! Round-trip integration coverage for the gateway-side WS channel
 //! server.
 //!
-//! Spins a real [`ChannelServer`] against a temp-dir socket, drives a
-//! raw `tokio-tungstenite` WebSocket client end-to-end — register →
-//! sidecar→agent message → agent→sidecar message → duplicate-register
-//! rejection → disconnect cleanup.
+//! Spins a real [`ChannelServer`] on an ephemeral loopback TCP port,
+//! drives a raw `tokio-tungstenite` WebSocket client end-to-end —
+//! register → sidecar→agent message → agent→sidecar message →
+//! duplicate-register rejection → disconnect cleanup.
 //!
 //! No Rust SDK exists any more; sidecars ship as the TypeScript
 //! package under `sdks/channel-ts/`, so this test talks to the
 //! gateway's WS endpoint directly via the shared [`wire`] module.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::wire::{self, Frame, Message as WireMessage, PROTOCOL_VERSION};
 use aura_channels::{AgentOutput, OutgoingMessage};
+use aura_gateway::channel_listener::ChannelServer;
 use aura_gateway::test_support::build_test_deps;
-use aura_gateway::uds::ChannelServer;
 use aura_gateway_auth::{CHANNEL_TOKEN_HEADER, ClientIdentity, TUI_PSK_HEADER};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata};
 use futures::{SinkExt, StreamExt};
-use tokio::net::UnixStream;
+use tokio::net::TcpStream;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TEST_PSK: [u8; 32] = [0x42; 32];
-const HANDSHAKE_URL: &str = "ws://localhost/v1/channel-ws";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn channel_ws_end_to_end() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let socket_path = tempdir.path().join("channel.sock");
+    let port_file = tempdir.path().join("channel.port");
 
     let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -40,21 +40,21 @@ async fn channel_ws_end_to_end() {
 
     let server = ChannelServer::bind(
         &tg.deps,
-        socket_path.clone(),
+        port_file.clone(),
         TEST_PSK,
         channel_tokens.clone(),
     )
     .expect("bind ChannelServer");
+    let port = server.port();
 
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
         let _ = server.run(server_shutdown).await;
     });
 
-    // Mint a token bound to the test process's PID. The UDS listener
-    // extracts peercred on accept, the channel-auth middleware enforces
-    // pid == token.pid, and the register-frame validator then re-checks
-    // the same identity against the token embedded in the frame.
+    // Mint a token. Peer credentials are no longer part of the auth
+    // chain (loopback TCP), so any PID works — we use the test
+    // process's id purely for diagnostic symmetry with production.
     let handle = channel_tokens.mint(ClientIdentity {
         pid: std::process::id(),
         label: "slack".into(),
@@ -64,7 +64,7 @@ async fn channel_ws_end_to_end() {
     let slack = ChannelType::from("slack");
 
     // 1. Sidecar registers.
-    let mut client = connect_register(&socket_path, &token, slack.clone())
+    let mut client = connect_register(port, &token, slack.clone())
         .await
         .expect("sidecar handshake");
     assert!(
@@ -124,7 +124,7 @@ async fn channel_ws_end_to_end() {
     assert_eq!(recv.channel_type, slack);
 
     // 4. Duplicate registration for the same channel type is rejected.
-    match connect_register(&socket_path, &token, slack.clone()).await {
+    match connect_register(port, &token, slack.clone()).await {
         Ok(_) => panic!("duplicate register unexpectedly succeeded"),
         Err(ConnectError::RegistrationRejected(msg)) => {
             assert!(
@@ -151,7 +151,7 @@ async fn channel_ws_end_to_end() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 }
 
-type WsStream = tokio_tungstenite::WebSocketStream<UnixStream>;
+type WsStream = tokio_tungstenite::WebSocketStream<TcpStream>;
 
 #[derive(Debug)]
 enum ConnectError {
@@ -174,15 +174,23 @@ impl From<wire::WireError> for ConnectError {
     }
 }
 
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+fn handshake_url(port: u16) -> String {
+    format!("ws://127.0.0.1:{port}/v1/channel-ws")
+}
+
 async fn connect_register(
-    socket_path: &std::path::Path,
+    port: u16,
     token: &str,
     channel_type: ChannelType,
 ) -> Result<WsStream, ConnectError> {
-    let stream = UnixStream::connect(socket_path)
+    let stream = TcpStream::connect(loopback(port))
         .await
         .map_err(ConnectError::Dial)?;
-    let mut request = HANDSHAKE_URL
+    let mut request = handshake_url(port)
         .into_client_request()
         .map_err(|e| ConnectError::Upgrade(e.to_string()))?;
     request.headers_mut().insert(
@@ -303,7 +311,7 @@ async fn recv_notice(ws: &mut WsStream) -> Result<(String, String, String), Conn
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let socket_path = tempdir.path().join("channel.sock");
+    let port_file = tempdir.path().join("channel.port");
 
     let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let pairing_store = tg.deps.stores.channel_pairing.clone();
@@ -312,11 +320,12 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
 
     let server = ChannelServer::bind(
         &tg.deps,
-        socket_path.clone(),
+        port_file.clone(),
         TEST_PSK,
         channel_tokens.clone(),
     )
     .expect("bind ChannelServer");
+    let port = server.port();
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
         let _ = server.run(server_shutdown).await;
@@ -329,15 +338,16 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let token = handle.token().to_string();
     let slack = ChannelType::from("slack");
 
-    let mut client = connect_register(&socket_path, &token, slack.clone())
+    let mut client = connect_register(port, &token, slack.clone())
         .await
         .expect("sidecar handshake");
 
     // 1. Un-paired triple — aura refuses with a Notice containing a code.
     let inbound = WireMessage {
         content: "hi".into(),
-        // Empty session_id triggers the empty-session branch that runs
-        // the pairing gate; the sidecar path also carries user_id+bot_id.
+        // Empty session_id triggers the empty-session branch that
+        // runs the pairing gate; the sidecar path also carries
+        // user_id + bot_id.
         session_id: String::new(),
         user_id: "alice".into(),
         channel_type: slack.clone(),
@@ -413,7 +423,7 @@ async fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_tui_clients_same_gateway_different_sessions() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let socket_path = tempdir.path().join("channel.sock");
+    let port_file = tempdir.path().join("channel.port");
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -422,11 +432,12 @@ async fn two_tui_clients_same_gateway_different_sessions() {
 
     let server = ChannelServer::bind(
         &tg.deps,
-        socket_path.clone(),
+        port_file.clone(),
         TEST_PSK,
         channel_tokens.clone(),
     )
     .expect("bind ChannelServer");
+    let port = server.port();
 
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -436,10 +447,10 @@ async fn two_tui_clients_same_gateway_different_sessions() {
     let tui = ChannelType::from(ChannelType::TUI);
 
     // Two TUIs pin distinct session ids.
-    let mut alice = connect_register_tui(&socket_path, &TEST_PSK, "sess-alice")
+    let mut alice = connect_register_tui(port, &TEST_PSK, "sess-alice")
         .await
         .expect("alice handshake");
-    let mut bob = connect_register_tui(&socket_path, &TEST_PSK, "sess-bob")
+    let mut bob = connect_register_tui(port, &TEST_PSK, "sess-bob")
         .await
         .expect("bob handshake");
 
@@ -453,7 +464,7 @@ async fn two_tui_clients_same_gateway_different_sessions() {
     );
 
     // Duplicate registration of an already-claimed session id is rejected.
-    match connect_register_tui(&socket_path, &TEST_PSK, "sess-alice").await {
+    match connect_register_tui(port, &TEST_PSK, "sess-alice").await {
         Ok(_) => panic!("duplicate session register unexpectedly succeeded"),
         Err(ConnectError::RegistrationRejected(msg)) => {
             assert!(msg.contains("already"), "unexpected reason: {msg}",);
@@ -545,13 +556,14 @@ async fn two_tui_clients_same_gateway_different_sessions() {
 }
 
 /// Server-side history acts like a zsh ring shared across every TUI
-/// process attached to this gateway: entries one TUI writes become part
-/// of the snapshot a subsequent TUI sees, with consecutive duplicates
-/// deduped and no vault contention between the two clients.
+/// process attached to this gateway: entries one TUI writes become
+/// part of the snapshot a subsequent TUI sees, with consecutive
+/// duplicates deduped and no vault contention between the two
+/// clients.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tui_history_round_trips_across_clients() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let socket_path = tempdir.path().join("channel.sock");
+    let port_file = tempdir.path().join("channel.port");
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_tokens = tg.channel_tokens.clone();
@@ -559,11 +571,12 @@ async fn tui_history_round_trips_across_clients() {
 
     let server = ChannelServer::bind(
         &tg.deps,
-        socket_path.clone(),
+        port_file.clone(),
         TEST_PSK,
         channel_tokens.clone(),
     )
     .expect("bind ChannelServer");
+    let port = server.port();
 
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -572,13 +585,13 @@ async fn tui_history_round_trips_across_clients() {
 
     // Alice connects first — fresh vault, empty snapshot.
     let (mut alice, alice_snapshot) =
-        connect_register_tui_with_snapshot(&socket_path, &TEST_PSK, "sess-alice")
+        connect_register_tui_with_snapshot(port, &TEST_PSK, "sess-alice")
             .await
             .expect("alice handshake");
     assert!(alice_snapshot.is_empty(), "fresh vault: snapshot is empty");
 
-    // Alice appends three entries, with one consecutive duplicate that
-    // the server-side store should collapse.
+    // Alice appends three entries, with one consecutive duplicate
+    // that the server-side store should collapse.
     for entry in ["one", "two", "two", "three"] {
         send_frame(
             &mut alice,
@@ -591,10 +604,10 @@ async fn tui_history_round_trips_across_clients() {
         .expect("alice append");
     }
 
-    // Bob connects on a fresh session. The gateway is the single writer
-    // of the vault key, so Bob's snapshot must contain Alice's entries
-    // (consecutive duplicate collapsed).
-    let bob_snapshot = wait_for_snapshot(&socket_path, &TEST_PSK, "bob-", &["one", "two", "three"])
+    // Bob connects on a fresh session. The gateway is the single
+    // writer of the vault key, so Bob's snapshot must contain
+    // Alice's entries (consecutive duplicate collapsed).
+    let bob_snapshot = wait_for_snapshot(port, &TEST_PSK, "bob-", &["one", "two", "three"])
         .await
         .expect("bob snapshot reflects alice's appends");
     assert_eq!(bob_snapshot, vec!["one", "two", "three"]);
@@ -603,15 +616,16 @@ async fn tui_history_round_trips_across_clients() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 }
 
-/// Repeatedly open a TUI connection and return the first snapshot that
-/// matches `expected`. Appends over the WS are fire-and-forget so a new
-/// client may observe the store before the gateway has persisted the
-/// latest append — polling is the simplest way to stay deterministic
-/// without reaching into the store directly. Each attempt uses a fresh
-/// session id so the registry's per-session guard doesn't reject the
-/// re-register while the previous connection is still being torn down.
+/// Repeatedly open a TUI connection and return the first snapshot
+/// that matches `expected`. Appends over the WS are fire-and-forget
+/// so a new client may observe the store before the gateway has
+/// persisted the latest append — polling is the simplest way to
+/// stay deterministic without reaching into the store directly.
+/// Each attempt uses a fresh session id so the registry's
+/// per-session guard doesn't reject the re-register while the
+/// previous connection is still being torn down.
 async fn wait_for_snapshot(
-    socket_path: &std::path::Path,
+    port: u16,
     psk: &[u8; 32],
     session_prefix: &str,
     expected: &[&str],
@@ -621,8 +635,7 @@ async fn wait_for_snapshot(
     while tokio::time::Instant::now() < deadline {
         let sid = format!("{session_prefix}{attempt}");
         attempt += 1;
-        if let Ok((_ws, snapshot)) =
-            connect_register_tui_with_snapshot(socket_path, psk, &sid).await
+        if let Ok((_ws, snapshot)) = connect_register_tui_with_snapshot(port, psk, &sid).await
             && snapshot.len() == expected.len()
             && snapshot.iter().zip(expected).all(|(a, b)| a == b)
         {
@@ -634,27 +647,27 @@ async fn wait_for_snapshot(
 }
 
 async fn connect_register_tui(
-    socket_path: &std::path::Path,
+    port: u16,
     psk: &[u8; 32],
     session_id: &str,
 ) -> Result<WsStream, ConnectError> {
-    let (ws, _) = connect_register_tui_with_snapshot(socket_path, psk, session_id).await?;
+    let (ws, _) = connect_register_tui_with_snapshot(port, psk, session_id).await?;
     Ok(ws)
 }
 
 /// Same as [`connect_register_tui`] but also returns the history
-/// snapshot the server pushes right after `RegisterAck`. Used by the
-/// history round-trip tests; the regular session-routing tests ignore
-/// the snapshot.
+/// snapshot the server pushes right after `RegisterAck`. Used by
+/// the history round-trip tests; the regular session-routing tests
+/// ignore the snapshot.
 async fn connect_register_tui_with_snapshot(
-    socket_path: &std::path::Path,
+    port: u16,
     psk: &[u8; 32],
     session_id: &str,
 ) -> Result<(WsStream, Vec<String>), ConnectError> {
-    let stream = UnixStream::connect(socket_path)
+    let stream = TcpStream::connect(loopback(port))
         .await
         .map_err(ConnectError::Dial)?;
-    let mut request = HANDSHAKE_URL
+    let mut request = handshake_url(port)
         .into_client_request()
         .map_err(|e| ConnectError::Upgrade(e.to_string()))?;
     let psk_hex = hex::encode(psk);
@@ -689,9 +702,9 @@ async fn connect_register_tui_with_snapshot(
         _ => return Err(ConnectError::ProtocolViolation("expected RegisterAck")),
     }
 
-    // Session-scoped TUI clients receive a HistorySnapshot right after
-    // RegisterAck. Drain it so the caller sees a clean stream of
-    // agent-output frames afterward.
+    // Session-scoped TUI clients receive a HistorySnapshot right
+    // after RegisterAck. Drain it so the caller sees a clean stream
+    // of agent-output frames afterward.
     match recv_frame(&mut ws).await? {
         Frame::HistorySnapshot {
             session_id: sid,

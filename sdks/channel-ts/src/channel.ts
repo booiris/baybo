@@ -146,18 +146,18 @@ export interface Channel {
 
 export interface RunOptions {
   /**
-   * Explicit WebSocket URL. Accepts standard `ws://` / `wss://` for TCP
-   * deployments and `ws+unix://<socket-path>:/v1/channel-ws` for UDS.
-   * Default: derived from the `AURA_CHANNEL_SOCKET` env var — the
-   * convention a future sidecar supervisor will set; until that lands,
-   * the sidecar's launcher must export it (or pass `wsUrl` directly).
+   * Explicit WebSocket URL (e.g. `ws://127.0.0.1:42111/v1/channel-ws`
+   * for the default loopback deployment, or `wss://` for any custom
+   * remote gateway). Default: read from the `AURA_CHANNEL_URL` env
+   * var — the gateway's sidecar supervisor sets it when it spawns
+   * the child process.
    */
   wsUrl?: string;
 
   /**
-   * Capability token presented on the `Register` frame. Default: read
-   * from the `AURA_CHANNEL_TOKEN` env var (same launcher contract as
-   * `AURA_CHANNEL_SOCKET`).
+   * Capability token presented on the `Register` frame. Default:
+   * read from the `AURA_CHANNEL_TOKEN` env var (same launcher
+   * contract as `AURA_CHANNEL_URL`).
    */
   token?: string;
 

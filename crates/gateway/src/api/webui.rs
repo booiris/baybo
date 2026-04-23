@@ -1,12 +1,13 @@
 //! Serves the React dashboard (built from `web/`) baked into the
 //! gateway binary at compile time.
 //!
-//! `build.rs` walks `web/dist/` and emits a `lookup()` function where
-//! each arm is an `include_bytes!`-backed asset — no embedding crate
-//! needed at runtime. If the frontend hasn't been built, `build.rs`
-//! drops a placeholder `index.html` so `cargo build` still works;
-//! release builds run `npm ci && npm run build` in `web/` first to
-//! ship the real dashboard.
+//! `build.rs` walks `web/dist/`, zstd-compresses each asset, and emits
+//! a static asset table. The first request lazily decompresses that
+//! table into memory — no embedding crate needed at runtime. If the
+//! frontend hasn't been built, `build.rs` drops a placeholder
+//! `index.html` so `cargo build` still works; release builds run
+//! `pnpm install && pnpm --filter aura-web build` first to ship the
+//! real dashboard.
 //!
 //! Mounted as the admin router fallback, so `/`, `/assets/…`, and any
 //! unmatched path resolve here while `/healthz`, `/readyz`, and
@@ -14,20 +15,39 @@
 //! the bundle is inert HTML/JS; every privileged data path still goes
 //! through `/v1/*`, which keeps its bearer-token gate.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 
-mod assets {
+mod generated {
     include!(concat!(env!("OUT_DIR"), "/webui_assets.rs"));
 }
+
+struct DecompressedAsset {
+    bytes: Box<[u8]>,
+    mime: &'static str,
+}
+
+static DECOMPRESSED_ASSETS: OnceLock<Result<HashMap<&'static str, DecompressedAsset>, String>> =
+    OnceLock::new();
 
 pub async fn serve(uri: Uri) -> Response {
     let raw = uri.path().trim_start_matches('/');
     let path = if raw.is_empty() { "index.html" } else { raw };
 
-    if let Some((bytes, mime)) = assets::lookup(path) {
-        return build_response(path, bytes, mime);
+    match lookup(path) {
+        Ok(Some((bytes, mime))) => return build_response(path, bytes, mime),
+        Ok(None) => {}
+        Err(message) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("webui asset load failed: {message}"),
+            )
+                .into_response();
+        }
     }
 
     // Missing hashed asset: return 404 rather than SPA-fallback so a
@@ -39,10 +59,41 @@ pub async fn serve(uri: Uri) -> Response {
 
     // Unknown route — fall back to index.html so SPA deep links keep
     // working.
-    match assets::lookup("index.html") {
-        Some((bytes, mime)) => build_response("index.html", bytes, mime),
-        None => (StatusCode::NOT_FOUND, "webui bundle not embedded").into_response(),
+    match lookup("index.html") {
+        Ok(Some((bytes, mime))) => build_response("index.html", bytes, mime),
+        Ok(None) => (StatusCode::NOT_FOUND, "webui bundle not embedded").into_response(),
+        Err(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("webui asset load failed: {message}"),
+        )
+            .into_response(),
     }
+}
+
+fn lookup(path: &str) -> Result<Option<(&'static [u8], &'static str)>, &'static str> {
+    let assets = DECOMPRESSED_ASSETS.get_or_init(build_asset_cache);
+    match assets {
+        Ok(assets) => Ok(assets
+            .get(path)
+            .map(|asset| (asset.bytes.as_ref(), asset.mime))),
+        Err(message) => Err(message.as_str()),
+    }
+}
+
+fn build_asset_cache() -> Result<HashMap<&'static str, DecompressedAsset>, String> {
+    let mut assets = HashMap::with_capacity(generated::ASSETS.len());
+    for asset in generated::ASSETS {
+        let bytes = zstd::stream::decode_all(asset.content_zst)
+            .map_err(|e| format!("decompress {}: {e}", asset.path))?;
+        assets.insert(
+            asset.path,
+            DecompressedAsset {
+                bytes: bytes.into_boxed_slice(),
+                mime: asset.mime,
+            },
+        );
+    }
+    Ok(assets)
 }
 
 fn build_response(path: &str, bytes: &'static [u8], mime: &'static str) -> Response {

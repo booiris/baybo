@@ -7,7 +7,7 @@
 //! PSK-authenticated flow — the subprocess env-var flow has no Rust
 //! consumer and isn't carried over.
 
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use aura_channels::wire::{self, Frame, Message, PROTOCOL_VERSION};
@@ -15,32 +15,27 @@ use aura_model::ChannelType;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use thiserror::Error;
-use tokio::net::UnixStream;
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
-/// HTTP header carrying the per-install TUI PSK (hex-encoded) on the WS
-/// upgrade request. Mirrors `aura_gateway_auth::TUI_PSK_HEADER`; kept
-/// as a plain const so the TUI stays free of a runtime dep on the
-/// gateway-auth crate.
+/// HTTP header carrying the per-install TUI PSK (hex-encoded) on the
+/// WS upgrade request. Mirrors `aura_gateway_auth::TUI_PSK_HEADER`;
+/// kept as a plain const so the TUI stays free of a runtime dep on
+/// the gateway-auth crate.
 const TUI_PSK_HEADER: &str = "x-aura-tui-secret";
 
-/// Nominal WebSocket URL. The UDS is the real transport, but
-/// `tokio-tungstenite::client_async` still needs a syntactically valid
-/// URL for the HTTP upgrade line; the host part is never resolved.
-const HANDSHAKE_URL: &str = "ws://localhost/v1/channel-ws";
-
-type WsStream = WebSocketStream<UnixStream>;
+type WsStream = WebSocketStream<TcpStream>;
 type WsSink = SplitSink<WsStream, WsMessage>;
 type WsSource = SplitStream<WsStream>;
 
 /// Error surface for the TUI's WS client.
 #[derive(Debug, Error)]
 pub enum WsClientError {
-    #[error("uds dial failed: {0}")]
-    UdsDial(#[source] std::io::Error),
+    #[error("tcp dial failed: {0}")]
+    TcpDial(#[source] std::io::Error),
 
     #[error("websocket upgrade failed: {0}")]
     WsUpgrade(String),
@@ -87,14 +82,14 @@ impl WsClient {
     /// means the caller's `recv_*` loop sees a clean stream of turn
     /// frames afterward and never has to know the snapshot exists.
     pub async fn connect_tui(
-        socket_path: impl AsRef<Path>,
+        port: u16,
         psk: &[u8; 32],
         channel_type: ChannelType,
         session_id: String,
     ) -> Result<(Self, Vec<String>), WsClientError> {
         let psk_hex = hex::encode(psk);
         Self::connect_inner(
-            socket_path.as_ref().to_path_buf(),
+            port,
             TUI_PSK_HEADER,
             &psk_hex,
             String::new(),
@@ -105,17 +100,23 @@ impl WsClient {
     }
 
     async fn connect_inner(
-        socket_path: PathBuf,
+        port: u16,
         header_name: &'static str,
         header_value: &str,
         register_token: String,
         channel_type: ChannelType,
         session_id: Option<String>,
     ) -> Result<(Self, Vec<String>), WsClientError> {
-        let stream = UnixStream::connect(&socket_path)
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let stream = TcpStream::connect(addr)
             .await
-            .map_err(WsClientError::UdsDial)?;
-        let mut request = HANDSHAKE_URL
+            .map_err(WsClientError::TcpDial)?;
+        // Handshake URL embeds the real port so the HTTP Upgrade's
+        // Host header matches what the gateway sees on the accept
+        // socket — avoids any "origin mismatch" surprises if axum
+        // ever gates on that.
+        let handshake_url = format!("ws://127.0.0.1:{port}/v1/channel-ws");
+        let mut request = handshake_url
             .into_client_request()
             .map_err(|e| WsClientError::WsUpgrade(e.to_string()))?;
         request.headers_mut().insert(

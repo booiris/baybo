@@ -127,7 +127,11 @@ async function runOnce(
   if (rootSignal.aborted) connAbort.abort();
   else rootSignal.addEventListener("abort", onRootAbort, { once: true });
 
-  const ws = new WebSocket(wsUrl, { handshakeTimeout: 5_000 });
+  const dialUrl = appendToken(wsUrl, token);
+  logger.info(
+    `connecting ${wsUrl} (token ${token.slice(0, 6)}…, len ${token.length})`,
+  );
+  const ws = new WebSocket(dialUrl, { handshakeTimeout: 5_000 });
   ws.binaryType = "arraybuffer";
   const frames = new FrameQueue();
   attachWsHandlers(ws, frames, logger);
@@ -254,14 +258,26 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function deriveWsUrl(): string {
-  const socketPath = process.env["AURA_CHANNEL_SOCKET"];
-  if (!socketPath) {
+  const url = process.env["AURA_CHANNEL_URL"];
+  if (!url) {
     throw new RunnerError(
-      "missing connection target: pass opts.wsUrl or set AURA_CHANNEL_SOCKET",
+      "missing connection target: pass opts.wsUrl or set AURA_CHANNEL_URL",
       "config",
     );
   }
-  return `ws+unix://${socketPath}:/v1/channel-ws`;
+  return url;
+}
+
+/// Append `token=<encoded>` to a ws:// URL's query string. Idempotent
+/// — if an existing `token=` is present it's replaced.
+function appendToken(url: string, token: string): string {
+  const encoded = encodeURIComponent(token);
+  const [base, query = ""] = url.split("?", 2);
+  const kept = query
+    .split("&")
+    .filter((p) => p.length > 0 && !p.startsWith("token="));
+  kept.push(`token=${encoded}`);
+  return `${base}?${kept.join("&")}`;
 }
 
 function waitOpen(ws: WebSocket): Promise<void> {

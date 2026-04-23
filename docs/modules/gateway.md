@@ -9,13 +9,18 @@ by side against the same manager graph:
    operator controls (config, jobs, cron, memory, traces, skills, tools,
    channels-list, llm, status) that mirror the CLI command families. No
    chat content or session data flows here.
-2. **Channel listener** — Unix domain socket, authenticated by either the
-   TUI pre-shared key or a per-subprocess token (subprocess pid pinned).
-   Hosts a single `GET /v1/channel-ws` endpoint that upgrades authed
-   requests to a WebSocket. Each connection registers itself as a live
+2. **Channel listener** — loopback TCP (`127.0.0.1:<ephemeral>`),
+   authenticated by either the TUI pre-shared key or a per-subprocess
+   token. The chosen port is published to `<workspace>/channel.port`
+   (mode `0o600`) so the TUI and spawned sidecars discover it without
+   a config roundtrip. The listener hosts a single
+   `GET /v1/channel-ws` endpoint that upgrades authed requests to a
+   WebSocket. Each connection registers itself as a live
    [`aura_channels::Channel`] on the workspace [`ChannelRegistry`] and
    exchanges MessagePack-framed events with the agent. The built-in
-   TUI and every out-of-process sidecar plugin speak this one protocol.
+   TUI and every out-of-process sidecar plugin speak this one
+   protocol. `127.0.0.1` binding is hardcoded — config cannot loosen
+   it to `0.0.0.0`.
 
 Per-connection state lives in `src/channel/adapter.rs::Sidecar`: it
 builds the [`aura_channels::Channel`] handle the registry sees, owns an
@@ -67,20 +72,21 @@ invalidate a leaked token. Because the vault requires the master
 encryption key, the token's confidentiality rides on the same root
 secret as every other credential in the project.
 
-### Channel auth — peer-cred + PSK / subprocess token
+### Channel auth — PSK / subprocess token
 
-The channel listener enforces two stacked checks on every request:
+The channel listener enforces header auth on every request — exactly
+one of:
 
-1. **SO_PEERCRED** (Linux) / `getpeereid` (macOS) extracts the peer
-   `(uid, pid)` on accept. Requests from a uid other than
-   `geteuid()` are rejected before middleware runs.
-2. **Header auth** — exactly one of:
-   - `x-aura-tui-secret: <hex>` matching the effective TUI PSK (see
-     below). Used by `aura tui`.
-   - `x-aura-channel-token: <hex>` matching an entry in the in-memory
-     `ChannelTokenTable`, provided the connecting peer's pid matches
-     the pid recorded when the token was minted. Used by subprocess
-     channel plugins spawned via `ChannelSpawner`.
+- `x-aura-tui-secret: <hex>` matching the effective TUI PSK (see
+  below). Used by `aura tui`.
+- `x-aura-channel-token: <hex>` matching an entry in the in-memory
+  `ChannelTokenTable`. Used by subprocess channel plugins spawned
+  via `ChannelSpawner`. The table is keyed by the token alone; the
+  entry's PID is retained for diagnostics (log lines, `/v1/status`)
+  but is not used for auth — loopback TCP carries no kernel-attested
+  peer credential, and the token's uniqueness + delivery via a child
+  env var only the owning UID can read makes the extra PID check
+  redundant under the same-UID threat model.
 
 The TUI PSK lives in `aura-gateway-auth` as a 32-byte value generated
 at build time (`build.rs` writes `$OUT_DIR/tui_psk.bin`) plus an
@@ -96,9 +102,10 @@ The effective TUI PSK is a **workspace-binding token**, *not* a defence
 against a same-UID hostile process. Being explicit about the boundary:
 
 *Designed to reject*
-- connections from a different Unix user (already covered by UDS
-  `0o600` perms + `SO_PEERCRED`; the PSK is the belt on top of those
-  suspenders);
+- connections from a different Unix user — the salt file is mode
+  `0o600` and the `<workspace>/channel.port` discovery file is
+  `0o600`, so another UID can't even locate the listener's port;
+  the PSK is the belt on top of those suspenders;
 - cross-workspace mix-ups — a TUI built against workspace A cannot
   authenticate to a gateway in workspace B because the per-install
   salt diverges;
@@ -117,9 +124,8 @@ isolation (seccomp, sandbox-exec, etc.) — not an application-layer
 PSK.
 
 Per-subprocess tokens are minted by `ChannelSpawner::spawn` before
-`Command::spawn`, inserted into `ChannelTokenTable` keyed by the hash
-of the token plus the child pid, and removed in the `ChildHandle`
-`Drop`. Pid reuse is bounded by the child's lifetime. The same
+`Command::spawn`, inserted into `ChannelTokenTable` keyed by the
+token string, and removed in the `ChildHandle` `Drop`. The same
 threat-model caveat applies: a same-UID process can read
 `/proc/<pid>/environ` on Linux and lift the token, so subprocess
 tokens are also workspace/lifetime binding, not hostile-process
@@ -278,12 +284,17 @@ browser — `/v1/*` still enforces `require_admin_token`.
 The admin TCP listener doubles as a web frontend. Sources live at the
 repo root in `web/` (React 19 + TypeScript + Vite + Tailwind v4 +
 react-router, neo-brutalist style). `crates/gateway/build.rs` walks
-`web/dist/` at compile time and emits `$OUT_DIR/webui_assets.rs` with
-one `match` arm per asset — each arm pairs an `include_bytes!`
-reference with a pre-computed MIME string from a small hand-rolled
-extension table (`html`, `js`, `css`, `svg`, `png`, `ico`, fonts,
-fallbacks). No `rust-embed`, no `mime_guess`; the handler reduces to a
-two-entry lookup.
+the relevant `web/` source inputs (`src/`, `index.html`,
+`package.json`, `tsconfig*.json`, `vite.config.ts`,
+`docs/openapi.json`, and the pnpm lock/workspace files). If those
+inputs changed since the last successful web build, it runs
+`pnpm --filter aura-web build`; otherwise it reuses the existing
+`web/dist/`. It then zstd-compresses each emitted asset and writes
+`$OUT_DIR/webui_assets.rs` with a static asset table pairing the path,
+pre-computed MIME string, and compressed bytes (`html`, `js`, `css`,
+`svg`, `png`, `ico`, fonts, fallbacks). No `rust-embed`, no
+`mime_guess`; `api::webui` lazily decompresses the table into memory on
+the first request and then serves the cached bytes afterward.
 
 `api::webui::serve` is mounted via `Router::fallback` so `/`,
 `/assets/...`, and any unmatched path resolve to a baked asset while
@@ -313,16 +324,17 @@ for the regeneration flow.
 Release flow:
 
 ```bash
-cd web
-npm ci
-npm run build
+pnpm install
+pnpm --filter aura-web build
 cargo build --release -p aura-gateway
 ```
 
-If the frontend hasn't been built, `build.rs` drops a one-line
-placeholder `index.html` into `web/dist/` so `cargo build` still
-works for backend-only development. `cargo:rerun-if-changed=web/dist`
-makes the macro re-fire on the next `npm run build`.
+If the tracked web inputs changed, `build.rs` attempts
+`pnpm --filter aura-web build` automatically during `cargo build`. If
+that build fails or the frontend toolchain isn't available,
+`build.rs` falls back to the existing `web/dist/`; if no dist exists at
+all, it writes a one-line placeholder `index.html` so backend-only
+development still compiles.
 
 **Dev flow (HMR)**: rebuilding the gateway on every frontend tweak is
 slow, so for UI iteration run the two sides separately:
@@ -465,7 +477,7 @@ GET    /v1/llm
 GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin surface
 ```
 
-**Channel listener (UDS, peer-cred + PSK/token)** —
+**Channel listener (loopback TCP, PSK/token)** —
 `auth_channel::require_channel_client`:
 
 ```
@@ -536,13 +548,15 @@ pub async fn build_secret_vault(config: &AuraConfig) -> Result<Arc<SecretVault>>
 ```
 
 `gateway_cmd::start` is now the **only** caller of `build_managers` +
-`wire_router` — the TUI talks to the gateway over UDS and holds no
-manager graph of its own. The gateway builds a `GatewayServer` from
-`GatewayDeps`, binds both the admin `TcpListener` and the channel
-`UnixListener`, and drives them in parallel with the router via
-`tokio::select!` on `shutdown.wait`. The channel UDS is `chmod 0o600`
-after bind and unlinked on shutdown (plus a `Drop` guard covers panic
-exits). `graph.channels_registry` starts empty at boot — every
+`wire_router` — the TUI talks to the gateway over loopback TCP and
+holds no manager graph of its own. The gateway builds a
+`GatewayServer` from `GatewayDeps`, binds the admin `TcpListener`
+and a second loopback `TcpListener` (127.0.0.1:0) for the channel
+WS, and drives them in parallel with the router via `tokio::select!`
+on `shutdown.wait`. The channel listener publishes its chosen port
+to `<workspace>/channel.port` (mode `0o600`) and the file is
+unlinked on shutdown (plus a `Drop` guard covers panic exits).
+`graph.channels_registry` starts empty at boot — every
 registered channel (including the bundled TUI) arrives later as a
 `/v1/channel-ws` client and registers itself from its route task.
 
@@ -560,10 +574,11 @@ subcommands use it for the same reason.
   token; (b) the admin auth middleware strips `?token=` from the URI
   before the `TraceLayer` span is emitted; (c) the channel auth
   middleware never echoes header values.
-- **UDS is same-UID only.** The socket is `srw-------` (0o600) and
-  `SO_PEERCRED` rejects non-matching uids before any header is looked
-  at. A process running as a different local user cannot connect even
-  with a valid PSK. The PSK layer above is a *workspace binding*, not a
+- **Channel listener is loopback + same-UID.** The listener binds
+  `127.0.0.1:0` and publishes the chosen port to
+  `<workspace>/channel.port` at mode `0o600`, so a different local
+  user can't even discover the port. The PSK layer above is a
+  *workspace binding*, not a
   defence against same-UID hostile processes — see the PSK threat
   model note under "Channel auth" for the boundary.
 - **All gateway logs pass through `RedactingMakeWriter`** — the same
@@ -588,10 +603,10 @@ crates/gateway/
 ├── build.rs                 # emits $OUT_DIR/webui_assets.rs with include_bytes! + MIME per web/dist file
 ├── src/
 │   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, ChannelServer, …
-│   ├── config.rs            # RuntimeGatewayConfig (admin bind + channel socket path + shutdown grace)
+│   ├── config.rs            # RuntimeGatewayConfig (admin bind + shutdown grace)
 │   ├── server.rs            # GatewayDeps, AdminState, GatewayServer (admin TCP)
-│   ├── uds.rs               # cfg(unix) ChannelServer (channel UDS + accept loop)
-│   ├── spawn.rs             # cfg(unix) ChannelSpawner — spawn a subprocess client with a channel token
+│   ├── channel_listener.rs  # ChannelServer (loopback TCP + channel.port discovery + accept loop)
+│   ├── spawn.rs             # ChannelSpawner — spawn a subprocess client with a channel token
 │   ├── channel/             # /v1/channel-ws WS server for sidecar plugins + the TUI
 │   │   ├── mod.rs           #   module glue; re-exports route + state
 │   │   ├── adapter.rs       #   Sidecar — per-connection Channel + outbound frame pump
@@ -619,7 +634,7 @@ crates/gateway/
     ├── auth.rs                  # admin bearer auth
     ├── admin_has_no_channels.rs # /v1/channel-ws is 404 on the admin listener
     ├── openapi_spec_sync.rs     # asserts router spec == docs/openapi.json (UPDATE_OPENAPI=1 to rewrite)
-    └── uds.rs                   # full UDS round-trip via hyper client
+    └── channel_ws.rs            # full loopback-TCP WS round-trip via tokio-tungstenite
 ```
 
 The frontend sources live outside the crate at `web/` (npm workspace,

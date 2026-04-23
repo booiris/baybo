@@ -1,6 +1,7 @@
 //! `/v1/channels` — read-only list of registered channels and their
-//! statuses. Lives on the admin listener so operators can see channel
-//! registrations; messaging/session routes live on the channel UDS.
+//! statuses. Lives on the admin listener so operators can see
+//! channel registrations; messaging/session routes live on the
+//! loopback-TCP channel listener.
 
 use std::sync::Arc;
 

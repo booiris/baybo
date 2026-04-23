@@ -9,11 +9,12 @@
 //!
 //! `start` is a long-running server: it acquires the per-workspace
 //! singleton, builds the full manager graph via [`crate::runtime`]
-//! (passing [`BootMode::Gateway`] so the auth token is registered as a
-//! log redaction rule), and drives the router, admin [`GatewayServer`],
-//! and [`ChannelServer`] UDS listener side by side under a shared
-//! `ShutdownSignal`. Sidecars register themselves with the channel
-//! registry from the WS route task when they connect.
+//! (passing [`BootMode::Gateway`] so the auth token is registered as
+//! a log redaction rule), and drives the router, admin
+//! [`GatewayServer`], and the loopback-TCP [`ChannelServer`] side by
+//! side under a shared `ShutdownSignal`. Sidecars register
+//! themselves with the channel registry from the WS route task when
+//! they connect.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +23,10 @@ use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
-use aura_gateway::{AdminToken, ChannelServer, GatewayDeps, GatewayServer, RuntimeGatewayConfig};
+use aura_gateway::{
+    AdminToken, ChannelServer, ChannelSpawner, GatewayDeps, GatewayServer, RuntimeGatewayConfig,
+    SidecarRuntime, SidecarSupervisor,
+};
 use aura_gateway_auth::{ChannelTokenTable, effective_tui_psk};
 
 use crate::boot;
@@ -266,7 +270,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         cron_handle.run().await;
     }));
 
-    // Shared capability table — the channel UDS listener consumes it
+    // Shared capability table — the channel TCP listener consumes it
     // for auth, and the WS channel server re-reads it in the
     // Register-frame handshake via `GatewayDeps`.
     let channel_tokens = ChannelTokenTable::new();
@@ -314,17 +318,55 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         bot_reconciler: Arc::clone(&bot_reconciler),
     };
 
-    // Channel UDS listener — lives under the same workspace identity dir
-    // as the singleton lockfile. The PSK is derived with a per-install
-    // salt so two copies of the same release binary don't share an
+    // Channel loopback-TCP listener — publishes its ephemeral port to
+    // `<workspace>/channel.port` (same workspace identity dir as the
+    // singleton lockfile) so TUI and sidecars can discover it without
+    // a config roundtrip. The PSK is derived with a per-install salt
+    // so two copies of the same release binary don't share an
     // effective PSK across machines.
+    let port_file = workspace_root.join("channel.port");
     let channel_server = {
         let psk = effective_tui_psk(workspace_root.as_path())
             .map_err(|e| anyhow::anyhow!("derive channel PSK: {e}"))?;
-        let socket_path = workspace_root.join("channel.sock");
-        ChannelServer::bind(&deps, socket_path.clone(), psk, channel_tokens)
-            .map_err(|e| anyhow::anyhow!("bind channel UDS: {e}"))?
+        ChannelServer::bind(&deps, port_file.clone(), psk, channel_tokens.clone())
+            .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?
     };
+    let channel_port = channel_server.port();
+    let channel_url = format!("ws://127.0.0.1:{channel_port}/v1/channel-ws");
+
+    // Embedded-sidecar supervisor. The channel TCP listener is already
+    // bound above so the kernel's listen queue absorbs child
+    // connection attempts even before `channel_server.run()` starts
+    // accepting inside the select! below. Each channel type gets its
+    // own restart loop driven by the shared shutdown signal.
+    match SidecarRuntime::install() {
+        Ok(runtime) => {
+            let channel_types: Vec<String> = runtime.channel_types().map(String::from).collect();
+            if channel_types.is_empty() {
+                tracing::info!("no embedded sidecars in this build");
+            } else {
+                tracing::info!(
+                    channel_types = ?channel_types,
+                    bun_version = aura_gateway::sidecar::bun_version(),
+                    bun_target = runtime.bun_target(),
+                    channel_port,
+                    "starting embedded sidecars",
+                );
+                let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
+                let supervisor = SidecarSupervisor::new(Arc::new(runtime), spawner);
+                let sv_shutdown = shutdown.clone();
+                task_tracker.track(tokio::spawn(async move {
+                    supervisor.run(sv_shutdown, channel_types).await;
+                }));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "embedded sidecar runtime unavailable; no sidecars will be spawned",
+            );
+        }
+    }
 
     let server = GatewayServer::new(deps);
     let banner_bind = server.bind();

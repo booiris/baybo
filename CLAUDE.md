@@ -60,7 +60,7 @@ corpora live under `crates/security/fuzz/corpus/<target>/`.
 
 ## Platform Support
 
-Aura targets **Unix only** (Linux and macOS — see `default = ["linux", "macos"]` in `crates/gateway/Cargo.toml`). Don't write `#[cfg(unix)]` / `#[cfg(not(unix))]` branches or stub shims for Windows. Call `libc::getuid`, `std::os::unix::fs::PermissionsExt`, `tokio::net::UnixStream`, etc. directly. A non-Unix build failing is intentional.
+Aura targets **Unix only** (Linux and macOS — see `default = ["linux", "macos"]` in `crates/gateway/Cargo.toml`). Don't write `#[cfg(unix)]` / `#[cfg(not(unix))]` branches or stub shims for Windows. Call `libc::getuid`, `std::os::unix::fs::PermissionsExt`, `nix::sys::signal`, etc. directly. A non-Unix build failing is intentional.
 
 ## WebUI (`web/`)
 
@@ -74,6 +74,15 @@ The admin TCP listener serves an embedded React dashboard baked into the gateway
 - The webui is unauthenticated on purpose. The bundle is inert HTML/JS; every privileged data path still goes through `/v1/*` and its bearer-token gate.
 - Admin API types are generated: `docs/openapi.json` is produced by `aura-gateway` (utoipa) and kept in sync by `crates/gateway/tests/openapi_spec_sync.rs` (regen with `UPDATE_OPENAPI=1 cargo test -p aura-gateway --test openapi_spec_sync`). The web build runs `openapi-typescript` over that file (`pnpm --filter aura-web gen:api`, wired into `pnpm --filter aura-web build`) to emit `web/src/api/schema.d.ts`; the runtime client lives in `web/src/api/client.ts` (`openapi-fetch` with Bearer auth pre-applied). `utoipa` itself is only a dependency of `aura-gateway` — domain crates stay framework-agnostic, and new HTTP-visible fields are added by editing the mirror DTOs in `crates/gateway/src/api/dto.rs`.
 - Design tokens (`--color-brand`, `--shadow-brutal*`, `--font-mono`, …) live in `web/src/index.css` under Tailwind v4's `@theme` block. Keep the heavy-border + offset-shadow aesthetic consistent when adding new components.
+
+## Channel Sidecars (embedded)
+
+Every in-tree channel sidecar under `channel-src/*` ships inside the aura binary as a zstd-compressed JS bundle plus a single shared zstd-compressed `bun` runtime. `crates/gateway/build.rs` fetches the bun release pinned in `.bun-version` at the repo root (cached under `target/bun-cache/`), `bun build`s each sidecar, compresses both, and emits `$OUT_DIR/sidecar_assets.rs`. At boot, `SidecarRuntime::install` materialises everything to `$XDG_CACHE_HOME/aura/{runtime/bun-<ver>-<target>, sidecars/<channel>-<hash>.js}` (version- and hash-keyed so upgrades never overwrite the old files — a downgraded install can still find its binaries). `SidecarSupervisor` then runs one restart loop per embedded channel type and spawns through `ChannelSpawner`.
+
+- Pre-reqs before `cargo build`: `pnpm install` must have populated `channel-src/*/node_modules` and `sdks/channel-ts/dist` (same story as `web/dist`). Missing either degrades to `cargo:warning=…` and empty embedded assets — the build still succeeds, the supervisor logs "embedded sidecar runtime unavailable".
+- First-ever build downloads bun (~100MB zipped; cached afterwards). Network for `github.com` + its release-CDN redirect is required on that single invocation.
+- Bumping the bun version: edit `.bun-version`, download the matching `bun-<target>.zip`, record its sha256 in `.bun-shasums` (oven-sh `SHASUMS256.txt` format), and commit both together. A sha256 mismatch at build time is a **hard fail** — the panic message names the expected/actual hashes. A missing entry for the current target downgrades to an unverified download with a loud cargo:warning that prints the line to paste in.
+- Adding a new sidecar: create `channel-src/<name>/` with `src/index.ts` calling `runSidecar`, add it to `pnpm-workspace.yaml`, and run `pnpm install`. `build.rs` picks it up automatically via the `channel-src/*` enumeration — no Rust changes needed.
 
 ## Dependency Management
 

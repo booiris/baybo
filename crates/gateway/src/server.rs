@@ -6,20 +6,21 @@
 //!   status, jobs, cron, memory, traces, skills, tools, llm, and a
 //!   read-only channel list. No chat content flows through these
 //!   endpoints.
-//! * **Channel** — Unix domain socket, peer-credential +
-//!   PSK/token authenticated (see `uds` and `auth_channel` modules).
-//!   Hosts the WebSocket endpoint (`/v1/channel-ws`) — the only surface
-//!   the TUI and sidecar channel plugins talk to. Session CRUD lives
-//!   on the admin surface; the router creates sessions lazily on first
-//!   message frame.
+//! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`), PSK /
+//!   subprocess-token authenticated (see [`crate::channel_listener`]
+//!   and [`crate::auth_channel`]). Hosts the WebSocket endpoint
+//!   (`/v1/channel-ws`) — the only surface the TUI and sidecar
+//!   channel plugins talk to. Session CRUD lives on the admin
+//!   surface; the router creates sessions lazily on first message
+//!   frame.
 //!
 //! [`AdminState`] and [`ChannelState`] split the old monolithic
 //! `ApiState` so each listener only sees the managers it needs. Both
 //! are cheap to clone — every field is an `Arc` or a small value.
 //!
-//! [`GatewayServer`] owns the admin listener. The UDS half lives in
-//! [`crate::uds`] and is driven by the gateway CLI alongside the
-//! admin server.
+//! [`GatewayServer`] owns the admin listener. The channel-TCP half
+//! lives in [`crate::channel_listener`] and is driven by the gateway
+//! CLI alongside the admin server.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -82,8 +83,8 @@ pub struct GatewayDeps {
     /// Router intake. Cloned into the WS channel server so sidecar
     /// frames can be forwarded as `IncomingMessage`s.
     pub incoming_tx: mpsc::Sender<IncomingMessage>,
-    /// Per-install capability tokens. The channel UDS listener passes
-    /// this to the WS server for Register-frame verification.
+    /// Per-install capability tokens. The channel TCP listener
+    /// passes this to the WS server for Register-frame verification.
     pub channel_tokens: ChannelTokenTable,
     /// Vault handle shared with the channel server so the WS route can
     /// build a [`crate::channel::TuiHistoryStore`] without re-opening
@@ -130,7 +131,7 @@ pub struct AdminState {
     pub bind_display: String,
 }
 
-/// State shared with channel UDS handlers. Cheap to clone.
+/// State shared with channel-TCP handlers. Cheap to clone.
 ///
 /// After the HTTP+SSE surface was retired, all live chat traffic flows
 /// through the WS endpoint and its [`WsChannelState`](crate::channel::WsChannelState).
@@ -178,9 +179,10 @@ impl ChannelState {
     }
 }
 
-/// TCP admin server. Long-lived; owns its own axum `Router` built from
-/// the caller-supplied [`GatewayDeps`]. The companion UDS listener is
-/// started separately (see `crate::uds::serve`) with the same deps.
+/// TCP admin server. Long-lived; owns its own axum `Router` built
+/// from the caller-supplied [`GatewayDeps`]. The companion channel
+/// listener is started separately (see
+/// [`crate::channel_listener::ChannelServer`]) with the same deps.
 pub struct GatewayServer {
     bind: SocketAddr,
     router: Router,
@@ -236,25 +238,30 @@ fn build_admin_router(deps: GatewayDeps) -> Router {
     let cors = build_cors(&deps.runtime_config.cors_allowed_origins);
 
     let (admin_router, _admin_spec) = api::admin::v1_router_and_spec();
+    // TraceLayer goes *inside* the auth middleware so it sees the
+    // URI AFTER `require_admin_token` has stripped `?token=…`. If
+    // TraceLayer is on the outside it would log the raw URI (token
+    // and all) before auth rewrites it — tower middleware runs outer-
+    // to-inner, so "outer" = "logs first".
     let admin_router = admin_router
         .with_state(state)
+        .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             auth_state,
             require_admin_token,
         ));
 
     Router::new()
-        .merge(api::health::routes())
+        .merge(api::health::routes().layer(TraceLayer::new_for_http()))
         .merge(admin_router)
         .fallback(api::webui::serve)
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
 }
 
-/// Build the router served on the channel UDS. Called by
-/// [`crate::uds::serve`]. The auth middleware is applied to the `/v1`
-/// routes only — health lives outside so orchestrators can poll it
-/// without an auth handshake.
+/// Build the router served on the channel TCP listener. Called by
+/// [`crate::channel_listener::ChannelServer::run`]. The auth
+/// middleware is applied to the `/v1` routes only — health lives
+/// outside so orchestrators can poll it without an auth handshake.
 pub fn build_channel_router(
     deps: &GatewayDeps,
     auth_state: crate::auth_channel::ChannelAuthState,
@@ -282,11 +289,18 @@ pub fn build_channel_router(
         bot_reconciler: Arc::clone(&deps.bot_reconciler),
         pairing,
     };
-    let v1 = crate::auth_channel::attach(crate::channel::routes().with_state(ws_state), auth_state);
+    // TraceLayer goes *inside* the auth middleware so it sees the
+    // URI AFTER `require_channel_auth` has stripped `?token=…`.
+    // Outer-to-inner layer application means "outer" = "first to
+    // observe the request", so an outer TraceLayer would log the
+    // raw token-bearing URI before auth rewrites it.
+    let v1_inner = crate::channel::routes()
+        .with_state(ws_state)
+        .layer(TraceLayer::new_for_http());
+    let v1 = crate::auth_channel::attach(v1_inner, auth_state);
     Router::new()
-        .merge(api::health::routes())
+        .merge(api::health::routes().layer(TraceLayer::new_for_http()))
         .nest("/v1", v1)
-        .layer(TraceLayer::new_for_http())
 }
 
 fn build_cors(origins: &[String]) -> CorsLayer {

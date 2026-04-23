@@ -2,17 +2,20 @@
 //!
 //! # Threat model
 //!
-//! The effective TUI PSK is a **workspace-binding token**, not a defense
-//! against a same-UID hostile process. It usefully rejects:
+//! The effective TUI PSK is a **workspace-binding token**, not a
+//! defense against a same-UID hostile process. It usefully rejects:
 //!
-//! * connections from a different Unix user (already gated by UDS
-//!   `0o600` perms + `SO_PEERCRED`; the PSK is the belt on top of those
-//!   suspenders);
-//! * connections that crossed a workspace boundary (a TUI built against
-//!   workspace A will not authenticate against the gateway running in
-//!   workspace B, because the per-install salt file diverges);
-//! * stale reconnects from an older build or a different on-disk install
-//!   (different embedded PSK bytes).
+//! * connections from a different Unix user (already gated by the
+//!   salt file's `0o600` perms and the `<workspace>/channel.port`
+//!   discovery file also being `0o600` — another UID can't even
+//!   locate the gateway's channel port; the PSK is the belt on top
+//!   of those suspenders);
+//! * connections that crossed a workspace boundary (a TUI built
+//!   against workspace A will not authenticate against the gateway
+//!   running in workspace B, because the per-install salt file
+//!   diverges);
+//! * stale reconnects from an older build or a different on-disk
+//!   install (different embedded PSK bytes).
 //!
 //! It explicitly does **not** defend against a malicious process running
 //! as the same UID as the gateway. Such a process can read the salt file
@@ -44,8 +47,9 @@ const HKDF_INFO: &[u8] = b"aura-gateway tui psk v1";
 /// Read or create the workspace-local salt file, then derive the
 /// effective TUI PSK via HKDF-SHA256(ikm=EMBEDDED_TUI_PSK, salt=salt).
 ///
-/// * `workspace_dir` is the per-workspace identity directory (the same
-///   one that holds the gateway singleton lock and the channel UDS).
+/// * `workspace_dir` is the per-workspace identity directory (the
+///   same one that holds the gateway singleton lock and
+///   `channel.port`).
 /// * If the salt file is missing, 32 random bytes are written with mode
 ///   0600. Concurrent writers race benignly: the first write wins and
 ///   subsequent readers see the same value.

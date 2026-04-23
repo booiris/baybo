@@ -111,22 +111,55 @@ for third-party sidecars is the TypeScript package at
 `runChannel(channel)` entry point: the sidecar author implements
 `onMessage`, `inbound(signal)`, and optionally `onApprovalRequested`
 / `onDelta` / `onNotice`, and the SDK handles the WebSocket + MessagePack
-transport, `Register`/`Ack` handshake, UDS dial, frame dispatch,
-concurrent approval spawning, and auto-reconnect with exponential
-backoff + jitter on transient drops (disable with `reconnect: false`).
+transport, `Register`/`Ack` handshake, loopback-TCP dial, frame
+dispatch, concurrent approval spawning, and auto-reconnect with
+exponential backoff + jitter on transient drops (disable with
+`reconnect: false`).
 The SDK-provided default logger also forwards its own output as
 `Frame::SidecarLog` frames while the WS is open — the gateway pushes
 them into the same `LogBuffer` that backs `/v1/logs`, so sidecar lines
 surface in the dashboard alongside gateway-internal tracing. Custom
 loggers (pino / winston) stay local; attribution uses
 `sidecar::<channel_type>[::<target>]`.
-The UDS path + token are read from `AURA_CHANNEL_SOCKET` /
-`AURA_CHANNEL_TOKEN` env vars — the contract a future sidecar
-supervisor will set. `ChannelSpawner` (`crates/gateway/src/spawn.rs`)
-is the primitive that injects these when it eventually gets wired
-into a `PluginManager` / `Supervisor`; until then the sidecar's
-launcher must export them (or call `runChannel` with explicit
-`wsUrl` / `token`).
+The channel WebSocket URL + token are read from `AURA_CHANNEL_URL`
+/ `AURA_CHANNEL_TOKEN` env vars. `ChannelSpawner`
+(`crates/gateway/src/spawn.rs`) is the primitive that mints a fresh
+token per spawn and injects both env vars; the URL the supervisor
+builds is `ws://127.0.0.1:<port>/v1/channel-ws` where `<port>` comes
+from [`ChannelServer::port`] after it binds on `127.0.0.1:0`.
+[`SidecarSupervisor`] (`crates/gateway/src/sidecar/supervisor.rs`)
+drives it: at gateway boot, [`SidecarRuntime::install`]
+materialises the pinned `bun` runtime and each sidecar's JS bundle
+to `$XDG_CACHE_HOME/aura/{runtime, sidecars}/`, then one supervised
+task per embedded channel type `Command::new(bun).arg(bundle).spawn()`s
+through `ChannelSpawner` and restarts on exit with exponential
+backoff (500ms → 30s, reset after ≥60s of stable uptime). Shutdown
+fans out via the shared `ShutdownSignal` — children are SIGKILLed
+and awaited. Bringing up a custom sidecar out-of-tree is still
+possible: export the two env vars yourself (or pass `wsUrl` /
+`token` to `runChannel`) and run the process however you like.
+
+**Embedded sidecar toolchain.** `crates/gateway/build.rs` fetches the
+bun release pinned in `.bun-version` at the repo root into
+`target/bun-cache/` (one-time, cached across rebuilds), verifies the
+downloaded zip's sha256 against `.bun-shasums` (mismatch = hard-fail
+panic; missing entry for the current target = loud cargo:warning +
+unverified download with the line to paste in), runs
+`bun build --target=bun --minify` over each
+`channel-src/*/src/index.ts`, and zstd-compresses both the runtime
+and every bundle before `include_bytes!`. Sidecar packaging is keyed by
+the relevant sidecar inputs (workspace lockfiles, `channel-src/*`
+sources/configs, and `sdks/channel-ts/dist`): if those inputs are
+unchanged, a later `cargo build` reuses the cached compressed bundles
+instead of re-running bun. `--target=bun` lets bun
+substitute its own WS polyfill for the `ws` npm package — the
+channel SDK stays within the WHATWG `WebSocket` API (auth token
+rides in a `?token=…` query-string rather than a custom HTTP
+header, since the standard constructor can't set headers). Other
+failures (no network,
+missing `node_modules`, bun error) degrade to `cargo:warning=…` +
+empty assets — `cargo build` still succeeds, the supervisor just
+logs "embedded sidecar runtime unavailable" and skips the spawn loop.
 Raw wire types are re-exported under the `./wire` subpath for advanced
 callers. There is no Rust SDK — the TUI
 has its own private WS client, and the server is authoritative on the

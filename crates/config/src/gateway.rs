@@ -5,13 +5,14 @@ use serde::{Deserialize, Serialize};
 /// The gateway runs two listeners:
 ///
 /// * **Admin** on TCP (`bind_address`:`port`) with a bearer token —
-///   config / status / jobs / cron / memory / traces / skills / tools /
-///   llm and a read-only channel list.
-/// * **Channel** on a Unix domain socket under the per-workspace
-///   identity directory (`<workspace>/channel.sock`, not configurable)
-///   with peer-credential + PSK/token auth — sessions, messages,
-///   approvals, SSE streams. The TUI and future sidecar channel plugins
-///   talk to this listener.
+///   config / status / jobs / cron / memory / traces / skills /
+///   tools / llm and a read-only channel list.
+/// * **Channel** on loopback TCP (`127.0.0.1:<ephemeral>`, hardcoded
+///   — not configurable) with PSK / subprocess-token auth. The
+///   chosen port is published to `<workspace>/channel.port` so the
+///   TUI and spawned sidecars discover it without a config
+///   roundtrip. Hosts the WS endpoint for sessions, messages,
+///   approvals, and history snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct GatewayConfig {
@@ -22,9 +23,9 @@ pub struct GatewayConfig {
     pub bind_address: String,
     /// Admin TCP listener port.
     pub port: u16,
-    /// CORS origins permitted by the admin listener. Empty = no CORS
-    /// headers emitted. CORS is meaningless on the UDS listener and is
-    /// not applied there.
+    /// CORS origins permitted by the admin listener. Empty = no
+    /// CORS headers emitted. CORS is meaningless on the loopback
+    /// channel listener and is not applied there.
     pub cors_allowed_origins: Vec<String>,
     /// Seconds the process waits for graceful shutdown before the
     /// force-exit watchdog kicks in.

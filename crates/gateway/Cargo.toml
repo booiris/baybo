@@ -14,7 +14,7 @@ linux = []
 macos = []
 # Exposes test helpers to downstream crate-level tests. Never enabled in
 # release builds.
-test-support = ["dep:tempfile"]
+test-support = []
 
 [dependencies]
 aura-agent = { workspace = true }
@@ -62,9 +62,21 @@ tower-http = { workspace = true, features = ["cors", "trace"] }
 tower = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
-# Test-support-only deps. `test-support` feature wires them in; release
-# builds never include them.
-tempfile = { workspace = true, optional = true }
+zstd = { workspace = true }
+# Runtime dep: sidecar asset install uses NamedTempFile for crash-safe
+# atomic writes under the shared user cache dir, so concurrent first-
+# installs from two workspaces of the same user can't clobber each
+# other's temp file. See `src/sidecar/assets.rs::decompress_to`.
+tempfile = { workspace = true }
+
+[build-dependencies]
+# build.rs fetches the pinned bun release (version in `.bun-version` at
+# the repo root) and bundles each `channel-src/*` sidecar into a JS
+# payload. Both are zstd-compressed before `include_bytes!`.
+ureq = { workspace = true }
+sha2 = { workspace = true }
+zip = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 aura-gateway = { workspace = true, features = ["test-support"] }

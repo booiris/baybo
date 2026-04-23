@@ -3,9 +3,9 @@
 //! `main.rs` (TUI) and `gateway_cmd::start` (HTTP gateway) both need the
 //! same manager graph, router, and signal handler. Keeping the wiring
 //! here lets each entry point stay focused on what is genuinely
-//! different — TUI adds `TuiAdapter` + slash + dashboard, the gateway
-//! adds `GatewayServer` and the channel UDS listener — while the
-//! common backbone stays in one place.
+//! different — TUI adds `TuiAdapter` + slash + dashboard, the
+//! gateway adds `GatewayServer` and the channel TCP listener — while
+//! the common backbone stays in one place.
 //!
 //! Contract:
 //!

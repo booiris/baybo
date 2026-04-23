@@ -1,6 +1,6 @@
-//! Pure handshake validator for the WS channel server. Separated from
-//! the route handler so it can be unit-tested without spinning a
-//! TCP/UDS listener.
+//! Pure handshake validator for the WS channel server. Separated
+//! from the route handler so it can be unit-tested without spinning
+//! a TCP listener.
 
 use aura_channels::wire::{Frame, PROTOCOL_VERSION};
 use aura_gateway_auth::ChannelTokenTable;

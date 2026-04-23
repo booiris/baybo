@@ -1,11 +1,12 @@
 //! The admin TCP listener must not serve channel-surface routes.
 //!
-//! After the two-listener split, `/v1/sessions`, `/v1/sessions/{id}`,
-//! `/v1/sessions/{id}/messages`, `/v1/sessions/{id}/stream`, and
-//! `/v1/approvals*` live exclusively on the channel UDS. Requesting any
-//! of them through the admin router has to come back `404`, even with a
-//! valid bearer token — a leaked admin credential must not yield chat
-//! content or approval control.
+//! After the two-listener split, `/v1/sessions`,
+//! `/v1/sessions/{id}`, `/v1/sessions/{id}/messages`,
+//! `/v1/sessions/{id}/stream`, and `/v1/approvals*` live exclusively
+//! on the loopback-TCP channel listener. Requesting any of them
+//! through the admin router has to come back `404`, even with a
+//! valid bearer token — a leaked admin credential must not yield
+//! chat content or approval control.
 //!
 //! The test drives `GatewayServer`'s router through `tower::ServiceExt`
 //! so we exercise the actual route table the TCP listener assembles (not
