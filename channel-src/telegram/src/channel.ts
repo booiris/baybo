@@ -269,6 +269,10 @@ export class TelegramChannel implements Channel {
     const userId = userIdFor(botId, chat.id, from.id);
     this.chatByUser.set(userId, chat.id);
     this.botByUser.set(userId, botId);
+
+    ctx.replyWithChatAction("typing").catch((err) => {
+      this.logger.debug("sendChatAction(typing) failed", err);
+    });
     this.pushInbound({ sessionId: "", userId, content: text, botId });
   }
 
