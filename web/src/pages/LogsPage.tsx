@@ -80,7 +80,7 @@ export function LogsPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<LogEntry | null>(null);
-  const [live, setLive] = useState(false);
+  const [live, setLive] = useState(true);
   const [liveConnected, setLiveConnected] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -121,9 +121,12 @@ export function LogsPage() {
           params: { query },
         });
         if (canceled) return;
-        if (apiError) {
-          setError(apiError.error);
-          if (response.status === 401) logout();
+        if (response.status === 401) {
+          logout();
+          return;
+        }
+        if (apiError || !response.ok) {
+          setError(apiError?.error || `HTTP Error ${response.status}`);
           return;
         }
         setItems(data?.items ?? []);
@@ -237,14 +240,19 @@ export function LogsPage() {
 
   return (
     <div className="p-5 h-full flex flex-col overflow-hidden">
-      <div className="flex justify-between items-start mb-5">
+      <div className="flex justify-between items-start mb-3">
         <div>
-          <h2 className="text-[1.8rem] font-bold uppercase -tracking-[0.05em] mb-1">
+          <h2 className="text-[1.7rem] font-bold uppercase -tracking-[0.05em] mb-1">
             SYSTEM LOGS
           </h2>
         </div>
-        <Button variant="primary" onClick={handleExport} disabled={items.length === 0}>
-          <RiDownloadLine /> Export
+        <Button 
+          variant="primary" 
+          onClick={handleExport} 
+          disabled={items.length === 0}
+          className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
+        >
+          <RiDownloadLine className="text-base" /> Export
         </Button>
       </div>
 
@@ -253,10 +261,12 @@ export function LogsPage() {
           placeholder="Filter by message or source..."
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
+          className="h-10"
         />
         <SelectBox
           value={level}
           onChange={(e) => setLevel(e.target.value as 'all' | ApiLogLevel)}
+          className="!py-2 !px-3 !pr-8 text-[0.9rem] h-10"
         >
           <option value="all">All Levels</option>
           <option value="error">Error</option>
@@ -271,6 +281,7 @@ export function LogsPage() {
           onClick={() => setLive((v) => !v)}
           aria-pressed={live}
           disabled={offset !== 0}
+          className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
           title={
             offset !== 0
               ? 'Return to page 1 to enable live tail'
@@ -278,16 +289,20 @@ export function LogsPage() {
           }
         >
           {live && !liveConnected ? (
-            <RiLoader4Line className="animate-spin" />
+            <RiLoader4Line className="animate-spin text-base" />
           ) : (
             <RiBroadcastLine
-              className={live && liveConnected ? 'animate-pulse' : undefined}
+              className={`text-base ${live && liveConnected ? 'animate-pulse' : ''}`}
             />
           )}
           Live
         </Button>
-        <Button onClick={() => setRefreshKey((k) => k + 1)} disabled={loading}>
-          <RiRefreshLine /> Refresh
+        <Button 
+          onClick={() => setRefreshKey((k) => k + 1)} 
+          disabled={loading}
+          className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
+        >
+          <RiRefreshLine className="text-base" /> Refresh
         </Button>
       </div>
 
@@ -298,7 +313,7 @@ export function LogsPage() {
       )}
 
       <div className="flex-1 flex flex-col min-h-0 bg-white border-[3px] border-black rounded-md shadow-brutal">
-        <div ref={scrollRef} className="flex-1 overflow-auto">
+        <div ref={scrollRef} className="flex-1 overflow-auto overscroll-none">
           <table className="w-full border-collapse">
           <thead>
             <tr>
@@ -355,7 +370,7 @@ export function LogsPage() {
         </table>
       </div>
 
-        <div className="flex justify-between items-center px-6 py-4 border-t-2 border-black bg-white">
+        <div className="flex justify-between items-center px-4 py-3 border-t-2 border-black bg-white">
           <span className="text-[0.85rem] text-ink-soft min-w-[200px]">
             {loading ? (
               <span className="flex items-center gap-2">
@@ -386,12 +401,14 @@ export function LogsPage() {
               <Button
                 onClick={() => setOffset((o) => Math.max(0, o - pageSize))}
                 disabled={!hasPrev || loading}
+                className="!py-1 !px-3 !text-[0.85rem] h-8"
               >
                 Prev
               </Button>
               <Button
                 onClick={() => setOffset((o) => o + pageSize)}
                 disabled={!hasNext || loading}
+                className="!py-1 !px-3 !text-[0.85rem] h-8"
               >
                 Next
               </Button>

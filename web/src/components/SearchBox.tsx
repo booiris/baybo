@@ -9,7 +9,7 @@ export function SearchBox({ className = '', ...rest }: InputHTMLAttributes<HTMLI
       <RiFilter3Line className="text-ink-soft" />
       <input
         type="text"
-        className="w-full border-none outline-none py-3 bg-transparent font-mono text-[0.95rem]"
+        className="w-full border-none outline-none py-1.5 bg-transparent font-mono text-[0.95rem]"
         {...rest}
       />
     </div>
