@@ -31,6 +31,20 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
     );
   }
 
+  /**
+   * The thread id must be forwarded explicitly — `sendChatAction`
+   * applies to a chat, and in a forum-style supergroup the indicator
+   * would otherwise surface in the main topic instead of the one the
+   * user is actually posting in.
+   */
+  async notifyTyping(bot: Bot, chat: TelegramChat): Promise<void> {
+    await bot.api.sendChatAction(
+      chat.chatId,
+      "typing",
+      chat.threadId !== undefined ? { message_thread_id: chat.threadId } : {},
+    );
+  }
+
   async stopBot(bot: Bot): Promise<void> {
     if (bot.isRunning()) await bot.stop();
   }
@@ -74,34 +88,10 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
       threadId !== undefined
         ? { chatId: chat.id, threadId }
         : { chatId: chat.id };
-    this.acknowledgeTyping(ctx);
     emit({
       chat: address,
       platformUserId: String(from.id),
       content: text,
     });
-  }
-
-  /**
-   * Read-receipt ping so the user sees "Bot is typing…" while aura
-   * processes the inbound. Fire-and-forget — a failure here (rate
-   * limit, network blip) must not block the real inbound pump.
-   *
-   * The thread id must be forwarded explicitly — grammy's
-   * `replyWithChatAction` only auto-fills `chat_id` from the context,
-   * not `message_thread_id`, so in a forum-style supergroup the
-   * indicator would otherwise surface in the main topic instead of
-   * the one the user is actually posting in.
-   */
-  private acknowledgeTyping(ctx: Context): void {
-    const threadId = ctx.message?.message_thread_id;
-    ctx
-      .replyWithChatAction(
-        "typing",
-        threadId !== undefined ? { message_thread_id: threadId } : {},
-      )
-      .catch((err) => {
-        this.logger.debug("sendChatAction(typing) failed", err);
-      });
   }
 }

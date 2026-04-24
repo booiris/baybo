@@ -138,6 +138,17 @@ export interface BotPlatform<BotHandle, ChatId> {
     chat: ChatId,
     notice: AgentNotice,
   ): Promise<void>;
+
+  /**
+   * Optional "working on it" ping fired by the channel once per
+   * accepted inbound, before the event is queued for aura. Best-effort:
+   * the channel fire-and-forgets the returned promise, so a rate-limit
+   * or network blip is a debug log, not a pumped error. Implement when
+   * your platform has a typing / presence primitive (Telegram
+   * `sendChatAction`, Slack typing indicator, Discord `triggerTyping`,
+   * …); omit otherwise.
+   */
+  notifyTyping?(handle: BotHandle, chat: ChatId): Promise<void>;
 }
 
 /**
@@ -203,9 +214,37 @@ export interface BotChannelOptions<
    * Default: 1024.
    */
   inboundQueueCapacity?: number;
+  /**
+   * How often to re-issue the typing indicator while the agent is
+   * working. Telegram's `sendChatAction` expires server-side in ~5s,
+   * so refresh just under that. Default: 4000 ms.
+   */
+  typingRefreshMs?: number;
+  /**
+   * Maximum quiet time between agent outputs before the typing
+   * session self-cancels. Inbounds from the user do NOT extend this
+   * timer — only the agent producing an `onMessage` / `onNotice` does.
+   * Guards against a wedged agent leaving the indicator on forever
+   * while the user keeps typing. Default: 60_000 ms.
+   */
+  typingSafetyMs?: number;
 }
 
 const DEFAULT_QUEUE_CAPACITY = 1024;
+const DEFAULT_TYPING_REFRESH_MS = 4000;
+const DEFAULT_TYPING_SAFETY_MS = 60_000;
+
+interface TypingSession {
+  timer: ReturnType<typeof setInterval>;
+  safety: ReturnType<typeof setTimeout>;
+  // Pending turn counter — incremented on inbound, decremented on
+  // outbound (onMessage/onNotice). The session only really ends when
+  // this reaches zero, so a quick double-send doesn't lose the
+  // indicator when the first turn replies while the second is still
+  // queued behind aura's per-session serialization.
+  pending: number;
+  ping: () => void;
+}
 
 /**
  * Stable string form for any plain-data chat address. Primitives pass
@@ -291,6 +330,9 @@ export class BotChannel<BotHandle, ChatId>
     | PlatformApprovals<BotHandle, ChatId>
     | undefined;
   private readonly capacity: number;
+  private readonly typingRefreshMs: number;
+  private readonly typingSafetyMs: number;
+  private readonly typingSessions = new Map<string, TypingSession>();
 
   // Slot per botId holds the live handle and a SDK-internal generation
   // counter. `BotHandle` itself is an opaque platform value (grammy
@@ -320,6 +362,8 @@ export class BotChannel<BotHandle, ChatId>
     this.platform = opts.platform;
     this.approvals = opts.approvals;
     this.capacity = opts.inboundQueueCapacity ?? DEFAULT_QUEUE_CAPACITY;
+    this.typingRefreshMs = opts.typingRefreshMs ?? DEFAULT_TYPING_REFRESH_MS;
+    this.typingSafetyMs = opts.typingSafetyMs ?? DEFAULT_TYPING_SAFETY_MS;
   }
 
   inbound(signal: AbortSignal): AsyncIterable<UserInbound> {
@@ -359,6 +403,7 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   async onMessage(msg: AgentMessage): Promise<void> {
+    this.completeTypingTurn(msg.userId);
     const route = this.route(msg.userId);
     if (!route) {
       this.logger.warn(
@@ -375,6 +420,7 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   async onNotice(notice: AgentNotice): Promise<void> {
+    this.completeTypingTurn(notice.userId);
     const route = this.route(notice.userId);
     if (!route) {
       this.logger.debug("notice for unknown user; dropping", notice.userId);
@@ -397,6 +443,11 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   async onApprovalRequested(req: ApprovalRequest): Promise<ApprovalDecision> {
+    // Approval UI is about to render to the user; the bot is waiting
+    // on them, not processing. Force-cancel regardless of how many
+    // turns are pending — they're all effectively paused until the
+    // user interacts.
+    this.cancelTyping(req.userId);
     if (!this.approvals) {
       this.logger.warn(
         "approval request received but no approvals hook is configured; auto-denying",
@@ -496,6 +547,7 @@ export class BotChannel<BotHandle, ChatId>
       }
     }
     this.stopped = true;
+    this.cancelAllTyping();
     if (this.waiter) {
       const waiter = this.waiter;
       this.waiter = null;
@@ -542,12 +594,93 @@ export class BotChannel<BotHandle, ChatId>
     const userId = `${this.channelType}_${botId}_${chatKey}_${ev.platformUserId}`;
     this.chatByUser.set(userId, ev.chat);
     this.botByUser.set(userId, botId);
+    this.startOrRefreshTyping(userId, botId, ev.chat);
     this.pushInbound({
       sessionId: "",
       userId,
       content: ev.content,
       botId,
     });
+  }
+
+  private startOrRefreshTyping(
+    userId: string,
+    botId: string,
+    chat: ChatId,
+  ): void {
+    const notify = this.platform.notifyTyping;
+    if (!notify) return;
+    // Polling may deliver the first message before `onStartBot` has
+    // finished populating `bots` (grammy starts polling inside
+    // `bot.start()` which we don't await). Skip the indicator in that
+    // narrow window rather than crash — losing typing on the first
+    // post-startup message is not user-visible.
+    const entry = this.bots.get(botId);
+    if (entry === undefined) return;
+    const handle = entry.handle;
+    const existing = this.typingSessions.get(userId);
+    if (existing !== undefined) {
+      existing.pending += 1;
+      // Do NOT reset safety: it's scoped to agent liveness (quiet
+      // time between outbounds), not to the user's typing cadence.
+      existing.ping();
+      return;
+    }
+    const ping = (): void => {
+      notify.call(this.platform, handle, chat).catch((err: unknown) => {
+        this.logger.debug("notifyTyping failed", err);
+      });
+    };
+    ping();
+    // .unref() so an orphan session can't block process exit; the
+    // sidecar runner's normal shutdown path still calls onStop() which
+    // clears tickers explicitly.
+    const timer = setInterval(ping, this.typingRefreshMs);
+    timer.unref?.();
+    const safety = setTimeout(
+      () => this.cancelTyping(userId),
+      this.typingSafetyMs,
+    );
+    safety.unref?.();
+    this.typingSessions.set(userId, { timer, safety, pending: 1, ping });
+  }
+
+  private completeTypingTurn(userId: string): void {
+    const session = this.typingSessions.get(userId);
+    if (session === undefined) return;
+    session.pending -= 1;
+    if (session.pending <= 0) {
+      this.cancelTyping(userId);
+      return;
+    }
+    // Agent is alive — proven by this outbound. Reset the quiet-time
+    // cap so the ticker can keep going through the rest of the queue.
+    clearTimeout(session.safety);
+    session.safety = setTimeout(
+      () => this.cancelTyping(userId),
+      this.typingSafetyMs,
+    );
+    session.safety.unref?.();
+  }
+
+  private cancelTyping(userId: string): void {
+    const session = this.typingSessions.get(userId);
+    if (session === undefined) return;
+    clearInterval(session.timer);
+    clearTimeout(session.safety);
+    this.typingSessions.delete(userId);
+  }
+
+  private cancelAllTypingForBot(botId: string): void {
+    for (const [userId, bid] of this.botByUser.entries()) {
+      if (bid === botId) this.cancelTyping(userId);
+    }
+  }
+
+  private cancelAllTyping(): void {
+    for (const userId of [...this.typingSessions.keys()]) {
+      this.cancelTyping(userId);
+    }
   }
 
   private onPollingExit(
@@ -569,6 +702,7 @@ export class BotChannel<BotHandle, ChatId>
     // re-message. Pending approvals for this bot are still released
     // — the promises can't finish against a dead handle.
     this.bots.delete(botId);
+    this.cancelAllTypingForBot(botId);
     void this.notifyBotStopped(botId).catch((hookErr) => {
       this.logger.debug("approvals.onBotStopped threw on polling exit", hookErr);
     });
@@ -588,6 +722,7 @@ export class BotChannel<BotHandle, ChatId>
     this.bots.delete(botId);
     for (const [userId, bid] of this.botByUser.entries()) {
       if (bid === botId) {
+        this.cancelTyping(userId);
         this.botByUser.delete(userId);
         this.chatByUser.delete(userId);
       }

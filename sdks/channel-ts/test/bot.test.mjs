@@ -321,6 +321,226 @@ test("StopBot after a polling crash still purges stale user routes", async () =>
   assert.equal(fake.calls.sends.length, 0);
 });
 
+test("ingest fires platform.notifyTyping once per inbound with the routed handle", async () => {
+  const fake = makePlatform();
+  const typed = [];
+  fake.platform.notifyTyping = async (handle, chat) => {
+    typed.push({ handleId: handle.id, chat });
+  };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: { chatId: 42, threadId: 7 }, platformUserId: "u", content: "hi" });
+  fake.emit({ chat: { chatId: 42 }, platformUserId: "u", content: "again" });
+  // fire-and-forget — let the microtask run
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(typed, [
+    { handleId: 0, chat: { chatId: 42, threadId: 7 } },
+    { handleId: 0, chat: { chatId: 42 } },
+  ]);
+});
+
+test("typing session keeps pinging at the refresh cadence until onMessage terminates it", async () => {
+  const fake = makePlatform();
+  const typed = [];
+  fake.platform.notifyTyping = async () => { typed.push(Date.now()); };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 15,
+    typingSafetyMs: 5000,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+
+  await new Promise((r) => setTimeout(r, 70));
+  assert.ok(typed.length >= 3, `expected ≥3 pings, got ${typed.length}`);
+
+  const before = typed.length;
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "reply" });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed.length, before, "no pings after onMessage stop");
+});
+
+test("double-send keeps typing alive between reply A and reply B (pending-turn counter)", async () => {
+  const fake = makePlatform();
+  let typed = 0;
+  fake.platform.notifyTyping = async () => { typed++; };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 15,
+    typingSafetyMs: 5000,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  fake.emit({ chat: 42, platformUserId: "u", content: "A" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "B" });
+  await new Promise((r) => setTimeout(r, 50));
+  const beforeReplyA = typed;
+  assert.ok(beforeReplyA >= 3, `expected ≥3 pings before any reply, got ${beforeReplyA}`);
+
+  // Reply to A — B still pending, typing must continue.
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "reply A" });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.ok(
+    typed > beforeReplyA,
+    `ticker must keep firing while B is pending (before=${beforeReplyA}, now=${typed})`,
+  );
+
+  // Reply to B — pending reaches 0, typing stops.
+  const beforeReplyB = typed;
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "reply B" });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed, beforeReplyB, "no pings after the final reply");
+});
+
+test("safety cap is not extended by subsequent inbounds from the same user", async () => {
+  const fake = makePlatform();
+  let typed = 0;
+  fake.platform.notifyTyping = async () => { typed++; };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 10,
+    typingSafetyMs: 60,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  // Wedged agent: user keeps typing, bot never replies. Repeat
+  // inbounds must NOT slide the safety deadline set at t=0.
+  fake.emit({ chat: 42, platformUserId: "u", content: "1" });
+  await new Promise((r) => setTimeout(r, 25));
+  fake.emit({ chat: 42, platformUserId: "u", content: "2" });
+  await new Promise((r) => setTimeout(r, 25));
+  fake.emit({ chat: 42, platformUserId: "u", content: "3" });
+  // Past the original 60ms cap from the first inbound.
+  await new Promise((r) => setTimeout(r, 40));
+  const atCap = typed;
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed, atCap, `inbounds must not extend the safety cap (atCap=${atCap})`);
+});
+
+test("typing session stops on onApprovalRequested (bot is waiting on the user, not processing)", async () => {
+  const fake = makePlatform();
+  const typed = [];
+  fake.platform.notifyTyping = async () => { typed.push(1); };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    approvals: { async onRequested() { return "approve"; } },
+    typingRefreshMs: 15,
+    typingSafetyMs: 5000,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+  await new Promise((r) => setTimeout(r, 50));
+  const before = typed.length;
+  assert.ok(before >= 2);
+
+  await channel.onApprovalRequested({
+    callId: "c1",
+    sessionId: "s",
+    userId: "test_b1_42_u",
+    tool: "tool",
+    paramsPreview: "",
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed.length, before, "no pings after approval request");
+});
+
+test("typing safety timeout caps an orphan session when no outbound ever arrives", async () => {
+  const fake = makePlatform();
+  let typed = 0;
+  fake.platform.notifyTyping = async () => { typed++; };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 10,
+    typingSafetyMs: 40,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+
+  await new Promise((r) => setTimeout(r, 120));
+  const atCap = typed;
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed, atCap, `no pings after safety cap (atCap=${atCap})`);
+});
+
+test("StopBot cancels pending typing sessions for that bot", async () => {
+  const fake = makePlatform();
+  let typed = 0;
+  fake.platform.notifyTyping = async () => { typed++; };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 10,
+    typingSafetyMs: 5000,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+  await new Promise((r) => setTimeout(r, 40));
+  const before = typed;
+  assert.ok(before >= 2);
+
+  await channel.onStopBot({ botId: "b1" });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed, before, "no pings after StopBot");
+});
+
+test("polling exit cancels typing sessions (but preserves user routes)", async () => {
+  const fake = makePlatform();
+  let typed = 0;
+  fake.platform.notifyTyping = async () => { typed++; };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 10,
+    typingSafetyMs: 5000,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+  await new Promise((r) => setTimeout(r, 40));
+  const before = typed;
+  assert.ok(before >= 2);
+
+  fake.rejectExit(new Error("boom"));
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed, before, "no pings after polling exit");
+});
+
+test("a rejected notifyTyping is swallowed and does not break ingest", async () => {
+  const fake = makePlatform();
+  fake.platform.notifyTyping = async () => {
+    throw new Error("rate limited");
+  };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+  await new Promise((r) => setImmediate(r));
+
+  // Inbound must still reach a consumer even though the typing ping rejected.
+  const iter = channel.inbound(new AbortController().signal)[Symbol.asyncIterator]();
+  const next = await iter.next();
+  assert.equal(next.done, false);
+  assert.equal(next.value.content, "hi");
+});
+
 test("explicit StopBot clears the user route (contrast with polling exit)", async () => {
   const fake = makePlatform();
   const channel = new BotChannel({
