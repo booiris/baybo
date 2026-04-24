@@ -1,0 +1,29 @@
+{
+  "name": "@aura/channel-weixin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Weixin (WeChat iLink bot) channel sidecar for the Aura gateway",
+  "type": "module",
+  "bin": {
+    "aura-channel-weixin": "./dist/index.js"
+  },
+  "ilink_appid": "bot",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "test": "node --test 'test/**/*.test.mjs'"
+  },
+  "dependencies": {
+    "@aura/channel-sdk": "workspace:*",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=21"
+  }
+}

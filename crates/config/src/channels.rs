@@ -15,6 +15,9 @@ pub struct ChannelsConfig {
     /// Optional HTTP channel settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpChannelConfig>,
+    /// Optional Weixin (WeChat iLink bot) channel settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weixin: Option<WeixinChannelConfig>,
     /// Size of the internal mpsc message buffer.
     pub message_buffer_size: usize,
 }
@@ -26,6 +29,7 @@ impl Default for ChannelsConfig {
             telegram: None,
             discord: None,
             http: None,
+            weixin: None,
             message_buffer_size: 256,
         }
     }
@@ -62,4 +66,9 @@ pub struct HttpChannelConfig {
     pub enabled: bool,
     pub bind_address: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WeixinChannelConfig {
+    pub enabled: bool,
 }

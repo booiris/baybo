@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use aura_channels::registration::{
-    Prompter, RegistrationFlow, RegistrationResult, builtin_registration_flows,
+    Prompter, RegistrationFlow, RegistrationResult, WeixinRegistration, builtin_registration_flows,
 };
 use aura_model::ChannelType;
 use aura_security::SecretVault;
@@ -16,6 +16,32 @@ use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
 mod select;
+mod weixin_login;
+
+/// Assemble the flows offered by `aura channel add` / `remove` / `bots`.
+/// Starts from the builtin catalog and appends weixin when the current
+/// build ships a weixin sidecar bundle (the QR-login flow delegates
+/// into that bundle via bun).
+fn registration_flows() -> Vec<Arc<dyn RegistrationFlow>> {
+    let mut flows = builtin_registration_flows();
+    match weixin_login::SidecarLoginRunner::try_new() {
+        Ok(Some(runner)) => {
+            flows.push(Arc::new(WeixinRegistration::new(Arc::new(runner))));
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "weixin sidecar bundle absent; omitting from channel registration catalog"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "could not prepare weixin login runner; omitting from catalog"
+            );
+        }
+    }
+    flows
+}
 
 pub async fn handle(ctx: &CommandContext, cmd: ChannelCmd) -> Result<CommandOutput> {
     match cmd {
@@ -282,7 +308,7 @@ async fn persist_bot_registration(
 async fn add_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     let (vault, store) = require_bot_deps(ctx)?;
 
-    let flows = builtin_registration_flows();
+    let flows = registration_flows();
     let labels: Vec<&str> = flows.iter().map(|f| f.display_name()).collect();
     let idx = select::select_one("Channel:", &labels)?;
     let flow: Arc<dyn RegistrationFlow> = flows[idx].clone();
@@ -334,7 +360,7 @@ async fn pick_channel_with_bots(store: &Arc<dyn ChannelBotStore>) -> Result<Opti
     // in sync with what's registrable. A bot registered for an unknown
     // channel type would be unreachable here — acceptable while the
     // catalog is the source of truth.
-    let flows = builtin_registration_flows();
+    let flows = registration_flows();
     let mut populated: Vec<(String, ChannelType)> = Vec::new();
     for flow in &flows {
         let ct = flow.channel_type();

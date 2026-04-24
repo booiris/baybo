@@ -23,6 +23,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 anyhow = { workspace = true }
 
@@ -31,4 +32,3 @@ anyhow = { workspace = true }
 ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }

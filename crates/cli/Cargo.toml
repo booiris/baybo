@@ -8,6 +8,7 @@ aura-model = { workspace = true }
 aura-agent = { workspace = true }
 aura-channels = { workspace = true }
 aura-config = { workspace = true }
+aura-gateway = { workspace = true }
 aura-cron = { workspace = true }
 aura-job = { workspace = true }
 aura-session = { workspace = true }

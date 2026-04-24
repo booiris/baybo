@@ -311,6 +311,7 @@ dependencies = [
  "aura-config",
  "aura-context",
  "aura-cron",
+ "aura-gateway",
  "aura-job",
  "aura-llm",
  "aura-model",

@@ -29,6 +29,7 @@ impl ChannelType {
     pub const TUI: &'static str = "tui";
     pub const TELEGRAM: &'static str = "telegram";
     pub const DISCORD: &'static str = "discord";
+    pub const WEIXIN: &'static str = "weixin";
 
     pub fn http() -> Self {
         Self(Self::HTTP.to_owned())
@@ -44,6 +45,10 @@ impl ChannelType {
 
     pub fn discord() -> Self {
         Self(Self::DISCORD.to_owned())
+    }
+
+    pub fn weixin() -> Self {
+        Self(Self::WEIXIN.to_owned())
     }
 
     pub fn as_str(&self) -> &str {
