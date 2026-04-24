@@ -29,13 +29,12 @@ type BotLookup = (botId: string) => Bot | undefined;
  * `tg_<bot>_<chat>_<user>` id. The broker uses `botByUser` to recover
  * which bot originated the user, then `lookupBot(botId)` to find the
  * running grammy instance that should post the prompt. Callback
- * queries from the user arrive on whatever bot posted the prompt, so
- * each bot gets its own `callbackQuery` handler installed by the
- * broker on first use.
+ * queries from the user arrive on whatever bot posted the prompt;
+ * the channel calls `attach(bot)` for each new bot before starting
+ * polling so the `callbackQuery` handler is in place ahead of time.
  */
 export class ApprovalBroker {
   private readonly pending = new Map<string, PendingEntry>();
-  private readonly botsWithHandler = new Set<string>();
 
   constructor(
     private readonly botByUser: Map<string, string>,
@@ -43,6 +42,19 @@ export class ApprovalBroker {
     private readonly lookupBot: BotLookup,
     private readonly logger: Logger,
   ) {}
+
+  /**
+   * Register the callback handler on a freshly-created bot. Must be
+   * called before `bot.start()` — grammy freezes its middleware tree
+   * the moment polling begins, after which any further `.callbackQuery`
+   * registration throws as a memory-leak guard.
+   */
+  attach(bot: Bot): void {
+    bot.callbackQuery(
+      new RegExp(`^${CALLBACK_PREFIX}`),
+      (ctx) => this.handleCallback(ctx),
+    );
+  }
 
   /**
    * Post an approval prompt and wait for the user's tap. Fails closed
@@ -62,7 +74,6 @@ export class ApprovalBroker {
       );
       return "deny";
     }
-    this.ensureCallbackHandler(botId, bot);
 
     const text = formatPrompt(req);
     const keyboard = new InlineKeyboard()
@@ -113,16 +124,6 @@ export class ApprovalBroker {
       entry.resolve("deny");
     }
     this.pending.clear();
-    this.botsWithHandler.clear();
-  }
-
-  private ensureCallbackHandler(botId: string, bot: Bot): void {
-    if (this.botsWithHandler.has(botId)) return;
-    this.botsWithHandler.add(botId);
-    bot.callbackQuery(
-      new RegExp(`^${CALLBACK_PREFIX}`),
-      (ctx) => this.handleCallback(ctx),
-    );
   }
 
   private async handleCallback(ctx: Context): Promise<void> {

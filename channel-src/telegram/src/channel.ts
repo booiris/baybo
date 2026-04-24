@@ -172,6 +172,7 @@ export class TelegramChannel implements Channel {
 
     const bot = new Bot(cmd.token);
     bot.on("message:text", (ctx) => this.onTelegramText(cmd.botId, ctx));
+    this.approvals.attach(bot);
 
     try {
       await bot.init();
