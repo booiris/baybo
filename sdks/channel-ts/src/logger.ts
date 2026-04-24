@@ -45,8 +45,7 @@ const MAX_LINE_BYTES = 1024;
 const WINDOW_MS = 1000;
 const MAX_LINES_PER_WINDOW = 100;
 
-export function defaultLogger(channelType: string): WireCapableLogger {
-  const prefix = `[aura:${channelType}]`;
+export function defaultLogger(_channelType: string): WireCapableLogger {
   let sink: WireLogSink | null = null;
   let windowStart = 0;
   let windowCount = 0;
@@ -84,27 +83,39 @@ export function defaultLogger(channelType: string): WireCapableLogger {
     }
   };
 
+  // With a wire sink attached, the gateway also pipes the child's
+  // stdout/stderr into the same LogBuffer — console writes here would
+  // double-log. Fall back to console only when no sink is set.
   return {
     debug(msg, ...args) {
       const text = formatLine(msg, args);
-      // stdout stays off for debug; let operators raise it via a custom
-      // logger if they need it locally
-      forward("debug", text);
+      if (sink) {
+        forward("debug", text);
+      }
     },
     info(msg, ...args) {
       const text = formatLine(msg, args);
-      console.log(prefix, text);
-      forward("info", text);
+      if (sink) {
+        forward("info", text);
+      } else {
+        console.log(text);
+      }
     },
     warn(msg, ...args) {
       const text = formatLine(msg, args);
-      console.warn(prefix, text);
-      forward("warn", text);
+      if (sink) {
+        forward("warn", text);
+      } else {
+        console.warn(text);
+      }
     },
     error(msg, ...args) {
       const text = formatLine(msg, args);
-      console.error(prefix, text);
-      forward("error", text);
+      if (sink) {
+        forward("error", text);
+      } else {
+        console.error(text);
+      }
     },
     setWireSink(next) {
       sink = next;

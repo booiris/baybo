@@ -11,17 +11,35 @@
 //! Backoff is exponential with a 30s cap. A child that ran for ≥60s
 //! before dying resets backoff so a long-stable sidecar that finally
 //! crashes restarts immediately.
+//!
+//! Child stdout/stderr are (a) pushed into the shared [`LogBuffer`]
+//! for the live admin dashboard, (b) appended to a per-channel
+//! daily-rolling file at `<channel_log_dir>/<channel_type>.log.<date>`
+//! through [`RedactingMakeWriter`], and (c) tee'd to the gateway's
+//! own stdout/stderr so running `aura gateway start` in a terminal
+//! still shows every sidecar line live. Sidecar output never enters
+//! `aura.log`.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aura_agent::service::ShutdownSignal;
+use aura_security::{LeakDetector, RedactingMakeWriter};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_subscriber::fmt::MakeWriter;
 
+use crate::log_buffer::{LogBuffer, LogLevel};
 use crate::spawn::ChannelSpawner;
 
 use super::assets::SidecarRuntime;
+
+const SIDECAR_PIPE_LINE_MAX_BYTES: usize = 1024;
 
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -30,17 +48,34 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// taking 30s to come back after a transient failure.
 const UPTIME_RESET_THRESHOLD: Duration = Duration::from_secs(60);
 
+type ChannelLogWriter = Arc<RedactingMakeWriter<NonBlocking>>;
+
 /// Drives the restart loop for every embedded sidecar. Clone-cheap
-/// (everything is `Arc`).
+/// (everything is `Arc` / small value).
 #[derive(Clone)]
 pub struct SidecarSupervisor {
     runtime: Arc<SidecarRuntime>,
     spawner: ChannelSpawner,
+    log_buffer: Arc<LogBuffer>,
+    channel_log_dir: PathBuf,
+    leak_detector: Arc<LeakDetector>,
 }
 
 impl SidecarSupervisor {
-    pub fn new(runtime: Arc<SidecarRuntime>, spawner: ChannelSpawner) -> Self {
-        Self { runtime, spawner }
+    pub fn new(
+        runtime: Arc<SidecarRuntime>,
+        spawner: ChannelSpawner,
+        log_buffer: Arc<LogBuffer>,
+        channel_log_dir: PathBuf,
+        leak_detector: Arc<LeakDetector>,
+    ) -> Self {
+        Self {
+            runtime,
+            spawner,
+            log_buffer,
+            channel_log_dir,
+            leak_detector,
+        }
     }
 
     /// Spawn one supervising task per channel type in `channel_types`
@@ -48,8 +83,16 @@ impl SidecarSupervisor {
     /// log a warning and are dropped. Returns when `shutdown` fires
     /// and every child has been signalled + awaited.
     pub async fn run(self, shutdown: ShutdownSignal, channel_types: Vec<String>) {
+        if let Err(e) = std::fs::create_dir_all(&self.channel_log_dir) {
+            tracing::warn!(
+                dir = %self.channel_log_dir.display(),
+                error = %e,
+                "failed to create channel log dir; sidecar output will stay in-memory only",
+            );
+        }
         let this = Arc::new(self);
         let mut tasks = Vec::new();
+        let mut guards: Vec<WorkerGuard> = Vec::new();
         for channel_type in channel_types {
             if this.runtime.bundle_for(&channel_type).is_none() {
                 tracing::warn!(
@@ -58,19 +101,31 @@ impl SidecarSupervisor {
                 );
                 continue;
             }
+            let writer = build_channel_log_writer(
+                &this.channel_log_dir,
+                &channel_type,
+                Arc::clone(&this.leak_detector),
+                &mut guards,
+            );
             let sv = Arc::clone(&this);
             let sd = shutdown.clone();
             tasks.push(tokio::spawn(async move {
-                sv.supervise_one(channel_type, sd).await;
+                sv.supervise_one(channel_type, sd, writer).await;
             }));
         }
         shutdown.wait().await;
         for t in tasks {
             let _ = t.await;
         }
+        drop(guards);
     }
 
-    async fn supervise_one(self: Arc<Self>, channel_type: String, shutdown: ShutdownSignal) {
+    async fn supervise_one(
+        self: Arc<Self>,
+        channel_type: String,
+        shutdown: ShutdownSignal,
+        writer: Option<ChannelLogWriter>,
+    ) {
         let bundle = match self.runtime.bundle_for(&channel_type) {
             Some(p) => p.to_owned(),
             None => return,
@@ -81,12 +136,8 @@ impl SidecarSupervisor {
         while !shutdown.is_shutdown() {
             let mut cmd = Command::new(&bun);
             cmd.arg(&bundle);
-            // Keep child stdout/stderr inherited so its logs show up
-            // in the gateway's terminal during development. In
-            // production the service manager captures these; we don't
-            // need to plumb them through the LogBuffer because the
-            // sidecar SDK already forwards its own tracing via
-            // `Frame::SidecarLog` over the channel WS.
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
             let handle = match self.spawner.spawn(cmd, format!("sidecar-{channel_type}")) {
                 Ok(h) => h,
                 Err(e) => {
@@ -112,17 +163,36 @@ impl SidecarSupervisor {
 
             let started = Instant::now();
             let mut handle = handle;
+            let stdout_task = handle.child_mut().stdout.take().map(|out| {
+                tokio::spawn(drain_pipe(
+                    out,
+                    Arc::clone(&self.log_buffer),
+                    writer.clone(),
+                    channel_type.clone(),
+                    format!("sidecar::{channel_type}::stdout"),
+                    Stream::Stdout,
+                    LogLevel::Info,
+                ))
+            });
+            let stderr_task = handle.child_mut().stderr.take().map(|err| {
+                tokio::spawn(drain_pipe(
+                    err,
+                    Arc::clone(&self.log_buffer),
+                    writer.clone(),
+                    channel_type.clone(),
+                    format!("sidecar::{channel_type}::stderr"),
+                    Stream::Stderr,
+                    LogLevel::Warn,
+                ))
+            });
             tokio::select! {
                 _ = shutdown.wait() => {
-                    // Graceful: try TERM via kill() (tokio sends
-                    // SIGKILL; that's acceptable — the sidecar owns
-                    // nothing persistent and the WS peer notices the
-                    // drop immediately).
                     if let Err(e) = handle.child_mut().start_kill() {
                         tracing::debug!(%channel_type, pid, error = %e, "start_kill failed");
                     }
                     let _ = handle.child_mut().wait().await;
                     tracing::info!(%channel_type, pid, "sidecar stopped on shutdown");
+                    join_pipe_readers(stdout_task, stderr_task).await;
                     return;
                 }
                 status = handle.child_mut().wait() => {
@@ -143,6 +213,7 @@ impl SidecarSupervisor {
                     }
                 }
             }
+            join_pipe_readers(stdout_task, stderr_task).await;
             drop(handle); // revokes the token early
 
             if started.elapsed() >= UPTIME_RESET_THRESHOLD {
@@ -156,11 +227,242 @@ impl SidecarSupervisor {
     }
 }
 
+/// Build the per-channel-type daily-rolling appender and wrap it in
+/// the shared leak-detector's redactor. Pushes the `WorkerGuard` into
+/// `guards` so the caller keeps flushing alive for the supervisor's
+/// lifetime. Returns `None` only if the caller should skip the file
+/// sink entirely (currently never — left as a future opt-out).
+fn build_channel_log_writer(
+    dir: &Path,
+    channel_type: &str,
+    leak_detector: Arc<LeakDetector>,
+    guards: &mut Vec<WorkerGuard>,
+) -> Option<ChannelLogWriter> {
+    let appender = tracing_appender::rolling::daily(dir, format!("{channel_type}.log"));
+    let (nb, guard) = tracing_appender::non_blocking(appender);
+    guards.push(guard);
+    Some(Arc::new(RedactingMakeWriter::new(leak_detector, nb)))
+}
+
 /// Sleep `dur` but wake early on shutdown. Returns `false` if shutdown
 /// fired (caller should stop looping).
 async fn wait_or_shutdown(shutdown: &ShutdownSignal, dur: Duration) -> bool {
     tokio::select! {
         _ = shutdown.wait() => false,
         _ = sleep(dur) => true,
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+impl Stream {
+    fn tag(self) -> &'static str {
+        match self {
+            Stream::Stdout => "stdout",
+            Stream::Stderr => "stderr",
+        }
+    }
+}
+
+async fn drain_pipe<R>(
+    reader: R,
+    buffer: Arc<LogBuffer>,
+    file_writer: Option<ChannelLogWriter>,
+    channel_type: String,
+    target: String,
+    stream: Stream,
+    level: LogLevel,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let trimmed = truncate_utf8(line, SIDECAR_PIPE_LINE_MAX_BYTES);
+                if let Some(mw) = file_writer.as_ref() {
+                    write_line_to_file(mw, stream.tag(), &trimmed);
+                }
+                tee_to_terminal(stream, &channel_type, &trimmed);
+                buffer.push_external(level, target.clone(), trimmed);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let msg = format!("[aura] sidecar pipe read error: {e}");
+                if let Some(mw) = file_writer.as_ref() {
+                    write_line_to_file(mw, stream.tag(), &msg);
+                }
+                tee_to_terminal(stream, &channel_type, &msg);
+                buffer.push_external(LogLevel::Warn, target.clone(), msg);
+                break;
+            }
+        }
+    }
+}
+
+fn write_line_to_file(mw: &ChannelLogWriter, stream_tag: &str, line: &str) {
+    let mut w = mw.make_writer();
+    let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
+    let _ = writeln!(w, "{ts} [{stream_tag}] {line}");
+}
+
+fn tee_to_terminal(stream: Stream, channel_type: &str, line: &str) {
+    match stream {
+        Stream::Stdout => {
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "[{channel_type}] {line}");
+        }
+        Stream::Stderr => {
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(err, "[{channel_type}] {line}");
+        }
+    }
+}
+
+async fn join_pipe_readers(
+    stdout: Option<tokio::task::JoinHandle<()>>,
+    stderr: Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(t) = stdout {
+        let _ = t.await;
+    }
+    if let Some(t) = stderr {
+        let _ = t.await;
+    }
+}
+
+fn truncate_utf8(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = text;
+    out.truncate(cut);
+    out.push_str(" [...truncated]");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_buffer::LogQuery;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn pipe_forwards_each_line_to_buffer() {
+        let buf = LogBuffer::new(8);
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let target = "sidecar::telegram::stdout".to_string();
+        let drain = tokio::spawn(drain_pipe(
+            reader,
+            Arc::clone(&buf),
+            None,
+            "telegram".to_string(),
+            target.clone(),
+            Stream::Stdout,
+            LogLevel::Info,
+        ));
+        writer
+            .write_all(b"first line\nsecond line\n")
+            .await
+            .unwrap();
+        drop(writer);
+        drain.await.unwrap();
+
+        let page = buf.query(&LogQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items[0].message, "second line");
+        assert_eq!(page.items[1].message, "first line");
+        assert!(page.items.iter().all(|r| r.target == target));
+    }
+
+    #[tokio::test]
+    async fn pipe_writes_redacted_lines_to_per_channel_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let leak = Arc::new(LeakDetector::with_default_rules());
+        let mut guards = Vec::new();
+        let mw = build_channel_log_writer(dir.path(), "telegram", leak, &mut guards).unwrap();
+
+        let buf = LogBuffer::new(8);
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let drain = tokio::spawn(drain_pipe(
+            reader,
+            Arc::clone(&buf),
+            Some(mw),
+            "telegram".to_string(),
+            "sidecar::telegram::stdout".to_string(),
+            Stream::Stdout,
+            LogLevel::Info,
+        ));
+        let secret_line = b"bootstrapping with key AKIAIOSFODNN7EXAMPLE now\n";
+        writer.write_all(secret_line).await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+        drop(guards); // flush the non-blocking appender
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let name = entries[0].file_name().into_string().unwrap();
+        assert!(name.starts_with("telegram.log."), "got {name}");
+        let contents = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(contents.contains("[stdout]"));
+        assert!(!contents.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(contents.contains("[{REDACTED_LOG_aws_access_key}]"));
+    }
+
+    #[tokio::test]
+    async fn pipe_truncates_oversized_line() {
+        let buf = LogBuffer::new(4);
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let drain = tokio::spawn(drain_pipe(
+            reader,
+            Arc::clone(&buf),
+            None,
+            "t".to_string(),
+            "sidecar::t::stdout".to_string(),
+            Stream::Stdout,
+            LogLevel::Info,
+        ));
+        let big = "x".repeat(SIDECAR_PIPE_LINE_MAX_BYTES + 128);
+        writer.write_all(big.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+
+        let page = buf.query(&LogQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(page.total, 1);
+        let rec = &page.items[0];
+        assert!(rec.message.ends_with("[...truncated]"));
+        assert!(rec.message.len() <= SIDECAR_PIPE_LINE_MAX_BYTES + " [...truncated]".len());
+    }
+
+    #[test]
+    fn truncate_utf8_respects_char_boundary() {
+        let s: String = "é".repeat(10);
+        let out = truncate_utf8(s, 5);
+        assert!(out.is_char_boundary(out.len() - " [...truncated]".len()));
+        assert!(out.ends_with("[...truncated]"));
+    }
+
+    #[test]
+    fn truncate_utf8_noop_under_cap() {
+        let s = "hello".to_string();
+        assert_eq!(truncate_utf8(s.clone(), 10), s);
     }
 }

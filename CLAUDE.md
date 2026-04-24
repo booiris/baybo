@@ -51,7 +51,7 @@ corpora live under `crates/security/fuzz/corpus/<target>/`.
 - Map errors with context: `.map_err(|e| SomeError::Variant { reason: e.to_string() })?`
 - Prefer strong types over strings (enums, newtypes); use typed structs instead of `HashMap<String, Value>`, only keep an `extra` field for truly dynamic extensions
 - Keep functions focused, extract helpers when logic is reused
-- Comments for non-obvious logic only
+- Default to zero comments. Only add one when the WHY is non-obvious (hidden constraint, subtle invariant, workaround). Don't narrate WHAT the code does — well-named identifiers cover that. No module-level blurbs that restate the types, no docstrings on helpers whose signature already tells the story, no inline "//" notes explaining straightforward control flow.
 - Avoid exporting unnecessary item, prefer `pub(crate)` for functions and structs; use `pub` only when necessary
 - Test-only helpers (fakes, `NeverShutdown`-style stubs, dummy fixtures) MUST be gated so they don't ship in release builds:
   - Same-crate tests only → `#[cfg(test)]`.

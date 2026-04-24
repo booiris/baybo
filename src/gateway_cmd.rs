@@ -353,7 +353,13 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                     "starting embedded sidecars",
                 );
                 let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
-                let supervisor = SidecarSupervisor::new(Arc::new(runtime), spawner);
+                let supervisor = SidecarSupervisor::new(
+                    Arc::new(runtime),
+                    spawner,
+                    Arc::clone(&log_buffer),
+                    log_dir.join("channel"),
+                    Arc::clone(&leak_detector),
+                );
                 let sv_shutdown = shutdown.clone();
                 task_tracker.track(tokio::spawn(async move {
                     supervisor.run(sv_shutdown, channel_types).await;

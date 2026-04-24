@@ -139,14 +139,12 @@ async function runOnce(
   try {
     await waitOpen(ws);
     await performRegister(ws, frames, channel.channelType, token);
+    logger.info("registered");
 
     connAbort.signal.addEventListener("abort", () => safeClose(ws), {
       once: true,
     });
 
-    // Wire the default logger's forwarder into this WS. Third-party
-    // loggers (pino / winston) don't expose `setWireSink`, so they
-    // stay local — the `hasWireSink` guard is the opt-in switch.
     if (hasWireSink(logger)) {
       logger.setWireSink(makeWireSink(ws));
     }
