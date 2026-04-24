@@ -48,7 +48,7 @@ export interface ApprovalRequest {
   callId: string;
   sessionId: string;
   /**
-   * Aura user id (`tg_<id>` for Telegram, matching the inbound
+   * Aura user id (`<channelType>_<id>` — e.g. `telegram_<...>` — matching the inbound
    * `UserInbound.userId`). Sidecars that route approval prompts by
    * platform user consume this directly; empty string when the tool
    * call isn't user-scoped (e.g. cron-triggered).
@@ -138,6 +138,13 @@ export interface Channel {
    * Yield one `UserInbound` per native platform event. Terminate the
    * iterable when `signal` aborts — the runner uses the same signal to
    * tear down the transport.
+   *
+   * Single-consumer contract: the runner drives exactly one iterator
+   * at a time per connection, and a channel instance is long-lived
+   * across reconnects (each new connection calls `inbound(newSignal)`
+   * once). Implementations may share queue state across iterators to
+   * buffer events across a reconnect window, but must not be driven
+   * by two concurrent consumers — behavior is undefined.
    */
   inbound(signal: AbortSignal): AsyncIterable<UserInbound>;
 

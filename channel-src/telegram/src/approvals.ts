@@ -3,19 +3,21 @@ import type {
   ApprovalRequest,
   Logger,
 } from "@aura/channel-sdk";
+import type { BotRoute, PlatformApprovals } from "@aura/channel-sdk/bot";
 import type { Bot, Context } from "grammy";
 import { InlineKeyboard } from "grammy";
 
+import type { TelegramChat } from "./transport.js";
+
 type PendingEntry = {
   botId: string;
-  chatId: number;
+  handle: Bot;
+  chat: TelegramChat;
   messageId: number;
   resolve: (decision: ApprovalDecision) => void;
 };
 
 const CALLBACK_PREFIX = "aura:approve:";
-
-type BotLookup = (botId: string) => Bot | undefined;
 
 /**
  * Interactive approval broker.
@@ -25,30 +27,18 @@ type BotLookup = (botId: string) => Bot | undefined;
  * SDK's detached promise with the chosen decision; the SDK encodes it
  * as `ResolveApproval` on the wire.
  *
- * Routing: aura's `ApprovalRequest.userId` is the sidecar-composed
- * `tg_<bot>_<chat>_<user>` id. The broker uses `botByUser` to recover
- * which bot originated the user, then `lookupBot(botId)` to find the
- * running grammy instance that should post the prompt. Callback
- * queries from the user arrive on whatever bot posted the prompt;
- * the channel calls `attach(bot)` for each new bot before starting
- * polling so the `callbackQuery` handler is in place ahead of time.
+ * The SDK hands us the already-resolved {@link BotRoute} so we never
+ * need to touch its routing tables. The bot handle is captured into
+ * the pending entry, so `onResolved` can edit the prompt even after
+ * the user's route has been purged by a StopBot.
  */
-export class ApprovalBroker {
+export class TelegramApprovals
+  implements PlatformApprovals<Bot, TelegramChat>
+{
   private readonly pending = new Map<string, PendingEntry>();
 
-  constructor(
-    private readonly botByUser: Map<string, string>,
-    private readonly chatByUser: Map<string, number>,
-    private readonly lookupBot: BotLookup,
-    private readonly logger: Logger,
-  ) {}
+  constructor(private readonly logger: Logger) {}
 
-  /**
-   * Register the callback handler on a freshly-created bot. Must be
-   * called before `bot.start()` — grammy freezes its middleware tree
-   * the moment polling begins, after which any further `.callbackQuery`
-   * registration throws as a memory-leak guard.
-   */
   attach(bot: Bot): void {
     bot.callbackQuery(
       new RegExp(`^${CALLBACK_PREFIX}`),
@@ -56,17 +46,11 @@ export class ApprovalBroker {
     );
   }
 
-  /**
-   * Post an approval prompt and wait for the user's tap. Fails closed
-   * (resolves with `"deny"`) when the user / bot can't be located or
-   * Telegram refuses the send — matches the SDK's behavior for handler
-   * errors.
-   */
-  async request(req: ApprovalRequest): Promise<ApprovalDecision> {
-    const botId = this.botByUser.get(req.userId);
-    const chatId = this.chatByUser.get(req.userId);
-    const bot = botId !== undefined ? this.lookupBot(botId) : undefined;
-    if (!bot || chatId === undefined || botId === undefined) {
+  async onRequested(
+    req: ApprovalRequest,
+    route: BotRoute<Bot, TelegramChat> | null,
+  ): Promise<ApprovalDecision> {
+    if (!route) {
       this.logger.warn(
         "approval request with no routable chat; auto-denying",
         req.userId,
@@ -84,8 +68,11 @@ export class ApprovalBroker {
 
     let messageId: number;
     try {
-      const sent = await bot.api.sendMessage(chatId, text, {
+      const sent = await route.handle.api.sendMessage(route.chat.chatId, text, {
         reply_markup: keyboard,
+        ...(route.chat.threadId !== undefined
+          ? { message_thread_id: route.chat.threadId }
+          : {}),
       });
       messageId = sent.message_id;
     } catch (err) {
@@ -94,11 +81,25 @@ export class ApprovalBroker {
     }
 
     return new Promise<ApprovalDecision>((resolve) => {
-      this.pending.set(req.callId, { botId, chatId, messageId, resolve });
+      this.pending.set(req.callId, {
+        botId: route.botId,
+        handle: route.handle,
+        chat: route.chat,
+        messageId,
+        resolve,
+      });
     });
   }
 
-  async notifyResolved(
+  onBotStopped(botId: string): void {
+    for (const [callId, entry] of this.pending) {
+      if (entry.botId !== botId) continue;
+      this.pending.delete(callId);
+      entry.resolve("deny");
+    }
+  }
+
+  async onResolved(
     callId: string,
     decision: ApprovalDecision,
   ): Promise<void> {
@@ -106,11 +107,12 @@ export class ApprovalBroker {
     if (!entry) return;
     this.pending.delete(callId);
     entry.resolve(decision);
-    const bot = this.lookupBot(entry.botId);
-    if (!bot) return;
     try {
-      await bot.api.editMessageText(
-        entry.chatId,
+      // editMessageText identifies the target by (chat_id, message_id);
+      // thread is already encoded in the original message, so no
+      // message_thread_id is needed here.
+      await entry.handle.api.editMessageText(
+        entry.chat.chatId,
         entry.messageId,
         `${decisionIcon(decision)} ${decisionLabel(decision)}`,
       );
@@ -119,7 +121,7 @@ export class ApprovalBroker {
     }
   }
 
-  flushDenyAll(): void {
+  onStop(): void {
     for (const [, entry] of this.pending) {
       entry.resolve("deny");
     }
