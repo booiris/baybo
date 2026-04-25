@@ -386,7 +386,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                     bun_version = aura_gateway::sidecar::bun_version(),
                     bun_target = runtime.bun_target(),
                     channel_port,
-                    "starting embedded sidecars",
+                    "sidecar supervisor active; channels start on first registered bot",
                 );
                 let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
                 let supervisor = SidecarSupervisor::new(
@@ -395,10 +395,11 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                     Arc::clone(&log_buffer),
                     log_dir.join("channel"),
                     Arc::clone(&leak_detector),
+                    graph.stores.channel_bot.clone(),
                 );
                 let sv_shutdown = shutdown.clone();
                 task_tracker.track(tokio::spawn(async move {
-                    supervisor.run(sv_shutdown, channel_types).await;
+                    supervisor.run(sv_shutdown).await;
                 }));
             }
         }

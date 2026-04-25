@@ -1,12 +1,22 @@
 //! Lifecycle loop for embedded sidecars.
 //!
-//! One supervised task per channel type: materialise a
-//! `tokio::process::Command` pointed at `bun <bundle>`, hand it to
+//! Lazy spawn model: an embedded channel type only gets a supervised
+//! restart loop once at least one bot is registered for it. The
+//! supervisor polls [`ChannelBotStore`] on a short tick, and the first
+//! time a channel reports live bots it materialises a
+//! `tokio::process::Command` pointed at `bun <bundle>`, hands it to
 //! [`ChannelSpawner`] (which injects the channel WS URL + a fresh
-//! capability token via env vars — see `spawn.rs`), and wait on the
-//! child. On
-//! exit, back off and restart. On shutdown, SIGKILL the child and
-//! exit.
+//! capability token via env vars — see `spawn.rs`), and starts waiting
+//! on the child. On exit, back off and restart. On shutdown, SIGKILL
+//! the child and exit.
+//!
+//! A channel that never gains a bot never spawns. A channel that
+//! gains one at runtime spawns within one discovery tick. The supervisor
+//! does not currently tear a sidecar down when its bot count drops back
+//! to zero — the [`crate::channel::ChannelBotReconciler`] keeps the
+//! sidecar's roster in sync, so an idle sidecar costs only the bun
+//! process; explicit stop-on-empty would just kill a process that's
+//! already doing nothing.
 //!
 //! Backoff is exponential with a 30s cap. A child that ran for ≥60s
 //! before dying resets backoff so a long-stable sidecar that finally
@@ -20,6 +30,7 @@
 //! still shows every sidecar line live. Sidecar output never enters
 //! `aura.log`.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -27,7 +38,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aura_agent::service::ShutdownSignal;
+use aura_model::ChannelType;
 use aura_security::{LeakDetector, RedactingMakeWriter};
+use aura_storage::ChannelBotStore;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -47,11 +60,16 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// minimum. Prevents a sidecar that's been stable for hours from
 /// taking 30s to come back after a transient failure.
 const UPTIME_RESET_THRESHOLD: Duration = Duration::from_secs(60);
+/// How often the supervisor polls the bot store for embedded channel
+/// types that have gained their first registered bot. Matches the
+/// reconciler tick so an `aura channel add` propagates uniformly.
+const BOT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 type ChannelLogWriter = Arc<RedactingMakeWriter<NonBlocking>>;
 
-/// Drives the restart loop for every embedded sidecar. Clone-cheap
-/// (everything is `Arc` / small value).
+/// Drives the restart loop for every embedded sidecar that has at
+/// least one registered bot. Clone-cheap (everything is `Arc` / small
+/// value).
 #[derive(Clone)]
 pub struct SidecarSupervisor {
     runtime: Arc<SidecarRuntime>,
@@ -59,6 +77,7 @@ pub struct SidecarSupervisor {
     log_buffer: Arc<LogBuffer>,
     channel_log_dir: PathBuf,
     leak_detector: Arc<LeakDetector>,
+    bot_store: Arc<dyn ChannelBotStore>,
 }
 
 impl SidecarSupervisor {
@@ -68,6 +87,7 @@ impl SidecarSupervisor {
         log_buffer: Arc<LogBuffer>,
         channel_log_dir: PathBuf,
         leak_detector: Arc<LeakDetector>,
+        bot_store: Arc<dyn ChannelBotStore>,
     ) -> Self {
         Self {
             runtime,
@@ -75,14 +95,15 @@ impl SidecarSupervisor {
             log_buffer,
             channel_log_dir,
             leak_detector,
+            bot_store,
         }
     }
 
-    /// Spawn one supervising task per channel type in `channel_types`
-    /// that this build actually embeds. Unknown or unembedded types
-    /// log a warning and are dropped. Returns when `shutdown` fires
-    /// and every child has been signalled + awaited.
-    pub async fn run(self, shutdown: ShutdownSignal, channel_types: Vec<String>) {
+    /// Poll the bot store and spawn a supervised restart loop for each
+    /// embedded channel type the first time it reports ≥ 1 live bot.
+    /// Channels with no bots are never spawned. Returns when `shutdown`
+    /// fires and every child has been signalled + awaited.
+    pub async fn run(self, shutdown: ShutdownSignal) {
         if let Err(e) = std::fs::create_dir_all(&self.channel_log_dir) {
             tracing::warn!(
                 dir = %self.channel_log_dir.display(),
@@ -91,29 +112,63 @@ impl SidecarSupervisor {
             );
         }
         let this = Arc::new(self);
-        let mut tasks = Vec::new();
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut guards: Vec<WorkerGuard> = Vec::new();
-        for channel_type in channel_types {
-            if this.runtime.bundle_for(&channel_type).is_none() {
-                tracing::warn!(
-                    %channel_type,
-                    "channel type not embedded in this build; sidecar not started",
-                );
-                continue;
-            }
-            let writer = build_channel_log_writer(
-                &this.channel_log_dir,
-                &channel_type,
-                Arc::clone(&this.leak_detector),
-                &mut guards,
-            );
-            let sv = Arc::clone(&this);
-            let sd = shutdown.clone();
-            tasks.push(tokio::spawn(async move {
-                sv.supervise_one(channel_type, sd, writer).await;
-            }));
+        let mut started: HashSet<String> = HashSet::new();
+
+        let embedded: Vec<String> = this.runtime.channel_types().map(String::from).collect();
+        if embedded.is_empty() {
+            shutdown.wait().await;
+            return;
         }
-        shutdown.wait().await;
+
+        let mut ticker = tokio::time::interval(BOT_DISCOVERY_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = shutdown.wait() => break,
+                _ = ticker.tick() => {
+                    for ct_str in &embedded {
+                        if started.contains(ct_str) {
+                            continue;
+                        }
+                        let ct = ChannelType::from(ct_str.as_str());
+                        let has_live = match this.bot_store.list_live(&ct).await {
+                            Ok(rows) => !rows.is_empty(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    channel_type = %ct_str,
+                                    error = %format!("{e:#}"),
+                                    "list live bots failed; will retry next discovery tick",
+                                );
+                                continue;
+                            }
+                        };
+                        if !has_live {
+                            continue;
+                        }
+                        let writer = build_channel_log_writer(
+                            &this.channel_log_dir,
+                            ct_str,
+                            Arc::clone(&this.leak_detector),
+                            &mut guards,
+                        );
+                        started.insert(ct_str.clone());
+                        let sv = Arc::clone(&this);
+                        let sd = shutdown.clone();
+                        let ct_owned = ct_str.clone();
+                        tracing::info!(
+                            channel_type = %ct_str,
+                            "registered bot detected; starting sidecar",
+                        );
+                        tasks.push(tokio::spawn(async move {
+                            sv.supervise_one(ct_owned, sd, writer).await;
+                        }));
+                    }
+                }
+            }
+        }
         for t in tasks {
             let _ = t.await;
         }
