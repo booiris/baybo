@@ -160,7 +160,14 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         state.bot_reconciler.seed(channel_type.clone(), sent);
     }
 
-    run_inbound_loop(source, &state, &channel_type, &sidecar).await;
+    run_inbound_loop(
+        source,
+        &state,
+        &channel_type,
+        &sidecar,
+        session_id.as_deref(),
+    )
+    .await;
 
     if session_id.is_none() {
         state.control.unregister(&channel_type);
@@ -337,6 +344,7 @@ async fn run_inbound_loop(
     state: &WsChannelState,
     channel_type: &ChannelType,
     sidecar: &Sidecar,
+    connection_session_id: Option<&str>,
 ) {
     while let Some(msg) = source.next().await {
         let msg = match msg {
@@ -357,54 +365,84 @@ async fn run_inbound_loop(
                 };
                 match frame {
                     Frame::Message(wire_msg) => {
-                        // Sidecars that don't mint their own UUIDs (the
-                        // Telegram channel, future Discord / Slack, …)
-                        // send `session_id = ""` and rely on the gateway
-                        // to allocate one keyed on (channel_type,
-                        // user_id). The TUI always fills session_id in
-                        // itself so it skips this branch (and the
-                        // pairing gate below).
-                        let session_id = if wire_msg.session_id.is_empty() {
-                            if wire_msg.user_id.is_empty() {
-                                tracing::warn!(
-                                    %channel_type,
-                                    "inbound Message with empty session_id AND user_id; dropping",
-                                );
-                                continue;
-                            }
-                            // Pairing gate: unknown / expired-pending
-                            // triples get a short code back via Notice
-                            // and the message is dropped before any
-                            // session is created.
-                            if !enforce_pairing(
-                                state,
-                                sidecar,
-                                channel_type,
-                                &wire_msg.bot_id,
-                                &wire_msg.user_id,
-                            )
-                            .await
-                            {
-                                continue;
-                            }
-                            match state
-                                .session_resolver
-                                .resolve_or_create(channel_type, &wire_msg.user_id)
-                                .await
-                            {
-                                Ok(sid) => sid,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
+                        // Two cases:
+                        //
+                        // 1. Session-scoped client (TUI). The session_id
+                        //    was bound at Register and is the only one
+                        //    this connection may target — `wire_msg`'s
+                        //    field is ignored so a misbehaving TUI can't
+                        //    inject into other sessions. We still drop
+                        //    if the wire field disagrees, so a clearly
+                        //    confused client surfaces in logs instead
+                        //    of silently misrouting.
+                        //
+                        // 2. Type-scoped sidecar (Telegram, Discord, …).
+                        //    The sidecar is *never* trusted to name its
+                        //    session_id — that would bypass pairing and
+                        //    let the sidecar inject into or steal output
+                        //    from any session whose id it knows. We
+                        //    always derive (channel_type, user_id) →
+                        //    session via the resolver, after the
+                        //    pairing gate.
+                        let session_id = match connection_session_id {
+                            Some(sid) => {
+                                if !wire_msg.session_id.is_empty() && wire_msg.session_id != sid {
+                                    tracing::warn!(
                                         %channel_type,
-                                        user_id = %wire_msg.user_id,
-                                        "resolve session id for inbound message failed; dropping",
+                                        bound = %sid,
+                                        wire = %wire_msg.session_id,
+                                        "session-scoped client supplied a different session_id; dropping",
                                     );
                                     continue;
                                 }
+                                sid.to_string()
                             }
-                        } else {
-                            wire_msg.session_id
+                            None => {
+                                if !wire_msg.session_id.is_empty() {
+                                    tracing::warn!(
+                                        %channel_type,
+                                        "subprocess sidecar supplied session_id on Message; ignoring (resolver is canonical)",
+                                    );
+                                }
+                                if wire_msg.user_id.is_empty() {
+                                    tracing::warn!(
+                                        %channel_type,
+                                        "inbound Message with empty user_id; dropping",
+                                    );
+                                    continue;
+                                }
+                                // Pairing gate: unknown / expired-pending
+                                // triples get a short code back via Notice
+                                // and the message is dropped before any
+                                // session is created.
+                                if !enforce_pairing(
+                                    state,
+                                    sidecar,
+                                    channel_type,
+                                    &wire_msg.bot_id,
+                                    &wire_msg.user_id,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                                match state
+                                    .session_resolver
+                                    .resolve_or_create(channel_type, &wire_msg.user_id)
+                                    .await
+                                {
+                                    Ok(sid) => sid,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            %channel_type,
+                                            user_id = %wire_msg.user_id,
+                                            "resolve session id for inbound message failed; dropping",
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                         };
 
                         let sender = User {

@@ -138,7 +138,11 @@ impl SidecarSupervisor {
             cmd.arg(&bundle);
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
-            let handle = match self.spawner.spawn(cmd, format!("sidecar-{channel_type}")) {
+            let handle = match self.spawner.spawn(
+                cmd,
+                format!("sidecar-{channel_type}"),
+                channel_type.clone(),
+            ) {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::error!(

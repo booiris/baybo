@@ -12,3 +12,22 @@ sdks/*/dist/
 channel-src/*/dist/
 web/dist/
 origin_channel_plugin
+
+# user dotfiles / shell config bind-mounted into the workspace
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.ripgreprc
+
+# editor / tooling
+.idea
+.claude/agents
+.claude/commands
+.claude/settings.json
+.mcp.json
+
+# stray submodule manifest from local sandbox
+.gitmodules

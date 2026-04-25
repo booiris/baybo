@@ -250,13 +250,18 @@ mod tests {
         Request::builder().uri("/v1/x").body(Body::empty()).unwrap()
     }
 
+    fn ident(pid: u32, label: &str) -> ClientIdentity {
+        ClientIdentity {
+            pid,
+            label: label.into(),
+            bound_channel_type: None,
+        }
+    }
+
     #[test]
     fn tui_token_label_resolves_to_tui_authed_client() {
         let (state, tokens) = mk_state();
-        let handle = tokens.mint(ClientIdentity {
-            pid: 0,
-            label: TUI_CLIENT_LABEL.into(),
-        });
+        let handle = tokens.mint(ident(0, TUI_CLIENT_LABEL));
         let mut req = empty_req();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, handle.token().parse().unwrap());
@@ -267,10 +272,7 @@ mod tests {
     #[test]
     fn subprocess_token_label_resolves_to_subprocess() {
         let (state, tokens) = mk_state();
-        let handle = tokens.mint(ClientIdentity {
-            pid: 1234,
-            label: "telegram".into(),
-        });
+        let handle = tokens.mint(ident(1234, "telegram"));
         let mut req = empty_req();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, handle.token().parse().unwrap());
@@ -302,10 +304,7 @@ mod tests {
     fn token_revoked_after_handle_drop() {
         let (state, tokens) = mk_state();
         let token_str = {
-            let handle = tokens.mint(ClientIdentity {
-                pid: 1234,
-                label: "telegram".into(),
-            });
+            let handle = tokens.mint(ident(1234, "telegram"));
             handle.token().to_string()
             // handle drops here -> token revoked
         };
@@ -319,10 +318,7 @@ mod tests {
     #[test]
     fn token_query_param_accepted() {
         let (state, tokens) = mk_state();
-        let handle = tokens.mint(ClientIdentity {
-            pid: 42,
-            label: "telegram".into(),
-        });
+        let handle = tokens.mint(ident(42, "telegram"));
         let uri = format!("/v1/channel-ws?token={}", handle.token());
         let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
         let out = check_channel_token(&req, &state).unwrap();
@@ -339,10 +335,7 @@ mod tests {
         // the precedence so a later change doesn't silently let a
         // leaked query override a fresh header.
         let (state, tokens) = mk_state();
-        let handle = tokens.mint(ClientIdentity {
-            pid: 42,
-            label: "telegram".into(),
-        });
+        let handle = tokens.mint(ident(42, "telegram"));
         let uri = format!("/v1/channel-ws?token={}", handle.token());
         let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
         req.headers_mut()

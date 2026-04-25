@@ -35,6 +35,7 @@ fn mint_test_tui_token(tokens: &ChannelTokenTable) -> (String, TokenHandle) {
     let handle = tokens.mint(ClientIdentity {
         pid: 0,
         label: TUI_CLIENT_LABEL.to_string(),
+        bound_channel_type: None,
     });
     (handle.token().to_string(), handle)
 }
@@ -47,6 +48,7 @@ async fn channel_ws_end_to_end() {
     let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let channel_tokens = tg.channel_tokens.clone();
+    let pairing_store = tg.deps.stores.channel_pairing.clone();
     let shutdown = tg.shutdown.clone();
 
     let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
@@ -64,10 +66,24 @@ async fn channel_ws_end_to_end() {
     let handle = channel_tokens.mint(ClientIdentity {
         pid: std::process::id(),
         label: "slack".into(),
+        bound_channel_type: Some("slack".into()),
     });
     let token = handle.token().to_string();
 
     let slack = ChannelType::from("slack");
+
+    // Pre-approve a pairing for (slack, prod-bot, user-1) so the
+    // resolver-driven path admits the inbound message immediately
+    // without an operator round-trip.
+    let now = chrono::Utc::now().timestamp();
+    let row = pairing_store
+        .upsert_pending(&slack, "prod-bot", "user-1", "TESTCD", now, now + 600)
+        .await
+        .expect("seed pending pairing");
+    pairing_store
+        .approve_by_code(&row.code, now)
+        .await
+        .expect("approve pairing");
 
     // 1. Sidecar registers.
     let mut client = connect_register(port, &token, slack.clone())
@@ -81,13 +97,16 @@ async fn channel_ws_end_to_end() {
         "sidecar not registered with ChannelRegistry",
     );
 
-    // 2. Sidecar → agent message reaches router intake.
+    // 2. Sidecar → agent message reaches router intake. session_id
+    // intentionally left empty: subprocess sidecars are no longer
+    // permitted to self-supply the session id (would bypass pairing
+    // and let the sidecar inject into other users' sessions).
     let outbound = WireMessage {
         content: "hi aura".into(),
-        session_id: "sess-1".into(),
+        session_id: String::new(),
         user_id: "user-1".into(),
         channel_type: slack.clone(),
-        bot_id: String::new(),
+        bot_id: "prod-bot".into(),
     };
     send_frame(&mut client, &Frame::Message(outbound.clone()))
         .await
@@ -97,7 +116,11 @@ async fn channel_ws_end_to_end() {
         .await
         .expect("router intake timeout")
         .expect("router intake closed");
-    assert_eq!(incoming.message.session_id, "sess-1");
+    let resolved_session_id = incoming.message.session_id.clone();
+    assert!(
+        !resolved_session_id.is_empty(),
+        "resolver should have allocated a session id",
+    );
     assert_eq!(incoming.message.sender.id, "user-1");
     assert_eq!(incoming.message.channel, slack);
     match incoming.message.content.first() {
@@ -111,7 +134,7 @@ async fn channel_ws_end_to_end() {
         .expect("channel present after registration");
     channel_handle
         .send(AgentOutput::Message(OutgoingMessage {
-            session_id: "sess-1".into(),
+            session_id: resolved_session_id.clone(),
             user_id: "user-1".into(),
             channel: slack.clone(),
             content: vec![ContentBlock::Text("pong".into())],
@@ -126,7 +149,7 @@ async fn channel_ws_end_to_end() {
         .expect("sidecar recv timeout")
         .expect("sidecar recv");
     assert_eq!(recv.content, "pong");
-    assert_eq!(recv.session_id, "sess-1");
+    assert_eq!(recv.session_id, resolved_session_id);
     assert_eq!(recv.channel_type, slack);
 
     // 4. Duplicate registration for the same channel type is rejected.
@@ -335,6 +358,7 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let handle = channel_tokens.mint(ClientIdentity {
         pid: std::process::id(),
         label: "slack".into(),
+        bound_channel_type: Some("slack".into()),
     });
     let token = handle.token().to_string();
     let slack = ChannelType::from("slack");

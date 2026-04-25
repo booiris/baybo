@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aura_channels::register_wire::{MAX_FRAME_BYTES, PromptKind, RegisterIn, RegisterOut};
 use aura_channels::registration::{Prompter, RegistrationResult};
-use aura_gateway::SidecarRuntime;
+use aura_gateway::{SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
 use aura_model::ChannelType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
@@ -12,24 +12,10 @@ use crate::error::{CliError, Result};
 
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 
-/// Env vars the registration subprocess is allowed to inherit. Every
-/// `AURA_*` value stays behind so gateway capability tokens and vault
-/// endpoints can't leak into an untrusted bundle.
-const ENV_ALLOWLIST: &[&str] = &[
-    "PATH",
-    "HOME",
-    "TERM",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LC_MESSAGES",
-    "LC_NUMERIC",
-    "LC_TIME",
-    "LC_COLLATE",
-    "LC_MONETARY",
-    "TZ",
-    "TMPDIR",
-];
+// The registration subprocess inherits the same minimal env as the
+// supervised channel sidecars — see `aura_gateway::SIDECAR_ENV_ALLOWLIST`
+// for the canonical list. Keeping a single source of truth means a
+// future entry (or removal) lands in both spawn paths together.
 
 /// Spawn the channel's bundled sidecar in registration mode, drive the
 /// stdin/stdout JSON exchange, and return the credentials it emits.
@@ -200,7 +186,7 @@ async fn read_line_capped<R: AsyncReadExt + Unpin>(
 
 fn scrubbed_env(cmd: &mut Command) {
     cmd.env_clear();
-    for key in ENV_ALLOWLIST {
+    for key in SIDECAR_ENV_ALLOWLIST {
         if let Ok(v) = std::env::var(key) {
             cmd.env(key, v);
         }

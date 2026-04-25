@@ -87,11 +87,32 @@ pub(crate) fn validate_register(
             if identity.pid != *pid || identity.label != *label {
                 return Err("token identity mismatch".to_string());
             }
+            // Token is bound to a single channel_type at mint time
+            // (see `ChannelSpawner::spawn`). A compromised sidecar
+            // must not be able to claim a different channel and
+            // collect that channel's bot secrets.
+            if let Some(bound) = identity.bound_channel_type.as_deref()
+                && bound != normalized
+            {
+                return Err(format!(
+                    "token bound to channel_type '{bound}', cannot register as '{normalized}'",
+                ));
+            }
             if RESERVED_CHANNEL_TYPES.iter().any(|r| *r == normalized) {
                 return Err(format!("channel_type '{normalized}' is reserved"));
             }
             if normalized == ChannelType::TUI {
                 return Err("channel_type 'tui' is reserved for the built-in TUI".to_string());
+            }
+            // Subprocess sidecars are type-scoped, not session-scoped.
+            // Letting them self-supply a session_id would (a) bypass
+            // the pairing gate and (b) let them attach to or impersonate
+            // any session whose id they can guess. The Register frame
+            // must therefore leave session_id empty.
+            if session_id.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                return Err(
+                    "subprocess sidecars must not declare a session_id in Register".to_string(),
+                );
             }
         }
     }
@@ -148,6 +169,7 @@ mod tests {
         let handle = tokens.mint(ClientIdentity {
             pid: 42,
             label: "slack".into(),
+            bound_channel_type: Some("slack".into()),
         });
         let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
         let authed = subprocess(42, "slack");
@@ -162,6 +184,7 @@ mod tests {
         let handle = tokens.mint(ClientIdentity {
             pid: 1,
             label: "slack".into(),
+            bound_channel_type: Some("slack".into()),
         });
         let frame = register(handle.token(), "slack", PROTOCOL_VERSION + 1);
         let authed = subprocess(1, "slack");
@@ -184,6 +207,7 @@ mod tests {
         let handle = tokens.mint(ClientIdentity {
             pid: 42,
             label: "slack".into(),
+            bound_channel_type: Some("slack".into()),
         });
         let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
         let authed = subprocess(999, "slack");
@@ -197,6 +221,7 @@ mod tests {
         let handle = tokens.mint(ClientIdentity {
             pid: 42,
             label: "slack".into(),
+            bound_channel_type: Some("slack".into()),
         });
         let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
         let authed = subprocess(42, "discord");
@@ -235,6 +260,7 @@ mod tests {
         let handle = tokens.mint(ClientIdentity {
             pid: 1,
             label: "tui".into(),
+            bound_channel_type: Some("tui".into()),
         });
         let frame = register(handle.token(), ChannelType::TUI, PROTOCOL_VERSION);
         let authed = subprocess(1, "tui");
@@ -248,6 +274,7 @@ mod tests {
         let handle = tokens.mint(ClientIdentity {
             pid: 1,
             label: "http".into(),
+            bound_channel_type: Some("http".into()),
         });
         let frame = register(handle.token(), "http", PROTOCOL_VERSION);
         let authed = subprocess(1, "http");
@@ -261,6 +288,7 @@ mod tests {
         let handle = tokens.mint(ClientIdentity {
             pid: 1,
             label: "slack".into(),
+            bound_channel_type: Some("slack".into()),
         });
         let frame = register(handle.token(), "   ", PROTOCOL_VERSION);
         let authed = subprocess(1, "slack");
@@ -281,5 +309,86 @@ mod tests {
         let authed = subprocess(1, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert_eq!(err, "expected Register frame");
+    }
+
+    #[test]
+    fn rejects_subprocess_claiming_other_bound_channel_type() {
+        // Token was minted for "slack" (the supervisor knows the
+        // channel_type at spawn time). The sidecar must not be able
+        // to register as "discord" and steal that channel's bot
+        // secrets.
+        let tokens = ChannelTokenTable::new();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 7,
+            label: "sidecar-slack".into(),
+            bound_channel_type: Some("slack".into()),
+        });
+        let frame = register(handle.token(), "discord", PROTOCOL_VERSION);
+        let authed = subprocess(7, "sidecar-slack");
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(
+            err.contains("bound to channel_type 'slack'") && err.contains("'discord'"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn accepts_subprocess_claiming_bound_channel_type() {
+        let tokens = ChannelTokenTable::new();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 7,
+            label: "sidecar-slack".into(),
+            bound_channel_type: Some("slack".into()),
+        });
+        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let authed = subprocess(7, "sidecar-slack");
+        let outcome = validate_register(frame, &authed, &tokens).unwrap();
+        assert_eq!(outcome.channel_type.as_str(), "slack");
+        assert!(outcome.session_id.is_none());
+    }
+
+    #[test]
+    fn rejects_subprocess_supplying_session_id() {
+        // Subprocess sidecars are type-scoped, never session-scoped:
+        // letting them name a session_id would bypass pairing AND
+        // let them attach to any guessable session.
+        let tokens = ChannelTokenTable::new();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 7,
+            label: "sidecar-slack".into(),
+            bound_channel_type: Some("slack".into()),
+        });
+        let frame = register_with_session(
+            handle.token(),
+            "slack",
+            PROTOCOL_VERSION,
+            Some("session-i-want-to-hijack"),
+        );
+        let authed = subprocess(7, "sidecar-slack");
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(err.contains("must not declare a session_id"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_subprocess_supplying_whitespace_session_id() {
+        // Whitespace-only is treated as empty by the trimmer below
+        // the auth checks, but we want the explicit rejection to
+        // happen *before* trimming so an attacker can't slip a value
+        // past the gate by padding it with spaces.
+        let tokens = ChannelTokenTable::new();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 7,
+            label: "sidecar-slack".into(),
+            bound_channel_type: Some("slack".into()),
+        });
+        let frame = register_with_session(
+            handle.token(),
+            "slack",
+            PROTOCOL_VERSION,
+            Some(" some-session "),
+        );
+        let authed = subprocess(7, "sidecar-slack");
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(err.contains("must not declare a session_id"), "got: {err}");
     }
 }

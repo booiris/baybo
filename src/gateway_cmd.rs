@@ -305,6 +305,11 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         ClientIdentity {
             pid: std::process::id(),
             label: TUI_CLIENT_LABEL.to_string(),
+            // None: TUI's channel-type binding is enforced via
+            // `TUI_CLIENT_LABEL` in the handshake, not via this
+            // field. Subprocess sidecars get `Some(channel_type)`
+            // from `ChannelSpawner::spawn`.
+            bound_channel_type: None,
         },
     );
 

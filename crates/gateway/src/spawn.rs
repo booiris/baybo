@@ -36,6 +36,29 @@ pub const ENV_CHANNEL_URL: &str = "AURA_CHANNEL_URL";
 /// [`CHANNEL_TOKEN_HEADER`].
 pub const ENV_CHANNEL_TOKEN: &str = "AURA_CHANNEL_TOKEN";
 
+/// Env vars a supervised channel sidecar is allowed to inherit from
+/// the gateway. Anything else (`OPENAI_API_KEY`, every `AURA_*` from
+/// the operator's shell, cloud / proxy creds, …) is scrubbed before
+/// `execve` so a compromised JS bundle can't read the gateway's
+/// secret env. Mirrors the registration-mode allowlist used by
+/// `cli::commands::channel::register::scrubbed_env`; both call sites
+/// import this constant so they can't drift apart.
+pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "TZ",
+    "TMPDIR",
+];
+
 /// Spawns channel-plugin subprocesses and mints their tokens. Cheap
 /// to clone — every field is already a small value.
 #[derive(Clone)]
@@ -56,13 +79,38 @@ impl ChannelSpawner {
     /// Spawn `cmd` as a channel client.
     ///
     /// `label` is recorded on the minted token for diagnostics (e.g.
-    /// `"telegram"`). The returned [`ChildHandle`] revokes the token
-    /// on drop; the child itself is *not* auto-killed (callers own
-    /// process lifecycle — the supervisor applies its own restart /
-    /// kill policy).
-    pub fn spawn(&self, mut cmd: Command, label: impl Into<String>) -> Result<ChildHandle> {
+    /// `"sidecar-telegram"`). `bound_channel_type` constrains the
+    /// `channel_type` the child can claim in its `Register` frame —
+    /// the handshake rejects any mismatch so a compromised sidecar
+    /// can't impersonate another channel and steal its bot secrets.
+    /// The returned [`ChildHandle`] revokes the token on drop; the
+    /// child itself is *not* auto-killed (callers own process
+    /// lifecycle — the supervisor applies its own restart / kill
+    /// policy).
+    ///
+    /// The child's environment is scrubbed to [`SIDECAR_ENV_ALLOWLIST`]
+    /// plus the two channel env vars before exec, so the operator's
+    /// `OPENAI_API_KEY`, `AURA_*`, cloud creds, etc. never reach the JS bundle.
+    pub fn spawn(
+        &self,
+        mut cmd: Command,
+        label: impl Into<String>,
+        bound_channel_type: impl Into<String>,
+    ) -> Result<ChildHandle> {
         let label = label.into();
+        let bound_channel_type = bound_channel_type.into();
         let token = generate_token();
+
+        // Drop everything inherited from the gateway, then re-add the
+        // allowlist + the two channel-protocol vars. Order matters:
+        // `env_clear` wipes the in-Command env table, *then* the
+        // explicit `env(...)` calls populate it.
+        cmd.env_clear();
+        for key in SIDECAR_ENV_ALLOWLIST {
+            if let Ok(v) = std::env::var(key) {
+                cmd.env(key, v);
+            }
+        }
         cmd.env(ENV_CHANNEL_URL, &self.url);
         cmd.env(ENV_CHANNEL_TOKEN, &token);
 
@@ -78,6 +126,7 @@ impl ChannelSpawner {
         let token_prefix: String = token.chars().take(6).collect();
         tracing::debug!(
             label = %label,
+            channel_type = %bound_channel_type,
             pid,
             url = %self.url,
             token_prefix = %token_prefix,
@@ -88,6 +137,7 @@ impl ChannelSpawner {
             ClientIdentity {
                 pid,
                 label: label.clone(),
+                bound_channel_type: Some(bound_channel_type),
             },
         );
         Ok(ChildHandle {
@@ -142,15 +192,70 @@ mod tests {
         assert_eq!(ENV_CHANNEL_TOKEN, "AURA_CHANNEL_TOKEN");
     }
 
+    /// End-to-end check that the spawned child does NOT inherit
+    /// arbitrary gateway env vars. The previous implementation just
+    /// `cmd.env(...)`'d the channel vars on top of the inherited
+    /// environment, leaking `OPENAI_API_KEY`-shaped secrets straight
+    /// into untrusted JS bundles.
+    #[tokio::test]
+    async fn spawn_scrubs_inherited_env_vars() {
+        struct EnvCleanup(&'static str);
+        impl Drop for EnvCleanup {
+            fn drop(&mut self) {
+                // SAFETY: env mutation is unsynchronised; the var name
+                // is unique enough that no other test touches it.
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+
+        let secret_var = "AURA_TEST_SECRET_THAT_MUST_NOT_LEAK";
+        // SAFETY: see EnvCleanup::drop.
+        unsafe { std::env::set_var(secret_var, "hunter2") };
+        let _cleanup = EnvCleanup(secret_var);
+
+        let tokens = ChannelTokenTable::new();
+        let spawner =
+            ChannelSpawner::new("ws://127.0.0.1:1/v1/channel-ws".to_owned(), tokens.clone());
+
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdout(std::process::Stdio::piped());
+        let mut handle = spawner.spawn(cmd, "test", "test-channel").unwrap();
+        let stdout = handle.child_mut().stdout.take().expect("piped stdout");
+        let mut buf = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let mut stdout = stdout;
+        stdout.read_to_end(&mut buf).await.unwrap();
+        let _ = handle.child_mut().wait().await;
+
+        let env_dump = String::from_utf8_lossy(&buf);
+        assert!(
+            !env_dump.contains(secret_var),
+            "leaked env var {secret_var} into spawned child:\n{env_dump}",
+        );
+        // Channel-protocol vars must still be present.
+        assert!(env_dump.contains(ENV_CHANNEL_URL), "missing channel URL");
+        assert!(
+            env_dump.contains(ENV_CHANNEL_TOKEN),
+            "missing channel token"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_registers_token_with_child_pid() {
         // `true` exits zero immediately — enough to sample its PID.
         let tokens = ChannelTokenTable::new();
         let spawner =
             ChannelSpawner::new("ws://127.0.0.1:1/v1/channel-ws".to_owned(), tokens.clone());
-        let handle = spawner.spawn(Command::new("true"), "test").unwrap();
+        let handle = spawner
+            .spawn(Command::new("true"), "test", "test-channel")
+            .unwrap();
         assert!(!tokens.is_empty());
         assert_eq!(tokens.len(), 1);
+        // The minted token must be bound to "test-channel" so a
+        // compromised sidecar can't claim a different channel type.
+        let token = handle._token.token().to_string();
+        let identity = tokens.lookup(&token).unwrap();
+        assert_eq!(identity.bound_channel_type.as_deref(), Some("test-channel"));
         let pid = handle.pid();
         drop(handle);
         // Drop revokes the token.

@@ -46,9 +46,17 @@ pub struct ClientIdentity {
     /// Gateway-owned credentials (the bundled TUI) report the gateway's
     /// own pid here for diagnostic symmetry.
     pub pid: u32,
-    /// Operator-visible label for the client (e.g. "telegram", "discord",
-    /// or [`TUI_CLIENT_LABEL`]).
+    /// Operator-visible label for the client (e.g. "sidecar-telegram",
+    /// "sidecar-discord", or [`TUI_CLIENT_LABEL`]).
     pub label: String,
+    /// When `Some(ct)`, the bearer of this token may *only* register
+    /// as channel type `ct`. The handshake rejects any other claimed
+    /// type so a compromised sidecar can't impersonate a different
+    /// channel and trick the gateway into pushing that channel's bot
+    /// secrets to it. `None` for the gateway-issued TUI token: the
+    /// TUI's channel type is enforced via [`TUI_CLIENT_LABEL`] in the
+    /// handshake instead.
+    pub bound_channel_type: Option<String>,
 }
 
 /// In-memory registry of active subprocess tokens keyed by the token
@@ -154,6 +162,7 @@ mod tests {
         ClientIdentity {
             pid,
             label: label.into(),
+            bound_channel_type: None,
         }
     }
 
