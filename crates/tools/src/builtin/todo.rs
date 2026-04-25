@@ -172,19 +172,7 @@ todo_tool!(
     reason = "session task list is not yet modeled"
 );
 
-// -- MCP / tool search -------------------------------------------------------
-todo_tool!(
-    ListMcpResourcesTool,
-    name = "ListMcpResourcesTool",
-    desc = "List resources exposed by connected MCP servers.",
-    reason = "MCP client support is tracked in docs/todo/reintroduce-mcp-support.md"
-);
-todo_tool!(
-    ReadMcpResourceTool,
-    name = "ReadMcpResourceTool",
-    desc = "Read a specific MCP resource by URI.",
-    reason = "MCP client support is tracked in docs/todo/reintroduce-mcp-support.md"
-);
+// -- Tool search -------------------------------------------------------------
 todo_tool!(
     ToolSearchTool,
     name = "ToolSearch",

@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use aura_storage::{ChannelBotStore, retry_on_busy};
 use serde_json::json;
 
 use crate::cli::ChannelCmd;
+use crate::commands::secret_input::{RawModeGuard, read_masked_secret};
 use crate::context::CommandContext;
 use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
@@ -127,89 +128,6 @@ fn prompt_line<R: BufRead, W: Write>(
         ));
     }
     Ok(buf.trim().to_string())
-}
-
-struct RawModeGuard {
-    fd: i32,
-    original: libc::termios,
-}
-
-impl RawModeGuard {
-    fn new(fd: i32) -> Result<Self> {
-        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-        let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
-        if rc != 0 {
-            return Err(CliError::Io(format!(
-                "failed to read terminal mode: {}",
-                io::Error::last_os_error()
-            )));
-        }
-
-        let original = unsafe { termios.assume_init() };
-        let mut raw = original;
-        raw.c_lflag &= !(libc::ECHO | libc::ICANON);
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-
-        let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
-        if rc != 0 {
-            return Err(CliError::Io(format!(
-                "failed to enable raw terminal mode: {}",
-                io::Error::last_os_error()
-            )));
-        }
-
-        Ok(Self { fd, original })
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-    }
-}
-
-fn read_masked_secret<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    label: &str,
-) -> Result<String> {
-    writer.write_all(label.as_bytes())?;
-    writer.flush()?;
-
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = reader
-            .read(&mut byte)
-            .map_err(|e| CliError::Config(format!("failed to read token input: {e}")))?;
-        if n == 0 {
-            writer.write_all(b"\n")?;
-            writer.flush()?;
-            return Err(CliError::Io("stdin closed while reading token".into()));
-        }
-
-        match byte[0] {
-            b'\n' | b'\r' => {
-                writer.write_all(b"\n")?;
-                writer.flush()?;
-                break;
-            }
-            0x08 | 0x7f => {
-                if buf.pop().is_some() {
-                    writer.write_all(b"\x08 \x08")?;
-                    writer.flush()?;
-                }
-            }
-            b => {
-                buf.push(b);
-                writer.write_all(b"*")?;
-                writer.flush()?;
-            }
-        }
-    }
-
-    String::from_utf8(buf).map_err(|e| CliError::Config(format!("token must be valid utf-8: {e}")))
 }
 
 struct CliPrompter {

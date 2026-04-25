@@ -44,10 +44,12 @@ use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
+use aura_tools::mcp::McpReconciler;
 use aura_workspace::WorkspaceManager;
 use parking_lot::Mutex;
 use regex::Regex;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::boot;
@@ -134,7 +136,7 @@ pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<Secre
 /// Open the libsql store and return the vault + full [`Store`] handle
 /// for CLI subcommands that manage per-channel credentials
 /// (`aura channel list/add/remove`) or per-user pairings
-/// (`aura pair list/approve/revoke`). The returned [`Store`] is clonable
+/// (`aura pair list/approve/revoke`). The returned [`Store`] is cloneable
 /// and its fields share a single libsql connection, so CLI writes land
 /// atomically in the same file the gateway reads from.
 pub async fn build_bot_registry_deps(
@@ -169,7 +171,7 @@ pub struct ManagerGraph {
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
-    /// Clonable bundle of every libsql-backed store handle. Keeping the
+    /// Cloneable bundle of every libsql-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
     /// pick it up via `stores.xxx` without a new field here.
@@ -297,6 +299,28 @@ pub async fn build_managers(
 
     let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
     let hook_manager = Arc::new(HookManager::new());
+
+    // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
+    // dynamically registers/unregisters MCP-discovered tools. Bridge the
+    // shared `ShutdownSignal` to a `CancellationToken` since the
+    // reconciler lives in `aura-tools`, which doesn't depend on
+    // `aura-agent`.
+    let mcp_cancel = CancellationToken::new();
+    {
+        let signal = shutdown.clone();
+        let cancel_on_shutdown = mcp_cancel.clone();
+        tokio::spawn(async move {
+            signal.wait().await;
+            cancel_on_shutdown.cancel();
+        });
+    }
+    let mcp_reconciler = McpReconciler::new(
+        workspace_root.clone(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&secret_vault),
+        mcp_cancel,
+    );
+    mcp_reconciler.spawn();
 
     Ok(ManagerGraph {
         config,

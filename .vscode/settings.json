@@ -122,6 +122,8 @@
         "pendings",
         "pgpass",
         "pids",
+        "PKCE",
+        "precheck",
         "prefilter",
         "psks",
         "psql",
@@ -166,6 +168,7 @@
         "socat",
         "spammy",
         "sqlx",
+        "statuscode",
         "streamable",
         "stringly",
         "subcomponent",
@@ -189,6 +192,7 @@
         "thiserror",
         "tiktoken",
         "tmpfs",
+        "tokenless",
         "tombstoned",
         "tungstenite",
         "Turso",
@@ -245,7 +249,7 @@
         "**/.claude/agents": true,
         "**/.claude/commands": true,
         "**/.claude/settings.json": true,
-        "**/.mcp.json": true,
+        "./.mcp.json": true,
         "**/.gitmodules": true
     },
     "rust-analyzer.cargo.features": []

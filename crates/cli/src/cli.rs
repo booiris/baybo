@@ -69,6 +69,13 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: ChannelCmd,
     },
+    /// Manage Model Context Protocol servers exposed to the agent loop.
+    /// MCP-discovered tools surface to the LLM as `<server>/<tool>` and
+    /// are persisted to `.mcp.json` at the workspace root.
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
     /// Manage per-user pairings: approve new senders, list pending
     /// requests, revoke existing approvals. See
     /// `docs/modules/pairing.md`.
@@ -238,6 +245,140 @@ pub enum ChannelCmd {
     /// secret; a running gateway's reconciler pushes a `StopBot` to
     /// the sidecar on the next tick.
     Remove,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCmd {
+    /// Register a Model Context Protocol server. For HTTP transports
+    /// guarded by OAuth, the authorization flow runs inline before the
+    /// entry is persisted; failed auth → no mutation.
+    ///
+    /// Mirrors `claude mcp add`. The trailing positional after `name` is
+    /// the URL (HTTP) or the binary path (stdio); any further positionals
+    /// after `--` are forwarded as args to the stdio command.
+    #[command(after_help = "\
+EXAMPLES:
+  # HTTP server (no auth)
+  aura mcp add --transport http sentry https://mcp.sentry.dev/mcp
+
+  # HTTP server with a static bearer token (stored encrypted in the vault)
+  aura mcp add --transport http corridor https://app.corridor.dev/api/mcp \\
+      --header \"Authorization: Bearer abc123\"
+
+  # HTTP server with OAuth — runs the browser-based authorization flow at add-time;
+  # tokens are persisted only on success
+  aura mcp add --transport http github https://api.githubcopilot.com/mcp/ \\
+      --client-id Iv23liABCDEF
+
+  # HTTP server with OAuth, providing a client secret (read from stdin)
+  aura mcp add --transport http figma https://mcp.figma.com/mcp \\
+      --client-id <id> --client-secret
+
+  # HTTP server with OAuth on a fixed callback port (for pre-registered redirect URIs)
+  aura mcp add --transport http acme https://mcp.acme.dev/mcp \\
+      --client-id <id> --callback-port 8765
+
+  # stdio server with env vars
+  aura mcp add -e API_KEY=xxx my-server -- npx my-mcp-server
+
+  # stdio server with subprocess flags
+  aura mcp add my-server -- my-command --some-flag arg1
+
+  # Trust level
+  aura mcp add --transport http trusted-srv https://mcp.example.com/mcp \\
+      --trust-level trusted
+
+NOTES:
+  * Stdio servers ignore --header/--client-id/--client-secret/--callback-port.
+  * HTTP servers ignore --env (use --header for auth headers).
+  * On success the running gateway picks up the new tools within ~5 seconds via the
+    MCP reconciler — no restart required.
+")]
+    Add {
+        /// Transport type. Defaults to `stdio` if absent.
+        #[arg(short = 't', long, value_enum, default_value_t = McpTransportArg::Stdio)]
+        transport: McpTransportArg,
+        /// Environment variable to inject into a stdio MCP server, in
+        /// `KEY=VALUE` form. Repeatable.
+        #[arg(short = 'e', long = "env")]
+        envs: Vec<String>,
+        /// Header to attach to every HTTP request, in `Header: Value`
+        /// form. Repeatable. Stored encrypted in the secret vault.
+        #[arg(short = 'H', long = "header")]
+        headers: Vec<String>,
+        /// Pre-registered OAuth client id. If absent and the server
+        /// requires OAuth, Aura attempts Dynamic Client Registration.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// Prompt for the OAuth client secret (read from stdin).
+        #[arg(long)]
+        client_secret: bool,
+        /// Fixed callback port for the OAuth redirect URI. Use this when
+        /// the OAuth provider requires a pre-registered redirect URI;
+        /// otherwise an ephemeral port is bound.
+        #[arg(long)]
+        callback_port: Option<u16>,
+        /// Trust ceiling applied to every tool the server exports.
+        /// Defaults to `installed`.
+        #[arg(long, value_enum, default_value_t = TrustLevelArg::Installed)]
+        trust_level: TrustLevelArg,
+        /// Server identifier. Must be unique within `.mcp.json`. Used
+        /// as the prefix for tool names exposed to the LLM
+        /// (`<name>/<tool>`).
+        name: String,
+        /// For stdio: the binary path or `npx`-style entry. For HTTP:
+        /// the server URL.
+        command_or_url: String,
+        /// Trailing args passed to a stdio command (after `--`). Ignored
+        /// for HTTP transports.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// List configured MCP servers across `.mcp.json`. Each row probes
+    /// the server with a short timeout and reports a STATUS column.
+    /// Pass `--no-probe` for config-only output (cheap, no subprocess
+    /// spawn / HTTP roundtrip).
+    List {
+        /// Skip the live connection probe; render config only.
+        #[arg(long)]
+        no_probe: bool,
+    },
+    /// Show one server's full record. Vault values are rendered as
+    /// `********`. By default the server is probed; pass `--no-probe`
+    /// for config-only output.
+    Get {
+        /// Server name.
+        name: String,
+        /// Skip the live connection probe; render config only.
+        #[arg(long)]
+        no_probe: bool,
+    },
+    /// Remove an MCP server. Drops the entry from `.mcp.json` and every
+    /// associated vault key. Requires `--yes` in slash mode.
+    Remove {
+        /// Server name.
+        name: String,
+        /// Confirm the destructive action (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Copy, Clone, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum McpTransportArg {
+    Stdio,
+    Http,
+    /// Accepted for `claude mcp add` parity; treated as `http`.
+    Sse,
+}
+
+#[derive(Debug, Copy, Clone, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum TrustLevelArg {
+    Trusted,
+    Installed,
+    Untrusted,
 }
 
 #[derive(Debug, Subcommand)]

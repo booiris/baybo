@@ -109,7 +109,7 @@ impl ToolExecutor {
         debug!(tool = tool_name, "executing tool");
 
         if let Some(manifest) = self.tool_registry.get_manifest(tool_name) {
-            self.validate_trust(tool_name, manifest)?;
+            self.validate_trust(tool_name, &manifest)?;
         }
 
         // Begin observability recording up front so denial / approval

@@ -8,12 +8,12 @@ A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consu
 
 Top-level sections: `llm`, `agent`, `session`, `channels`, `security`, `skills`, `tools`, `trace`, `cost`, `workspace`.
 
-> **MCP status note.** The `tools.mcp_servers[]` surface, its mirror structs
-> (`McpServerEntry`, `McpTransportConfig`, `SecretRequirementConfig`,
-> `SecretAccessConfig`, `CapabilityConfig`), and their validation have been
-> temporarily removed along with MCP client support in `aura-tools`. The
-> remaining `tools` section keeps only `default_timeout_ms`. The full MCP
-> re-add plan is in `docs/todo/reintroduce-mcp-support.md`.
+> **MCP status note.** MCP server records do **not** live in `aura.json`.
+> They live in `<workspace>/.mcp.json`, owned by `aura-tools::mcp` (config
+> shape: `McpFile`, `McpServerEntry`, `McpTransportConfig`, `OAuthConfig`).
+> `aura.json`'s `tools` section keeps only `default_timeout_ms`. See
+> `docs/modules/tools.md` for the MCP client architecture and
+> `docs/modules/cli.md` for the `aura mcp {add,list,get,remove}` surface.
 
 There is no `storage` section. Storage paths are **derived** from the project root (`workspace.path`) — operators choose a project root, not individual data-file locations.
 

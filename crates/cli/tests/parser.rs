@@ -259,9 +259,125 @@ fn config_validate_accepts_optional_file() {
 
 #[test]
 fn unknown_subcommand_is_rejected() {
+    // `mcp serve` (server side) stays deferred — only the client commands ship.
     assert!(Cli::try_parse_from(["aura", "mcp", "serve"]).is_err());
+    // `mcp login` was folded into `mcp add` (auth runs inline).
+    assert!(Cli::try_parse_from(["aura", "mcp", "login", "github"]).is_err());
     assert!(Cli::try_parse_from(["aura", "gateway"]).is_err());
     assert!(Cli::try_parse_from(["aura", "daemon", "start"]).is_err());
+}
+
+#[test]
+fn mcp_add_http_parses() {
+    use aura_cli::cli::{McpCmd, McpTransportArg};
+    let cli = parse(&[
+        "mcp",
+        "add",
+        "--transport",
+        "http",
+        "github",
+        "https://api.githubcopilot.com/mcp/",
+    ]);
+    match cli.command {
+        Some(Commands::Mcp {
+            cmd:
+                McpCmd::Add {
+                    transport,
+                    name,
+                    command_or_url,
+                    ..
+                },
+        }) => {
+            assert!(matches!(transport, McpTransportArg::Http));
+            assert_eq!(name, "github");
+            assert_eq!(command_or_url, "https://api.githubcopilot.com/mcp/");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_add_stdio_with_args_parses() {
+    use aura_cli::cli::{McpCmd, McpTransportArg};
+    let cli = parse(&[
+        "mcp",
+        "add",
+        "demo",
+        "npx",
+        "--",
+        "@modelcontextprotocol/server-memory",
+    ]);
+    match cli.command {
+        Some(Commands::Mcp {
+            cmd:
+                McpCmd::Add {
+                    transport,
+                    name,
+                    command_or_url,
+                    args,
+                    ..
+                },
+        }) => {
+            assert!(matches!(transport, McpTransportArg::Stdio));
+            assert_eq!(name, "demo");
+            assert_eq!(command_or_url, "npx");
+            assert_eq!(
+                args,
+                vec!["@modelcontextprotocol/server-memory".to_string()]
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_list_get_remove_parse() {
+    use aura_cli::cli::McpCmd;
+    // Default: probe is on (no_probe = false).
+    let cli = parse(&["mcp", "list"]);
+    match cli.command {
+        Some(Commands::Mcp {
+            cmd: McpCmd::List { no_probe },
+        }) => assert!(!no_probe),
+        other => panic!("unexpected: {other:?}"),
+    }
+    let cli = parse(&["mcp", "list", "--no-probe"]);
+    match cli.command {
+        Some(Commands::Mcp {
+            cmd: McpCmd::List { no_probe },
+        }) => assert!(no_probe),
+        other => panic!("unexpected: {other:?}"),
+    }
+    let cli = parse(&["mcp", "get", "github"]);
+    match cli.command {
+        Some(Commands::Mcp {
+            cmd: McpCmd::Get { name, no_probe },
+        }) => {
+            assert_eq!(name, "github");
+            assert!(!no_probe);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    let cli = parse(&["mcp", "get", "github", "--no-probe"]);
+    match cli.command {
+        Some(Commands::Mcp {
+            cmd: McpCmd::Get { name, no_probe },
+        }) => {
+            assert_eq!(name, "github");
+            assert!(no_probe);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    let cli = parse(&["mcp", "remove", "github", "--yes"]);
+    match cli.command {
+        Some(Commands::Mcp {
+            cmd: McpCmd::Remove { name, yes },
+        }) => {
+            assert_eq!(name, "github");
+            assert!(yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
 }
 
 #[test]

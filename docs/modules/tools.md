@@ -1,11 +1,5 @@
 # tools - Tool System
 
-> **Status note.** MCP client support (`McpTool`, `McpToolProvider`, `rmcp`
-> transports, the `tools.mcp_servers[]` config surface) has been temporarily
-> removed pending the final shape of the tool system. Plan to re-add is
-> tracked in `docs/todo/reintroduce-mcp-support.md`. Sections below that refer
-> to MCP describe the target state once it lands again.
-
 ## Overview
 
 The `tools` crate provides Aura's tool abstraction, registration, and runtime routing. It exposes a uniform `Tool` interface so Agent does not care how a particular tool is implemented.
@@ -13,7 +7,7 @@ The `tools` crate provides Aura's tool abstraction, registration, and runtime ro
 Core responsibilities:
 
 - Define `Tool` trait and `ToolOutput`
-- Manage `ToolRegistry` for built-in tools (MCP tools will rejoin once support is reintroduced)
+- Manage `ToolRegistry` — both built-in tools (registered at startup) and **dynamic** tools sourced from external providers like MCP servers (registered/unregistered at runtime via `register_dynamic` / `unregister_for_source`)
 - Generate tool definitions for the LLM (name, description, parameters schema only — no secrets or governance details)
 - Carry source, capability, trust, and runtime metadata in `ToolManifest`
 
@@ -32,7 +26,7 @@ permission rules.
 | `WebFetch`                                                                                                                                                                                                                                                            | implemented | returns raw body; no side-channel LLM extraction yet                                                        |
 | `Echo`                                                                                                                                                                                                                                                                | debug-only  | returns params verbatim; registered only under `debug_assertions` for round-trip smoke-testing              |
 | `CronCreate`, `CronDelete`, `CronList`                                                                                                                                                                                                                                | implemented | live in `aura-agent::cron_tools` (not `aura-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `src/main.rs` after the scheduler is constructed |
-| `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `Skill`, `Task*`/`TodoWrite`, `ToolSearch`, `WebSearch`, `Team*`, `ListMcpResourcesTool`, `ReadMcpResourceTool`           | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed |
+| `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `Skill`, `Task*`/`TodoWrite`, `ToolSearch`, `WebSearch`, `Team*`                                                          | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed |
 
 `ToolRegistry::with_defaults()` registers the implemented set with
 `TrustLevel::Trusted` manifests declaring their capabilities
@@ -53,13 +47,48 @@ final tool-system design. `ToolContext` currently carries no secrets; a future
 iteration will reintroduce per-tool secret access on top of the finalized
 `Tool` trait and governance model.
 
-### MCP client support (removed — pending reintroduction)
+### MCP client support
 
-MCP client support previously lived here (`McpTool`, `McpToolProvider`, stdio
-and HTTP transports via the `rmcp` SDK, `{server_name}/{tool_name}`
-namespacing, trust/capability inheritance from `McpServerConfig`). It was
-removed pending the final tool-system design. The re-add plan lives in
-`docs/todo/reintroduce-mcp-support.md`.
+The `mcp` submodule (`crates/tools/src/mcp/`) implements an MCP **client**
+that surfaces every tool advertised by a configured MCP server through the
+agent loop's `Tool` path. Per the workspace's "MCP scope is agent-loop only"
+rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
+
+- **Configuration** lives in `<workspace>/.mcp.json` (loaded/written by
+  `aura_tools::mcp::McpFile`). Each entry carries a `name`, a transport
+  (`stdio { command, args }` or `http { url }`), a `trust_level`, an
+  optional `capabilities` set, and an optional `oauth { client_id,
+  callback_port }` block. **Nothing secret lives in this file** — env
+  bags, header bags, OAuth client secrets, and OAuth refresh/access
+  tokens all live in `SecretVault` under the `mcp.<name>.…` namespace
+  (`aura_tools::mcp::vault_keys`).
+- **Tool wrapping** — every server-side tool descriptor becomes an
+  `aura_tools::mcp::McpTool` named `<server>/<tool>` so MCP names cannot
+  collide with builtins. Each `McpTool` carries an `Arc`-cloned
+  `Peer<RoleClient>` that proxies `call_tool` over the connected
+  rmcp transport.
+- **Reconciler** (`McpReconciler`) re-reads `.mcp.json` every 5 seconds,
+  computes a per-entry identity hash (transport + trust + capabilities +
+  OAuth client_id), and connects/disconnects accordingly. Connections
+  are torn down + re-established when the identity hash changes;
+  `register_dynamic` / `unregister_for_source` keep the registry in
+  sync. Cancelled via the shared shutdown signal.
+- **OAuth** — the `oauth` submodule (`aura_tools::mcp::oauth`) drives
+  OAuth 2.1 + PKCE + Dynamic Client Registration via rmcp's
+  `OAuthState`. The flow runs **inline inside `aura mcp add`** for HTTP
+  transports when any OAuth flag (`--client-id`, `--client-secret`,
+  `--callback-port`) is passed: discovery → DCR (if no client_id) →
+  PKCE → browser launch via `open::that` → localhost callback listener
+  (axum) on `--callback-port` (or an ephemeral port) → token exchange →
+  vault persistence. Failed authorization → no `.mcp.json` mutation.
+- **Trust + capabilities** — the entry's `trust_level` becomes the
+  `ToolManifest`'s ceiling; defaults are `[Http]` for HTTP and
+  `[Http, ExecCommand]` for stdio. The existing
+  `ToolExecutor::validate_trust` rule still fires (e.g. an `installed`
+  server may not declare `WriteFile` or `ExecCommand`). Each `McpTool`
+  reports a single `ResourceAccess::Http { host }` (HTTP) or
+  `ResourceAccess::ExecCommand { command }` (stdio) so the approval
+  gate can prompt per host or per command.
 
 ### Capability-driven governance
 
@@ -95,7 +124,7 @@ Tool output should prefer structured `Json`, use `LargeText` for long text with 
 
 ## Constraints
 
-- Depends on `model`, `session`, `registry` (the `rmcp` dep returns with MCP support)
+- Depends on `model`, `session`, `registry`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
 - Does not install third-party artifacts (that's `registry`)
 - Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-connection gate is built by the gateway's WS sidecar (`ChannelApprovalGate` backed by an `ApprovalQueue`), and the TUI renders the resulting prompts inline in its scrollback
 - `artifact_hash` must be recorded in `trace::ExecutionProvenance`

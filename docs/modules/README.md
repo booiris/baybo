@@ -29,7 +29,7 @@ Bottom-up along the dependency graph:
 ### Capability and Governance Layer
 
 - **llm** — LLM provider wrapping and response parsing.
-- **tools** — Tool abstraction, registration, capability declarations, runtime routing. (MCP client support is temporarily removed; see `docs/todo/reintroduce-mcp-support.md`.)
+- **tools** — Tool abstraction, registration, capability declarations, runtime routing. The `mcp` submodule ships an MCP client (config in `<workspace>/.mcp.json`, OAuth via rmcp) that surfaces every server's tools to the agent loop as `<server>/<tool>`; the `McpReconciler` keeps the registry in sync without a gateway restart.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
 - **workspace** — Identity files and long-running configuration.

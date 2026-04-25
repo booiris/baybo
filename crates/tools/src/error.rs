@@ -21,6 +21,9 @@ pub enum ToolError {
     #[error("tool '{tool}' denied by user: {reason}")]
     Denied { tool: String, reason: String },
 
+    #[error("mcp error: {0}")]
+    Mcp(String),
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
