@@ -233,7 +233,20 @@
         "index.scip": true,
         "**/node_modules": true,
         "**/dist": true,
-        "**/package-lock.json": true
+        "**/package-lock.json": true,
+        "**/.bash_profile": true,
+        "**/.bashrc": true,
+        "**/.profile": true,
+        "**/.zprofile": true,
+        "**/.zshrc": true,
+        "**/.gitconfig": true,
+        "**/.ripgreprc": true,
+        "**/.idea": true,
+        "**/.claude/agents": true,
+        "**/.claude/commands": true,
+        "**/.claude/settings.json": true,
+        "**/.mcp.json": true,
+        "**/.gitmodules": true
     },
     "rust-analyzer.cargo.features": []
 }
