@@ -38,7 +38,10 @@ pub async fn run(ctx: &CommandContext, name: String, do_probe: bool) -> Result<C
         .map_err(|e| CliError::Manager(format!("read oauth credentials: {e}")))?
         .is_some();
 
-    let auth = match (entry.oauth.is_some() && credentials_present, headers_present) {
+    let auth = match (
+        entry.oauth.is_some() && credentials_present,
+        headers_present,
+    ) {
         (true, _) => "oauth",
         (false, true) => "headers",
         _ => "none",

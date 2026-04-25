@@ -31,9 +31,7 @@ impl ProbeStatus {
             Self::Skipped => "(probe skipped)".into(),
             Self::Ok { tool_count } => format!("ok ({tool_count} tools)"),
             Self::Timeout => "timeout".into(),
-            Self::AuthRequired(_) => {
-                "auth required (run `aura mcp add` to re-authorize)".into()
-            }
+            Self::AuthRequired(_) => "auth required (run `aura mcp add` to re-authorize)".into(),
             Self::Unreachable(msg) => format!("unreachable: {}", clip(msg, 60)),
             Self::Error(msg) => format!("error: {}", clip(msg, 60)),
         }
@@ -134,7 +132,10 @@ pub(super) async fn http_auth_precheck(url: &str) -> Option<ProbeStatus> {
     for attempt in 0..HTTP_PRECHECK_ATTEMPTS {
         let req = client
             .post(url)
-            .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
             .json(&body);
         match req.send().await {
             Ok(resp) => {

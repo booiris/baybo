@@ -1,11 +1,10 @@
-//! `Bash` — execute a shell command via `sh -c`.
+//! `Bash` — execute a shell command via `sh -c` inside the OS sandbox.
 //!
 //! Matches Claude Code's Bash tool shape: one command per call, runs in its
-//! own process. Environment variables and `cd` changes do NOT persist across
-//! invocations (each call is a fresh `sh -c`).
+//! own sandboxed process. Environment variables and `cd` changes do NOT
+//! persist across invocations.
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -92,48 +91,38 @@ impl Tool for BashTool {
             )));
         }
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(&p.command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(dir) = &p.cwd {
-            cmd.current_dir(dir);
-        }
+        let Some(sandbox) = ctx.sandbox.as_ref() else {
+            return Err(ToolError::Execution(
+                "OS sandbox unavailable: install bwrap (Linux: `apt install bubblewrap`) \
+                 or sandbox-exec (macOS, ships with the system) and restart aura"
+                    .into(),
+            ));
+        };
 
         let timeout = p
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(ctx.timeout);
 
-        let run = async {
-            let child = cmd
-                .spawn()
-                .map_err(|e| ToolError::Execution(format!("spawn: {e}")))?;
-            let out = child
-                .wait_with_output()
-                .await
-                .map_err(|e| ToolError::Execution(format!("wait: {e}")))?;
-            Ok::<_, ToolError>(out)
-        };
+        let args = vec!["-c".into(), p.command];
+        let cwd_ref: Option<&Path> = p.cwd.as_deref();
 
         let out = tokio::select! {
             _ = ctx.cancellation_token.cancelled() => {
                 return Err(ToolError::Execution("cancelled".into()));
             }
-            res = tokio::time::timeout(timeout, run) => {
-                res.map_err(|_| ToolError::Timeout(format!("Bash exceeded {timeout:?}")))??
-            }
+            res = sandbox.spawn_command(Path::new("sh"), &args, cwd_ref, None, timeout) => res?,
         };
 
-        let exit = out.status.code().unwrap_or(-1);
+        if out.timed_out {
+            return Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")));
+        }
+
         let stdout = truncate_utf8(&out.stdout, MAX_OUTPUT_BYTES);
         let stderr = truncate_utf8(&out.stderr, MAX_OUTPUT_BYTES);
 
         Ok(ToolOutput::Json(json!({
-            "exit_code": exit,
+            "exit_code": out.exit_code,
             "stdout": stdout,
             "stderr": stderr,
         })))
@@ -156,10 +145,13 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SandboxedOutput;
+    use crate::test_support::FakeExecSandbox;
     use aura_model::{ChannelType, User};
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
-    fn ctx() -> ToolContext {
+    fn ctx_with(sandbox: Option<Arc<dyn crate::ExecSandbox>>) -> ToolContext {
         ToolContext {
             session_id: "t".into(),
             user: User {
@@ -169,55 +161,103 @@ mod tests {
             },
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
+            workspace_root: std::path::PathBuf::from("/tmp"),
+            sandbox,
         }
     }
 
-    #[tokio::test]
-    async fn captures_stdout_and_exit() {
-        let out = BashTool
-            .execute(json!({ "command": "echo hello" }), &ctx())
-            .await
-            .unwrap();
-        let ToolOutput::Json(v) = out else {
-            panic!();
-        };
-        assert_eq!(v["exit_code"], 0);
-        assert!(v["stdout"].as_str().unwrap().contains("hello"));
+    fn fake_with_response(
+        out: SandboxedOutput,
+    ) -> (Arc<FakeExecSandbox>, Arc<dyn crate::ExecSandbox>) {
+        let fake = Arc::new(FakeExecSandbox::new());
+        fake.set_response(out);
+        let dyn_handle: Arc<dyn crate::ExecSandbox> = fake.clone();
+        (fake, dyn_handle)
     }
 
     #[tokio::test]
-    async fn reports_non_zero_exit() {
+    async fn refuses_when_sandbox_missing() {
+        let err = BashTool
+            .execute(json!({ "command": "echo hi" }), &ctx_with(None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref m) if m.contains("OS sandbox unavailable")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_command_through_sandbox() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"hello\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
         let out = BashTool
-            .execute(json!({ "command": "exit 7" }), &ctx())
+            .execute(json!({ "command": "echo hello" }), &ctx_with(Some(sandbox)))
             .await
             .unwrap();
-        let ToolOutput::Json(v) = out else {
-            panic!();
-        };
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 0);
+        assert!(v["stdout"].as_str().unwrap().contains("hello"));
+
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, std::path::PathBuf::from("sh"));
+        assert_eq!(
+            calls[0].args,
+            vec!["-c".to_string(), "echo hello".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn surfaces_non_zero_exit_from_sandbox() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 7,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let out = BashTool
+            .execute(json!({ "command": "exit 7" }), &ctx_with(Some(sandbox)))
+            .await
+            .unwrap();
+        let ToolOutput::Json(v) = out else { panic!() };
         assert_eq!(v["exit_code"], 7);
     }
 
     #[tokio::test]
-    async fn times_out() {
+    async fn timeout_flag_yields_timeout_error() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: -1,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: true,
+        });
         let err = BashTool
-            .execute(json!({ "command": "sleep 5", "timeout_ms": 50 }), &ctx())
+            .execute(
+                json!({ "command": "sleep 5", "timeout_ms": 50 }),
+                &ctx_with(Some(sandbox)),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
     }
 
     #[tokio::test]
-    async fn rejects_relative_cwd() {
+    async fn rejects_relative_cwd_before_sandbox_dispatch() {
         let err = BashTool
             .execute(
                 json!({ "command": "echo hi", "cwd": "relative/path" }),
-                &ctx(),
+                &ctx_with(None),
             )
             .await
             .unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
-            "expected InvalidParams about absolute, got: {err:?}"
+            "got: {err:?}"
         );
     }
 }

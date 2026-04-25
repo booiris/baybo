@@ -251,6 +251,8 @@ impl AgentTestHarnessBuilder {
             Duration::from_secs(5),
             approval_gates,
             gateway.clone(),
+            std::path::PathBuf::from("/tmp"),
+            None,
         ));
 
         let tokenizer = Arc::new(TiktokenTokenizer::default());

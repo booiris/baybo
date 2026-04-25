@@ -30,6 +30,7 @@ Bottom-up along the dependency graph:
 
 - **llm** — LLM provider wrapping and response parsing.
 - **tools** — Tool abstraction, registration, capability declarations, runtime routing. The `mcp` submodule ships an MCP client (config in `<workspace>/.mcp.json`, OAuth via rmcp) that surfaces every server's tools to the agent loop as `<server>/<tool>`; the `McpReconciler` keeps the registry in sync without a gateway restart.
+- **[sandbox](sandbox.md)** — OS-native per-invocation isolation for tools declaring `ToolCapability::ExecCommand`. `bwrap` on Linux, `sandbox-exec` on macOS; the `ToolExecutor` injects a `SandboxAdapter` into `ToolContext.sandbox` so `BashTool` (and any future ExecCommand tools) routes its child process through the platform's isolation primitive. Filesystem-scoped to the workspace; network gated all-or-nothing on the manifest's `Http` capability.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
 - **workspace** — Identity files and long-running configuration.
@@ -77,7 +78,8 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
 storage   ──► model, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
 session   ──► model, storage (owns SessionManager; consumes SessionStore from storage)
 pairing   ──► model, storage (owns PairingService + code generator; consumes ChannelPairingStore from storage)
-agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, storage, hook, channels, config
+sandbox   ──► (no internal deps; OS sandbox runner consumed by agent)
+agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, sandbox, storage, hook, channels, config
 gateway   ──► agent, channels, config, cron, job, llm, model, pairing, security, session, skills, storage, tools, trace, workspace
 tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over HTTP+SSE)
 bootstrap ──► config + all domain crates it assembles (entry point only)

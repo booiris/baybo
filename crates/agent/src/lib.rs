@@ -7,6 +7,7 @@ pub mod memory;
 pub mod observability;
 pub mod policy;
 pub mod router;
+pub mod sandbox;
 pub mod security;
 pub mod service;
 pub mod session;

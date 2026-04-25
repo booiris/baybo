@@ -334,4 +334,3 @@ fn default_capabilities(transport: &McpTransportConfig) -> Vec<ToolCapability> {
         McpTransportConfig::Http { .. } => vec![ToolCapability::Http],
     }
 }
-

@@ -290,11 +290,43 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
+    let sandbox_runner = match aura_sandbox::current_platform_runner() {
+        Ok(r) => {
+            info!(backend = ?r.backend(), "OS sandbox ready");
+            Some(r)
+        }
+        Err(e @ aura_sandbox::SandboxError::BackendMissing { .. }) => {
+            error!(error = %e, "OS sandbox unavailable; ExecCommand tools will be refused");
+            None
+        }
+        Err(e) => {
+            return Err(e.into());
+        }
+    };
+    // Sandbox FS scope is the *project / cwd*, not Aura's state directory.
+    // `workspace_root` above is `config.workspace.path` (`~/.aura`), which is
+    // where Aura keeps its libsql + identity files. Bash and other
+    // ExecCommand tools should run scoped to where the user launched aura
+    // from. Canonicalize so symlink-vs-real-path comparisons in the adapter
+    // line up with paths the tool may produce.
+    let sandbox_root = match std::env::current_dir().and_then(|p| p.canonicalize()) {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to resolve current_dir for sandbox FS scope; falling back to workspace state directory",
+            );
+            workspace_root.clone()
+        }
+    };
+    info!(path = %sandbox_root.display(), "sandbox FS scope rooted");
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         boot::to_tool_timeout(&config.tools),
         gate_map,
         Arc::clone(&security_gateway),
+        sandbox_root,
+        sandbox_runner,
     ));
 
     let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));

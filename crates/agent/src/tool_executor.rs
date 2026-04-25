@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,9 +8,10 @@ use aura_job::OperationKind;
 use aura_model::TrustLevel;
 use aura_model::User;
 
+use aura_sandbox::{NetworkPolicy, SandboxRunner};
 use aura_tools::{
-    ApprovalDecision, ApprovalGateMap, ApprovalRequest, ApprovedResource, ResourceAccess,
-    ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry,
+    ApprovalDecision, ApprovalGateMap, ApprovalRequest, ApprovedResource, ExecSandbox,
+    ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry,
     approval::preview_params,
 };
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
@@ -19,6 +21,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::observability::ObservabilityRecorder;
+use crate::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
 
 /// Preview length used when rendering parameters inside an approval prompt.
@@ -31,6 +34,8 @@ pub struct ToolExecutor {
     default_timeout: Duration,
     gate_map: Arc<ApprovalGateMap>,
     security_gateway: Arc<SecurityGateway>,
+    workspace_root: PathBuf,
+    sandbox_runner: Option<Arc<dyn SandboxRunner>>,
 }
 
 impl ToolExecutor {
@@ -39,12 +44,16 @@ impl ToolExecutor {
         default_timeout: Duration,
         gate_map: Arc<ApprovalGateMap>,
         security_gateway: Arc<SecurityGateway>,
+        workspace_root: PathBuf,
+        sandbox_runner: Option<Arc<dyn SandboxRunner>>,
     ) -> Self {
         Self {
             tool_registry,
             default_timeout,
             gate_map,
             security_gateway,
+            workspace_root,
+            sandbox_runner,
         }
     }
 
@@ -190,12 +199,35 @@ impl ToolExecutor {
             }
         }
 
+        // Build per-call sandbox adapter for tools declaring ExecCommand.
+        let sandbox: Option<Arc<dyn ExecSandbox>> = if let Some(manifest) =
+            self.tool_registry.get_manifest(tool_name)
+            && manifest.capabilities.contains(&ToolCapability::ExecCommand)
+        {
+            let policy = if manifest.capabilities.contains(&ToolCapability::Http) {
+                NetworkPolicy::All
+            } else {
+                NetworkPolicy::None
+            };
+            self.sandbox_runner.as_ref().map(|runner| {
+                Arc::new(SandboxAdapter::new(
+                    Arc::clone(runner),
+                    self.workspace_root.clone(),
+                    policy,
+                )) as Arc<dyn ExecSandbox>
+            })
+        } else {
+            None
+        };
+
         // Build tool context
         let ctx = ToolContext {
             session_id: session_id.to_string(),
             user: user.clone(),
             timeout: self.default_timeout,
             cancellation_token: CancellationToken::new(),
+            workspace_root: self.workspace_root.clone(),
+            sandbox,
         };
 
         // Reveal placeholders in the tool's arguments just before

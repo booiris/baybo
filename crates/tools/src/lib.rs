@@ -7,7 +7,8 @@ pub mod registry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,6 +52,32 @@ pub struct ToolContext {
     pub user: User,
     pub timeout: Duration,
     pub cancellation_token: tokio_util::sync::CancellationToken,
+    pub workspace_root: PathBuf,
+    pub sandbox: Option<Arc<dyn ExecSandbox>>,
+}
+
+/// OS-level sandbox runner exposed to tools that need to spawn an
+/// external process. The `aura-agent` crate adapts a real
+/// `aura_sandbox::SandboxRunner` into this trait so `aura-tools` does
+/// not gain a transitive dependency on `aura-sandbox`.
+#[async_trait]
+pub trait ExecSandbox: Send + Sync {
+    async fn spawn_command(
+        &self,
+        program: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+    ) -> crate::Result<SandboxedOutput>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SandboxedOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub timed_out: bool,
 }
 
 /// Output from a tool execution.

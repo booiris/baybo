@@ -11,6 +11,7 @@ members = [
     "crates/job",
     "crates/trace",
     "crates/security",
+    "crates/sandbox",
     "crates/hook",
     "crates/agent",
     "crates/storage",
@@ -43,6 +44,7 @@ aura-session = { path = "crates/session" }
 aura-job = { path = "crates/job" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
+aura-sandbox = { path = "crates/sandbox" }
 aura-hook = { path = "crates/hook" }
 aura-agent = { path = "crates/agent" }
 aura-storage = { path = "crates/storage" }
@@ -162,6 +164,7 @@ aura-session = { workspace = true }
 aura-job = { workspace = true }
 aura-trace = { workspace = true }
 aura-security = { workspace = true }
+aura-sandbox = { workspace = true }
 aura-hook = { workspace = true }
 aura-agent = { workspace = true }
 aura-cron = { workspace = true }

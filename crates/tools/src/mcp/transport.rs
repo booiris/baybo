@@ -7,9 +7,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::model::Tool as RmcpTool;
 use rmcp::service::{Peer, RoleClient, RunningService};
-use rmcp::transport::auth::{
-    AuthClient, AuthorizationManager, CredentialStore, OAuthClientConfig,
-};
+use rmcp::transport::auth::{AuthClient, AuthorizationManager, CredentialStore, OAuthClientConfig};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -135,10 +133,7 @@ async fn connect_http(
         let mut manager = AuthorizationManager::new(url)
             .await
             .map_err(|e| McpError::OAuth(format!("oauth manager init: {e}")))?;
-        manager.set_credential_store(VaultCredentialStore::new(
-            Arc::clone(vault),
-            server_name,
-        ));
+        manager.set_credential_store(VaultCredentialStore::new(Arc::clone(vault), server_name));
         manager
             .initialize_from_store()
             .await
@@ -155,9 +150,8 @@ async fn connect_http(
             .await
             .map_err(|e| McpError::OAuth(format!("read oauth client secret: {e}")))?
         {
-            let secret = String::from_utf8(secret.as_bytes().to_vec()).map_err(|e| {
-                McpError::OAuth(format!("oauth client secret is not utf-8: {e}"))
-            })?;
+            let secret = String::from_utf8(secret.as_bytes().to_vec())
+                .map_err(|e| McpError::OAuth(format!("oauth client secret is not utf-8: {e}")))?;
             let (client_id, _) = manager
                 .get_credentials()
                 .await
@@ -165,11 +159,11 @@ async fn connect_http(
             // The redirect_uri is required by the oauth2 builder but is
             // never used during a refresh-token grant — the placeholder
             // here matches what rmcp uses for non-redirect flows.
-            let client_config = OAuthClientConfig::new(&client_id, "http://localhost")
-                .with_client_secret(secret);
-            manager.configure_client(client_config).map_err(|e| {
-                McpError::OAuth(format!("attach client secret for refresh: {e}"))
-            })?;
+            let client_config =
+                OAuthClientConfig::new(&client_id, "http://localhost").with_client_secret(secret);
+            manager
+                .configure_client(client_config)
+                .map_err(|e| McpError::OAuth(format!("attach client secret for refresh: {e}")))?;
         }
 
         let auth_client = AuthClient::new(reqwest::Client::new(), manager);

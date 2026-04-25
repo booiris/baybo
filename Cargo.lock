@@ -221,6 +221,7 @@ dependencies = [
  "aura-job",
  "aura-llm",
  "aura-model",
+ "aura-sandbox",
  "aura-security",
  "aura-session",
  "aura-skills",
@@ -257,6 +258,7 @@ dependencies = [
  "aura-job",
  "aura-llm",
  "aura-model",
+ "aura-sandbox",
  "aura-security",
  "aura-session",
  "aura-skills",
@@ -273,6 +275,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -543,6 +546,19 @@ dependencies = [
  "rand 0.10.0",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aura-sandbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
