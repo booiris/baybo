@@ -231,7 +231,11 @@
         "index.scip": true,
         "**/node_modules": true,
         "**/dist": true,
-        "**/package-lock.json": true
+        "**/package-lock.json": true,
+        "AGENTS.md": true,
+        "web/AGENTS.md": true,
+        "web/GEMINI.md": true,
+        "web/CLAUDE.md": true,
     },
     "rust-analyzer.cargo.features": []
 }
