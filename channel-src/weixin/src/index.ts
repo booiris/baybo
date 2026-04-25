@@ -1,4 +1,13 @@
 #!/usr/bin/env node
+/*!
+ * Aura weixin channel sidecar.
+ *
+ * Derived from openclaw-weixin (https://github.com/Tencent/openclaw-weixin),
+ * Copyright (C) 2026 Tencent, licensed under the MIT License. The iLink
+ * protocol layer (login QR flow, polling cadence, markdown filter, message
+ * encoding) is ported from that project; the surrounding sidecar runtime,
+ * approvals, and integration with the Aura gateway are original.
+ */
 import { runSidecar } from "@aura/channel-sdk";
 import { BotChannel } from "@aura/channel-sdk/bot";
 

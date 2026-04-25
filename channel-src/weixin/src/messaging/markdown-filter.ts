@@ -4,8 +4,9 @@
  *
  * WeChat's iLink bot rendering doesn't support common markdown; forwarding
  * raw markdown confuses recipients. Ported verbatim from upstream
- * openclaw-weixin, which was tuned against real iLink clients — the
- * behavior is load-bearing, not stylistic.
+ * openclaw-weixin (https://github.com/Tencent/openclaw-weixin), which was
+ * tuned against real iLink clients — the behavior is load-bearing, not
+ * stylistic.
  *
  * States:
  * - **sol** (start-of-line): line-start patterns (```, >, #####, indent)
