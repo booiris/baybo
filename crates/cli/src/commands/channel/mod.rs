@@ -28,32 +28,48 @@ pub async fn handle(ctx: &CommandContext, cmd: ChannelCmd) -> Result<CommandOutp
         ChannelCmd::List => list(ctx).await,
         ChannelCmd::Add => add_bot(ctx).await,
         ChannelCmd::Remove => remove_bot(ctx).await,
-        ChannelCmd::Bots => list_bots(ctx).await,
     }
 }
 
+async fn collect_all_bots(
+    store: &Arc<dyn ChannelBotStore>,
+) -> Result<Vec<(ChannelType, aura_storage::ChannelBotRow)>> {
+    let runtime = installed_runtime()?;
+    let mut out: Vec<(ChannelType, aura_storage::ChannelBotRow)> = Vec::new();
+    for ct in offered_channels(&runtime) {
+        let rows = store
+            .list_live(&ct)
+            .await
+            .map_err(|e| CliError::Manager(format!("list live bots: {e}")))?;
+        for row in rows {
+            out.push((ct.clone(), row));
+        }
+    }
+    Ok(out)
+}
+
 async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
-    let entries: Vec<String> = ctx
-        .channels
-        .list()
-        .into_iter()
-        .map(|ct| ct.to_string())
-        .collect();
-    let human = if entries.is_empty() {
-        "(no channels registered)".to_string()
+    let (_vault, store) = require_bot_deps(ctx)?;
+    let bots = collect_all_bots(store).await?;
+    let human = if bots.is_empty() {
+        "(no bots registered)".to_string()
     } else {
-        let mut buf = String::from("CHANNEL\n");
-        for ct in &entries {
-            buf.push_str(&format!("{ct}\n"));
+        let mut buf = String::from("BOT_ID\tCHANNEL\n");
+        for (ct, row) in &bots {
+            buf.push_str(&format!("{}\t{}\n", row.bot_id, ct.as_str()));
         }
         buf.trim_end().to_string()
     };
     Ok(CommandOutput::structured(
         human,
         &json!({
-            "channels": entries
+            "bots": bots
                 .iter()
-                .map(|ct| json!({ "channel": ct }))
+                .map(|(ct, row)| json!({
+                    "bot_id": row.bot_id,
+                    "channel_type": ct.as_str(),
+                    "created_at": row.created_at,
+                }))
                 .collect::<Vec<_>>(),
         }),
     ))
@@ -329,41 +345,6 @@ async fn add_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     ))
 }
 
-async fn pick_channel_with_bots(store: &Arc<dyn ChannelBotStore>) -> Result<Option<ChannelType>> {
-    let runtime = installed_runtime()?;
-    let mut populated: Vec<ChannelType> = Vec::new();
-    for ct in offered_channels(&runtime) {
-        let rows = store
-            .list_live(&ct)
-            .await
-            .map_err(|e| CliError::Manager(format!("list live bots: {e}")))?;
-        if !rows.is_empty() {
-            populated.push(ct);
-        }
-    }
-
-    if populated.is_empty() {
-        return Ok(None);
-    }
-
-    let labels: Vec<&str> = populated.iter().map(|c| c.as_str()).collect();
-    let idx = select::select_one("Channel:", &labels)?;
-    Ok(Some(populated.swap_remove(idx)))
-}
-
-async fn pick_bot(store: &Arc<dyn ChannelBotStore>, ct: &ChannelType) -> Result<String> {
-    let rows = store
-        .list_live(ct)
-        .await
-        .map_err(|e| CliError::Manager(format!("list live bots: {e}")))?;
-    if rows.is_empty() {
-        return Err(CliError::Config(format!("no bots for '{}'", ct.as_str())));
-    }
-    let labels: Vec<&str> = rows.iter().map(|r| r.bot_id.as_str()).collect();
-    let idx = select::select_one("Bot:", &labels)?;
-    Ok(rows[idx].bot_id.clone())
-}
-
 fn confirm(question: &str) -> Result<bool> {
     let stdin = io::stdin();
     let stderr = io::stderr();
@@ -381,13 +362,22 @@ fn confirm(question: &str) -> Result<bool> {
 
 async fn remove_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     let (vault, store) = require_bot_deps(ctx)?;
-    let Some(ct) = pick_channel_with_bots(store).await? else {
+    let bots = collect_all_bots(store).await?;
+    if bots.is_empty() {
         return Ok(CommandOutput::structured(
             "no bots to remove".to_string(),
             &json!({ "bots": [], "action": "noop" }),
         ));
-    };
-    let bot_id = pick_bot(store, &ct).await?;
+    }
+    let labels: Vec<String> = bots
+        .iter()
+        .map(|(ct, row)| format!("{} ({})", row.bot_id, ct.as_str()))
+        .collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let idx = select::select_one("Bot:", &label_refs)?;
+    let (ct, row) = &bots[idx];
+    let ct = ct.clone();
+    let bot_id = row.bot_id.clone();
 
     let question = format!("Delete {}/{}?", ct.as_str(), bot_id);
     if !confirm(&question)? {
@@ -430,42 +420,6 @@ async fn remove_bot(ctx: &CommandContext) -> Result<CommandOutput> {
             "channel_type": ct.as_str(),
             "bot_id": bot_id,
             "action": "removed",
-        }),
-    ))
-}
-
-async fn list_bots(ctx: &CommandContext) -> Result<CommandOutput> {
-    let (_vault, store) = require_bot_deps(ctx)?;
-    let Some(ct) = pick_channel_with_bots(store).await? else {
-        return Ok(CommandOutput::structured(
-            "no bots registered".to_string(),
-            &json!({ "bots": [] }),
-        ));
-    };
-    let rows = store
-        .list_live(&ct)
-        .await
-        .map_err(|e| CliError::Manager(format!("list live bots: {e}")))?;
-    let human = if rows.is_empty() {
-        format!("(no bots for '{}')", ct.as_str())
-    } else {
-        let mut buf = String::from("BOT_ID\tCREATED_AT\n");
-        for r in &rows {
-            buf.push_str(&format!("{}\t{}\n", r.bot_id, r.created_at));
-        }
-        buf.trim_end().to_string()
-    };
-    Ok(CommandOutput::structured(
-        human,
-        &json!({
-            "channel_type": ct.as_str(),
-            "bots": rows
-                .iter()
-                .map(|r| json!({
-                    "bot_id": r.bot_id,
-                    "created_at": r.created_at,
-                }))
-                .collect::<Vec<_>>(),
         }),
     ))
 }

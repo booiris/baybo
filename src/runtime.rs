@@ -133,7 +133,7 @@ pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<Secre
 
 /// Open the libsql store and return the vault + full [`Store`] handle
 /// for CLI subcommands that manage per-channel credentials
-/// (`aura channel add/remove/bots`) or per-user pairings
+/// (`aura channel list/add/remove`) or per-user pairings
 /// (`aura pair list/approve/revoke`). The returned [`Store`] is clonable
 /// and its fields share a single libsql connection, so CLI writes land
 /// atomically in the same file the gateway reads from.

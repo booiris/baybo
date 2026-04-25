@@ -513,17 +513,18 @@ async fn skills_list_on_empty_registry_returns_placeholder() {
 }
 
 #[tokio::test]
-async fn channels_list_on_empty_registry_returns_placeholder() {
+async fn channels_list_without_store_errors() {
     let ctx = context();
-    let out = dispatch::run(
+    let err = dispatch::run(
         &ctx,
         Commands::Channel {
             cmd: ChannelCmd::List,
         },
     )
     .await
-    .expect("channels list");
-    assert!(out.human.contains("no channels"));
+    .expect_err("channels list without a bot store should fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("unavailable"), "unexpected error: {msg}");
 }
 
 #[tokio::test]

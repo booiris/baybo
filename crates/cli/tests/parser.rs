@@ -100,17 +100,8 @@ fn channels_bot_add_takes_no_args() {
 }
 
 #[test]
-fn channel_bots_takes_no_args() {
-    let cli = parse(&["channel", "bots"]);
-    assert!(matches!(
-        cli.command,
-        Some(Commands::Channel {
-            cmd: ChannelCmd::Bots
-        })
-    ));
-
-    // Positional args were removed in favour of the interactive picker.
-    assert!(Cli::try_parse_from(["aura", "channel", "bots", "telegram"]).is_err());
+fn channel_bots_subcommand_removed() {
+    assert!(Cli::try_parse_from(["aura", "channel", "bots"]).is_err());
 }
 
 #[test]
