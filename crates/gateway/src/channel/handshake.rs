@@ -3,26 +3,27 @@
 //! a TCP listener.
 
 use aura_channels::wire::{Frame, PROTOCOL_VERSION};
-use aura_gateway_auth::ChannelTokenTable;
 use aura_model::ChannelType;
 
-use crate::auth_channel::AuthedClient;
+use crate::auth::{AuthedClient, ChannelTokenTable};
 
 /// Channel type strings reserved for in-process adapters. Sidecars may
 /// not claim these — they would shadow the real adapter. `tui` is not
-/// reserved: the bundled TUI authenticates via PSK and registers on
-/// this same endpoint as the `"tui"` channel type.
+/// reserved here because the bundled TUI registers as that exact
+/// channel type via the vault-token auth path; subprocess sidecars are
+/// blocked from claiming `"tui"` further down inside `validate_register`.
 const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP];
 
 /// Validate the first frame received on a `/v1/channel-ws` upgrade and
 /// produce the `ChannelType` the sidecar is registering as.
 ///
 /// `authed` is the [`AuthedClient`] the auth middleware already attached
-/// to the request via [`ChannelAuthState`](crate::auth_channel::ChannelAuthState).
+/// to the request via [`ChannelAuthState`](crate::auth::channel::ChannelAuthState).
 /// `tokens` is the live capability table — we consult it to confirm the
 /// `Register.token` that a subprocess embedded in the frame names the
 /// same identity that the header-based auth already validated. The
-/// built-in TUI authenticates via PSK, so its `Register.token` is
+/// built-in TUI authenticates with the vault-issued TUI token, which
+/// the middleware already verified, so its `Register.token` field is
 /// ignored and it must claim the `"tui"` channel type.
 /// Outcome of a successful Register handshake.
 ///
@@ -69,13 +70,13 @@ pub(crate) fn validate_register(
         AuthedClient::Tui => {
             if normalized != ChannelType::TUI {
                 return Err(format!(
-                    "tui psk must register as channel_type '{}', got '{normalized}'",
+                    "tui token must register as channel_type '{}', got '{normalized}'",
                     ChannelType::TUI
                 ));
             }
             if session_id.as_deref().is_none_or(str::is_empty) {
                 return Err(
-                    "tui psk clients must declare a session_id in the Register frame".to_string(),
+                    "tui clients must declare a session_id in the Register frame".to_string(),
                 );
             }
         }
@@ -113,8 +114,8 @@ pub(crate) fn validate_register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::ClientIdentity;
     use aura_channels::wire::Message as WireMessage;
-    use aura_gateway_auth::ClientIdentity;
 
     fn subprocess(pid: u32, label: &str) -> AuthedClient {
         AuthedClient::Subprocess {
@@ -225,7 +226,7 @@ mod tests {
         let tokens = ChannelTokenTable::new();
         let frame = register("", "slack", PROTOCOL_VERSION);
         let err = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap_err();
-        assert!(err.contains("tui psk must register"));
+        assert!(err.contains("tui token must register"));
     }
 
     #[test]

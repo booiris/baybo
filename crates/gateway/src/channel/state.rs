@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use aura_agent::SessionManager;
 use aura_channels::{ChannelRegistry, IncomingMessage};
-use aura_gateway_auth::ChannelTokenTable;
 use aura_pairing::PairingService;
 use aura_security::SecretVault;
 use aura_storage::ChannelBotStore;
@@ -21,6 +20,7 @@ use super::bot_reconciler::ChannelBotReconciler;
 use super::control::ChannelControlRegistry;
 use super::history::TuiHistoryStore;
 use super::session_resolver::ChannelSessionResolver;
+use crate::auth::ChannelTokenTable;
 use crate::log_buffer::LogBuffer;
 
 /// State passed to the `/v1/channel-ws` handler. Cheap to clone — every

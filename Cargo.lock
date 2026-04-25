@@ -217,7 +217,6 @@ dependencies = [
  "aura-context",
  "aura-cron",
  "aura-gateway",
- "aura-gateway-auth",
  "aura-hook",
  "aura-job",
  "aura-llm",
@@ -398,7 +397,6 @@ dependencies = [
  "aura-config",
  "aura-cron",
  "aura-gateway",
- "aura-gateway-auth",
  "aura-job",
  "aura-llm",
  "aura-model",
@@ -443,21 +441,6 @@ dependencies = [
  "uuid",
  "zip",
  "zstd",
-]
-
-[[package]]
-name = "aura-gateway-auth"
-version = "0.1.0"
-dependencies = [
- "dashmap",
- "hex",
- "hkdf",
- "rand 0.10.0",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -710,7 +693,6 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
- "hex",
  "parking_lot",
  "ratatui",
  "serde",

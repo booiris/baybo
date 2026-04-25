@@ -34,7 +34,7 @@ async fn admin_router() -> axum::Router {
     // Re-run the private `build_admin_router` via `GatewayServer::new`
     // — but it doesn't expose its router. Instead, duplicate the
     // assembly here using public building blocks.
-    use aura_gateway::auth_admin::{AdminAuthState, require_admin_token};
+    use aura_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
     let state = aura_gateway::server::AdminState {
         config: std::sync::Arc::clone(&tg.deps.config),

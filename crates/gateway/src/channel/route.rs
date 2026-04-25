@@ -21,7 +21,7 @@ use futures::{SinkExt, StreamExt};
 use super::adapter::Sidecar;
 use super::handshake::validate_register;
 use super::state::WsChannelState;
-use crate::auth_channel::AuthedClient;
+use crate::auth::AuthedClient;
 use crate::log_buffer::LogLevel;
 
 /// Defensive cap on the size of a forwarded sidecar log line. The SDK

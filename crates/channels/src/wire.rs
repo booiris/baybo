@@ -72,8 +72,8 @@ pub enum Frame {
     /// First frame after the WebSocket handshake. Carries the
     /// sidecar's capability token (injected via `AURA_CHANNEL_TOKEN`)
     /// and its declared channel type. For the built-in TUI the token
-    /// field is left empty — PSK auth already happened on the WS
-    /// upgrade request.
+    /// field is left empty — the channel auth middleware has already
+    /// validated the vault-issued TUI token from the upgrade header.
     ///
     /// `session_id` distinguishes two flavors of client:
     /// * `None` — **sidecar**. One process serves every user of this

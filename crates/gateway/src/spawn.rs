@@ -1,9 +1,9 @@
 //! Helper for spawning channel sidecars as gateway subprocesses.
 //!
 //! A subprocess channel plugin connects to the gateway's loopback TCP
-//! channel listener just like the TUI, but — unlike the TUI — its
-//! identity is bound to its process, not a shared PSK. At spawn time
-//! the gateway:
+//! channel listener just like the TUI, but — unlike the TUI's
+//! gateway-wide token published to the vault — its identity is a
+//! one-shot token bound to its process. At spawn time the gateway:
 //!
 //! 1. Generates a fresh capability token.
 //! 2. Sets `AURA_CHANNEL_URL` and `AURA_CHANNEL_TOKEN` in the child's
@@ -12,7 +12,7 @@
 //! 3. Spawns the child, captures its PID, and registers the token
 //!    with that PID in the gateway's [`ChannelTokenTable`] — the PID
 //!    is retained for diagnostics (log lines, `/v1/status`), not
-//!    used for auth (see [`crate::auth_channel`]).
+//!    used for auth (see [`crate::auth::channel`]).
 //! 4. Returns a [`ChildHandle`] whose `Drop` revokes the token — so
 //!    a crashed or killed child's token stops being valid the moment
 //!    the handle is dropped.
@@ -21,11 +21,11 @@
 //! management (restart policy, back-off, plugin manifest loading, …)
 //! is the supervisor's job ([`crate::sidecar::SidecarSupervisor`]).
 
-use aura_gateway_auth::{
-    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TokenHandle, generate_token,
-};
 use tokio::process::{Child, Command};
 
+use crate::auth::{
+    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TokenHandle, generate_token,
+};
 use crate::{GatewayError, Result};
 
 /// Env var: WebSocket URL of the gateway's channel listener, e.g.
@@ -123,7 +123,8 @@ impl ChildHandle {
     }
 
     /// Header the child must present on every request. Re-exported
-    /// so callers don't need a direct dep on `aura-gateway-auth`.
+    /// so callers don't need to import the constant from
+    /// [`crate::auth::token`] directly.
     pub fn token_header() -> &'static str {
         CHANNEL_TOKEN_HEADER
     }

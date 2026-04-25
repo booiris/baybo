@@ -88,7 +88,7 @@ async fn router_with_seed() -> (axum::Router, Arc<aura_gateway::log_buffer::LogB
         "slow query",
     );
 
-    use aura_gateway::auth_admin::{AdminAuthState, require_admin_token};
+    use aura_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
     let state = aura_gateway::server::AdminState {
         config: Arc::clone(&tg.deps.config),

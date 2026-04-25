@@ -24,10 +24,10 @@ use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
 use aura_gateway::{
-    AdminToken, ChannelServer, ChannelSpawner, GatewayDeps, GatewayServer, RuntimeGatewayConfig,
-    SidecarRuntime, SidecarSupervisor,
+    AdminToken, ChannelServer, ChannelSpawner, ChannelTokenTable, ClientIdentity, GatewayDeps,
+    GatewayServer, RuntimeGatewayConfig, SidecarRuntime, SidecarSupervisor, TUI_CLIENT_LABEL,
+    TUI_TOKEN_VAULT_KEY,
 };
-use aura_gateway_auth::{ChannelTokenTable, effective_tui_psk};
 
 use crate::boot;
 use crate::runtime;
@@ -220,22 +220,39 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let workspace_root = PathBuf::from(&config.workspace.path);
     let _workspace_lock = singleton::acquire(workspace_root.as_path())?;
 
-    // Read the auth token BEFORE building the manager graph: the gateway
-    // mode registers the token as a `LeakAction::Replace` rule on the
-    // LeakDetector, which happens inside `build_managers` before the
-    // detector is sealed into an Arc. Auto-mint on first run so a fresh
-    // workspace can `aura gateway start` without a prior `enable`.
-    let token = {
+    // Read the admin token AND mint+publish a fresh TUI token BEFORE
+    // building the manager graph: both are registered as
+    // `LeakAction::Replace` rules on the LeakDetector, which happens
+    // inside `build_managers` before the detector is sealed into an
+    // Arc. The admin token is auto-minted on first run so a fresh
+    // workspace can `aura gateway start` without a prior `enable`. The
+    // TUI token is rotated unconditionally on every start — semantics
+    // of a "temporary" token: any TUI still holding the previous
+    // generation's value must reconnect via the freshly published
+    // vault entry.
+    let (token, tui_token) = {
         let vault = runtime::build_secret_vault(&config).await?;
-        AdminToken::new(vault).mint_if_absent().await?
+        let admin_token = AdminToken::new(Arc::clone(&vault)).mint_if_absent().await?;
+        let tui_token = aura_gateway::generate_token();
+        vault
+            .store_secret(TUI_TOKEN_VAULT_KEY, tui_token.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("publish TUI token to vault: {e}"))?;
+        (admin_token, tui_token)
     };
 
-    // Build the leak detector (with the auth token registered as a
-    // `LeakAction::Replace` rule) BEFORE initialising tracing so log
-    // lines that accidentally echo the token are masked on disk. Pass
-    // the same `Arc<LeakDetector>` into `build_managers` so the runtime
-    // graph's SecurityGateway uses the same rule set.
-    let leak_detector = runtime::build_leak_detector(&config.security, Some(&token));
+    // Build the leak detector (with both gateway tokens registered as
+    // `LeakAction::Replace` rules) BEFORE initialising tracing so log
+    // lines that accidentally echo either credential are masked on
+    // disk. Pass the same `Arc<LeakDetector>` into `build_managers` so
+    // the runtime graph's SecurityGateway uses the same rule set.
+    let leak_detector = runtime::build_leak_detector(
+        &config.security,
+        &[
+            ("gateway.admin_token", token.as_str()),
+            (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
+        ],
+    );
     let log_dir = workspace_root.join("logs");
     let tracing_guards = init_tracing(TracingMode::File {
         log_dir: &log_dir,
@@ -243,6 +260,10 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     });
     let log_buffer = tracing_guards.log_buffer();
     tracing::info!(token_len = token.len(), "gateway token loaded from vault");
+    tracing::info!(
+        token_len = tui_token.len(),
+        "fresh TUI token published to vault"
+    );
 
     // Resolve the runtime gateway config up front so a bad `bind_address`
     // fails fast before we open libsql a second time.
@@ -274,6 +295,18 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // for auth, and the WS channel server re-reads it in the
     // Register-frame handshake via `GatewayDeps`.
     let channel_tokens = ChannelTokenTable::new();
+
+    // Register the TUI token with the freshly-published value. The
+    // returned handle is held for the rest of `start`, so the TUI
+    // entry stays live until shutdown drops it (which revokes the
+    // in-memory entry — the vault row is overwritten on next start).
+    let _tui_token_handle = channel_tokens.register(
+        tui_token.clone(),
+        ClientIdentity {
+            pid: std::process::id(),
+            label: TUI_CLIENT_LABEL.to_string(),
+        },
+    );
 
     let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
 
@@ -321,16 +354,14 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Channel loopback-TCP listener — publishes its ephemeral port to
     // `<workspace>/channel.port` (same workspace identity dir as the
     // singleton lockfile) so TUI and sidecars can discover it without
-    // a config roundtrip. The PSK is derived with a per-install salt
-    // so two copies of the same release binary don't share an
-    // effective PSK across machines.
+    // a config roundtrip. The TUI authenticates with the per-start
+    // token published above; sidecars use the per-spawn capability
+    // tokens minted by `ChannelSpawner`. Both arrive through the same
+    // `ChannelTokenTable`, so the listener doesn't need any extra
+    // auth material at bind time.
     let port_file = workspace_root.join("channel.port");
-    let channel_server = {
-        let psk = effective_tui_psk(workspace_root.as_path())
-            .map_err(|e| anyhow::anyhow!("derive channel PSK: {e}"))?;
-        ChannelServer::bind(&deps, port_file.clone(), psk, channel_tokens.clone())
-            .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?
-    };
+    let channel_server = ChannelServer::bind(&deps, port_file.clone(), channel_tokens.clone())
+        .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();
     let channel_url = format!("ws://127.0.0.1:{channel_port}/v1/channel-ws");
 

@@ -18,7 +18,9 @@ use aura_channels::wire::{self, Frame, Message as WireMessage, PROTOCOL_VERSION}
 use aura_channels::{AgentOutput, OutgoingMessage};
 use aura_gateway::channel_listener::ChannelServer;
 use aura_gateway::test_support::build_test_deps;
-use aura_gateway_auth::{CHANNEL_TOKEN_HEADER, ClientIdentity, TUI_PSK_HEADER};
+use aura_gateway::{
+    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TUI_CLIENT_LABEL, TokenHandle,
+};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -26,7 +28,16 @@ use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-const TEST_PSK: [u8; 32] = [0x42; 32];
+/// Mint a fresh TUI-flavoured token in `tokens` and return the live
+/// `(token_string, handle)` pair. The handle revokes the token on
+/// drop, so callers should keep it alive for the duration of the test.
+fn mint_test_tui_token(tokens: &ChannelTokenTable) -> (String, TokenHandle) {
+    let handle = tokens.mint(ClientIdentity {
+        pid: 0,
+        label: TUI_CLIENT_LABEL.to_string(),
+    });
+    (handle.token().to_string(), handle)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn channel_ws_end_to_end() {
@@ -38,13 +49,8 @@ async fn channel_ws_end_to_end() {
     let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
 
-    let server = ChannelServer::bind(
-        &tg.deps,
-        port_file.clone(),
-        TEST_PSK,
-        channel_tokens.clone(),
-    )
-    .expect("bind ChannelServer");
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
     let port = server.port();
 
     let server_shutdown = shutdown.clone();
@@ -318,13 +324,8 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
 
-    let server = ChannelServer::bind(
-        &tg.deps,
-        port_file.clone(),
-        TEST_PSK,
-        channel_tokens.clone(),
-    )
-    .expect("bind ChannelServer");
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
     let port = server.port();
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -430,13 +431,8 @@ async fn two_tui_clients_same_gateway_different_sessions() {
     let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
 
-    let server = ChannelServer::bind(
-        &tg.deps,
-        port_file.clone(),
-        TEST_PSK,
-        channel_tokens.clone(),
-    )
-    .expect("bind ChannelServer");
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
     let port = server.port();
 
     let server_shutdown = shutdown.clone();
@@ -444,13 +440,15 @@ async fn two_tui_clients_same_gateway_different_sessions() {
         let _ = server.run(server_shutdown).await;
     });
 
+    let (tui_token, _tui_handle) = mint_test_tui_token(&channel_tokens);
+
     let tui = ChannelType::from(ChannelType::TUI);
 
     // Two TUIs pin distinct session ids.
-    let mut alice = connect_register_tui(port, &TEST_PSK, "sess-alice")
+    let mut alice = connect_register_tui(port, &tui_token, "sess-alice")
         .await
         .expect("alice handshake");
-    let mut bob = connect_register_tui(port, &TEST_PSK, "sess-bob")
+    let mut bob = connect_register_tui(port, &tui_token, "sess-bob")
         .await
         .expect("bob handshake");
 
@@ -464,7 +462,7 @@ async fn two_tui_clients_same_gateway_different_sessions() {
     );
 
     // Duplicate registration of an already-claimed session id is rejected.
-    match connect_register_tui(port, &TEST_PSK, "sess-alice").await {
+    match connect_register_tui(port, &tui_token, "sess-alice").await {
         Ok(_) => panic!("duplicate session register unexpectedly succeeded"),
         Err(ConnectError::RegistrationRejected(msg)) => {
             assert!(msg.contains("already"), "unexpected reason: {msg}",);
@@ -569,13 +567,8 @@ async fn tui_history_round_trips_across_clients() {
     let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
 
-    let server = ChannelServer::bind(
-        &tg.deps,
-        port_file.clone(),
-        TEST_PSK,
-        channel_tokens.clone(),
-    )
-    .expect("bind ChannelServer");
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
     let port = server.port();
 
     let server_shutdown = shutdown.clone();
@@ -583,9 +576,11 @@ async fn tui_history_round_trips_across_clients() {
         let _ = server.run(server_shutdown).await;
     });
 
+    let (tui_token, _tui_handle) = mint_test_tui_token(&channel_tokens);
+
     // Alice connects first — fresh vault, empty snapshot.
     let (mut alice, alice_snapshot) =
-        connect_register_tui_with_snapshot(port, &TEST_PSK, "sess-alice")
+        connect_register_tui_with_snapshot(port, &tui_token, "sess-alice")
             .await
             .expect("alice handshake");
     assert!(alice_snapshot.is_empty(), "fresh vault: snapshot is empty");
@@ -607,7 +602,7 @@ async fn tui_history_round_trips_across_clients() {
     // Bob connects on a fresh session. The gateway is the single
     // writer of the vault key, so Bob's snapshot must contain
     // Alice's entries (consecutive duplicate collapsed).
-    let bob_snapshot = wait_for_snapshot(port, &TEST_PSK, "bob-", &["one", "two", "three"])
+    let bob_snapshot = wait_for_snapshot(port, &tui_token, "bob-", &["one", "two", "three"])
         .await
         .expect("bob snapshot reflects alice's appends");
     assert_eq!(bob_snapshot, vec!["one", "two", "three"]);
@@ -626,7 +621,7 @@ async fn tui_history_round_trips_across_clients() {
 /// previous connection is still being torn down.
 async fn wait_for_snapshot(
     port: u16,
-    psk: &[u8; 32],
+    tui_token: &str,
     session_prefix: &str,
     expected: &[&str],
 ) -> Option<Vec<String>> {
@@ -635,7 +630,7 @@ async fn wait_for_snapshot(
     while tokio::time::Instant::now() < deadline {
         let sid = format!("{session_prefix}{attempt}");
         attempt += 1;
-        if let Ok((_ws, snapshot)) = connect_register_tui_with_snapshot(port, psk, &sid).await
+        if let Ok((_ws, snapshot)) = connect_register_tui_with_snapshot(port, tui_token, &sid).await
             && snapshot.len() == expected.len()
             && snapshot.iter().zip(expected).all(|(a, b)| a == b)
         {
@@ -648,10 +643,10 @@ async fn wait_for_snapshot(
 
 async fn connect_register_tui(
     port: u16,
-    psk: &[u8; 32],
+    tui_token: &str,
     session_id: &str,
 ) -> Result<WsStream, ConnectError> {
-    let (ws, _) = connect_register_tui_with_snapshot(port, psk, session_id).await?;
+    let (ws, _) = connect_register_tui_with_snapshot(port, tui_token, session_id).await?;
     Ok(ws)
 }
 
@@ -661,7 +656,7 @@ async fn connect_register_tui(
 /// ignore the snapshot.
 async fn connect_register_tui_with_snapshot(
     port: u16,
-    psk: &[u8; 32],
+    tui_token: &str,
     session_id: &str,
 ) -> Result<(WsStream, Vec<String>), ConnectError> {
     let stream = TcpStream::connect(loopback(port))
@@ -670,12 +665,11 @@ async fn connect_register_tui_with_snapshot(
     let mut request = handshake_url(port)
         .into_client_request()
         .map_err(|e| ConnectError::Upgrade(e.to_string()))?;
-    let psk_hex = hex::encode(psk);
     request.headers_mut().insert(
-        TUI_PSK_HEADER,
-        psk_hex
+        CHANNEL_TOKEN_HEADER,
+        tui_token
             .parse()
-            .map_err(|_| ConnectError::Upgrade("invalid psk header".into()))?,
+            .map_err(|_| ConnectError::Upgrade("invalid tui-token header".into()))?,
     );
     let (mut ws, _) = client_async(request, stream)
         .await

@@ -47,24 +47,26 @@ pub struct WsTransport {
 
 impl WsTransport {
     /// Dial the gateway's loopback TCP channel listener with the TUI
-    /// PSK and register as the built-in `"tui"` channel. `session_id`
-    /// pins this TUI instance to one session so multiple concurrent
-    /// TUI processes can share the same gateway — the gateway routes
-    /// events for that session to this connection only.
-    pub async fn connect(port: u16, psk: [u8; 32], session_id: String) -> Result<Self> {
-        let (client, initial_history) =
-            WsClient::connect_tui(port, &psk, ChannelType::from("tui"), session_id.clone())
-                .await
-                .map_err(|e| match e {
-                    // Only true "nothing's listening on the port" failures
-                    // should trigger the auto-spawn gateway path upstream.
-                    // Handshake / protocol errors mean a gateway is alive
-                    // and we should surface the real reason instead.
-                    WsClientError::TcpDial(_) => {
-                        ChannelError::NotReachable(format!("tui ws connect: {e}"))
-                    }
-                    _ => ChannelError::Config(format!("tui ws connect: {e}")),
-                })?;
+    /// vault-token and register as the built-in `"tui"` channel.
+    /// `session_id` pins this TUI instance to one session so multiple
+    /// concurrent TUI processes can share the same gateway — the
+    /// gateway routes events for that session to this connection only.
+    pub async fn connect(port: u16, tui_token: String, session_id: String) -> Result<Self> {
+        let (client, initial_history) = WsClient::connect_tui(
+            port,
+            &tui_token,
+            ChannelType::from("tui"),
+            session_id.clone(),
+        )
+        .await
+        .map_err(|e| match e {
+            // Only true "nothing's listening on the port" failures
+            // should trigger the auto-spawn gateway path upstream.
+            // Handshake / protocol errors mean a gateway is alive
+            // and we should surface the real reason instead.
+            WsClientError::TcpDial(_) => ChannelError::NotReachable(format!("tui ws connect: {e}")),
+            _ => ChannelError::Config(format!("tui ws connect: {e}")),
+        })?;
         let client = Arc::new(client);
 
         let approval_queue = ApprovalQueue::new();

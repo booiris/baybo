@@ -52,27 +52,37 @@ use tracing::{error, info};
 
 use crate::boot;
 
-/// Build a [`LeakDetector`] seeded from config, optionally registering an
-/// extra `LeakAction::Replace` rule for the gateway admin token so any
-/// log line that happens to echo it is masked on disk. The same `Arc` is
-/// then shared between the tracing file redactor and [`build_managers`],
-/// keeping redaction coverage consistent across every log surface.
+/// Build a [`LeakDetector`] seeded from config, optionally registering
+/// extra `LeakAction::Replace` rules for the listed gateway-owned
+/// tokens so any log line that happens to echo them is masked on disk.
+/// The same `Arc` is then shared between the tracing file redactor and
+/// [`build_managers`], keeping redaction coverage consistent across
+/// every log surface.
+///
+/// Each entry in `gateway_tokens` is a `(name, token)` tuple where
+/// `name` becomes the rule name (used for diagnostics) and `token` is
+/// the literal value to redact. Empty token strings are skipped.
 pub fn build_leak_detector(
     security: &aura_config::SecurityConfig,
-    gateway_admin_token: Option<&str>,
+    gateway_tokens: &[(&str, &str)],
 ) -> Arc<LeakDetector> {
     let mut detector = boot::build_leak_detector(security);
-    if let Some(token) = gateway_admin_token
-        && !token.is_empty()
-    {
+    for (name, token) in gateway_tokens {
+        if token.is_empty() {
+            continue;
+        }
         match Regex::new(&regex::escape(token)) {
             Ok(pattern) => detector.add_rule(LeakDetectionRule {
-                name: "gateway.admin_token".into(),
+                name: (*name).into(),
                 pattern,
                 action: aura_security::LeakAction::Replace,
             }),
             Err(e) => {
-                tracing::warn!(error = %e, "failed to compile gateway token redaction rule");
+                tracing::warn!(
+                    error = %e,
+                    rule = %name,
+                    "failed to compile gateway token redaction rule",
+                );
             }
         }
     }

@@ -101,8 +101,8 @@ same endpoint:
 
 | Channel  | ID prefix | Transport                                                                |
 | -------- | --------- | ------------------------------------------------------------------------ |
-| TUI      | `tui_`    | `/v1/channel-ws` (PSK-authenticated)                                     |
-| Sidecars | `<name>_` | `/v1/channel-ws` (subprocess token, claims its own `channel_type`)       |
+| TUI      | `tui_`    | `/v1/channel-ws` (per-start token from `gateway.tui_token`)              |
+| Sidecars | `<name>_` | `/v1/channel-ws` (per-spawn capability token, claims its own `channel_type`) |
 
 See [`tui.md`](./tui.md) for the TUI client side and
 [`gateway.md`](./gateway.md) for the server side. The only public SDK
