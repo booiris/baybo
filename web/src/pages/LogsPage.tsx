@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   RiAlertFill,
   RiBug2Fill,
@@ -18,6 +19,7 @@ import { SearchBox } from '../components/SearchBox';
 import { SelectBox } from '../components/SelectBox';
 import { useAdminClient, useAuth } from '../api/auth';
 import type { components } from '../api/schema';
+import { useMockMode, MOCK_LOGS } from '../api/mock';
 
 type LogEntry = components['schemas']['LogEntry'];
 type ApiLogLevel = components['schemas']['LogLevel'];
@@ -67,6 +69,8 @@ function triggerDownload(filename: string, mime: string, body: string): void {
 }
 
 export function LogsPage() {
+  const isMock = useMockMode();
+  const [searchParams, setSearchParams] = useSearchParams();
   const client = useAdminClient();
   const { token, baseUrl, logout } = useAuth();
 
@@ -106,6 +110,14 @@ export function LogsPage() {
   useEffect(() => {
     let canceled = false;
     async function fetchData() {
+      if (isMock) {
+        setItems(MOCK_LOGS.slice(offset, offset + pageSize));
+        setTotal(MOCK_LOGS.length);
+        setLoading(false);
+        setError(null);
+        return;
+      }
+
       setLoading(true);
       setError(null);
       const query: Record<string, string | number> = {
@@ -140,7 +152,7 @@ export function LogsPage() {
     }
     void fetchData();
     return () => { canceled = true; };
-  }, [client, debouncedFilter, level, logout, offset, pageSize, refreshKey]);
+  }, [client, debouncedFilter, level, logout, offset, pageSize, refreshKey, isMock]);
 
   // Reset scroll on page change
   useEffect(() => {
@@ -155,7 +167,7 @@ export function LogsPage() {
   // `?token=...` as a fallback). Re-opened whenever the filter changes.
   useEffect(() => {
     setLiveConnected(false);
-    if (!live || offset !== 0 || !token) return;
+    if (isMock || !live || offset !== 0 || !token) return;
 
     const params = new URLSearchParams();
     params.set('token', token);
@@ -203,7 +215,7 @@ export function LogsPage() {
       es.close();
       setLiveConnected(false);
     };
-  }, [live, offset, token, baseUrl, level, debouncedFilter]);
+  }, [live, offset, token, baseUrl, level, debouncedFilter, isMock, pageSize]);
 
   // Pagination away from page 1 implicitly drops the user out of live
   // mode — the stream only makes sense at the head of the list.
@@ -221,6 +233,17 @@ export function LogsPage() {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     triggerDownload(`aura-logs-${stamp}.json`, 'application/json', body);
   }, [items]);
+
+  const toggleMock = () => {
+    const newParams = new URLSearchParams(searchParams);
+    if (isMock) {
+      newParams.delete('mock');
+    } else {
+      newParams.set('mock', 'true');
+    }
+    setSearchParams(newParams);
+    setOffset(0);
+  };
 
   const badge = useMemo(
     () =>
@@ -246,14 +269,25 @@ export function LogsPage() {
             SYSTEM LOGS
           </h2>
         </div>
-        <Button 
-          variant="primary" 
-          onClick={handleExport} 
-          disabled={items.length === 0}
-          className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
-        >
-          <RiDownloadLine className="text-base" /> Export
-        </Button>
+        <div className="flex gap-3">
+          {import.meta.env.DEV && (
+            <Button
+              variant={isMock ? 'primary' : 'default'}
+              onClick={toggleMock}
+              className="!py-2 !px-4 !text-[0.9rem] h-10 w-[140px] justify-center gap-1.5"
+            >
+              {isMock ? 'Mock: ON' : 'Mock: OFF'}
+            </Button>
+          )}
+          <Button 
+            variant="primary" 
+            onClick={handleExport} 
+            disabled={items.length === 0}
+            className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
+          >
+            <RiDownloadLine className="text-base" /> Export
+          </Button>
+        </div>
       </div>
 
       <div className="flex items-center gap-3 mb-4">
@@ -280,15 +314,17 @@ export function LogsPage() {
           variant={live ? 'primary' : 'default'}
           onClick={() => setLive((v) => !v)}
           aria-pressed={live}
-          disabled={offset !== 0}
+          disabled={offset !== 0 || isMock}
           className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
           title={
-            offset !== 0
+            isMock 
+              ? 'Live tail disabled in mock mode'
+              : offset !== 0
               ? 'Return to page 1 to enable live tail'
               : 'Stream new log records as they arrive'
           }
         >
-          {live && !liveConnected ? (
+          {live && !liveConnected && !isMock ? (
             <RiLoader4Line className="animate-spin text-base" />
           ) : (
             <RiBroadcastLine
@@ -299,7 +335,7 @@ export function LogsPage() {
         </Button>
         <Button 
           onClick={() => setRefreshKey((k) => k + 1)} 
-          disabled={loading}
+          disabled={loading || isMock}
           className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
         >
           <RiRefreshLine className="text-base" /> Refresh

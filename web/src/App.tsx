@@ -1,16 +1,20 @@
 import { useEffect, useState } from 'react';
-import { Navigate, Route, Routes } from 'react-router-dom';
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { RiLoader4Line } from 'react-icons/ri';
 import { Sidebar } from './components/Sidebar';
 import { TopNav } from './components/TopNav';
 import { LoginScreen } from './components/LoginScreen';
 import { LogsPage } from './pages/LogsPage';
+import { TracesPage } from './pages/TracesPage';
 import { useAuth } from './api/auth';
 
 export default function App() {
   const { token, client, logout } = useAuth();
   const [isValidating, setIsValidating] = useState(true);
   const [isValid, setIsValid] = useState(false);
+  const location = useLocation();
+
+  const breadcrumbs = location.pathname.startsWith('/traces') ? ['Traces'] : ['System Logs'];
 
   useEffect(() => {
     if (!token || !client) {
@@ -57,10 +61,11 @@ export default function App() {
     <div className="flex h-screen">
       <Sidebar />
       <main className="flex-1 flex flex-col overflow-hidden bg-canvas">
-        <TopNav breadcrumbs={['System Logs']} />
+        <TopNav breadcrumbs={breadcrumbs} />
         <Routes>
           <Route path="/" element={<Navigate to="/logs" replace />} />
           <Route path="/logs" element={<LogsPage />} />
+          <Route path="/traces" element={<TracesPage />} />
           <Route path="*" element={<Navigate to="/logs" replace />} />
         </Routes>
       </main>
