@@ -1,10 +1,12 @@
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 
-use aura_channels::registration::{
-    Prompter, RegistrationFlow, RegistrationResult, WeixinRegistration, builtin_registration_flows,
-};
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(600);
+
+use aura_channels::registration::{Prompter, RegistrationResult};
+use aura_gateway::SidecarRuntime;
 use aura_model::ChannelType;
 use aura_security::SecretVault;
 use aura_storage::{ChannelBotStore, retry_on_busy};
@@ -15,33 +17,11 @@ use crate::context::CommandContext;
 use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
+mod register;
 mod select;
-mod weixin_login;
 
-/// Assemble the flows offered by `aura channel add` / `remove` / `bots`.
-/// Starts from the builtin catalog and appends weixin when the current
-/// build ships a weixin sidecar bundle (the QR-login flow delegates
-/// into that bundle via bun).
-fn registration_flows() -> Vec<Arc<dyn RegistrationFlow>> {
-    let mut flows = builtin_registration_flows();
-    match weixin_login::SidecarLoginRunner::try_new() {
-        Ok(Some(runner)) => {
-            flows.push(Arc::new(WeixinRegistration::new(Arc::new(runner))));
-        }
-        Ok(None) => {
-            tracing::debug!(
-                "weixin sidecar bundle absent; omitting from channel registration catalog"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "could not prepare weixin login runner; omitting from catalog"
-            );
-        }
-    }
-    flows
-}
+#[cfg(any(test, feature = "test-support"))]
+pub use register::run_registration;
 
 pub async fn handle(ctx: &CommandContext, cmd: ChannelCmd) -> Result<CommandOutput> {
     match cmd {
@@ -100,10 +80,6 @@ fn require_bot_deps(
 }
 
 fn validate_bot_id(bot_id: &str) -> Result<()> {
-    // Stable bot ids end up in libsql primary keys, vault secret names
-    // (`channel.<ct>.bot.<id>.token`), and Telegram callback_data
-    // payloads. Restrict to a conservative charset so no caller has to
-    // think about quoting.
     if bot_id.is_empty() || bot_id.len() > 64 {
         return Err(CliError::Config("bot_id must be 1-64 characters".into()));
     }
@@ -145,7 +121,6 @@ struct RawModeGuard {
 impl RawModeGuard {
     fn new(fd: i32) -> Result<Self> {
         let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-        // SAFETY: `termios` points to valid, writable memory for libc to fill.
         let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
         if rc != 0 {
             return Err(CliError::Io(format!(
@@ -154,14 +129,12 @@ impl RawModeGuard {
             )));
         }
 
-        // SAFETY: `tcgetattr` succeeded and fully initialized `termios`.
         let original = unsafe { termios.assume_init() };
         let mut raw = original;
         raw.c_lflag &= !(libc::ECHO | libc::ICANON);
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
 
-        // SAFETY: `raw` is a valid termios struct for the same file descriptor.
         let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
         if rc != 0 {
             return Err(CliError::Io(format!(
@@ -176,7 +149,6 @@ impl RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        // SAFETY: restoring a previously captured termios for the same fd.
         let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
     }
 }
@@ -224,19 +196,21 @@ fn read_masked_secret<R: Read, W: Write>(
     String::from_utf8(buf).map_err(|e| CliError::Config(format!("token must be valid utf-8: {e}")))
 }
 
-struct CliPrompter<'a, R, W> {
-    reader: &'a mut R,
-    writer: &'a mut W,
+struct CliPrompter {
     tty_fd: i32,
 }
 
-impl<R: BufRead, W: Write> Prompter for CliPrompter<'_, R, W> {
+impl Prompter for CliPrompter {
     fn input(&mut self, label: &str, required: bool) -> anyhow::Result<String> {
+        let stdin = io::stdin();
+        let stderr = io::stderr();
+        let mut reader = stdin.lock();
+        let mut writer = stderr.lock();
         loop {
-            let value = prompt_line(self.reader, self.writer, label)
+            let value = prompt_line(&mut reader, &mut writer, label)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             if value.is_empty() && required {
-                writeln!(self.writer, "required")?;
+                writeln!(writer, "required")?;
                 continue;
             }
             return Ok(value);
@@ -244,14 +218,18 @@ impl<R: BufRead, W: Write> Prompter for CliPrompter<'_, R, W> {
     }
 
     fn password(&mut self, label: &str, required: bool) -> anyhow::Result<String> {
+        let stdin = io::stdin();
+        let stderr = io::stderr();
+        let mut reader = stdin.lock();
+        let mut writer = stderr.lock();
         loop {
             let _raw =
                 RawModeGuard::new(self.tty_fd).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let value = read_masked_secret(self.reader, self.writer, label)
+            let value = read_masked_secret(&mut reader, &mut writer, label)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             drop(_raw);
             if value.is_empty() && required {
-                writeln!(self.writer, "required")?;
+                writeln!(writer, "required")?;
                 continue;
             }
             return Ok(value);
@@ -259,12 +237,22 @@ impl<R: BufRead, W: Write> Prompter for CliPrompter<'_, R, W> {
     }
 }
 
-// Vault naming for the *remove* path. The add path lets each channel
-// compose its own secret keys via `RegistrationResult::secrets`; when the
-// remove path grows beyond a single hardcoded key, push this down into
-// the channel trait too.
 fn secret_name(channel_type: &ChannelType, bot_id: &str) -> String {
     format!("channel.{}.bot.{}.token", channel_type.as_str(), bot_id)
+}
+
+fn installed_runtime() -> Result<SidecarRuntime> {
+    SidecarRuntime::install().map_err(|e| {
+        CliError::Config(format!(
+            "sidecar runtime unavailable ({e}); rebuild with an embedded bundle"
+        ))
+    })
+}
+
+fn offered_channels(runtime: &SidecarRuntime) -> Vec<ChannelType> {
+    let mut channels: Vec<ChannelType> = runtime.channel_types().map(ChannelType::from).collect();
+    channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    channels
 }
 
 async fn persist_bot_registration(
@@ -275,22 +263,13 @@ async fn persist_bot_registration(
 ) -> Result<()> {
     validate_bot_id(&result.bot_id)?;
 
-    // Vault first — if encryption fails we want to know before
-    // advertising the bot in libsql. On success libsql picks up the
-    // row and the next gateway reconcile tick pushes StartBot.
-    //
-    // Both writes run under `retry_on_busy`: the CLI shares the libsql
-    // file with a potentially-running gateway, and a transient
-    // `database is locked` should be a warn-logged retry rather than
-    // an operator-facing failure. Real lock pathology escapes after
-    // ~200ms with the original error so we don't silently swallow bugs.
-    for (key, value) in &result.secrets {
-        retry_on_busy("vault.store_secret", || {
-            vault.store_secret(key, value.as_bytes())
-        })
-        .await
-        .map_err(|e| CliError::Manager(format!("store secret '{key}' in vault: {e}")))?;
-    }
+    let key = secret_name(ct, &result.bot_id);
+    let token = result.token.clone();
+    retry_on_busy("vault.store_secret", || {
+        vault.store_secret(&key, token.as_bytes())
+    })
+    .await
+    .map_err(|e| CliError::Manager(format!("store secret '{key}' in vault: {e}")))?;
 
     let ct_for_put = ct.clone();
     let bot_id_owned = result.bot_id.clone();
@@ -308,11 +287,16 @@ async fn persist_bot_registration(
 async fn add_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     let (vault, store) = require_bot_deps(ctx)?;
 
-    let flows = registration_flows();
-    let labels: Vec<&str> = flows.iter().map(|f| f.display_name()).collect();
+    let runtime = installed_runtime()?;
+    let channels = offered_channels(&runtime);
+    if channels.is_empty() {
+        return Err(CliError::Config(
+            "no channel bundles embedded in this build; rebuild after `pnpm install`".into(),
+        ));
+    }
+    let labels: Vec<&str> = channels.iter().map(|c| c.as_str()).collect();
     let idx = select::select_one("Channel:", &labels)?;
-    let flow: Arc<dyn RegistrationFlow> = flows[idx].clone();
-    let ct = flow.channel_type();
+    let ct = channels[idx].clone();
 
     let stdin = io::stdin();
     let stderr = io::stderr();
@@ -321,19 +305,11 @@ async fn add_bot(ctx: &CommandContext) -> Result<CommandOutput> {
             "interactive bot registration requires a terminal".into(),
         ));
     }
+    let tty_fd = stdin.as_raw_fd();
 
-    let result = {
-        let mut reader = stdin.lock();
-        let mut writer = stderr.lock();
-        let fd = reader.as_raw_fd();
-        let mut prompter = CliPrompter {
-            reader: &mut reader,
-            writer: &mut writer,
-            tty_fd: fd,
-        };
-        flow.prompt(&mut prompter)
-            .map_err(|e| CliError::Config(e.to_string()))?
-    };
+    let mut prompter = CliPrompter { tty_fd };
+    let result =
+        register::run_registration(&runtime, &ct, &mut prompter, REGISTRATION_TIMEOUT).await?;
 
     persist_bot_registration(vault, store, &ct, &result).await?;
 
@@ -353,23 +329,16 @@ async fn add_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     ))
 }
 
-/// Returns `None` when no bots are registered at all — callers render
-/// that as a friendly success, not an error.
 async fn pick_channel_with_bots(store: &Arc<dyn ChannelBotStore>) -> Result<Option<ChannelType>> {
-    // Enumerate via the builtin add-flow catalog so the picker stays
-    // in sync with what's registrable. A bot registered for an unknown
-    // channel type would be unreachable here — acceptable while the
-    // catalog is the source of truth.
-    let flows = registration_flows();
-    let mut populated: Vec<(String, ChannelType)> = Vec::new();
-    for flow in &flows {
-        let ct = flow.channel_type();
+    let runtime = installed_runtime()?;
+    let mut populated: Vec<ChannelType> = Vec::new();
+    for ct in offered_channels(&runtime) {
         let rows = store
             .list_live(&ct)
             .await
             .map_err(|e| CliError::Manager(format!("list live bots: {e}")))?;
         if !rows.is_empty() {
-            populated.push((flow.display_name().to_string(), ct));
+            populated.push(ct);
         }
     }
 
@@ -377,9 +346,9 @@ async fn pick_channel_with_bots(store: &Arc<dyn ChannelBotStore>) -> Result<Opti
         return Ok(None);
     }
 
-    let labels: Vec<&str> = populated.iter().map(|(n, _)| n.as_str()).collect();
+    let labels: Vec<&str> = populated.iter().map(|c| c.as_str()).collect();
     let idx = select::select_one("Channel:", &labels)?;
-    Ok(Some(populated.swap_remove(idx).1))
+    Ok(Some(populated.swap_remove(idx)))
 }
 
 async fn pick_bot(store: &Arc<dyn ChannelBotStore>, ct: &ChannelType) -> Result<String> {
@@ -434,9 +403,6 @@ async fn remove_bot(ctx: &CommandContext) -> Result<CommandOutput> {
 
     validate_bot_id(&bot_id)?;
 
-    // Retry both writes on transient libsql BUSY (see `add_bot` for
-    // why). Metadata goes first so a running reconciler sees the bot
-    // disappear and pushes StopBot before we strip the token.
     let ct_for_del = ct.clone();
     let bot_id_owned = bot_id.clone();
     retry_on_busy("channel_bots.delete", || {
@@ -533,7 +499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_registration_writes_every_secret_and_bot_row() {
+    async fn persist_registration_writes_token_and_bot_row() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store: Arc<dyn ChannelBotStore> = Arc::new(LibsqlChannelBotStore::new(pool));
         let vault = Arc::new(SecretVault::new(
@@ -544,26 +510,16 @@ mod tests {
 
         let result = RegistrationResult {
             bot_id: "123456789".into(),
-            secrets: vec![
-                (
-                    "channel.telegram.bot.123456789.token".into(),
-                    "123456789:hunter2".into(),
-                ),
-                (
-                    "channel.telegram.bot.123456789.webhook".into(),
-                    "https://example.test/hook".into(),
-                ),
-            ],
+            token: "123456789:hunter2".into(),
         };
 
         persist_bot_registration(&vault, &store, &channel_type, &result)
             .await
             .unwrap();
 
-        for (key, value) in &result.secrets {
-            let saved = vault.get_secret(key).await.unwrap().unwrap();
-            assert_eq!(saved.as_bytes(), value.as_bytes());
-        }
+        let key = secret_name(&channel_type, "123456789");
+        let saved = vault.get_secret(&key).await.unwrap().unwrap();
+        assert_eq!(saved.as_bytes(), result.token.as_bytes());
         assert!(
             store
                 .get(&channel_type, "123456789")

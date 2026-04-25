@@ -1,6 +1,8 @@
 export { runChannel } from "./runner.js";
 export { runSidecar } from "./sidecar.js";
 export type { SidecarOptions } from "./sidecar.js";
+export { runRegistration } from "./register.js";
+export type { RegistrationContext, RegistrationResult } from "./register.js";
 export { RunnerError } from "./channel.js";
 export type {
   AgentDelta,

@@ -38,6 +38,9 @@ crossterm = { workspace = true }
 shell-words = { workspace = true }
 libc = { workspace = true }
 
+[features]
+test-support = []
+
 [dev-dependencies]
 aura-context = { workspace = true }
 aura-cron = { workspace = true, features = ["test-support"] }
