@@ -58,9 +58,11 @@ impl ServiceInstaller for LaunchdInstaller {
         let log = ctx.log_dir.display().to_string();
         let mut env_block = String::new();
         if let Some(cfg) = &ctx.config_path {
-            env_block.push_str(
-                "    <key>EnvironmentVariables</key>\n    <dict>\n      <key>AURA_CONFIG_PATH</key>\n",
-            );
+            env_block.push_str("    <key>EnvironmentVariables</key>\n    <dict>\n");
+            env_block.push_str(&format!(
+                "      <key>{}</key>\n",
+                aura_workspace::paths::ENV_CONFIG_PATH
+            ));
             env_block.push_str(&format!("      <string>{}</string>\n", cfg.display()));
             env_block.push_str("    </dict>\n");
         }

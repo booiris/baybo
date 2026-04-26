@@ -19,6 +19,8 @@ use aura_context::TokenBudget;
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
 use aura_skills_assessor::AssessmentMode;
+use aura_workspace::WorkspacePaths;
+use aura_workspace::paths::{ENV_CONFIG_PATH, WORKSPACE_CONFIG_FILE};
 use tracing::info;
 
 // ---------------------------------------------------------------------------
@@ -29,20 +31,20 @@ use tracing::info;
 /// fall back to `AuraConfig::default()`. An explicit `AURA_CONFIG_PATH` that
 /// points at a missing file is a hard error — silent fallback would hide typos.
 pub async fn load_config() -> anyhow::Result<AuraConfig> {
-    let explicit = std::env::var("AURA_CONFIG_PATH").ok();
+    let explicit = std::env::var(ENV_CONFIG_PATH).ok();
     let path = explicit
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("aura.json"));
+        .unwrap_or_else(|| PathBuf::from(WORKSPACE_CONFIG_FILE));
 
     if !path.exists() {
         if explicit.is_some() {
             anyhow::bail!(
-                "AURA_CONFIG_PATH points to {} but the file does not exist",
+                "{ENV_CONFIG_PATH} points to {} but the file does not exist",
                 path.display()
             );
         }
-        info!("no aura.json found, using default configuration");
+        info!("no {WORKSPACE_CONFIG_FILE} found, using default configuration");
         return Ok(AuraConfig::default());
     }
 
@@ -59,10 +61,10 @@ pub async fn load_config() -> anyhow::Result<AuraConfig> {
 /// — callers running against `AuraConfig::default()` have no path to
 /// write back to, and mutation endpoints reject accordingly.
 pub fn resolve_config_path() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("AURA_CONFIG_PATH") {
+    if let Ok(explicit) = std::env::var(ENV_CONFIG_PATH) {
         return Some(PathBuf::from(explicit));
     }
-    let default = PathBuf::from("aura.json");
+    let default = PathBuf::from(WORKSPACE_CONFIG_FILE);
     default.exists().then_some(default)
 }
 
@@ -140,7 +142,7 @@ pub fn to_execution_policy(cfg: &AgentConfig) -> ExecutionPolicy {
 /// workspace root is itself the aura data directory (defaults to
 /// `~/.aura` in release, `./.aura` in debug).
 pub fn storage_db_path(cfg: &WorkspaceConfig) -> PathBuf {
-    PathBuf::from(&cfg.path).join("storage.db")
+    WorkspacePaths::new(PathBuf::from(&cfg.path)).storage_db()
 }
 
 pub fn to_token_budget(cfg: &aura_config::ContextConfig) -> TokenBudget {

@@ -833,7 +833,8 @@ mod tests {
         let ctx = make_ctx(tmp.path().to_path_buf());
         let _ = tool.execute(json!({"task": "x"}), &ctx).await.unwrap_err();
 
-        let runs_root = tmp.path().join(".aura").join("code-builder").join("runs");
+        let runs_root =
+            aura_workspace::WorkspacePaths::new(tmp.path().to_path_buf()).code_builder_runs_dir();
         if runs_root.exists() {
             let count = std::fs::read_dir(&runs_root).unwrap().count();
             assert_eq!(count, 0, "failed run must be cleaned up");

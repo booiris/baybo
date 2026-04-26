@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use aura_workspace::paths::{CACHE_RUNTIME_SUBDIR, aura_cache_root};
 use thiserror::Error;
 
 mod generated {
@@ -96,15 +97,11 @@ impl SidecarRuntime {
 }
 
 fn cache_root() -> Result<PathBuf, SidecarError> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .ok_or(SidecarError::NoCacheDir)?;
-    Ok(base.join("aura"))
+    aura_cache_root().ok_or(SidecarError::NoCacheDir)
 }
 
 fn install_bun(cache_root: &Path) -> Result<PathBuf, SidecarError> {
-    let dir = cache_root.join("runtime");
+    let dir = cache_root.join(CACHE_RUNTIME_SUBDIR);
     mkdir_all(&dir)?;
     // Version AND target are in the filename so a sibling install on
     // a different target (bind-mounted home dir, etc.) doesn't trip

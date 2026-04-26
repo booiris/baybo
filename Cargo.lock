@@ -356,6 +356,7 @@ dependencies = [
  "aura-security",
  "aura-storage",
  "aura-tools",
+ "aura-workspace",
  "futures",
  "hex",
  "parking_lot",
@@ -376,6 +377,7 @@ version = "0.1.0"
 dependencies = [
  "aura-model",
  "aura-tools",
+ "aura-workspace",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -693,6 +695,7 @@ dependencies = [
  "async-trait",
  "aura-model",
  "aura-security",
+ "aura-workspace",
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",

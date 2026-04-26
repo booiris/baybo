@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use aura_workspace::WorkspacePaths;
 use uuid::Uuid;
 
 use crate::error::CodeBuilderError;
@@ -28,10 +29,7 @@ pub(crate) struct RunDir {
 
 impl RunDir {
     pub fn create(workspace_root: &Path) -> Result<Self, CodeBuilderError> {
-        let base = workspace_root
-            .join(".aura")
-            .join("code-builder")
-            .join("runs");
+        let base = WorkspacePaths::new(workspace_root.to_path_buf()).code_builder_runs_dir();
         let id = Uuid::new_v4();
         let root = base.join(id.to_string());
         let uv_cache_dir = root.join("uv-cache");

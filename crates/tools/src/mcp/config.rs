@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use aura_model::TrustLevel;
+use aura_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
 
 use crate::ToolCapability;
 use crate::mcp::error::{McpError, McpResult};
-
-pub const MCP_FILE_NAME: &str = ".mcp.json";
 
 /// Mirror of [`aura_model::TrustLevel`] for the on-disk representation.
 /// Kept separate from the runtime enum so the serde format is stable
@@ -188,7 +187,7 @@ impl Default for McpFile {
 
 impl McpFile {
     pub fn path_for(workspace_root: &Path) -> PathBuf {
-        workspace_root.join(MCP_FILE_NAME)
+        WorkspacePaths::new(workspace_root.to_path_buf()).mcp_config()
     }
 
     /// Read `.mcp.json` from the workspace root. Returns `Ok(default)` if

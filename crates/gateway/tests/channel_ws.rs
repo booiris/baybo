@@ -43,7 +43,8 @@ fn mint_test_tui_token(tokens: &ChannelTokenTable) -> (String, TokenHandle) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn channel_ws_end_to_end() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file = tempdir.path().join("channel.port");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -340,7 +341,8 @@ async fn recv_notice(ws: &mut WsStream) -> Result<(String, String, String), Conn
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file = tempdir.path().join("channel.port");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let pairing_store = tg.deps.stores.channel_pairing.clone();
@@ -448,7 +450,8 @@ async fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_tui_clients_same_gateway_different_sessions() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file = tempdir.path().join("channel.port");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -585,7 +588,8 @@ async fn two_tui_clients_same_gateway_different_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tui_history_round_trips_across_clients() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file = tempdir.path().join("channel.port");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_tokens = tg.channel_tokens.clone();

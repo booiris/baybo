@@ -39,7 +39,7 @@ aura-model = { path = "crates/model" }
 aura-channels = { path = "crates/channels" }
 aura-llm = { path = "crates/llm" }
 aura-tools = { path = "crates/tools" }
-aura-workspace = { path = "crates/workspace" }
+aura-workspace = { path = "crates/workspace", default-features = false }
 aura-context = { path = "crates/context" }
 aura-session = { path = "crates/session" }
 aura-job = { path = "crates/job" }
@@ -160,7 +160,7 @@ aura-model = { workspace = true }
 aura-channels = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
-aura-workspace = { workspace = true }
+aura-workspace = { workspace = true, features = ["io"] }
 aura-context = { workspace = true }
 aura-session = { workspace = true }
 aura-job = { workspace = true }

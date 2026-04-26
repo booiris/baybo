@@ -196,10 +196,12 @@ pub async fn build_managers(
     leak_detector: Arc<LeakDetector>,
 ) -> anyhow::Result<ManagerGraph> {
     // --- minimal services shared by every mode
-    let workspace_root = std::path::PathBuf::from(&config.workspace.path);
+    let workspace_paths =
+        aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
+    let workspace_root = workspace_paths.root().to_path_buf();
     let skill_registry = {
         let reg = Arc::new(SkillRegistry::new());
-        let workspace_skills = workspace_root.join("skills");
+        let workspace_skills = workspace_paths.skills_dir();
         let loaded = reg.load_dir(&workspace_skills);
         if loaded > 0 {
             info!(

@@ -10,7 +10,7 @@ aura-llm = { workspace = true }
 aura-tools = { workspace = true }
 aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }
-aura-workspace = { workspace = true }
+aura-workspace = { workspace = true, features = ["io"] }
 aura-context = { workspace = true }
 aura-session = { workspace = true }
 aura-trace = { workspace = true }

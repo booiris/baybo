@@ -9,6 +9,7 @@ aura-tools = { workspace = true }
 aura-llm = { workspace = true }
 aura-sandbox = { workspace = true }
 aura-security = { workspace = true }
+aura-workspace = { workspace = true }
 
 async-trait = { workspace = true }
 serde = { workspace = true }

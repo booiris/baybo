@@ -148,7 +148,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 /// Resolve the channel port-file path. Fixed at `<workspace>/channel.port`
 /// — not configurable, so gateway and TUI resolve it identically.
 fn port_file_path(config: &AuraConfig) -> PathBuf {
-    PathBuf::from(&config.workspace.path).join("channel.port")
+    aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).channel_port()
 }
 
 /// Best-effort read of the per-start TUI token from the secret vault.

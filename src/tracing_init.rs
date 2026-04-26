@@ -132,7 +132,8 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
                 );
                 return init_tracing(TracingMode::Stdout);
             }
-            let appender = tracing_appender::rolling::daily(log_dir, "aura.log");
+            let appender =
+                tracing_appender::rolling::daily(log_dir, aura_workspace::paths::LOG_FILE_PREFIX);
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let writer = RedactingMakeWriter::new(leak_detector, writer);
             let fmt_layer = fmt::layer()

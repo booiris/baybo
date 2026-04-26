@@ -69,7 +69,8 @@ fn install_context(
     let exec_start = installer::resolve_exec_start(explicit_exec.as_deref())
         .map_err(|e| anyhow::anyhow!("cannot resolve executable path: {e}"))?;
     let config_path = resolve_install_config_path()?;
-    let log_dir = PathBuf::from(&config.workspace.path).join("logs");
+    let log_dir =
+        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).logs_dir();
     Ok(InstallContext {
         exec_start,
         config_path,
@@ -92,11 +93,13 @@ fn install_context(
 /// has to be baked into the unit file at install time — there's no
 /// second chance to pick it up later.
 fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
-    if let Some(raw) = std::env::var_os("AURA_CONFIG_PATH") {
+    use aura_workspace::paths::{ENV_CONFIG_PATH, WORKSPACE_CONFIG_FILE};
+
+    if let Some(raw) = std::env::var_os(ENV_CONFIG_PATH) {
         let p = PathBuf::from(&raw);
         let canon = p.canonicalize().map_err(|e| {
             anyhow::anyhow!(
-                "AURA_CONFIG_PATH={} cannot be resolved ({e}). Fix the path or unset the variable \
+                "{ENV_CONFIG_PATH}={} cannot be resolved ({e}). Fix the path or unset the variable \
                  before running install — a broken path baked into the unit file would only \
                  surface later when the service fails to start.",
                 p.display()
@@ -105,22 +108,22 @@ fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
         return Ok(Some(canon));
     }
 
-    let cwd_default = PathBuf::from("aura.json");
+    let cwd_default = PathBuf::from(WORKSPACE_CONFIG_FILE);
     if cwd_default.exists() {
-        let canon = cwd_default
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("./aura.json exists but cannot be canonicalized: {e}"))?;
+        let canon = cwd_default.canonicalize().map_err(|e| {
+            anyhow::anyhow!("./{WORKSPACE_CONFIG_FILE} exists but cannot be canonicalized: {e}")
+        })?;
         eprintln!(
-            "install: no AURA_CONFIG_PATH set; pinning service to {}",
+            "install: no {ENV_CONFIG_PATH} set; pinning service to {}",
             canon.display()
         );
         return Ok(Some(canon));
     }
 
     eprintln!(
-        "install: WARNING — no AURA_CONFIG_PATH and no ./aura.json; the installed service will \
-         run with built-in defaults (no LLM key, default workspace). Set AURA_CONFIG_PATH and \
-         re-run `aura gateway install` if that's not what you want."
+        "install: WARNING — no {ENV_CONFIG_PATH} and no ./{WORKSPACE_CONFIG_FILE}; the installed \
+         service will run with built-in defaults (no LLM key, default workspace). Set \
+         {ENV_CONFIG_PATH} and re-run `aura gateway install` if that's not what you want."
     );
     Ok(None)
 }
@@ -217,8 +220,9 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Per-workspace singleton. The gateway owns the same libsql store as
     // the TUI, runs job recovery, and drives cron ticks — two instances
     // against the same workspace would race.
-    let workspace_root = PathBuf::from(&config.workspace.path);
-    let _workspace_lock = singleton::acquire(workspace_root.as_path())?;
+    let workspace_paths =
+        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
+    let _workspace_lock = singleton::acquire(workspace_paths.root())?;
 
     // Read the admin token AND mint+publish a fresh TUI token BEFORE
     // building the manager graph: both are registered as
@@ -253,7 +257,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
             (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
         ],
     );
-    let log_dir = workspace_root.join("logs");
+    let log_dir = workspace_paths.logs_dir();
     let tracing_guards = init_tracing(TracingMode::File {
         log_dir: &log_dir,
         leak_detector: Arc::clone(&leak_detector),
@@ -364,7 +368,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // tokens minted by `ChannelSpawner`. Both arrive through the same
     // `ChannelTokenTable`, so the listener doesn't need any extra
     // auth material at bind time.
-    let port_file = workspace_root.join("channel.port");
+    let port_file = workspace_paths.channel_port();
     let channel_server = ChannelServer::bind(&deps, port_file.clone(), channel_tokens.clone())
         .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();

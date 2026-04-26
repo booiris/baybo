@@ -14,6 +14,8 @@ use std::fs::{OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::Path;
 
+use aura_workspace::WorkspacePaths;
+
 /// RAII guard that holds the workspace lock for its lifetime.
 pub struct WorkspaceLock {
     // The file must stay open to hold the flock; `_file` communicates intent.
@@ -26,7 +28,7 @@ pub fn acquire(workspace_root: &Path) -> anyhow::Result<WorkspaceLock> {
     std::fs::create_dir_all(workspace_root)
         .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", workspace_root.display()))?;
 
-    let path = workspace_root.join("aura.lock");
+    let path = WorkspacePaths::new(workspace_root.to_path_buf()).singleton_lock();
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -92,7 +94,7 @@ mod tests {
     fn lock_file_contains_pid() {
         let dir = tempdir();
         let _lock = acquire(&dir).expect("acquire");
-        let lock_path = dir.join("aura.lock");
+        let lock_path = WorkspacePaths::new(dir.clone()).singleton_lock();
         let contents = std::fs::read_to_string(&lock_path).expect("read lock file");
         let pid: u32 = contents.trim().parse().expect("pid should parse");
         assert_eq!(pid, std::process::id());

@@ -23,9 +23,11 @@ pub struct Cli {
 #[derive(Debug, clap::Args, Default, Clone)]
 pub struct GlobalArgs {
     /// Path to the Aura config file. Overrides `AURA_CONFIG_PATH`.
-    /// Clap's `env = "..."` makes the env var the fallback so both
-    /// surfaces land in the same field.
-    #[arg(long, global = true, env = "AURA_CONFIG_PATH")]
+    /// Clap's `env = ...` makes the env var the fallback so both
+    /// surfaces land in the same field. The variable name comes from
+    /// `aura_workspace::paths::ENV_CONFIG_PATH` so there is one source of
+    /// truth across the codebase.
+    #[arg(long, global = true, env = aura_workspace::paths::ENV_CONFIG_PATH)]
     pub config: Option<String>,
 
     /// Emit machine-readable JSON on stdout. Disables color.

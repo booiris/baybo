@@ -69,7 +69,11 @@ impl ServiceInstaller for SystemdInstaller {
         out.push_str("RestartSec=2\n");
         out.push_str("TimeoutStopSec=30\n");
         if let Some(cfg) = &ctx.config_path {
-            out.push_str(&format!("Environment=AURA_CONFIG_PATH={}\n", cfg.display()));
+            out.push_str(&format!(
+                "Environment={}={}\n",
+                aura_workspace::paths::ENV_CONFIG_PATH,
+                cfg.display()
+            ));
         }
         out.push_str(&format!(
             "# Log directory (ensure it exists and is writable): {}\n",

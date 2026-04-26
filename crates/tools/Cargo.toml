@@ -13,6 +13,7 @@ test-support = []
 [dependencies]
 aura-model = { workspace = true }
 aura-security = { workspace = true }
+aura-workspace = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
