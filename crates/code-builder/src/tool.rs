@@ -613,10 +613,7 @@ fn resolve_writable_bind_targets(
 ///   paths under it are auto-writable and need no consent. Anything
 ///   else — including paths that merely sit under the agent's host
 ///   workspace dir but outside the per-run scratch — must be approved.
-fn build_approval_accesses(
-    plan: &EffectivePlan,
-    scratch_root: &Path,
-) -> Vec<ResourceAccess> {
+fn build_approval_accesses(plan: &EffectivePlan, scratch_root: &Path) -> Vec<ResourceAccess> {
     let mut accesses: Vec<ResourceAccess> = Vec::new();
     if plan.network_policy == NetworkPolicy::All {
         accesses.push(ResourceAccess::Http { host: "*".into() });
@@ -638,9 +635,7 @@ fn build_approval_accesses(
             // has already been lexically validated as clean
             // (no `..`/`.`) by `plan::project`, so `starts_with` is
             // sound here.
-            (Some(canon_root), None) => {
-                p.starts_with(scratch_root) || p.starts_with(canon_root)
-            }
+            (Some(canon_root), None) => p.starts_with(scratch_root) || p.starts_with(canon_root),
             // canonicalize failed — fall back to a pure lexical check
             // against `scratch_root` only. NEVER fall back to a wider
             // path (the previous "or workspace_root" was a
@@ -658,29 +653,43 @@ fn build_approval_accesses(
 }
 
 /// Render the `params_preview` shown alongside the approval list. The
-/// fields the user cares about — task summary, the LLM's rationale,
-/// the network reason if any — go in here as a JSON blob the channel
-/// UI can pretty-print as it likes. Caller is responsible for
-/// rescanning every string-shaped argument against the leak detector
-/// (see `sanitize_preview`); this function is purely formatting.
-fn approval_preview(task: &str, plan: &EffectivePlan, writable_paths: &[String]) -> String {
-    const TASK_PREVIEW_BYTES: usize = 240;
-    let mut cut = TASK_PREVIEW_BYTES.min(task.len());
-    while cut > 0 && !task.is_char_boundary(cut) {
+/// access list above already names every resource the script will
+/// touch, and the LLM-authored task/rationale are noisy duplicates of
+/// the assistant turn that triggered the call — so they are dropped on
+/// purpose. The only information preserved is `network_reason` when
+/// the plan requires network, since `ResourceAccess::Http` carries no
+/// reason field of its own. Returns an empty string for the common
+/// write-only case so the channel UI skips the preview block entirely.
+/// Caller is responsible for rescanning every string-shaped argument
+/// against the leak detector (see `sanitize_preview`).
+fn approval_preview(_task: &str, plan: &EffectivePlan, _writable_paths: &[String]) -> String {
+    const REASON_PREVIEW_BYTES: usize = 240;
+
+    if plan.network_policy != NetworkPolicy::All {
+        return String::new();
+    }
+    let Some(reason) = plan.network_reason.as_deref() else {
+        return String::new();
+    };
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return String::new();
+    }
+    format!(
+        "network reason: {}",
+        truncate_for_preview(reason, REASON_PREVIEW_BYTES)
+    )
+}
+
+fn truncate_for_preview(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
     }
-    let task_short = if cut < task.len() {
-        format!("{}…", &task[..cut])
-    } else {
-        task.to_string()
-    };
-    serde_json::to_string(&json!({
-        "task": task_short,
-        "rationale": plan.rationale,
-        "network_reason": plan.network_reason,
-        "writable_paths_outside_scratch": writable_paths,
-    }))
-    .unwrap_or_default()
+    format!("{}…", &s[..cut])
 }
 
 fn locate_on_path(name: &str) -> Option<PathBuf> {
@@ -1271,8 +1280,7 @@ mod tests {
         cache: ApprovalCache,
     ) -> (ApprovalHandle, CapturedRequests, ApprovalCache) {
         let (gate, captured) = StubGate::new(decision);
-        let handle =
-            ApprovalHandle::new(gate as Arc<dyn ApprovalGate>, Arc::clone(&cache));
+        let handle = ApprovalHandle::new(gate as Arc<dyn ApprovalGate>, Arc::clone(&cache));
         (handle, captured, cache)
     }
 
@@ -1813,17 +1821,30 @@ mod tests {
     }
 
     #[test]
-    fn approval_preview_contains_task_rationale_and_network_reason() {
+    fn approval_preview_emits_only_network_reason_when_network_required() {
         let plan = plan_with(NetworkPolicy::All, vec![]);
         let writable: Vec<String> = vec![];
         let preview = super::approval_preview("write a CSV from /data/in.csv", &plan, &writable);
-        assert!(preview.contains("write a CSV"), "task: {preview}");
-        assert!(preview.contains("\"reason\""), "network_reason: {preview}");
-        let parsed: Value = serde_json::from_str(&preview).expect("preview is JSON");
-        assert!(parsed.get("task").is_some());
-        assert!(parsed.get("rationale").is_some());
-        assert!(parsed.get("network_reason").is_some());
-        assert!(parsed.get("writable_paths_outside_scratch").is_some());
+        assert_eq!(preview, "network reason: reason", "preview: {preview}");
+        assert!(
+            !preview.contains("write a CSV"),
+            "task should not appear in preview: {preview}"
+        );
+        assert!(
+            !preview.contains("rationale") && !preview.contains("\nwhy"),
+            "rationale should be dropped: {preview}"
+        );
+    }
+
+    #[test]
+    fn approval_preview_is_empty_when_network_policy_none() {
+        let plan = plan_with(NetworkPolicy::None, vec![]);
+        let writable: Vec<String> = vec![];
+        let preview = super::approval_preview("local-only task", &plan, &writable);
+        assert!(
+            preview.is_empty(),
+            "write-only plan should produce an empty preview so the channel UI skips the params block: {preview}"
+        );
     }
 
     #[tokio::test]
@@ -1863,15 +1884,12 @@ mod tests {
             !preview_text.contains("AKIAIOSFODNN7EXAMPLE"),
             "plaintext AWS key leaked into approval preview: {preview_text}"
         );
-        // The re-minted placeholder for that secret is what should
-        // appear in the preview, and the original is now stored in
-        // the vault keyed under that placeholder.
+        // The preview no longer carries the task itself (only the
+        // network reason, when applicable). The original plaintext
+        // must still be re-minted into the vault under its placeholder
+        // so the script body keeps using the vaulted form.
         let minter = PlaceholderMinter::from_master_key(vault.master_key());
         let placeholder = minter.mint(b"AKIAIOSFODNN7EXAMPLE");
-        assert!(
-            preview_text.contains(&placeholder),
-            "expected re-minted placeholder in preview: {preview_text}"
-        );
         let stored = vault.get_secret(&placeholder).await.unwrap().unwrap();
         let bytes: &[u8] = stored.as_bytes();
         assert_eq!(bytes, b"AKIAIOSFODNN7EXAMPLE");
