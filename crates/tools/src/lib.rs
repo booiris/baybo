@@ -145,6 +145,7 @@ impl ApprovalHandle {
             tool: tool.to_string(),
             accesses: uncovered.clone(),
             params_preview,
+            description: None,
         };
         let decision = self.gate.request(req).await;
         if decision == ApprovalDecision::ApproveAlways {

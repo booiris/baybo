@@ -551,6 +551,7 @@ mod tests {
             tool: "t".into(),
             accesses: vec![],
             params_preview: String::new(),
+            description: None,
         };
 
         // Outer wrapper drops the future before any resolution lands —
@@ -591,6 +592,7 @@ mod tests {
             tool: "t".into(),
             accesses: vec![],
             params_preview: String::new(),
+            description: None,
         };
         let q = queue.clone();
         let task = tokio::spawn(async move { gate.request(req).await });
