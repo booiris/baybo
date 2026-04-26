@@ -538,11 +538,8 @@ mod tests {
     #[tokio::test]
     async fn dropped_request_future_cleans_up_queue_entry() {
         let queue = ApprovalQueue::new();
-        let gate = ChannelApprovalGate::new(
-            queue.clone(),
-            Arc::new(|| {}),
-            Duration::from_secs(60),
-        );
+        let gate =
+            ChannelApprovalGate::new(queue.clone(), Arc::new(|| {}), Duration::from_secs(60));
 
         let req = ApprovalRequest {
             call_id: "stale".into(),
@@ -579,11 +576,8 @@ mod tests {
     #[tokio::test]
     async fn cleanup_guard_is_noop_when_consumer_resolves_first() {
         let queue = ApprovalQueue::new();
-        let gate = ChannelApprovalGate::new(
-            queue.clone(),
-            Arc::new(|| {}),
-            Duration::from_secs(60),
-        );
+        let gate =
+            ChannelApprovalGate::new(queue.clone(), Arc::new(|| {}), Duration::from_secs(60));
 
         let req = ApprovalRequest {
             call_id: "live".into(),
