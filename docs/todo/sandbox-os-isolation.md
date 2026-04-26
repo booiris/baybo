@@ -2,10 +2,13 @@
 
 ## v1 Status (shipped)
 
-- `aura-sandbox` crate with `bwrap` (Linux) and `sandbox-exec` (macOS)
-  backends behind matching Cargo features.
-- `SandboxRunner` trait + `current_platform_runner()` factory; per-call
-  cost is just an `Arc::clone` after the startup probe.
+- `aura-sandbox` crate with `bwrap` (Linux), `sandbox-exec` (macOS),
+  and a cross-platform `docker` fallback, all behind matching Cargo
+  features (default-on).
+- `SandboxRunner` trait + `current_platform_runner()` factory that
+  tries the native backend first and falls back to docker when its
+  binary is absent. Per-call cost is just an `Arc::clone` after the
+  startup probe.
 - Filesystem scoping: workspace bind mount RW; curated system dirs
   (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`,
   `/run/systemd/resolve`) RO.
@@ -40,7 +43,16 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   network rules on macOS. Today `SandboxSpec.allowed_hosts` is
   forward-compatible plumbing; v1 ignores its contents.
 - cgroup v2 memory + pid caps (Linux). v1 only sets `--die-with-parent`
-  + a fresh PID namespace.
+  + a fresh PID namespace. The Docker fallback similarly lacks
+  `--memory` / `--pids-limit` flags and inherits the daemon's
+  defaults.
+- Configurable Docker image (currently hardcoded to
+  `debian:stable-slim`). The runner already pre-pulls the image at
+  startup via `SandboxRunner::warm()` and pins it by digest for the
+  gateway lifetime, so the first agent-issued command no longer
+  pays the registry round-trip; what is left is exposing the image
+  choice to operators (and shipping a pinned-by-digest default in
+  source so the trust boundary is reproducible across fresh hosts).
 - `[sandbox]` config section in `aura.json` for timeouts, memory caps,
   extra readable paths (especially relevant for non-FHS distros like
   NixOS where `/usr` is essentially empty), and an explicit override

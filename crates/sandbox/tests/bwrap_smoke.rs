@@ -2,9 +2,11 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use aura_sandbox::{EnvPolicy, NetworkPolicy, SandboxSpec, StdinSource, current_platform_runner};
+use aura_sandbox::bwrap::BwrapRunner;
+use aura_sandbox::{EnvPolicy, NetworkPolicy, SandboxRunner, SandboxSpec, StdinSource};
 
 fn bwrap_present() -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
@@ -19,7 +21,9 @@ async fn echo_through_bwrap() {
         eprintln!("skipping: bwrap not installed on $PATH");
         return;
     }
-    let runner = current_platform_runner().expect("runner");
+    // Construct the bwrap runner directly so the docker fallback in
+    // `current_platform_runner()` can't shadow what this test exercises.
+    let runner: Arc<dyn SandboxRunner> = Arc::new(BwrapRunner::discover().expect("bwrap runner"));
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = runner
         .run(SandboxSpec {

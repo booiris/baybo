@@ -57,4 +57,5 @@ pub struct SandboxOutput {
 pub enum Backend {
     Bwrap,
     SandboxExec,
+    Docker,
 }

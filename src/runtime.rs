@@ -291,11 +291,25 @@ pub async fn build_managers(
     ));
     let gate_map = channels_registry.approval_gates();
     let sandbox_runner = match aura_sandbox::current_platform_runner() {
-        Ok(r) => {
-            info!(backend = ?r.backend(), "OS sandbox ready");
-            Some(r)
-        }
-        Err(e @ aura_sandbox::SandboxError::BackendMissing { .. }) => {
+        Ok(r) => match r.warm().await {
+            Ok(()) => {
+                info!(backend = ?r.backend(), "OS sandbox ready");
+                Some(r)
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    backend = ?r.backend(),
+                    "sandbox warm-up failed; ExecCommand tools will be refused",
+                );
+                None
+            }
+        },
+        Err(
+            e @ (aura_sandbox::SandboxError::BackendMissing { .. }
+            | aura_sandbox::SandboxError::BackendUnreachable { .. }
+            | aura_sandbox::SandboxError::NoBackendAvailable),
+        ) => {
             error!(error = %e, "OS sandbox unavailable; ExecCommand tools will be refused");
             None
         }

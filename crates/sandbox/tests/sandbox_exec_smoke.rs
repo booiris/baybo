@@ -2,9 +2,11 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use aura_sandbox::{EnvPolicy, NetworkPolicy, SandboxSpec, StdinSource, current_platform_runner};
+use aura_sandbox::sandbox_exec::SandboxExecRunner;
+use aura_sandbox::{EnvPolicy, NetworkPolicy, SandboxRunner, SandboxSpec, StdinSource};
 
 fn sandbox_exec_present() -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
@@ -19,7 +21,8 @@ async fn echo_through_sandbox_exec() {
         eprintln!("skipping: sandbox-exec not on $PATH");
         return;
     }
-    let runner = current_platform_runner().expect("runner");
+    let runner: Arc<dyn SandboxRunner> =
+        Arc::new(SandboxExecRunner::discover().expect("sandbox-exec runner"));
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = runner
         .run(SandboxSpec {
@@ -50,7 +53,8 @@ async fn host_tmp_writes_are_denied() {
         eprintln!("skipping: sandbox-exec not on $PATH");
         return;
     }
-    let runner = current_platform_runner().expect("runner");
+    let runner: Arc<dyn SandboxRunner> =
+        Arc::new(SandboxExecRunner::discover().expect("sandbox-exec runner"));
     let tmp = tempfile::tempdir().expect("tempdir");
     let marker = format!("/tmp/aura-sandbox-host-escape-{}", std::process::id());
     let _ = std::fs::remove_file(&marker);

@@ -38,20 +38,77 @@ running unsandboxed would defeat the whole point.
 
 ## Design Decisions
 
-### Backend per platform, not a shared abstraction
+### Backend per platform, with a Docker fallback
 
 `#[cfg(target_os = "linux")]` selects `BwrapRunner`; `#[cfg(target_os =
 "macos")]` selects `SandboxExecRunner`. Both are gated behind matching
-Cargo features (`linux`, `macos`, both on by default), mirroring the
-gateway's installer pattern. Other Unixes return
-`SandboxError::UnsupportedPlatform` — Aura is Unix-only and Windows is
-out of scope.
+Cargo features (`linux`, `macos`), mirroring the gateway's installer
+pattern. Aura is Unix-only and Windows is out of scope.
 
-The two backends have nothing meaningful in common at the syscall level —
-namespace flags vs. SBPL rules — so the trait surface is intentionally
-minimal: `run(spec) -> Result<SandboxOutput, SandboxError>` and `backend()`
-for diagnostics. There is no shared "policy" type beyond `SandboxSpec`
-itself.
+`current_platform_runner()` tries the native backend first; if its
+binary is missing on `$PATH`, it falls back to `DockerRunner` (gated
+on the `docker` feature, also default-on). All three features ship in
+the default set so the same build works whether the operator has
+`bwrap`, only `docker`, or — on a fresh macOS — only the OS-bundled
+`sandbox-exec`. If none are available the factory returns
+`SandboxError::NoBackendAvailable` and the gateway logs an error +
+refuses every `ExecCommand` call.
+
+The three backends have nothing meaningful in common at the syscall
+level — bwrap namespaces vs. SBPL rules vs. dockerd-managed cgroups —
+so the trait surface is intentionally minimal: `run(spec) ->
+Result<SandboxOutput, SandboxError>` and `backend()` for diagnostics.
+There is no shared "policy" type beyond `SandboxSpec` itself.
+
+#### Docker fallback specifics
+
+- **Lifecycle**: `discover()` (sync) verifies the docker CLI is on
+  `$PATH` and that `docker info` returns successfully — i.e. the
+  daemon socket is reachable and accessible to the gateway user. A
+  binary without a reachable daemon returns
+  `SandboxError::BackendUnreachable` and the factory keeps falling
+  through (or reports `NoBackendAvailable`).
+- **`warm()` at startup**: the Docker backend overrides the default
+  no-op `SandboxRunner::warm()`. It calls `docker image inspect` for
+  the configured image; if absent, runs `docker pull` once; then
+  resolves the image to its digest reference (`debian@sha256:…`) and
+  stores it in a `OnceLock`. Every subsequent `docker run` uses that
+  digest, with `--pull=never`, so the trust boundary is fixed for
+  the gateway's lifetime — even if the floating tag is rotated
+  upstream mid-session.
+- **Default image**: `debian:stable-slim`. Hardcoded for v1; a
+  `[sandbox]` config section will let operators override it.
+- **Workspace bind**: `-v <workspace>:<workspace>` with the same path
+  inside and outside the container so absolute paths line up for the
+  `cwd` validation in `SandboxAdapter` and for any path the tool
+  emits.
+- **Network**: `--network none` for `NetworkPolicy::None`, `--network
+  bridge` for `All`. We avoid `--network host` because Docker Desktop
+  on macOS does not expose host networking — `bridge` works
+  identically on Linux and macOS.
+- **User**: `--user <host-uid>:<host-gid>` so files the child writes
+  back into the workspace bind are owned by the launching user, not
+  root.
+- **Capabilities**: `--cap-drop=ALL`. The container kernel surface is
+  whatever the docker daemon chooses to expose, which is narrower
+  than a bwrap-namespaced child but not zero.
+- **Container lifecycle**: every `docker run` is started with a
+  unique `--name aura-sandbox-<pid>-<nanos>-<seq>`. On timeout or
+  io-error the runner issues `docker rm -f <name>` before returning,
+  because `kill_on_drop` only reaps the local docker CLI client and
+  the daemon-managed container would otherwise keep running with
+  the workspace bind still mounted. There is a regression test in
+  `tests/docker_smoke.rs::timeout_force_removes_container` that
+  proves a timed-out workload cannot continue writing into the
+  workspace.
+- **Daemon-side launch failures** (exit 125 with stderr) are
+  surfaced as `SandboxError::BackendFailure` so the agent doesn't
+  mis-attribute them to the user command.
+
+Limitation: the Docker fallback inherits the daemon's resource
+ceilings. Without explicit `--memory` / `--pids-limit` flags (deferred
+to v2) a runaway tool can still exhaust host memory or fork-bomb the
+docker daemon. For long-running gateways prefer the native backend.
 
 ### Capability-driven wrapping
 

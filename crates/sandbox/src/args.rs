@@ -72,7 +72,7 @@ pub fn build_bwrap_argv(spec: &SandboxSpec) -> Vec<OsString> {
     argv
 }
 
-fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
+pub(crate) fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let workspace = spec.workspace_root.display().to_string();
     out.push(("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()));
@@ -96,6 +96,105 @@ fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Build the `docker run …` argv for the cross-platform fallback runner.
+///
+/// The mapping intentionally mirrors bwrap semantics so the same
+/// `SandboxSpec` produces equivalent observable behaviour:
+///
+/// - workspace bind RW with the same path inside and outside the
+///   container (so absolute paths in the host and container line up
+///   for the `cwd` validation in the agent adapter and for any path
+///   the tool emits in its output);
+/// - `--network none` for `NetworkPolicy::None`, default bridge for
+///   `NetworkPolicy::All` — `host` networking is not portable to
+///   macOS Docker Desktop, so we deliberately avoid it;
+/// - `--user host_uid:host_gid` so files the child writes back into
+///   the workspace bind are owned by the host user rather than root;
+/// - `$TMPDIR` / `$TMP` / `$TEMP` route at the in-container `/tmp`
+///   tmpfs (every container gets its own);
+/// - `--name <container_name>` so the runner can `docker rm -f` the
+///   daemon-side container on timeout/cancellation rather than
+///   leaving it running;
+/// - `--pull=never` so a missing or upstream-rotated image surfaces
+///   loudly instead of silently swapping the trusted execution base
+///   between calls — `DockerRunner::warm()` is responsible for
+///   pulling and pinning the image up front.
+pub fn build_docker_argv(spec: &SandboxSpec, image: &str, container_name: &str) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = Vec::with_capacity(64);
+    argv.push(OsString::from("run"));
+    argv.push(OsString::from("--rm"));
+    argv.push(OsString::from("--init"));
+    argv.push(OsString::from("--pull=never"));
+    argv.push(OsString::from("--name"));
+    argv.push(OsString::from(container_name));
+
+    match spec.network_policy {
+        NetworkPolicy::None => {
+            argv.push(OsString::from("--network"));
+            argv.push(OsString::from("none"));
+        }
+        NetworkPolicy::All => {
+            argv.push(OsString::from("--network"));
+            argv.push(OsString::from("bridge"));
+        }
+    }
+
+    // Drop linux capabilities the child should not have. `--init` already
+    // covers PID-1 reaping, so we just need to keep the kernel-level
+    // surface narrow.
+    argv.push(OsString::from("--cap-drop=ALL"));
+
+    let (uid, gid) = current_uid_gid();
+    argv.push(OsString::from("--user"));
+    argv.push(OsString::from(format!("{uid}:{gid}")));
+
+    let ws = spec.workspace_root.as_os_str().to_owned();
+    argv.push(OsString::from("-v"));
+    let mut bind = ws.clone();
+    bind.push(":");
+    bind.push(&ws);
+    argv.push(bind);
+
+    for path in &spec.readable_paths {
+        let p = path.as_os_str().to_owned();
+        argv.push(OsString::from("-v"));
+        let mut ro = p.clone();
+        ro.push(":");
+        ro.push(&p);
+        ro.push(":ro");
+        argv.push(ro);
+    }
+
+    let cwd = spec.cwd.as_deref().unwrap_or(spec.workspace_root.as_path());
+    argv.push(OsString::from("-w"));
+    argv.push(cwd.as_os_str().to_owned());
+
+    for (k, v) in resolve_env(spec) {
+        argv.push(OsString::from("-e"));
+        argv.push(OsString::from(format!("{k}={v}")));
+    }
+
+    if matches!(
+        spec.stdin,
+        crate::spec::StdinSource::Bytes(_) | crate::spec::StdinSource::Inherit
+    ) {
+        argv.push(OsString::from("-i"));
+    }
+
+    argv.push(OsString::from(image));
+    argv.push(spec.program.as_os_str().to_owned());
+    for a in &spec.args {
+        argv.push(OsString::from(a));
+    }
+
+    argv
+}
+
+fn current_uid_gid() -> (u32, u32) {
+    // Safety: `getuid` and `getgid` are signal-safe and cannot fail per POSIX.
+    unsafe { (libc::getuid(), libc::getgid()) }
 }
 
 pub fn render_sbpl_profile(spec: &SandboxSpec) -> String {
@@ -314,6 +413,106 @@ mod tests {
         assert!(
             !block.contains("/private/var/folders"),
             "v1 must not allow writes to host /private/var/folders: {block}"
+        );
+    }
+
+    #[test]
+    fn docker_argv_starts_with_run_rm_init() {
+        let argv = build_docker_argv(
+            &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        assert_eq!(strs[0], "run");
+        assert_eq!(strs[1], "--rm");
+        assert_eq!(strs[2], "--init");
+    }
+
+    #[test]
+    fn docker_argv_disables_network_when_no_http() {
+        let argv = build_docker_argv(
+            &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        let i = strs
+            .iter()
+            .position(|a| a == "--network")
+            .expect("--network present");
+        assert_eq!(strs[i + 1], "none");
+    }
+
+    #[test]
+    fn docker_argv_uses_bridge_network_for_http() {
+        let argv = build_docker_argv(
+            &spec_for(NetworkPolicy::All, "/tmp/myws"),
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        let i = strs
+            .iter()
+            .position(|a| a == "--network")
+            .expect("--network present");
+        assert_eq!(strs[i + 1], "bridge");
+    }
+
+    #[test]
+    fn docker_argv_binds_workspace_with_matching_paths() {
+        let argv = build_docker_argv(
+            &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        let i = strs.iter().position(|a| a == "-v").expect("-v present");
+        assert_eq!(strs[i + 1], "/tmp/myws:/tmp/myws");
+    }
+
+    #[test]
+    fn docker_argv_drops_capabilities_and_pins_user() {
+        let argv = build_docker_argv(
+            &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        assert!(strs.contains(&"--cap-drop=ALL".to_string()));
+        let i = strs
+            .iter()
+            .position(|a| a == "--user")
+            .expect("--user present");
+        let pinned = &strs[i + 1];
+        assert!(
+            pinned.contains(':')
+                && pinned
+                    .split(':')
+                    .all(|seg| seg.chars().all(|c| c.is_ascii_digit())),
+            "expected uid:gid pair, got `{pinned}`"
+        );
+    }
+
+    #[test]
+    fn docker_argv_image_precedes_program_and_args() {
+        let argv = build_docker_argv(
+            &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        let image_idx = strs
+            .iter()
+            .position(|a| a == "debian:stable-slim")
+            .expect("image in argv");
+        let program_idx = strs
+            .iter()
+            .rposition(|a| a == "sh")
+            .expect("program in argv");
+        assert!(
+            image_idx < program_idx,
+            "image must come before program (image@{image_idx}, program@{program_idx})"
         );
     }
 
