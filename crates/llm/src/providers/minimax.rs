@@ -4,7 +4,7 @@ use rig::providers::openai;
 use crate::registry::{LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
 
-const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimax.io/v1";
+const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/v1";
 
 /// Factory that creates `LlmClient` instances configured for MiniMax models.
 ///
