@@ -16,7 +16,9 @@ use async_trait::async_trait;
 
 pub use bootstrap::SandboxAvailability;
 pub use error::SandboxError;
-pub use spec::{Backend, EnvPolicy, NetworkPolicy, SandboxOutput, SandboxSpec, StdinSource};
+pub use spec::{
+    Backend, EnvPolicy, NetworkPolicy, ResourceLimits, SandboxOutput, SandboxSpec, StdinSource,
+};
 
 #[async_trait]
 pub trait SandboxRunner: Send + Sync {
@@ -31,6 +33,20 @@ pub trait SandboxRunner: Send + Sync {
     /// default no-op.
     async fn warm(&self) -> Result<(), SandboxError> {
         Ok(())
+    }
+
+    /// Per-host-and-backend safe defaults: the conservative resource
+    /// caps this runner can actually enforce on the current host.
+    /// Callers like the agent's `SandboxAdapter` use this so the
+    /// per-call default is automatically tuned to the runner's
+    /// capability instead of always asking for caps that some
+    /// backends would have to refuse.
+    ///
+    /// Default implementation returns `ResourceLimits::unlimited()`,
+    /// which is safe to pass to every backend. Runners that can do
+    /// better override this.
+    fn default_resource_limits(&self) -> spec::ResourceLimits {
+        spec::ResourceLimits::unlimited()
     }
 }
 

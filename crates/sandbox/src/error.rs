@@ -27,6 +27,22 @@ pub enum SandboxError {
     #[error("invalid sandbox spec: {0}")]
     InvalidSpec(String),
 
+    /// The selected backend cannot enforce some part of the requested
+    /// `SandboxSpec` (e.g. per-host network allowlist on bwrap, cgroup
+    /// caps on a daemonised host without `systemd-run --user`). The
+    /// runner refuses rather than silently downgrading, so the caller
+    /// has a chance to either narrow the spec, switch backends, or
+    /// explicitly opt into the unenforced state via
+    /// `ResourceLimits::unlimited()` / empty `allowed_hosts`.
+    #[error(
+        "{backend} sandbox cannot enforce {what}; {hint} (or relax the spec to opt into the unenforced state)"
+    )]
+    Unenforceable {
+        backend: &'static str,
+        what: String,
+        hint: &'static str,
+    },
+
     #[error("io error launching sandbox: {0}")]
     Io(#[from] std::io::Error),
 

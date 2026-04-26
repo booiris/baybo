@@ -146,6 +146,15 @@ pub fn build_docker_argv(spec: &SandboxSpec, image: &str, container_name: &str) 
     // surface narrow.
     argv.push(OsString::from("--cap-drop=ALL"));
 
+    if let Some(bytes) = spec.resource_limits.memory_max_bytes {
+        argv.push(OsString::from("--memory"));
+        argv.push(OsString::from(format!("{bytes}")));
+    }
+    if let Some(pids) = spec.resource_limits.pids_max {
+        argv.push(OsString::from("--pids-limit"));
+        argv.push(OsString::from(format!("{pids}")));
+    }
+
     let (uid, gid) = current_uid_gid();
     argv.push(OsString::from("--user"));
     argv.push(OsString::from(format!("{uid}:{gid}")));
@@ -245,15 +254,42 @@ pub fn render_sbpl_profile(spec: &SandboxSpec) -> String {
     s.push_str("(allow ipc-posix-shm)\n");
     s.push_str("(allow sysctl-read)\n\n");
 
-    match spec.network_policy {
-        NetworkPolicy::None => s.push_str("(deny network*)\n"),
-        NetworkPolicy::All => s.push_str("(allow network*)\n"),
+    match (spec.network_policy, spec.allowed_hosts.is_empty()) {
+        (NetworkPolicy::None, _) => s.push_str("(deny network*)\n"),
+        (NetworkPolicy::All, true) => s.push_str("(allow network*)\n"),
+        (NetworkPolicy::All, false) => {
+            // Per-host scope. The kernel does name resolution before
+            // matching the `(remote tcp "host:port")` rule, so we must
+            // separately allow DNS (both UDP 53 and TCP 53 for edge
+            // cases like fallback to DoT or large responses) for the
+            // hostname rules to be useful at all. Everything else is
+            // denied by the leading `network*` rule.
+            s.push_str("(deny network*)\n");
+            s.push_str("(allow network-outbound (remote udp \"*:53\"))\n");
+            s.push_str("(allow network-outbound (remote tcp \"*:53\"))\n");
+            for host in &spec.allowed_hosts {
+                let entry = if host.contains(':') {
+                    host.clone()
+                } else {
+                    // Bare hostname → any port. Operators who want to
+                    // pin a port encode it as `host:443`.
+                    format!("{host}:*")
+                };
+                s.push_str(&format!(
+                    "(allow network-outbound (remote tcp \"{}\"))\n",
+                    sbpl_quote_str(&entry)
+                ));
+            }
+        }
     }
     s
 }
 
 pub fn sbpl_quote(path: &Path) -> String {
-    let raw = path.display().to_string();
+    sbpl_quote_str(&path.display().to_string())
+}
+
+pub fn sbpl_quote_str(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
         match ch {
@@ -285,6 +321,7 @@ mod tests {
             env: EnvPolicy::Baseline,
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
+            resource_limits: crate::spec::ResourceLimits::default(),
         }
     }
 
@@ -495,6 +532,43 @@ mod tests {
     }
 
     #[test]
+    fn docker_argv_emits_memory_and_pids_limits_when_set() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
+        spec.resource_limits = crate::spec::ResourceLimits {
+            memory_max_bytes: Some(256 * 1024 * 1024),
+            pids_max: Some(64),
+        };
+        let argv = build_docker_argv(&spec, "debian:stable-slim", "aura-sandbox-test");
+        let strs = argv_strs(&argv);
+        let mem = strs
+            .iter()
+            .position(|a| a == "--memory")
+            .expect("--memory present");
+        assert_eq!(strs[mem + 1], (256u64 * 1024 * 1024).to_string());
+        let pids = strs
+            .iter()
+            .position(|a| a == "--pids-limit")
+            .expect("--pids-limit present");
+        assert_eq!(strs[pids + 1], "64");
+    }
+
+    #[test]
+    fn docker_argv_omits_caps_when_unlimited() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
+        spec.resource_limits = crate::spec::ResourceLimits::unlimited();
+        let argv = build_docker_argv(&spec, "debian:stable-slim", "aura-sandbox-test");
+        let strs = argv_strs(&argv);
+        assert!(
+            !strs.iter().any(|a| a == "--memory"),
+            "no --memory when unlimited: {strs:?}"
+        );
+        assert!(
+            !strs.iter().any(|a| a == "--pids-limit"),
+            "no --pids-limit when unlimited: {strs:?}"
+        );
+    }
+
+    #[test]
     fn docker_argv_image_precedes_program_and_args() {
         let argv = build_docker_argv(
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
@@ -514,6 +588,47 @@ mod tests {
             image_idx < program_idx,
             "image must come before program (image@{image_idx}, program@{program_idx})"
         );
+    }
+
+    #[test]
+    fn sbpl_profile_per_host_scopes_replace_broad_allow() {
+        let mut spec = spec_for(NetworkPolicy::All, "/tmp/myws");
+        spec.allowed_hosts = BTreeSet::from(["api.openai.com:443".into(), "github.com".into()]);
+        let s = render_sbpl_profile(&spec);
+        assert!(
+            !s.contains("(allow network*)"),
+            "broad allow must be dropped when allowed_hosts is non-empty: {s}"
+        );
+        assert!(s.contains("(deny network*)"));
+        assert!(
+            s.contains("(allow network-outbound (remote tcp \"api.openai.com:443\"))"),
+            "explicit host:port entry must round-trip: {s}"
+        );
+        assert!(
+            s.contains("(allow network-outbound (remote tcp \"github.com:*\"))"),
+            "bare hostname must default to wildcard port: {s}"
+        );
+        assert!(
+            s.contains("(allow network-outbound (remote udp \"*:53\"))"),
+            "DNS must be allowed so hostname rules can resolve: {s}"
+        );
+    }
+
+    #[test]
+    fn sbpl_profile_allowed_hosts_ignored_under_network_none() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
+        spec.allowed_hosts = BTreeSet::from(["github.com".into()]);
+        let s = render_sbpl_profile(&spec);
+        assert!(s.contains("(deny network*)"));
+        assert!(
+            !s.contains("(allow network-outbound"),
+            "allowed_hosts must not unblock egress when policy is None: {s}"
+        );
+    }
+
+    #[test]
+    fn sbpl_quote_str_escapes_quotes_and_backslashes() {
+        assert_eq!(sbpl_quote_str(r#"a"b\c"#), r#"a\"b\\c"#);
     }
 
     #[test]

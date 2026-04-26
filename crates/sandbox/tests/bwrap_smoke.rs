@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_sandbox::bwrap::BwrapRunner;
-use aura_sandbox::{EnvPolicy, NetworkPolicy, SandboxRunner, SandboxSpec, StdinSource};
+use aura_sandbox::{
+    EnvPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec, StdinSource,
+};
 
 fn bwrap_present() -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
@@ -37,6 +39,7 @@ async fn echo_through_bwrap() {
             env: EnvPolicy::Baseline,
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
+            resource_limits: ResourceLimits::unlimited(),
         })
         .await
         .expect("sandboxed run");

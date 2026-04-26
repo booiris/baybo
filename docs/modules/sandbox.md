@@ -92,6 +92,11 @@ There is no shared "policy" type beyond `SandboxSpec` itself.
 - **Capabilities**: `--cap-drop=ALL`. The container kernel surface is
   whatever the docker daemon chooses to expose, which is narrower
   than a bwrap-namespaced child but not zero.
+- **Resource caps**: `--memory <bytes> --pids-limit <count>` are
+  emitted whenever `SandboxSpec.resource_limits` carries those
+  bounds (default 512 MiB / 256 pids). Setting either to `None` —
+  via `ResourceLimits::unlimited()` — drops the corresponding flag,
+  in which case the container inherits the daemon's defaults.
 - **Container lifecycle**: every `docker run` is started with a
   unique `--name aura-sandbox-<pid>-<nanos>-<seq>`. On timeout or
   io-error the runner issues `docker rm -f <name>` before returning,
@@ -105,10 +110,51 @@ There is no shared "policy" type beyond `SandboxSpec` itself.
   surfaced as `SandboxError::BackendFailure` so the agent doesn't
   mis-attribute them to the user command.
 
-Limitation: the Docker fallback inherits the daemon's resource
-ceilings. Without explicit `--memory` / `--pids-limit` flags (deferred
-to v2) a runaway tool can still exhaust host memory or fork-bomb the
-docker daemon. For long-running gateways prefer the native backend.
+### Resource caps (memory + pids)
+
+`SandboxSpec.resource_limits` carries `memory_max_bytes` and
+`pids_max`, both `Option<u64>`. The library default is
+`ResourceLimits::unlimited()` — most permissive — so a `SandboxSpec`
+constructed with `..Default::default()` works on every backend.
+`ResourceLimits::safe_defaults()` (512 MiB / 256 processes) is the
+conservative recommendation; backends that can enforce it use it as
+their `default_resource_limits`.
+
+Per-runner enforcement (queryable through
+`SandboxRunner::default_resource_limits`):
+
+- **Docker**: direct mapping to `--memory <bytes>` / `--pids-limit
+  <count>`. Always enforceable, so the runner's default is
+  `safe_defaults()`.
+- **bwrap with `systemd-run --user`** (probed once at `discover()`
+  via `systemd-run --user --scope -- /bin/true`): caps go through
+  cgroup v2 by wrapping the bwrap call in `systemd-run --user
+  --scope --collect --property=MemoryMax=… --property=TasksMax=…`.
+  Default is `safe_defaults()`.
+- **bwrap without `systemd-run`** (daemonised hosts, containers
+  without user systemd): cgroup caps are unreachable, so the
+  runner's default is `unlimited()`. If a caller explicitly passes
+  non-`unlimited()` limits, `BwrapRunner::run` returns
+  `SandboxError::Unenforceable` rather than silently downgrading.
+  Operators who need caps in daemonised setups should run aura
+  under a systemd user unit or use the Docker fallback.
+- **macOS (sandbox-exec)**: SBPL has no cgroup equivalent. Default
+  is `unlimited()`. Non-`unlimited()` specs return
+  `SandboxError::Unenforceable`. Operators who need a hard memory
+  ceiling on macOS should layer a separate launchd
+  `MemoryHighWaterMark` outside aura.
+
+`SandboxAdapter::new` reads `runner.default_resource_limits()` so the
+agent's per-call default is automatically tuned to whatever the
+chosen backend can enforce. Callers can still tighten or relax via
+`with_resource_limits(...)`; the runner validates and either
+enforces or fails-closed.
+
+The fail-closed posture is the headline change in the v1.1 hardening
+pass: prior to it, both Linux without `systemd-run` and macOS
+silently dropped the request, so `OK(...)` did not actually mean the
+caps were applied. Any caller asking for caps now either gets them
+or gets a clear error telling them which backend can deliver.
 
 ### Capability-driven wrapping
 
@@ -119,12 +165,44 @@ its manifest:
 - `ToolCapability::Http` (paired with `ExecCommand`) ⇒
   `NetworkPolicy::All`; otherwise `NetworkPolicy::None`.
 
-`Http` is currently all-or-nothing: a tool that needs network gets
-`--share-net` (Linux) or `(allow network*)` (macOS), no host-level
-allowlist. A future iteration adds per-host scoping via `socat` (Linux)
-and SBPL `(remote ip …)` rules (macOS); the `SandboxSpec.allowed_hosts`
-field exists for forward compatibility but is currently unused. See
-`docs/todo/sandbox-os-isolation.md`.
+`Http` is broad-allow when `SandboxSpec.allowed_hosts` is empty: the
+tool gets `--share-net` (Linux) / `--network bridge` (Docker) /
+`(allow network*)` (macOS) and can talk to anything the host can
+reach. When `allowed_hosts` is non-empty the runners diverge sharply:
+
+- **macOS**: the SBPL profile flips to `(deny network*)` followed by
+  one `(allow network-outbound (remote tcp "host:port"))` line per
+  entry, plus DNS over UDP and TCP port 53 so hostname rules can
+  resolve. Bare hostnames default to `host:*` (any port). The kernel
+  sandbox enforces this for **all TCP traffic** — there is no in-tree
+  way to bypass it short of the agent breaking out of the sandbox
+  entirely.
+- **Linux (bwrap)**: `allowed_hosts` is currently **advisory**. The
+  runner emits a `tracing::warn!` so operators see the field is
+  ignored, then runs with the regular `--share-net` (full host
+  network) for `NetworkPolicy::All`. The earlier in-process CONNECT
+  proxy was removed in the v1.1 hardening pass — its bypass surface
+  (raw TCP, plain HTTP, anything that ignored `HTTPS_PROXY`) made
+  the "best-effort" gate dishonest. The proper kernel-level
+  replacement (pre-provisioned netns + iptables egress filter) is
+  scoped in `docs/todo/sandbox-os-isolation.md` Path A but deferred.
+  Until that lands, callers who depend on host scoping should use
+  the macOS backend.
+- **Docker**: same as bwrap — `allowed_hosts` is **advisory**. The
+  runner emits a `tracing::warn!` and runs with the regular bridge
+  network. Docker has no in-tree per-host enforcement either; the
+  proper fix (a routable filter that the container can't bypass)
+  lives in `docs/todo/sandbox-os-isolation.md` next to the bwrap
+  netns work and is deferred to the same future round.
+
+`SandboxSpec.allowed_hosts` is still in the public API and wired to
+`SandboxAdapter::with_allowed_hosts(...)` so:
+
+- macOS callers can populate it and get real enforcement.
+- Linux/Docker callers immediately surface the limitation rather
+  than learning later that the boundary was advisory.
+- A future netns + nftables enforcer (or a kernel-level Linux
+  alternative) can plug into the same field without an API change.
 
 ### Curated read-only mounts (vs. a full host-root bind)
 
@@ -224,10 +302,16 @@ backend binary is absent.
 
 - Linux + macOS only. Other targets receive
   `SandboxError::UnsupportedPlatform`.
-- v1 network gate is per-call all-or-nothing. Per-host scoping is
-  deferred.
-- No cgroup memory or pid caps in v1; `--die-with-parent` plus a fresh
-  PID namespace are the only resource controls.
+- Per-host network allowlist enforces only on macOS (SBPL, all TCP).
+  bwrap and Docker both accept the field as advisory (warn + ignore).
+  The proper kernel-level Linux/Docker enforcer is deferred — see
+  `docs/todo/sandbox-os-isolation.md`.
+- Resource caps enforce on Docker (always) and bwrap (when
+  `systemd-run --user` is usable). Non-`unlimited()` caps on
+  sandbox-exec or bwrap-without-`systemd-run` return
+  `SandboxError::Unenforceable`; `SandboxAdapter` defers to the
+  runner's `default_resource_limits()` so default-policy callers
+  pick limits the backend can actually deliver.
 - ExecCommand tools refuse to run when the backend binary is missing —
   no fallback to unsandboxed execution.
 - MCP stdio servers (`aura-tools::mcp::McpReconciler`) currently spawn
@@ -246,9 +330,17 @@ backend binary is absent.
 
 Tracked in [`docs/todo/sandbox-os-isolation.md`](../todo/sandbox-os-isolation.md):
 
-- `socat`-driven per-host network allowlist on Linux; SBPL host-scoped
-  network rules on macOS.
-- cgroup v2 memory and pid caps (Linux).
+- **Per-host network allowlist on Linux** (bwrap and Docker). The
+  macOS SBPL path shipped. Linux currently fail-closes; the future
+  enforcement layer is netns + nftables egress filtering on bwrap
+  (CAP_NET_ADMIN inside the user namespace makes this tractable
+  without privileged setup), and a container-reachable filter for
+  Docker (host-gateway routing or in-container sidecar). Until that
+  lands, callers wanting host scopes use macOS or run with empty
+  `allowed_hosts`.
 - MCP stdio sandboxing.
-- `[sandbox]` config section for timeouts, memory caps, and extra
-  readable paths.
+- `[sandbox]` config section for timeouts, memory caps, extra
+  readable paths, and an explicit override for the sandbox FS root.
+- Configurable Docker image (currently hardcoded to
+  `debian:stable-slim`) with a digest-pinned default in source so the
+  trust boundary is reproducible across fresh hosts.

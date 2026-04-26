@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_sandbox::docker::DockerRunner;
-use aura_sandbox::{EnvPolicy, NetworkPolicy, SandboxRunner, SandboxSpec, StdinSource};
+use aura_sandbox::{
+    EnvPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec, StdinSource,
+};
 
 /// Returns whether the docker daemon looks reachable. CLI-on-PATH alone
 /// is not enough — most CI / dev hosts have the binary but not the
@@ -48,6 +50,7 @@ async fn echo_through_docker() {
             env: EnvPolicy::Baseline,
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(120),
+            resource_limits: ResourceLimits::default(),
         })
         .await
         .expect("sandboxed run");
@@ -97,6 +100,7 @@ async fn timeout_force_removes_container() {
             env: EnvPolicy::Baseline,
             stdin: StdinSource::Null,
             timeout: Duration::from_millis(800),
+            resource_limits: ResourceLimits::default(),
         })
         .await;
     assert!(
@@ -140,6 +144,7 @@ async fn network_none_blocks_dns() {
             env: EnvPolicy::Baseline,
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(120),
+            resource_limits: ResourceLimits::default(),
         })
         .await
         .expect("sandboxed run");

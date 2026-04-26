@@ -36,9 +36,30 @@ impl SandboxExecRunner {
     }
 }
 
+/// Pure validation of a `SandboxSpec` against sandbox-exec's
+/// enforcement capabilities. SBPL has no equivalent for cgroup
+/// memory/pid caps, so any non-`unlimited()` `resource_limits` is
+/// unenforceable here. Refuse rather than silently downgrade — the
+/// caller has either set caps deliberately and needs them, or has
+/// not thought about it and should be made aware.
+pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
+    if !spec.resource_limits.is_unlimited() {
+        return Err(SandboxError::Unenforceable {
+            backend: "sandbox-exec",
+            what: format!(
+                "resource_limits {:?} (SBPL has no cgroup equivalent)",
+                spec.resource_limits
+            ),
+            hint: "use the bwrap (Linux) or docker backend, layer a launchd MemoryHighWaterMark, or pass `ResourceLimits::unlimited()`",
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SandboxRunner for SandboxExecRunner {
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
+        validate_spec(&spec)?;
         let profile = render_sbpl_profile(&spec);
         // SBPL allows writes only inside the workspace. Carve out a
         // per-invocation scratch dir under the workspace and route
@@ -123,5 +144,46 @@ impl SandboxRunner for SandboxExecRunner {
 
     fn backend(&self) -> Backend {
         Backend::SandboxExec
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{NetworkPolicy, ResourceLimits, StdinSource};
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    fn baseline_spec() -> SandboxSpec {
+        SandboxSpec {
+            program: PathBuf::from("/usr/bin/true"),
+            args: vec![],
+            cwd: None,
+            workspace_root: PathBuf::from("/tmp/ws"),
+            readable_paths: vec![],
+            allowed_hosts: BTreeSet::new(),
+            network_policy: NetworkPolicy::None,
+            env: EnvPolicy::Baseline,
+            stdin: StdinSource::Null,
+            timeout: Duration::from_secs(5),
+            resource_limits: ResourceLimits::unlimited(),
+        }
+    }
+
+    #[test]
+    fn validate_spec_rejects_resource_limits() {
+        let mut spec = baseline_spec();
+        spec.resource_limits = ResourceLimits::safe_defaults();
+        let err = validate_spec(&spec).expect_err("must refuse");
+        let SandboxError::Unenforceable { backend, what, .. } = err else {
+            panic!("expected Unenforceable variant");
+        };
+        assert_eq!(backend, "sandbox-exec");
+        assert!(what.contains("resource_limits"));
+    }
+
+    #[test]
+    fn validate_spec_accepts_unlimited() {
+        validate_spec(&baseline_spec()).expect("unlimited must pass on sandbox-exec");
     }
 }

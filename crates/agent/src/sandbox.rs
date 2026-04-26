@@ -4,13 +4,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_sandbox::{EnvPolicy, NetworkPolicy, SandboxRunner, SandboxSpec, StdinSource};
+use aura_sandbox::{
+    EnvPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec, StdinSource,
+};
 use aura_tools::{ExecSandbox, SandboxedOutput, ToolError};
 
 pub struct SandboxAdapter {
     runner: Arc<dyn SandboxRunner>,
     workspace_root: PathBuf,
     network_policy: NetworkPolicy,
+    resource_limits: ResourceLimits,
+    allowed_hosts: BTreeSet<String>,
 }
 
 impl SandboxAdapter {
@@ -19,11 +23,32 @@ impl SandboxAdapter {
         workspace_root: PathBuf,
         network_policy: NetworkPolicy,
     ) -> Self {
+        // Pull the per-call default from the runner so the adapter
+        // doesn't ask for caps the chosen backend can't enforce. On
+        // bwrap with systemd-run + Docker this is `safe_defaults()`
+        // (512 MiB / 256 pids); on sandbox-exec or bwrap without
+        // systemd-run it's `unlimited()`. Callers can still override
+        // explicitly via `with_resource_limits`, in which case the
+        // backend's `validate_spec` will fail-closed if the request
+        // exceeds what it can deliver.
+        let resource_limits = runner.default_resource_limits();
         Self {
             runner,
             workspace_root,
             network_policy,
+            resource_limits,
+            allowed_hosts: BTreeSet::new(),
         }
+    }
+
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self
+    }
+
+    pub fn with_allowed_hosts(mut self, hosts: BTreeSet<String>) -> Self {
+        self.allowed_hosts = hosts;
+        self
     }
 }
 
@@ -67,7 +92,7 @@ impl ExecSandbox for SandboxAdapter {
             cwd: cwd.map(Path::to_path_buf),
             workspace_root: self.workspace_root.clone(),
             readable_paths: Vec::new(),
-            allowed_hosts: BTreeSet::new(),
+            allowed_hosts: self.allowed_hosts.clone(),
             network_policy: self.network_policy,
             env: EnvPolicy::Baseline,
             stdin: match stdin {
@@ -75,6 +100,7 @@ impl ExecSandbox for SandboxAdapter {
                 None => StdinSource::Null,
             },
             timeout,
+            resource_limits: self.resource_limits,
         };
 
         match self.runner.run(spec).await {
@@ -182,6 +208,37 @@ mod tests {
             .expect("cwd inside workspace must be accepted");
         assert_eq!(res.exit_code, 0);
         assert!(runner.seen.lock().is_some(), "runner must have been called");
+    }
+
+    #[tokio::test]
+    async fn resource_limits_and_allowed_hosts_round_trip_into_spec() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let runner = Arc::new(RecordingRunner::default());
+        let limits = ResourceLimits {
+            memory_max_bytes: Some(123_456_789),
+            pids_max: Some(7),
+        };
+        let hosts = BTreeSet::from(["api.openai.com:443".to_string(), "github.com".to_string()]);
+        let adapter = SandboxAdapter::new(
+            Arc::clone(&runner) as Arc<dyn SandboxRunner>,
+            workspace.path().to_path_buf(),
+            NetworkPolicy::All,
+        )
+        .with_resource_limits(limits)
+        .with_allowed_hosts(hosts.clone());
+        adapter
+            .spawn_command(
+                Path::new("/bin/echo"),
+                &["hi".into()],
+                None,
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("recording runner accepts");
+        let seen = runner.seen.lock().take().expect("runner saw spec");
+        assert_eq!(seen.resource_limits, limits);
+        assert_eq!(seen.allowed_hosts, hosts);
     }
 
     #[tokio::test]

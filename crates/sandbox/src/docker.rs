@@ -14,7 +14,7 @@ use crate::SandboxRunner;
 use crate::args::build_docker_argv;
 use crate::bootstrap::{SandboxAvailability, locate_binary, parse_version};
 use crate::error::SandboxError;
-use crate::spec::{Backend, SandboxOutput, SandboxSpec, StdinSource};
+use crate::spec::{Backend, ResourceLimits, SandboxOutput, SandboxSpec, StdinSource};
 
 /// Default container image used when no override is configured.
 ///
@@ -205,6 +205,18 @@ impl SandboxRunner for DockerRunner {
     }
 
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
+        if !spec.allowed_hosts.is_empty() {
+            // Docker has no in-tree per-host enforcement. The proper
+            // kernel-level filter is scoped in
+            // docs/todo/sandbox-os-isolation.md but deferred. This
+            // round is scoped to resource caps only on Linux/Docker,
+            // so the field is advisory: warn so operators see it,
+            // then run with the regular bridge network.
+            tracing::warn!(
+                hosts = ?spec.allowed_hosts,
+                "docker backend ignores allowed_hosts; egress is still all-or-nothing per network_policy. Per-host enforcement is deferred — see docs/todo/sandbox-os-isolation.md"
+            );
+        }
         let container_name = unique_container_name();
         let argv = build_docker_argv(&spec, self.effective_image(), &container_name);
         let mut cmd = Command::new(&self.binary);
@@ -276,6 +288,12 @@ impl SandboxRunner for DockerRunner {
 
     fn backend(&self) -> Backend {
         Backend::Docker
+    }
+
+    fn default_resource_limits(&self) -> ResourceLimits {
+        // dockerd always honors `--memory` / `--pids-limit`, so the
+        // safe defaults are always enforceable here.
+        ResourceLimits::safe_defaults()
     }
 }
 
