@@ -622,7 +622,7 @@ async fn workspace_set_identity_writes_file_in_argv_mode() {
 
     let data = out.data.expect("payload");
     assert_eq!(data.get("kind").and_then(|v| v.as_str()), Some("SOUL.md"));
-    let on_disk = std::fs::read_to_string(dir.join("SOUL.md")).unwrap();
+    let on_disk = std::fs::read_to_string(dir.join("profile").join("SOUL.md")).unwrap();
     assert_eq!(on_disk, "You are helpful.");
     std::fs::remove_dir_all(&dir).ok();
 }

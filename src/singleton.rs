@@ -3,9 +3,9 @@
 //! The chat loop owns the workspace's storage, job manager, and cron queue.
 //! Running two chat loops against the same workspace would race on those
 //! resources (libsql writes, cron tick loops, job recovery), so we serialize
-//! with an advisory `flock` on `<workspace>/aura.lock`. The lock is held by
-//! an open `File` and released when the process exits — even on crash,
-//! since the kernel drops the lock with the fd.
+//! with an advisory `flock` on `<workspace>/state/aura.lock`. The lock is
+//! held by an open `File` and released when the process exits — even on
+//! crash, since the kernel drops the lock with the fd.
 //!
 //! Scope is deliberately per-workspace: separate workspace dirs should be
 //! free to run their own aura concurrently.
@@ -25,10 +25,11 @@ pub struct WorkspaceLock {
 /// Try to acquire the workspace singleton lock. Returns an error if another
 /// aura process already holds it, or if the lock file cannot be opened.
 pub fn acquire(workspace_root: &Path) -> anyhow::Result<WorkspaceLock> {
-    std::fs::create_dir_all(workspace_root)
-        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", workspace_root.display()))?;
-
     let path = WorkspacePaths::new(workspace_root.to_path_buf()).singleton_lock();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)

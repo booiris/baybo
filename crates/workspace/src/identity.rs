@@ -26,22 +26,24 @@ async fn read_optional_file(path: &Path) -> anyhow::Result<Option<String>> {
 
 /// Write a single identity file atomically (tmpfile + rename).
 ///
-/// Creates `root` if it does not already exist. Returns the absolute path
-/// the content was written to. The previous version, if any, is replaced.
+/// Creates the workspace `profile/` directory if it does not already exist.
+/// Returns the absolute path the content was written to. The previous
+/// version, if any, is replaced.
 pub async fn write_identity_file(
     root: &Path,
     kind: IdentityKind,
     content: &str,
 ) -> anyhow::Result<PathBuf> {
-    tokio::fs::create_dir_all(root).await?;
-    let target = WorkspacePaths::new(root.to_path_buf()).identity_file(kind);
+    let paths = WorkspacePaths::new(root.to_path_buf());
+    tokio::fs::create_dir_all(paths.profile_dir()).await?;
+    let target = paths.identity_file(kind);
     let tmp = target.with_extension("md.tmp");
     tokio::fs::write(&tmp, content).await?;
     tokio::fs::rename(&tmp, &target).await?;
     Ok(target)
 }
 
-/// Loads all identity files from the given workspace root directory.
+/// Loads all identity files from the workspace `profile/` directory.
 pub async fn load_identity_files(root: &Path) -> anyhow::Result<IdentityFiles> {
     let paths = WorkspacePaths::new(root.to_path_buf());
     let agents_path = paths.identity_file(IdentityKind::Agents);
@@ -79,7 +81,7 @@ mod tests {
         let path = write_identity_file(&dir, IdentityKind::Soul, "You are helpful.")
             .await
             .expect("write soul");
-        assert_eq!(path, dir.join("SOUL.md"));
+        assert_eq!(path, dir.join("profile").join("SOUL.md"));
 
         let loaded = load_identity_files(&dir).await.unwrap();
         assert_eq!(loaded.soul.as_deref(), Some("You are helpful."));
@@ -99,8 +101,10 @@ mod tests {
             .join("target")
             .join("test_tmp")
             .join("workspace_identity_test");
-        let _ = tokio::fs::create_dir_all(&dir).await;
-        tokio::fs::write(dir.join("SOUL.md"), "You are helpful.")
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let profile = dir.join("profile");
+        tokio::fs::create_dir_all(&profile).await.unwrap();
+        tokio::fs::write(profile.join("SOUL.md"), "You are helpful.")
             .await
             .unwrap();
 

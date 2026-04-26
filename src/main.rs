@@ -76,6 +76,9 @@ async fn main() -> anyhow::Result<()> {
     let workspace_paths =
         aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
     let workspace_root = workspace_paths.root().to_path_buf();
+    aura_workspace::WorkspaceManager::new(workspace_root.clone())
+        .ensure_layout()
+        .await?;
 
     // TUI: ratatui owns stdout, so tracing goes to a rolling file under
     // `<workspace>/logs/` (redacted through the shared `LeakDetector`)

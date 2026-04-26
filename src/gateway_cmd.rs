@@ -84,7 +84,7 @@ fn install_context(
 /// Resolution order:
 /// 1. `AURA_CONFIG_PATH` — canonicalized; errors if it cannot be
 ///    resolved to an existing file.
-/// 2. `./aura.json` — if present in the current directory.
+/// 2. `<default_workspace_root>/profile/aura.json` — if it already exists.
 /// 3. Otherwise `None`, with a loud stderr warning: the service will
 ///    launch against built-in defaults (no LLM key, default workspace),
 ///    which is almost never what the user actually wants.
@@ -93,7 +93,7 @@ fn install_context(
 /// has to be baked into the unit file at install time — there's no
 /// second chance to pick it up later.
 fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
-    use aura_workspace::paths::{ENV_CONFIG_PATH, WORKSPACE_CONFIG_FILE};
+    use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 
     if let Some(raw) = std::env::var_os(ENV_CONFIG_PATH) {
         let p = PathBuf::from(&raw);
@@ -108,10 +108,13 @@ fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
         return Ok(Some(canon));
     }
 
-    let cwd_default = PathBuf::from(WORKSPACE_CONFIG_FILE);
-    if cwd_default.exists() {
-        let canon = cwd_default.canonicalize().map_err(|e| {
-            anyhow::anyhow!("./{WORKSPACE_CONFIG_FILE} exists but cannot be canonicalized: {e}")
+    let default_path = default_config_file();
+    if default_path.exists() {
+        let canon = default_path.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "{} exists but cannot be canonicalized: {e}",
+                default_path.display()
+            )
         })?;
         eprintln!(
             "install: no {ENV_CONFIG_PATH} set; pinning service to {}",
@@ -121,9 +124,10 @@ fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
     }
 
     eprintln!(
-        "install: WARNING — no {ENV_CONFIG_PATH} and no ./{WORKSPACE_CONFIG_FILE}; the installed \
+        "install: WARNING — no {ENV_CONFIG_PATH} and no {} on disk; the installed \
          service will run with built-in defaults (no LLM key, default workspace). Set \
-         {ENV_CONFIG_PATH} and re-run `aura gateway install` if that's not what you want."
+         {ENV_CONFIG_PATH} and re-run `aura gateway install` if that's not what you want.",
+        default_path.display(),
     );
     Ok(None)
 }
@@ -222,6 +226,9 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // against the same workspace would race.
     let workspace_paths =
         aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
+    aura_workspace::WorkspaceManager::new(workspace_paths.root().to_path_buf())
+        .ensure_layout()
+        .await?;
     let _workspace_lock = singleton::acquire(workspace_paths.root())?;
 
     // Read the admin token AND mint+publish a fresh TUI token BEFORE
@@ -397,7 +404,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                     Arc::new(runtime),
                     spawner,
                     Arc::clone(&log_buffer),
-                    log_dir.join("channel"),
+                    workspace_paths.channel_logs_dir(),
                     Arc::clone(&leak_detector),
                     graph.stores.channel_bot.clone(),
                 );

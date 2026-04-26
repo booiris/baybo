@@ -1,7 +1,7 @@
 //! Channel TCP listener.
 //!
 //! Binds a loopback TCP socket (`127.0.0.1:<ephemeral>`), publishes
-//! the chosen port to `<workspace>/channel.port` so the TUI and
+//! the chosen port to `<workspace>/state/channel.port` so the TUI and
 //! sidecars can discover it, and serves the channel router built by
 //! [`crate::server::build_channel_router`]. 127.0.0.1 is hardcoded —
 //! config cannot loosen it to `0.0.0.0`, so a fat-fingered bind
@@ -20,7 +20,7 @@
 //! won.
 //!
 //! Lifecycle:
-//! * `<workspace>/channel.port` is written `0o600` after bind
+//! * `<workspace>/state/channel.port` is written `0o600` after bind
 //!   succeeds and removed on graceful + abnormal exit via a Drop
 //!   guard on [`PortFileGuard`].
 //! * Graceful shutdown is driven by the shared [`ShutdownSignal`] —

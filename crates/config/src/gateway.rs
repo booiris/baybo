@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 ///   — not configurable) with channel-token auth backed by the
 ///   gateway's `ChannelTokenTable` (vault-issued TUI token plus
 ///   per-spawn subprocess capability tokens). The chosen port is
-///   published to `<workspace>/channel.port` so the TUI and spawned
+///   published to `<workspace>/state/channel.port` so the TUI and spawned
 ///   sidecars discover it without a config roundtrip. Hosts the WS
 ///   endpoint for sessions, messages, approvals, and history
 ///   snapshots.

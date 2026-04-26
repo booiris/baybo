@@ -37,6 +37,13 @@ impl LibsqlPool {
     /// Open (or create) a local libsql database at the given path.
     pub async fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+        }
         let db = libsql::Builder::new_local(path)
             .build()
             .await

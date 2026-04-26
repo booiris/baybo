@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use aura_config::AuraConfig;
-use aura_workspace::paths::{ENV_CONFIG_PATH, WORKSPACE_CONFIG_FILE};
+use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 
 use crate::cli::ConfigCmd;
 use crate::context::{CommandContext, Invocation};
@@ -45,7 +45,7 @@ async fn validate(ctx: &CommandContext, file: Option<String>) -> Result<CommandO
         .map(PathBuf::from)
         .or_else(|| ctx.config_path.clone())
         .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(WORKSPACE_CONFIG_FILE));
+        .unwrap_or_else(default_config_file);
 
     match AuraConfig::load_from_file(&path).await {
         Ok(_) => Ok(CommandOutput::structured(

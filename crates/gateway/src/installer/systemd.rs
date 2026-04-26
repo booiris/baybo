@@ -149,7 +149,7 @@ mod tests {
     fn ctx() -> InstallContext {
         InstallContext {
             exec_start: PathBuf::from("/usr/local/bin/aura"),
-            config_path: Some(PathBuf::from("/home/user/.aura/aura.json")),
+            config_path: Some(PathBuf::from("/home/user/.aura/profile/aura.json")),
             log_dir: PathBuf::from("/home/user/.aura/logs"),
             user_mode: true,
         }
@@ -160,7 +160,7 @@ mod tests {
         let inst = SystemdInstaller::new(true);
         let body = inst.render_unit(&ctx());
         assert!(body.contains("ExecStart=/usr/local/bin/aura gateway start"));
-        assert!(body.contains("Environment=AURA_CONFIG_PATH=/home/user/.aura/aura.json"));
+        assert!(body.contains("Environment=AURA_CONFIG_PATH=/home/user/.aura/profile/aura.json"));
         assert!(body.contains("Restart=on-failure"));
         assert!(body.contains("RestartSec=2"));
     }

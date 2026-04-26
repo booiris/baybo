@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::error::CodeBuilderError;
 
-/// Per-call run directory under `<workspace>/.aura/code-builder/runs/<uuid>/`.
+/// Per-call run directory under `<workspace>/work/code-builder/runs/<uuid>/`.
 ///
 /// Holds:
 /// - `script.py` — persisted; the agent's outer LLM sees this path in

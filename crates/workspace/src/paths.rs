@@ -5,15 +5,73 @@
 //! the constants or helpers in this module. Keeping the strings in a single
 //! leaf-level crate prevents the same filename from drifting across
 //! `gateway`, `tools`, `code-builder`, the binary entrypoints, etc.
+//!
+//! Layout under a workspace root:
+//!
+//! ```text
+//! <root>/
+//!   .gitignore         # allowlists profile/ and skills/
+//!   profile/           # git-tracked: aura.json, .mcp.json, *.md identity files
+//!   skills/            # git-tracked: user skill definitions
+//!   state/             # ignored: storage.db, aura.lock, channel.port
+//!   work/              # ignored: code-builder/runs/<uuid>/, future scratch
+//!   logs/              # ignored: aura.log.YYYY-MM-DD plus channel/<type>.log.<date>
+//! ```
 
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
-// Workspace-root file/dir names (relative to the workspace root)
+// Workspace top-level subdirectories
+// ---------------------------------------------------------------------------
+
+/// Git-tracked: aura.json, MCP registry, identity markdown files.
+pub const PROFILE_DIR: &str = "profile";
+
+/// Git-tracked: workspace-local skill definitions.
+pub const SKILLS_DIR: &str = "skills";
+
+/// Gitignored: persistent runtime state (db, locks, ports).
+pub const STATE_DIR: &str = "state";
+
+/// Gitignored: tool-generated scratch (code-builder runs, future scratch dirs).
+pub const WORK_DIR: &str = "work";
+
+/// Gitignored: rolling log files.
+pub const LOGS_DIR: &str = "logs";
+
+/// Repo-root marker that allowlists [`PROFILE_DIR`] and [`SKILLS_DIR`].
+pub const GITIGNORE_FILE: &str = ".gitignore";
+
+/// Contents of the workspace `.gitignore`. Allowlist style: ignore everything,
+/// then re-include the directories the user is meant to version. Keep this in
+/// sync with the directory constants above.
+pub const GITIGNORE_CONTENTS: &str = "\
+# Aura workspace gitignore — only profile/ and skills/ are version-controlled.
+/*
+!/.gitignore
+!/profile/
+!/skills/
+";
+
+// ---------------------------------------------------------------------------
+// Files inside `profile/` (git-tracked)
 // ---------------------------------------------------------------------------
 
 /// Top-level config file (default name; `AURA_CONFIG_PATH` overrides).
+/// Stored at `<root>/profile/aura.json`.
 pub const WORKSPACE_CONFIG_FILE: &str = "aura.json";
+
+/// MCP server registry file. Stored at `<root>/profile/.mcp.json`.
+pub const MCP_CONFIG_FILE: &str = ".mcp.json";
+
+pub const IDENTITY_AGENTS_FILE: &str = "AGENTS.md";
+pub const IDENTITY_SOUL_FILE: &str = "SOUL.md";
+pub const IDENTITY_USER_FILE: &str = "USER.md";
+pub const IDENTITY_IDENTITY_FILE: &str = "IDENTITY.md";
+
+// ---------------------------------------------------------------------------
+// Files inside `state/` (gitignored)
+// ---------------------------------------------------------------------------
 
 /// libsql database file.
 pub const STORAGE_DB_FILE: &str = "storage.db";
@@ -24,32 +82,26 @@ pub const SINGLETON_LOCK_FILE: &str = "aura.lock";
 /// Channel TCP listener publishes its ephemeral port here.
 pub const CHANNEL_PORT_FILE: &str = "channel.port";
 
-/// MCP server registry file.
-pub const MCP_CONFIG_FILE: &str = ".mcp.json";
+// ---------------------------------------------------------------------------
+// Files inside `work/` (gitignored)
+// ---------------------------------------------------------------------------
 
-/// Per-workspace logs directory.
-pub const LOGS_DIR: &str = "logs";
+/// Code-builder scratch parent inside [`WORK_DIR`].
+pub const CODE_BUILDER_SUBDIR: &str = "code-builder";
 
-/// File-name prefix for rolling log files (`aura.log.YYYY-MM-DD`).
-pub const LOG_FILE_PREFIX: &str = "aura.log";
-
-/// Workspace-local skill definitions directory.
-pub const SKILLS_DIR: &str = "skills";
-
-/// Subdirectory for code-builder scratch state.
-pub const CODE_BUILDER_DIR: &str = ".aura/code-builder";
-
-/// Per-call scratch dirs sit under `<CODE_BUILDER_DIR>/<RUNS_SUBDIR>/<uuid>/`.
+/// Per-call scratch dirs sit under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<RUNS_SUBDIR>/<uuid>/`.
 pub const CODE_BUILDER_RUNS_SUBDIR: &str = "runs";
 
 // ---------------------------------------------------------------------------
-// Identity files
+// Files inside `logs/` (gitignored)
 // ---------------------------------------------------------------------------
 
-pub const IDENTITY_AGENTS_FILE: &str = "AGENTS.md";
-pub const IDENTITY_SOUL_FILE: &str = "SOUL.md";
-pub const IDENTITY_USER_FILE: &str = "USER.md";
-pub const IDENTITY_IDENTITY_FILE: &str = "IDENTITY.md";
+/// File-name prefix for the gateway's rolling log files (`aura.log.YYYY-MM-DD`).
+pub const LOG_FILE_PREFIX: &str = "aura.log";
+
+/// Subdirectory under [`LOGS_DIR`] holding per-channel sidecar log files
+/// (`<channel_type>.log.YYYY-MM-DD`).
+pub const CHANNEL_LOGS_SUBDIR: &str = "channel";
 
 // ---------------------------------------------------------------------------
 // Cache (XDG-style, outside the workspace root)
@@ -69,7 +121,7 @@ pub const CACHE_RUNTIME_SUBDIR: &str = "runtime";
 pub const ENV_CONFIG_PATH: &str = "AURA_CONFIG_PATH";
 
 // ---------------------------------------------------------------------------
-// Default workspace root
+// Default workspace root + default config file
 // ---------------------------------------------------------------------------
 
 /// Default workspace root: `~/.aura` in release, `./.aura` in debug. The
@@ -83,6 +135,14 @@ pub fn default_workspace_root() -> PathBuf {
         Some(home) => home.join(".aura"),
         None => PathBuf::from("./.aura"),
     }
+}
+
+/// Default `aura.json` location: `<default_workspace_root>/profile/aura.json`.
+/// Used as the fallback when `AURA_CONFIG_PATH` is not set.
+pub fn default_config_file() -> PathBuf {
+    default_workspace_root()
+        .join(PROFILE_DIR)
+        .join(WORKSPACE_CONFIG_FILE)
 }
 
 /// System-level aura cache root: `$XDG_CACHE_HOME/aura`, falling back to
@@ -110,7 +170,7 @@ pub enum IdentityKind {
 
 impl IdentityKind {
     /// Filename this identity document is stored under, relative to the
-    /// workspace root.
+    /// profile directory.
     pub fn file_name(self) -> &'static str {
         match self {
             Self::Agents => IDENTITY_AGENTS_FILE,
@@ -158,38 +218,72 @@ impl WorkspacePaths {
         self.root
     }
 
-    pub fn storage_db(&self) -> PathBuf {
-        self.root.join(STORAGE_DB_FILE)
-    }
+    // -- top-level subdirectories --
 
-    pub fn singleton_lock(&self) -> PathBuf {
-        self.root.join(SINGLETON_LOCK_FILE)
-    }
-
-    pub fn channel_port(&self) -> PathBuf {
-        self.root.join(CHANNEL_PORT_FILE)
-    }
-
-    pub fn mcp_config(&self) -> PathBuf {
-        self.root.join(MCP_CONFIG_FILE)
-    }
-
-    pub fn logs_dir(&self) -> PathBuf {
-        self.root.join(LOGS_DIR)
+    pub fn profile_dir(&self) -> PathBuf {
+        self.root.join(PROFILE_DIR)
     }
 
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join(SKILLS_DIR)
     }
 
-    pub fn code_builder_runs_dir(&self) -> PathBuf {
-        self.root
-            .join(CODE_BUILDER_DIR)
-            .join(CODE_BUILDER_RUNS_SUBDIR)
+    pub fn state_dir(&self) -> PathBuf {
+        self.root.join(STATE_DIR)
+    }
+
+    pub fn work_dir(&self) -> PathBuf {
+        self.root.join(WORK_DIR)
+    }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join(LOGS_DIR)
+    }
+
+    /// Per-channel sidecar log directory:
+    /// `<root>/logs/channel/<channel_type>.log.YYYY-MM-DD`.
+    pub fn channel_logs_dir(&self) -> PathBuf {
+        self.logs_dir().join(CHANNEL_LOGS_SUBDIR)
+    }
+
+    pub fn gitignore_file(&self) -> PathBuf {
+        self.root.join(GITIGNORE_FILE)
+    }
+
+    // -- profile/ contents --
+
+    pub fn config_file(&self) -> PathBuf {
+        self.profile_dir().join(WORKSPACE_CONFIG_FILE)
+    }
+
+    pub fn mcp_config(&self) -> PathBuf {
+        self.profile_dir().join(MCP_CONFIG_FILE)
     }
 
     pub fn identity_file(&self, kind: IdentityKind) -> PathBuf {
-        self.root.join(kind.file_name())
+        self.profile_dir().join(kind.file_name())
+    }
+
+    // -- state/ contents --
+
+    pub fn storage_db(&self) -> PathBuf {
+        self.state_dir().join(STORAGE_DB_FILE)
+    }
+
+    pub fn singleton_lock(&self) -> PathBuf {
+        self.state_dir().join(SINGLETON_LOCK_FILE)
+    }
+
+    pub fn channel_port(&self) -> PathBuf {
+        self.state_dir().join(CHANNEL_PORT_FILE)
+    }
+
+    // -- work/ contents --
+
+    pub fn code_builder_runs_dir(&self) -> PathBuf {
+        self.work_dir()
+            .join(CODE_BUILDER_SUBDIR)
+            .join(CODE_BUILDER_RUNS_SUBDIR)
     }
 }
 
@@ -200,20 +294,35 @@ mod tests {
     #[test]
     fn workspace_paths_compose_under_root() {
         let p = WorkspacePaths::new("/var/aura");
-        assert_eq!(p.storage_db(), PathBuf::from("/var/aura/storage.db"));
-        assert_eq!(p.singleton_lock(), PathBuf::from("/var/aura/aura.lock"));
-        assert_eq!(p.channel_port(), PathBuf::from("/var/aura/channel.port"));
-        assert_eq!(p.mcp_config(), PathBuf::from("/var/aura/.mcp.json"));
+        assert_eq!(
+            p.config_file(),
+            PathBuf::from("/var/aura/profile/aura.json")
+        );
+        assert_eq!(p.mcp_config(), PathBuf::from("/var/aura/profile/.mcp.json"));
+        assert_eq!(
+            p.identity_file(IdentityKind::Soul),
+            PathBuf::from("/var/aura/profile/SOUL.md"),
+        );
+        assert_eq!(p.storage_db(), PathBuf::from("/var/aura/state/storage.db"),);
+        assert_eq!(
+            p.singleton_lock(),
+            PathBuf::from("/var/aura/state/aura.lock"),
+        );
+        assert_eq!(
+            p.channel_port(),
+            PathBuf::from("/var/aura/state/channel.port"),
+        );
         assert_eq!(p.logs_dir(), PathBuf::from("/var/aura/logs"));
+        assert_eq!(
+            p.channel_logs_dir(),
+            PathBuf::from("/var/aura/logs/channel"),
+        );
         assert_eq!(p.skills_dir(), PathBuf::from("/var/aura/skills"));
         assert_eq!(
             p.code_builder_runs_dir(),
-            PathBuf::from("/var/aura/.aura/code-builder/runs"),
+            PathBuf::from("/var/aura/work/code-builder/runs"),
         );
-        assert_eq!(
-            p.identity_file(IdentityKind::Soul),
-            PathBuf::from("/var/aura/SOUL.md"),
-        );
+        assert_eq!(p.gitignore_file(), PathBuf::from("/var/aura/.gitignore"));
     }
 
     #[test]
@@ -237,5 +346,20 @@ mod tests {
         // branches by inspecting the constant composition that the
         // helper performs.
         assert_eq!(CACHE_SUBDIR, "aura");
+    }
+
+    #[test]
+    fn default_config_file_lives_under_default_root_profile() {
+        let cfg = default_config_file();
+        let root = default_workspace_root();
+        assert_eq!(cfg, root.join(PROFILE_DIR).join(WORKSPACE_CONFIG_FILE));
+    }
+
+    #[test]
+    fn gitignore_contents_allowlists_profile_and_skills() {
+        assert!(GITIGNORE_CONTENTS.contains("/*"));
+        assert!(GITIGNORE_CONTENTS.contains("!/profile/"));
+        assert!(GITIGNORE_CONTENTS.contains("!/skills/"));
+        assert!(GITIGNORE_CONTENTS.contains("!/.gitignore"));
     }
 }

@@ -102,7 +102,7 @@ async fn stdio_roundtrip_persists_and_scrubs() {
         .expect("env bag should be present");
     let env: serde_json::Value = serde_json::from_slice(env_bag.as_bytes()).unwrap();
     assert_eq!(env["KEY"], "secret-value");
-    let json = std::fs::read_to_string(tmpdir.path().join(".mcp.json")).unwrap();
+    let json = std::fs::read_to_string(tmpdir.path().join("profile").join(".mcp.json")).unwrap();
     assert!(
         !json.contains("secret-value"),
         ".mcp.json must not leak secrets"
@@ -191,7 +191,7 @@ async fn add_rejects_stdio_without_trusted_level() {
     );
 
     // Confirm nothing was persisted.
-    assert!(!tmpdir.path().join(".mcp.json").exists());
+    assert!(!tmpdir.path().join("profile").join(".mcp.json").exists());
 }
 
 #[tokio::test]
@@ -277,7 +277,7 @@ async fn http_with_static_header_persists_without_network_probe() {
     assert_eq!(bag["Authorization"], "Bearer abc123");
 
     // Bearer token must never appear in plaintext on disk.
-    let on_disk = std::fs::read_to_string(tmpdir.path().join(".mcp.json")).unwrap();
+    let on_disk = std::fs::read_to_string(tmpdir.path().join("profile").join(".mcp.json")).unwrap();
     assert!(!on_disk.contains("abc123"));
 }
 

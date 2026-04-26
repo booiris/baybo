@@ -55,8 +55,8 @@ pub async fn handle(ctx: &CommandContext, cmd: McpCmd) -> Result<CommandOutput> 
 }
 
 /// Resolve the workspace root the same way `boot` does: parse
-/// `config.workspace.path`. `.mcp.json` always lives at this directory's
-/// root.
+/// `config.workspace.path`. `.mcp.json` lives at `<root>/profile/.mcp.json`
+/// (resolved by `McpFile::path_for`).
 pub(super) fn workspace_root(ctx: &CommandContext) -> PathBuf {
     PathBuf::from(&ctx.config.workspace.path)
 }
