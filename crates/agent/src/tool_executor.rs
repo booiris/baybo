@@ -149,11 +149,13 @@ impl ToolExecutor {
 
         // Approval gate: derive resource accesses from the tool and check
         // them against the session's cached approvals. If any access is
-        // uncovered, prompt the user via the gate.
-        let accesses = self
+        // uncovered, prompt the user via the gate. We also capture the
+        // tool's per-call label here so the approval prompt can show a
+        // human-readable summary alongside the JSON preview.
+        let (accesses, call_label) = self
             .tool_registry
             .get(tool_name)
-            .map(|tool| tool.accessed_resources(&params))
+            .map(|tool| (tool.accessed_resources(&params), tool.call_label(&params)))
             .unwrap_or_default();
 
         let uncovered: Vec<ResourceAccess> = {
@@ -181,6 +183,7 @@ impl ToolExecutor {
                     tool: tool_name.to_string(),
                     accesses: uncovered.clone(),
                     params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
+                    description: call_label.clone(),
                 })
                 .await;
             match decision {

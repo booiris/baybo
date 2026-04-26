@@ -138,6 +138,12 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(type = "unknown[]"))]
         accesses: Vec<ResourceAccess>,
         params_preview: String,
+        /// Optional human-readable label the tool produced via
+        /// `Tool::call_label` (e.g. Bash's `description` parameter).
+        /// Sidecars predating this field still decode: the field
+        /// deserializes to `None` and is omitted on serialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     /// Server -> client: any client (including ours) resolved the
     /// approval — drop it from the local UI so concurrent frontends
@@ -353,6 +359,7 @@ mod tests {
                 path: PathBuf::from("/tmp/x"),
             }],
             params_preview: "{}".into(),
+            description: Some("read x".into()),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

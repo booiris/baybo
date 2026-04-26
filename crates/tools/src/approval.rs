@@ -67,6 +67,13 @@ pub struct ApprovalRequest {
     pub accesses: Vec<ResourceAccess>,
     /// Short truncated JSON preview of the parameters, for UI display only.
     pub params_preview: String,
+    /// Caller-supplied label produced by [`crate::Tool::call_label`]
+    /// (e.g. Bash's `description` parameter). Channel-side approval
+    /// UIs can render this above the JSON preview. Wire-compatible
+    /// with older sidecars: missing on input deserializes to `None`,
+    /// `None` is omitted on serialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Implemented by channel-side UIs (or an auto-deny fallback) to resolve
@@ -453,6 +460,7 @@ mod tests {
                 tool: "t".into(),
                 accesses: vec![],
                 params_preview: String::new(),
+                description: None,
             })
             .await;
         assert_eq!(out, ApprovalDecision::Deny);
@@ -486,6 +494,7 @@ mod tests {
             tool: "read".into(),
             accesses: vec![],
             params_preview: String::new(),
+            description: None,
         };
         let handle = tokio::spawn(async move { gate.request(req).await });
 

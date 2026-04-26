@@ -186,6 +186,7 @@ fn build_approval_gate(queue: ApprovalQueue, frame_tx: mpsc::Sender<Frame>) -> C
                     tool: entry.tool,
                     accesses: entry.accesses,
                     params_preview: entry.params_preview,
+                    description: entry.description,
                 };
                 let _ = tx.send(frame).await;
             });

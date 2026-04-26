@@ -235,6 +235,7 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             tool,
             accesses,
             params_preview,
+            description,
         } => {
             if session_id != target_session {
                 debug!(
@@ -253,6 +254,7 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
                 tool,
                 accesses,
                 params_preview,
+                description,
             });
             Some(TransportEvent::ApprovalRequested)
         }

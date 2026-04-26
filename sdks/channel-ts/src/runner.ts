@@ -664,6 +664,7 @@ async function handleApproval(
       userId: frame.user_id ?? "",
       tool: frame.tool,
       paramsPreview: frame.params_preview,
+      ...(frame.description != null ? { description: frame.description } : {}),
     });
   } catch (err) {
     logger.error("onApprovalRequested threw; defaulting to deny", err);

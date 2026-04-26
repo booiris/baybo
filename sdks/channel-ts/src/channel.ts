@@ -56,6 +56,14 @@ export interface ApprovalRequest {
   userId: string;
   tool: string;
   paramsPreview: string;
+  /**
+   * Optional human-readable label produced by the tool's
+   * `Tool::call_label` hook (e.g. Bash's `description` parameter).
+   * Sidecars should prefer this in the approval UI when present and
+   * fall back to `paramsPreview` otherwise. `undefined` when the tool
+   * did not supply one.
+   */
+  description?: string;
 }
 
 export type ApprovalDecision = "approve" | "approve_always" | "deny";

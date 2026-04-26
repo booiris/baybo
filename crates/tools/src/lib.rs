@@ -44,6 +44,14 @@ pub trait Tool: Send + Sync {
         Vec::new()
     }
 
+    /// Caller-supplied human-readable label for this call (typically a
+    /// short summary the model writes alongside its arguments). The
+    /// executor surfaces it in approval prompts and traces. Default
+    /// returns `None`; tools that accept such a parameter override.
+    fn call_label(&self, _params: &Value) -> Option<String> {
+        None
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput>;
 }
 
