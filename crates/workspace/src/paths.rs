@@ -14,7 +14,7 @@
 //!   profile/           # git-tracked: aura.json, .mcp.json, *.md identity files
 //!   skills/            # git-tracked: user skill definitions
 //!   state/             # ignored: storage.db, aura.lock, channel.port
-//!   work/              # ignored: code-builder/runs/<uuid>/, future scratch
+//!   work/              # ignored: sandbox FS scope; code-builder/<uuid>/, future scratch
 //!   logs/              # ignored: aura.log.YYYY-MM-DD plus channel/<type>.log.<date>
 //! ```
 
@@ -86,11 +86,9 @@ pub const CHANNEL_PORT_FILE: &str = "channel.port";
 // Files inside `work/` (gitignored)
 // ---------------------------------------------------------------------------
 
-/// Code-builder scratch parent inside [`WORK_DIR`].
+/// Code-builder scratch parent inside [`WORK_DIR`]. Per-call scratch dirs
+/// sit directly under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`.
 pub const CODE_BUILDER_SUBDIR: &str = "code-builder";
-
-/// Per-call scratch dirs sit under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<RUNS_SUBDIR>/<uuid>/`.
-pub const CODE_BUILDER_RUNS_SUBDIR: &str = "runs";
 
 // ---------------------------------------------------------------------------
 // Files inside `logs/` (gitignored)
@@ -280,10 +278,8 @@ impl WorkspacePaths {
 
     // -- work/ contents --
 
-    pub fn code_builder_runs_dir(&self) -> PathBuf {
-        self.work_dir()
-            .join(CODE_BUILDER_SUBDIR)
-            .join(CODE_BUILDER_RUNS_SUBDIR)
+    pub fn code_builder_dir(&self) -> PathBuf {
+        self.work_dir().join(CODE_BUILDER_SUBDIR)
     }
 }
 
@@ -319,8 +315,8 @@ mod tests {
         );
         assert_eq!(p.skills_dir(), PathBuf::from("/var/aura/skills"));
         assert_eq!(
-            p.code_builder_runs_dir(),
-            PathBuf::from("/var/aura/work/code-builder/runs"),
+            p.code_builder_dir(),
+            PathBuf::from("/var/aura/work/code-builder"),
         );
         assert_eq!(p.gitignore_file(), PathBuf::from("/var/aura/.gitignore"));
     }

@@ -1,15 +1,19 @@
 use std::path::{Path, PathBuf};
 
-use aura_workspace::WorkspacePaths;
+use aura_workspace::paths::CODE_BUILDER_SUBDIR;
 use uuid::Uuid;
 
 use crate::error::CodeBuilderError;
 
-/// Per-call run directory under `<workspace>/work/code-builder/runs/<uuid>/`.
+/// Per-call run directory under `<sandbox_root>/code-builder/<uuid>/`.
+/// In production `sandbox_root` is `<workspace>/work`, so the full
+/// path is `<workspace>/work/code-builder/<uuid>/`.
 ///
 /// Holds:
 /// - `script.py` — persisted; the agent's outer LLM sees this path in
 ///   the tool result, not the inlined code.
+/// - `tool_call.json` — persisted; sanitized record of the tool call's
+///   input + output JSON, written 0600 next to `script.py`.
 /// - `stdout.txt` / `stderr.txt` — persisted **only** when the live
 ///   output exceeded the inline threshold; written by the tool after
 ///   leak-pattern sanitization.
@@ -28,8 +32,8 @@ pub(crate) struct RunDir {
 }
 
 impl RunDir {
-    pub fn create(workspace_root: &Path) -> Result<Self, CodeBuilderError> {
-        let base = WorkspacePaths::new(workspace_root.to_path_buf()).code_builder_runs_dir();
+    pub fn create(sandbox_root: &Path) -> Result<Self, CodeBuilderError> {
+        let base = sandbox_root.join(CODE_BUILDER_SUBDIR);
         let id = Uuid::new_v4();
         let root = base.join(id.to_string());
         let uv_cache_dir = root.join("uv-cache");
@@ -58,6 +62,10 @@ impl RunDir {
 
     pub fn stderr_path(&self) -> PathBuf {
         self.root.join("stderr.txt")
+    }
+
+    pub fn tool_call_path(&self) -> PathBuf {
+        self.root.join("tool_call.json")
     }
 
     /// Write a long stdout/stderr body to disk with mode 0600. The body

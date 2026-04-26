@@ -341,23 +341,20 @@ pub async fn build_managers(
         tracing::warn!("CodeBuilder tool not registered: OS sandbox unavailable");
     }
 
-    // Sandbox FS scope is the *project / cwd*, not Aura's state directory.
-    // `workspace_root` above is `config.workspace.path` (`~/.aura`), which is
-    // where Aura keeps its libsql + identity files. Bash and other
-    // ExecCommand tools should run scoped to where the user launched aura
-    // from. Canonicalize so symlink-vs-real-path comparisons in the adapter
-    // line up with paths the tool may produce.
-    let sandbox_root = match std::env::current_dir().and_then(|p| p.canonicalize()) {
-        Ok(cwd) => cwd,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "failed to resolve current_dir for sandbox FS scope; falling back to workspace state directory",
-            );
-            workspace_root.clone()
-        }
-    };
-    info!(path = %sandbox_root.display(), "sandbox FS scope rooted");
+    // Sandbox FS scope is the workspace `work/` directory — the gitignored
+    // scratch root for tool-generated files. `ensure_layout` creates this
+    // before `build_managers` runs. Canonicalize so symlink-vs-real-path
+    // comparisons in the adapter line up with paths the tool may produce.
+    let work_dir = workspace_paths.work_dir();
+    let sandbox_root = work_dir.canonicalize().unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            path = %work_dir.display(),
+            "failed to canonicalize sandbox work dir; using literal path",
+        );
+        work_dir
+    });
+    info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         boot::to_tool_timeout(&config.tools),

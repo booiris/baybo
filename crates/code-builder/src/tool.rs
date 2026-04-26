@@ -237,6 +237,7 @@ impl Tool for CodeBuilderTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        let params_for_record = params.clone();
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         if p.task.trim().is_empty() {
@@ -294,7 +295,7 @@ impl Tool for CodeBuilderTool {
 
         run_dir.keep();
 
-        Ok(ToolOutput::Json(json!({
+        let output_value = json!({
             "script_path": run_dir.script_path.display().to_string(),
             "exit_code": out.exit_code,
             "stdout": stdout_field,
@@ -317,13 +318,38 @@ impl Tool for CodeBuilderTool {
                     .collect::<Vec<_>>(),
             },
             "rationale": plan.rationale,
-        })))
+        });
+
+        if let Err(e) = self
+            .persist_tool_call_record(&run_dir, &params_for_record, &output_value)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to persist tool_call.json record");
+        }
+
+        Ok(ToolOutput::Json(output_value))
     }
 }
 
 impl CodeBuilderTool {
     async fn sanitize_run_output(&self, body: &str) -> Result<String, CodeBuilderError> {
         rescan_for_llm(body, &self.leak_detector, &self.minter, &self.secret_vault).await
+    }
+
+    async fn persist_tool_call_record(
+        &self,
+        run_dir: &RunDir,
+        input: &Value,
+        output: &Value,
+    ) -> Result<(), CodeBuilderError> {
+        let record = json!({
+            "input": input,
+            "output": output,
+        });
+        let serialised = serde_json::to_string_pretty(&record)
+            .map_err(|e| CodeBuilderError::Scratch(format!("serialise tool_call record: {e}")))?;
+        let sanitised = self.sanitize_run_output(&serialised).await?;
+        run_dir.write_overflow(&run_dir.tool_call_path(), &sanitised)
     }
 
     /// Decide between inline (short) and on-disk (long) output. The
@@ -833,11 +859,54 @@ mod tests {
         let ctx = make_ctx(tmp.path().to_path_buf());
         let _ = tool.execute(json!({"task": "x"}), &ctx).await.unwrap_err();
 
-        let runs_root =
-            aura_workspace::WorkspacePaths::new(tmp.path().to_path_buf()).code_builder_runs_dir();
+        let runs_root = tmp.path().join("code-builder");
         if runs_root.exists() {
             let count = std::fs::read_dir(&runs_root).unwrap().count();
             assert_eq!(count, 0, "failed run must be cleaned up");
         }
+    }
+
+    #[tokio::test]
+    async fn tool_call_record_persisted_alongside_script() {
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response(ok_response(
+            r#"{"code":"print(7)","network_required":false,"readable_paths":[],"estimated_runtime_seconds":1,"estimated_memory_mb":64,"rationale":"x"}"#,
+        ));
+        let fake = FakeSandboxRunner::new(SandboxOutput {
+            exit_code: 0,
+            stdout: b"7\n".to_vec(),
+            stderr: b"".to_vec(),
+            elapsed: Duration::from_millis(11),
+            timed_out: false,
+        });
+        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let v = match tool
+            .execute(json!({"task": "print 7"}), &ctx)
+            .await
+            .unwrap()
+        {
+            ToolOutput::Json(v) => v,
+            other => panic!("expected JSON, got {other:?}"),
+        };
+
+        let script_path = PathBuf::from(v["script_path"].as_str().unwrap());
+        let record_path = script_path.parent().unwrap().join("tool_call.json");
+        assert!(
+            record_path.exists(),
+            "tool_call.json must sit next to script.py"
+        );
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&record_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "tool_call.json must be 0600");
+
+        let body = std::fs::read_to_string(&record_path).unwrap();
+        let parsed: Value = serde_json::from_str(&body).expect("tool_call.json must be valid JSON");
+        assert_eq!(parsed["input"]["task"], "print 7");
+        assert_eq!(parsed["output"]["exit_code"], 0);
+        assert_eq!(parsed["output"]["stdout"]["inline"], "7\n");
     }
 }
