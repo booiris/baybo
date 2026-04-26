@@ -34,6 +34,7 @@ async fn echo_through_bwrap() {
             cwd: None,
             workspace_root: tmp.path().to_path_buf(),
             readable_paths: vec![],
+            writable_paths: vec![],
             allowed_hosts: BTreeSet::new(),
             network_policy: NetworkPolicy::None,
             env: EnvPolicy::Baseline,

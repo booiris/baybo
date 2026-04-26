@@ -16,6 +16,7 @@ pub(crate) fn build_sandbox_spec(
     plan: &EffectivePlan,
     scratch: &RunDir,
     uv_path: &Path,
+    writable_bind_targets: &[PathBuf],
 ) -> SandboxSpec {
     let mut args: Vec<String> = Vec::with_capacity(16);
     args.push(format!("UV_CACHE_DIR={}", scratch.uv_cache_dir.display()));
@@ -50,6 +51,7 @@ pub(crate) fn build_sandbox_spec(
         cwd: Some(scratch.workdir.clone()),
         workspace_root: scratch.root.clone(),
         readable_paths,
+        writable_paths: writable_bind_targets.to_vec(),
         allowed_hosts: BTreeSet::new(),
         network_policy: plan.network_policy,
         env: EnvPolicy::Allowlist {
@@ -97,7 +99,10 @@ mod tests {
         EffectivePlan {
             code: "print(1)".into(),
             network_policy: NetworkPolicy::None,
+            network_reason: None,
             readable_paths: vec![PathBuf::from("/data")],
+            writable_paths: vec![],
+            canonical_caller_writes: vec![],
             wall_clock_seconds: 30,
             memory_max_bytes: 256 * 1024 * 1024,
             pids_max: 64,
@@ -111,7 +116,7 @@ mod tests {
         let scratch = RunDir::create(tmp.path()).unwrap();
         let uv = PathBuf::from("/usr/local/bin/uv");
 
-        let spec = build_sandbox_spec(&dummy_plan(), &scratch, &uv);
+        let spec = build_sandbox_spec(&dummy_plan(), &scratch, &uv, &[]);
         assert_eq!(spec.program, PathBuf::from("/usr/bin/env"));
         assert!(spec.args.iter().any(|a| a.starts_with("UV_CACHE_DIR=")));
         assert!(spec.args.iter().any(|a| a == "--isolated"));
@@ -147,7 +152,7 @@ mod tests {
         let scratch = RunDir::create(tmp.path()).unwrap();
         let uv = PathBuf::from("/usr/local/bin/uv");
 
-        let spec = build_sandbox_spec(&dummy_plan(), &scratch, &uv);
+        let spec = build_sandbox_spec(&dummy_plan(), &scratch, &uv, &[]);
         for a in &spec.args {
             assert!(
                 !a.starts_with("CODE_BUILDER_INPUT_"),

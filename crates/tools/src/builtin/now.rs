@@ -64,6 +64,7 @@ mod tests {
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
             sandbox: None,
+            approval: None,
         }
     }
 

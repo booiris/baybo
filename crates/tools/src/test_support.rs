@@ -196,6 +196,7 @@ mod tests {
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: PathBuf::from("/tmp"),
             sandbox: None,
+            approval: None,
         }
     }
 

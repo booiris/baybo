@@ -7,8 +7,18 @@ pub(crate) struct RawPlan {
     pub code: String,
     #[serde(default)]
     pub network_required: bool,
+    /// LLM's one-sentence justification for needing the network.
+    /// Required (and surfaced in the approval prompt) when
+    /// `network_required` is true; ignored otherwise.
+    #[serde(default)]
+    pub network_reason: Option<String>,
     #[serde(default)]
     pub readable_paths: Vec<String>,
+    /// Absolute paths the script will write to in addition to its
+    /// scratch CWD. Subset of the caller's `extra_writable_paths`.
+    /// Empty if the script only writes inside its CWD.
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
     #[serde(default)]
     pub estimated_runtime_seconds: Option<u64>,
     #[serde(default)]

@@ -53,6 +53,12 @@ pub fn build_bwrap_argv(spec: &SandboxSpec) -> Vec<OsString> {
         argv.push(path.as_os_str().to_owned());
     }
 
+    for path in &spec.writable_paths {
+        argv.push(OsString::from("--bind"));
+        argv.push(path.as_os_str().to_owned());
+        argv.push(path.as_os_str().to_owned());
+    }
+
     for (k, v) in resolve_env(spec) {
         argv.push(OsString::from("--setenv"));
         argv.push(OsString::from(k));
@@ -176,6 +182,15 @@ pub fn build_docker_argv(spec: &SandboxSpec, image: &str, container_name: &str) 
         argv.push(ro);
     }
 
+    for path in &spec.writable_paths {
+        let p = path.as_os_str().to_owned();
+        argv.push(OsString::from("-v"));
+        let mut rw = p.clone();
+        rw.push(":");
+        rw.push(&p);
+        argv.push(rw);
+    }
+
     let cwd = spec.cwd.as_deref().unwrap_or(spec.workspace_root.as_path());
     argv.push(OsString::from("-w"));
     argv.push(cwd.as_os_str().to_owned());
@@ -236,6 +251,9 @@ pub fn render_sbpl_profile(spec: &SandboxSpec) -> String {
     for p in &spec.readable_paths {
         s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
     }
+    for p in &spec.writable_paths {
+        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+    }
     s.push_str(")\n\n");
 
     // Workspace is the only host path the child may write to. Host temp
@@ -248,6 +266,9 @@ pub fn render_sbpl_profile(spec: &SandboxSpec) -> String {
         "  (subpath \"{}\")\n",
         sbpl_quote(&spec.workspace_root)
     ));
+    for p in &spec.writable_paths {
+        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+    }
     s.push_str(")\n\n");
 
     s.push_str("(allow mach-lookup)\n");
@@ -316,6 +337,7 @@ mod tests {
             cwd: None,
             workspace_root: PathBuf::from(ws),
             readable_paths: vec![],
+            writable_paths: vec![],
             allowed_hosts: BTreeSet::new(),
             network_policy: network,
             env: EnvPolicy::Baseline,
@@ -623,6 +645,112 @@ mod tests {
         assert!(
             !s.contains("(allow network-outbound"),
             "allowed_hosts must not unblock egress when policy is None: {s}"
+        );
+    }
+
+    #[test]
+    fn bwrap_argv_writable_paths_are_rw_bound_not_ro_bound() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/ws");
+        spec.writable_paths = vec![PathBuf::from("/data/out"), PathBuf::from("/var/out2")];
+        let argv = build_bwrap_argv(&spec);
+        let strs = argv_strs(&argv);
+        // Each entry must appear as `--bind <p> <p>` (RW), not as
+        // `--ro-bind-try` (which is what readable_paths uses).
+        for p in ["/data/out", "/var/out2"] {
+            let bind_pos = strs
+                .iter()
+                .enumerate()
+                .find(|(i, a)| {
+                    *a == "--bind"
+                        && strs.get(i + 1).map(String::as_str) == Some(p)
+                        && strs.get(i + 2).map(String::as_str) == Some(p)
+                })
+                .map(|(i, _)| i);
+            assert!(
+                bind_pos.is_some(),
+                "expected --bind {p} {p} in argv: {strs:?}"
+            );
+            assert!(
+                !strs
+                    .iter()
+                    .enumerate()
+                    .any(|(i, a)| a == "--ro-bind-try"
+                        && strs.get(i + 1).map(String::as_str) == Some(p)),
+                "writable path {p} must NOT appear under --ro-bind-try"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_argv_writable_paths_omit_ro_suffix() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
+        spec.writable_paths = vec![PathBuf::from("/data/out")];
+        let argv = build_docker_argv(&spec, "debian:stable-slim", "aura-sandbox-test");
+        let strs = argv_strs(&argv);
+        // `-v <path>:<path>` for writable; `-v <path>:<path>:ro` for
+        // readable. Confirm the writable entry uses the bare form.
+        let writable_pos = strs
+            .iter()
+            .position(|a| a == "/data/out:/data/out")
+            .expect("writable_paths must produce a bare RW bind");
+        // The same path must NOT also appear with a `:ro` suffix.
+        assert!(
+            !strs.iter().any(|a| a == "/data/out:/data/out:ro"),
+            "writable path must not also appear as :ro readonly: {strs:?}"
+        );
+        // And the `-v` flag immediately precedes it.
+        assert!(
+            writable_pos > 0 && strs[writable_pos - 1] == "-v",
+            "expected -v to precede the bind spec at index {writable_pos}: {strs:?}"
+        );
+    }
+
+    #[test]
+    fn sbpl_writable_paths_extend_file_write_block() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
+        spec.writable_paths = vec![PathBuf::from("/data/out"), PathBuf::from("/var/log/app")];
+        let s = render_sbpl_profile(&spec);
+        // Locate the file-write* block boundaries.
+        let start = s
+            .find("(allow file-write*")
+            .expect("profile must allow workspace writes");
+        let after = &s[start..];
+        let end_rel = after.find(")\n\n").expect("write block terminator");
+        let block = &after[..end_rel];
+        assert!(
+            block.contains("(subpath \"/tmp/myws\")"),
+            "workspace write entry preserved: {block}"
+        );
+        assert!(
+            block.contains("(subpath \"/data/out\")"),
+            "writable_paths entry must extend the write block: {block}"
+        );
+        assert!(
+            block.contains("(subpath \"/var/log/app\")"),
+            "second writable_paths entry must extend the write block: {block}"
+        );
+    }
+
+    #[test]
+    fn sbpl_writable_paths_also_grant_read_access() {
+        // A writable subpath should also be readable — most file ops
+        // (open, fstat) require both. Without this the script can
+        // write but not read the path it just wrote.
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
+        spec.writable_paths = vec![PathBuf::from("/data/out")];
+        let s = render_sbpl_profile(&spec);
+        // Read block starts before the write block; verify the
+        // writable path is listed in `(allow file-read* …)` too.
+        let read_start = s
+            .find("(allow file-read*")
+            .expect("file-read* block must exist");
+        let read_block_end = s[read_start..]
+            .find(")\n\n")
+            .expect("file-read* terminator");
+        let read_block = &s[read_start..read_start + read_block_end];
+        assert!(
+            read_block.contains("(subpath \"/data/out\")"),
+            "writable path must also be readable: {read_block}"
         );
     }
 

@@ -343,8 +343,13 @@ impl AgentLoop {
 
             // Execute tool calls. Approved resources are shared via a
             // Mutex so concurrent tool calls (when supported) see each
-            // other's grants immediately.
-            let approved = parking_lot::Mutex::new(session.state.approved_resources.clone());
+            // other's grants immediately. Wrapped in an `Arc` so that
+            // any persist-always closure injected into `ToolContext`
+            // mid-execution can clone its handle into the executor
+            // boundary without a borrow-lifetime escape.
+            let approved = std::sync::Arc::new(parking_lot::Mutex::new(
+                session.state.approved_resources.clone(),
+            ));
 
             for tool_call in &response.tool_calls {
                 debug!(
@@ -411,7 +416,7 @@ impl AgentLoop {
             }
 
             // Flush accumulated approvals back into session state.
-            session.state.approved_resources = approved.into_inner();
+            session.state.approved_resources = approved.lock().clone();
         }
 
         // If we exhausted iterations, return what we have

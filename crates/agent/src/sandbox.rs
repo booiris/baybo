@@ -92,6 +92,7 @@ impl ExecSandbox for SandboxAdapter {
             cwd: cwd.map(Path::to_path_buf),
             workspace_root: self.workspace_root.clone(),
             readable_paths: Vec::new(),
+            writable_paths: Vec::new(),
             allowed_hosts: self.allowed_hosts.clone(),
             network_policy: self.network_policy,
             env: EnvPolicy::Baseline,

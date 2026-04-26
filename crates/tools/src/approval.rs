@@ -376,16 +376,45 @@ impl ChannelApprovalGate {
 #[async_trait]
 impl ApprovalGate for ChannelApprovalGate {
     async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+        let call_id = req.call_id.clone();
         let (tx, rx) = oneshot::channel();
         self.queue.push(PendingApproval {
             req,
             responder: Some(tx),
         });
         (self.waker)();
+
+        // RAII guard: if our future is dropped before a decision lands
+        // (e.g. the outer tool timeout fires while the user is still
+        // reading the modal) or the gate's own timeout elapses, remove
+        // the queue entry so the channel UI doesn't catch the user's
+        // *next* click on a stale, disconnected `tx` — which would
+        // cost an extra click per orphan and could let a stale
+        // resolution silently land on a disconnected receiver.
+        let _cleanup = QueueCleanup {
+            queue: self.queue.clone(),
+            call_id,
+        };
+
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(decision)) => decision,
             _ => ApprovalDecision::Deny,
         }
+    }
+}
+
+/// RAII helper that removes a queue entry when its owning request
+/// future is dropped. A no-op if `resolve_head` / `resolve_by_call_id`
+/// already popped the entry (the matching `call_id` is gone, and
+/// `drop_call` returns `false`).
+struct QueueCleanup {
+    queue: ApprovalQueue,
+    call_id: String,
+}
+
+impl Drop for QueueCleanup {
+    fn drop(&mut self) {
+        let _ = self.queue.drop_call(&self.call_id);
     }
 }
 
@@ -489,5 +518,76 @@ mod tests {
     fn resolve_head_on_empty_is_noop() {
         let queue = ApprovalQueue::new();
         assert!(!queue.resolve_head(ApprovalDecision::Approve));
+    }
+
+    /// Regression for codex adversarial review #3 (medium): when a
+    /// caller drops the request future before resolution (typical
+    /// scenario: an outer tool-execution timeout cancels the future
+    /// while the user is still reading the approval modal), the queue
+    /// entry must be removed so a follow-up `resolve_head` does not
+    /// pop a now-disconnected entry and cost the user an extra click.
+    #[tokio::test]
+    async fn dropped_request_future_cleans_up_queue_entry() {
+        let queue = ApprovalQueue::new();
+        let gate = ChannelApprovalGate::new(
+            queue.clone(),
+            Arc::new(|| {}),
+            Duration::from_secs(60),
+        );
+
+        let req = ApprovalRequest {
+            call_id: "stale".into(),
+            session_id: "s".into(),
+            user_id: "u".into(),
+            tool: "t".into(),
+            accesses: vec![],
+            params_preview: String::new(),
+        };
+
+        // Outer wrapper drops the future before any resolution lands —
+        // simulates `tokio::time::timeout` firing on the tool side
+        // while the user is still reading the modal.
+        let res = tokio::time::timeout(Duration::from_millis(20), gate.request(req)).await;
+        assert!(res.is_err(), "outer timeout must fire first");
+
+        // Without cleanup, the entry would still be in the queue with
+        // a now-disconnected `tx` and the next `resolve_head` would
+        // silently waste the user's click on it.
+        assert!(
+            queue.is_empty(),
+            "dropped request must remove its queue entry"
+        );
+        assert!(
+            !queue.resolve_head(ApprovalDecision::Approve),
+            "no live entry should remain"
+        );
+    }
+
+    /// Resolution before drop still works: the entry is popped first
+    /// by the consumer, so the cleanup guard's call to `drop_call` is
+    /// a harmless no-op (`false`).
+    #[tokio::test]
+    async fn cleanup_guard_is_noop_when_consumer_resolves_first() {
+        let queue = ApprovalQueue::new();
+        let gate = ChannelApprovalGate::new(
+            queue.clone(),
+            Arc::new(|| {}),
+            Duration::from_secs(60),
+        );
+
+        let req = ApprovalRequest {
+            call_id: "live".into(),
+            session_id: "s".into(),
+            user_id: "u".into(),
+            tool: "t".into(),
+            accesses: vec![],
+            params_preview: String::new(),
+        };
+        let q = queue.clone();
+        let task = tokio::spawn(async move { gate.request(req).await });
+        tokio::task::yield_now().await;
+        assert!(q.resolve_head(ApprovalDecision::Approve));
+        assert_eq!(task.await.unwrap(), ApprovalDecision::Approve);
+        assert!(queue.is_empty());
     }
 }

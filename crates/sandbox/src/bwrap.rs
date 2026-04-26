@@ -248,6 +248,7 @@ mod tests {
             cwd: None,
             workspace_root: PathBuf::from("/tmp/ws"),
             readable_paths: vec![],
+            writable_paths: vec![],
             allowed_hosts: BTreeSet::new(),
             network_policy: NetworkPolicy::All,
             env: EnvPolicy::Baseline,

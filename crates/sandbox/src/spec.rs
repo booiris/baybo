@@ -11,6 +11,13 @@ pub struct SandboxSpec {
     pub cwd: Option<PathBuf>,
     pub workspace_root: PathBuf,
     pub readable_paths: Vec<PathBuf>,
+    /// Extra host paths the child may read **and** write through. The
+    /// workspace bind is always RW; this list is for opt-in writes
+    /// outside the workspace (e.g. a CodeBuilder script writing a
+    /// rendered artefact into a project directory the agent owns). Each
+    /// entry mounts at the same path inside the sandbox.
+    #[serde(default)]
+    pub writable_paths: Vec<PathBuf>,
     pub allowed_hosts: BTreeSet<String>,
     pub network_policy: NetworkPolicy,
     pub env: EnvPolicy,
