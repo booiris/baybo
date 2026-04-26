@@ -104,6 +104,7 @@ serenity = { version = "0.12", features = ["client", "gateway", "model"] }
 tower = { version = "0.5", features = ["util"] }
 url = "2"
 reqwest = { version = "0.13", features = ["json"] }
+htmd = "0.5"
 bytes = "1"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 cron = "0.15"

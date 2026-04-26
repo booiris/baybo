@@ -70,7 +70,7 @@ pub fn default_tools() -> Vec<(Arc<dyn Tool>, ToolManifest)> {
         trusted(BashTool, vec![ToolCapability::ExecCommand]),
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
-        trusted(WebFetchTool, vec![ToolCapability::Http]),
+        trusted(WebFetchTool::default(), vec![ToolCapability::Http]),
         trusted(NowTool, vec![]),
     ];
     #[cfg(debug_assertions)]
