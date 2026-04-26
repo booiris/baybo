@@ -184,17 +184,55 @@ impl DockerRunner {
             Ok(digest)
         }
     }
+}
 
-    /// Best-effort cleanup of a daemon-side container. Called when
-    /// `run()` is unwinding through a timeout or io error so the
-    /// container cannot keep writing into the workspace bind after
-    /// we have already returned to the agent.
-    fn force_remove_container(&self, name: &str) {
-        let _ = std::process::Command::new(&self.binary)
-            .args(["rm", "-f", name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+/// RAII guard that force-removes a daemon-side container on drop
+/// unless explicitly disarmed. The local docker CLI is killed by
+/// `kill_on_drop`, but dockerd-managed containers live independently
+/// of our process tree — without this, an outer timeout or upstream
+/// cancellation that drops `run()`'s future leaves the workload
+/// running and still writing into the workspace bind.
+struct ContainerCleanupGuard {
+    binary: PathBuf,
+    name: String,
+    armed: bool,
+}
+
+impl ContainerCleanupGuard {
+    fn new(binary: PathBuf, name: String) -> Self {
+        Self {
+            binary,
+            name,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Detach onto a std thread: Drop may run on a tokio runtime
+        // worker (the future was cancelled mid-await), and we don't
+        // want to block that worker on a docker rm subprocess. The
+        // call is fire-and-forget by design — best-effort cleanup
+        // and any failure is just logged via stderr being /dev/null.
+        let binary = std::mem::take(&mut self.binary);
+        let name = std::mem::take(&mut self.name);
+        let _ = std::thread::Builder::new()
+            .name("aura-sandbox-docker-cleanup".into())
+            .spawn(move || {
+                let _ = std::process::Command::new(&binary)
+                    .args(["rm", "-f", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            });
     }
 }
 
@@ -230,6 +268,13 @@ impl SandboxRunner for DockerRunner {
             StdinSource::Bytes(_) => Stdio::piped(),
         });
 
+        // Arm the cleanup guard before spawning. From this point on,
+        // every exit path — including the future being dropped by an
+        // outer timeout or a select! cancellation upstream — fires a
+        // `docker rm -f` against the daemon. Disarmed only on the
+        // success path where `--rm` already removed the container.
+        let mut cleanup = ContainerCleanupGuard::new(self.binary.clone(), container_name.clone());
+
         let started = Instant::now();
         let mut child = cmd.spawn()?;
 
@@ -252,14 +297,19 @@ impl SandboxRunner for DockerRunner {
                 // Heuristic: docker exits 125 for daemon-side launch
                 // failures (e.g. socket unavailable, missing image).
                 // Surface that as a backend-setup error so the agent
-                // doesn't mis-attribute it to the user command.
+                // doesn't mis-attribute it to the user command. The
+                // cleanup guard stays armed because a partially-
+                // created container may still be sitting in the
+                // daemon's stopped state.
                 if !out.status.success() && exit_code == 125 && !out.stderr.is_empty() {
-                    self.force_remove_container(&container_name);
                     return Err(SandboxError::BackendFailure {
                         status: out.status.code(),
                         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
                     });
                 }
+                // Clean docker-CLI exit means `--rm` removed the
+                // container; skip the redundant cleanup.
+                cleanup.disarm();
                 Ok(SandboxOutput {
                     exit_code,
                     stdout: out.stdout,
@@ -268,21 +318,8 @@ impl SandboxRunner for DockerRunner {
                     timed_out: false,
                 })
             }
-            Ok(Err(e)) => {
-                self.force_remove_container(&container_name);
-                Err(SandboxError::Io(e))
-            }
-            Err(_) => {
-                // The local docker CLI client is killed via
-                // kill_on_drop, but the daemon-side container is
-                // independent of our process tree. Without an
-                // explicit `docker rm -f` it would keep running
-                // — and writing into the workspace bind — long
-                // after the agent has been told the tool timed
-                // out. Force-remove before returning.
-                self.force_remove_container(&container_name);
-                Err(SandboxError::Timeout(spec.timeout))
-            }
+            Ok(Err(e)) => Err(SandboxError::Io(e)),
+            Err(_) => Err(SandboxError::Timeout(spec.timeout)),
         }
     }
 

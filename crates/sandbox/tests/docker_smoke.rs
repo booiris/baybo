@@ -118,6 +118,63 @@ async fn timeout_force_removes_container() {
     );
 }
 
+/// Regression: when the caller drops `runner.run()` (e.g. an outer
+/// `tokio::time::timeout` or a `select!` cancellation upstream),
+/// `kill_on_drop` only kills the local docker CLI — the daemon-side
+/// container survives unless the runner's RAII cleanup guard fires
+/// on future-drop. Without that guard the workload keeps running
+/// and continues to write into the workspace bind after the caller
+/// has already returned an error.
+#[tokio::test]
+async fn external_future_drop_force_removes_container() {
+    if !docker_reachable() {
+        eprintln!("skipping: docker daemon not reachable");
+        return;
+    }
+    let runner = DockerRunner::discover().expect("docker runner");
+    runner.warm().await.expect("warm-up (image pull) succeeds");
+    let runner: Arc<dyn SandboxRunner> = Arc::new(runner);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let marker = tmp.path().join("post-cancel-marker");
+    let marker_in_container = marker.to_string_lossy().to_string();
+
+    let spec = SandboxSpec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec![
+            "-c".into(),
+            format!("sleep 4 && touch {marker_in_container}"),
+        ],
+        cwd: None,
+        workspace_root: tmp.path().to_path_buf(),
+        readable_paths: vec![],
+        allowed_hosts: BTreeSet::new(),
+        network_policy: NetworkPolicy::None,
+        env: EnvPolicy::Baseline,
+        stdin: StdinSource::Null,
+        // Inner sandbox timeout is intentionally far longer than the
+        // outer wrapper timeout below — we want the future to be
+        // dropped by the outer timeout before the runner's own
+        // timeout branch ever runs.
+        timeout: Duration::from_secs(60),
+        resource_limits: ResourceLimits::default(),
+    };
+
+    let res = tokio::time::timeout(Duration::from_millis(800), runner.run(spec)).await;
+    assert!(
+        res.is_err(),
+        "expected the outer wrapper timeout to fire first, got: {res:?}"
+    );
+
+    // Wait past the workload's own `sleep 4`. If the cleanup guard
+    // missed the future-drop case, the touch fires inside the
+    // surviving container and the marker shows up on host disk.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        !marker.exists(),
+        "container survived future drop: marker `{marker_in_container}` was written after the outer timeout returned",
+    );
+}
+
 /// The Docker runner pins `--network none` for `NetworkPolicy::None`.
 /// Confirm that an attempt to resolve a hostname fails inside the
 /// container even on hosts with full internet access.
