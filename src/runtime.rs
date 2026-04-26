@@ -317,6 +317,28 @@ pub async fn build_managers(
             return Err(e.into());
         }
     };
+
+    // --- code-builder tool: needs the LLM client (for codegen), the
+    // sandbox runner (to execute generated code under per-call caps),
+    // and the leak detector + vault so revealed tool args can be
+    // re-sanitized before they reach the nested planning LLM. Skip
+    // registration if the sandbox is unavailable — CodeBuilder would
+    // refuse every call without it.
+    if let Some(runner) = sandbox_runner.as_ref() {
+        let reg = Arc::get_mut(&mut tool_registry)
+            .expect("tool_registry has no other owners at this point");
+        let llm: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&llm_client) as _;
+        let (tool, manifest) = aura_code_builder::agent_tool(
+            llm,
+            Arc::clone(runner),
+            Arc::clone(&leak_detector),
+            Arc::clone(&secret_vault),
+        );
+        reg.register(tool, manifest);
+    } else {
+        tracing::warn!("CodeBuilder tool not registered: OS sandbox unavailable");
+    }
+
     // Sandbox FS scope is the *project / cwd*, not Aura's state directory.
     // `workspace_root` above is `config.workspace.path` (`~/.aura`), which is
     // where Aura keeps its libsql + identity files. Bash and other

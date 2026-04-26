@@ -213,6 +213,7 @@ dependencies = [
  "aura-agent",
  "aura-channels",
  "aura-cli",
+ "aura-code-builder",
  "aura-config",
  "aura-context",
  "aura-cron",
@@ -342,6 +343,31 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aura-code-builder"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aura-llm",
+ "aura-model",
+ "aura-sandbox",
+ "aura-security",
+ "aura-storage",
+ "aura-tools",
+ "futures",
+ "hex",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

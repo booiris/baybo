@@ -1,0 +1,30 @@
+[package]
+name = "aura-code-builder"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-model = { workspace = true }
+aura-tools = { workspace = true }
+aura-llm = { workspace = true }
+aura-sandbox = { workspace = true }
+aura-security = { workspace = true }
+
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+aura-llm = { workspace = true, features = ["test-support"] }
+aura-storage = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
