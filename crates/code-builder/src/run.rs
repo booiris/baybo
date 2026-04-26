@@ -37,12 +37,19 @@ pub(crate) fn build_sandbox_spec(
 
     let _ = plan; // dependencies travel inside the script via PEP 723 inline metadata.
 
+    // Bind-mount the uv binary itself. The default bwrap RO roots only
+    // cover /usr, /bin, /sbin, /lib, /lib64, /etc — a uv living in the
+    // user's $HOME (e.g. ~/.local/bin/uv from the astral installer) is
+    // otherwise invisible inside the namespace and `env` exits 127.
+    let mut readable_paths = plan.readable_paths.clone();
+    readable_paths.push(uv_path.to_path_buf());
+
     SandboxSpec {
         program: PathBuf::from("/usr/bin/env"),
         args,
         cwd: Some(scratch.workdir.clone()),
         workspace_root: scratch.root.clone(),
-        readable_paths: plan.readable_paths.clone(),
+        readable_paths,
         allowed_hosts: BTreeSet::new(),
         network_policy: plan.network_policy,
         env: EnvPolicy::Allowlist {
@@ -125,6 +132,10 @@ mod tests {
         assert_eq!(spec.resource_limits.pids_max, Some(64));
         assert_eq!(spec.workspace_root, scratch.root);
         assert_eq!(spec.cwd.as_deref(), Some(scratch.workdir.as_path()));
+        assert!(
+            spec.readable_paths.contains(&uv),
+            "uv binary must be in readable_paths so the sandbox can exec it"
+        );
     }
 
     #[test]
