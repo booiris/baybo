@@ -88,8 +88,8 @@ pub fn build_llm_client(cfg: &LlmConfig) -> anyhow::Result<LlmClient> {
 
 /// Resolve the LLM API key from the env var named by `api_key_env`, falling
 /// back to provider-specific defaults (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-/// `GEMINI_API_KEY`). Returns `None` if nothing is set — the provider may
-/// still accept it (e.g. local models) or error later.
+/// `GEMINI_API_KEY`, `MINIMAX_API_KEY`). Returns `None` if nothing is set —
+/// the provider may still accept it (e.g. local models) or error later.
 pub fn resolve_llm_api_key(cfg: &LlmConfig) -> Option<String> {
     if let Some(env) = &cfg.api_key_env
         && let Ok(v) = std::env::var(env)
@@ -100,6 +100,7 @@ pub fn resolve_llm_api_key(cfg: &LlmConfig) -> Option<String> {
         "openai" => std::env::var("OPENAI_API_KEY").ok(),
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
         "gemini" => std::env::var("GEMINI_API_KEY").ok(),
+        "minimax" => std::env::var("MINIMAX_API_KEY").ok(),
         _ => None,
     }
 }

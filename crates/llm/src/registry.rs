@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::LlmClient;
 use crate::providers::{
     anthropic::AnthropicProviderFactory, gemini::GeminiProviderFactory,
-    openai::OpenAIProviderFactory,
+    minimax::MiniMaxProviderFactory, openai::OpenAIProviderFactory,
 };
 
 /// Configuration for creating an LLM provider client.
@@ -64,6 +64,7 @@ impl LlmProviderRegistry {
         registry.register(OpenAIProviderFactory);
         registry.register(AnthropicProviderFactory);
         registry.register(GeminiProviderFactory);
+        registry.register(MiniMaxProviderFactory);
         registry
     }
 
