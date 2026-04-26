@@ -101,7 +101,7 @@ pub(crate) fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
 /// Build the `docker run …` argv for the cross-platform fallback runner.
 ///
 /// The mapping intentionally mirrors bwrap semantics so the same
-/// `SandboxSpec` produces equivalent observable behaviour:
+/// `SandboxSpec` produces equivalent observable behavior:
 ///
 /// - workspace bind RW with the same path inside and outside the
 ///   container (so absolute paths in the host and container line up
