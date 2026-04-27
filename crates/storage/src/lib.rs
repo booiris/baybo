@@ -1,3 +1,4 @@
+pub mod blob;
 pub mod channel_bot;
 pub mod channel_pairing;
 pub mod channel_session;
@@ -16,6 +17,7 @@ pub mod trace;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use blob::{BlobMeta, BlobStore, SHA256_PREFIX};
 pub use channel_bot::{ChannelBotRow, ChannelBotStore};
 pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 pub use channel_session::ChannelSessionStore;
@@ -50,24 +52,33 @@ pub struct Store {
     pub channel_session: std::sync::Arc<dyn ChannelSessionStore>,
     pub channel_bot: std::sync::Arc<dyn ChannelBotStore>,
     pub channel_pairing: std::sync::Arc<dyn ChannelPairingStore>,
+    pub blob: std::sync::Arc<dyn BlobStore>,
 }
 
 impl Store {
     /// Open (or create) a `Store` backed by a libsql database at `path`.
-    /// Parent directories are created if missing.
+    /// Parent directories are created if missing. Blob payloads land in
+    /// `<parent>/blobs/` — kept alongside the libsql db so a single
+    /// state directory holds the whole persistent state.
     pub async fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to create storage directory {}: {e}",
-                    parent.display()
-                )
-            })?;
-        }
+        let parent_dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to create storage directory {}: {e}",
+                        parent.display()
+                    )
+                })?;
+                parent.to_path_buf()
+            }
+            // Bare filename or root path: park blobs next to CWD; rare
+            // outside tests that pass `:memory:`-style placeholders.
+            _ => std::path::PathBuf::from("."),
+        };
+        let blob_root = parent_dir.join("blobs");
         let pool = libsql::LibsqlPool::open(path).await?;
+        let blob = libsql::LibsqlBlobStore::open(pool.clone(), &blob_root).await?;
         Ok(Self {
             session: std::sync::Arc::new(libsql::LibsqlSessionStore::new(pool.clone())),
             memory: std::sync::Arc::new(libsql::LibsqlMemoryStore::new(pool.clone())),
@@ -82,6 +93,7 @@ impl Store {
             )),
             channel_bot: std::sync::Arc::new(libsql::LibsqlChannelBotStore::new(pool.clone())),
             channel_pairing: std::sync::Arc::new(libsql::LibsqlChannelPairingStore::new(pool)),
+            blob: std::sync::Arc::new(blob),
         })
     }
 }

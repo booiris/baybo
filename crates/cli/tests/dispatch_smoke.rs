@@ -513,17 +513,18 @@ async fn skills_list_on_empty_registry_returns_placeholder() {
 }
 
 #[tokio::test]
-async fn channels_list_on_empty_registry_returns_placeholder() {
+async fn channels_list_without_store_errors() {
     let ctx = context();
-    let out = dispatch::run(
+    let err = dispatch::run(
         &ctx,
         Commands::Channel {
             cmd: ChannelCmd::List,
         },
     )
     .await
-    .expect("channels list");
-    assert!(out.human.contains("no channels"));
+    .expect_err("channels list without a bot store should fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("unavailable"), "unexpected error: {msg}");
 }
 
 #[tokio::test]
@@ -621,7 +622,7 @@ async fn workspace_set_identity_writes_file_in_argv_mode() {
 
     let data = out.data.expect("payload");
     assert_eq!(data.get("kind").and_then(|v| v.as_str()), Some("SOUL.md"));
-    let on_disk = std::fs::read_to_string(dir.join("SOUL.md")).unwrap();
+    let on_disk = std::fs::read_to_string(dir.join("profile").join("SOUL.md")).unwrap();
     assert_eq!(on_disk, "You are helpful.");
     std::fs::remove_dir_all(&dir).ok();
 }

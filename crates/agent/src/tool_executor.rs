@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,10 +8,11 @@ use aura_job::OperationKind;
 use aura_model::TrustLevel;
 use aura_model::User;
 
+use aura_sandbox::{NetworkPolicy, SandboxRunner};
 use aura_tools::{
-    ApprovalDecision, ApprovalGateMap, ApprovalRequest, ApprovedResource, ResourceAccess,
-    ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput, ToolRegistry,
-    approval::preview_params,
+    ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalRequest, ApprovedResource,
+    ExecSandbox, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolRegistry, approval::preview_params,
 };
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
@@ -19,10 +21,19 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::observability::ObservabilityRecorder;
+use crate::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
 
 /// Preview length used when rendering parameters inside an approval prompt.
 const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
+
+/// Headroom added to the per-tool outer timeout so a slow user
+/// approval (handled mid-execution via [`aura_tools::ApprovalHandle`])
+/// cannot kill the tool while it is legitimately blocked on a modal.
+/// Tracks the channel gate's own `APPROVAL_TIMEOUT` in
+/// `crates/gateway/src/channel/adapter.rs`; if you change one, change
+/// the other.
+const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
 
 /// Executes tools with trust-level validation, approval gating, and
 /// observability recording.
@@ -31,6 +42,8 @@ pub struct ToolExecutor {
     default_timeout: Duration,
     gate_map: Arc<ApprovalGateMap>,
     security_gateway: Arc<SecurityGateway>,
+    workspace_root: PathBuf,
+    sandbox_runner: Option<Arc<dyn SandboxRunner>>,
 }
 
 impl ToolExecutor {
@@ -39,12 +52,16 @@ impl ToolExecutor {
         default_timeout: Duration,
         gate_map: Arc<ApprovalGateMap>,
         security_gateway: Arc<SecurityGateway>,
+        workspace_root: PathBuf,
+        sandbox_runner: Option<Arc<dyn SandboxRunner>>,
     ) -> Self {
         Self {
             tool_registry,
             default_timeout,
             gate_map,
             security_gateway,
+            workspace_root,
+            sandbox_runner,
         }
     }
 
@@ -95,6 +112,8 @@ impl ToolExecutor {
     /// it on `ApproveAlways`, so concurrent tool calls within a turn see
     /// each other's grants immediately. The caller flushes the final
     /// contents back into `session.state` after all calls complete.
+    /// `Arc` so the persist-always closure injected into `ToolContext`
+    /// can outlive the borrowed slot of any one call.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
@@ -102,14 +121,14 @@ impl ToolExecutor {
         params: Value,
         session_id: &str,
         user: &User,
-        approved_resources: &Mutex<Vec<ApprovedResource>>,
+        approved_resources: &Arc<Mutex<Vec<ApprovedResource>>>,
         recorder: &ObservabilityRecorder,
         parent_job_id: Option<&str>,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
         if let Some(manifest) = self.tool_registry.get_manifest(tool_name) {
-            self.validate_trust(tool_name, manifest)?;
+            self.validate_trust(tool_name, &manifest)?;
         }
 
         // Begin observability recording up front so denial / approval
@@ -130,11 +149,13 @@ impl ToolExecutor {
 
         // Approval gate: derive resource accesses from the tool and check
         // them against the session's cached approvals. If any access is
-        // uncovered, prompt the user via the gate.
-        let accesses = self
+        // uncovered, prompt the user via the gate. We also capture the
+        // tool's per-call label here so the approval prompt can show a
+        // human-readable summary alongside the JSON preview.
+        let (accesses, call_label) = self
             .tool_registry
             .get(tool_name)
-            .map(|tool| tool.accessed_resources(&params))
+            .map(|tool| (tool.accessed_resources(&params), tool.call_label(&params)))
             .unwrap_or_default();
 
         let uncovered: Vec<ResourceAccess> = {
@@ -162,6 +183,7 @@ impl ToolExecutor {
                     tool: tool_name.to_string(),
                     accesses: uncovered.clone(),
                     params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
+                    description: call_label.clone(),
                 })
                 .await;
             match decision {
@@ -190,12 +212,47 @@ impl ToolExecutor {
             }
         }
 
+        // Build per-call sandbox adapter for tools declaring ExecCommand.
+        let sandbox: Option<Arc<dyn ExecSandbox>> = if let Some(manifest) =
+            self.tool_registry.get_manifest(tool_name)
+            && manifest.capabilities.contains(&ToolCapability::ExecCommand)
+        {
+            let policy = if manifest.capabilities.contains(&ToolCapability::Http) {
+                NetworkPolicy::All
+            } else {
+                NetworkPolicy::None
+            };
+            self.sandbox_runner.as_ref().map(|runner| {
+                Arc::new(SandboxAdapter::new(
+                    Arc::clone(runner),
+                    self.workspace_root.clone(),
+                    policy,
+                )) as Arc<dyn ExecSandbox>
+            })
+        } else {
+            None
+        };
+
+        // Mid-execution approval handle. Tools that decide which
+        // resources to touch only after some internal work (e.g.
+        // CodeBuilder runs an LLM to draft the program before knowing
+        // what files it needs) prompt the user through this handle.
+        // We pass the SAME `Arc<Mutex<Vec<ApprovedResource>>>` the
+        // pre-execute gate (lines 140–200) reads/writes, so the
+        // mid-execution path filters covered accesses up front and
+        // persists `ApproveAlways` decisions back into the same cache.
+        let approval_gate = self.gate_map.get(&user.channel, session_id);
+        let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
+
         // Build tool context
         let ctx = ToolContext {
             session_id: session_id.to_string(),
             user: user.clone(),
             timeout: self.default_timeout,
             cancellation_token: CancellationToken::new(),
+            workspace_root: self.workspace_root.clone(),
+            sandbox,
+            approval: Some(approval),
         };
 
         // Reveal placeholders in the tool's arguments just before
@@ -208,10 +265,18 @@ impl ToolExecutor {
             .reveal_in_value(&mut params_revealed)
             .await?;
 
-        // Execute with timeout enforcement
+        // Execute with timeout enforcement. The outer deadline pads
+        // `ctx.timeout` with `APPROVAL_HEADROOM` so a tool that prompts
+        // mid-execution (CodeBuilder via `ApprovalHandle::request`) is
+        // not killed while the user is reading the modal — the channel
+        // gate already caps user wait at `APPROVAL_TIMEOUT`. The tool
+        // itself still sees `ctx.timeout` for its inner timing, so a
+        // hung post-approval phase still falls back to the kill switch
+        // before `outer_deadline` elapses.
+        let outer_deadline = ctx.timeout + APPROVAL_HEADROOM;
         let start = std::time::Instant::now();
         let result = tokio::time::timeout(
-            ctx.timeout,
+            outer_deadline,
             self.tool_registry.execute(tool_name, params_revealed, &ctx),
         )
         .await;

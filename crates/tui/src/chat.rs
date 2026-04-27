@@ -322,17 +322,15 @@ fn render_approval_inline(entry: &crate::app::ApprovalChatEntry, out: &mut Vec<L
                     out.push(Line::from(spans));
                 }
             }
-            // Params
             if !entry.params_preview.is_empty() {
                 out.push(Line::from(""));
-                out.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled("params:", Style::default().fg(Color::DarkGray)),
-                ]));
                 for param_line in entry.params_preview.lines() {
                     out.push(Line::from(vec![
                         Span::raw("      "),
-                        Span::raw(param_line.to_string()),
+                        Span::styled(
+                            param_line.to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ]));
                 }
             }
@@ -413,12 +411,20 @@ fn access_summary(accesses: &[ResourceAccess]) -> String {
 
 fn format_access(acc: &ResourceAccess) -> Vec<Span<'static>> {
     let (verb, target) = match acc {
-        ResourceAccess::ReadFile { path } => ("read file", path.display().to_string()),
-        ResourceAccess::WriteFile { path } => ("write file", path.display().to_string()),
-        ResourceAccess::Http { host } => ("http", host.clone()),
-        ResourceAccess::ExecCommand { command } => ("exec", command.clone()),
+        ResourceAccess::ReadFile { path } => ("needs read access to", path.display().to_string()),
+        ResourceAccess::WriteFile { path } => {
+            ("needs write access to", path.display().to_string())
+        }
+        ResourceAccess::Http { host } => {
+            if host == "*" {
+                ("needs network access", String::new())
+            } else {
+                ("needs network access to", host.clone())
+            }
+        }
+        ResourceAccess::ExecCommand { command } => ("needs to run", command.clone()),
     };
-    vec![
+    let mut spans = vec![
         Span::raw("  • "),
         Span::styled(
             verb,
@@ -426,9 +432,12 @@ fn format_access(acc: &ResourceAccess) -> Vec<Span<'static>> {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
-        Span::raw(target),
-    ]
+    ];
+    if !target.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw(target));
+    }
+    spans
 }
 
 /// Count how many rows a paragraph will occupy when rendered with

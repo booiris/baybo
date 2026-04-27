@@ -1,17 +1,4 @@
-/**
- * Standalone CLI entry for the weixin QR login flow.
- *
- * Spawned by `aura channel add` (see `crates/cli/src/commands/channel/
- * weixin_login.rs`) with `AURA_WEIXIN_MODE=login`. Renders the QR to
- * stdout so the operator can scan, then prints a single machine-parsable
- * marker line when the login completes:
- *
- *     AURA_WEIXIN_LOGIN_RESULT:<json>\n
- *
- * The Rust parent parses that line, stores the blob in the vault, and
- * registers the bot. All human-facing output (QR ASCII, progress) goes
- * to stderr so stdout is clean for the marker.
- */
+import type { RegistrationResult } from "@aura/channel-sdk";
 import qrcode from "qrcode-terminal";
 
 import {
@@ -22,8 +9,6 @@ import {
 } from "./auth/login-qr.js";
 import { normalizeBotId } from "./auth/normalize.js";
 import type { AuthBlob } from "./types.js";
-
-const LOGIN_RESULT_MARKER = "AURA_WEIXIN_LOGIN_RESULT:";
 
 function out(msg: string): void {
   process.stderr.write(msg);
@@ -40,19 +25,10 @@ async function renderQr(qrcodeContent: string): Promise<void> {
   out(`${qrcodeContent}\n\n`);
 }
 
-export async function runLogin(): Promise<void> {
+export async function runLogin(): Promise<RegistrationResult> {
   const timeoutMs = Number(process.env.AURA_WEIXIN_LOGIN_TIMEOUT_MS ?? 480_000);
   const apiBaseUrl = process.env.AURA_WEIXIN_API_BASE_URL || FIXED_BASE_URL;
   const botType = process.env.AURA_WEIXIN_BOT_TYPE || DEFAULT_ILINK_BOT_TYPE;
-
-  const controller = new AbortController();
-  const onSignal = () => {
-    out("\n取消登录。\n");
-    controller.abort();
-    process.exit(130);
-  };
-  process.once("SIGINT", onSignal);
-  process.once("SIGTERM", onSignal);
 
   out("正在启动微信扫码登录...\n");
   const start = await startWeixinLoginWithQr({
@@ -61,8 +37,7 @@ export async function runLogin(): Promise<void> {
     force: true,
   });
   if (!start.qrcodeUrl) {
-    out(`${start.message}\n`);
-    process.exit(1);
+    throw new Error(start.message || "weixin login failed to produce a QR");
   }
 
   out("\n使用微信扫描以下二维码，以完成连接：\n\n");
@@ -74,7 +49,6 @@ export async function runLogin(): Promise<void> {
     timeoutMs,
     apiBaseUrl,
     botType,
-    signal: controller.signal,
     onStatus: (status) => {
       if (status === "scaned") out("👀 已扫码，在微信继续操作...\n");
     },
@@ -87,29 +61,26 @@ export async function runLogin(): Promise<void> {
   });
 
   if (!result.connected) {
-    out(`${result.message}\n`);
-    process.exit(1);
+    throw new Error(result.message || "weixin login did not complete");
   }
-
   if (!result.accountId) {
-    out(`登录失败：服务器未返回 accountId。\n`);
-    process.exit(1);
+    throw new Error("登录失败：服务器未返回 accountId。");
   }
   if (!result.botToken) {
-    out(`登录失败：服务器未返回 botToken。\n`);
-    process.exit(1);
+    throw new Error("登录失败：服务器未返回 botToken。");
   }
 
+  const cdnBaseUrl = process.env.AURA_WEIXIN_CDN_BASE_URL ?? "";
   const blob: AuthBlob = {
     version: 1,
     botToken: result.botToken,
     baseUrl: result.baseUrl || apiBaseUrl,
+    ...(cdnBaseUrl ? { cdnBaseUrl } : {}),
     userId: result.userId || "",
     accountId: normalizeBotId(result.accountId),
     createdAt: new Date().toISOString(),
   };
 
   out(`\n${result.message}\n`);
-  process.stdout.write(`${LOGIN_RESULT_MARKER}${JSON.stringify(blob)}\n`);
-  process.exit(0);
+  return { botId: blob.accountId, token: JSON.stringify(blob) };
 }

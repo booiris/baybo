@@ -1,23 +1,26 @@
 //! Channel TCP listener.
 //!
 //! Binds a loopback TCP socket (`127.0.0.1:<ephemeral>`), publishes
-//! the chosen port to `<workspace>/channel.port` so the TUI and
+//! the chosen port to `<workspace>/state/channel.port` so the TUI and
 //! sidecars can discover it, and serves the channel router built by
 //! [`crate::server::build_channel_router`]. 127.0.0.1 is hardcoded —
 //! config cannot loosen it to `0.0.0.0`, so a fat-fingered bind
 //! address can't leak the channel listener to the network.
 //!
-//! Auth lives in the axum middleware [`crate::auth_channel`]:
-//! sidecars present `x-aura-channel-token` (entries in
-//! [`ChannelTokenTable`]), the TUI presents `x-aura-tui-secret` (the
-//! derived PSK). Same-UID containment comes from the fact that both
-//! secrets are delivered over channels only the owning UID can read
-//! (child env vars for the token, salt file under the workspace for
-//! the PSK), so port-level exposure on loopback is not itself a
-//! threat — an attacker with the local UID has already won.
+//! Auth lives in the axum middleware [`crate::auth::channel`]: every
+//! caller — sidecar or bundled TUI — presents `x-aura-channel-token`
+//! and the middleware looks the token up in [`ChannelTokenTable`].
+//! Sidecar tokens are minted at spawn time and handed to the child via
+//! env var; the TUI token is minted at gateway boot, written to the
+//! secret vault under `gateway.tui_token`, and read back by the TUI
+//! before it dials. Same-UID containment comes from the fact that both
+//! delivery channels are owned by the gateway UID (child env vars and
+//! the `0o600` libsql vault file), so port-level exposure on loopback
+//! is not itself a threat — an attacker with the local UID has already
+//! won.
 //!
 //! Lifecycle:
-//! * `<workspace>/channel.port` is written `0o600` after bind
+//! * `<workspace>/state/channel.port` is written `0o600` after bind
 //!   succeeds and removed on graceful + abnormal exit via a Drop
 //!   guard on [`PortFileGuard`].
 //! * Graceful shutdown is driven by the shared [`ShutdownSignal`] —
@@ -32,7 +35,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aura_agent::service::ShutdownSignal;
-use aura_gateway_auth::ChannelTokenTable;
 use axum::Router;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -42,7 +44,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tower::Service;
 
-use crate::auth_channel::ChannelAuthState;
+use crate::auth::ChannelTokenTable;
+use crate::auth::channel::ChannelAuthState;
 use crate::server::{GatewayDeps, build_channel_router};
 use crate::{GatewayError, Result};
 
@@ -57,14 +60,9 @@ pub struct ChannelServer {
 
 impl ChannelServer {
     /// Bind on `127.0.0.1:0`, publish the chosen port to `port_file`,
-    /// and assemble the channel router with the given PSK + token
-    /// table. Always loopback — the bind address is not configurable.
-    pub fn bind(
-        deps: &GatewayDeps,
-        port_file: PathBuf,
-        psk: [u8; 32],
-        tokens: ChannelTokenTable,
-    ) -> Result<Self> {
+    /// and assemble the channel router with the given token table.
+    /// Always loopback — the bind address is not configurable.
+    pub fn bind(deps: &GatewayDeps, port_file: PathBuf, tokens: ChannelTokenTable) -> Result<Self> {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         // Use std bind first so we can read `local_addr` before
         // handing the fd to tokio. `TcpListener::from_std` wants a
@@ -90,7 +88,7 @@ impl ChannelServer {
         })?;
 
         let port_file = PortFileGuard::write(&port_file, local_addr.port())?;
-        let auth_state = ChannelAuthState::new(psk, tokens);
+        let auth_state = ChannelAuthState::new(tokens);
         let router = build_channel_router(deps, auth_state);
         let shutdown_grace = deps.runtime_config.shutdown_grace;
         Ok(Self {

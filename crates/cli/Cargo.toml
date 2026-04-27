@@ -20,11 +20,13 @@ aura-tools = { workspace = true }
 aura-trace = { workspace = true }
 aura-llm = { workspace = true }
 aura-tui = { workspace = true }
-aura-workspace = { workspace = true }
+aura-workspace = { workspace = true, features = ["io"] }
 
 async-trait = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
 parking_lot = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -38,7 +40,11 @@ crossterm = { workspace = true }
 shell-words = { workspace = true }
 libc = { workspace = true }
 
+[features]
+test-support = []
+
 [dev-dependencies]
 aura-context = { workspace = true }
 aura-cron = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

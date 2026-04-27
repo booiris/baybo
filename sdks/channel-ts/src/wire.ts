@@ -4,6 +4,8 @@ import type { Frame } from "./generated/Frame.js";
 
 export type { Frame } from "./generated/Frame.js";
 export type { Message } from "./generated/Message.js";
+export type { AttachmentKind } from "./generated/AttachmentKind.js";
+export type { WireAttachment } from "./generated/WireAttachment.js";
 export { PROTOCOL_VERSION } from "./generated/constants.js";
 
 export function encodeFrame(frame: Frame): Uint8Array {

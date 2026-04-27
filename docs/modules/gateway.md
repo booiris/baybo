@@ -72,71 +72,86 @@ invalidate a leaked token. Because the vault requires the master
 encryption key, the token's confidentiality rides on the same root
 secret as every other credential in the project.
 
-### Channel auth — PSK / subprocess token
+### Channel auth — vault-issued tokens (TUI + subprocess)
 
-The channel listener enforces header auth on every request — exactly
-one of:
+The channel listener enforces a single header on every request:
+`x-aura-channel-token: <hex>`, looked up against the in-memory
+`ChannelTokenTable`. Each entry carries a `ClientIdentity { pid, label }`
+and the auth middleware uses the reserved label
+`aura_gateway::TUI_CLIENT_LABEL` ("tui") to distinguish a bundled-TUI
+connection from a subprocess sidecar — the same channel-token pipeline
+carries both.
 
-- `x-aura-tui-secret: <hex>` matching the effective TUI PSK (see
-  below). Used by `aura tui`.
-- `x-aura-channel-token: <hex>` matching an entry in the in-memory
-  `ChannelTokenTable`. Used by subprocess channel plugins spawned
-  via `ChannelSpawner`. The table is keyed by the token alone; the
-  entry's PID is retained for diagnostics (log lines, `/v1/status`)
-  but is not used for auth — loopback TCP carries no kernel-attested
-  peer credential, and the token's uniqueness + delivery via a child
-  env var only the owning UID can read makes the extra PID check
-  redundant under the same-UID threat model.
+Two flavours of token end up in the table:
 
-The TUI PSK lives in `aura-gateway-auth` as a 32-byte value generated
-at build time (`build.rs` writes `$OUT_DIR/tui_psk.bin`) plus an
-optional per-install salt: on first start the gateway writes 32 random
-bytes to `{workspace_identity_dir}/tui_psk.salt` (mode 0600) and
-derives the effective PSK via `HKDF-SHA256(EMBEDDED_PSK, salt)`. TUI
-reads the same salt file. Two users running the same release binary
-end up with different effective PSKs.
+- **TUI token.** Generated on every `aura gateway start`, written to
+  the secret vault under the key
+  `aura_gateway::TUI_TOKEN_VAULT_KEY` ("gateway.tui_token"), and
+  registered with the gateway's own pid + the reserved TUI label. The
+  gateway holds the returned `TokenHandle` for the entire lifetime of
+  `start`, so the in-memory entry is revoked the moment shutdown
+  drops it. The vault row stays around between starts (the next start
+  overwrites it), but a TUI presenting a vault value from a previous
+  generation is rejected because the in-memory table has the new
+  value.
+- **Subprocess capability tokens.** Minted inside
+  `ChannelSpawner::spawn` before `Command::spawn`, handed to the
+  child via the `AURA_CHANNEL_TOKEN` env var, and revoked when the
+  owning `ChildHandle` drops. The PID stored on the identity is the
+  child PID and is retained for diagnostics (log lines,
+  `/v1/status`) — it is *not* part of the auth check, since loopback
+  TCP carries no kernel-attested peer credential and the token's
+  uniqueness + same-UID-only delivery already cover the threat
+  model.
 
-#### TUI PSK threat model — what it is and isn't
+For runtimes whose WebSocket client cannot set custom headers (bun's
+WHATWG client, browser-style clients) the listener also accepts
+`?token=<hex>` on the upgrade URL. The auth middleware strips the
+query parameter from the request URI before the inner `TraceLayer`
+runs so the secret never lands in structured logs.
 
-The effective TUI PSK is a **workspace-binding token**, *not* a defence
-against a same-UID hostile process. Being explicit about the boundary:
+#### Threat model
+
+The vault-token scheme is a **workspace-binding** credential, *not*
+a defence against a same-UID hostile process.
 
 *Designed to reject*
-- connections from a different Unix user — the salt file is mode
-  `0o600` and the `<workspace>/channel.port` discovery file is
-  `0o600`, so another UID can't even locate the listener's port;
-  the PSK is the belt on top of those suspenders;
-- cross-workspace mix-ups — a TUI built against workspace A cannot
-  authenticate to a gateway in workspace B because the per-install
-  salt diverges;
-- stale reconnects from an older build / a different on-disk install
-  (different embedded PSK bytes).
+- connections from a different Unix user — the libsql vault file is
+  `0o600` and `<workspace>/channel.port` is also `0o600`, so another
+  UID can't even locate the listener's port, let alone read the
+  freshly-rotated TUI token;
+- cross-workspace mix-ups — every workspace has its own libsql
+  database with its own (master-key-encrypted) `gateway.tui_token`
+  row, so a TUI pointed at workspace B will never come up with the
+  matching value for workspace A;
+- stale reconnects after a gateway restart — the in-memory
+  `ChannelTokenTable` is rebuilt empty on every start, so a TUI
+  still holding the previous generation's token must re-read the
+  vault.
 
 *Not designed to defend against*
 - a malicious process running as the same UID as the gateway. Such a
-  process can read the salt file and the installed binary, recompute
-  the effective PSK, and present it. Treat "same-UID local adversary"
-  as out of scope for this mechanism.
+  process can read the libsql file, recompute the master key (or
+  read the env var that holds it), decrypt the row, and present the
+  same token. Treat "same-UID local adversary" as out of scope for
+  this mechanism — the practical tools are file permissions on the
+  vault + master-key file, service-manager sandboxing, and OS-level
+  isolation (seccomp, sandbox-exec, etc.).
 
-The practical tools for the same-UID threat are file permissions on
-the binary + salt file, service-manager sandboxing, and OS-level
-isolation (seccomp, sandbox-exec, etc.) — not an application-layer
-PSK.
-
-Per-subprocess tokens are minted by `ChannelSpawner::spawn` before
-`Command::spawn`, inserted into `ChannelTokenTable` keyed by the
-token string, and removed in the `ChildHandle` `Drop`. The same
-threat-model caveat applies: a same-UID process can read
-`/proc/<pid>/environ` on Linux and lift the token, so subprocess
-tokens are also workspace/lifetime binding, not hostile-process
+The same caveat applies to subprocess tokens: a same-UID process can
+read `/proc/<pid>/environ` on Linux and lift the env-var-delivered
+token. They are workspace/lifetime binding, not hostile-process
 resistance.
 
-All header compares are constant-time via `subtle::ConstantTimeEq`.
-`/healthz` and `/readyz` skip auth on both listeners.
+All token compares are constant-time via
+`aura_gateway::constant_time_eq` (re-exported from
+`crate::auth::token` and used internally by `ChannelTokenTable::lookup`'s
+underlying `DashMap` plus the header-extraction path). `/healthz` and
+`/readyz` skip auth on both listeners.
 
 ### Admin auth — bearer token, URI sanitisation before tracing
 
-`auth_admin::require_admin_token` accepts `Authorization: Bearer
+`auth::admin::require_admin_token` accepts `Authorization: Bearer
 <token>` first and falls back to `?token=<token>` for embedded links
 (SSE streams opened from a browser, quick-copy `curl`s). Comparisons
 run through `constant_time_eq`. After a successful compare the
@@ -149,15 +164,13 @@ logs.
 `LeakDetector::add_rule` takes `&mut self`; the detector is shared as
 `Arc<LeakDetector>` across every manager once the runtime is wired, so
 there is no way to register a new redaction rule after construction.
-The workable option is to **read the vault-stored admin token in
-`runtime::build_managers` before the detector is built** and add it as a
-rule on the fresh detector, then also register the effective TUI PSK and
-any active channel tokens after `ChannelTokenTable` is created. If the
-vault has not been seeded yet (first `start` before `enable`), the
-runtime fails fast with a message telling the user to run
-`aura gateway enable` first. This means `enable` needs the full storage
-init path (open `Store`, open `SecretVault`), not just a one-shot file
-write.
+`gateway_cmd::start` therefore opens the vault once *before* tracing
+init: it reads or auto-mints the admin token, generates the fresh TUI
+token + writes it to `gateway.tui_token`, and only then calls
+`runtime::build_leak_detector` with both values registered as
+`LeakAction::Replace` rules. The same `Arc<LeakDetector>` is then
+forwarded into `build_managers`, so the runtime graph's
+`SecurityGateway` redacts both credentials on every log surface.
 
 ### Sidecar owns the outbound pump
 
@@ -444,7 +457,7 @@ Routes are split between the two listeners. `/healthz` and `/readyz`
 live on both; every other authenticated route goes through the
 listener-specific auth middleware.
 
-**Admin listener (TCP, bearer token)** — `auth_admin::require_admin_token`:
+**Admin listener (TCP, bearer token)** — `auth::admin::require_admin_token`:
 
 ```
 GET    /healthz                         liveness (no auth)
@@ -477,8 +490,8 @@ GET    /v1/llm
 GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin surface
 ```
 
-**Channel listener (loopback TCP, PSK/token)** —
-`auth_channel::require_channel_client`:
+**Channel listener (loopback TCP, vault-issued tokens)** —
+`auth::channel::require_channel_auth`:
 
 ```
 GET    /healthz                         liveness (no auth)
@@ -495,9 +508,10 @@ The WS protocol is defined by [`aura_channels::wire::Frame`]
 (tagged on `kind`, MessagePack-named). The client opens with a
 `Register { token, channel_type, protocol_version }` frame; the server
 validates it via `channel::handshake::validate_register` against the
-[`auth_channel::AuthedClient`] the middleware already attached (PSK
-→ must claim `"tui"`; subprocess token → must match the minted
-identity's `(pid, label)` and claim a non-reserved channel type).
+[`auth::channel::AuthedClient`] the middleware already attached (TUI
+token → must claim `"tui"` and a non-empty `session_id`; subprocess
+token → must match the minted identity's `(pid, label)` and claim a
+non-reserved channel type).
 `RegisterAck { ok, reason? }` closes the handshake; subsequent frames
 are `Message` (user input in, final assistant response out), `Delta`
 (streaming assistant text, server → client), `Notice` (out-of-band
@@ -570,17 +584,18 @@ subcommands use it for the same reason.
 
 - **Secrets never logged unredacted.** Three layers: (a) `LeakDetector`
   rules registered at detector construction redact any log line that
-  echoes the admin token, the effective TUI PSK, or an active channel
-  token; (b) the admin auth middleware strips `?token=` from the URI
-  before the `TraceLayer` span is emitted; (c) the channel auth
-  middleware never echoes header values.
+  echoes the admin token or the per-start TUI token; (b) the admin
+  auth middleware strips `?token=` from the URI before the
+  `TraceLayer` span is emitted, and the channel middleware does the
+  same to the channel-token query parameter; (c) the auth middlewares
+  never echo header values.
 - **Channel listener is loopback + same-UID.** The listener binds
   `127.0.0.1:0` and publishes the chosen port to
   `<workspace>/channel.port` at mode `0o600`, so a different local
-  user can't even discover the port. The PSK layer above is a
-  *workspace binding*, not a
-  defence against same-UID hostile processes — see the PSK threat
-  model note under "Channel auth" for the boundary.
+  user can't even discover the port. The vault-token layer above is
+  a *workspace binding*, not a defence against same-UID hostile
+  processes — see the threat-model note under "Channel auth" for the
+  boundary.
 - **All gateway logs pass through `RedactingMakeWriter`** — the same
   writer wrapper the TUI uses (`src/logging.rs`). `AURA_LOG_FORMAT=json`
   is honoured. Request spans carry a `listener` field (`admin` /
@@ -610,11 +625,14 @@ crates/gateway/
 │   ├── channel/             # /v1/channel-ws WS server for sidecar plugins + the TUI
 │   │   ├── mod.rs           #   module glue; re-exports route + state
 │   │   ├── adapter.rs       #   Sidecar — per-connection Channel + outbound frame pump
-│   │   ├── handshake.rs     #   validate_register (PSK / subprocess-token gating)
+│   │   ├── handshake.rs     #   validate_register (TUI vs. subprocess gating via AuthedClient)
 │   │   ├── route.rs         #   ws_handler + inbound loop
 │   │   └── state.rs         #   WsChannelState (registry, incoming_tx, tokens, sessions)
-│   ├── auth_admin.rs        # AdminAuthState, require_admin_token
-│   ├── auth_channel.rs      # ChannelAuthState, require_channel_client (peer-cred + PSK/token)
+│   ├── auth/                # gateway auth surface (re-exports common types from mod.rs)
+│   │   ├── mod.rs           #   re-exports AdminToken, AuthedClient, ChannelTokenTable, …
+│   │   ├── admin.rs         #   AdminAuthState, AdminToken, require_admin_token
+│   │   ├── channel.rs       #   ChannelAuthState, AuthedClient, require_channel_auth
+│   │   └── token.rs         #   ChannelTokenTable + ClientIdentity + TokenHandle, vault-key + label consts
 │   ├── error.rs             # GatewayError : IntoResponse
 │   ├── test_support.rs      # cfg(test-support) build_test_deps + TestGateway
 │   ├── api/
@@ -640,10 +658,15 @@ crates/gateway/
 The frontend sources live outside the crate at `web/` (npm workspace,
 not a Cargo member) and produce `web/dist/` which `build.rs` consumes.
 
-The companion crate `aura-gateway-auth` exposes the PSK material, the
-channel header constants (`TUI_PSK_HEADER`, `CHANNEL_TOKEN_HEADER`), and
-the `ChannelTokenTable` type shared by both the gateway and the TUI
-client.
+The channel-listener wire constants (`CHANNEL_TOKEN_HEADER`, the
+reserved `TUI_CLIENT_LABEL`, the vault key `TUI_TOKEN_VAULT_KEY`) and
+the `ChannelTokenTable` / `ClientIdentity` / `TokenHandle` types live
+inline in `crates/gateway/src/auth/token.rs` and are re-exported from
+both `crate::auth` and the crate root, so internal call sites can
+write `use crate::auth::ChannelTokenTable` and the bin's `gateway_cmd`
+/ `tui_cmd` boot paths reach them as `aura_gateway::ChannelTokenTable`.
+There is no compiled-in PSK any more — every credential is generated
+at runtime and stored in the per-workspace vault.
 
 ## Collaboration
 
@@ -655,24 +678,21 @@ client.
   `wire::{Frame, Message}` MessagePack types the WS route speaks.
   Every accepted `/v1/channel-ws` connection registers its
   `Arc<Channel>` on the shared registry and unregisters on disconnect.
-- **gateway-auth** — embeds the build-time PSK, defines the
-  `ChannelTokenTable` + `ClientIdentity` types, and owns the channel
-  header constants. Shared between the gateway server and the TUI
-  client so both agree on the wire protocol.
-- **security** — `SecretVault` for admin-token persistence;
+- **security** — `SecretVault` for admin-token + TUI-token persistence;
   `LeakDetector` for log redaction; `SecurityGateway` for the outgoing
-  reveal path. The admin token, effective TUI PSK, and live channel
-  tokens are all registered as `LeakDetector` rules at detector-
-  construction time.
+  reveal path. The admin token and the per-start TUI token are
+  registered as `LeakDetector::Replace` rules at detector-construction
+  time.
 - **config** — `AuraConfig::gateway` drives admin bind address, channel
   socket path, CORS origins, and shutdown grace.
 - **storage** — `Store::open` for vault bootstrap in `gateway_cmd`; the
   `TraceStore` trait behind `/v1/traces/:session_id`.
 - **tui** — the TUI is a `/v1/channel-ws` client like any other
-  sidecar. It authenticates with the effective PSK via the
-  `x-aura-tui-secret` header, registers as `channel_type = "tui"`, and
-  client-generates session UUIDs. Admin endpoints are not reached from
-  the TUI.
+  sidecar. It reads the per-start token from `gateway.tui_token` in
+  the secret vault, presents it via the shared
+  `x-aura-channel-token` header, registers as `channel_type = "tui"`,
+  and client-generates session UUIDs. Admin endpoints are not
+  reached from the TUI.
 - **cli** — `Commands::Gateway { cmd: GatewayCmd }` is defined in
   `crates/cli/src/cli.rs`; the dispatcher explicitly returns
   `UnknownCommand` because `src/main.rs` intercepts the variant before

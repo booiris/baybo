@@ -58,9 +58,11 @@ impl ServiceInstaller for LaunchdInstaller {
         let log = ctx.log_dir.display().to_string();
         let mut env_block = String::new();
         if let Some(cfg) = &ctx.config_path {
-            env_block.push_str(
-                "    <key>EnvironmentVariables</key>\n    <dict>\n      <key>AURA_CONFIG_PATH</key>\n",
-            );
+            env_block.push_str("    <key>EnvironmentVariables</key>\n    <dict>\n");
+            env_block.push_str(&format!(
+                "      <key>{}</key>\n",
+                aura_workspace::paths::ENV_CONFIG_PATH
+            ));
             env_block.push_str(&format!("      <string>{}</string>\n", cfg.display()));
             env_block.push_str("    </dict>\n");
         }
@@ -156,7 +158,7 @@ mod tests {
     fn ctx() -> InstallContext {
         InstallContext {
             exec_start: PathBuf::from("/usr/local/bin/aura"),
-            config_path: Some(PathBuf::from("/Users/me/.aura/aura.json")),
+            config_path: Some(PathBuf::from("/Users/me/.aura/profile/aura.json")),
             log_dir: PathBuf::from("/Users/me/.aura/logs"),
             user_mode: true,
         }
@@ -170,7 +172,7 @@ mod tests {
         assert!(body.contains("<string>/usr/local/bin/aura</string>"));
         assert!(body.contains("<string>gateway</string>"));
         assert!(body.contains("AURA_CONFIG_PATH"));
-        assert!(body.contains("/Users/me/.aura/aura.json"));
+        assert!(body.contains("/Users/me/.aura/profile/aura.json"));
         assert!(body.contains("<key>KeepAlive</key>"));
     }
 

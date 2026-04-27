@@ -12,6 +12,14 @@ export interface AuthBlob {
   version: 1;
   botToken: string;
   baseUrl: string;
+  /**
+   * Override for the iLink CDN endpoint used to download / upload
+   * inbound and outbound media. Empty string defers to the server-
+   * supplied `full_url` field on every media item — that's the
+   * common case in production. Operators only set this when they
+   * deploy against a non-default CDN host (private clouds, etc.).
+   */
+  cdnBaseUrl?: string;
   userId: string;
   accountId: string;
   createdAt: string;
@@ -40,6 +48,8 @@ export interface RuntimeState {
   readonly accountId: string;
   readonly botToken: string;
   baseUrl: string;
+  /** iLink CDN endpoint for inbound media decrypt / outbound upload. */
+  readonly cdnBaseUrl: string;
   readonly userId: string;
   getUpdatesBuf: string;
   readonly configMgr: WeixinConfigManager;

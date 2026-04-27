@@ -11,16 +11,17 @@ members = [
     "crates/job",
     "crates/trace",
     "crates/security",
+    "crates/sandbox",
     "crates/hook",
     "crates/agent",
     "crates/storage",
     "crates/skills",
     "crates/skills-assessor",
     "crates/cron",
+    "crates/code-builder",
     "crates/config",
     "crates/cli",
     "crates/gateway",
-    "crates/gateway-auth",
     "crates/tui",
     "crates/pairing",
     "crates/integration-tests",
@@ -38,22 +39,23 @@ aura-model = { path = "crates/model" }
 aura-channels = { path = "crates/channels" }
 aura-llm = { path = "crates/llm" }
 aura-tools = { path = "crates/tools" }
-aura-workspace = { path = "crates/workspace" }
+aura-workspace = { path = "crates/workspace", default-features = false }
 aura-context = { path = "crates/context" }
 aura-session = { path = "crates/session" }
 aura-job = { path = "crates/job" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
+aura-sandbox = { path = "crates/sandbox" }
 aura-hook = { path = "crates/hook" }
 aura-agent = { path = "crates/agent" }
 aura-storage = { path = "crates/storage" }
 aura-skills = { path = "crates/skills" }
 aura-skills-assessor = { path = "crates/skills-assessor" }
 aura-cron = { path = "crates/cron" }
+aura-code-builder = { path = "crates/code-builder" }
 aura-config = { path = "crates/config" }
 aura-cli = { path = "crates/cli" }
 aura-gateway = { path = "crates/gateway" }
-aura-gateway-auth = { path = "crates/gateway-auth" }
 aura-tui = { path = "crates/tui" }
 aura-pairing = { path = "crates/pairing" }
 aura-integration-tests = { path = "crates/integration-tests" }
@@ -101,7 +103,8 @@ teloxide = { version = "0.17", features = ["macros"] }
 serenity = { version = "0.12", features = ["client", "gateway", "model"] }
 tower = { version = "0.5", features = ["util"] }
 url = "2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
+htmd = "0.5"
 bytes = "1"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 cron = "0.15"
@@ -133,6 +136,20 @@ ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
 zstd = "0.13"
 ureq = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# MCP client: rmcp for the protocol + transports, oauth2 for the
+# authorization-code-with-PKCE flow, `open` to launch the user's browser
+# during `aura mcp add` against an OAuth-protected HTTP server, base64 for
+# PKCE challenge encoding.
+rmcp = { version = "1.5", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+    "auth",
+] }
+oauth2 = "5"
+open = "5"
+base64 = "0.22"
 
 [package]
 name = "aura"
@@ -144,24 +161,26 @@ aura-model = { workspace = true }
 aura-channels = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
-aura-workspace = { workspace = true }
+aura-workspace = { workspace = true, features = ["io"] }
 aura-context = { workspace = true }
 aura-session = { workspace = true }
 aura-job = { workspace = true }
 aura-trace = { workspace = true }
 aura-security = { workspace = true }
+aura-sandbox = { workspace = true }
 aura-hook = { workspace = true }
 aura-agent = { workspace = true }
 aura-cron = { workspace = true }
+aura-code-builder = { workspace = true }
 aura-storage = { workspace = true }
 aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }
 aura-config = { workspace = true }
 aura-cli = { workspace = true }
 aura-gateway = { workspace = true }
-aura-gateway-auth = { workspace = true }
 aura-tui = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }

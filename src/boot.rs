@@ -19,30 +19,36 @@ use aura_context::TokenBudget;
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
 use aura_skills_assessor::AssessmentMode;
+use aura_workspace::WorkspacePaths;
+use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Loaders (perform I/O)
 // ---------------------------------------------------------------------------
 
-/// Resolve the config path from `AURA_CONFIG_PATH`, else `./aura.json`, else
-/// fall back to `AuraConfig::default()`. An explicit `AURA_CONFIG_PATH` that
-/// points at a missing file is a hard error — silent fallback would hide typos.
+/// Resolve the config path from `AURA_CONFIG_PATH`, else
+/// `<default_workspace_root>/profile/aura.json`, else fall back to
+/// `AuraConfig::default()`. An explicit `AURA_CONFIG_PATH` that points at a
+/// missing file is a hard error — silent fallback would hide typos.
 pub async fn load_config() -> anyhow::Result<AuraConfig> {
-    let explicit = std::env::var("AURA_CONFIG_PATH").ok();
+    let explicit = std::env::var(ENV_CONFIG_PATH).ok();
     let path = explicit
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("aura.json"));
+        .unwrap_or_else(default_config_file);
 
     if !path.exists() {
         if explicit.is_some() {
             anyhow::bail!(
-                "AURA_CONFIG_PATH points to {} but the file does not exist",
+                "{ENV_CONFIG_PATH} points to {} but the file does not exist",
                 path.display()
             );
         }
-        info!("no aura.json found, using default configuration");
+        info!(
+            "no aura.json found at {}, using default configuration",
+            path.display()
+        );
         return Ok(AuraConfig::default());
     }
 
@@ -55,14 +61,15 @@ pub async fn load_config() -> anyhow::Result<AuraConfig> {
 /// Resolve the effective `aura.json` path, if any.
 ///
 /// Same precedence as [`load_config`]: `AURA_CONFIG_PATH` first, then
-/// `./aura.json` (only if present). Returns `None` when neither exists
-/// — callers running against `AuraConfig::default()` have no path to
-/// write back to, and mutation endpoints reject accordingly.
+/// `<default_workspace_root>/profile/aura.json` (only if present). Returns
+/// `None` when neither exists — callers running against
+/// `AuraConfig::default()` have no path to write back to, and mutation
+/// endpoints reject accordingly.
 pub fn resolve_config_path() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("AURA_CONFIG_PATH") {
+    if let Ok(explicit) = std::env::var(ENV_CONFIG_PATH) {
         return Some(PathBuf::from(explicit));
     }
-    let default = PathBuf::from("aura.json");
+    let default = default_config_file();
     default.exists().then_some(default)
 }
 
@@ -81,8 +88,8 @@ pub fn build_llm_client(cfg: &LlmConfig) -> anyhow::Result<LlmClient> {
 
 /// Resolve the LLM API key from the env var named by `api_key_env`, falling
 /// back to provider-specific defaults (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-/// `GEMINI_API_KEY`). Returns `None` if nothing is set — the provider may
-/// still accept it (e.g. local models) or error later.
+/// `GEMINI_API_KEY`, `MINIMAX_API_KEY`). Returns `None` if nothing is set —
+/// the provider may still accept it (e.g. local models) or error later.
 pub fn resolve_llm_api_key(cfg: &LlmConfig) -> Option<String> {
     if let Some(env) = &cfg.api_key_env
         && let Ok(v) = std::env::var(env)
@@ -93,6 +100,7 @@ pub fn resolve_llm_api_key(cfg: &LlmConfig) -> Option<String> {
         "openai" => std::env::var("OPENAI_API_KEY").ok(),
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
         "gemini" => std::env::var("GEMINI_API_KEY").ok(),
+        "minimax" => std::env::var("MINIMAX_API_KEY").ok(),
         _ => None,
     }
 }
@@ -136,11 +144,11 @@ pub fn to_execution_policy(cfg: &AgentConfig) -> ExecutionPolicy {
 }
 
 /// Path to the libsql database file, derived from the project root
-/// (`workspace.path`). Storage always lives at `<root>/storage.db`; the
-/// workspace root is itself the aura data directory (defaults to
+/// (`workspace.path`). Storage always lives at `<root>/state/storage.db`;
+/// the workspace root is itself the aura data directory (defaults to
 /// `~/.aura` in release, `./.aura` in debug).
 pub fn storage_db_path(cfg: &WorkspaceConfig) -> PathBuf {
-    PathBuf::from(&cfg.path).join("storage.db")
+    WorkspacePaths::new(PathBuf::from(&cfg.path)).storage_db()
 }
 
 pub fn to_token_budget(cfg: &aura_config::ContextConfig) -> TokenBudget {
@@ -218,13 +226,13 @@ mod tests {
     }
 
     #[test]
-    fn storage_db_path_is_under_workspace_root() {
+    fn storage_db_path_is_under_workspace_state_dir() {
         let cfg = WorkspaceConfig {
             path: "/tmp/project".into(),
         };
         assert_eq!(
             storage_db_path(&cfg),
-            std::path::PathBuf::from("/tmp/project/storage.db"),
+            std::path::PathBuf::from("/tmp/project/state/storage.db"),
         );
     }
 

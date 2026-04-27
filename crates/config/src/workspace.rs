@@ -1,3 +1,4 @@
+use aura_workspace::paths::default_workspace_root;
 use serde::{Deserialize, Serialize};
 
 /// Project-root configuration.
@@ -19,17 +20,7 @@ pub struct WorkspaceConfig {
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
-            path: default_path(),
+            path: default_workspace_root().to_string_lossy().into_owned(),
         }
-    }
-}
-
-fn default_path() -> String {
-    if cfg!(debug_assertions) {
-        return "./.aura".to_string();
-    }
-    match std::env::home_dir() {
-        Some(home) => home.join(".aura").to_string_lossy().into_owned(),
-        None => "./.aura".to_string(),
     }
 }

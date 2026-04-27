@@ -24,10 +24,10 @@ use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
 use aura_gateway::{
-    AdminToken, ChannelServer, ChannelSpawner, GatewayDeps, GatewayServer, RuntimeGatewayConfig,
-    SidecarRuntime, SidecarSupervisor,
+    AdminToken, ChannelServer, ChannelSpawner, ChannelTokenTable, ClientIdentity, GatewayDeps,
+    GatewayServer, RuntimeGatewayConfig, SidecarRuntime, SidecarSupervisor, TUI_CLIENT_LABEL,
+    TUI_TOKEN_VAULT_KEY,
 };
-use aura_gateway_auth::{ChannelTokenTable, effective_tui_psk};
 
 use crate::boot;
 use crate::runtime;
@@ -69,7 +69,8 @@ fn install_context(
     let exec_start = installer::resolve_exec_start(explicit_exec.as_deref())
         .map_err(|e| anyhow::anyhow!("cannot resolve executable path: {e}"))?;
     let config_path = resolve_install_config_path()?;
-    let log_dir = PathBuf::from(&config.workspace.path).join("logs");
+    let log_dir =
+        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).logs_dir();
     Ok(InstallContext {
         exec_start,
         config_path,
@@ -83,7 +84,7 @@ fn install_context(
 /// Resolution order:
 /// 1. `AURA_CONFIG_PATH` — canonicalized; errors if it cannot be
 ///    resolved to an existing file.
-/// 2. `./aura.json` — if present in the current directory.
+/// 2. `<default_workspace_root>/profile/aura.json` — if it already exists.
 /// 3. Otherwise `None`, with a loud stderr warning: the service will
 ///    launch against built-in defaults (no LLM key, default workspace),
 ///    which is almost never what the user actually wants.
@@ -92,11 +93,13 @@ fn install_context(
 /// has to be baked into the unit file at install time — there's no
 /// second chance to pick it up later.
 fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
-    if let Some(raw) = std::env::var_os("AURA_CONFIG_PATH") {
+    use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
+
+    if let Some(raw) = std::env::var_os(ENV_CONFIG_PATH) {
         let p = PathBuf::from(&raw);
         let canon = p.canonicalize().map_err(|e| {
             anyhow::anyhow!(
-                "AURA_CONFIG_PATH={} cannot be resolved ({e}). Fix the path or unset the variable \
+                "{ENV_CONFIG_PATH}={} cannot be resolved ({e}). Fix the path or unset the variable \
                  before running install — a broken path baked into the unit file would only \
                  surface later when the service fails to start.",
                 p.display()
@@ -105,22 +108,26 @@ fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
         return Ok(Some(canon));
     }
 
-    let cwd_default = PathBuf::from("aura.json");
-    if cwd_default.exists() {
-        let canon = cwd_default
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("./aura.json exists but cannot be canonicalized: {e}"))?;
+    let default_path = default_config_file();
+    if default_path.exists() {
+        let canon = default_path.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "{} exists but cannot be canonicalized: {e}",
+                default_path.display()
+            )
+        })?;
         eprintln!(
-            "install: no AURA_CONFIG_PATH set; pinning service to {}",
+            "install: no {ENV_CONFIG_PATH} set; pinning service to {}",
             canon.display()
         );
         return Ok(Some(canon));
     }
 
     eprintln!(
-        "install: WARNING — no AURA_CONFIG_PATH and no ./aura.json; the installed service will \
-         run with built-in defaults (no LLM key, default workspace). Set AURA_CONFIG_PATH and \
-         re-run `aura gateway install` if that's not what you want."
+        "install: WARNING — no {ENV_CONFIG_PATH} and no {} on disk; the installed \
+         service will run with built-in defaults (no LLM key, default workspace). Set \
+         {ENV_CONFIG_PATH} and re-run `aura gateway install` if that's not what you want.",
+        default_path.display(),
     );
     Ok(None)
 }
@@ -217,32 +224,57 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Per-workspace singleton. The gateway owns the same libsql store as
     // the TUI, runs job recovery, and drives cron ticks — two instances
     // against the same workspace would race.
-    let workspace_root = PathBuf::from(&config.workspace.path);
-    let _workspace_lock = singleton::acquire(workspace_root.as_path())?;
+    let workspace_paths =
+        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
+    aura_workspace::WorkspaceManager::new(workspace_paths.root().to_path_buf())
+        .ensure_layout()
+        .await?;
+    let _workspace_lock = singleton::acquire(workspace_paths.root())?;
 
-    // Read the auth token BEFORE building the manager graph: the gateway
-    // mode registers the token as a `LeakAction::Replace` rule on the
-    // LeakDetector, which happens inside `build_managers` before the
-    // detector is sealed into an Arc. Auto-mint on first run so a fresh
-    // workspace can `aura gateway start` without a prior `enable`.
-    let token = {
+    // Read the admin token AND mint+publish a fresh TUI token BEFORE
+    // building the manager graph: both are registered as
+    // `LeakAction::Replace` rules on the LeakDetector, which happens
+    // inside `build_managers` before the detector is sealed into an
+    // Arc. The admin token is auto-minted on first run so a fresh
+    // workspace can `aura gateway start` without a prior `enable`. The
+    // TUI token is rotated unconditionally on every start — semantics
+    // of a "temporary" token: any TUI still holding the previous
+    // generation's value must reconnect via the freshly published
+    // vault entry.
+    let (token, tui_token) = {
         let vault = runtime::build_secret_vault(&config).await?;
-        AdminToken::new(vault).mint_if_absent().await?
+        let admin_token = AdminToken::new(Arc::clone(&vault)).mint_if_absent().await?;
+        let tui_token = aura_gateway::generate_token();
+        vault
+            .store_secret(TUI_TOKEN_VAULT_KEY, tui_token.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("publish TUI token to vault: {e}"))?;
+        (admin_token, tui_token)
     };
 
-    // Build the leak detector (with the auth token registered as a
-    // `LeakAction::Replace` rule) BEFORE initialising tracing so log
-    // lines that accidentally echo the token are masked on disk. Pass
-    // the same `Arc<LeakDetector>` into `build_managers` so the runtime
-    // graph's SecurityGateway uses the same rule set.
-    let leak_detector = runtime::build_leak_detector(&config.security, Some(&token));
-    let log_dir = workspace_root.join("logs");
+    // Build the leak detector (with both gateway tokens registered as
+    // `LeakAction::Replace` rules) BEFORE initialising tracing so log
+    // lines that accidentally echo either credential are masked on
+    // disk. Pass the same `Arc<LeakDetector>` into `build_managers` so
+    // the runtime graph's SecurityGateway uses the same rule set.
+    let leak_detector = runtime::build_leak_detector(
+        &config.security,
+        &[
+            ("gateway.admin_token", token.as_str()),
+            (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
+        ],
+    );
+    let log_dir = workspace_paths.logs_dir();
     let tracing_guards = init_tracing(TracingMode::File {
         log_dir: &log_dir,
         leak_detector: Arc::clone(&leak_detector),
     });
     let log_buffer = tracing_guards.log_buffer();
     tracing::info!(token_len = token.len(), "gateway token loaded from vault");
+    tracing::info!(
+        token_len = tui_token.len(),
+        "fresh TUI token published to vault"
+    );
 
     // Resolve the runtime gateway config up front so a bad `bind_address`
     // fails fast before we open libsql a second time.
@@ -274,6 +306,23 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // for auth, and the WS channel server re-reads it in the
     // Register-frame handshake via `GatewayDeps`.
     let channel_tokens = ChannelTokenTable::new();
+
+    // Register the TUI token with the freshly-published value. The
+    // returned handle is held for the rest of `start`, so the TUI
+    // entry stays live until shutdown drops it (which revokes the
+    // in-memory entry — the vault row is overwritten on next start).
+    let _tui_token_handle = channel_tokens.register(
+        tui_token.clone(),
+        ClientIdentity {
+            pid: std::process::id(),
+            label: TUI_CLIENT_LABEL.to_string(),
+            // None: TUI's channel-type binding is enforced via
+            // `TUI_CLIENT_LABEL` in the handshake, not via this
+            // field. Subprocess sidecars get `Some(channel_type)`
+            // from `ChannelSpawner::spawn`.
+            bound_channel_type: None,
+        },
+    );
 
     let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
 
@@ -321,16 +370,14 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Channel loopback-TCP listener — publishes its ephemeral port to
     // `<workspace>/channel.port` (same workspace identity dir as the
     // singleton lockfile) so TUI and sidecars can discover it without
-    // a config roundtrip. The PSK is derived with a per-install salt
-    // so two copies of the same release binary don't share an
-    // effective PSK across machines.
-    let port_file = workspace_root.join("channel.port");
-    let channel_server = {
-        let psk = effective_tui_psk(workspace_root.as_path())
-            .map_err(|e| anyhow::anyhow!("derive channel PSK: {e}"))?;
-        ChannelServer::bind(&deps, port_file.clone(), psk, channel_tokens.clone())
-            .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?
-    };
+    // a config roundtrip. The TUI authenticates with the per-start
+    // token published above; sidecars use the per-spawn capability
+    // tokens minted by `ChannelSpawner`. Both arrive through the same
+    // `ChannelTokenTable`, so the listener doesn't need any extra
+    // auth material at bind time.
+    let port_file = workspace_paths.channel_port();
+    let channel_server = ChannelServer::bind(&deps, port_file.clone(), channel_tokens.clone())
+        .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();
     let channel_url = format!("ws://127.0.0.1:{channel_port}/v1/channel-ws");
 
@@ -350,19 +397,20 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                     bun_version = aura_gateway::sidecar::bun_version(),
                     bun_target = runtime.bun_target(),
                     channel_port,
-                    "starting embedded sidecars",
+                    "sidecar supervisor active; channels start on first registered bot",
                 );
                 let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
                 let supervisor = SidecarSupervisor::new(
                     Arc::new(runtime),
                     spawner,
                     Arc::clone(&log_buffer),
-                    log_dir.join("channel"),
+                    workspace_paths.channel_logs_dir(),
                     Arc::clone(&leak_detector),
+                    graph.stores.channel_bot.clone(),
                 );
                 let sv_shutdown = shutdown.clone();
                 task_tracker.track(tokio::spawn(async move {
-                    supervisor.run(sv_shutdown, channel_types).await;
+                    supervisor.run(sv_shutdown).await;
                 }));
             }
         }

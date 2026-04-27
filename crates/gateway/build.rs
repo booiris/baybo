@@ -340,25 +340,43 @@ const ZSTD_LEVEL: i32 = 19;
 fn embed_sidecars(ws_root: &Path) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
     let generated = out_dir.join("sidecar_assets.rs");
+    let strict = sidecars_required();
 
     let bun_version = match read_bun_version(ws_root) {
         Ok(v) => v,
         Err(e) => {
-            println!("cargo:warning={e}");
+            sidecar_failure(strict, &e);
             write_empty_sidecar_assets(&generated, "unknown", "unknown");
             return;
         }
     };
 
     emit_rerun_if_changed(&ws_root.join(".bun-version"));
+    println!("cargo:rerun-if-env-changed={STRICT_SIDECARS_ENV}");
 
-    let Some(target) = detect_bun_target() else {
-        println!(
-            "cargo:warning=unsupported host for bun (os={}, arch={}); sidecars disabled",
+    // `host_target` is the bun build needs to actually exec on this
+    // machine to bundle TS → JS. `runtime_target` is the bun we ship
+    // inside the binary so it can exec on the final aura host.
+    // Conflating the two silently broke `cargo build --target ≠ host`
+    // (host couldn't exec the target binary, bundling failed, build
+    // succeeded with empty sidecars).
+    let Some(host_target) = detect_host_bun_target() else {
+        let msg = format!(
+            "unsupported build host for bun (os={}, arch={}); sidecars disabled",
             std::env::consts::OS,
             std::env::consts::ARCH,
         );
-        write_empty_sidecar_assets(&generated, &bun_version, "unsupported");
+        sidecar_failure(strict, &msg);
+        write_empty_sidecar_assets(&generated, &bun_version, "unsupported-host");
+        return;
+    };
+    let Some(runtime_target) = detect_runtime_bun_target() else {
+        let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let msg =
+            format!("unsupported runtime target for bun (os={os}, arch={arch}); sidecars disabled");
+        sidecar_failure(strict, &msg);
+        write_empty_sidecar_assets(&generated, &bun_version, "unsupported-target");
         return;
     };
 
@@ -366,14 +384,19 @@ fn embed_sidecars(ws_root: &Path) {
     let sidecars_dir = ws_root.join("channel-src");
     let sidecar_dirs = list_sidecar_dirs(&sidecars_dir);
     let cache_root = ws_root.join("target").join("sidecar-cache");
-    let input_fingerprint =
-        match sidecar_input_fingerprint(ws_root, &bun_version, &target, &sidecar_dirs) {
-            Ok(fingerprint) => fingerprint,
-            Err(e) => {
-                println!("cargo:warning=hash sidecar inputs failed ({e}); rebuilding sidecars");
-                String::new()
-            }
-        };
+    let input_fingerprint = match sidecar_input_fingerprint(
+        ws_root,
+        &bun_version,
+        &host_target,
+        &runtime_target,
+        &sidecar_dirs,
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(e) => {
+            println!("cargo:warning=hash sidecar inputs failed ({e}); rebuilding sidecars");
+            String::new()
+        }
+    };
     let cache_dir = cache_root.join(if input_fingerprint.is_empty() {
         "adhoc".to_string()
     } else {
@@ -386,7 +409,7 @@ fn embed_sidecars(ws_root: &Path) {
                 emit_sidecar_assets(
                     &generated,
                     &bun_version,
-                    &target,
+                    &runtime_target,
                     Some(cache.bun_zst.as_path()),
                     &cache.sidecars,
                 );
@@ -399,25 +422,43 @@ fn embed_sidecars(ws_root: &Path) {
         }
     }
 
-    let bun_binary = match ensure_bun(ws_root, &bun_version, &target) {
+    let host_bun = match ensure_bun(ws_root, &bun_version, &host_target) {
         Ok(p) => p,
         Err(e) => {
-            println!("cargo:warning=bun download failed ({e}); sidecars disabled");
-            write_empty_sidecar_assets(&generated, &bun_version, &target);
+            let msg = format!("host bun download failed ({e}); sidecars disabled");
+            sidecar_failure(strict, &msg);
+            write_empty_sidecar_assets(&generated, &bun_version, &runtime_target);
             return;
+        }
+    };
+    let runtime_bun = if runtime_target == host_target {
+        host_bun.clone()
+    } else {
+        match ensure_bun(ws_root, &bun_version, &runtime_target) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!(
+                    "runtime bun download failed for {runtime_target} ({e}); sidecars disabled"
+                );
+                sidecar_failure(strict, &msg);
+                write_empty_sidecar_assets(&generated, &bun_version, &runtime_target);
+                return;
+            }
         }
     };
 
     if let Err(e) = fs::create_dir_all(&cache_dir) {
-        println!(
-            "cargo:warning=create sidecar cache dir {} failed: {e}",
+        let msg = format!(
+            "create sidecar cache dir {} failed: {e}",
             cache_dir.display()
         );
-        write_empty_sidecar_assets(&generated, &bun_version, &target);
+        sidecar_failure(strict, &msg);
+        write_empty_sidecar_assets(&generated, &bun_version, &runtime_target);
         return;
     }
 
     let mut entries: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut bundling_failures = 0usize;
     for dir in &sidecar_dirs {
         let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("?");
         let entry_ts = dir.join("src/index.ts");
@@ -426,24 +467,32 @@ fn embed_sidecars(ws_root: &Path) {
             continue;
         }
         let bundle_path = cache_dir.join(format!("{name}.js"));
-        match bundle_with_bun(&bun_binary, &entry_ts, &bundle_path) {
+        match bundle_with_bun(&host_bun, &entry_ts, &bundle_path) {
             Ok(()) => {
                 let hash = sha256_hex(&bundle_path);
                 entries.push((name.to_string(), bundle_path, hash));
             }
             Err(e) => {
-                println!("cargo:warning=bundling sidecar '{name}' failed: {e}");
+                bundling_failures += 1;
+                let msg = format!("bundling sidecar '{name}' failed: {e}");
+                sidecar_failure(strict, &msg);
             }
         }
+    }
+    if strict && bundling_failures > 0 {
+        // sidecar_failure has already paniced above, but defensively
+        // bail before we ship a partial set.
+        panic!("{STRICT_SIDECARS_ENV} is set but {bundling_failures} sidecar(s) failed to bundle",);
     }
 
     // Compress bun + each bundle into the content-addressed sidecar
     // cache. The generated Rust then points `include_bytes!` at those
     // absolute paths.
     let bun_zst = cache_dir.join("bun.zst");
-    if let Err(e) = compress_file(&bun_binary, &bun_zst) {
-        println!("cargo:warning=compress bun runtime failed: {e}");
-        write_empty_sidecar_assets(&generated, &bun_version, &target);
+    if let Err(e) = compress_file(&runtime_bun, &bun_zst) {
+        let msg = format!("compress bun runtime failed: {e}");
+        sidecar_failure(strict, &msg);
+        write_empty_sidecar_assets(&generated, &bun_version, &runtime_target);
         return;
     }
 
@@ -451,7 +500,8 @@ fn embed_sidecars(ws_root: &Path) {
     for (name, bundle, hash) in &entries {
         let zst_path = cache_dir.join(format!("{name}.js.zst"));
         if let Err(e) = compress_file(bundle, &zst_path) {
-            println!("cargo:warning=compress sidecar '{name}' failed: {e}");
+            let msg = format!("compress sidecar '{name}' failed: {e}");
+            sidecar_failure(strict, &msg);
             continue;
         }
         emitted.push((name.clone(), zst_path, hash.clone()));
@@ -463,7 +513,34 @@ fn embed_sidecars(ws_root: &Path) {
         println!("cargo:warning=write sidecar cache manifest failed: {e}");
     }
 
-    emit_sidecar_assets(&generated, &bun_version, &target, Some(&bun_zst), &emitted);
+    emit_sidecar_assets(
+        &generated,
+        &bun_version,
+        &runtime_target,
+        Some(&bun_zst),
+        &emitted,
+    );
+}
+
+/// Opt-in CI/release gate: when set to `1`/`true`, any sidecar
+/// packaging failure becomes a hard build error instead of a
+/// `cargo:warning` + empty-asset degrade. The gateway binary boots fine
+/// without sidecars during local backend hacking, but a release build
+/// with no embedded channels is almost always a packaging mistake.
+const STRICT_SIDECARS_ENV: &str = "AURA_REQUIRE_SIDECARS";
+
+fn sidecars_required() -> bool {
+    matches!(
+        std::env::var(STRICT_SIDECARS_ENV).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    )
+}
+
+fn sidecar_failure(strict: bool, msg: &str) {
+    if strict {
+        panic!("{STRICT_SIDECARS_ENV}=1 and sidecar packaging failed: {msg}");
+    }
+    println!("cargo:warning={msg}");
 }
 
 fn read_bun_version(ws_root: &Path) -> Result<String, String> {
@@ -482,13 +559,23 @@ fn read_bun_version(ws_root: &Path) -> Result<String, String> {
     Ok(trimmed.trim_start_matches('v').to_owned())
 }
 
-/// Map the cargo **target** triple (not the host) onto bun's release
-/// naming. The embedded bun must match the architecture the final
-/// aura binary will run on, which is always `TARGET`.
-fn detect_bun_target() -> Option<String> {
+/// bun release naming for the **host** that runs `build.rs` — i.e.
+/// the bun we'll exec to bundle TS → JS at compile time.
+fn detect_host_bun_target() -> Option<String> {
+    bun_target(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// bun release naming for the cargo **target** triple — i.e. the bun
+/// we compress into the binary so it can exec on the final aura host.
+/// Different from the host when cross-compiling.
+fn detect_runtime_bun_target() -> Option<String> {
     let os = std::env::var("CARGO_CFG_TARGET_OS").ok()?;
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").ok()?;
-    match (os.as_str(), arch.as_str()) {
+    bun_target(&os, &arch)
+}
+
+fn bun_target(os: &str, arch: &str) -> Option<String> {
+    match (os, arch) {
         ("linux", "x86_64") => Some("linux-x64".into()),
         ("linux", "aarch64") => Some("linux-aarch64".into()),
         ("macos", "x86_64") => Some("darwin-x64".into()),
@@ -640,7 +727,8 @@ fn list_sidecar_dirs(root: &Path) -> Vec<PathBuf> {
 fn sidecar_input_fingerprint(
     ws_root: &Path,
     bun_version: &str,
-    target: &str,
+    host_target: &str,
+    runtime_target: &str,
     sidecar_dirs: &[PathBuf],
 ) -> Result<String, String> {
     let input_roots = sidecar_input_roots(ws_root, sidecar_dirs);
@@ -663,7 +751,9 @@ fn sidecar_input_fingerprint(
     let mut hasher = Sha256::new();
     hasher.update(bun_version.as_bytes());
     hasher.update([0]);
-    hasher.update(target.as_bytes());
+    hasher.update(host_target.as_bytes());
+    hasher.update([0]);
+    hasher.update(runtime_target.as_bytes());
     hasher.update([0]);
     for path in &input_roots {
         hash_path_state(&mut hasher, ws_root, path)?;

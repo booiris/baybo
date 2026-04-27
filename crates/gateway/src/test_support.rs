@@ -12,11 +12,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::auth::ChannelTokenTable;
 use aura_agent::service::ShutdownSignal;
 use aura_agent::{CronScheduler, JobManager, MemoryManager, SessionManager};
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, SecretVault};
 use aura_skills::SkillRegistry;

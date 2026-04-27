@@ -184,11 +184,14 @@ none of those exist on the TUI side.
    `with_session_id`. The gateway's router auto-creates the session on
    the first inbound frame via `SessionManager::get_or_create`, so no
    REST round-trip is needed to provision one.
-5. **Connect the WS channel** — dial `/v1/channel-ws` with the
-   `x-aura-tui-secret` header carrying the effective PSK, send
-   `Frame::Register { channel_type: "tui", protocol_version, token:
-   "", session_id: Some(<this-process-session>) }`, and wait for
-   `RegisterAck { ok: true }`. Pinning the TUI's session into the
+5. **Connect the WS channel** — read the per-start TUI token from
+   the secret vault under the key
+   `aura_gateway::TUI_TOKEN_VAULT_KEY` ("gateway.tui_token"),
+   dial `/v1/channel-ws` with the shared `x-aura-channel-token`
+   header carrying that value, send `Frame::Register { channel_type:
+   "tui", protocol_version, token: "", session_id:
+   Some(<this-process-session>) }`, and wait for `RegisterAck { ok:
+   true }`. Pinning the TUI's session into the
    handshake is what lets multiple `aura tui` processes coexist on
    the same gateway — the `ChannelRegistry` routes events for that
    session to this connection only. The gateway rejects a TUI

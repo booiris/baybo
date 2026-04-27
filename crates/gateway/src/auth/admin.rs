@@ -102,7 +102,7 @@ pub async fn require_admin_token(
     let Some(presented) = extract_token(&req) else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    if !aura_gateway_auth::constant_time_eq(state.expected.as_bytes(), presented.as_bytes()) {
+    if !super::token::constant_time_eq(state.expected.as_bytes(), presented.as_bytes()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     if let Some(sanitised) = sanitise_uri(req.uri()) {

@@ -4,13 +4,15 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aura-workspace = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# Mirror contract tests only. The library itself is leaf-level and keeps no
-# runtime dependency on aura-* crates.
+# Mirror contract tests only. The library has no runtime aura-* dep beyond
+# `aura-workspace` (paths only — `default-features = false` keeps the I/O
+# layer out of the dep graph).
 aura-model = { workspace = true }
 aura-tools = { workspace = true }

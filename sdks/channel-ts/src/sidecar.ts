@@ -1,5 +1,10 @@
 import { RunnerError, type Channel, type RunOptions } from "./channel.js";
 import { defaultLogger, type WireCapableLogger } from "./logger.js";
+import {
+  runRegistration,
+  type RegistrationContext,
+  type RegistrationResult,
+} from "./register.js";
 import { runChannel } from "./runner.js";
 
 /**
@@ -36,6 +41,16 @@ export interface SidecarOptions {
    * directly if you need that level of control.
    */
   runOptions?: Omit<RunOptions, "abortSignal" | "logger">;
+
+  /**
+   * One-shot registration hook. When the bundle is spawned with
+   * `AURA_CHANNEL_MODE=register` the sidecar skips the normal
+   * `build`/`runChannel` path and instead runs this function over a
+   * stdin/stdout JSON protocol. Human-visible output (QR, progress)
+   * should go to `process.stderr`; stdout is reserved for protocol
+   * frames.
+   */
+  register(ctx: RegistrationContext): Promise<RegistrationResult>;
 }
 
 /**
@@ -70,6 +85,23 @@ export interface SidecarOptions {
  * `process.exit`.
  */
 export async function runSidecar(opts: SidecarOptions): Promise<never> {
+  if (process.env["AURA_CHANNEL_MODE"] === "register") {
+    if (!opts.register) {
+      const line =
+        JSON.stringify({
+          type: "error",
+          message: `${opts.channelType}: no register hook declared`,
+        }) + "\n";
+      process.stdout.write(line, () => process.exit(1));
+      return new Promise<never>(() => { });
+    }
+    await runRegistration(opts.register);
+    // runRegistration is `Promise<never>` — it always exits — but guard
+    // against future loosening so we never fall through into runChannel
+    // after a successful registration.
+    return new Promise<never>(() => { });
+  }
+
   const logger = defaultLogger(opts.channelType);
   const controller = new AbortController();
 

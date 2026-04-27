@@ -44,35 +44,47 @@ use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
+use aura_tools::mcp::McpReconciler;
 use aura_workspace::WorkspaceManager;
 use parking_lot::Mutex;
 use regex::Regex;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::boot;
 
-/// Build a [`LeakDetector`] seeded from config, optionally registering an
-/// extra `LeakAction::Replace` rule for the gateway admin token so any
-/// log line that happens to echo it is masked on disk. The same `Arc` is
-/// then shared between the tracing file redactor and [`build_managers`],
-/// keeping redaction coverage consistent across every log surface.
+/// Build a [`LeakDetector`] seeded from config, optionally registering
+/// extra `LeakAction::Replace` rules for the listed gateway-owned
+/// tokens so any log line that happens to echo them is masked on disk.
+/// The same `Arc` is then shared between the tracing file redactor and
+/// [`build_managers`], keeping redaction coverage consistent across
+/// every log surface.
+///
+/// Each entry in `gateway_tokens` is a `(name, token)` tuple where
+/// `name` becomes the rule name (used for diagnostics) and `token` is
+/// the literal value to redact. Empty token strings are skipped.
 pub fn build_leak_detector(
     security: &aura_config::SecurityConfig,
-    gateway_admin_token: Option<&str>,
+    gateway_tokens: &[(&str, &str)],
 ) -> Arc<LeakDetector> {
     let mut detector = boot::build_leak_detector(security);
-    if let Some(token) = gateway_admin_token
-        && !token.is_empty()
-    {
+    for (name, token) in gateway_tokens {
+        if token.is_empty() {
+            continue;
+        }
         match Regex::new(&regex::escape(token)) {
             Ok(pattern) => detector.add_rule(LeakDetectionRule {
-                name: "gateway.admin_token".into(),
+                name: (*name).into(),
                 pattern,
                 action: aura_security::LeakAction::Replace,
             }),
             Err(e) => {
-                tracing::warn!(error = %e, "failed to compile gateway token redaction rule");
+                tracing::warn!(
+                    error = %e,
+                    rule = %name,
+                    "failed to compile gateway token redaction rule",
+                );
             }
         }
     }
@@ -123,8 +135,8 @@ pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<Secre
 
 /// Open the libsql store and return the vault + full [`Store`] handle
 /// for CLI subcommands that manage per-channel credentials
-/// (`aura channel add/remove/bots`) or per-user pairings
-/// (`aura pair list/approve/revoke`). The returned [`Store`] is clonable
+/// (`aura channel list/add/remove`) or per-user pairings
+/// (`aura pair list/approve/revoke`). The returned [`Store`] is cloneable
 /// and its fields share a single libsql connection, so CLI writes land
 /// atomically in the same file the gateway reads from.
 pub async fn build_bot_registry_deps(
@@ -159,7 +171,7 @@ pub struct ManagerGraph {
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
-    /// Clonable bundle of every libsql-backed store handle. Keeping the
+    /// Cloneable bundle of every libsql-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
     /// pick it up via `stores.xxx` without a new field here.
@@ -184,10 +196,12 @@ pub async fn build_managers(
     leak_detector: Arc<LeakDetector>,
 ) -> anyhow::Result<ManagerGraph> {
     // --- minimal services shared by every mode
-    let workspace_root = std::path::PathBuf::from(&config.workspace.path);
+    let workspace_paths =
+        aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
+    let workspace_root = workspace_paths.root().to_path_buf();
     let skill_registry = {
         let reg = Arc::new(SkillRegistry::new());
-        let workspace_skills = workspace_root.join("skills");
+        let workspace_skills = workspace_paths.skills_dir();
         let loaded = reg.load_dir(&workspace_skills);
         if loaded > 0 {
             info!(
@@ -278,15 +292,102 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
+    let sandbox_runner = match aura_sandbox::current_platform_runner() {
+        Ok(r) => match r.warm().await {
+            Ok(()) => {
+                info!(backend = ?r.backend(), "OS sandbox ready");
+                Some(r)
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    backend = ?r.backend(),
+                    "sandbox warm-up failed; ExecCommand tools will be refused",
+                );
+                None
+            }
+        },
+        Err(
+            e @ (aura_sandbox::SandboxError::BackendMissing { .. }
+            | aura_sandbox::SandboxError::BackendUnreachable { .. }
+            | aura_sandbox::SandboxError::NoBackendAvailable),
+        ) => {
+            error!(error = %e, "OS sandbox unavailable; ExecCommand tools will be refused");
+            None
+        }
+        Err(e) => {
+            return Err(e.into());
+        }
+    };
+
+    // --- code-builder tool: needs the LLM client (for codegen), the
+    // sandbox runner (to execute generated code under per-call caps),
+    // and the leak detector + vault so revealed tool args can be
+    // re-sanitized before they reach the nested planning LLM. Skip
+    // registration if the sandbox is unavailable — CodeBuilder would
+    // refuse every call without it.
+    if let Some(runner) = sandbox_runner.as_ref() {
+        let reg = Arc::get_mut(&mut tool_registry)
+            .expect("tool_registry has no other owners at this point");
+        let llm: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&llm_client) as _;
+        let (tool, manifest) = aura_code_builder::agent_tool(
+            llm,
+            Arc::clone(runner),
+            Arc::clone(&leak_detector),
+            Arc::clone(&secret_vault),
+        );
+        reg.register(tool, manifest);
+    } else {
+        tracing::warn!("CodeBuilder tool not registered: OS sandbox unavailable");
+    }
+
+    // Sandbox FS scope is the workspace `work/` directory — the gitignored
+    // scratch root for tool-generated files. `ensure_layout` creates this
+    // before `build_managers` runs. Canonicalize so symlink-vs-real-path
+    // comparisons in the adapter line up with paths the tool may produce.
+    let work_dir = workspace_paths.work_dir();
+    let sandbox_root = work_dir.canonicalize().unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            path = %work_dir.display(),
+            "failed to canonicalize sandbox work dir; using literal path",
+        );
+        work_dir
+    });
+    info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         boot::to_tool_timeout(&config.tools),
         gate_map,
         Arc::clone(&security_gateway),
+        sandbox_root,
+        sandbox_runner,
     ));
 
     let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
     let hook_manager = Arc::new(HookManager::new());
+
+    // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
+    // dynamically registers/unregisters MCP-discovered tools. Bridge the
+    // shared `ShutdownSignal` to a `CancellationToken` since the
+    // reconciler lives in `aura-tools`, which doesn't depend on
+    // `aura-agent`.
+    let mcp_cancel = CancellationToken::new();
+    {
+        let signal = shutdown.clone();
+        let cancel_on_shutdown = mcp_cancel.clone();
+        tokio::spawn(async move {
+            signal.wait().await;
+            cancel_on_shutdown.cancel();
+        });
+    }
+    let mcp_reconciler = McpReconciler::new(
+        workspace_root.clone(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&secret_vault),
+        mcp_cancel,
+    );
+    mcp_reconciler.spawn();
 
     Ok(ManagerGraph {
         config,

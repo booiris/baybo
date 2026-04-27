@@ -7,14 +7,16 @@
 //! actually handed to the tool (critical for tool-arg reveal/sanitize
 //! boundary tests).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::TrustLevel;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolManifest, ToolOutput};
+use crate::{ExecSandbox, SandboxedOutput, Tool, ToolContext, ToolManifest, ToolOutput};
 
 /// `Tool` that returns its serialized parameters as text. Trust level
 /// is `Trusted` by default so the tool isn't blocked by approval gates
@@ -116,11 +118,71 @@ impl Tool for RecordingTool {
     }
 }
 
+/// `ExecSandbox` that records calls and returns canned output. Used by
+/// downstream tests that want to exercise tools declaring `ExecCommand`
+/// capability without requiring a real backend binary on the host.
+#[derive(Clone, Default)]
+pub struct FakeExecSandbox {
+    calls: Arc<Mutex<Vec<FakeSandboxCall>>>,
+    response: Arc<Mutex<SandboxedOutput>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FakeSandboxCall {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub stdin: Option<Vec<u8>>,
+    pub timeout: Duration,
+}
+
+impl FakeExecSandbox {
+    pub fn new() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            response: Arc::new(Mutex::new(SandboxedOutput {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                timed_out: false,
+            })),
+        }
+    }
+
+    pub fn set_response(&self, output: SandboxedOutput) {
+        *self.response.lock() = output;
+    }
+
+    pub fn calls(&self) -> Vec<FakeSandboxCall> {
+        self.calls.lock().clone()
+    }
+}
+
+#[async_trait]
+impl ExecSandbox for FakeExecSandbox {
+    async fn spawn_command(
+        &self,
+        program: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+    ) -> crate::Result<SandboxedOutput> {
+        self.calls.lock().push(FakeSandboxCall {
+            program: program.to_path_buf(),
+            args: args.to_vec(),
+            cwd: cwd.map(Path::to_path_buf),
+            stdin: stdin.map(<[u8]>::to_vec),
+            timeout,
+        });
+        Ok(self.response.lock().clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aura_model::{ChannelType, User};
-    use std::time::Duration;
 
     fn ctx() -> ToolContext {
         ToolContext {
@@ -132,6 +194,9 @@ mod tests {
             },
             timeout: Duration::from_secs(5),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
+            workspace_root: PathBuf::from("/tmp"),
+            sandbox: None,
+            approval: None,
         }
     }
 

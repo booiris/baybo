@@ -1,12 +1,41 @@
-//! One-shot tokens for subprocess-spawned channel clients.
+//! Channel-listener token primitives shared by the gateway server, the
+//! bundled TUI, and the bin's `aura gateway` / `aura tui` boot paths.
+//!
+//! Two flavours of token end up in the same [`ChannelTokenTable`]:
+//!
+//! * **TUI token** — generated when the gateway boots, stashed in the
+//!   secret vault under [`TUI_TOKEN_VAULT_KEY`], and registered with
+//!   the reserved [`TUI_CLIENT_LABEL`]. The bundled `aura tui` reads
+//!   it from the vault and presents it on the channel WebSocket
+//!   upgrade in [`CHANNEL_TOKEN_HEADER`]. The gateway holds the
+//!   returned [`TokenHandle`] for its whole lifetime so the token is
+//!   revoked from the live table on shutdown.
+//! * **Subprocess capability tokens** — generated when the gateway
+//!   spawns a channel sidecar, handed to the child via env var, and
+//!   revoked when the owning [`crate::spawn::ChildHandle`] (which
+//!   holds the [`TokenHandle`]) drops.
 
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use rand::Rng;
 
-/// HTTP header the child sends to present its one-shot token.
+/// HTTP header the child or TUI sends to present its capability token.
 pub const CHANNEL_TOKEN_HEADER: &str = "x-aura-channel-token";
+
+/// Reserved [`ClientIdentity::label`] value the gateway uses when it
+/// registers the bundled-TUI token at startup. The auth middleware uses
+/// this constant to distinguish a TUI-flavoured connection from a
+/// subprocess sidecar connection — no other client may register under
+/// this label.
+pub const TUI_CLIENT_LABEL: &str = "tui";
+
+/// Secret-vault key under which the gateway publishes the current
+/// generation of the TUI channel token. Rotated on every `aura
+/// gateway start`; the bundled `aura tui` reads it back from the vault
+/// to authenticate against the channel listener. Both ends must agree
+/// on the key, hence pinning it here.
+pub const TUI_TOKEN_VAULT_KEY: &str = "gateway.tui_token";
 
 const TOKEN_BYTES: usize = 32;
 
@@ -14,9 +43,20 @@ const TOKEN_BYTES: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientIdentity {
     /// Owning subprocess PID, returned by [`tokio::process::Child::id`].
+    /// Gateway-owned credentials (the bundled TUI) report the gateway's
+    /// own pid here for diagnostic symmetry.
     pub pid: u32,
-    /// Operator-visible label for the client (e.g. "telegram", "discord").
+    /// Operator-visible label for the client (e.g. "sidecar-telegram",
+    /// "sidecar-discord", or [`TUI_CLIENT_LABEL`]).
     pub label: String,
+    /// When `Some(ct)`, the bearer of this token may *only* register
+    /// as channel type `ct`. The handshake rejects any other claimed
+    /// type so a compromised sidecar can't impersonate a different
+    /// channel and trick the gateway into pushing that channel's bot
+    /// secrets to it. `None` for the gateway-issued TUI token: the
+    /// TUI's channel type is enforced via [`TUI_CLIENT_LABEL`] in the
+    /// handshake instead.
+    pub bound_channel_type: Option<String>,
 }
 
 /// In-memory registry of active subprocess tokens keyed by the token
@@ -100,8 +140,9 @@ pub fn generate_token() -> String {
     hex::encode(bytes)
 }
 
-/// Constant-time equality on byte slices. Exposed here because both the
-/// PSK compare and the token compare live in the auth middleware.
+/// Constant-time equality on byte slices. Exposed here so callers
+/// outside the auth middleware can reuse the same compare helper for
+/// any other token-shaped credential without pulling in `subtle`.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -121,6 +162,7 @@ mod tests {
         ClientIdentity {
             pid,
             label: label.into(),
+            bound_channel_type: None,
         }
     }
 

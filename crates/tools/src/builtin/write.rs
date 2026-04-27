@@ -86,6 +86,9 @@ mod tests {
             },
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
+            workspace_root: std::path::PathBuf::from("/tmp"),
+            sandbox: None,
+            approval: None,
         }
     }
 

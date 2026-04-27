@@ -91,7 +91,7 @@ The dev fallback for the encryption key is intentional but explicit: a fresh che
 
 ## What boot does NOT do
 
-- **No MCP server registration** — MCP support (and the `tools.mcp_servers[]` config surface) is temporarily removed; see `docs/todo/reintroduce-mcp-support.md`.
+- **No bootstrap-time MCP wiring beyond launching the reconciler.** MCP servers themselves are configured in `<workspace>/.mcp.json`, owned by `aura-tools::mcp` (not `aura-config`). `runtime::build_managers` only spawns the `McpReconciler`; the reconciler reads `.mcp.json` itself on each tick and connects/disconnects servers + registers their tools dynamically.
 - **No compiled-in channel adapters.** `ChannelRegistry` starts empty. Every channel — the bundled TUI and any sidecar plugin — arrives at runtime as a `/v1/channel-ws` client and registers itself from the gateway's route task. `channels.{http, telegram, discord}` in `aura.json` are validated but not yet wired.
 - **No cost guard or rate limiter** — `cost.*` is validated but not yet consumed by the running router.
 

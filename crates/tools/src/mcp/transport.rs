@@ -1,0 +1,207 @@
+use std::collections::HashMap;
+use std::process::Stdio;
+use std::sync::Arc;
+
+use aura_security::SecretVault;
+use reqwest::header::{HeaderName, HeaderValue};
+use rmcp::ServiceExt;
+use rmcp::model::Tool as RmcpTool;
+use rmcp::service::{Peer, RoleClient, RunningService};
+use rmcp::transport::auth::{AuthClient, AuthorizationManager, CredentialStore, OAuthClientConfig};
+use rmcp::transport::child_process::TokioChildProcess;
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
+use serde_json::Value;
+use tokio::process::Command;
+
+use crate::mcp::config::{McpServerEntry, McpTransportConfig};
+use crate::mcp::credentials::VaultCredentialStore;
+use crate::mcp::error::{McpError, McpResult};
+use crate::mcp::vault_keys;
+
+pub struct McpServerSession {
+    running: RunningService<RoleClient, ()>,
+    tools: Vec<RmcpTool>,
+}
+
+impl McpServerSession {
+    pub fn peer(&self) -> Peer<RoleClient> {
+        self.running.peer().clone()
+    }
+
+    pub fn tools(&self) -> &[RmcpTool] {
+        &self.tools
+    }
+
+    pub async fn shutdown(self) {
+        let _ = self.running.cancel().await;
+    }
+}
+
+pub async fn connect(
+    entry: &McpServerEntry,
+    vault: &Arc<SecretVault>,
+) -> McpResult<McpServerSession> {
+    let running = match &entry.transport {
+        McpTransportConfig::Stdio { command, args } => {
+            connect_stdio(&entry.name, command, args, vault).await?
+        }
+        McpTransportConfig::Http { url } => connect_http(&entry.name, url, vault).await?,
+    };
+
+    let tools = running
+        .peer()
+        .list_all_tools()
+        .await
+        .map_err(|e| McpError::Protocol(format!("list_all_tools: {e}")))?;
+
+    Ok(McpServerSession { running, tools })
+}
+
+async fn connect_stdio(
+    server_name: &str,
+    command: &str,
+    args: &[String],
+    vault: &Arc<SecretVault>,
+) -> McpResult<RunningService<RoleClient, ()>> {
+    let env = load_string_map(vault, &vault_keys::env_bag(server_name)).await?;
+
+    let mut tokio_cmd = Command::new(command);
+    tokio_cmd
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear();
+    for var in ["PATH", "HOME", "LANG", "TZ", "TMPDIR"] {
+        if let Ok(value) = std::env::var(var) {
+            tokio_cmd.env(var, value);
+        }
+    }
+    for (k, v) in std::env::vars() {
+        if k.starts_with("LC_") {
+            tokio_cmd.env(k, v);
+        }
+    }
+    for (k, v) in env {
+        tokio_cmd.env(k, v);
+    }
+
+    let (process, _stderr) = TokioChildProcess::builder(tokio_cmd)
+        .spawn()
+        .map_err(|e| McpError::Transport(format!("spawn '{command}': {e}")))?;
+
+    ().serve(process)
+        .await
+        .map_err(|e| McpError::Connection(e.to_string()))
+}
+
+async fn connect_http(
+    server_name: &str,
+    url: &str,
+    vault: &Arc<SecretVault>,
+) -> McpResult<RunningService<RoleClient, ()>> {
+    let headers = load_string_map(vault, &vault_keys::header_bag(server_name)).await?;
+
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+    if !headers.is_empty() {
+        let mut as_hashmap: HashMap<HeaderName, HeaderValue> = HashMap::new();
+        for (name, value) in headers {
+            let header_name: HeaderName = name
+                .parse()
+                .map_err(|e| McpError::Transport(format!("invalid header name '{name}': {e}")))?;
+            let header_value: HeaderValue = value
+                .parse()
+                .map_err(|e| McpError::Transport(format!("invalid header value: {e}")))?;
+            as_hashmap.insert(header_name, header_value);
+        }
+        config = config.custom_headers(as_hashmap);
+    }
+
+    let creds_store = VaultCredentialStore::new(Arc::clone(vault), server_name);
+    let has_creds = creds_store
+        .load()
+        .await
+        .map_err(|e| McpError::OAuth(format!("read stored credentials: {e}")))?
+        .is_some();
+
+    if has_creds {
+        // OAuth path: AuthClient injects the bearer token per-request and
+        // refreshes transparently when the cached access token expires —
+        // the rotated tokens land back in the vault via VaultCredentialStore.
+        let mut manager = AuthorizationManager::new(url)
+            .await
+            .map_err(|e| McpError::OAuth(format!("oauth manager init: {e}")))?;
+        manager.set_credential_store(VaultCredentialStore::new(Arc::clone(vault), server_name));
+        manager
+            .initialize_from_store()
+            .await
+            .map_err(|e| McpError::OAuth(format!("load credentials from vault: {e}")))?;
+
+        // For confidential clients, `initialize_from_store` only sets the
+        // client_id (StoredCredentials does not carry the secret). Re-attach
+        // the secret from the vault so the refresh-token grant authenticates
+        // — without this, the access token rotates fine until first expiry
+        // and then every request 401s until the operator re-runs `aura
+        // mcp add`.
+        if let Some(secret) = vault
+            .get_secret(&vault_keys::oauth_client_secret(server_name))
+            .await
+            .map_err(|e| McpError::OAuth(format!("read oauth client secret: {e}")))?
+        {
+            let secret = String::from_utf8(secret.as_bytes().to_vec())
+                .map_err(|e| McpError::OAuth(format!("oauth client secret is not utf-8: {e}")))?;
+            let (client_id, _) = manager
+                .get_credentials()
+                .await
+                .map_err(|e| McpError::OAuth(format!("read client id from store: {e}")))?;
+            // The redirect_uri is required by the oauth2 builder but is
+            // never used during a refresh-token grant — the placeholder
+            // here matches what rmcp uses for non-redirect flows.
+            let client_config =
+                OAuthClientConfig::new(&client_id, "http://localhost").with_client_secret(secret);
+            manager
+                .configure_client(client_config)
+                .map_err(|e| McpError::OAuth(format!("attach client secret for refresh: {e}")))?;
+        }
+
+        let auth_client = AuthClient::new(reqwest::Client::new(), manager);
+        let transport = StreamableHttpClientTransport::with_client(auth_client, config);
+        ().serve(transport)
+            .await
+            .map_err(|e| McpError::Connection(e.to_string()))
+    } else {
+        // No OAuth: plain reqwest client. Static-bearer / API-key servers
+        // get their auth via the `--header` bag, which is already in
+        // `config.custom_headers`.
+        let client = reqwest::Client::new();
+        let transport = StreamableHttpClientTransport::with_client(client, config);
+        ().serve(transport)
+            .await
+            .map_err(|e| McpError::Connection(e.to_string()))
+    }
+}
+
+async fn load_string_map(vault: &Arc<SecretVault>, key: &str) -> McpResult<Vec<(String, String)>> {
+    let secret = vault
+        .get_secret(key)
+        .await
+        .map_err(|e| McpError::OAuth(format!("read vault key '{key}': {e}")))?;
+    let Some(secret) = secret else {
+        return Ok(Vec::new());
+    };
+    let value: Value = serde_json::from_slice(secret.as_bytes())
+        .map_err(|e| McpError::OAuth(format!("decode vault key '{key}': {e}")))?;
+    let map = value.as_object().ok_or_else(|| {
+        McpError::OAuth(format!("vault key '{key}' did not contain a JSON object"))
+    })?;
+    let mut out = Vec::with_capacity(map.len());
+    for (k, v) in map {
+        let s = v
+            .as_str()
+            .ok_or_else(|| McpError::OAuth(format!("vault key '{key}.{k}' is not a string")))?;
+        out.push((k.clone(), s.to_string()));
+    }
+    Ok(out)
+}

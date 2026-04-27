@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     // practice.
     if let Some(path) = cli.global.config.as_deref() {
         unsafe {
-            std::env::set_var("AURA_CONFIG_PATH", path);
+            std::env::set_var(aura_workspace::paths::ENV_CONFIG_PATH, path);
         }
     }
 
@@ -73,7 +73,12 @@ async fn main() -> anyhow::Result<()> {
 
     let config = boot::load_config().await?;
     let config = Arc::new(config);
-    let workspace_root = PathBuf::from(&config.workspace.path);
+    let workspace_paths =
+        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
+    let workspace_root = workspace_paths.root().to_path_buf();
+    aura_workspace::WorkspaceManager::new(workspace_root.clone())
+        .ensure_layout()
+        .await?;
 
     // TUI: ratatui owns stdout, so tracing goes to a rolling file under
     // `<workspace>/logs/` (redacted through the shared `LeakDetector`)
@@ -107,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
 
     let skill_registry = {
         let reg = Arc::new(aura_skills::SkillRegistry::new());
-        let workspace_skills = workspace_root.join("skills");
+        let workspace_skills = workspace_paths.skills_dir();
         let loaded = reg.load_dir(&workspace_skills);
         if loaded > 0 {
             info!(

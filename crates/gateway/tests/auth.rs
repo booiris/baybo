@@ -1,12 +1,12 @@
 //! Crate-level tests for the admin `require_admin_token` axum middleware.
 //!
-//! The middleware is unit-tested at the helper level in `src/auth_admin.rs`;
+//! The middleware is unit-tested at the helper level in `src/auth/admin.rs`;
 //! these tests drive a real axum `Router` through `tower::ServiceExt`
 //! so we cover what the framework actually sees: header vs. query
 //! extraction, 401 paths, and the URI-sanitization contract that stops
 //! tokens leaking into structured logs.
 
-use aura_gateway::auth_admin::{AdminAuthState, require_admin_token};
+use aura_gateway::auth::admin::{AdminAuthState, require_admin_token};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;

@@ -6,9 +6,11 @@
 //!
 //! Port discovery: the gateway writes `<workspace>/channel.port` on
 //! bind; both sides read the same file so they agree on the loopback
-//! port without any config roundtrip. TUI auth is a per-install PSK
-//! derived via `aura_gateway_auth::effective_tui_psk`; both ends read
-//! the same on-disk salt to arrive at the same key.
+//! port without any config roundtrip. TUI auth is a per-start
+//! temporary token the gateway publishes to the secret vault at
+//! `gateway.tui_token` (rotated on every `aura gateway start`); the
+//! TUI opens the same vault, reads the token, and presents it on the
+//! channel WebSocket upgrade.
 //!
 //! If the connect fails the command prints a concrete block telling
 //! the operator how to start a gateway and exits. The dev-only
@@ -22,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use aura_agent::service::ShutdownSignal;
 use aura_channels::ChannelError;
 use aura_config::AuraConfig;
-use aura_gateway_auth::effective_tui_psk;
+use aura_gateway::TUI_TOKEN_VAULT_KEY;
 use aura_tui::client::{TuiDashboardProvider, TuiSlashHandler, WsTransport};
 use aura_tui::{TuiAdapter, TuiLogSink};
 use tracing::info;
@@ -49,7 +51,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     });
     info!("Aura - Intelligent Assistant Framework starting");
 
-    let (port_file, psk) = resolve_channel_auth(&config)?;
+    let port_file = port_file_path(&config);
 
     let session_id = opts
         .session
@@ -62,36 +64,48 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     #[cfg(debug_assertions)]
     let mut _auto_gateway: Option<dev_auto::AutoGatewayGuard> = None;
 
-    let transport = match try_connect(&port_file, &psk, &session_id).await {
-        Ok(t) => Arc::new(t),
-        Err(err) if !matches!(err, ChannelError::NotReachable(_)) => {
-            return Err(unreachable_gateway_error(&port_file, &err.to_string()));
-        }
-        Err(err) => {
-            #[cfg(debug_assertions)]
-            if opts.dev_auto_gateway {
-                // Propagate the parent's resolved config path so the
-                // spawned gateway reads the same workspace — otherwise
-                // a `--config` flag on the TUI would point the child
-                // at a different vault, and they'd disagree on the
-                // port file.
-                let config_path = crate::boot::resolve_config_path();
-                _auto_gateway =
-                    Some(dev_auto::spawn_and_wait_ready(&port_file, config_path).await?);
-                Arc::new(
-                    try_connect(&port_file, &psk, &session_id)
-                        .await
-                        .map_err(|e| unreachable_gateway_error(&port_file, &e.to_string()))?,
-                )
-            } else {
+    // Read the per-start TUI token from the vault. Done once up front
+    // so a missing token (gateway not running yet) flows into the same
+    // `NotReachable`-style fallback as a missing port file. In
+    // `--dev-auto-gateway` mode the spawned child writes the token
+    // before publishing the port; we re-read after spawn to pick up
+    // the freshly-rotated value.
+    let mut tui_token = read_tui_token(&config).await;
+
+    let transport =
+        match try_connect_with_token(&port_file, tui_token.as_deref(), &session_id).await {
+            Ok(t) => Arc::new(t),
+            Err(err) if !matches!(err, ChannelError::NotReachable(_)) => {
                 return Err(unreachable_gateway_error(&port_file, &err.to_string()));
             }
-            #[cfg(not(debug_assertions))]
-            {
-                return Err(unreachable_gateway_error(&port_file, &err.to_string()));
+            Err(err) => {
+                #[cfg(debug_assertions)]
+                if opts.dev_auto_gateway {
+                    // Propagate the parent's resolved config path so the
+                    // spawned gateway reads the same workspace — otherwise
+                    // a `--config` flag on the TUI would point the child
+                    // at a different vault, and they'd disagree on the
+                    // port file.
+                    let config_path = crate::boot::resolve_config_path();
+                    _auto_gateway =
+                        Some(dev_auto::spawn_and_wait_ready(&port_file, config_path).await?);
+                    // Reread the freshly-rotated token the spawned gateway
+                    // just published.
+                    tui_token = read_tui_token(&config).await;
+                    Arc::new(
+                        try_connect_with_token(&port_file, tui_token.as_deref(), &session_id)
+                            .await
+                            .map_err(|e| unreachable_gateway_error(&port_file, &e.to_string()))?,
+                    )
+                } else {
+                    return Err(unreachable_gateway_error(&port_file, &err.to_string()));
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    return Err(unreachable_gateway_error(&port_file, &err.to_string()));
+                }
             }
-        }
-    };
+        };
     info!(
         port_file = %port_file.display(),
         "connected to gateway"
@@ -131,27 +145,52 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Derive the channel port-file path and effective TUI PSK from the
-/// workspace config. The file is fixed at `<workspace>/channel.port`
+/// Resolve the channel port-file path. Fixed at `<workspace>/channel.port`
 /// — not configurable, so gateway and TUI resolve it identically.
-/// The PSK is mixed with the per-install salt file the gateway
-/// writes on its first start; if the salt is missing we fall back
-/// to creating it here so `aura tui --dev-auto-gateway` works on a
-/// fresh workspace.
-fn resolve_channel_auth(config: &AuraConfig) -> anyhow::Result<(PathBuf, [u8; 32])> {
-    let workspace_root = PathBuf::from(&config.workspace.path);
-    let port_file = workspace_root.join("channel.port");
-    let psk = effective_tui_psk(workspace_root.as_path())
-        .map_err(|e| anyhow::anyhow!("derive channel PSK: {e}"))?;
-    Ok((port_file, psk))
+fn port_file_path(config: &AuraConfig) -> PathBuf {
+    aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).channel_port()
 }
 
-/// Read the gateway's published port. Absence of the file is treated
-/// as `NotReachable` so the caller's existing fallback paths (dev
-/// auto-gateway, user-facing error) work without a new code path.
-async fn try_connect(
+/// Best-effort read of the per-start TUI token from the secret vault.
+/// Returns `None` if the vault can't be opened (no encryption key,
+/// libsql missing) or the key isn't present yet — both surface to the
+/// caller as the same "no live gateway" fallback path. A loud error
+/// would only mask the more specific port-file-missing message that
+/// the connect attempt produces a moment later.
+async fn read_tui_token(config: &AuraConfig) -> Option<String> {
+    let vault = match crate::runtime::build_secret_vault(config).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "tui token: open vault failed");
+            return None;
+        }
+    };
+    match vault.get_secret(TUI_TOKEN_VAULT_KEY).await {
+        Ok(Some(value)) => match std::str::from_utf8(value.as_bytes()) {
+            Ok(s) => Some(s.to_owned()),
+            Err(e) => {
+                tracing::warn!(error = %e, "tui token in vault is not valid utf-8");
+                None
+            }
+        },
+        Ok(None) => {
+            tracing::debug!("tui token: vault key absent (gateway not started yet)");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "tui token: vault read failed");
+            None
+        }
+    }
+}
+
+/// Read the gateway's published port and dial the channel listener
+/// with the supplied TUI token. Absence of either the port file or
+/// the token is treated as `NotReachable` so the caller's existing
+/// fallback paths (dev auto-gateway, user-facing error) cover both.
+async fn try_connect_with_token(
     port_file: &Path,
-    psk: &[u8; 32],
+    tui_token: Option<&str>,
     session_id: &str,
 ) -> Result<WsTransport, ChannelError> {
     let port = read_port(port_file).ok_or_else(|| {
@@ -160,7 +199,12 @@ async fn try_connect(
             port_file.display(),
         ))
     })?;
-    WsTransport::connect(port, *psk, session_id.to_owned()).await
+    let token = tui_token.ok_or_else(|| {
+        ChannelError::NotReachable(format!(
+            "no {TUI_TOKEN_VAULT_KEY} in vault (is the gateway running?)",
+        ))
+    })?;
+    WsTransport::connect(port, token.to_owned(), session_id.to_owned()).await
 }
 
 fn read_port(port_file: &Path) -> Option<u16> {

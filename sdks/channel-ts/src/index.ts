@@ -1,6 +1,8 @@
 export { runChannel } from "./runner.js";
 export { runSidecar } from "./sidecar.js";
 export type { SidecarOptions } from "./sidecar.js";
+export { runRegistration } from "./register.js";
+export type { RegistrationContext, RegistrationResult } from "./register.js";
 export { RunnerError } from "./channel.js";
 export type {
   AgentDelta,
@@ -24,3 +26,10 @@ export type {
   WireLogLevel,
   WireLogSink,
 } from "./logger.js";
+export type { AttachmentKind, WireAttachment } from "./wire.js";
+export { BlobPairingRequiredError, fetchBlob, uploadBlob } from "./blobs.js";
+export type {
+  BlobClientOptions,
+  FetchBlobResult,
+  UploadBlobResult,
+} from "./blobs.js";

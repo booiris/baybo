@@ -6,9 +6,10 @@
 //!   status, jobs, cron, memory, traces, skills, tools, llm, and a
 //!   read-only channel list. No chat content flows through these
 //!   endpoints.
-//! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`), PSK /
-//!   subprocess-token authenticated (see [`crate::channel_listener`]
-//!   and [`crate::auth_channel`]). Hosts the WebSocket endpoint
+//! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`),
+//!   channel-token authenticated against [`ChannelTokenTable`] (see
+//!   [`crate::channel_listener`] and [`crate::auth::channel`]). Hosts
+//!   the WebSocket endpoint
 //!   (`/v1/channel-ws`) — the only surface the TUI and sidecar
 //!   channel plugins talk to. Session CRUD lives on the admin
 //!   surface; the router creates sessions lazily on first message
@@ -31,7 +32,6 @@ use aura_agent::{
 };
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_gateway_auth::ChannelTokenTable;
 use aura_llm::LlmClient;
 use aura_pairing::PairingService;
 use aura_security::SecretVault;
@@ -45,7 +45,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::api;
-use crate::auth_admin::{AdminAuthState, require_admin_token};
+use crate::auth::admin::{AdminAuthState, require_admin_token};
+use crate::auth::{ChannelTokenTable, channel as channel_auth};
 use crate::config::RuntimeGatewayConfig;
 use crate::log_buffer::LogBuffer;
 use crate::{GatewayError, Result};
@@ -264,7 +265,7 @@ fn build_admin_router(deps: GatewayDeps) -> Router {
 /// outside so orchestrators can poll it without an auth handshake.
 pub fn build_channel_router(
     deps: &GatewayDeps,
-    auth_state: crate::auth_channel::ChannelAuthState,
+    auth_state: channel_auth::ChannelAuthState,
 ) -> Router {
     let _channel_state = ChannelState::from_deps(deps);
     let tui_history = Arc::new(crate::channel::TuiHistoryStore::new(Arc::clone(
@@ -288,6 +289,7 @@ pub fn build_channel_router(
         secret_vault: Arc::clone(&deps.secret_vault),
         bot_reconciler: Arc::clone(&deps.bot_reconciler),
         pairing,
+        blob_store: deps.stores.blob.clone(),
     };
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_channel_auth` has stripped `?token=…`.
@@ -297,7 +299,7 @@ pub fn build_channel_router(
     let v1_inner = crate::channel::routes()
         .with_state(ws_state)
         .layer(TraceLayer::new_for_http());
-    let v1 = crate::auth_channel::attach(v1_inner, auth_state);
+    let v1 = channel_auth::attach(v1_inner, auth_state);
     Router::new()
         .merge(api::health::routes().layer(TraceLayer::new_for_http()))
         .nest("/v1", v1)

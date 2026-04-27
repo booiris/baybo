@@ -18,7 +18,9 @@ use aura_channels::wire::{self, Frame, Message as WireMessage, PROTOCOL_VERSION}
 use aura_channels::{AgentOutput, OutgoingMessage};
 use aura_gateway::channel_listener::ChannelServer;
 use aura_gateway::test_support::build_test_deps;
-use aura_gateway_auth::{CHANNEL_TOKEN_HEADER, ClientIdentity, TUI_PSK_HEADER};
+use aura_gateway::{
+    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TUI_CLIENT_LABEL, TokenHandle,
+};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -26,25 +28,32 @@ use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-const TEST_PSK: [u8; 32] = [0x42; 32];
+/// Mint a fresh TUI-flavoured token in `tokens` and return the live
+/// `(token_string, handle)` pair. The handle revokes the token on
+/// drop, so callers should keep it alive for the duration of the test.
+fn mint_test_tui_token(tokens: &ChannelTokenTable) -> (String, TokenHandle) {
+    let handle = tokens.mint(ClientIdentity {
+        pid: 0,
+        label: TUI_CLIENT_LABEL.to_string(),
+        bound_channel_type: None,
+    });
+    (handle.token().to_string(), handle)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn channel_ws_end_to_end() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file = tempdir.path().join("channel.port");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let channel_tokens = tg.channel_tokens.clone();
+    let pairing_store = tg.deps.stores.channel_pairing.clone();
     let shutdown = tg.shutdown.clone();
 
-    let server = ChannelServer::bind(
-        &tg.deps,
-        port_file.clone(),
-        TEST_PSK,
-        channel_tokens.clone(),
-    )
-    .expect("bind ChannelServer");
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
     let port = server.port();
 
     let server_shutdown = shutdown.clone();
@@ -58,10 +67,24 @@ async fn channel_ws_end_to_end() {
     let handle = channel_tokens.mint(ClientIdentity {
         pid: std::process::id(),
         label: "slack".into(),
+        bound_channel_type: Some("slack".into()),
     });
     let token = handle.token().to_string();
 
     let slack = ChannelType::from("slack");
+
+    // Pre-approve a pairing for (slack, prod-bot, user-1) so the
+    // resolver-driven path admits the inbound message immediately
+    // without an operator round-trip.
+    let now = chrono::Utc::now().timestamp();
+    let row = pairing_store
+        .upsert_pending(&slack, "prod-bot", "user-1", "TESTCD", now, now + 600)
+        .await
+        .expect("seed pending pairing");
+    pairing_store
+        .approve_by_code(&row.code, now)
+        .await
+        .expect("approve pairing");
 
     // 1. Sidecar registers.
     let mut client = connect_register(port, &token, slack.clone())
@@ -75,13 +98,17 @@ async fn channel_ws_end_to_end() {
         "sidecar not registered with ChannelRegistry",
     );
 
-    // 2. Sidecar → agent message reaches router intake.
+    // 2. Sidecar → agent message reaches router intake. session_id
+    // intentionally left empty: subprocess sidecars are no longer
+    // permitted to self-supply the session id (would bypass pairing
+    // and let the sidecar inject into other users' sessions).
     let outbound = WireMessage {
         content: "hi aura".into(),
-        session_id: "sess-1".into(),
+        session_id: String::new(),
         user_id: "user-1".into(),
         channel_type: slack.clone(),
-        bot_id: String::new(),
+        bot_id: "prod-bot".into(),
+        attachments: Vec::new(),
     };
     send_frame(&mut client, &Frame::Message(outbound.clone()))
         .await
@@ -91,7 +118,11 @@ async fn channel_ws_end_to_end() {
         .await
         .expect("router intake timeout")
         .expect("router intake closed");
-    assert_eq!(incoming.message.session_id, "sess-1");
+    let resolved_session_id = incoming.message.session_id.clone();
+    assert!(
+        !resolved_session_id.is_empty(),
+        "resolver should have allocated a session id",
+    );
     assert_eq!(incoming.message.sender.id, "user-1");
     assert_eq!(incoming.message.channel, slack);
     match incoming.message.content.first() {
@@ -105,7 +136,7 @@ async fn channel_ws_end_to_end() {
         .expect("channel present after registration");
     channel_handle
         .send(AgentOutput::Message(OutgoingMessage {
-            session_id: "sess-1".into(),
+            session_id: resolved_session_id.clone(),
             user_id: "user-1".into(),
             channel: slack.clone(),
             content: vec![ContentBlock::Text("pong".into())],
@@ -120,7 +151,7 @@ async fn channel_ws_end_to_end() {
         .expect("sidecar recv timeout")
         .expect("sidecar recv");
     assert_eq!(recv.content, "pong");
-    assert_eq!(recv.session_id, "sess-1");
+    assert_eq!(recv.session_id, resolved_session_id);
     assert_eq!(recv.channel_type, slack);
 
     // 4. Duplicate registration for the same channel type is rejected.
@@ -311,20 +342,16 @@ async fn recv_notice(ws: &mut WsStream) -> Result<(String, String, String), Conn
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file = tempdir.path().join("channel.port");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let pairing_store = tg.deps.stores.channel_pairing.clone();
     let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
 
-    let server = ChannelServer::bind(
-        &tg.deps,
-        port_file.clone(),
-        TEST_PSK,
-        channel_tokens.clone(),
-    )
-    .expect("bind ChannelServer");
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
     let port = server.port();
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -334,6 +361,7 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let handle = channel_tokens.mint(ClientIdentity {
         pid: std::process::id(),
         label: "slack".into(),
+        bound_channel_type: Some("slack".into()),
     });
     let token = handle.token().to_string();
     let slack = ChannelType::from("slack");
@@ -352,6 +380,7 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
         user_id: "alice".into(),
         channel_type: slack.clone(),
         bot_id: "prod-bot".into(),
+        attachments: Vec::new(),
     };
     send_frame(&mut client, &Frame::Message(inbound.clone()))
         .await
@@ -423,20 +452,16 @@ async fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_tui_clients_same_gateway_different_sessions() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file = tempdir.path().join("channel.port");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
     let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
 
-    let server = ChannelServer::bind(
-        &tg.deps,
-        port_file.clone(),
-        TEST_PSK,
-        channel_tokens.clone(),
-    )
-    .expect("bind ChannelServer");
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
     let port = server.port();
 
     let server_shutdown = shutdown.clone();
@@ -444,13 +469,15 @@ async fn two_tui_clients_same_gateway_different_sessions() {
         let _ = server.run(server_shutdown).await;
     });
 
+    let (tui_token, _tui_handle) = mint_test_tui_token(&channel_tokens);
+
     let tui = ChannelType::from(ChannelType::TUI);
 
     // Two TUIs pin distinct session ids.
-    let mut alice = connect_register_tui(port, &TEST_PSK, "sess-alice")
+    let mut alice = connect_register_tui(port, &tui_token, "sess-alice")
         .await
         .expect("alice handshake");
-    let mut bob = connect_register_tui(port, &TEST_PSK, "sess-bob")
+    let mut bob = connect_register_tui(port, &tui_token, "sess-bob")
         .await
         .expect("bob handshake");
 
@@ -464,7 +491,7 @@ async fn two_tui_clients_same_gateway_different_sessions() {
     );
 
     // Duplicate registration of an already-claimed session id is rejected.
-    match connect_register_tui(port, &TEST_PSK, "sess-alice").await {
+    match connect_register_tui(port, &tui_token, "sess-alice").await {
         Ok(_) => panic!("duplicate session register unexpectedly succeeded"),
         Err(ConnectError::RegistrationRejected(msg)) => {
             assert!(msg.contains("already"), "unexpected reason: {msg}",);
@@ -563,19 +590,15 @@ async fn two_tui_clients_same_gateway_different_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tui_history_round_trips_across_clients() {
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file = tempdir.path().join("channel.port");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
 
-    let server = ChannelServer::bind(
-        &tg.deps,
-        port_file.clone(),
-        TEST_PSK,
-        channel_tokens.clone(),
-    )
-    .expect("bind ChannelServer");
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
     let port = server.port();
 
     let server_shutdown = shutdown.clone();
@@ -583,9 +606,11 @@ async fn tui_history_round_trips_across_clients() {
         let _ = server.run(server_shutdown).await;
     });
 
+    let (tui_token, _tui_handle) = mint_test_tui_token(&channel_tokens);
+
     // Alice connects first — fresh vault, empty snapshot.
     let (mut alice, alice_snapshot) =
-        connect_register_tui_with_snapshot(port, &TEST_PSK, "sess-alice")
+        connect_register_tui_with_snapshot(port, &tui_token, "sess-alice")
             .await
             .expect("alice handshake");
     assert!(alice_snapshot.is_empty(), "fresh vault: snapshot is empty");
@@ -607,7 +632,7 @@ async fn tui_history_round_trips_across_clients() {
     // Bob connects on a fresh session. The gateway is the single
     // writer of the vault key, so Bob's snapshot must contain
     // Alice's entries (consecutive duplicate collapsed).
-    let bob_snapshot = wait_for_snapshot(port, &TEST_PSK, "bob-", &["one", "two", "three"])
+    let bob_snapshot = wait_for_snapshot(port, &tui_token, "bob-", &["one", "two", "three"])
         .await
         .expect("bob snapshot reflects alice's appends");
     assert_eq!(bob_snapshot, vec!["one", "two", "three"]);
@@ -626,7 +651,7 @@ async fn tui_history_round_trips_across_clients() {
 /// previous connection is still being torn down.
 async fn wait_for_snapshot(
     port: u16,
-    psk: &[u8; 32],
+    tui_token: &str,
     session_prefix: &str,
     expected: &[&str],
 ) -> Option<Vec<String>> {
@@ -635,7 +660,7 @@ async fn wait_for_snapshot(
     while tokio::time::Instant::now() < deadline {
         let sid = format!("{session_prefix}{attempt}");
         attempt += 1;
-        if let Ok((_ws, snapshot)) = connect_register_tui_with_snapshot(port, psk, &sid).await
+        if let Ok((_ws, snapshot)) = connect_register_tui_with_snapshot(port, tui_token, &sid).await
             && snapshot.len() == expected.len()
             && snapshot.iter().zip(expected).all(|(a, b)| a == b)
         {
@@ -648,10 +673,10 @@ async fn wait_for_snapshot(
 
 async fn connect_register_tui(
     port: u16,
-    psk: &[u8; 32],
+    tui_token: &str,
     session_id: &str,
 ) -> Result<WsStream, ConnectError> {
-    let (ws, _) = connect_register_tui_with_snapshot(port, psk, session_id).await?;
+    let (ws, _) = connect_register_tui_with_snapshot(port, tui_token, session_id).await?;
     Ok(ws)
 }
 
@@ -661,7 +686,7 @@ async fn connect_register_tui(
 /// ignore the snapshot.
 async fn connect_register_tui_with_snapshot(
     port: u16,
-    psk: &[u8; 32],
+    tui_token: &str,
     session_id: &str,
 ) -> Result<(WsStream, Vec<String>), ConnectError> {
     let stream = TcpStream::connect(loopback(port))
@@ -670,12 +695,11 @@ async fn connect_register_tui_with_snapshot(
     let mut request = handshake_url(port)
         .into_client_request()
         .map_err(|e| ConnectError::Upgrade(e.to_string()))?;
-    let psk_hex = hex::encode(psk);
     request.headers_mut().insert(
-        TUI_PSK_HEADER,
-        psk_hex
+        CHANNEL_TOKEN_HEADER,
+        tui_token
             .parse()
-            .map_err(|_| ConnectError::Upgrade("invalid psk header".into()))?,
+            .map_err(|_| ConnectError::Upgrade("invalid tui-token header".into()))?,
     );
     let (mut ws, _) = client_async(request, stream)
         .await

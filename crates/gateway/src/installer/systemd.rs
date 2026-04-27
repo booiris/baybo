@@ -69,7 +69,11 @@ impl ServiceInstaller for SystemdInstaller {
         out.push_str("RestartSec=2\n");
         out.push_str("TimeoutStopSec=30\n");
         if let Some(cfg) = &ctx.config_path {
-            out.push_str(&format!("Environment=AURA_CONFIG_PATH={}\n", cfg.display()));
+            out.push_str(&format!(
+                "Environment={}={}\n",
+                aura_workspace::paths::ENV_CONFIG_PATH,
+                cfg.display()
+            ));
         }
         out.push_str(&format!(
             "# Log directory (ensure it exists and is writable): {}\n",
@@ -145,7 +149,7 @@ mod tests {
     fn ctx() -> InstallContext {
         InstallContext {
             exec_start: PathBuf::from("/usr/local/bin/aura"),
-            config_path: Some(PathBuf::from("/home/user/.aura/aura.json")),
+            config_path: Some(PathBuf::from("/home/user/.aura/profile/aura.json")),
             log_dir: PathBuf::from("/home/user/.aura/logs"),
             user_mode: true,
         }
@@ -156,7 +160,7 @@ mod tests {
         let inst = SystemdInstaller::new(true);
         let body = inst.render_unit(&ctx());
         assert!(body.contains("ExecStart=/usr/local/bin/aura gateway start"));
-        assert!(body.contains("Environment=AURA_CONFIG_PATH=/home/user/.aura/aura.json"));
+        assert!(body.contains("Environment=AURA_CONFIG_PATH=/home/user/.aura/profile/aura.json"));
         assert!(body.contains("Restart=on-failure"));
         assert!(body.contains("RestartSec=2"));
     }

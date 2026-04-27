@@ -1,14 +1,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use serde_json::Value;
 
 use crate::{Tool, ToolContext, ToolDefinition, ToolManifest, ToolOutput};
 
-/// Central registry for all available tools.
 pub struct ToolRegistry {
     builtin: HashMap<String, Arc<dyn Tool>>,
+    builtin_manifests: HashMap<String, ToolManifest>,
+    dynamic: RwLock<DynamicState>,
+}
+
+#[derive(Default)]
+struct DynamicState {
+    tools: HashMap<String, Arc<dyn Tool>>,
     manifests: HashMap<String, ToolManifest>,
+    by_source: HashMap<String, Vec<String>>,
 }
 
 impl Default for ToolRegistry {
@@ -21,11 +29,11 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             builtin: HashMap::new(),
-            manifests: HashMap::new(),
+            builtin_manifests: HashMap::new(),
+            dynamic: RwLock::new(DynamicState::default()),
         }
     }
 
-    /// Registry pre-populated with all implemented builtin tools.
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         for (tool, manifest) in crate::builtin::default_tools() {
@@ -34,9 +42,9 @@ impl ToolRegistry {
         registry
     }
 
-    /// Register a tool together with its governance manifest.
+    /// Register a builtin tool together with its governance manifest.
     ///
-    /// The manifest's `name` must match the tool's `name()`; only the last
+    /// Builtin registration is single-writer at startup; only the last
     /// registration for a given name wins.
     pub fn register(&mut self, tool: Arc<dyn Tool>, manifest: ToolManifest) {
         let name = tool.name().to_string();
@@ -44,26 +52,98 @@ impl ToolRegistry {
             name, manifest.name,
             "tool name does not match manifest name"
         );
-        self.manifests.insert(name.clone(), manifest);
+        self.builtin_manifests.insert(name.clone(), manifest);
         self.builtin.insert(name, tool);
     }
 
-    /// Generate tool definitions visible to the LLM.
-    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs = Vec::new();
-        for tool in self.builtin.values() {
-            defs.push(ToolDefinition {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                parameters_schema: tool.parameters_schema(),
-            });
+    /// Register a tool sourced from an external provider (an MCP server,
+    /// for example). `source` is the logical owner the reconciler uses
+    /// for [`Self::unregister_for_source`]; tools should be named with a
+    /// `<source>/<tool>` convention to avoid colliding with builtins.
+    pub fn register_dynamic(&self, source: &str, tool: Arc<dyn Tool>, manifest: ToolManifest) {
+        let name = tool.name().to_string();
+        debug_assert_eq!(
+            name, manifest.name,
+            "tool name does not match manifest name"
+        );
+
+        if self.builtin.contains_key(&name) {
+            tracing::warn!(
+                tool = %name,
+                source = %source,
+                "dynamic tool shadows a builtin; the dynamic registration wins"
+            );
         }
-        defs
+
+        let mut state = self.dynamic.write();
+        state.tools.insert(name.clone(), tool);
+        state.manifests.insert(name.clone(), manifest);
+        state
+            .by_source
+            .entry(source.to_string())
+            .or_default()
+            .push(name);
     }
 
-    /// Look up a tool by name.
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.builtin.get(name).map(|t| t.as_ref())
+    /// Drop every dynamic tool previously registered under `source`.
+    /// Returns the names that were removed.
+    pub fn unregister_for_source(&self, source: &str) -> Vec<String> {
+        let mut state = self.dynamic.write();
+        let names = state.by_source.remove(source).unwrap_or_default();
+        for name in &names {
+            state.tools.remove(name);
+            state.manifests.remove(name);
+        }
+        names
+    }
+
+    /// List the names of every dynamic tool currently registered under
+    /// `source`. The reconciler consults this to diff what is connected
+    /// against what the config asks for.
+    pub fn dynamic_names_for_source(&self, source: &str) -> Vec<String> {
+        self.dynamic
+            .read()
+            .by_source
+            .get(source)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Generate tool definitions visible to the LLM. Dynamic tools win on
+    /// name collision so a reconciler-installed tool can shadow a builtin
+    /// of the same name (the warning logged in `register_dynamic` is the
+    /// audit trail).
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        let mut defs: HashMap<String, ToolDefinition> = HashMap::new();
+        for tool in self.builtin.values() {
+            defs.insert(
+                tool.name().to_string(),
+                ToolDefinition {
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                    parameters_schema: tool.parameters_schema(),
+                },
+            );
+        }
+        for tool in self.dynamic.read().tools.values() {
+            defs.insert(
+                tool.name().to_string(),
+                ToolDefinition {
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                    parameters_schema: tool.parameters_schema(),
+                },
+            );
+        }
+        defs.into_values().collect()
+    }
+
+    /// Look up a tool by name. Dynamic registrations shadow builtins.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if let Some(t) = self.dynamic.read().tools.get(name) {
+            return Some(Arc::clone(t));
+        }
+        self.builtin.get(name).cloned()
     }
 
     /// Execute a tool by name with the given parameters and context.
@@ -79,8 +159,12 @@ impl ToolRegistry {
         tool.execute(params, ctx).await
     }
 
-    /// Look up the manifest for a registered tool by name.
-    pub fn get_manifest(&self, name: &str) -> Option<&ToolManifest> {
-        self.manifests.get(name)
+    /// Look up the manifest for a registered tool by name. Dynamic
+    /// manifests shadow builtins to match [`Self::get`].
+    pub fn get_manifest(&self, name: &str) -> Option<ToolManifest> {
+        if let Some(m) = self.dynamic.read().manifests.get(name) {
+            return Some(m.clone());
+        }
+        self.builtin_manifests.get(name).cloned()
     }
 }

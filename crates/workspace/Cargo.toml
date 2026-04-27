@@ -4,5 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
-anyhow = { workspace = true }
+tokio = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+
+[features]
+# `io` brings in async identity-file readers/writers and `WorkspaceManager`.
+# Pure-data consumers (aura-config and similar leaf crates) opt out via
+# `default-features = false` to avoid a transitive tokio/anyhow dep when
+# they only need path constants and `WorkspacePaths`.
+default = ["io"]
+io = ["dep:tokio", "dep:anyhow"]

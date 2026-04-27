@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use aura_workspace::paths::{CACHE_RUNTIME_SUBDIR, aura_cache_root};
 use thiserror::Error;
 
 mod generated {
@@ -96,25 +97,26 @@ impl SidecarRuntime {
 }
 
 fn cache_root() -> Result<PathBuf, SidecarError> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .ok_or(SidecarError::NoCacheDir)?;
-    Ok(base.join("aura"))
+    aura_cache_root().ok_or(SidecarError::NoCacheDir)
 }
 
 fn install_bun(cache_root: &Path) -> Result<PathBuf, SidecarError> {
-    let dir = cache_root.join("runtime");
+    let dir = cache_root.join(CACHE_RUNTIME_SUBDIR);
     mkdir_all(&dir)?;
     // Version AND target are in the filename so a sibling install on
     // a different target (bind-mounted home dir, etc.) doesn't trip
     // over ours.
     let dest = dir.join(format!("bun-{BUN_VERSION}-{BUN_TARGET}"));
     if dest.exists() {
+        // Defensive repair: a previous install that crashed between
+        // persist and chmod (older code path), or any other reason
+        // the cached binary lost +x, would otherwise wedge the
+        // supervisor in a permanent spawn-failure loop. Force the
+        // mode back to 0o700 every boot — it's idempotent and cheap.
+        ensure_mode(&dest, 0o700)?;
         return Ok(dest);
     }
-    decompress_to(BUN_RUNTIME_ZST, &dest, "bun runtime")?;
-    set_executable(&dest)?;
+    decompress_to(BUN_RUNTIME_ZST, &dest, "bun runtime", Some(0o700))?;
     Ok(dest)
 }
 
@@ -128,11 +130,16 @@ fn install_sidecar(cache_root: &Path, asset: &SidecarAsset) -> Result<PathBuf, S
     if dest.exists() {
         return Ok(dest);
     }
-    decompress_to(asset.bundle_zst, &dest, "sidecar bundle")?;
+    decompress_to(asset.bundle_zst, &dest, "sidecar bundle", None)?;
     Ok(dest)
 }
 
-fn decompress_to(zst: &[u8], dest: &Path, what: &'static str) -> Result<(), SidecarError> {
+fn decompress_to(
+    zst: &[u8],
+    dest: &Path,
+    what: &'static str,
+    mode: Option<u32>,
+) -> Result<(), SidecarError> {
     // Per-process tempfile under the same dir as `dest`, atomically
     // persisted. Two concerns this addresses, both from
     // `$XDG_CACHE_HOME/aura/` being user-level shared across every
@@ -147,6 +154,12 @@ fn decompress_to(zst: &[u8], dest: &Path, what: &'static str) -> Result<(), Side
     //   2. A crash mid-write leaves the NamedTempFile's `Drop`
     //      unlinking the partial, instead of a stale `<dest>.part`
     //      that a later run might mistake for something.
+    //
+    // `mode`, when set, is applied to the **tempfile** before persist
+    // so the published path is always either nonexistent or fully
+    // permission — a crash between `persist` and a later chmod
+    // can't leave a stale non-executable bun on disk that we'd
+    // happily reuse forever.
     let parent = dest.parent().ok_or_else(|| SidecarError::Io {
         path: dest.to_path_buf(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "dest has no parent dir"),
@@ -165,6 +178,9 @@ fn decompress_to(zst: &[u8], dest: &Path, what: &'static str) -> Result<(), Side
             path: tmp.path().to_path_buf(),
             source,
         })?;
+    if let Some(mode) = mode {
+        set_mode(tmp.path(), mode)?;
+    }
     // `persist` does `rename(tmp, dest)` — atomic-replace on Unix.
     // If another gateway won the race and already published `dest`,
     // we still overwrite with byte-identical content and drop the
@@ -183,17 +199,90 @@ fn mkdir_all(dir: &Path) -> Result<(), SidecarError> {
     })
 }
 
-fn set_executable(path: &Path) -> Result<(), SidecarError> {
+fn set_mode(path: &Path, mode: u32) -> Result<(), SidecarError> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)
-        .map_err(|source| SidecarError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .permissions();
-    perms.set_mode(0o700);
-    fs::set_permissions(path, perms).map_err(|source| SidecarError::Io {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| SidecarError::Io {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Ensure `path`'s permission bits already match `mode` and, if not,
+/// repair them. Used on the cached-runtime path so a partial install
+/// from an older binary (or any out-of-band tampering) gets fixed up
+/// the moment the gateway notices, instead of wedging the supervisor.
+fn ensure_mode(path: &Path, mode: u32) -> Result<(), SidecarError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::metadata(path).map_err(|source| SidecarError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if meta.permissions().mode() & 0o777 == mode {
+        return Ok(());
+    }
+    set_mode(path, mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn ensure_mode_repairs_non_executable_cached_bun() {
+        // Simulates the partial-install crash path: a previous build
+        // wrote the file but died before chmod, leaving it at 0o600.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bun");
+        fs::write(&path, b"placeholder").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        ensure_mode(&path, 0o700).unwrap();
+
+        let got = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, 0o700, "ensure_mode should restore 0o700");
+    }
+
+    #[test]
+    fn ensure_mode_is_idempotent_on_already_correct_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bun");
+        fs::write(&path, b"placeholder").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        ensure_mode(&path, 0o700).unwrap();
+        let got = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, 0o700);
+    }
+
+    #[test]
+    fn decompress_to_with_mode_publishes_file_already_executable() {
+        // The fix for F2: the chmod must happen on the tempfile before
+        // persist, so the published path is never observed without +x.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("bun");
+        let payload = b"#!/bin/sh\necho hi\n";
+        let zst = zstd::bulk::compress(payload, 3).unwrap();
+
+        decompress_to(&zst, &dest, "test runtime", Some(0o700)).unwrap();
+
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "published file must already be executable");
+        assert_eq!(fs::read(&dest).unwrap(), payload);
+    }
+
+    #[test]
+    fn decompress_to_without_mode_uses_umask_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("bundle.js");
+        let payload = b"console.log('hi');";
+        let zst = zstd::bulk::compress(payload, 3).unwrap();
+
+        decompress_to(&zst, &dest, "test bundle", None).unwrap();
+
+        // Whatever the umask is, no exec bit was forced — the JS
+        // bundles aren't executable on disk.
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o111;
+        assert_eq!(mode, 0, "data files should not get the exec bit");
+        assert_eq!(fs::read(&dest).unwrap(), payload);
+    }
 }

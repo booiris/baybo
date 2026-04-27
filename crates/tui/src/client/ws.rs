@@ -4,8 +4,10 @@
 //! This is deliberately not a reusable SDK: the only channel consumer
 //! outside the gateway itself is the TS package under
 //! `sdks/channel-ts/`. Everything here is scoped to the TUI's
-//! PSK-authenticated flow — the subprocess env-var flow has no Rust
-//! consumer and isn't carried over.
+//! token-authenticated flow — the gateway publishes a fresh per-start
+//! token to the secret vault under `gateway.tui_token`; the TUI reads
+//! it and presents it on the WS upgrade in the shared
+//! `x-aura-channel-token` header.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -21,11 +23,11 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
-/// HTTP header carrying the per-install TUI PSK (hex-encoded) on the
-/// WS upgrade request. Mirrors `aura_gateway_auth::TUI_PSK_HEADER`;
+/// HTTP header carrying the channel-listener auth token on the WS
+/// upgrade request. Mirrors `aura_gateway::CHANNEL_TOKEN_HEADER`;
 /// kept as a plain const so the TUI stays free of a runtime dep on
-/// the gateway-auth crate.
-const TUI_PSK_HEADER: &str = "x-aura-tui-secret";
+/// the gateway crate.
+const CHANNEL_TOKEN_HEADER: &str = "x-aura-channel-token";
 
 type WsStream = WebSocketStream<TcpStream>;
 type WsSink = SplitSink<WsStream, WsMessage>;
@@ -69,13 +71,13 @@ pub struct WsClient {
 }
 
 impl WsClient {
-    /// Connect using the bundled-TUI PSK flow: the handshake carries the
-    /// hex-encoded PSK in `x-aura-tui-secret`, and the `Register` frame
-    /// leaves the capability `token` empty because auth already happened
-    /// on the upgrade request. `session_id` pins this TUI instance to a
-    /// specific session — the gateway routes approvals/output for that
-    /// session to this WS only, so multiple TUIs can coexist on the same
-    /// gateway without collision.
+    /// Connect using the bundled-TUI vault-token flow: the handshake
+    /// presents the per-start TUI token in `x-aura-channel-token`, and
+    /// the `Register` frame leaves the capability `token` empty because
+    /// auth already happened on the upgrade request. `session_id` pins
+    /// this TUI instance to a specific session — the gateway routes
+    /// approvals/output for that session to this WS only, so multiple
+    /// TUIs can coexist on the same gateway without collision.
     ///
     /// Returns the client plus the server-side input-history snapshot
     /// the gateway pushes right after `RegisterAck` — consuming it here
@@ -83,15 +85,14 @@ impl WsClient {
     /// frames afterward and never has to know the snapshot exists.
     pub async fn connect_tui(
         port: u16,
-        psk: &[u8; 32],
+        tui_token: &str,
         channel_type: ChannelType,
         session_id: String,
     ) -> Result<(Self, Vec<String>), WsClientError> {
-        let psk_hex = hex::encode(psk);
         Self::connect_inner(
             port,
-            TUI_PSK_HEADER,
-            &psk_hex,
+            CHANNEL_TOKEN_HEADER,
+            tui_token,
             String::new(),
             channel_type,
             Some(session_id),

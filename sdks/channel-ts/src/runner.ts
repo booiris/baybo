@@ -454,6 +454,9 @@ async function pumpOutbound(
           user_id: msg.userId,
           channel_type: channel.channelType,
           ...(msg.botId ? { bot_id: msg.botId } : {}),
+          ...(msg.attachments && msg.attachments.length > 0
+            ? { attachments: msg.attachments }
+            : {}),
         }),
       );
     }
@@ -507,6 +510,9 @@ function dispatchFrame(
             sessionId: frame.session_id,
             userId: frame.user_id,
             content: frame.content,
+            ...(frame.attachments && frame.attachments.length > 0
+              ? { attachments: frame.attachments }
+              : {}),
           }),
         "onMessage",
         logger,
@@ -664,6 +670,7 @@ async function handleApproval(
       userId: frame.user_id ?? "",
       tool: frame.tool,
       paramsPreview: frame.params_preview,
+      ...(frame.description != null ? { description: frame.description } : {}),
     });
   } catch (err) {
     logger.error("onApprovalRequested threw; defaulting to deny", err);

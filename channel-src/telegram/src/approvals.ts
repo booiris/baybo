@@ -7,7 +7,7 @@ import type { BotRoute, PlatformApprovals } from "@aura/channel-sdk/bot";
 import type { Bot, Context } from "grammy";
 import { InlineKeyboard } from "grammy";
 
-import type { TelegramChat } from "./transport.js";
+import type { TelegramChat } from "./platform.js";
 
 type PendingEntry = {
   botId: string;

@@ -15,8 +15,7 @@ type Result<T> = std::result::Result<T, SecurityError>;
 
 use aura_channels::{Message, OutgoingMessage};
 use aura_llm::LlmResponse;
-use aura_model::ContentBlock;
-use aura_model::Session;
+use aura_model::{ContentBlock, Session, ThinkingContent};
 
 const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
 
@@ -136,8 +135,29 @@ impl SecurityGateway {
         );
 
         for block in response.content_blocks.iter_mut() {
-            if let ContentBlock::Text(text) = block {
-                sanitize_string(text, &self.leak_detector, &self.minter, &mut mints);
+            match block {
+                ContentBlock::Text(text) => {
+                    sanitize_string(text, &self.leak_detector, &self.minter, &mut mints);
+                }
+                ContentBlock::Thinking { content, .. } => {
+                    for tc in content.iter_mut() {
+                        match tc {
+                            ThinkingContent::Text { text, .. }
+                            | ThinkingContent::Summary { text } => {
+                                sanitize_string(
+                                    text,
+                                    &self.leak_detector,
+                                    &self.minter,
+                                    &mut mints,
+                                );
+                            }
+                            // Redacted blobs are opaque bytes the provider
+                            // requires us to echo verbatim — leave them.
+                            ThinkingContent::Redacted { .. } => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -915,6 +935,57 @@ mod tests {
         assert!(!t.contains("AKIAIOSFODNN7EXAMPLE"));
         // ghp + AKIA → two distinct vault entries (AKIA appears 3x but same key)
         assert_eq!(store.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sanitize_llm_response_scrubs_thinking_block_text() {
+        let (gw, store) = make_gateway();
+        let mut resp = LlmResponse {
+            content: "answer".into(),
+            content_blocks: vec![
+                ContentBlock::Text("answer".into()),
+                ContentBlock::Thinking {
+                    id: None,
+                    content: vec![
+                        ThinkingContent::Text {
+                            text: "step 1: AKIAIOSFODNN7EXAMPLE".into(),
+                            signature: None,
+                        },
+                        ThinkingContent::Summary {
+                            text: "summary AKIAIOSFODNN7EXAMPLE".into(),
+                        },
+                        ThinkingContent::Redacted {
+                            data: "AKIAIOSFODNN7EXAMPLE".into(),
+                        },
+                    ],
+                },
+            ],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: Some("AKIAIOSFODNN7EXAMPLE".into()),
+        };
+        gw.sanitize_llm_response(&mut resp).await.unwrap();
+
+        match &resp.content_blocks[1] {
+            ContentBlock::Thinking { content, .. } => {
+                let (text, summary, redacted) = match (&content[0], &content[1], &content[2]) {
+                    (
+                        ThinkingContent::Text { text, .. },
+                        ThinkingContent::Summary { text: s },
+                        ThinkingContent::Redacted { data },
+                    ) => (text, s, data),
+                    other => panic!("unexpected thinking content shape: {other:?}"),
+                };
+                assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"));
+                assert!(text.contains("[{REDACTED_SECRET_"));
+                assert!(!summary.contains("AKIAIOSFODNN7EXAMPLE"));
+                assert!(summary.contains("[{REDACTED_SECRET_"));
+                // Redacted blob is opaque to us — must be echoed verbatim.
+                assert_eq!(redacted, "AKIAIOSFODNN7EXAMPLE");
+            }
+            other => panic!("expected Thinking block, got {other:?}"),
+        }
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

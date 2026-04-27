@@ -1,9 +1,19 @@
 import type { Logger } from "./logger.js";
+import type { WireAttachment } from "./wire.js";
 
 export interface AgentMessage {
   sessionId: string;
   userId: string;
   content: string;
+  /**
+   * Non-text payloads the agent attached to this turn. Bytes are not
+   * inline — each entry's `blob_id` references a blob the gateway has
+   * already persisted. Sidecars that want to deliver these to the
+   * platform should use `fetchBlob` to pull the bytes back over
+   * `GET /v1/blobs/<id>`. Empty / undefined when the agent's reply is
+   * text-only.
+   */
+  attachments?: WireAttachment[];
 }
 
 /**
@@ -42,6 +52,13 @@ export interface UserInbound {
    * pairing gate uses `(channelType, botId, userId)` as the triple.
    */
   botId?: string;
+  /**
+   * Non-text payloads attached to the user's message. Each entry
+   * references a blob the sidecar already uploaded via
+   * `POST /v1/blobs`; the gateway's wire-side conversion turns them
+   * into `ContentBlock::Image/Audio/File` for the agent.
+   */
+  attachments?: WireAttachment[];
 }
 
 export interface ApprovalRequest {
@@ -56,6 +73,14 @@ export interface ApprovalRequest {
   userId: string;
   tool: string;
   paramsPreview: string;
+  /**
+   * Optional human-readable label produced by the tool's
+   * `Tool::call_label` hook (e.g. Bash's `description` parameter).
+   * Sidecars should prefer this in the approval UI when present and
+   * fall back to `paramsPreview` otherwise. `undefined` when the tool
+   * did not supply one.
+   */
+  description?: string;
 }
 
 export type ApprovalDecision = "approve" | "approve_always" | "deny";

@@ -23,6 +23,8 @@ pub mod format;
 pub mod slash;
 
 pub use cli::{Cli, Commands, GlobalArgs};
+#[cfg(any(test, feature = "test-support"))]
+pub use commands::channel::run_registration;
 pub use context::{CommandContext, ContextBuilder, Invocation};
 pub use dashboard::CliDashboardProvider;
 pub use dispatch::run;

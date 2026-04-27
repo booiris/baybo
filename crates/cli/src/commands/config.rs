@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use aura_config::AuraConfig;
+use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 
 use crate::cli::ConfigCmd;
 use crate::context::{CommandContext, Invocation};
@@ -43,8 +44,8 @@ async fn validate(ctx: &CommandContext, file: Option<String>) -> Result<CommandO
     let path: PathBuf = file
         .map(PathBuf::from)
         .or_else(|| ctx.config_path.clone())
-        .or_else(|| std::env::var("AURA_CONFIG_PATH").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("aura.json"));
+        .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from))
+        .unwrap_or_else(default_config_file);
 
     match AuraConfig::load_from_file(&path).await {
         Ok(_) => Ok(CommandOutput::structured(
@@ -65,7 +66,7 @@ fn file(ctx: &CommandContext) -> Result<CommandOutput> {
     let path = ctx
         .config_path
         .clone()
-        .or_else(|| std::env::var("AURA_CONFIG_PATH").ok().map(PathBuf::from));
+        .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from));
     match path {
         Some(p) => Ok(CommandOutput::structured(
             p.display().to_string(),
@@ -115,13 +116,12 @@ fn dotted_to_pointer(path: &str) -> String {
 fn resolve_target_path(ctx: &CommandContext) -> Result<PathBuf> {
     ctx.config_path
         .clone()
-        .or_else(|| std::env::var("AURA_CONFIG_PATH").ok().map(PathBuf::from))
+        .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from))
         .ok_or_else(|| {
-            CliError::Config(
-                "no config file resolved; set AURA_CONFIG_PATH (or pass --config <path>) so the \
+            CliError::Config(format!(
+                "no config file resolved; set {ENV_CONFIG_PATH} (or pass --config <path>) so the \
                  mutation has a destination"
-                    .into(),
-            )
+            ))
         })
 }
 

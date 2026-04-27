@@ -101,8 +101,8 @@ same endpoint:
 
 | Channel  | ID prefix | Transport                                                                |
 | -------- | --------- | ------------------------------------------------------------------------ |
-| TUI      | `tui_`    | `/v1/channel-ws` (PSK-authenticated)                                     |
-| Sidecars | `<name>_` | `/v1/channel-ws` (subprocess token, claims its own `channel_type`)       |
+| TUI      | `tui_`    | `/v1/channel-ws` (per-start token from `gateway.tui_token`)              |
+| Sidecars | `<name>_` | `/v1/channel-ws` (per-spawn capability token, claims its own `channel_type`) |
 
 See [`tui.md`](./tui.md) for the TUI client side and
 [`gateway.md`](./gateway.md) for the server side. The only public SDK
@@ -173,6 +173,65 @@ keyboard prompt in the originating chat. It's also the working example
 of the full `Channel` contract — `inbound(signal)` pump, `onMessage` /
 `onNotice` round-trip, concurrent `onApprovalRequested`, `onStop`
 cleanup.
+
+## Bot Registration
+
+`aura channel add` is a separate, one-shot mode of the same bundle
+that runs the channel at runtime. The CLI spawns
+`bun <bundle>` with `AURA_CHANNEL_MODE=register` set; the SDK's
+[`runSidecar`] notices the env var and dispatches into the channel's
+optional `register(ctx)` hook instead of the normal `runChannel` path.
+There is no WebSocket and no capability token in this mode — the
+subprocess is locally driven over stdin/stdout and never connects back
+to the gateway.
+
+**Wire**: line-delimited JSON, types defined under
+`crates/channels/src/register_wire.rs` and exported to TS via `ts-rs`.
+Sidecar→host frames: `Prompt { id, label, kind: input|password, required }`,
+`Result { bot_id, token }`, `Error { message }`. Host→sidecar frames:
+`PromptReply { id, value }`, `Cancel`. **stdout is protocol-only**;
+human-facing output (QR codes, progress text) goes to stderr, which the
+CLI inherits. Sidecar→host frames are capped at ~1 MiB (sized to fit a
+1 MiB `token` plus envelope overhead); the SDK separately caps
+host→sidecar frames at 64 KiB since prompt replies are user input.
+
+**SDK contract**: declare a `register` function on `runSidecar`'s
+options. The function receives a `RegistrationContext { input,
+password }` (each prompt awaits the host's reply over the wire) and
+returns `{ botId, token }`. Throw to surface a registration failure as
+an `Error` frame. Multiple separate credentials should be packed into
+the single `token` string as JSON (the weixin sidecar already uses this
+pattern via its `AuthBlob`).
+
+```ts
+// channel-src/telegram/src/index.ts (excerpt)
+register: async (ctx) => {
+  const token = await ctx.password("bot token: ", { required: true });
+  const colon = token.indexOf(":");
+  if (colon <= 0 || !/^\d+$/.test(token.slice(0, colon))) {
+    throw new Error("invalid telegram token");
+  }
+  return { botId: token.slice(0, colon), token };
+}
+```
+
+**CLI driver**: `crates/cli/src/commands/channel/register.rs` enforces
+the contract from the host side. It runs the bundle with
+`Command::env_clear()` + a small allowlist (`PATH`, `HOME`, `TERM`,
+`LANG`, `LC_*`, `TZ`, `TMPDIR`, plus `AURA_CHANNEL_MODE=register`) so
+no `AURA_*` value (capability tokens, vault endpoints, gateway URL)
+leaks in. The driver enforces a 10-minute overall timeout, a 5-second
+post-result exit grace, and `kill_on_drop(true)` so any error path
+terminates the subprocess. On success it persists exactly one vault
+key, `channel.<channel_type>.bot.<bot_id>.token`, mirroring what
+`Frame::StartBot` reads at runtime — the sidecar receives the same
+string back via `onStartBot(cmd)` when the gateway later boots the
+bot.
+
+**Reference implementations**: `channel-src/telegram/src/index.ts`
+(single-prompt token validation) and `channel-src/weixin/src/cli.ts`
+(non-interactive QR scan with progress on stderr) are the two working
+examples.
 
 ## Channel Registry
 
