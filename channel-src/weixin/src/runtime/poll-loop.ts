@@ -1,6 +1,7 @@
 import type { Logger, WireAttachment } from "@aura/channel-sdk";
 import { uploadBlob } from "@aura/channel-sdk";
 import type { BotInboundEvent, BotStartHooks } from "@aura/channel-sdk/bot";
+import { composeAuraUserId } from "@aura/channel-sdk/bot";
 
 import { SESSION_EXPIRED_ERRCODE, pauseSession } from "../api/session-guard.js";
 import { getUpdates } from "../api/endpoints.js";
@@ -147,9 +148,20 @@ async function downloadAndUpload(
 
   try {
     const fromUserId = msg.from_user_id ?? "";
+    // Match `BotChannel.ingest`'s composite aura user id so the
+    // gateway's pairing gate sees the same identity for the upload
+    // as for the text frame the user has already approved. Weixin
+    // overrides `chatKey` to `chat.toUserId`, so pass that through.
+    const auraUserId = composeAuraUserId(
+      "weixin",
+      state.accountId,
+      { toUserId: fromUserId },
+      fromUserId,
+      (chat) => chat.toUserId,
+    );
     const { blobId } = await uploadBlob(media.bytes, media.mimeType, {
       botId: state.accountId,
-      userId: fromUserId,
+      userId: auraUserId,
     });
     return {
       kind: media.kind === "video" ? "file" : media.kind, // wire side only knows image/audio/file

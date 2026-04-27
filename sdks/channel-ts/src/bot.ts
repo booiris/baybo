@@ -288,14 +288,46 @@ interface TypingSession {
  * which is exactly the discrimination we want: `{chatId: 42}` and
  * `{chatId: 42, threadId: 7}` produce different keys → different
  * sessions.
+ *
+ * Exported so platform code can compute the same chat key the
+ * `BotChannel` does — e.g. when constructing the aura user id for an
+ * out-of-band action (blob upload) before `hooks.emit` has fired.
  */
-function defaultChatKey(chat: unknown): string {
+export function defaultChatKey(chat: unknown): string {
   if (chat === null || typeof chat !== "object") {
     return String(chat);
   }
   const obj = chat as Record<string, unknown>;
   const keys = Object.keys(obj).sort();
   return keys.map((k) => `${k}=${String(obj[k])}`).join("&");
+}
+
+/**
+ * Compose the canonical aura user id `<channelType>_<botId>_<chatKey>_<platformUserId>`.
+ *
+ * This is the identity the gateway pairs against — both the
+ * `Frame::Message.user_id` it stores and the `x-aura-user-id` header
+ * the blob `POST /v1/blobs` endpoint expects. `BotChannel.ingest`
+ * uses this when emitting inbound events; platform code that needs
+ * to act on the user before the event reaches the channel (chiefly
+ * uploading inbound media to the gateway, which has its own pairing
+ * gate) MUST compose the same id, otherwise the upload pairs against
+ * a different identity and lands in `pending` even when the user has
+ * already approved their text-message pairing.
+ *
+ * Pass `chatKey` only if the platform overrides
+ * {@link BotPlatform.chatKey}; the same default we apply in
+ * `ingest` is used otherwise.
+ */
+export function composeAuraUserId<ChatId>(
+  channelType: string,
+  botId: string,
+  chat: ChatId,
+  platformUserId: string,
+  chatKey?: (chat: ChatId) => string,
+): string {
+  const k = chatKey ? chatKey(chat) : defaultChatKey(chat);
+  return `${channelType}_${botId}_${k}_${platformUserId}`;
 }
 
 /**
@@ -636,12 +668,13 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   private ingest(botId: string, ev: BotInboundEvent<ChatId>): void {
-    // Canonical userId format, owned by the SDK so every platform
-    // shares the same shape: <channelType>_<botId>_<chatKey>_<user>.
-    const chatKey = this.platform.chatKey
-      ? this.platform.chatKey(ev.chat)
-      : defaultChatKey(ev.chat);
-    const userId = `${this.channelType}_${botId}_${chatKey}_${ev.platformUserId}`;
+    const userId = composeAuraUserId(
+      this.channelType,
+      botId,
+      ev.chat,
+      ev.platformUserId,
+      this.platform.chatKey?.bind(this.platform),
+    );
     this.chatByUser.set(userId, ev.chat);
     this.botByUser.set(userId, botId);
     this.startOrRefreshTyping(userId, botId, ev.chat);
