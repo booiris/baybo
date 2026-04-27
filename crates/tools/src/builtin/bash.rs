@@ -266,6 +266,8 @@ mod tests {
             workspace_root: std::path::PathBuf::from("/tmp"),
             sandbox,
             approval: None,
+            subagent: None,
+            parent_job_id: None,
         }
     }
 

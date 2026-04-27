@@ -11,8 +11,8 @@ use aura_model::User;
 use aura_sandbox::{NetworkPolicy, SandboxRunner};
 use aura_tools::{
     ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalRequest, ApprovedResource,
-    ExecSandbox, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
-    ToolRegistry, approval::preview_params,
+    ExecSandbox, ResourceAccess, SubAgentSpawner, ToolCapability, ToolContext, ToolError,
+    ToolManifest, ToolOutput, ToolRegistry, approval::preview_params,
 };
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
@@ -44,6 +44,10 @@ pub struct ToolExecutor {
     security_gateway: Arc<SecurityGateway>,
     workspace_root: PathBuf,
     sandbox_runner: Option<Arc<dyn SandboxRunner>>,
+    /// Wired into every `ToolContext` so the `Agent` tool can spawn
+    /// a sub-agent. `None` keeps the surface minimal; the tool then
+    /// returns `NotImplemented` when invoked.
+    subagent: Option<Arc<dyn SubAgentSpawner>>,
 }
 
 impl ToolExecutor {
@@ -62,7 +66,15 @@ impl ToolExecutor {
             security_gateway,
             workspace_root,
             sandbox_runner,
+            subagent: None,
         }
+    }
+
+    /// Wire a sub-agent spawner. Must be called before the executor
+    /// is shared (typically right after construction in `runtime.rs`).
+    pub fn with_subagent(mut self, spawner: Arc<dyn SubAgentSpawner>) -> Self {
+        self.subagent = Some(spawner);
+        self
     }
 
     /// Validate that the tool's trust level permits execution with its declared capabilities.
@@ -253,6 +265,8 @@ impl ToolExecutor {
             workspace_root: self.workspace_root.clone(),
             sandbox,
             approval: Some(approval),
+            subagent: self.subagent.clone(),
+            parent_job_id: parent_job_id.map(str::to_owned),
         };
 
         // Reveal placeholders in the tool's arguments just before

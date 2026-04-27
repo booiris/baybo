@@ -741,6 +741,8 @@ mod tests {
             workspace_root,
             sandbox: None,
             approval: None,
+            subagent: None,
+            parent_job_id: None,
         }
     }
 
@@ -1297,6 +1299,8 @@ mod tests {
             workspace_root,
             sandbox: None,
             approval: Some(handle),
+            subagent: None,
+            parent_job_id: None,
         }
     }
 

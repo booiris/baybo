@@ -70,6 +70,51 @@ pub struct ToolContext {
     /// this handle. `None` means the executor did not wire one in;
     /// callers must fail-closed.
     pub approval: Option<ApprovalHandle>,
+    /// Sub-agent spawn handle. The `Agent` tool delegates to this to
+    /// run an isolated child agent loop in a freshly-minted session
+    /// (`Session.parent_link.kind = SubAgent`) and synchronously wait
+    /// for its terminal output. `None` means the executor did not
+    /// wire one in; the tool returns `NotImplemented` in that case.
+    /// Defined as a trait + injected handle (rather than holding the
+    /// `SessionManager` / `JobManager` directly) so `aura-tools`
+    /// doesn't need to take a dep on the agent crate.
+    pub subagent: Option<Arc<dyn SubAgentSpawner>>,
+    /// Id of the parent job that owns this tool call, if any. Sub-
+    /// agent dispatch threads it through to set the child Job's
+    /// `parent_job_id` so the parent/child relationship survives
+    /// crash recovery.
+    pub parent_job_id: Option<String>,
+}
+
+/// Capability injected into [`ToolContext`] so the `Agent` tool can
+/// spawn an isolated child agent loop in its own session and block
+/// for the result. Implemented by the agent crate.
+#[async_trait]
+pub trait SubAgentSpawner: Send + Sync {
+    /// Spawn a sub-agent for `prompt` under the given parent
+    /// (`parent_session_id`, `parent_job_id`) and synchronously wait
+    /// until the child reaches a terminal state.
+    ///
+    /// Returns the child's final response text on success. Errors
+    /// surface back to the parent agent loop as a tool failure.
+    async fn spawn(
+        &self,
+        prompt: String,
+        parent_session_id: &str,
+        parent_job_id: Option<&str>,
+        user: &User,
+    ) -> Result<SubAgentOutput>;
+}
+
+/// Result of [`SubAgentSpawner::spawn`].
+#[derive(Debug, Clone)]
+pub struct SubAgentOutput {
+    /// Id of the freshly-minted child session.
+    pub child_session_id: String,
+    /// Id of the child Job dispatched into that session.
+    pub child_job_id: String,
+    /// Final reply text the child produced.
+    pub final_text: String,
 }
 
 /// Mid-execution approval entry point handed to a tool through

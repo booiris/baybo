@@ -197,6 +197,8 @@ mod tests {
             workspace_root: PathBuf::from("/tmp"),
             sandbox: None,
             approval: None,
+            subagent: None,
+            parent_job_id: None,
         }
     }
 

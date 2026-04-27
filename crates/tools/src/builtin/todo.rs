@@ -53,12 +53,63 @@ macro_rules! todo_tool {
 }
 
 // -- Subagent / interaction ---------------------------------------------------
-todo_tool!(
-    AgentTool,
-    name = "Agent",
-    desc = "Spawn a subagent with its own context window.",
-    reason = "subagent dispatch is not yet wired to AgentSupervisor"
-);
+
+/// Real implementation of the `Agent` tool: dispatches the prompt to
+/// a sub-agent in a freshly-minted child session and synchronously
+/// returns the child's final reply text.
+///
+/// The actual spawn is delegated to a [`crate::SubAgentSpawner`] that
+/// the agent crate wires into [`crate::ToolContext::subagent`]. The
+/// tool returns `NotImplemented` if the executor did not configure
+/// one, so callers stay fail-closed.
+pub struct AgentTool;
+
+#[async_trait]
+impl Tool for AgentTool {
+    fn name(&self) -> &str {
+        "Agent"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn a subagent with its own context window. The parent waits for the subagent's terminal reply and receives it as the tool result."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Initial user-style prompt for the sub-agent."
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false,
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+        let prompt = params
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParams("`prompt` must be a string".into()))?;
+        let Some(spawner) = ctx.subagent.as_ref() else {
+            return Err(ToolError::NotImplemented(
+                "Agent: no SubAgentSpawner wired into this ToolContext".into(),
+            ));
+        };
+        let out = spawner
+            .spawn(
+                prompt.to_string(),
+                &ctx.session_id,
+                ctx.parent_job_id.as_deref(),
+                &ctx.user,
+            )
+            .await
+            .map_err(|e| ToolError::Execution(format!("subagent spawn: {e}")))?;
+        Ok(ToolOutput::Text(out.final_text))
+    }
+}
 
 todo_tool!(
     AskUserQuestionTool,
@@ -210,7 +261,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
-    async fn stub_returns_not_implemented() {
+    async fn agent_tool_returns_not_implemented_without_spawner() {
         let ctx = ToolContext {
             session_id: "t".into(),
             user: User {
@@ -223,8 +274,104 @@ mod tests {
             workspace_root: std::path::PathBuf::from("/tmp"),
             sandbox: None,
             approval: None,
+            subagent: None,
+            parent_job_id: None,
+        };
+        let err = AgentTool
+            .execute(json!({"prompt": "do a thing"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotImplemented(_)));
+    }
+
+    #[tokio::test]
+    async fn agent_tool_rejects_missing_prompt() {
+        let ctx = ToolContext {
+            session_id: "t".into(),
+            user: User {
+                id: "u".into(),
+                name: None,
+                channel: ChannelType::tui(),
+            },
+            timeout: Duration::from_secs(1),
+            cancellation_token: CancellationToken::new(),
+            workspace_root: std::path::PathBuf::from("/tmp"),
+            sandbox: None,
+            approval: None,
+            subagent: None,
+            parent_job_id: None,
         };
         let err = AgentTool.execute(json!({}), &ctx).await.unwrap_err();
-        assert!(matches!(err, ToolError::NotImplemented(_)));
+        assert!(matches!(err, ToolError::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn agent_tool_delegates_to_spawner() {
+        use async_trait::async_trait;
+        use parking_lot::Mutex;
+
+        #[derive(Default)]
+        struct CapturedArgs {
+            prompt: Option<String>,
+            parent_session_id: Option<String>,
+            parent_job_id: Option<Option<String>>,
+            calls: usize,
+        }
+        struct CapturingSpawner {
+            captured: Mutex<CapturedArgs>,
+        }
+        #[async_trait]
+        impl crate::SubAgentSpawner for CapturingSpawner {
+            async fn spawn(
+                &self,
+                prompt: String,
+                parent_session_id: &str,
+                parent_job_id: Option<&str>,
+                _user: &User,
+            ) -> crate::Result<crate::SubAgentOutput> {
+                let mut g = self.captured.lock();
+                g.calls += 1;
+                g.prompt = Some(prompt.clone());
+                g.parent_session_id = Some(parent_session_id.to_owned());
+                g.parent_job_id = Some(parent_job_id.map(str::to_owned));
+                Ok(crate::SubAgentOutput {
+                    child_session_id: format!("child-of-{parent_session_id}"),
+                    child_job_id: "child-job".into(),
+                    final_text: format!("echoed: {prompt}"),
+                })
+            }
+        }
+
+        let spawner = std::sync::Arc::new(CapturingSpawner {
+            captured: Mutex::new(CapturedArgs::default()),
+        });
+        let ctx = ToolContext {
+            session_id: "parent-sess".into(),
+            user: User {
+                id: "u".into(),
+                name: None,
+                channel: ChannelType::tui(),
+            },
+            timeout: Duration::from_secs(1),
+            cancellation_token: CancellationToken::new(),
+            workspace_root: std::path::PathBuf::from("/tmp"),
+            sandbox: None,
+            approval: None,
+            subagent: Some(spawner.clone() as std::sync::Arc<dyn crate::SubAgentSpawner>),
+            parent_job_id: Some("parent-job".into()),
+        };
+        let out = AgentTool
+            .execute(json!({"prompt": "summarize"}), &ctx)
+            .await
+            .unwrap();
+        match out {
+            ToolOutput::Text(t) => assert_eq!(t, "echoed: summarize"),
+            other => panic!("expected text output, got {other:?}"),
+        }
+        let g = spawner.captured.lock();
+        assert_eq!(g.calls, 1);
+        assert_eq!(g.prompt.as_deref(), Some("summarize"));
+        assert_eq!(g.parent_session_id.as_deref(), Some("parent-sess"));
+        assert_eq!(g.parent_job_id, Some(Some("parent-job".to_owned())));
     }
 }
