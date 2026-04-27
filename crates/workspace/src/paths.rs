@@ -82,6 +82,11 @@ pub const SINGLETON_LOCK_FILE: &str = "aura.lock";
 /// Channel TCP listener publishes its ephemeral port here.
 pub const CHANNEL_PORT_FILE: &str = "channel.port";
 
+/// Per-session LLM call logs land under [`STATE_DIR`]`/`[`SESSIONS_LOG_SUBDIR`]
+/// as `<session_id>.jsonl`. One line per LLM call: input messages,
+/// parameters, and the response (or error) plus latency / model metadata.
+pub const SESSIONS_LOG_SUBDIR: &str = "sessions";
+
 // ---------------------------------------------------------------------------
 // Files inside `work/` (gitignored)
 // ---------------------------------------------------------------------------
@@ -276,6 +281,13 @@ impl WorkspacePaths {
         self.state_dir().join(CHANNEL_PORT_FILE)
     }
 
+    /// Per-session LLM call log directory:
+    /// `<root>/state/sessions/`. Each session writes one
+    /// `<session_id>.jsonl` file inside this directory.
+    pub fn sessions_log_dir(&self) -> PathBuf {
+        self.state_dir().join(SESSIONS_LOG_SUBDIR)
+    }
+
     // -- work/ contents --
 
     pub fn code_builder_dir(&self) -> PathBuf {
@@ -307,6 +319,10 @@ mod tests {
         assert_eq!(
             p.channel_port(),
             PathBuf::from("/var/aura/state/channel.port"),
+        );
+        assert_eq!(
+            p.sessions_log_dir(),
+            PathBuf::from("/var/aura/state/sessions"),
         );
         assert_eq!(p.logs_dir(), PathBuf::from("/var/aura/logs"));
         assert_eq!(

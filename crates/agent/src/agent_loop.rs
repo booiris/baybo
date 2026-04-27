@@ -23,6 +23,7 @@ use crate::error_recovery::ErrorHandler;
 use crate::observability::ObservabilityRecorder;
 use crate::policy::ExecutionPolicy;
 use crate::security::SecurityGateway;
+use crate::session_log::{LlmCallOutcome, LlmCallRecord, SessionLlmLogger};
 use crate::soul::Soul;
 use crate::tool_executor::ToolExecutor;
 
@@ -87,6 +88,11 @@ pub struct AgentLoop {
     /// checked before injection: `Dangerous` verdicts veto the skill,
     /// `Suspicious` verdicts log a warning but allow it through.
     skill_assessor: Option<Arc<SkillAssessor>>,
+    /// Optional per-session JSONL logger for LLM calls. When set, every
+    /// `call_llm` invocation appends a record (request, response or
+    /// error, latency, model metadata) to
+    /// `<state>/sessions/<session_id>.jsonl`.
+    session_log: Option<Arc<SessionLlmLogger>>,
 }
 
 impl AgentLoop {
@@ -114,11 +120,17 @@ impl AgentLoop {
             security_gateway,
             error_handler: ErrorHandler::default(),
             skill_assessor: None,
+            session_log: None,
         }
     }
 
     pub fn with_skill_assessor(mut self, assessor: Arc<SkillAssessor>) -> Self {
         self.skill_assessor = Some(assessor);
+        self
+    }
+
+    pub fn with_session_log(mut self, logger: Arc<SessionLlmLogger>) -> Self {
+        self.session_log = Some(logger);
         self
     }
 
@@ -511,10 +523,12 @@ impl AgentLoop {
             tools: tool_defs,
         };
 
+        let started_at = std::time::Instant::now();
         let llm_result = match delta_tx {
             Some(tx) => self.chat_streaming(&request, session, tx).await,
             None => self.llm_client.chat(&request).await,
         };
+        let latency_ms = started_at.elapsed().as_millis() as u64;
 
         match llm_result {
             Ok(mut response) => {
@@ -529,6 +543,15 @@ impl AgentLoop {
                 {
                     warn!(error = %e, "failed to sanitize LLM response");
                 }
+                self.write_session_log(
+                    session,
+                    &request,
+                    LlmCallOutcome::Ok {
+                        response: response.clone(),
+                        latency_ms,
+                    },
+                )
+                .await;
                 let trace_tool_calls: Vec<aura_trace::LlmToolCallRecord> = response
                     .tool_calls
                     .iter()
@@ -588,12 +611,47 @@ impl AgentLoop {
                     .sanitize_error(&raw)
                     .await
                     .unwrap_or(raw);
+                self.write_session_log(
+                    session,
+                    &request,
+                    LlmCallOutcome::Err {
+                        error: error_msg.clone(),
+                        latency_ms,
+                    },
+                )
+                .await;
                 recorder.fail(handle, &error_msg).await?;
                 if let Err(fe) = recorder.flush().await {
                     warn!(error = %fe, "failed to flush trace after LLM failure");
                 }
                 Err(e.into())
             }
+        }
+    }
+
+    /// Append a single LLM call record to the per-session JSONL log.
+    /// No-op when no logger is configured. Failures are logged at warn
+    /// and swallowed — log persistence must never block a turn.
+    async fn write_session_log(
+        &self,
+        session: &Session,
+        request: &ChatRequest,
+        outcome: LlmCallOutcome,
+    ) {
+        let Some(logger) = self.session_log.as_ref() else {
+            return;
+        };
+        let info = self.llm_client.model_info();
+        let record = LlmCallRecord {
+            timestamp: chrono::Utc::now(),
+            session_id: session.id.clone(),
+            provider: info.provider.clone(),
+            model: info.id.clone(),
+            request: request.clone(),
+            outcome,
+        };
+        if let Err(e) = logger.log(&record).await {
+            warn!(error = %e, "failed to append session llm log");
         }
     }
 
