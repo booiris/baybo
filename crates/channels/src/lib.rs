@@ -15,6 +15,8 @@ pub use registry::ChannelRegistry;
 pub use slash::{
     DashboardProvider, DashboardSnapshot, SlashCommand, SlashHandler, SlashOutcome, ViewKind,
 };
-pub use types::{AgentOutput, IncomingMessage, Message, NoticeLevel, OutgoingMessage};
+pub use types::{
+    AgentOutput, IncomingMessage, Message, NoticeLevel, OutgoingMessage, ProgressKind,
+};
 
 pub type Result<T> = std::result::Result<T, ChannelError>;

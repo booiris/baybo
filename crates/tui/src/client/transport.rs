@@ -266,6 +266,13 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
+        Frame::Progress { .. } => {
+            // The TUI doesn't render structured progress events yet;
+            // they're additive frames meant for richer surfaces (the
+            // WebUI inspector). Drop silently — emitting a `warn` here
+            // would noise up logs on every iteration.
+            None
+        }
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
         | Frame::ResolveApproval { .. }

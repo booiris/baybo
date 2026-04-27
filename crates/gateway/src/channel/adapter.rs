@@ -250,6 +250,58 @@ async fn agent_output_to_frame(
                 text,
             }
         }
+        AgentOutput::Progress {
+            session_id,
+            user_id,
+            job_id,
+            span_id,
+            span_index,
+            kind,
+            summary,
+            structured,
+            ..
+        } => {
+            let (progress_kind, detail) = encode_progress_kind(&kind);
+            Frame::Progress {
+                session_id,
+                user_id,
+                job_id,
+                span_id,
+                span_index,
+                progress_kind,
+                summary,
+                detail: structured.or(detail),
+            }
+        }
+    }
+}
+
+fn encode_progress_kind(kind: &aura_channels::ProgressKind) -> (String, Option<serde_json::Value>) {
+    use aura_channels::ProgressKind;
+    match kind {
+        ProgressKind::SpanStarted => ("span_started".into(), None),
+        ProgressKind::SpanCompleted => ("span_completed".into(), None),
+        ProgressKind::JobSubmitted => ("job_submitted".into(), None),
+        ProgressKind::JobAccepted => ("job_accepted".into(), None),
+        ProgressKind::ToolStarted { tool_name } => (
+            "tool_started".into(),
+            Some(serde_json::json!({ "tool_name": tool_name })),
+        ),
+        ProgressKind::ToolCompleted { tool_name, ok } => (
+            "tool_completed".into(),
+            Some(serde_json::json!({ "tool_name": tool_name, "ok": ok })),
+        ),
+        ProgressKind::SubAgentSpawned { child_session_id } => (
+            "sub_agent_spawned".into(),
+            Some(serde_json::json!({ "child_session_id": child_session_id })),
+        ),
+        ProgressKind::SubAgentCompleted {
+            child_session_id,
+            ok,
+        } => (
+            "sub_agent_completed".into(),
+            Some(serde_json::json!({ "child_session_id": child_session_id, "ok": ok })),
+        ),
     }
 }
 

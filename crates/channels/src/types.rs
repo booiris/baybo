@@ -2,6 +2,7 @@ use aura_model::{ChannelType, User};
 use aura_model::{ContentBlock, MessageMetadata};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -76,6 +77,52 @@ pub enum AgentOutput {
         level: NoticeLevel,
         text: String,
     },
+    /// Structured progress event for an in-flight agent loop iteration.
+    ///
+    /// Channels that don't render fine-grained progress (e.g. a stock
+    /// chat sidecar) drop these without rendering. UIs that do (the
+    /// TUI, the WebUI's session inspector, future Slack threads) use
+    /// `kind` to render a step indicator and `summary` as the human
+    /// label. `structured` carries kind-specific extras the renderer
+    /// may surface (token counts, latency, etc.) without locking the
+    /// schema across the whole codebase.
+    Progress {
+        session_id: String,
+        user_id: String,
+        channel: ChannelType,
+        job_id: String,
+        span_id: String,
+        span_index: u32,
+        kind: ProgressKind,
+        summary: String,
+        structured: Option<Value>,
+    },
+}
+
+/// One discrete step in the agent's progress through an iteration.
+///
+/// Variants are added as the surrounding system grows (sub-agent and
+/// acceptance flows pull in more); sidecars that decode an unknown
+/// variant should drop the event silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProgressKind {
+    /// A new ReAct iteration just opened.
+    SpanStarted,
+    /// The iteration's LLM picked a tool and the executor is dispatching it.
+    ToolStarted { tool_name: String },
+    /// A tool dispatched by the iteration finished, success or not.
+    ToolCompleted { tool_name: String, ok: bool },
+    /// The iteration body finished (final response, max-iter exit, or error).
+    SpanCompleted,
+    /// JobManager moved the job from `Completed` to `Submitted`.
+    JobSubmitted,
+    /// JobManager moved the job from `Submitted` to `Accepted`.
+    JobAccepted,
+    /// A sub-agent was spawned in a child session; parent waits for it.
+    SubAgentSpawned { child_session_id: String },
+    /// The sub-agent's job reached a terminal state.
+    SubAgentCompleted { child_session_id: String, ok: bool },
 }
 
 /// Severity attached to an `AgentOutput::Notice`. Used only for

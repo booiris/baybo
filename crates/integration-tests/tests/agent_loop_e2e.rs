@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::AgentOutput;
+use aura_channels::{AgentOutput, ProgressKind};
 use aura_integration_tests::{AgentTestHarness, capture_tracing};
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmResponse, StreamEvent, ToolCallInfo};
@@ -187,6 +187,39 @@ async fn tool_call_round_trip_invokes_recording_tool() {
         .find(|n| &n.span_id != tool_span)
         .expect("iter-2 LLM call has its own span_id");
     assert_ne!(iter1_llm.span_index, iter2_llm.span_index);
+
+    // Progress sequence: SpanStarted (iter 0) → ToolStarted → ToolCompleted →
+    // SpanCompleted (iter 0) → SpanStarted (iter 1) → SpanCompleted (iter 1).
+    let progress: Vec<_> = outs
+        .iter()
+        .filter_map(|o| match o {
+            AgentOutput::Progress {
+                kind, span_index, ..
+            } => Some((*span_index, kind.clone())),
+            _ => None,
+        })
+        .collect();
+    let kinds: Vec<&ProgressKind> = progress.iter().map(|(_, k)| k).collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                ProgressKind::SpanStarted,
+                ProgressKind::ToolStarted { .. },
+                ProgressKind::ToolCompleted { ok: true, .. },
+                ProgressKind::SpanCompleted,
+                ProgressKind::SpanStarted,
+                ProgressKind::SpanCompleted,
+            ]
+        ),
+        "unexpected progress sequence: {:?}",
+        kinds
+    );
+    // Iteration indices are zero-based and monotonically increasing.
+    assert_eq!(progress[0].0, 0);
+    assert_eq!(progress[3].0, 0);
+    assert_eq!(progress[4].0, 1);
+    assert_eq!(progress[5].0, 1);
 
     let _: Arc<StubLlm> = harness.stub_llm.clone();
     harness.shutdown().await;

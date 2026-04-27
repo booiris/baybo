@@ -196,6 +196,31 @@ pub enum Frame {
         level: String,
         text: String,
     },
+    /// Server -> client: structured progress event for an in-flight
+    /// agent loop iteration. Sidecars without a step-renderer should
+    /// drop these silently. Additive frame — older sidecars decode the
+    /// unknown tag as a no-op.
+    ///
+    /// `progress_kind` is the snake_case discriminator (`span_started`,
+    /// `tool_started`, `tool_completed`, `span_completed`,
+    /// `job_submitted`, `job_accepted`, `sub_agent_spawned`,
+    /// `sub_agent_completed`). Unknown discriminators are dropped on
+    /// the receive side. Per-kind extras (e.g. `tool_name`, `ok`,
+    /// `child_session_id`) ride on `detail`. `summary` is the human
+    /// label the renderer should show.
+    Progress {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        job_id: String,
+        span_id: String,
+        span_index: u32,
+        progress_kind: String,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional, type = "unknown"))]
+        detail: Option<serde_json::Value>,
+    },
     /// Server -> client: a tool call is blocked waiting for the
     /// channel's user to approve or deny. Clients with an approval UX
     /// should echo a [`Frame::ResolveApproval`] back; clients without

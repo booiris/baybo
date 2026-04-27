@@ -325,6 +325,11 @@ impl Router {
                 session_id,
                 channel,
                 ..
+            }
+            | AgentOutput::Progress {
+                session_id,
+                channel,
+                ..
             } => (session_id.clone(), channel.clone()),
             AgentOutput::Message(outgoing) => {
                 (outgoing.session_id.clone(), outgoing.channel.clone())

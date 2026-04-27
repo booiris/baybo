@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, NoticeLevel, OutgoingMessage};
+use aura_channels::{AgentOutput, NoticeLevel, OutgoingMessage, ProgressKind};
 use aura_context::ContextManager;
 use aura_job::OperationKind;
 use aura_llm::{
     ChatRequest, LlmCompletion, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
-use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_model::{ChannelType, ChatMessage, ContentBlock, Role};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -70,6 +70,81 @@ enum SkillGate {
     Pass,
     PassWithWarning { rationale: String },
     Block { rationale: String },
+}
+
+/// Best-effort RAII emitter for [`ProgressKind::SpanCompleted`].
+///
+/// `?`-bubbled errors inside the iteration body would otherwise leave
+/// progress consumers staring at a half-open span forever. The drop
+/// uses `try_send` because (a) it's sync and (b) progress is purely
+/// additive UX — losing one event when the receiver is full is fine.
+/// Call [`ProgressGuard::finish`] on the happy path so drop becomes a
+/// no-op and the explicit emit upstream is the one consumers see.
+struct ProgressGuard {
+    tx: Option<tokio::sync::mpsc::Sender<AgentOutput>>,
+    session_id: String,
+    user_id: String,
+    channel: ChannelType,
+    job_id: String,
+    span_id: String,
+    span_index: u32,
+    completed: bool,
+}
+
+impl ProgressGuard {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        tx: Option<tokio::sync::mpsc::Sender<AgentOutput>>,
+        session_id: String,
+        user_id: String,
+        channel: ChannelType,
+        job_id: String,
+        span_id: String,
+        span_index: u32,
+    ) -> Self {
+        Self {
+            tx,
+            session_id,
+            user_id,
+            channel,
+            job_id,
+            span_id,
+            span_index,
+            completed: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        self.send();
+    }
+
+    fn send(&self) {
+        let Some(tx) = &self.tx else { return };
+        let _ = tx.try_send(AgentOutput::Progress {
+            session_id: self.session_id.clone(),
+            user_id: self.user_id.clone(),
+            channel: self.channel.clone(),
+            job_id: self.job_id.clone(),
+            span_id: self.span_id.clone(),
+            span_index: self.span_index,
+            kind: ProgressKind::SpanCompleted,
+            summary: String::new(),
+            structured: None,
+        });
+    }
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            self.send();
+        }
+    }
 }
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
@@ -257,7 +332,32 @@ impl AgentLoop {
             // span on any path out of this scope, including `?`-bubbled
             // errors, so a later cron-driven tool call on the same
             // recorder can't inherit a stale span.
-            let _iteration_guard = recorder.open_iteration((iterations - 1) as u32);
+            let span_index = (iterations - 1) as u32;
+            let iteration_guard = recorder.open_iteration(span_index);
+            let span_id = iteration_guard.span_id().to_string();
+            // RAII guard so a `?`-bubbled error inside the iteration
+            // body still emits `SpanCompleted` for any progress
+            // consumer; otherwise UIs would render a half-open span
+            // forever. `finish()` on the happy path disarms the drop.
+            let mut progress_guard = ProgressGuard::new(
+                delta_tx.clone(),
+                session.id.clone(),
+                session.user.id.clone(),
+                session.channel.clone(),
+                parent_job_id.unwrap_or_default().to_owned(),
+                span_id.clone(),
+                span_index,
+            );
+            self.emit_progress(
+                delta_tx.as_ref(),
+                session,
+                parent_job_id,
+                &span_id,
+                span_index,
+                ProgressKind::SpanStarted,
+                String::new(),
+            )
+            .await;
 
             // Proactive compression before building the ChatRequest
             if let Some(stats) = self.context_manager.maybe_compress(session).await? {
@@ -322,6 +422,7 @@ impl AgentLoop {
                     warn!(error = %e, "failed to auto-store memory");
                 }
 
+                progress_guard.finish();
                 return Ok(OutgoingMessage {
                     session_id: session.id.clone(),
                     user_id: session.user.id.clone(),
@@ -377,6 +478,19 @@ impl AgentLoop {
                     "executing tool call"
                 );
 
+                self.emit_progress(
+                    delta_tx.as_ref(),
+                    session,
+                    parent_job_id,
+                    &span_id,
+                    span_index,
+                    ProgressKind::ToolStarted {
+                        tool_name: tool_call.name.clone(),
+                    },
+                    format!("calling tool {}", tool_call.name),
+                )
+                .await;
+
                 let tool_result = self
                     .tool_executor
                     .execute(
@@ -389,6 +503,25 @@ impl AgentLoop {
                         parent_job_id,
                     )
                     .await;
+
+                let tool_ok = matches!(&tool_result, Ok(ToolOutput::Text(_) | ToolOutput::Json(_)));
+                self.emit_progress(
+                    delta_tx.as_ref(),
+                    session,
+                    parent_job_id,
+                    &span_id,
+                    span_index,
+                    ProgressKind::ToolCompleted {
+                        tool_name: tool_call.name.clone(),
+                        ok: tool_ok,
+                    },
+                    format!(
+                        "tool {} {}",
+                        tool_call.name,
+                        if tool_ok { "completed" } else { "failed" }
+                    ),
+                )
+                .await;
 
                 let raw_result_text = match &tool_result {
                     Ok(ToolOutput::Text(s)) => s.clone(),
@@ -437,8 +570,10 @@ impl AgentLoop {
 
             // Flush accumulated approvals back into session state.
             session.state.approved_resources = approved.lock().clone();
-            // `_iteration_guard` drops here, closing the span; the
-            // next loop turn calls `open_iteration` for round N+1.
+            progress_guard.finish();
+            // `iteration_guard` drops here, closing the trace span;
+            // the next loop turn calls `open_iteration` for round N+1.
+            drop(iteration_guard);
         }
 
         // If we exhausted iterations, return what we have
@@ -854,6 +989,40 @@ impl AgentLoop {
                 );
                 SkillGate::Pass
             }
+        }
+    }
+
+    /// Send an `AgentOutput::Progress` for the current iteration. Silently
+    /// no-ops when there's no live output channel (e.g. cron-triggered
+    /// turns) — Progress is purely additive UX, never load-bearing.
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_progress(
+        &self,
+        output_tx: Option<&mpsc::Sender<AgentOutput>>,
+        session: &Session,
+        parent_job_id: Option<&str>,
+        span_id: &str,
+        span_index: u32,
+        kind: ProgressKind,
+        summary: String,
+    ) {
+        let Some(tx) = output_tx else { return };
+        if tx
+            .send(AgentOutput::Progress {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                job_id: parent_job_id.unwrap_or_default().to_owned(),
+                span_id: span_id.to_owned(),
+                span_index,
+                kind,
+                summary,
+                structured: None,
+            })
+            .await
+            .is_err()
+        {
+            debug!("progress receiver dropped; skipping event");
         }
     }
 

@@ -166,6 +166,10 @@ impl SecurityGateway {
         }
 
         for tc in response.tool_calls.iter_mut() {
+            // Tool names are LLM-generated and now leave the gateway as
+            // free-form strings on Progress events; scrub them so a
+            // hallucinated secret-shaped name doesn't reach a sidecar.
+            sanitize_string(&mut tc.name, &self.leak_detector, &self.minter, &mut mints);
             sanitize_value(
                 &mut tc.arguments,
                 &self.leak_detector,
