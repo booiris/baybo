@@ -302,6 +302,17 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         cron_handle.run().await;
     }));
 
+    {
+        let janitor =
+            aura_janitor::Janitor::new(workspace_paths.clone(), graph.stores.blob.clone());
+        let janitor_shutdown = shutdown.clone();
+        task_tracker.track(tokio::spawn(async move {
+            janitor
+                .run(async move { janitor_shutdown.wait().await })
+                .await;
+        }));
+    }
+
     // Shared capability table — the channel TCP listener consumes it
     // for auth, and the WS channel server re-reads it in the
     // Register-frame handshake via `GatewayDeps`.

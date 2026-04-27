@@ -269,6 +269,7 @@ impl LibsqlPool {
                     uploader_identity TEXT,
                     read_token        TEXT,
                     created_at        INTEGER NOT NULL,
+                    last_accessed_at  INTEGER NOT NULL,
                     deleted_at        INTEGER
                 );
 

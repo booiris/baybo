@@ -25,6 +25,7 @@ members = [
     "crates/tui",
     "crates/pairing",
     "crates/integration-tests",
+    "crates/janitor",
 ]
 exclude = ["crates/security/fuzz"]
 
@@ -59,6 +60,7 @@ aura-gateway = { path = "crates/gateway" }
 aura-tui = { path = "crates/tui" }
 aura-pairing = { path = "crates/pairing" }
 aura-integration-tests = { path = "crates/integration-tests" }
+aura-janitor = { path = "crates/janitor" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -171,6 +173,7 @@ aura-sandbox = { workspace = true }
 aura-hook = { workspace = true }
 aura-agent = { workspace = true }
 aura-cron = { workspace = true }
+aura-janitor = { workspace = true }
 aura-code-builder = { workspace = true }
 aura-storage = { workspace = true }
 aura-skills = { workspace = true }

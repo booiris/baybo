@@ -384,6 +384,7 @@ struct MemoryBlob {
     bytes: Vec<u8>,
     mime_type: String,
     created_at: i64,
+    last_accessed_at: i64,
     read_token: String,
     deleted_at: Option<i64>,
 }
@@ -427,17 +428,20 @@ impl BlobStore for MemoryBlobStore {
         let hex = hex_encode(&hasher.finalize());
         let read_token = "fake-token";
         let blob_id = format!("{SHA256_PREFIX}{hex}.{read_token}");
+        let now = chrono::Utc::now().timestamp();
         let mut guard = self.blobs.lock();
         guard
             .entry(blob_id.clone())
             .and_modify(|b| {
                 b.mime_type = mime_type.to_owned();
+                b.last_accessed_at = now;
                 b.deleted_at = None;
             })
             .or_insert(MemoryBlob {
                 bytes: bytes.to_vec(),
                 mime_type: mime_type.to_owned(),
-                created_at: chrono::Utc::now().timestamp(),
+                created_at: now,
+                last_accessed_at: now,
                 read_token: read_token.to_owned(),
                 deleted_at: None,
             });
@@ -470,6 +474,9 @@ impl BlobStore for MemoryBlobStore {
     }
 
     async fn get(&self, blob_id: &str) -> BlobResult<Vec<u8>> {
+        // Funnel through `stat` so the LRU touch + token check fire on
+        // every read, matching the libsql backend's contract.
+        let _ = self.stat(blob_id).await?;
         match self.blobs.lock().get(blob_id) {
             Some(b) if b.deleted_at.is_none() => Ok(b.bytes.clone()),
             _ => Err(StorageError::NotFound(format!("blob {blob_id}"))),
@@ -483,11 +490,17 @@ impl BlobStore for MemoryBlobStore {
 
     async fn stat(&self, blob_id: &str) -> BlobResult<BlobMeta> {
         let (_hex, token) = split_id(blob_id)?;
-        match self.blobs.lock().get(blob_id) {
+        let now = chrono::Utc::now().timestamp();
+        let mut guard = self.blobs.lock();
+        match guard.get_mut(blob_id) {
             Some(b) if b.deleted_at.is_none() => {
                 if b.read_token != token {
                     return Err(StorageError::NotFound(format!("blob {blob_id}")));
                 }
+                // LRU touch — mirror the libsql backend so tests that
+                // exercise touch-on-access behave identically against
+                // either store.
+                b.last_accessed_at = now;
                 Ok(BlobMeta {
                     blob_id: blob_id.to_owned(),
                     mime_type: b.mime_type.clone(),
@@ -507,6 +520,19 @@ impl BlobStore for MemoryBlobStore {
                 .get_or_insert_with(|| chrono::Utc::now().timestamp());
         }
         Ok(())
+    }
+
+    async fn purge_older_than(&self, cutoff_unix: i64) -> BlobResult<u64> {
+        let mut guard = self.blobs.lock();
+        let now = chrono::Utc::now().timestamp();
+        let mut purged: u64 = 0;
+        for blob in guard.values_mut() {
+            if blob.deleted_at.is_none() && blob.last_accessed_at < cutoff_unix {
+                blob.deleted_at = Some(now);
+                purged += 1;
+            }
+        }
+        Ok(purged)
     }
 }
 

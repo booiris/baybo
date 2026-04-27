@@ -219,6 +219,7 @@ dependencies = [
  "aura-cron",
  "aura-gateway",
  "aura-hook",
+ "aura-janitor",
  "aura-job",
  "aura-llm",
  "aura-model",
@@ -518,6 +519,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aura-janitor"
+version = "0.1.0"
+dependencies = [
+ "aura-storage",
+ "aura-workspace",
+ "chrono",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

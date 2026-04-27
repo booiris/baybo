@@ -100,4 +100,12 @@ pub trait BlobStore: Send + Sync {
     /// bytes stay so a future `put` of the same content can revive the
     /// row in O(1). Idempotent on missing / already-deleted ids.
     async fn delete(&self, blob_id: &str) -> Result<()>;
+
+    /// Bulk garbage-collect every live blob whose `created_at <
+    /// cutoff_unix`. Soft-deletes the metadata row and (where the
+    /// backend keeps payload files on disk) unlinks the byte file iff
+    /// no remaining live row resolves to the same on-disk path. Returns
+    /// the number of rows transitioned from live to deleted.
+    /// Idempotent: a no-op when no live row matches.
+    async fn purge_older_than(&self, cutoff_unix: i64) -> Result<u64>;
 }
