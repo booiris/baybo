@@ -13,13 +13,13 @@ use std::task::{Context, Poll};
 
 use futures::stream::{Stream, StreamExt};
 use rig::OneOrMany;
-use rig::completion::{
-    self, AssistantContent, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
-    ToolDefinition,
-};
 use rig::completion::message::{
     Audio, AudioMediaType, Document, DocumentMediaType, DocumentSourceKind, Image, ImageDetail,
     ImageMediaType,
+};
+use rig::completion::{
+    self, AssistantContent, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
+    ToolDefinition,
 };
 use rig::message::{Message, Text, UserContent};
 use rig::providers::{anthropic, gemini, openai};
@@ -436,10 +436,7 @@ impl LlmClient {
     /// content. Required for `supports_vision: true` to actually mean
     /// "image bytes flow through" — without it, the build path falls
     /// back to a text stub even on vision-capable models.
-    pub fn with_blob_fetcher(
-        mut self,
-        fetcher: std::sync::Arc<dyn BlobFetcher>,
-    ) -> Self {
+    pub fn with_blob_fetcher(mut self, fetcher: std::sync::Arc<dyn BlobFetcher>) -> Self {
         self.blob_fetcher = Some(fetcher);
         self
     }
@@ -658,18 +655,16 @@ impl LlmClient {
     /// fetch fails — the block degrades to a `[image: …]`-style text
     /// stub so the conversation can keep going even if the bytes
     /// aren't deliverable.
-    async fn user_content_for_block(
-        &self,
-        block: &aura_model::ContentBlock,
-    ) -> UserContent {
+    async fn user_content_for_block(&self, block: &aura_model::ContentBlock) -> UserContent {
         match block {
             aura_model::ContentBlock::Text(t) => UserContent::Text(Text { text: t.clone() }),
             aura_model::ContentBlock::Image { blob, mime_type }
                 if self.model_info.supports_vision =>
             {
-                if let (Some(fetcher), Some(media_type)) =
-                    (self.blob_fetcher.as_ref(), parse_image_media_type(mime_type))
-                {
+                if let (Some(fetcher), Some(media_type)) = (
+                    self.blob_fetcher.as_ref(),
+                    parse_image_media_type(mime_type),
+                ) {
                     match fetcher.fetch(&blob.blob_id).await {
                         Ok(bytes) => UserContent::Image(Image {
                             data: DocumentSourceKind::Base64(b64_encode(&bytes)),
@@ -704,9 +699,10 @@ impl LlmClient {
             aura_model::ContentBlock::Audio { blob, mime_type }
                 if self.model_info.supports_vision =>
             {
-                if let (Some(fetcher), Some(media_type)) =
-                    (self.blob_fetcher.as_ref(), parse_audio_media_type(mime_type))
-                {
+                if let (Some(fetcher), Some(media_type)) = (
+                    self.blob_fetcher.as_ref(),
+                    parse_audio_media_type(mime_type),
+                ) {
                     match fetcher.fetch(&blob.blob_id).await {
                         Ok(bytes) => UserContent::Audio(Audio {
                             data: DocumentSourceKind::Base64(b64_encode(&bytes)),
@@ -1035,12 +1031,17 @@ mod multimodal_dispatch_tests {
                 assert_eq!(img.media_type, Some(ImageMediaType::JPEG));
                 // Required by rig's OpenAI converter — Base64 source
                 // without an image detail errors at message-build time.
-                assert_eq!(img.detail, Some(rig::completion::message::ImageDetail::Auto));
+                assert_eq!(
+                    img.detail,
+                    Some(rig::completion::message::ImageDetail::Auto)
+                );
                 let DocumentSourceKind::Base64(b64) = img.data else {
                     panic!("expected base64 data");
                 };
                 use base64::Engine;
-                let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .unwrap();
                 assert_eq!(decoded, bytes);
             }
             other => panic!("expected Image variant, got {other:?}"),
@@ -1119,8 +1120,14 @@ mod multimodal_dispatch_tests {
 
     #[test]
     fn parse_image_media_type_recognises_common_mimes() {
-        assert_eq!(parse_image_media_type("image/jpeg"), Some(ImageMediaType::JPEG));
-        assert_eq!(parse_image_media_type("IMAGE/PNG"), Some(ImageMediaType::PNG));
+        assert_eq!(
+            parse_image_media_type("image/jpeg"),
+            Some(ImageMediaType::JPEG)
+        );
+        assert_eq!(
+            parse_image_media_type("IMAGE/PNG"),
+            Some(ImageMediaType::PNG)
+        );
         assert_eq!(
             parse_image_media_type("image/jpeg; charset=binary"),
             Some(ImageMediaType::JPEG),
