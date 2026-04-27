@@ -27,6 +27,7 @@ use aura_agent::cost::CostTracker;
 use aura_agent::observability::ObservabilityRecorder;
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
+use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
@@ -433,6 +434,11 @@ pub struct RouterRunHandle {
 pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let buffer = graph.config.channels.message_buffer_size;
 
+    let session_log_dir =
+        aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&graph.config.workspace.path))
+            .sessions_log_dir();
+    let session_logger = Arc::new(SessionLlmLogger::new(session_log_dir));
+
     let tokenizer: Arc<dyn Tokenizer> =
         Arc::new(TiktokenTokenizer::for_model(graph.llm_client.model_id()));
 
@@ -464,6 +470,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let actor_cost_tracker = Arc::clone(&graph.cost_tracker);
     let actor_skill_assessor = Arc::clone(&graph.skill_assessor);
     let actor_security_gateway = Arc::clone(&graph.security_gateway);
+    let actor_session_logger = Arc::clone(&session_logger);
 
     let router = Router::new(
         Arc::clone(&graph.session_manager),
@@ -487,7 +494,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             Soul::custom(system_prompt.clone()),
             Arc::clone(&actor_security_gateway),
         )
-        .with_skill_assessor(Arc::clone(&actor_skill_assessor));
+        .with_skill_assessor(Arc::clone(&actor_skill_assessor))
+        .with_session_log(Arc::clone(&actor_session_logger));
 
         let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
             &session.id,
