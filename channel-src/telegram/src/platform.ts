@@ -9,6 +9,7 @@ import type {
   BotMediaPayload,
   BotPlatform,
   BotStartHooks,
+  SlashCommandSpec,
 } from "@aura/channel-sdk/bot";
 import { composeAuraUserId } from "@aura/channel-sdk/bot";
 import { Bot, type Context } from "grammy";
@@ -61,6 +62,18 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
 
   async stopBot(bot: Bot): Promise<void> {
     if (bot.isRunning()) await bot.stop();
+  }
+
+  async registerSlashCommands(
+    bot: Bot,
+    commands: ReadonlyArray<SlashCommandSpec>,
+  ): Promise<void> {
+    // setMyCommands replaces the bot's command list; passing an empty
+    // array would clear it, which is never what the SDK wants here
+    // (it skips this method entirely on an empty manifest).
+    await bot.api.setMyCommands(
+      commands.map((c) => ({ command: c.command, description: c.description })),
+    );
   }
 
   async startBot(

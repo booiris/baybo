@@ -163,6 +163,18 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         state
             .control
             .register(channel_type.clone(), sidecar.frame_tx_clone());
+        // Push the slash-command manifest before any StartBot so the
+        // sidecar's `BotChannel` already has the gateway-authored list
+        // when it publishes commands on bot startup. Best-effort: a
+        // failure here just means the sidecar runs without command UI.
+        if let Err(e) = sidecar
+            .send_frame(Frame::SlashManifest {
+                commands: super::slash::manifest(),
+            })
+            .await
+        {
+            tracing::warn!(error = %e, %channel_type, "send SlashManifest failed");
+        }
         let sent = push_live_bots(&state, &channel_type, &sidecar).await;
         state.bot_reconciler.seed(channel_type.clone(), sent);
     }
@@ -432,6 +444,36 @@ async fn run_inbound_loop(
                                 .await
                                 {
                                     continue;
+                                }
+                                // Slash-command interception. Sidecar
+                                // session_id is server-resolved, so
+                                // commands like `/new` that need to
+                                // repoint the mapping naturally fit
+                                // before resolve_or_create. Session-
+                                // scoped clients (TUI) take a different
+                                // branch above and own their own
+                                // adapter-side dispatcher, so they're
+                                // unaffected.
+                                match super::slash::try_handle(
+                                    &state.session_resolver,
+                                    &wire_msg.content,
+                                    channel_type,
+                                    &wire_msg.user_id,
+                                )
+                                .await
+                                {
+                                    super::slash::SlashOutcome::Handled(reply) => {
+                                        if let Err(e) =
+                                            sidecar.send_frame(Frame::Message(reply)).await
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "send slash reply failed",
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    super::slash::SlashOutcome::PassThrough => {}
                                 }
                                 match state
                                     .session_resolver

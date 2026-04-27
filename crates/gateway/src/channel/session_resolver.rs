@@ -89,6 +89,43 @@ impl ChannelSessionResolver {
             .unwrap_or(session.id);
         Ok(canonical)
     }
+
+    /// Drop the existing `(channel_type, user_id)` mapping (if any) and
+    /// allocate a brand-new aura session for the same user. Returns the
+    /// new `session_id`. The previous session row stays soft-deleted in
+    /// the `sessions` table for replay/audit; only the channel mapping
+    /// is repointed.
+    ///
+    /// `put`'s `ON CONFLICT` keeps the live `session_id` when a row is
+    /// already live, so a delete is required to actually repoint.
+    pub async fn reset_session(
+        &self,
+        channel_type: &ChannelType,
+        user_id: &str,
+    ) -> Result<String, ResolverError> {
+        self.store
+            .delete(channel_type, user_id)
+            .await
+            .map_err(|e| ResolverError::Store(e.to_string()))?;
+
+        let user = User {
+            id: user_id.to_owned(),
+            name: None,
+            channel: channel_type.clone(),
+        };
+        let session = self
+            .sessions
+            .create_session(user, channel_type.clone())
+            .await
+            .map_err(|e| ResolverError::SessionManager(e.to_string()))?;
+
+        self.store
+            .put(channel_type, user_id, &session.id)
+            .await
+            .map_err(|e| ResolverError::Store(e.to_string()))?;
+
+        Ok(session.id)
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +175,26 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn reset_session_repoints_mapping_to_new_id() {
+        let resolver = build().await;
+        let ct = ChannelType::telegram();
+        let first = resolver.resolve_or_create(&ct, "tg_42").await.unwrap();
+        let fresh = resolver.reset_session(&ct, "tg_42").await.unwrap();
+        assert_ne!(first, fresh);
+        // Subsequent resolves now land on the fresh session.
+        let after = resolver.resolve_or_create(&ct, "tg_42").await.unwrap();
+        assert_eq!(after, fresh);
+    }
+
+    #[tokio::test]
+    async fn reset_session_works_without_prior_mapping() {
+        let resolver = build().await;
+        let ct = ChannelType::telegram();
+        let fresh = resolver.reset_session(&ct, "tg_new").await.unwrap();
+        let resolved = resolver.resolve_or_create(&ct, "tg_new").await.unwrap();
+        assert_eq!(resolved, fresh);
     }
 }

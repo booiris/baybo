@@ -591,6 +591,15 @@ function dispatchFrame(
       );
       return;
     }
+    case "slash_manifest": {
+      if (!channel.onSlashManifest) return;
+      void safeInvoke(
+        () => channel.onSlashManifest!(frame.commands),
+        "onSlashManifest",
+        logger,
+      );
+      return;
+    }
     // History frames are TUI-only; sidecars silently drop them.
     case "history_append":
     case "history_snapshot":

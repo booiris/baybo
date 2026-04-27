@@ -9,8 +9,11 @@ import type {
   StopBotCommand,
   UserInbound,
 } from "./channel.js";
+import type { SlashCommandSpec } from "./generated/SlashCommandSpec.js";
 import type { Logger } from "./logger.js";
 import type { WireAttachment } from "./wire.js";
+
+export type { SlashCommandSpec };
 
 /**
  * One native-platform inbound event flowing from the transport into
@@ -183,6 +186,22 @@ export interface BotPlatform<BotHandle, ChatId> {
    * …); omit otherwise.
    */
   notifyTyping?(handle: BotHandle, chat: ChatId): Promise<void>;
+
+  /**
+   * Optional slash-command registrar. Implement when the platform has
+   * a server-side command list the client UI surfaces (Telegram
+   * `setMyCommands`, Discord application commands, Slack
+   * `commands.list`, …); omit otherwise. Called once per successful
+   * {@link startBot} with the gateway-authored manifest published via
+   * `Frame::SlashManifest` (and re-published on every reconnect).
+   * Best-effort: a thrown error is logged but does not fail bot
+   * startup, since the bot still functions without the client-side
+   * autocomplete affordance.
+   */
+  registerSlashCommands?(
+    handle: BotHandle,
+    commands: ReadonlyArray<SlashCommandSpec>,
+  ): Promise<void>;
 }
 
 /**
@@ -262,6 +281,18 @@ export interface BotChannelOptions<
    * while the user keeps typing. Default: 60_000 ms.
    */
   typingSafetyMs?: number;
+  /**
+   * Slash commands to publish on every successful StartBot via
+   * {@link BotPlatform.registerSlashCommands}. Empty / omitted means
+   * "do not register". Platforms that don't implement
+   * `registerSlashCommands` log a warning the first time the channel
+   * tries to register and otherwise no-op.
+   *
+   * The list is the channel's static manifest, not a per-bot one:
+   * registering the same set on every bot is the intended behaviour
+   * since aura's gateway-side dispatcher is bot-agnostic.
+   */
+  slashCommands?: ReadonlyArray<SlashCommandSpec>;
 }
 
 const DEFAULT_QUEUE_CAPACITY = 1024;
@@ -399,6 +430,16 @@ export class BotChannel<BotHandle, ChatId>
   private readonly typingRefreshMs: number;
   private readonly typingSafetyMs: number;
   private readonly typingSessions = new Map<string, TypingSession>();
+  // Mutable: starts as the constructor-supplied seed (defaults to empty)
+  // and is replaced wholesale every time the gateway pushes a fresh
+  // `Frame::SlashManifest`. The gateway is the single source of truth
+  // once connected; the seed only matters for offline / pre-connect
+  // tests where there's no SlashManifest at all.
+  private slashCommands: ReadonlyArray<SlashCommandSpec>;
+  // Latched the first time we notice the platform configured
+  // `slashCommands` but does not implement `registerSlashCommands` —
+  // keeps the warning to one line per process even if many bots start.
+  private slashCapabilityWarned = false;
 
   // Slot per botId holds the live handle and a SDK-internal generation
   // counter. `BotHandle` itself is an opaque platform value (grammy
@@ -430,6 +471,7 @@ export class BotChannel<BotHandle, ChatId>
     this.capacity = opts.inboundQueueCapacity ?? DEFAULT_QUEUE_CAPACITY;
     this.typingRefreshMs = opts.typingRefreshMs ?? DEFAULT_TYPING_REFRESH_MS;
     this.typingSafetyMs = opts.typingSafetyMs ?? DEFAULT_TYPING_SAFETY_MS;
+    this.slashCommands = opts.slashCommands ?? [];
   }
 
   inbound(signal: AbortSignal): AsyncIterable<UserInbound> {
@@ -588,11 +630,50 @@ export class BotChannel<BotHandle, ChatId>
         (err: unknown) => this.onPollingExit(cmd.botId, gen, err),
       );
     }
+    await this.publishSlashCommands(cmd.botId, out.handle);
     return {
       botId: cmd.botId,
       ok: true,
       message: out.username ? `running as @${out.username}` : "running",
     };
+  }
+
+  async onSlashManifest(
+    commands: ReadonlyArray<SlashCommandSpec>,
+  ): Promise<void> {
+    // Snapshot the field synchronously before the first await so any
+    // concurrent `onStartBot` reads the new manifest, not the old one.
+    this.slashCommands = [...commands];
+    if (this.slashCommands.length === 0) return;
+    const live = [...this.bots.entries()];
+    for (const [botId, entry] of live) {
+      await this.publishSlashCommands(botId, entry.handle);
+    }
+  }
+
+  private async publishSlashCommands(
+    botId: string,
+    handle: BotHandle,
+  ): Promise<void> {
+    if (this.slashCommands.length === 0) return;
+    const register = this.platform.registerSlashCommands;
+    if (!register) {
+      if (!this.slashCapabilityWarned) {
+        this.slashCapabilityWarned = true;
+        this.logger.warn(
+          `slashCommands configured but platform does not implement registerSlashCommands; skipping (bot=${botId})`,
+        );
+      }
+      return;
+    }
+    try {
+      await register.call(this.platform, handle, this.slashCommands);
+    } catch (err) {
+      this.logger.warn(
+        `registerSlashCommands failed for bot=${botId}; bot remains live without command UI`,
+        err,
+      );
+    }
   }
 
   async onStopBot(cmd: StopBotCommand): Promise<BotStatusReport> {

@@ -24,6 +24,7 @@ pub(crate) mod handshake;
 pub(crate) mod history;
 pub mod route;
 pub(crate) mod session_resolver;
+pub(crate) mod slash;
 pub mod state;
 
 pub use bot_reconciler::ChannelBotReconciler;

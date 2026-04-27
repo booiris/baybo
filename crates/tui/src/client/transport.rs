@@ -274,12 +274,14 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
         | Frame::SidecarLog { .. }
         | Frame::StartBot { .. }
         | Frame::StopBot { .. }
-        | Frame::BotStatus { .. } => {
+        | Frame::BotStatus { .. }
+        | Frame::SlashManifest { .. } => {
             // HistorySnapshot is drained during `connect_tui`; any
             // stray instance post-handshake is a protocol violation.
             // SidecarLog / StartBot / StopBot / BotStatus are sidecar
             // control-plane frames — the TUI never participates in
-            // that flow.
+            // that flow. SlashManifest is also sidecar-only: the TUI
+            // owns its slash commands client-side via TuiSlashHandler.
             warn!("unexpected frame from gateway; dropping");
             None
         }

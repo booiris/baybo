@@ -111,6 +111,26 @@ pub struct Message {
     pub attachments: Vec<WireAttachment>,
 }
 
+/// One slash command published to a sidecar's native command surface
+/// (Telegram `setMyCommands`, Discord application commands, …). The
+/// gateway is the single source of truth for the command list and
+/// pushes it via [`Frame::SlashManifest`] after RegisterAck so the
+/// sidecar doesn't have to keep its own copy in sync.
+///
+/// `command` is the bare command name (no leading `/`). Telegram's
+/// rule (`[a-z0-9_]{1,32}`) is the most restrictive — keep entries
+/// inside it for portability across platforms.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub struct SlashCommandSpec {
+    pub command: String,
+    pub description: String,
+}
+
 /// Frame envelope. Tagged on the `kind` field so the receive side
 /// never has to guess. Encoded with
 /// [`rmp_serde::to_vec_named`](rmp_serde::to_vec_named) so field names
@@ -268,6 +288,14 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(optional))]
         message: Option<String>,
     },
+    /// Server -> client: gateway-authored list of slash commands the
+    /// sidecar should publish on its native command surface (e.g.
+    /// Telegram's `setMyCommands`). Sent once right after a successful
+    /// `RegisterAck` for sidecar-flavoured connections (not session-
+    /// scoped TUIs); the manifest replaces any prior list. Sidecars
+    /// that don't surface client-side autocomplete may ignore this.
+    /// Additive; older sidecars decode the unknown tag as a no-op.
+    SlashManifest { commands: Vec<SlashCommandSpec> },
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -341,6 +369,32 @@ mod tests {
         // `skip_serializing_if` omits it when None.
         let decoded = decode(&encoded).unwrap();
         assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn round_trip_slash_manifest() {
+        let frame = Frame::SlashManifest {
+            commands: vec![
+                SlashCommandSpec {
+                    command: "new".into(),
+                    description: "Start a fresh session".into(),
+                },
+                SlashCommandSpec {
+                    command: "help".into(),
+                    description: "Show help".into(),
+                },
+            ],
+        };
+        let bytes = encode(&frame).unwrap();
+        assert_eq!(frame, decode(&bytes).unwrap());
+    }
+
+    #[test]
+    fn round_trip_slash_manifest_empty() {
+        let frame = Frame::SlashManifest {
+            commands: Vec::new(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
 
     #[test]

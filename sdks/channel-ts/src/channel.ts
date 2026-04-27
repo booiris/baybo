@@ -141,6 +141,20 @@ export interface Channel {
   onApprovalResolved?(callId: string, decision: ApprovalDecision): Promise<void>;
 
   /**
+   * Control-plane: gateway-authored slash-command manifest. Pushed
+   * once after a successful Register handshake (and on every
+   * reconnect) so each sidecar's native command surface — Telegram
+   * `setMyCommands`, Discord application commands, … — stays in sync
+   * with the gateway dispatcher without each sidecar maintaining its
+   * own copy. Sidecars without a command UI may ignore this hook;
+   * `BotChannel` honours it by re-publishing the new list to every
+   * live bot.
+   */
+  onSlashManifest?(
+    commands: ReadonlyArray<import("./generated/SlashCommandSpec.js").SlashCommandSpec>,
+  ): Promise<void>;
+
+  /**
    * Control-plane: aura is attaching a new per-tenant credential (bot
    * token for Telegram / Discord / Slack, API key for an HTTP
    * channel, …). Return `ok: true` once the credential is live, or
