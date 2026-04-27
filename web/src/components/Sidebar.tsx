@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { RiFileList3Line, RiGitMergeLine, RiAlarmLine } from 'react-icons/ri';
+import { RiFileList3Line, RiGitMergeLine, RiAlarmLine, RiBarChartBoxLine } from 'react-icons/ri';
 
 const navItem =
   'flex items-center gap-2.5 px-3 py-2.5 no-underline text-ink text-[1rem] font-bold uppercase tracking-wider rounded-md transition-[transform,box-shadow] duration-100 border-[3px] border-transparent cursor-pointer hover:bg-gray-100';
@@ -35,6 +35,13 @@ export function Sidebar() {
         >
           <RiAlarmLine className="text-xl" />
           Cron
+        </NavLink>
+        <NavLink
+          to="/analytics"
+          className={({ isActive }) => `${navItem} ${isActive ? navItemActive : ''}`}
+        >
+          <RiBarChartBoxLine className="text-xl" />
+          Analytics
         </NavLink>
       </nav>
 
