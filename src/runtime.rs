@@ -217,21 +217,28 @@ pub async fn build_managers(
     let workspace = Arc::new(WorkspaceManager::new(workspace_root.clone()));
     let channels_registry = Arc::new(ChannelRegistry::new());
 
-    let llm_client = {
-        let client = boot::build_llm_client(&config.llm)?;
-        let client = Arc::new(client);
-        info!(
-            provider = %client.model_info().provider,
-            model = %client.model_id(),
-            "configured LLM client"
-        );
-        client
-    };
-
     // --- storage + domain managers. `stores` is kept whole: every Arc
     // handed to a manager is a cheap `stores.xxx.clone()` so the bundle
     // itself stays intact for the graph + downstream consumers.
     let stores = Store::open(boot::storage_db_path(&config.workspace)).await?;
+
+    // Built after `stores` so `build_llm_client` can wire the blob
+    // store in as a `BlobFetcher` — without it, multimodal user
+    // content would degrade to a `[image: …]` text stub even on
+    // vision-capable models.
+    let llm_client = {
+        let client = Arc::new(boot::build_llm_client(
+            &config.llm,
+            Some(stores.blob.clone()),
+        )?);
+        info!(
+            provider = %client.model_info().provider,
+            model = %client.model_id(),
+            supports_vision = client.model_info().supports_vision,
+            "configured LLM client"
+        );
+        client
+    };
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
     let skill_assessor = Arc::new(SkillAssessor::with_background_worker(

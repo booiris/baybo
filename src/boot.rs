@@ -74,16 +74,51 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 }
 
 /// Build an `LlmClient` from `LlmConfig`, resolving the api key through env.
-pub fn build_llm_client(cfg: &LlmConfig) -> anyhow::Result<LlmClient> {
+///
+/// `blob_store` is optional. When `Some`, the client is wired with a
+/// `BlobFetcher` so vision-capable models actually receive image
+/// bytes; without it, multimodal blocks degrade to a text stub even
+/// on a model that claims `supports_vision: true`. Pass `None` only
+/// for one-shot tooling (e.g. a `probe` subcommand) that never sends
+/// multimodal content.
+pub fn build_llm_client(
+    cfg: &LlmConfig,
+    blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
+) -> anyhow::Result<LlmClient> {
     let registry = LlmProviderRegistry::with_default_providers();
-    registry
+    let client = registry
         .create_client(&LlmProviderConfig {
             provider: cfg.provider.clone(),
             api_key: resolve_llm_api_key(cfg),
             base_url: cfg.base_url.clone(),
             model: cfg.model.clone(),
+            supports_vision: cfg.supports_vision,
         })
-        .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))
+        .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))?;
+    Ok(match blob_store {
+        Some(store) => {
+            let fetcher: std::sync::Arc<dyn aura_llm::BlobFetcher> =
+                std::sync::Arc::new(BlobStoreFetcher(store));
+            client.with_blob_fetcher(fetcher)
+        }
+        None => client,
+    })
+}
+
+/// Bridge `aura_storage::BlobStore` into `aura_llm::BlobFetcher`. Lives
+/// here next to `build_llm_client` because both crates are framework-
+/// agnostic and shouldn't know about each other — the application
+/// boot layer is the only place that's allowed to glue them together.
+struct BlobStoreFetcher(std::sync::Arc<dyn aura_storage::BlobStore>);
+
+#[async_trait::async_trait]
+impl aura_llm::BlobFetcher for BlobStoreFetcher {
+    async fn fetch(&self, blob_id: &str) -> aura_llm::Result<Vec<u8>> {
+        self.0
+            .get(blob_id)
+            .await
+            .map_err(|e| aura_llm::LlmError::Provider(format!("blob fetch: {e}")))
+    }
 }
 
 /// Resolve the LLM API key from the env var named by `api_key_env`, falling

@@ -134,7 +134,10 @@ async fn main() -> anyhow::Result<()> {
     // "LLM client unavailable" message when no API key was configured,
     // which users reasonably interpreted as a hard error.
     let llm_client = if needs_llm(&cmd) {
-        match boot::build_llm_client(&config.llm) {
+        // `llm` / `doctor` / `status` never send multimodal content,
+        // so it's fine to skip the BlobStore wiring here — opening
+        // libsql for a status probe would be wasteful.
+        match boot::build_llm_client(&config.llm, None) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 tracing::warn!(error = %e, "LLM client unavailable for this command");

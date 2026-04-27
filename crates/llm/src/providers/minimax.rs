@@ -87,6 +87,7 @@ mod tests {
             api_key: None,
             base_url: None,
             model: "MiniMax-M2".into(),
+            supports_vision: None,
         };
         assert!(factory.create(&config).is_err());
     }
@@ -99,6 +100,7 @@ mod tests {
             api_key: Some("test-key".into()),
             base_url: None,
             model: "MiniMax-M2".into(),
+            supports_vision: None,
         };
         let client = factory.create(&config).expect("client builds with api key");
         assert_eq!(client.model_info().provider, "minimax");
@@ -109,5 +111,59 @@ mod tests {
     fn test_known_models_lists_flagship() {
         let factory = MiniMaxProviderFactory;
         assert!(factory.known_models().contains(&"MiniMax-M2"));
+    }
+
+    #[test]
+    fn factory_default_keeps_vision_off_for_text_first_models() {
+        // M2 generation is text-first; the factory must NOT claim
+        // vision by default, otherwise the runtime base64-encodes a
+        // 100 MiB image into a request that gets silently flattened
+        // to a URL on the server side.
+        let factory = MiniMaxProviderFactory;
+        let config = LlmProviderConfig {
+            provider: "minimax".into(),
+            api_key: Some("test-key".into()),
+            base_url: None,
+            model: "MiniMax-M2".into(),
+            supports_vision: None,
+        };
+        let client = factory.create(&config).unwrap();
+        assert!(!client.model_info().supports_vision);
+    }
+
+    #[test]
+    fn registry_supports_vision_override_flips_the_flag() {
+        // Operator on a truly multimodal MiniMax model (e.g. VL-01)
+        // can opt in via config without recompiling. This is the
+        // post-factory override path inside `create_client`.
+        let registry = crate::registry::LlmProviderRegistry::with_default_providers();
+        let client = registry
+            .create_client(&LlmProviderConfig {
+                provider: "minimax".into(),
+                api_key: Some("test-key".into()),
+                base_url: None,
+                model: "MiniMax-VL-01".into(),
+                supports_vision: Some(true),
+            })
+            .unwrap();
+        assert!(client.model_info().supports_vision);
+    }
+
+    #[test]
+    fn registry_supports_vision_override_can_force_off() {
+        // Symmetric path: a provider that claims vision can be
+        // explicitly disabled (e.g. local-only deployments where the
+        // image path costs are unwanted).
+        let registry = crate::registry::LlmProviderRegistry::with_default_providers();
+        let client = registry
+            .create_client(&LlmProviderConfig {
+                provider: "anthropic".into(),
+                api_key: Some("test-key".into()),
+                base_url: None,
+                model: "claude-sonnet-4-6".into(),
+                supports_vision: Some(false),
+            })
+            .unwrap();
+        assert!(!client.model_info().supports_vision);
     }
 }

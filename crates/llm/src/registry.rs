@@ -15,6 +15,11 @@ pub struct LlmProviderConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: String,
+    /// Operator override for the factory's default `supports_vision`.
+    /// `None` keeps the factory default; `Some` forces the flag.
+    /// Surfaces the corresponding field on `aura_config::LlmConfig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
 }
 
 /// A factory that knows how to create an `LlmClient` for a specific provider.
@@ -92,11 +97,17 @@ impl LlmProviderRegistry {
     }
 
     /// Creates an `LlmClient` using the factory that matches `config.provider`.
+    /// Applies `config.supports_vision` as a post-factory override so each
+    /// individual provider doesn't have to forward the flag.
     pub fn create_client(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let factory = self.factories.get(&config.provider).ok_or_else(|| {
             crate::LlmError::ModelNotFound(format!("unknown LLM provider: {}", config.provider))
         })?;
-        factory.create(config)
+        let mut client = factory.create(config)?;
+        if let Some(override_) = config.supports_vision {
+            client.model_info.supports_vision = override_;
+        }
+        Ok(client)
     }
 }
 

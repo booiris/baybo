@@ -542,6 +542,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
+ "base64 0.22.1",
  "futures",
  "parking_lot",
  "rig-core",
