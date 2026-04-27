@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import { RiLoader4Line } from 'react-icons/ri';
 import { Button } from '../components/Button';
 import { SelectBox } from '../components/SelectBox';
@@ -20,13 +20,13 @@ function splitTimestamp(iso: string): { date: string; time: string } {
 export function TracesPage() {
   const isMock = useMockMode();
   const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
 
   const [offset, setOffset] = useState(0);
   const [pageSize, setPageSize] = useState(20);
   const [loading] = useState(false);
   const [items, setItems] = useState<TraceSession[]>([]);
   const [total, setTotal] = useState(0);
-  const [selected, setSelected] = useState<TraceSession | null>(null);
 
   useEffect(() => {
     if (isMock) {
@@ -128,7 +128,7 @@ export function TracesPage() {
                   <tr 
                     key={session.id} 
                     className="hover:bg-gray-50 cursor-pointer group"
-                    onClick={() => setSelected(session)}
+                    onClick={() => navigate(`/traces/${encodeURIComponent(session.id)}${searchParams.toString() ? '?' + searchParams.toString() : ''}`)}
                   >
                     <td className={cell}>
                       <div className="text-ink-soft text-[0.85rem] leading-snug whitespace-nowrap">
@@ -209,70 +209,6 @@ export function TracesPage() {
                 Next
               </Button>
             </div>
-          </div>
-        </div>
-      </div>
-
-      {selected && <TraceDetailModal session={selected} onClose={() => setSelected(null)} />}
-    </div>
-  );
-}
-
-function TraceDetailModal({ session, onClose }: { session: TraceSession; onClose: () => void }) {
-  const createTs = splitTimestamp(session.createTime);
-  const activeTs = splitTimestamp(session.activeTime);
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
-      role="dialog"
-      aria-modal="true"
-      onClick={onClose}
-    >
-      <div
-        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <header className="flex items-center justify-between px-6 py-4 border-b-2 border-black">
-          <div className="flex items-center gap-3">
-            <code className="font-mono text-[0.9rem] font-bold">{session.id}</code>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-[0.85rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink cursor-pointer"
-          >
-            Close
-          </button>
-        </header>
-        <div className="px-6 py-4 space-y-4">
-          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 font-mono text-[0.85rem]">
-            <div className="contents">
-              <dt className="font-bold text-ink-soft">Trigger</dt>
-              <dd className="break-words font-bold">{session.trigger}</dd>
-            </div>
-            <div className="contents">
-              <dt className="font-bold text-ink-soft">Last Message</dt>
-              <dd className="break-words italic">"{session.lastMessage}"</dd>
-            </div>
-            <div className="contents">
-              <dt className="font-bold text-ink-soft">Status</dt>
-              <dd className="break-words uppercase">{session.status}</dd>
-            </div>
-            <div className="contents">
-              <dt className="font-bold text-ink-soft">Create Time</dt>
-              <dd className="break-words">{createTs.date} {createTs.time}</dd>
-            </div>
-            <div className="contents">
-              <dt className="font-bold text-ink-soft">Active Time</dt>
-              <dd className="break-words">{activeTs.date} {activeTs.time}</dd>
-            </div>
-            <div className="contents">
-              <dt className="font-bold text-ink-soft">Span Count</dt>
-              <dd className="break-words">{session.spanCount}</dd>
-            </div>
-          </dl>
-          <div className="pt-4 border-t-2 border-black text-center text-ink-soft text-[0.85rem]">
-            Detailed span view coming soon.
           </div>
         </div>
       </div>
