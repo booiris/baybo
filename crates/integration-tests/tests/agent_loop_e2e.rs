@@ -155,6 +155,39 @@ async fn tool_call_round_trip_invokes_recording_tool() {
         "expected a final Message after the tool round-trip, got {outs:?}"
     );
 
+    // Span grouping: the LLM call + tool call from iteration 1 must
+    // share a span_id, while the iteration-2 LLM call gets a different
+    // span_id. Roles must reflect the operation kind.
+    let session_id = harness.session.id.clone();
+    let trace = aura_storage::TraceStore::load_trace(harness.trace_store.as_ref(), &session_id)
+        .await
+        .unwrap()
+        .expect("trace persisted for session");
+    use aura_trace::SpanRole;
+    let llm_nodes: Vec<_> = trace
+        .nodes
+        .values()
+        .filter(|n| n.span_role == SpanRole::Llm)
+        .collect();
+    let tool_nodes: Vec<_> = trace
+        .nodes
+        .values()
+        .filter(|n| n.span_role == SpanRole::Tool)
+        .collect();
+    assert_eq!(llm_nodes.len(), 2, "two LLM calls, one per iteration");
+    assert_eq!(tool_nodes.len(), 1, "one tool call");
+
+    let tool_span = &tool_nodes[0].span_id;
+    let iter1_llm = llm_nodes
+        .iter()
+        .find(|n| &n.span_id == tool_span)
+        .expect("iter-1 LLM call shares span_id with the tool call");
+    let iter2_llm = llm_nodes
+        .iter()
+        .find(|n| &n.span_id != tool_span)
+        .expect("iter-2 LLM call has its own span_id");
+    assert_ne!(iter1_llm.span_index, iter2_llm.span_index);
+
     let _: Arc<StubLlm> = harness.stub_llm.clone();
     harness.shutdown().await;
 }

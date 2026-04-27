@@ -511,6 +511,7 @@ dependencies = [
  "aura-skills",
  "aura-storage",
  "aura-tools",
+ "aura-trace",
  "chrono",
  "futures",
  "parking_lot",

@@ -27,6 +27,29 @@ pub struct OperationHandle {
     pub span_handle: SpanHandle,
 }
 
+/// RAII guard returned by [`ObservabilityRecorder::open_iteration`].
+/// Closes the iteration span on drop so a `?`-propagated error inside
+/// the agent loop can never leave the recorder grouping subsequent
+/// (e.g. cron-driven) trace nodes under the failed iteration's id.
+pub struct IterationGuard<'a> {
+    recorder: &'a ObservabilityRecorder,
+    span_id: String,
+}
+
+impl<'a> IterationGuard<'a> {
+    /// The span id every node created during this iteration shares.
+    /// Will be useful for correlating Progress events emitted in PR4.
+    pub fn span_id(&self) -> &str {
+        &self.span_id
+    }
+}
+
+impl Drop for IterationGuard<'_> {
+    fn drop(&mut self) {
+        self.recorder.close_iteration();
+    }
+}
+
 impl ObservabilityRecorder {
     pub fn new(
         job_manager: Arc<JobManager>,
@@ -38,6 +61,28 @@ impl ObservabilityRecorder {
             trace_collector,
             cost_tracker,
         }
+    }
+
+    /// Open a fresh ReAct-iteration span. Every `begin` call inside
+    /// the returned guard's scope tags its trace node with the same
+    /// `span_id` and the supplied `span_index`. The guard's `Drop`
+    /// closes the span, which means error-propagation via `?` cannot
+    /// leak a stale `current_span` into a later (e.g. cron-triggered)
+    /// tool dispatch on the same recorder.
+    pub fn open_iteration(&self, span_index: u32) -> IterationGuard<'_> {
+        let span_id = {
+            let mut collector = self.trace_collector.lock();
+            collector.open_iteration(span_index)
+        };
+        IterationGuard {
+            recorder: self,
+            span_id,
+        }
+    }
+
+    fn close_iteration(&self) {
+        let mut collector = self.trace_collector.lock();
+        collector.close_iteration();
     }
 
     /// Begin recording an operation: create a Job and a Trace span.

@@ -250,6 +250,14 @@ impl AgentLoop {
                 break;
             }
             iterations += 1;
+            // Group every node produced by this iteration (LLM call +
+            // tool calls + any system events like compression) under a
+            // single span_id so trace consumers can aggregate "what
+            // happened in ReAct round N". The guard's Drop closes the
+            // span on any path out of this scope, including `?`-bubbled
+            // errors, so a later cron-driven tool call on the same
+            // recorder can't inherit a stale span.
+            let _iteration_guard = recorder.open_iteration((iterations - 1) as u32);
 
             // Proactive compression before building the ChatRequest
             if let Some(stats) = self.context_manager.maybe_compress(session).await? {
@@ -429,6 +437,8 @@ impl AgentLoop {
 
             // Flush accumulated approvals back into session state.
             session.state.approved_resources = approved.lock().clone();
+            // `_iteration_guard` drops here, closing the span; the
+            // next loop turn calls `open_iteration` for round N+1.
         }
 
         // If we exhausted iterations, return what we have
