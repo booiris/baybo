@@ -1,8 +1,15 @@
-import type { Logger } from "@aura/channel-sdk";
+import type { Logger, WireAttachment } from "@aura/channel-sdk";
+import { uploadBlob } from "@aura/channel-sdk";
 import type { BotInboundEvent, BotStartHooks } from "@aura/channel-sdk/bot";
 
 import { SESSION_EXPIRED_ERRCODE, pauseSession } from "../api/session-guard.js";
 import { getUpdates } from "../api/endpoints.js";
+import type { WeixinMessage } from "../api/types.js";
+import {
+  decodeMediaItem,
+  findDownloadableMedia,
+  type InboundMedia,
+} from "../media/media-download.js";
 import { extractPlainText } from "../messaging/inbound.js";
 import type { WeixinChat, WeixinBotHandle } from "../types.js";
 
@@ -19,6 +26,12 @@ const ERROR_THRESHOLD = 3;
  * `get_updates_buf` is in-memory only; a sidecar restart replays the
  * most recent updates from an empty cursor. Downstream session
  * dedup in aura handles the duplicates.
+ *
+ * Media is decoded inline: the first downloadable item is decrypted
+ * via the iLink CDN, uploaded to the gateway's blob store, and
+ * surfaced as a `WireAttachment` on the inbound event. Failure to
+ * decode media is non-fatal — the text body still flows through and
+ * the agent loses only the binary payload, with an error logged.
  */
 export async function runPollLoop(
   handle: WeixinBotHandle,
@@ -60,14 +73,7 @@ export async function runPollLoop(
         if (msg.context_token) {
           state.contextTokens.set(msg.from_user_id, msg.context_token);
         }
-        const text = extractPlainText(msg);
-        if (!text) continue;
-        const ev: BotInboundEvent<WeixinChat> = {
-          chat: { toUserId: msg.from_user_id },
-          platformUserId: msg.from_user_id,
-          content: text,
-        };
-        hooks.emit(ev);
+        await dispatchInboundMessage(handle, hooks, logger, msg);
       }
     } catch (err) {
       if (state.abort.signal.aborted) return;
@@ -87,6 +93,74 @@ export async function runPollLoop(
         consecutiveErrors = 0;
       }
     }
+  }
+}
+
+async function dispatchInboundMessage(
+  handle: WeixinBotHandle,
+  hooks: BotStartHooks<WeixinBotHandle, WeixinChat>,
+  logger: Logger,
+  msg: WeixinMessage,
+): Promise<void> {
+  const { state } = handle;
+  const fromUserId = msg.from_user_id ?? "";
+
+  const text = extractPlainText(msg);
+  const mediaItem = findDownloadableMedia(msg);
+  let attachment: WireAttachment | undefined;
+  if (mediaItem) {
+    attachment = await downloadAndUpload(handle, logger, msg, mediaItem);
+  }
+
+  // A bare image with no caption produces empty text + an attachment.
+  // We still emit so the agent sees the media; pure no-ops (no text
+  // and no media) drop here.
+  if (!text && !attachment) return;
+
+  const ev: BotInboundEvent<WeixinChat> = {
+    chat: { toUserId: fromUserId },
+    platformUserId: fromUserId,
+    content: text,
+    ...(attachment ? { attachments: [attachment] } : {}),
+  };
+  // Suppress lint about unused state — state is used implicitly via
+  // the handle reference threaded through `downloadAndUpload`.
+  void state;
+  hooks.emit(ev);
+}
+
+async function downloadAndUpload(
+  handle: WeixinBotHandle,
+  logger: Logger,
+  msg: WeixinMessage,
+  mediaItem: ReturnType<typeof findDownloadableMedia> & object,
+): Promise<WireAttachment | undefined> {
+  const { state } = handle;
+  let media: InboundMedia | null;
+  try {
+    media = await decodeMediaItem(mediaItem, state.cdnBaseUrl, logger);
+  } catch (err) {
+    logger.error(`weixin inbound media decode threw: ${String(err)}`);
+    return undefined;
+  }
+  if (!media) return undefined;
+
+  try {
+    const fromUserId = msg.from_user_id ?? "";
+    const { blobId } = await uploadBlob(media.bytes, media.mimeType, {
+      botId: state.accountId,
+      userId: fromUserId,
+    });
+    return {
+      kind: media.kind === "video" ? "file" : media.kind, // wire side only knows image/audio/file
+      blob_id: blobId,
+      mime_type: media.mimeType,
+      size: media.bytes.length,
+      ...(media.filename ? { filename: media.filename } : {}),
+    };
+  } catch (err) {
+    logger.error(`weixin inbound media upload failed: ${String(err)}`);
+    return undefined;
   }
 }
 

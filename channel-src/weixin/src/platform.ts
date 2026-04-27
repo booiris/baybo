@@ -77,6 +77,7 @@ export class WeixinPlatform implements BotPlatform<WeixinBotHandle, WeixinChat> 
       accountId: cmd.botId,
       botToken: blob.botToken,
       baseUrl: blob.baseUrl,
+      cdnBaseUrl: blob.cdnBaseUrl ?? "",
       userId: blob.userId,
       getUpdatesBuf: "",
       configMgr,
