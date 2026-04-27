@@ -454,6 +454,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn id_without_token_or_with_wrong_token_is_not_found() {
+        // Pins the capability model the codex review flagged: holding
+        // the SHA-256 alone (or a wrong token) is not enough to read
+        // the blob. Every code path that surfaces bytes — `get`,
+        // `stat`, `open` — must reject a doctored id that strips or
+        // mutates the token suffix.
+        let (store, _dir) = build().await;
+        let real = store.put(b"private", "text/plain", None).await.unwrap();
+
+        // Sanity: legitimate id round-trips.
+        assert_eq!(store.get(&real.blob_id).await.unwrap(), b"private");
+
+        let hex_with_token = real.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let (hex, token) = hex_with_token.split_once('.').unwrap();
+        assert_eq!(token.len(), 32, "token should be 32 hex chars (16 bytes)");
+
+        // Variants an attacker could plausibly construct.
+        let bad_ids = [
+            // Hex only — no token.
+            format!("{SHA256_PREFIX}{hex}"),
+            // Hex + empty token.
+            format!("{SHA256_PREFIX}{hex}."),
+            // Hex + a different (well-formed-looking) token. Same
+            // shape as a real id, different bits — must not unlock
+            // the file.
+            format!("{SHA256_PREFIX}{hex}.{}", "f".repeat(32)),
+            // Hex + a one-bit-flipped token (off-by-one).
+            format!(
+                "{SHA256_PREFIX}{hex}.{}{}",
+                if token.starts_with('0') { "1" } else { "0" },
+                &token[1..],
+            ),
+        ];
+        for bad in &bad_ids {
+            match store.get(bad).await {
+                Err(StorageError::NotFound(_)) => {}
+                other => panic!("get({bad}) leaked: {other:?}"),
+            }
+            match store.stat(bad).await {
+                Err(StorageError::NotFound(_)) => {}
+                other => panic!("stat({bad}) leaked: {other:?}"),
+            }
+            match store.open(bad).await {
+                Err(StorageError::NotFound(_)) => {}
+                Err(other) => panic!("open({bad}) leaked: {other:?}"),
+                Ok(_) => panic!("open({bad}) leaked Ok"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn delete_then_get_is_not_found() {
         let (store, _dir) = build().await;
         let blob = store.put(b"bye", "text/plain", None).await.unwrap();
