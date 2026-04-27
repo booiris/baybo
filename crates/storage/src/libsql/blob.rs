@@ -53,13 +53,6 @@ impl LibsqlBlobStore {
         self.root.join(&hex[..2]).join(hex)
     }
 
-    fn parse_id(blob_id: &str) -> Result<&str> {
-        blob_id
-            .strip_prefix(SHA256_PREFIX)
-            .filter(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
-            .ok_or_else(|| StorageError::NotFound(format!("invalid blob_id {blob_id}")))
-    }
-
     /// Top-level scratch directory for in-flight streaming uploads.
     /// Lives under the blob root with a leading dot so the 2-char hex
     /// shard scan can never collide. Contents are unique-per-attempt
@@ -71,12 +64,19 @@ impl LibsqlBlobStore {
     /// Persist the metadata row + return the `BlobRef`. Idempotent:
     /// `ON CONFLICT … DO UPDATE` keeps the latest mime and clears
     /// `deleted_at`, matching the soft-delete revival rule.
-    async fn record_metadata(&self, hex: &str, mime_type: &str, size: u64) -> Result<BlobRef> {
-        let blob_id = format!("{SHA256_PREFIX}{hex}");
+    async fn record_metadata(
+        &self,
+        hex: &str,
+        mime_type: &str,
+        size: u64,
+        uploader_identity: Option<&str>,
+        read_token: &str,
+    ) -> Result<BlobRef> {
+        let blob_id = format!("{SHA256_PREFIX}{hex}.{read_token}");
         let conn = self.pool.conn();
         conn.execute(
-            "INSERT INTO blobs (blob_id, mime_type, size, created_at, deleted_at) \
-             VALUES (?1, ?2, ?3, ?4, NULL) \
+            "INSERT INTO blobs (blob_id, mime_type, size, uploader_identity, read_token, created_at, deleted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL) \
              ON CONFLICT(blob_id) DO UPDATE SET \
                 mime_type = excluded.mime_type, \
                 deleted_at = NULL",
@@ -84,6 +84,8 @@ impl LibsqlBlobStore {
                 blob_id.clone(),
                 mime_type.to_string(),
                 size as i64,
+                uploader_identity.map(|s| s.to_string()),
+                read_token.to_string(),
                 now_unix(),
             ],
         )
@@ -99,7 +101,12 @@ fn now_unix() -> i64 {
 
 #[async_trait]
 impl BlobStore for LibsqlBlobStore {
-    async fn put(&self, bytes: &[u8], mime_type: &str) -> Result<BlobRef> {
+    async fn put(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+        uploader_identity: Option<&str>,
+    ) -> Result<BlobRef> {
         // Single-call put: wrap the buffer as a one-chunk stream so
         // every code path goes through the same write+rename pipeline.
         // `Bytes::copy_from_slice` is unavoidable here — the trait
@@ -107,13 +114,15 @@ impl BlobStore for LibsqlBlobStore {
         // `'static`-owned for the spawned write loop.
         let chunk = Bytes::copy_from_slice(bytes);
         let stream = stream::once(async move { Ok::<_, std::io::Error>(chunk) }).boxed();
-        self.put_stream(stream, mime_type, u64::MAX).await
+        self.put_stream(stream, mime_type, uploader_identity, u64::MAX)
+            .await
     }
 
     async fn put_stream(
         &self,
         mut stream: ByteStream,
         mime_type: &str,
+        uploader_identity: Option<&str>,
         max_bytes: u64,
     ) -> Result<BlobRef> {
         // Hash + size are unknown until the stream drains, so we can't
@@ -193,6 +202,7 @@ impl BlobStore for LibsqlBlobStore {
         drop(file);
 
         let hex = hex_encode(&hasher.finalize());
+        let read_token = unique_read_token();
         let final_path = self.blob_path(&hex);
         // Skip the rename when the canonical path already exists —
         // some other put or a previous attempt got there first. Either
@@ -223,11 +233,12 @@ impl BlobStore for LibsqlBlobStore {
             }
         }
 
-        self.record_metadata(&hex, mime_type, total).await
+        self.record_metadata(&hex, mime_type, total, uploader_identity, &read_token)
+            .await
     }
 
     async fn get(&self, blob_id: &str) -> Result<Vec<u8>> {
-        let hex = Self::parse_id(blob_id)?;
+        let (hex, _token) = split_id(blob_id)?;
         // stat first so a soft-deleted blob whose bytes are still on
         // disk surfaces as NotFound rather than reading them anyway.
         let _ = self.stat(blob_id).await?;
@@ -242,7 +253,7 @@ impl BlobStore for LibsqlBlobStore {
     }
 
     async fn open(&self, blob_id: &str) -> Result<BlobReader> {
-        let hex = Self::parse_id(blob_id)?;
+        let (hex, _token) = split_id(blob_id)?;
         let _ = self.stat(blob_id).await?;
         let path = self.blob_path(hex);
         let file = tokio::fs::File::open(&path).await.map_err(|e| {
@@ -256,11 +267,11 @@ impl BlobStore for LibsqlBlobStore {
     }
 
     async fn stat(&self, blob_id: &str) -> Result<BlobMeta> {
-        Self::parse_id(blob_id)?;
+        let (_hex, token) = split_id(blob_id)?;
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT blob_id, mime_type, size, created_at \
+                "SELECT blob_id, mime_type, size, created_at, read_token \
                  FROM blobs WHERE blob_id = ?1 AND deleted_at IS NULL",
                 libsql::params![blob_id.to_string()],
             )
@@ -285,16 +296,29 @@ impl BlobStore for LibsqlBlobStore {
         let created_at: i64 = row
             .get(3)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}")))?;
+        let read_token: Option<String> = row
+            .get(4)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get read_token: {e}")))?;
+
+        // Enforce the unguessable token match. Legacy blobs without a
+        // token are open (backward compatibility).
+        if let Some(expected) = read_token.as_deref()
+            && expected != token
+        {
+            return Err(StorageError::NotFound(format!("blob {blob_id}")));
+        }
+
         Ok(BlobMeta {
             blob_id: id,
             mime_type,
             size: size as u64,
             created_at,
+            read_token,
         })
     }
 
     async fn delete(&self, blob_id: &str) -> Result<()> {
-        Self::parse_id(blob_id)?;
+        let _ = split_id(blob_id)?;
         let conn = self.pool.conn();
         conn.execute(
             "UPDATE blobs SET deleted_at = ?2 \
@@ -332,6 +356,29 @@ fn unique_tmp_name() -> String {
     format!("inflight.{pid}.{n}.{rand:x}.tmp")
 }
 
+/// 16-byte (128-bit) random hex token mixed into the blob ID. With
+/// per-blob entropy this large, an attacker holding only a content
+/// digest can't probe IDs across tenant boundaries — the token is the
+/// read capability. `rand::random()` pulls from the OS-seeded thread
+/// RNG, which is what we want for unguessability.
+fn unique_read_token() -> String {
+    let bytes: [u8; 16] = rand::random();
+    hex_encode(&bytes)
+}
+
+/// Split a `blob_id` into `(hex_digest, token)`. Legacy IDs without
+/// a token return an empty string for the second part.
+fn split_id(blob_id: &str) -> Result<(&str, &str)> {
+    let hex_all = blob_id
+        .strip_prefix(SHA256_PREFIX)
+        .ok_or_else(|| StorageError::NotFound(format!("invalid blob_id {blob_id}")))?;
+    let (hex, token) = hex_all.split_once('.').unwrap_or((hex_all, ""));
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StorageError::NotFound(format!("invalid blob_id {blob_id}")));
+    }
+    Ok((hex, token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,7 +396,7 @@ mod tests {
     async fn put_get_stat_roundtrip() {
         let (store, _dir) = build().await;
         let bytes = b"hello world".to_vec();
-        let blob_ref = store.put(&bytes, "text/plain").await.unwrap();
+        let blob_ref = store.put(&bytes, "text/plain", None).await.unwrap();
         assert!(blob_ref.blob_id.starts_with(SHA256_PREFIX));
 
         let got = store.get(&blob_ref.blob_id).await.unwrap();
@@ -362,14 +409,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_is_idempotent_and_dedups() {
+    async fn put_of_same_content_yields_distinct_capability_ids() {
+        // Each put mints a fresh `read_token` so the resulting
+        // `blob_id` (which embeds the token) is distinct even when the
+        // bytes are identical. The on-disk file is content-addressed
+        // and shared, but the metadata rows are per-call so two
+        // tenants uploading the same image get two unforgeable ids.
         let (store, _dir) = build().await;
-        let a = store.put(b"same", "image/png").await.unwrap();
-        let b = store.put(b"same", "image/jpeg").await.unwrap();
-        assert_eq!(a.blob_id, b.blob_id);
-        // Second put updated the mime — confirms upsert semantics.
-        let meta = store.stat(&b.blob_id).await.unwrap();
-        assert_eq!(meta.mime_type, "image/jpeg");
+        let a = store.put(b"same", "image/png", None).await.unwrap();
+        let b = store.put(b"same", "image/jpeg", None).await.unwrap();
+        assert_ne!(
+            a.blob_id, b.blob_id,
+            "distinct read tokens produce distinct ids",
+        );
+        assert_eq!(store.get(&a.blob_id).await.unwrap(), b"same");
+        assert_eq!(store.get(&b.blob_id).await.unwrap(), b"same");
+        // Each metadata row carries its own caller-supplied mime.
+        assert_eq!(store.stat(&a.blob_id).await.unwrap().mime_type, "image/png");
+        assert_eq!(
+            store.stat(&b.blob_id).await.unwrap().mime_type,
+            "image/jpeg"
+        );
     }
 
     #[tokio::test]
@@ -396,23 +456,36 @@ mod tests {
     #[tokio::test]
     async fn delete_then_get_is_not_found() {
         let (store, _dir) = build().await;
-        let blob = store.put(b"bye", "text/plain").await.unwrap();
+        let blob = store.put(b"bye", "text/plain", None).await.unwrap();
         store.delete(&blob.blob_id).await.unwrap();
         let err = store.get(&blob.blob_id).await.unwrap_err();
         assert!(matches!(err, StorageError::NotFound(_)));
     }
 
     #[tokio::test]
-    async fn put_revives_soft_deleted_blob() {
+    async fn delete_does_not_affect_a_fresh_put_of_same_content() {
+        // Soft-delete revival via shared `blob_id` is gone with the
+        // capability-id model — each put is its own row keyed by a
+        // fresh token. This test pins the new contract: deleting one
+        // capability for some content must not block a different
+        // tenant from uploading the same content and getting their
+        // own (independent, readable) id.
         let (store, _dir) = build().await;
-        let blob = store.put(b"revive me", "text/plain").await.unwrap();
-        store.delete(&blob.blob_id).await.unwrap();
-        let revived = store.put(b"revive me", "text/markdown").await.unwrap();
-        assert_eq!(revived.blob_id, blob.blob_id);
-        let meta = store.stat(&revived.blob_id).await.unwrap();
-        assert_eq!(meta.mime_type, "text/markdown");
-        let bytes = store.get(&revived.blob_id).await.unwrap();
-        assert_eq!(bytes, b"revive me");
+        let first = store.put(b"shared", "text/plain", None).await.unwrap();
+        store.delete(&first.blob_id).await.unwrap();
+        let second = store.put(b"shared", "text/markdown", None).await.unwrap();
+        assert_ne!(first.blob_id, second.blob_id);
+        // The deleted capability stays dead.
+        assert!(matches!(
+            store.get(&first.blob_id).await,
+            Err(StorageError::NotFound(_))
+        ));
+        // The new capability reads back the same on-disk bytes.
+        assert_eq!(store.get(&second.blob_id).await.unwrap(), b"shared");
+        assert_eq!(
+            store.stat(&second.blob_id).await.unwrap().mime_type,
+            "text/markdown",
+        );
     }
 
     #[tokio::test]
@@ -437,14 +510,20 @@ mod tests {
         let blob_root = dir.path().join("blobs");
         let store = LibsqlBlobStore::open(pool, &blob_root).await.unwrap();
 
-        let blob = store.put(b"perm check", "text/plain").await.unwrap();
+        let blob = store.put(b"perm check", "text/plain", None).await.unwrap();
 
         // Root must be 0o700.
         let mode = std::fs::metadata(&blob_root).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "blob root mode {mode:o}");
 
-        // Shard dir 0o700.
-        let hex = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        // Shard dir 0o700. The blob id is `sha256:<hex>.<token>`; the
+        // on-disk path is content-addressed by `<hex>` only — the
+        // token is metadata, not part of the filename.
+        let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let hex = hex_with_token
+            .split_once('.')
+            .map(|(h, _)| h)
+            .unwrap_or(hex_with_token);
         let shard = blob_root.join(&hex[..2]);
         let mode = std::fs::metadata(&shard).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "shard mode {mode:o}");
@@ -463,7 +542,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_stream_writes_chunks_and_dedups() {
+    async fn put_stream_writes_chunks_and_round_trips_content() {
+        // Streaming and buffered paths land on the same on-disk file
+        // (content-addressed shard), so each one's `get` must return
+        // the same bytes — even though the capability ids differ.
         let (store, _dir) = build().await;
         let chunks = [
             Bytes::from_static(b"hello "),
@@ -472,19 +554,24 @@ mod tests {
         ];
         let stream = stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)).boxed();
         let blob = store
-            .put_stream(stream, "text/plain", u64::MAX)
+            .put_stream(stream, "text/plain", None, u64::MAX)
             .await
             .unwrap();
 
-        // Same content via single-shot `put` produces the same id —
-        // streaming and buffered paths must agree on the digest.
         let direct = store
-            .put(b"hello streaming world", "text/plain")
+            .put(b"hello streaming world", "text/plain", None)
             .await
             .unwrap();
-        assert_eq!(blob.blob_id, direct.blob_id);
+        assert_ne!(
+            blob.blob_id, direct.blob_id,
+            "fresh capabilities are minted per call",
+        );
         assert_eq!(
             store.get(&blob.blob_id).await.unwrap(),
+            b"hello streaming world",
+        );
+        assert_eq!(
+            store.get(&direct.blob_id).await.unwrap(),
             b"hello streaming world",
         );
     }
@@ -495,7 +582,7 @@ mod tests {
         let chunks = vec![Bytes::from(vec![b'a'; 10]), Bytes::from(vec![b'b'; 20])];
         let stream = stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)).boxed();
         let result = store
-            .put_stream(stream, "application/octet-stream", 16)
+            .put_stream(stream, "application/octet-stream", None, 16)
             .await;
         match result {
             Err(StorageError::TooLarge { limit, actual }) => {
@@ -515,6 +602,7 @@ mod tests {
             .put_stream(
                 stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)).boxed(),
                 "application/octet-stream",
+                None,
                 8,
             )
             .await;
@@ -534,7 +622,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let (store, _dir) = build().await;
         let blob = store
-            .put(b"streaming download", "text/plain")
+            .put(b"streaming download", "text/plain", None)
             .await
             .unwrap();
         let mut reader = store.open(&blob.blob_id).await.expect("open");
@@ -555,27 +643,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_put_of_same_content_is_idempotent() {
-        // Regression test for the codex adversarial-review finding:
-        // two writers used to share `<hex>.tmp` and one rename could
-        // fire ENOENT when the other consumed the temp first. Both
-        // sides must now succeed with the same blob_id.
+    async fn concurrent_puts_of_same_content_each_get_unique_capabilities() {
+        // Regression for the codex adversarial-review finding: two
+        // writers used to share `<hex>.tmp` and one rename could fire
+        // ENOENT when the other consumed the temp first. With the
+        // capability-id model, each writer gets its own unforgeable
+        // id and no rename ever conflicts.
         let (store, _dir) = build().await;
         let store = std::sync::Arc::new(store);
         let bytes = b"identical content";
         let mut handles = Vec::new();
         for _ in 0..16 {
             let s = std::sync::Arc::clone(&store);
-            handles.push(tokio::spawn(
-                async move { s.put(bytes, "text/plain").await },
-            ));
+            handles.push(tokio::spawn(async move {
+                s.put(bytes, "text/plain", None).await
+            }));
         }
         let mut ids = Vec::new();
         for h in handles {
             ids.push(h.await.unwrap().expect("concurrent put").blob_id);
         }
-        assert!(ids.iter().all(|id| id == &ids[0]), "all ids match");
-        let bytes_back = store.get(&ids[0]).await.unwrap();
-        assert_eq!(bytes_back, bytes);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "every put gets a fresh capability");
+        // All ids resolve to the same on-disk file content.
+        for id in &ids {
+            assert_eq!(store.get(id).await.unwrap(), bytes);
+        }
     }
 }

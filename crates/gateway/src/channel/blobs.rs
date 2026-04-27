@@ -29,7 +29,7 @@ use crate::auth::AuthedClient;
 /// Sidecar-supplied originator identity. The sidecar fills these in
 /// from the inbound platform event so the gateway can run the same
 /// `(channel_type, bot_id, user_id)` pairing check it runs on
-/// `Frame::Message` — without this header a sidecar could persist a
+/// `Frame::Message` — without these headers a sidecar could persist a
 /// 100 MiB blob for an unpaired user before the message-side pairing
 /// gate ever runs.
 const HEADER_BOT_ID: &str = "x-aura-bot-id";
@@ -66,13 +66,11 @@ enum UploadAuth {
     /// TUI / session-scoped client — pairing not applicable.
     Bypass,
     /// Subprocess sidecar passed pairing. Carries the resolved
-    /// `(channel_type, bot_id, user_id)` triple for diagnostics.
+    /// `(channel_type, bot_id, user_id)` triple — the handler stamps
+    /// it onto the blob's `uploader_identity` for diagnostics.
     Approved {
-        #[allow(dead_code)]
         channel_type: ChannelType,
-        #[allow(dead_code)]
         bot_id: String,
-        #[allow(dead_code)]
         user_id: String,
     },
     /// Subprocess sidecar; pairing not yet approved. Body contains the
@@ -154,8 +152,14 @@ async fn upload(
     // 100 MiB writes — the moment a sidecar holds the bytes, the gate
     // decides whether they're allowed to land at all. TUI traffic is
     // session-scoped and bypasses the gate (same as on the WS side).
-    match authorize_upload(state.pairing.as_ref(), &authed, &headers).await {
-        UploadAuth::Bypass | UploadAuth::Approved { .. } => {}
+    let uploader_identity = match authorize_upload(state.pairing.as_ref(), &authed, &headers).await
+    {
+        UploadAuth::Bypass => None,
+        UploadAuth::Approved {
+            channel_type,
+            bot_id,
+            user_id,
+        } => Some(format!("{channel_type}:{bot_id}:{user_id}")),
         UploadAuth::Pending(code) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -167,7 +171,7 @@ async fn upload(
                 .into_response();
         }
         UploadAuth::Reject(status, msg) => return (status, msg).into_response(),
-    }
+    };
 
     let mime = headers
         .get(header::CONTENT_TYPE)
@@ -191,7 +195,12 @@ async fn upload(
 
     match state
         .blob_store
-        .put_stream(stream, &mime, MAX_BLOB_BYTES as u64)
+        .put_stream(
+            stream,
+            &mime,
+            uploader_identity.as_deref(),
+            MAX_BLOB_BYTES as u64,
+        )
         .await
     {
         Ok(blob_ref) => (

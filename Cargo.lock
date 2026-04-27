@@ -681,6 +681,7 @@ dependencies = [
  "libc",
  "libsql",
  "parking_lot",
+ "rand 0.10.0",
  "serde",
  "serde_json",
  "sha2",

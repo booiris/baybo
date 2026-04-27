@@ -46,12 +46,20 @@ pub struct BlobMeta {
 
 #[async_trait]
 pub trait BlobStore: Send + Sync {
-    /// Persist `bytes` and return the content-addressed [`BlobRef`].
-    /// Idempotent: putting the same bytes a second time returns the
-    /// same id without rewriting the file (and revives a soft-deleted
-    /// row, per the storage soft-delete rule). `mime_type` is recorded
-    /// on the metadata row; if the blob already existed the mime is
-    /// updated to the latest value the caller supplied.
+    /// Persist `bytes` and return a fresh [`BlobRef`]. Each call mints
+    /// a new unguessable `read_token` and returns a distinct
+    /// `blob_id` — even for identical content. The on-disk byte file
+    /// is content-addressed by the SHA-256 digest, so duplicate
+    /// content shares the same physical file (deduplication at the
+    /// filesystem layer); only the metadata row + capability id are
+    /// per-call.
+    ///
+    /// Two consequences for callers:
+    /// * The id is the read capability. Anyone who learns it can
+    ///   read; sharing a `blob_id` means delegating read access.
+    /// * "Same bytes" is not the same as "same id". A test relying
+    ///   on dedup-by-id from `put` is wrong; use the bytes you
+    ///   uploaded as the comparison anchor.
     async fn put(
         &self,
         bytes: &[u8],
@@ -66,7 +74,7 @@ pub trait BlobStore: Send + Sync {
     /// total past the cap returns [`StorageError::TooLarge`] without
     /// buffering the rest. Pass `u64::MAX` to opt out.
     ///
-    /// Same idempotence and soft-delete-revival semantics as `put`.
+    /// Same per-call distinct-id semantics as `put`.
     async fn put_stream(
         &self,
         stream: ByteStream,

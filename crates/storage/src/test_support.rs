@@ -384,6 +384,7 @@ struct MemoryBlob {
     bytes: Vec<u8>,
     mime_type: String,
     created_at: i64,
+    read_token: String,
     deleted_at: Option<i64>,
 }
 
@@ -415,10 +416,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
-    async fn put(&self, bytes: &[u8], mime_type: &str) -> BlobResult<BlobRef> {
+    async fn put(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+        _uploader_identity: Option<&str>,
+    ) -> BlobResult<BlobRef> {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
-        let blob_id = format!("{SHA256_PREFIX}{}", hex_encode(&hasher.finalize()));
+        let hex = hex_encode(&hasher.finalize());
+        let read_token = "fake-token";
+        let blob_id = format!("{SHA256_PREFIX}{hex}.{read_token}");
         let mut guard = self.blobs.lock();
         guard
             .entry(blob_id.clone())
@@ -430,6 +438,7 @@ impl BlobStore for MemoryBlobStore {
                 bytes: bytes.to_vec(),
                 mime_type: mime_type.to_owned(),
                 created_at: chrono::Utc::now().timestamp(),
+                read_token: read_token.to_owned(),
                 deleted_at: None,
             });
         Ok(BlobRef { blob_id })
@@ -439,6 +448,7 @@ impl BlobStore for MemoryBlobStore {
         &self,
         mut stream: ByteStream,
         mime_type: &str,
+        uploader_identity: Option<&str>,
         max_bytes: u64,
     ) -> BlobResult<BlobRef> {
         // Tests only — buffer everything into a Vec and reuse the
@@ -456,7 +466,7 @@ impl BlobStore for MemoryBlobStore {
             }
             buf.extend_from_slice(&chunk);
         }
-        self.put(&buf, mime_type).await
+        self.put(&buf, mime_type, uploader_identity).await
     }
 
     async fn get(&self, blob_id: &str) -> BlobResult<Vec<u8>> {
@@ -472,22 +482,38 @@ impl BlobStore for MemoryBlobStore {
     }
 
     async fn stat(&self, blob_id: &str) -> BlobResult<BlobMeta> {
+        let (_hex, token) = split_id(blob_id)?;
         match self.blobs.lock().get(blob_id) {
-            Some(b) if b.deleted_at.is_none() => Ok(BlobMeta {
-                blob_id: blob_id.to_owned(),
-                mime_type: b.mime_type.clone(),
-                size: b.bytes.len() as u64,
-                created_at: b.created_at,
-            }),
+            Some(b) if b.deleted_at.is_none() => {
+                if b.read_token != token {
+                    return Err(StorageError::NotFound(format!("blob {blob_id}")));
+                }
+                Ok(BlobMeta {
+                    blob_id: blob_id.to_owned(),
+                    mime_type: b.mime_type.clone(),
+                    size: b.bytes.len() as u64,
+                    created_at: b.created_at,
+                    read_token: Some(b.read_token.clone()),
+                })
+            }
             _ => Err(StorageError::NotFound(format!("blob {blob_id}"))),
         }
     }
 
     async fn delete(&self, blob_id: &str) -> BlobResult<()> {
+        let _ = split_id(blob_id)?;
         if let Some(b) = self.blobs.lock().get_mut(blob_id) {
             b.deleted_at
                 .get_or_insert_with(|| chrono::Utc::now().timestamp());
         }
         Ok(())
     }
+}
+
+fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
+    let hex_all = blob_id
+        .strip_prefix(SHA256_PREFIX)
+        .ok_or_else(|| StorageError::NotFound(format!("invalid blob_id {blob_id}")))?;
+    let (hex, token) = hex_all.split_once('.').unwrap_or((hex_all, ""));
+    Ok((hex, token))
 }
