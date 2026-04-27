@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aura_channels::{AgentOutput, Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
-use aura_model::{Session, User};
+use aura_model::{Session, SessionTrigger, User};
 
 use aura_cron::CronTriggerEvent;
 
@@ -166,54 +166,77 @@ impl Router {
         self.supervisor.shutdown_all().await;
     }
 
-    /// Handle a cron trigger by resolving (or creating) a session for the
-    /// target user+channel combination and routing a `CronTrigger` message.
+    /// Handle a cron trigger by minting a fresh session and routing a
+    /// `CronTrigger` message into it.
+    ///
+    /// Each fire creates an isolated session so the audit trail records
+    /// one trigger == one session, with the schedule and fire-time
+    /// stamped on `SessionTrigger::Cron`. Continuity across triggers
+    /// belongs to memory + skill loading, not to a shared mutable
+    /// transcript.
+    ///
+    /// The spawned actor is intentionally NOT registered with the
+    /// supervisor: each cron session is one-shot and has no follow-up
+    /// traffic, so registering would just accumulate dangling actor
+    /// handles in the supervisor's map. We send `CronTrigger` followed
+    /// by `Shutdown`; the actor processes the trigger (FIFO), exits on
+    /// Shutdown, and its mailbox closes when this function returns and
+    /// drops the sender.
     async fn handle_cron_trigger(&mut self, event: CronTriggerEvent) -> anyhow::Result<()> {
-        // Stable session ID derived from user+channel so repeated cron
-        // triggers reuse a single session for conversational continuity.
-        let session_id = format!("cron-{}-{}", event.user_id, event.channel);
-
         let user = User {
             id: event.user_id.clone(),
             name: None,
             channel: event.channel.clone(),
         };
 
+        let session = self
+            .session_manager
+            .create_session_with_trigger(
+                user,
+                event.channel.clone(),
+                SessionTrigger::Cron {
+                    cron_job_id: event.job_id.clone(),
+                    scheduled_fire_time: event.scheduled_fire_time,
+                },
+            )
+            .await?;
+        let session_id = session.id.clone();
+
+        let Some(ref spawner) = self.actor_spawner else {
+            warn!(session_id = %session_id, "no actor spawner configured for cron trigger");
+            return Ok(());
+        };
+
         debug!(
             session_id = %session_id,
             job_id = %event.job_id,
-            "routing cron trigger"
+            "routing cron trigger to fresh session"
         );
 
-        let session = self
-            .session_manager
-            .get_or_create(&session_id, user, event.channel.clone())
-            .await?;
+        let response_tx = self.supervisor.response_tx().clone();
+        // The spawner returns only the actor's sender; its tokio JoinHandle
+        // is dropped inside the closure. Process-exit therefore can't wait
+        // for in-flight cron work — same gap as registered actors, since
+        // `AgentSupervisor::shutdown_all` only forwards `Shutdown` messages
+        // and never awaits joins. A future PR can plumb a `JoinSet` through
+        // the spawner contract to fix that across all actor flows.
+        let sender = spawner(session, response_tx);
 
-        self.session_manager.touch(&session_id).await?;
-
-        let message = AgentMessage::CronTrigger {
+        let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
             action: event.action,
         };
-
-        let routed = self.supervisor.route(&session_id, message.clone()).await;
-
-        if !routed {
-            if let Some(ref spawner) = self.actor_spawner {
-                info!(session_id = %session_id, "creating new actor for cron session");
-                let response_tx = self.supervisor.response_tx().clone();
-                let sender = spawner(session, response_tx);
-                self.supervisor.register(session_id.clone(), sender);
-
-                if !self.supervisor.route(&session_id, message).await {
-                    warn!(session_id = %session_id, "failed to route cron trigger after actor creation");
-                }
-            } else {
-                warn!(session_id = %session_id, "no actor spawner configured for cron trigger");
-            }
+        if let Err(e) = sender.send(trigger_msg).await {
+            warn!(session_id = %session_id, error = %e, "failed to deliver cron trigger");
+            return Ok(());
         }
-
+        if let Err(e) = sender.send(AgentMessage::Shutdown).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to deliver post-trigger shutdown; actor will still exit when sender drops",
+            );
+        }
         Ok(())
     }
 

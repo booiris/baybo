@@ -83,12 +83,18 @@ fn row_to_execution(row: CronExecutionRow) -> Result<CronExecution> {
 // ── Scheduler ──────────────────────────────────────────────────────────
 
 /// Event emitted when a cron job fires.
+///
+/// `scheduled_fire_time` is the wall-clock instant the job was due
+/// (not when this event was emitted). Routers stamp it on the new
+/// session's `SessionTrigger::Cron` so audit trails record the
+/// scheduled time even if dispatch was delayed by a process restart.
 #[derive(Debug, Clone)]
 pub struct CronTriggerEvent {
     pub job_id: String,
     pub user_id: String,
     pub channel: ChannelType,
     pub action: TriggerAction,
+    pub scheduled_fire_time: DateTime<Utc>,
 }
 
 /// Manages cron job lifecycle and runs a background tick loop
@@ -294,6 +300,7 @@ impl CronScheduler {
             user_id: execution.user_id.clone(),
             channel: execution.channel.clone(),
             action: execution.action.clone(),
+            scheduled_fire_time: execution.scheduled_fire_time,
         };
 
         self.trigger_tx
@@ -384,6 +391,7 @@ impl CronScheduler {
                 user_id: exec.user_id.clone(),
                 channel: exec.channel,
                 action: exec.action.clone(),
+                scheduled_fire_time: exec.scheduled_fire_time,
             };
 
             if let Err(e) = self.trigger_tx.send(event).await {
@@ -500,6 +508,7 @@ impl CronScheduler {
                 user_id: execution.user_id.clone(),
                 channel: execution.channel,
                 action: execution.action.clone(),
+                scheduled_fire_time: execution.scheduled_fire_time,
             };
 
             if let Err(e) = self.trigger_tx.send(event).await {

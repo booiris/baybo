@@ -4,13 +4,13 @@
 
 The `cron` crate defines domain types for scheduled recurring work: `CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `TriggerAction`, `ExecutionStatus`, and `CronError`. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs.
 
-CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Session resolution happens dynamically at trigger time in the agent layer. A `CronJob` also records its `origin_session_id` — the session that created it — purely for traceability; trigger-time session resolution is unaffected.
+CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. The Router mints a fresh session per fire stamped with `SessionTrigger::Cron { cron_job_id, scheduled_fire_time }`; conversational continuity across fires lives in long-term memory (vector store) and the skill loader, not in a shared mutable transcript. A `CronJob` also records its `origin_session_id` — the session that created it — purely for traceability.
 
 ## Design Decisions
 
 ### Bind to user_id + channel, not session_id
 
-Sessions are ephemeral (30-min default timeout). A cron job is a long-lived intent that must outlive any single session. Binding to `user_id + channel` provides a stable identity; the Router resolves or creates a session at trigger time using a deterministic session ID (`cron-{user_id}-{channel}`).
+Sessions are ephemeral (30-min default timeout). A cron job is a long-lived intent that must outlive any single session. Binding to `user_id + channel` provides a stable identity. The Router mints a brand-new session (UUID id) on every fire and tags its `SessionTrigger` with the cron job id and scheduled fire time. Each fire's actor is one-shot: spawned, sent the `CronTrigger` message, then sent `Shutdown`; the actor processes the trigger, exits, and the sender drops without registering with the supervisor — so per-fire actors don't accumulate.
 
 ### Pre-computed next_trigger_at
 
