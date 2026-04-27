@@ -6,8 +6,8 @@ use chrono::Utc;
 use super::LibsqlPool;
 use crate::trace::{Result, TraceStore};
 use aura_trace::{
-    ExecutionProvenance, ForkRecord, SessionTrace, SpanInput, SpanResult, TraceError, TraceFilter,
-    TraceNode, TraceNodeId, TraceSpan,
+    ExecutionProvenance, ForkRecord, SessionTrace, SpanInput, SpanResult, SpanRole, TraceError,
+    TraceFilter, TraceNode, TraceNodeId, TraceSpan,
 };
 
 pub struct LibsqlTraceStore {
@@ -94,8 +94,9 @@ impl TraceStore for LibsqlTraceStore {
             tx.execute(
                 "INSERT OR REPLACE INTO trace_nodes
                     (id, session_id, parent_id, kind, job_id, provenance,
-                     input, result, started_at, ended_at, snapshot, deleted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL)",
+                     input, result, started_at, ended_at, snapshot,
+                     span_id, span_index, span_role, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL)",
                 libsql::params![
                     node.id.clone(),
                     sid.clone(),
@@ -107,7 +108,10 @@ impl TraceStore for LibsqlTraceStore {
                     result_json.unwrap_or_default(),
                     started,
                     ended.unwrap_or_default(),
-                    snap_json.unwrap_or_default()
+                    snap_json.unwrap_or_default(),
+                    node.span_id.clone(),
+                    node.span_index as i64,
+                    span_role_to_str(node.span_role).to_string()
                 ],
             )
             .await
@@ -246,7 +250,8 @@ impl TraceStore for LibsqlTraceStore {
         let mut rows = conn
             .query(
                 "SELECT id, parent_id, kind, job_id, provenance, input,
-                        result, started_at, ended_at, snapshot
+                        result, started_at, ended_at, snapshot,
+                        span_id, span_index, span_role
                  FROM trace_nodes
                  WHERE session_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 libsql::params![session_id.to_string(), node_id.clone()],
@@ -299,7 +304,8 @@ impl LibsqlTraceStore {
         let mut rows = conn
             .query(
                 "SELECT id, parent_id, kind, job_id, provenance, input,
-                        result, started_at, ended_at, snapshot
+                        result, started_at, ended_at, snapshot,
+                        span_id, span_index, span_role
                  FROM trace_nodes
                  WHERE session_id = ?1 AND deleted_at IS NULL
                  ORDER BY started_at",
@@ -379,6 +385,11 @@ impl LibsqlTraceStore {
         let started_str: String = row.get(7).map_err(|e| ie(format!("get started: {e}")))?;
         let ended_raw: String = row.get(8).map_err(|e| ie(format!("get ended: {e}")))?;
         let snap_raw: String = row.get(9).map_err(|e| ie(format!("get snap: {e}")))?;
+        let span_id: String = row.get(10).map_err(|e| ie(format!("get span_id: {e}")))?;
+        let span_index_i: i64 = row
+            .get(11)
+            .map_err(|e| ie(format!("get span_index: {e}")))?;
+        let span_role_raw: String = row.get(12).map_err(|e| ie(format!("get span_role: {e}")))?;
 
         let parent = if parent_raw.is_empty() {
             None
@@ -430,6 +441,17 @@ impl LibsqlTraceStore {
             Some(de(&snap_raw)?)
         };
 
+        // Legacy rows that pre-date the span_id column carry an empty
+        // string; fall back to using the node id as its own span so the
+        // downstream code never sees an empty span_id.
+        let span_id = if span_id.is_empty() {
+            id.clone()
+        } else {
+            span_id
+        };
+        let span_index = u32::try_from(span_index_i).unwrap_or(0);
+        let span_role = parse_span_role(&span_role_raw);
+
         Ok(TraceNode {
             id,
             parent,
@@ -444,7 +466,26 @@ impl LibsqlTraceStore {
                 result,
             },
             context_snapshot,
+            span_id,
+            span_index,
+            span_role,
         })
+    }
+}
+
+fn span_role_to_str(role: SpanRole) -> &'static str {
+    match role {
+        SpanRole::Llm => "llm",
+        SpanRole::Tool => "tool",
+        SpanRole::System => "system",
+    }
+}
+
+fn parse_span_role(raw: &str) -> SpanRole {
+    match raw {
+        "llm" => SpanRole::Llm,
+        "tool" => SpanRole::Tool,
+        _ => SpanRole::System,
     }
 }
 
@@ -474,6 +515,9 @@ mod tests {
                 result: None,
             },
             context_snapshot: None,
+            span_id: node_id.clone(),
+            span_index: 0,
+            span_role: SpanRole::Llm,
         };
         let mut nodes = HashMap::new();
         nodes.insert(node_id.clone(), node);
@@ -505,6 +549,9 @@ mod tests {
                 result: None,
             },
             context_snapshot: None,
+            span_id: root_id.clone(),
+            span_index: 0,
+            span_role: SpanRole::System,
         };
         let child = TraceNode {
             id: child_id.clone(),
@@ -532,6 +579,9 @@ mod tests {
                 }),
             },
             context_snapshot: None,
+            span_id: child_id.clone(),
+            span_index: 1,
+            span_role: SpanRole::Llm,
         };
         let mut nodes = HashMap::new();
         nodes.insert(root_id.clone(), root);

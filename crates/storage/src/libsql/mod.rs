@@ -138,11 +138,16 @@ impl LibsqlPool {
                     started_at TEXT NOT NULL,
                     ended_at   TEXT,
                     snapshot   TEXT,
+                    span_id    TEXT NOT NULL DEFAULT '',
+                    span_index INTEGER NOT NULL DEFAULT 0,
+                    span_role  TEXT NOT NULL DEFAULT 'system',
                     deleted_at INTEGER,
                     PRIMARY KEY (session_id, id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_trace_nodes_started
                     ON trace_nodes(session_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_trace_nodes_span
+                    ON trace_nodes(session_id, job_id, span_id, span_index);
 
                 CREATE TABLE IF NOT EXISTS trace_forks (
                     id         TEXT PRIMARY KEY,
@@ -290,6 +295,63 @@ impl LibsqlPool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
+
+        self.migrate_trace_nodes_span_columns().await?;
+
+        Ok(())
+    }
+
+    /// Idempotently add the span_* columns to pre-existing `trace_nodes`
+    /// tables. The CREATE TABLE in `init_db` already declares them for
+    /// fresh databases; this only catches DBs that were initialized
+    /// before those columns existed.
+    async fn migrate_trace_nodes_span_columns(&self) -> anyhow::Result<()> {
+        let mut existing = std::collections::HashSet::new();
+        let mut rows = self
+            .conn
+            .query("PRAGMA table_info(trace_nodes)", ())
+            .await
+            .map_err(|e| anyhow::anyhow!("pragma table_info(trace_nodes): {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| anyhow::anyhow!("read pragma row: {e}"))?
+        {
+            let name: String = row
+                .get(1)
+                .map_err(|e| anyhow::anyhow!("read pragma col name: {e}"))?;
+            existing.insert(name);
+        }
+
+        // Empty result means trace_nodes does not yet exist (fresh DB whose
+        // CREATE TABLE will run after this); nothing to migrate.
+        if existing.is_empty() {
+            return Ok(());
+        }
+
+        let migrations: &[(&str, &str)] = &[
+            (
+                "span_id",
+                "ALTER TABLE trace_nodes ADD COLUMN span_id TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "span_index",
+                "ALTER TABLE trace_nodes ADD COLUMN span_index INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "span_role",
+                "ALTER TABLE trace_nodes ADD COLUMN span_role TEXT NOT NULL DEFAULT 'system'",
+            ),
+        ];
+        for (col, stmt) in migrations {
+            if existing.contains(*col) {
+                continue;
+            }
+            self.conn
+                .execute(stmt, ())
+                .await
+                .map_err(|e| anyhow::anyhow!("alter trace_nodes add {col}: {e}"))?;
+        }
         Ok(())
     }
 }

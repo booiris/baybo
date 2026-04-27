@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_model::{ChannelType, ChatMessage, Session, SessionState, User};
+use aura_model::{ChannelType, ChatMessage, Session, SessionState, SessionTrigger, User};
 use aura_storage::{SessionStore, StorageError};
 use chrono::{Duration, Utc};
 use tracing::{debug, warn};
@@ -28,7 +28,17 @@ impl SessionManager {
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
-        self.create_session_with_id(uuid::Uuid::new_v4().to_string(), user, channel)
+        self.create_session_with_trigger(user, channel, SessionTrigger::User)
+            .await
+    }
+
+    pub async fn create_session_with_trigger(
+        &self,
+        user: User,
+        channel: ChannelType,
+        trigger: SessionTrigger,
+    ) -> Result<Session> {
+        self.create_session_with_id(uuid::Uuid::new_v4().to_string(), user, channel, trigger)
             .await
     }
 
@@ -37,12 +47,15 @@ impl SessionManager {
         id: String,
         user: User,
         channel: ChannelType,
+        trigger: SessionTrigger,
     ) -> Result<Session> {
         let now = Utc::now();
         let session = Session {
             id,
             user,
             channel,
+            trigger,
+            parent_link: None,
             messages: Vec::new(),
             created_at: now,
             last_active: now,
@@ -65,14 +78,19 @@ impl SessionManager {
                 debug!(session_id, "session expired, replacing with new session");
                 self.store.delete(session_id).await.map_err(wrap)?;
                 return self
-                    .create_session_with_id(session_id.to_string(), user, channel)
+                    .create_session_with_id(
+                        session_id.to_string(),
+                        user,
+                        channel,
+                        SessionTrigger::User,
+                    )
                     .await;
             }
             debug!(session_id, "returning existing session");
             return Ok(session);
         }
         debug!(session_id, "session not found, creating new session");
-        self.create_session_with_id(session_id.to_string(), user, channel)
+        self.create_session_with_id(session_id.to_string(), user, channel, SessionTrigger::User)
             .await
     }
 

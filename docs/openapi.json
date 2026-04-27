@@ -1676,7 +1676,9 @@
           "submitted",
           "accepted",
           "failed",
-          "stuck"
+          "stuck",
+          "cancelled",
+          "abandoned"
         ]
       },
       "LlmInfo": {

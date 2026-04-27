@@ -248,6 +248,8 @@ mod tests {
                 channel: aura_model::ChannelType::tui(),
             },
             channel: aura_model::ChannelType::tui(),
+            trigger: Default::default(),
+            parent_link: None,
             messages,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),

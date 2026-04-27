@@ -38,6 +38,33 @@ pub struct TraceNode {
     pub children: Vec<TraceNodeId>,
     pub span: TraceSpan,
     pub context_snapshot: Option<ContextSnapshot>,
+    /// ReAct-iteration grouping. All nodes produced within the same
+    /// agent-loop iteration share this id (one LLM node + 0..K tool
+    /// nodes). Defaults to the node id when no grouping is recorded
+    /// (e.g. legacy trace data).
+    #[serde(default)]
+    pub span_id: String,
+    /// Zero-based index of this span within the owning Job. Increments
+    /// by one per ReAct iteration. `0` for legacy nodes.
+    #[serde(default)]
+    pub span_index: u32,
+    /// What role this node plays inside its span.
+    #[serde(default)]
+    pub span_role: SpanRole,
+}
+
+/// What kind of action a `TraceNode` represents inside its span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanRole {
+    /// The LLM call that opens the iteration.
+    Llm,
+    /// A tool call dispatched by the iteration's LLM call.
+    Tool,
+    /// A system action (compression, memory write, acceptance event, …)
+    /// that does not fit the LLM/Tool roles.
+    #[default]
+    System,
 }
 
 /// Details of a traced operation span.

@@ -71,30 +71,14 @@ impl JobManager {
         Ok(jobs)
     }
 
-    /// Cancel a job. Transitions the job to `Failed` with a cancellation
-    /// reason. `Pending` jobs are first started, then failed (the state
-    /// machine does not allow `Pending -> Failed` directly). Terminal jobs
-    /// (`Accepted`, `Failed`) and already-settled jobs (`Completed`,
-    /// `Submitted`) are rejected as no-ops so the operator gets a clear
-    /// error rather than silently losing audit trail for work that has
-    /// already produced output.
+    /// Cancel a job. `Pending`, `InProgress`, and `Stuck` jobs are
+    /// transitioned directly to `Cancelled`; jobs that already reached
+    /// `Completed` or beyond are rejected so a settled audit trail isn't
+    /// reclassified after the fact.
     pub async fn cancel(&self, job_id: &str) -> Result<Job> {
-        let job = self.load_job(job_id).await?;
         let reason = "cancelled by operator";
-        match job.status {
-            JobStatus::Pending => {
-                self.start(job_id).await?;
-                self.fail(job_id, reason).await?;
-            }
-            JobStatus::InProgress | JobStatus::Stuck => {
-                self.fail(job_id, reason).await?;
-            }
-            other => {
-                return Err(JobError::InvalidTransition(format!(
-                    "cannot cancel job {job_id} in status {other}"
-                )));
-            }
-        }
+        let (job, transition) = self.apply(job_id, |j| j.cancel(reason)).await?;
+        self.persist(job, transition).await?;
         self.load_job(job_id).await
     }
 
@@ -445,39 +429,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_pending_job_transitions_through_in_progress() {
+    async fn cancel_pending_job_goes_to_cancelled() {
         let mgr = make_manager();
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
 
         let out = mgr.cancel(&job.id).await.unwrap();
-        assert_eq!(out.status, JobStatus::Failed);
-        assert_eq!(out.error.as_deref(), Some("cancelled by operator"));
+        assert_eq!(out.status, JobStatus::Cancelled);
 
         let history = mgr.get_history(&job.id).await.unwrap();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].to, JobStatus::InProgress);
-        assert_eq!(history[1].to, JobStatus::Failed);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].from, JobStatus::Pending);
+        assert_eq!(history[0].to, JobStatus::Cancelled);
+        assert_eq!(history[0].reason.as_deref(), Some("cancelled by operator"));
     }
 
     #[tokio::test]
-    async fn cancel_in_progress_job_fails_directly() {
+    async fn cancel_in_progress_job_goes_to_cancelled() {
         let mgr = make_manager();
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         mgr.start(&job.id).await.unwrap();
 
         let out = mgr.cancel(&job.id).await.unwrap();
-        assert_eq!(out.status, JobStatus::Failed);
+        assert_eq!(out.status, JobStatus::Cancelled);
     }
 
     #[tokio::test]
-    async fn cancel_stuck_job_fails() {
+    async fn cancel_stuck_job_goes_to_cancelled() {
         let mgr = make_manager();
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         mgr.start(&job.id).await.unwrap();
         mgr.stuck(&job.id, "hung").await.unwrap();
 
         let out = mgr.cancel(&job.id).await.unwrap();
-        assert_eq!(out.status, JobStatus::Failed);
+        assert_eq!(out.status, JobStatus::Cancelled);
     }
 
     #[tokio::test]

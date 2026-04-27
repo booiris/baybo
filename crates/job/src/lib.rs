@@ -4,6 +4,8 @@ mod operation;
 pub use error::JobError;
 pub use operation::OperationKind;
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,14 +13,23 @@ use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, JobError>;
 
-/// Job lifecycle status with a fixed state machine.
+/// Job lifecycle status.
 ///
 /// ```text
 /// Pending -> InProgress -> Completed -> Submitted -> Accepted
-///                       \-> Failed
-///                       \-> Stuck -> InProgress
-///                                \-> Failed
+///       |         |              \-> Failed
+///       |         \-> Failed
+///       |         \-> Cancelled        (user-initiated abort)
+///       |         \-> Stuck -> InProgress
+///       |                  \-> Failed
+///       |                  \-> Abandoned (recovery gave up)
+///       \-> Cancelled                   (cancel before start)
 /// ```
+///
+/// Submitted/Accepted distinguish "agent finished" from "verifier
+/// approved". `AcceptancePolicy::Auto` causes JobManager to walk both
+/// transitions atomically on completion so user-facing chat does not
+/// see the seam.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
@@ -29,18 +40,38 @@ pub enum JobStatus {
     Accepted,
     Failed,
     Stuck,
+    /// User explicitly aborted this job.
+    ///
+    /// Distinct from `Failed` so cost/billing and failure-rate stats can
+    /// exclude it; trace retains any partial spans for inspection.
+    Cancelled,
+    /// Recovery worker decided not to retry a `Stuck` job.
+    Abandoned,
 }
 
 impl JobStatus {
     /// Returns the set of statuses reachable from `self`.
     pub fn allowed_transitions(&self) -> &'static [JobStatus] {
         match self {
-            JobStatus::Pending => &[JobStatus::InProgress],
-            JobStatus::InProgress => &[JobStatus::Completed, JobStatus::Failed, JobStatus::Stuck],
+            JobStatus::Pending => &[JobStatus::InProgress, JobStatus::Cancelled],
+            JobStatus::InProgress => &[
+                JobStatus::Completed,
+                JobStatus::Failed,
+                JobStatus::Stuck,
+                JobStatus::Cancelled,
+            ],
             JobStatus::Completed => &[JobStatus::Submitted],
-            JobStatus::Submitted => &[JobStatus::Accepted],
-            JobStatus::Stuck => &[JobStatus::InProgress, JobStatus::Failed],
-            JobStatus::Accepted | JobStatus::Failed => &[],
+            JobStatus::Submitted => &[JobStatus::Accepted, JobStatus::Failed],
+            JobStatus::Stuck => &[
+                JobStatus::InProgress,
+                JobStatus::Failed,
+                JobStatus::Cancelled,
+                JobStatus::Abandoned,
+            ],
+            JobStatus::Accepted
+            | JobStatus::Failed
+            | JobStatus::Cancelled
+            | JobStatus::Abandoned => &[],
         }
     }
 
@@ -49,9 +80,12 @@ impl JobStatus {
         self.allowed_transitions().contains(target)
     }
 
-    /// Whether this is a terminal status (`Accepted` or `Failed`).
+    /// Whether this is a terminal status.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, JobStatus::Accepted | JobStatus::Failed)
+        matches!(
+            self,
+            JobStatus::Accepted | JobStatus::Failed | JobStatus::Cancelled | JobStatus::Abandoned
+        )
     }
 
     /// Whether a job in this status needs recovery after a system restart.
@@ -73,8 +107,77 @@ impl std::fmt::Display for JobStatus {
             JobStatus::Accepted => "Accepted",
             JobStatus::Failed => "Failed",
             JobStatus::Stuck => "Stuck",
+            JobStatus::Cancelled => "Cancelled",
+            JobStatus::Abandoned => "Abandoned",
         };
         write!(f, "{s}")
+    }
+}
+
+/// Who is responsible for moving a job from `Completed` → `Submitted`
+/// or `Submitted` → `Accepted`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AcceptancePolicy {
+    /// Both transitions auto-fire as soon as the job reaches `Completed`.
+    /// Default for chat turns, cron, and system actions.
+    #[default]
+    Auto,
+    /// Submit auto-fires on completion; Accept waits for `acceptor`.
+    AutoSubmit { acceptor: Acceptor },
+    /// Both transitions wait for explicit triggers from the named parties.
+    Manual {
+        submitter: Acceptor,
+        acceptor: Acceptor,
+    },
+}
+
+/// A party that can transition a job in the acceptance flow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Acceptor {
+    /// Wait for an explicit user action (e.g. `/v1/jobs/{id}/accept`).
+    User,
+    /// Invoke a tool/skill that returns an accept/reject verdict.
+    Validator { tool_id: String },
+    /// Apply `default` after `after` elapses without an explicit signal.
+    Timeout {
+        #[serde(with = "duration_secs")]
+        after: Duration,
+        default: bool,
+    },
+}
+
+/// What to do with a `Stuck` job after a system restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecoveryPolicy {
+    /// Recovery worker auto-resumes up to `max_attempts` times.
+    AutoResume { max_attempts: u32 },
+    /// Wait for an operator to manually resume.
+    Manual,
+    /// Move directly to `Abandoned`.
+    Abandon,
+}
+
+impl Default for RecoveryPolicy {
+    fn default() -> Self {
+        RecoveryPolicy::AutoResume { max_attempts: 3 }
+    }
+}
+
+mod duration_secs {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_secs())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let secs = u64::deserialize(d)?;
+        Ok(Duration::from_secs(secs))
     }
 }
 
@@ -93,10 +196,24 @@ pub struct Job {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Acceptance flow policy. See `AcceptancePolicy`.
+    #[serde(default)]
+    pub acceptance: AcceptancePolicy,
+    /// What to do if this job ends up `Stuck`.
+    #[serde(default)]
+    pub recovery: RecoveryPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<DateTime<Utc>>,
+    /// Number of times this job has been recovered from `Stuck`.
+    #[serde(default)]
+    pub recovery_attempts: u32,
 }
 
 impl Job {
-    /// Create a new job in `Pending` status with a generated UUID.
+    /// Create a new job in `Pending` status with a generated UUID and
+    /// default acceptance/recovery policies (`Auto` and `AutoResume`).
     pub fn new(session_id: &str, kind: OperationKind, parent_job_id: Option<&str>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -111,6 +228,11 @@ impl Job {
             created_at: Utc::now(),
             started_at: None,
             completed_at: None,
+            acceptance: AcceptancePolicy::default(),
+            recovery: RecoveryPolicy::default(),
+            submitted_at: None,
+            accepted_at: None,
+            recovery_attempts: 0,
         }
     }
 
@@ -139,15 +261,31 @@ impl Job {
         let from = self.status.clone();
         let now = Utc::now();
 
-        // Timestamp management
         if target == JobStatus::InProgress && self.started_at.is_none() {
             self.started_at = Some(now);
         }
+        // Stamp the first time the job leaves the live phase. Submitted→Failed
+        // (verifier rejection) keeps the original `completed_at` so audit shows
+        // when the agent actually stopped working, not when the rejection landed.
         if matches!(
             target,
-            JobStatus::Completed | JobStatus::Accepted | JobStatus::Failed
-        ) {
+            JobStatus::Completed
+                | JobStatus::Accepted
+                | JobStatus::Failed
+                | JobStatus::Cancelled
+                | JobStatus::Abandoned
+        ) && self.completed_at.is_none()
+        {
             self.completed_at = Some(now);
+        }
+        if target == JobStatus::Submitted {
+            self.submitted_at = Some(now);
+        }
+        if target == JobStatus::Accepted {
+            self.accepted_at = Some(now);
+        }
+        if from == JobStatus::Stuck && target == JobStatus::InProgress {
+            self.recovery_attempts = self.recovery_attempts.saturating_add(1);
         }
 
         self.status = target.clone();
@@ -204,6 +342,18 @@ impl Job {
         self.transition(JobStatus::InProgress, None, None, Some(reason.to_owned()))
     }
 
+    /// Transition to `Cancelled` with a reason. Legal from `Pending` or
+    /// `InProgress`. Distinct from `fail()` so cost/billing can exclude
+    /// cancelled jobs from failure-rate metrics.
+    pub fn cancel(&mut self, reason: &str) -> Result<JobTransition> {
+        self.transition(JobStatus::Cancelled, None, None, Some(reason.to_owned()))
+    }
+
+    /// Mark a `Stuck` job as `Abandoned` (recovery gave up).
+    pub fn abandon(&mut self, reason: &str) -> Result<JobTransition> {
+        self.transition(JobStatus::Abandoned, None, None, Some(reason.to_owned()))
+    }
+
     /// Mark this job as interrupted by a system restart.
     ///
     /// Only `InProgress` jobs are transitioned to `Stuck`. Jobs in other
@@ -250,9 +400,10 @@ mod tests {
     // -- JobStatus tests --
 
     #[test]
-    fn pending_can_only_go_to_in_progress() {
+    fn pending_transitions() {
         let s = JobStatus::Pending;
         assert!(s.can_transition_to(&JobStatus::InProgress));
+        assert!(s.can_transition_to(&JobStatus::Cancelled));
         assert!(!s.can_transition_to(&JobStatus::Completed));
         assert!(!s.can_transition_to(&JobStatus::Failed));
         assert!(!s.can_transition_to(&JobStatus::Accepted));
@@ -264,8 +415,40 @@ mod tests {
         assert!(s.can_transition_to(&JobStatus::Completed));
         assert!(s.can_transition_to(&JobStatus::Failed));
         assert!(s.can_transition_to(&JobStatus::Stuck));
+        assert!(s.can_transition_to(&JobStatus::Cancelled));
         assert!(!s.can_transition_to(&JobStatus::Accepted));
         assert!(!s.can_transition_to(&JobStatus::Pending));
+    }
+
+    #[test]
+    fn stuck_can_be_abandoned() {
+        let s = JobStatus::Stuck;
+        assert!(s.can_transition_to(&JobStatus::Abandoned));
+        assert!(s.can_transition_to(&JobStatus::Cancelled));
+    }
+
+    #[test]
+    fn submitted_to_failed_preserves_completed_at() {
+        let mut job = Job::new("s1", test_kind(), None);
+        job.start().unwrap();
+        job.complete(serde_json::json!(null)).unwrap();
+        let original = job.completed_at;
+        assert!(original.is_some());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        job.submit().unwrap();
+        job.fail("verifier rejected").unwrap();
+        assert_eq!(job.status, JobStatus::Failed);
+        // completed_at must still point at the agent's actual completion,
+        // not at the verifier rejection time.
+        assert_eq!(job.completed_at, original);
+    }
+
+    #[test]
+    fn cancelled_and_abandoned_are_terminal() {
+        assert!(JobStatus::Cancelled.is_terminal());
+        assert!(JobStatus::Abandoned.is_terminal());
+        assert!(JobStatus::Cancelled.allowed_transitions().is_empty());
+        assert!(JobStatus::Abandoned.allowed_transitions().is_empty());
     }
 
     #[test]
@@ -278,10 +461,85 @@ mod tests {
     fn is_terminal() {
         assert!(JobStatus::Accepted.is_terminal());
         assert!(JobStatus::Failed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+        assert!(JobStatus::Abandoned.is_terminal());
         assert!(!JobStatus::Pending.is_terminal());
         assert!(!JobStatus::InProgress.is_terminal());
         assert!(!JobStatus::Completed.is_terminal());
         assert!(!JobStatus::Stuck.is_terminal());
+    }
+
+    #[test]
+    fn cancel_from_pending() {
+        let mut job = Job::new("s1", test_kind(), None);
+        let t = job.cancel("user changed mind").unwrap();
+        assert_eq!(t.from, JobStatus::Pending);
+        assert_eq!(t.to, JobStatus::Cancelled);
+        assert!(job.is_terminal());
+        assert!(job.completed_at.is_some());
+    }
+
+    #[test]
+    fn cancel_from_in_progress() {
+        let mut job = Job::new("s1", test_kind(), None);
+        job.start().unwrap();
+        let t = job.cancel("user pressed escape").unwrap();
+        assert_eq!(t.to, JobStatus::Cancelled);
+        assert_eq!(t.reason.as_deref(), Some("user pressed escape"));
+        assert!(job.is_terminal());
+    }
+
+    #[test]
+    fn submit_and_accept_record_timestamps() {
+        let mut job = Job::new("s1", test_kind(), None);
+        job.start().unwrap();
+        job.complete(serde_json::json!(null)).unwrap();
+        assert!(job.submitted_at.is_none());
+        assert!(job.accepted_at.is_none());
+        job.submit().unwrap();
+        assert!(job.submitted_at.is_some());
+        assert!(job.accepted_at.is_none());
+        job.accept().unwrap();
+        assert!(job.accepted_at.is_some());
+    }
+
+    #[test]
+    fn recovery_attempts_increments_on_recover() {
+        let mut job = Job::new("s1", test_kind(), None);
+        job.start().unwrap();
+        assert_eq!(job.recovery_attempts, 0);
+        job.stuck("hung").unwrap();
+        job.recover("retrying").unwrap();
+        assert_eq!(job.recovery_attempts, 1);
+        job.stuck("hung again").unwrap();
+        job.recover("second retry").unwrap();
+        assert_eq!(job.recovery_attempts, 2);
+    }
+
+    #[test]
+    fn abandon_from_stuck() {
+        let mut job = Job::new("s1", test_kind(), None);
+        job.start().unwrap();
+        job.stuck("hung").unwrap();
+        let t = job.abandon("max retries exceeded").unwrap();
+        assert_eq!(t.to, JobStatus::Abandoned);
+        assert!(job.is_terminal());
+        assert!(job.completed_at.is_some());
+    }
+
+    #[test]
+    fn default_acceptance_is_auto() {
+        let job = Job::new("s1", test_kind(), None);
+        assert!(matches!(job.acceptance, AcceptancePolicy::Auto));
+    }
+
+    #[test]
+    fn default_recovery_is_auto_resume_three() {
+        let job = Job::new("s1", test_kind(), None);
+        assert!(matches!(
+            job.recovery,
+            RecoveryPolicy::AutoResume { max_attempts: 3 }
+        ));
     }
 
     // -- Job constructor tests --

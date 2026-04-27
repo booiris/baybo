@@ -379,7 +379,7 @@ export interface components {
          * @description Mirror of [`aura_job::JobStatus`].
          * @enum {string}
          */
-        JobStatus: "pending" | "in_progress" | "completed" | "submitted" | "accepted" | "failed" | "stuck";
+        JobStatus: "pending" | "in_progress" | "completed" | "submitted" | "accepted" | "failed" | "stuck" | "cancelled" | "abandoned";
         /** @description Current LLM provider descriptor. */
         LlmInfo: {
             model_id: string;

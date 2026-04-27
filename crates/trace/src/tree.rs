@@ -4,7 +4,9 @@ use aura_job::OperationKind;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::{ExecutionProvenance, SessionTrace, SpanInput, TraceNode, TraceNodeId, TraceSpan};
+use crate::{
+    ExecutionProvenance, SessionTrace, SpanInput, SpanRole, TraceNode, TraceNodeId, TraceSpan,
+};
 
 /// Create a new root node for a fresh session trace.
 pub fn create_root_node(session_id: &str) -> (TraceNodeId, TraceNode) {
@@ -25,6 +27,9 @@ pub fn create_root_node(session_id: &str) -> (TraceNodeId, TraceNode) {
             result: None,
         },
         context_snapshot: None,
+        span_id: id.clone(),
+        span_index: 0,
+        span_role: SpanRole::System,
     };
     (id, node)
 }
@@ -55,6 +60,9 @@ pub fn attach_child(
             result: None,
         },
         context_snapshot: None,
+        span_id: child_id.clone(),
+        span_index: 0,
+        span_role: SpanRole::System,
     };
 
     // Insert the child node first, then update the parent's children list.

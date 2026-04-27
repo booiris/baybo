@@ -273,6 +273,8 @@ pub enum JobStatus {
     Accepted,
     Failed,
     Stuck,
+    Cancelled,
+    Abandoned,
 }
 
 impl From<aura_job::JobStatus> for JobStatus {
@@ -285,6 +287,8 @@ impl From<aura_job::JobStatus> for JobStatus {
             aura_job::JobStatus::Accepted => Self::Accepted,
             aura_job::JobStatus::Failed => Self::Failed,
             aura_job::JobStatus::Stuck => Self::Stuck,
+            aura_job::JobStatus::Cancelled => Self::Cancelled,
+            aura_job::JobStatus::Abandoned => Self::Abandoned,
         }
     }
 }

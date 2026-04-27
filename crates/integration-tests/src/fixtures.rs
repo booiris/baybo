@@ -94,6 +94,8 @@ impl SessionBuilder {
                 channel: self.channel.clone(),
             },
             channel: self.channel,
+            trigger: Default::default(),
+            parent_link: None,
             messages: self.messages,
             created_at: now,
             last_active: now,

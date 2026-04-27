@@ -139,6 +139,8 @@ mod tests {
                 channel: ChannelType::tui(),
             },
             channel: ChannelType::tui(),
+            trigger: Default::default(),
+            parent_link: None,
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),

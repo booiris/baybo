@@ -102,6 +102,8 @@ fn seeded_session_manager(ids: &[&str]) -> (Arc<SessionManager>, Vec<String>) {
                 channel: ChannelType::tui(),
             },
             channel: ChannelType::tui(),
+            trigger: Default::default(),
+            parent_link: None,
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),
@@ -954,7 +956,7 @@ async fn job_cancel_requires_yes_in_slash_mode() {
 }
 
 #[tokio::test]
-async fn job_cancel_pending_transitions_to_failed() {
+async fn job_cancel_pending_transitions_to_cancelled() {
     let (ctx, seeded) = context_with_jobs().await;
     let pending_id = seeded
         .iter()
@@ -974,7 +976,7 @@ async fn job_cancel_pending_transitions_to_failed() {
     .expect("argv cancel should not require --yes");
     let data = out.data.expect("structured payload");
     assert_eq!(data["cancelled"], pending_id);
-    assert_eq!(data["status"], "Failed");
+    assert_eq!(data["status"], "Cancelled");
 }
 
 #[tokio::test]
@@ -996,7 +998,11 @@ async fn job_cancel_terminal_job_errors() {
     )
     .await
     .expect_err("cancel of terminal job must fail");
-    assert!(format!("{err}").to_lowercase().contains("cannot cancel"));
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("invalid state transition") && msg.contains("cancelled"),
+        "unexpected error message: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -1483,6 +1489,9 @@ fn make_trace(session: &str, started_at: DateTime<Utc>) -> SessionTrace {
             result: None,
         },
         context_snapshot: None,
+        span_id: node_id.clone(),
+        span_index: 0,
+        span_role: aura_trace::SpanRole::Llm,
     };
     let mut nodes = HashMap::new();
     nodes.insert(node_id.clone(), node);
@@ -1785,6 +1794,9 @@ fn make_trace_with_snapshot(
             messages,
             token_count: tokens,
         }),
+        span_id: root_id.clone(),
+        span_index: 0,
+        span_role: aura_trace::SpanRole::Llm,
     };
     let child = TraceNode {
         id: child_id.clone(),
@@ -1802,6 +1814,9 @@ fn make_trace_with_snapshot(
             result: None,
         },
         context_snapshot: None,
+        span_id: child_id.clone(),
+        span_index: 1,
+        span_role: aura_trace::SpanRole::Llm,
     };
 
     let mut nodes = HashMap::new();
