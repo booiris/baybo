@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use aura_llm::{ChatRequest, LlmResponse};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -29,9 +29,23 @@ pub struct LlmCallRecord {
     pub session_id: String,
     pub provider: String,
     pub model: String,
+    #[serde(serialize_with = "serialize_request_without_tools")]
     pub request: ChatRequest,
     #[serde(flatten)]
     pub outcome: LlmCallOutcome,
+}
+
+fn serialize_request_without_tools<S>(req: &ChatRequest, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::SerializeStruct;
+    let tool_names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+    let mut st = s.serialize_struct("ChatRequest", 3)?;
+    st.serialize_field("messages", &req.messages)?;
+    st.serialize_field("temperature", &req.temperature)?;
+    st.serialize_field("tools", &tool_names)?;
+    st.end()
 }
 
 /// Append-only JSONL writer for per-session LLM call traces.
@@ -160,6 +174,7 @@ mod tests {
             assert_eq!(v["model"], "gpt-x");
             assert_eq!(v["outcome"], "ok");
             assert_eq!(v["request"]["temperature"], 0.7);
+            assert_eq!(v["request"]["tools"], serde_json::json!(["noop"]));
             assert_eq!(v["response"]["usage"]["input_tokens"], 4);
         }
     }
