@@ -47,10 +47,16 @@ impl LibsqlBlobStore {
         Ok(Self { pool, root })
     }
 
-    fn blob_path(&self, hex: &str) -> PathBuf {
+    fn blob_path(&self, hex: &str, ext: &str) -> PathBuf {
         // 2-char shard prefix to keep one directory from accumulating
-        // every blob — same shape git uses for its objects.
-        self.root.join(&hex[..2]).join(hex)
+        // every blob — same shape git uses for its objects. The
+        // extension is purely cosmetic: the canonical id is the hash,
+        // but `image.jpg` is more useful than a 64-hex string when
+        // someone is poking around the state directory by hand.
+        let mut name = String::with_capacity(hex.len() + ext.len());
+        name.push_str(hex);
+        name.push_str(ext);
+        self.root.join(&hex[..2]).join(name)
     }
 
     /// Top-level scratch directory for in-flight streaming uploads.
@@ -97,6 +103,52 @@ impl LibsqlBlobStore {
 
 fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// Cosmetic file extension to append to a blob's on-disk filename so a
+/// human poking around `<state>/blobs/` can recognise an image vs a
+/// PDF without consulting the libsql metadata. Returns `""` when the
+/// MIME type isn't in the table — anything we don't recognise lands
+/// without a suffix rather than guessing wrong.
+fn mime_extension(mime: &str) -> &'static str {
+    // Strip parameters (`image/jpeg; charset=utf-8`) and lowercase
+    // before lookup so casing / params don't change the on-disk path.
+    let bare = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    match bare.as_str() {
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/heic" => ".heic",
+        "image/heif" => ".heif",
+        "image/svg+xml" => ".svg",
+        "image/bmp" => ".bmp",
+        "audio/ogg" | "audio/opus" => ".ogg",
+        "audio/mpeg" => ".mp3",
+        "audio/mp4" | "audio/m4a" => ".m4a",
+        "audio/wav" | "audio/x-wav" => ".wav",
+        "audio/flac" => ".flac",
+        "audio/silk" => ".silk",
+        "video/mp4" => ".mp4",
+        "video/webm" => ".webm",
+        "video/quicktime" => ".mov",
+        "video/x-matroska" => ".mkv",
+        "application/pdf" => ".pdf",
+        "application/zip" => ".zip",
+        "application/json" => ".json",
+        "application/x-tar" => ".tar",
+        "application/gzip" | "application/x-gzip" => ".gz",
+        "text/plain" => ".txt",
+        "text/html" => ".html",
+        "text/csv" => ".csv",
+        "text/markdown" => ".md",
+        _ => "",
+    }
 }
 
 #[async_trait]
@@ -203,7 +255,7 @@ impl BlobStore for LibsqlBlobStore {
 
         let hex = hex_encode(&hasher.finalize());
         let read_token = unique_read_token();
-        let final_path = self.blob_path(&hex);
+        let final_path = self.blob_path(&hex, mime_extension(mime_type));
         // Skip the rename when the canonical path already exists —
         // some other put or a previous attempt got there first. Either
         // way the bytes match (content-addressed) so we just clean
@@ -240,9 +292,11 @@ impl BlobStore for LibsqlBlobStore {
     async fn get(&self, blob_id: &str) -> Result<Vec<u8>> {
         let (hex, _token) = split_id(blob_id)?;
         // stat first so a soft-deleted blob whose bytes are still on
-        // disk surfaces as NotFound rather than reading them anyway.
-        let _ = self.stat(blob_id).await?;
-        let path = self.blob_path(hex);
+        // disk surfaces as NotFound rather than reading them anyway —
+        // and so we have the recorded mime to reconstruct the on-disk
+        // extension the put path appended.
+        let meta = self.stat(blob_id).await?;
+        let path = self.blob_path(hex, mime_extension(&meta.mime_type));
         tokio::fs::read(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound(format!("blob bytes missing for {blob_id}"))
@@ -254,8 +308,8 @@ impl BlobStore for LibsqlBlobStore {
 
     async fn open(&self, blob_id: &str) -> Result<BlobReader> {
         let (hex, _token) = split_id(blob_id)?;
-        let _ = self.stat(blob_id).await?;
-        let path = self.blob_path(hex);
+        let meta = self.stat(blob_id).await?;
+        let path = self.blob_path(hex, mime_extension(&meta.mime_type));
         let file = tokio::fs::File::open(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound(format!("blob bytes missing for {blob_id}"))
@@ -568,8 +622,9 @@ mod tests {
         assert_eq!(mode, 0o700, "blob root mode {mode:o}");
 
         // Shard dir 0o700. The blob id is `sha256:<hex>.<token>`; the
-        // on-disk path is content-addressed by `<hex>` only — the
-        // token is metadata, not part of the filename.
+        // on-disk path is content-addressed by `<hex>` plus a cosmetic
+        // mime-derived extension (`.txt` here) — the token never
+        // appears on disk.
         let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
         let hex = hex_with_token
             .split_once('.')
@@ -579,8 +634,8 @@ mod tests {
         let mode = std::fs::metadata(&shard).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "shard mode {mode:o}");
 
-        // Final file 0o600.
-        let file = shard.join(hex);
+        // Final file 0o600 — name is `<hex>.txt` for `text/plain`.
+        let file = shard.join(format!("{hex}.txt"));
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "blob file mode {mode:o}");
 
@@ -590,6 +645,62 @@ mod tests {
             let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "scratch mode {mode:o}");
         }
+    }
+
+    #[tokio::test]
+    async fn on_disk_filename_carries_mime_derived_extension() {
+        // The `blob_id` stays content-addressed, but the on-disk
+        // filename gets a cosmetic suffix so a human can identify the
+        // file at a glance. Round-trips must still work because the
+        // read path reconstructs the same suffix from the recorded
+        // mime in the metadata row.
+        let (store, dir) = build().await;
+        let blob = store
+            .put(b"\xFF\xD8\xFF\xE0", "image/jpeg", None)
+            .await
+            .unwrap();
+        let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let hex = hex_with_token.split_once('.').map(|(h, _)| h).unwrap();
+        let path = dir
+            .path()
+            .join("blobs")
+            .join(&hex[..2])
+            .join(format!("{hex}.jpg"));
+        assert!(path.exists(), "expected {} to exist", path.display());
+        // Read back through the public api — proves the get path
+        // reconstructs the same filename from the stored mime.
+        let got = store.get(&blob.blob_id).await.unwrap();
+        assert_eq!(got, b"\xFF\xD8\xFF\xE0");
+    }
+
+    #[tokio::test]
+    async fn unknown_mime_lands_without_extension() {
+        // Unrecognized mimes (e.g. `application/x-aura-foo`) must not
+        // synthesis a fake suffix — the disk filename falls back to
+        // the bare hash. Both put and get round-trip.
+        let (store, dir) = build().await;
+        let blob = store
+            .put(b"opaque", "application/x-aura-foo", None)
+            .await
+            .unwrap();
+        let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let hex = hex_with_token.split_once('.').map(|(h, _)| h).unwrap();
+        let path = dir.path().join("blobs").join(&hex[..2]).join(hex);
+        assert!(path.exists(), "expected {} to exist", path.display());
+        let got = store.get(&blob.blob_id).await.unwrap();
+        assert_eq!(got, b"opaque");
+    }
+
+    #[test]
+    fn mime_extension_table_is_case_and_param_tolerant() {
+        // Lookup must ignore casing and `;`-suffixed parameters.
+        assert_eq!(mime_extension("image/jpeg"), ".jpg");
+        assert_eq!(mime_extension("IMAGE/JPEG"), ".jpg");
+        assert_eq!(mime_extension("image/jpeg; charset=binary"), ".jpg");
+        assert_eq!(mime_extension("audio/ogg"), ".ogg");
+        assert_eq!(mime_extension("application/pdf"), ".pdf");
+        assert_eq!(mime_extension("video/mp4"), ".mp4");
+        assert_eq!(mime_extension("application/x-not-known"), "");
     }
 
     #[tokio::test]
