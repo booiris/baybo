@@ -62,10 +62,10 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
             },
         };
 
-        Ok(LlmClient::new(
-            model_info,
-            AnyCompletionModel::OpenAI(model),
-        ))
+        Ok(
+            LlmClient::new(model_info, AnyCompletionModel::OpenAI(model))
+                .with_parse_inline_think_tags(true),
+        )
     }
 }
 

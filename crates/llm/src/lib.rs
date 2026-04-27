@@ -2,10 +2,12 @@ mod error;
 pub mod multimodal;
 mod providers;
 pub mod registry;
+mod think_tags;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -155,6 +157,44 @@ impl LlmStream {
             inner: Box::pin(mapped),
         }
     }
+
+    /// Wrap this stream so inline `<think>...</think>` content in
+    /// `StreamEvent::Text` is rerouted through `Reasoning` /
+    /// `ThinkingBlock` events. Used by providers (e.g. MiniMax M2)
+    /// that bake reasoning into the regular text channel rather than
+    /// emitting a separate `reasoning_content` field.
+    fn with_inline_think_filter(self) -> Self {
+        let filter = think_tags::ThinkTagFilter::default();
+        let queue: VecDeque<crate::Result<StreamEvent>> = VecDeque::new();
+        let stream =
+            futures::stream::unfold((self, filter, queue), |(mut s, mut f, mut q)| async move {
+                loop {
+                    if let Some(event) = q.pop_front() {
+                        return Some((event, (s, f, q)));
+                    }
+                    match s.next().await {
+                        None => {
+                            for ev in f.flush() {
+                                q.push_back(Ok(ev));
+                            }
+                            if q.is_empty() {
+                                return None;
+                            }
+                        }
+                        Some(Err(e)) => return Some((Err(e), (s, f, q))),
+                        Some(Ok(StreamEvent::Text(t))) => {
+                            for ev in f.push_text(&t) {
+                                q.push_back(Ok(ev));
+                            }
+                        }
+                        Some(Ok(other)) => return Some((Ok(other), (s, f, q))),
+                    }
+                }
+            });
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
 }
 
 fn convert_stream_event<R: GetTokenUsage>(
@@ -281,12 +321,28 @@ impl LlmCompletion for LlmClient {
 pub struct LlmClient {
     model_info: ModelInfo,
     model: AnyCompletionModel,
+    /// Strip inline `<think>...</think>` content out of assistant text
+    /// and route it through the reasoning channel. Set by providers
+    /// (e.g. MiniMax M2) whose models bake CoT into the regular text
+    /// stream instead of using a dedicated reasoning field.
+    parse_inline_think_tags: bool,
 }
 
 impl LlmClient {
     /// Creates a new `LlmClient` from a provider-specific completion model.
     pub(crate) fn new(model_info: ModelInfo, model: AnyCompletionModel) -> Self {
-        Self { model_info, model }
+        Self {
+            model_info,
+            model,
+            parse_inline_think_tags: false,
+        }
+    }
+
+    /// Opt in to stripping inline `<think>...</think>` blocks. See the
+    /// field doc on `parse_inline_think_tags` for rationale.
+    pub(crate) fn with_parse_inline_think_tags(mut self, enabled: bool) -> Self {
+        self.parse_inline_think_tags = enabled;
+        self
     }
 
     /// Sends a chat request to the provider and returns a unified response.
@@ -305,7 +361,7 @@ impl LlmClient {
             .await
             .map_err(|e| LlmError::Provider(e.to_string()))?;
 
-        let llm_response = Self::convert_response(response);
+        let llm_response = self.convert_response(response);
 
         debug!(
             content_len = llm_response.content.len(),
@@ -328,10 +384,17 @@ impl LlmClient {
 
         let rig_request = self.build_completion_request(request);
 
-        self.model
+        let stream = self
+            .model
             .stream(rig_request)
             .await
-            .map_err(|e| LlmError::Provider(e.to_string()))
+            .map_err(|e| LlmError::Provider(e.to_string()))?;
+
+        Ok(if self.parse_inline_think_tags {
+            stream.with_inline_think_filter()
+        } else {
+            stream
+        })
     }
 
     /// Build a rig `CompletionRequest` from our `ChatRequest`.
@@ -492,20 +555,34 @@ impl LlmClient {
     }
 
     /// Convert a rig `CompletionResponse` into our `LlmResponse`.
-    fn convert_response(response: completion::CompletionResponse<()>) -> LlmResponse {
+    fn convert_response(&self, response: completion::CompletionResponse<()>) -> LlmResponse {
         let mut content = String::new();
         let mut content_blocks = Vec::new();
         let mut tool_calls = Vec::new();
-        let mut thinking = None;
+        let mut thinking: Option<String> = None;
+        let mut inline_thinking = String::new();
 
         for item in response.choice.into_iter() {
             match item {
                 AssistantContent::Text(text) => {
-                    if !content.is_empty() {
-                        content.push('\n');
+                    let (clean, extracted) = if self.parse_inline_think_tags {
+                        think_tags::extract_inline_thinking(&text.text)
+                    } else {
+                        (text.text.clone(), None)
+                    };
+                    if let Some(t) = extracted {
+                        if !inline_thinking.is_empty() {
+                            inline_thinking.push('\n');
+                        }
+                        inline_thinking.push_str(&t);
                     }
-                    content.push_str(&text.text);
-                    content_blocks.push(aura_model::ContentBlock::Text(text.text));
+                    if !clean.is_empty() {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&clean);
+                        content_blocks.push(aura_model::ContentBlock::Text(clean));
+                    }
                 }
                 AssistantContent::ToolCall(tc) => {
                     tool_calls.push(ToolCallInfo {
@@ -538,6 +615,20 @@ impl LlmClient {
                 }
                 AssistantContent::Image(_) => {}
             }
+        }
+
+        if !inline_thinking.is_empty() {
+            thinking = Some(match thinking.take() {
+                Some(existing) => format!("{existing}\n{inline_thinking}"),
+                None => inline_thinking.clone(),
+            });
+            content_blocks.push(aura_model::ContentBlock::Thinking {
+                id: None,
+                content: vec![aura_model::ThinkingContent::Text {
+                    text: inline_thinking,
+                    signature: None,
+                }],
+            });
         }
 
         let usage = TokenUsage {
