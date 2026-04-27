@@ -1,12 +1,18 @@
-//! The admin TCP listener must not serve channel-surface routes.
+//! The admin TCP listener must not serve chat-surface routes.
 //!
-//! After the two-listener split, `/v1/sessions`,
-//! `/v1/sessions/{id}`, `/v1/sessions/{id}/messages`,
-//! `/v1/sessions/{id}/stream`, and `/v1/approvals*` live exclusively
-//! on the loopback-TCP channel listener. Requesting any of them
-//! through the admin router has to come back `404`, even with a
-//! valid bearer token — a leaked admin credential must not yield
-//! chat content or approval control.
+//! `POST /v1/sessions` (create), `POST /v1/sessions/{id}/messages`
+//! (send), `GET /v1/sessions/{id}/stream`, and `/v1/approvals*` live
+//! exclusively on the loopback-TCP channel listener. Requesting any
+//! of them through the admin router has to come back `404`, even
+//! with a valid bearer token — a leaked admin credential must not
+//! yield chat content or approval control.
+//!
+//! Note: admin DOES serve metadata-only session views
+//! (`GET /v1/sessions`, `GET /v1/sessions/{id}` — both omit the
+//! transcript) plus the cross-session fork operation
+//! (`POST /v1/sessions/{id}/fork`) introduced in the trace 4-layer
+//! redesign. Those endpoints are admin observability + governance,
+//! not chat content.
 //!
 //! The test drives `GatewayServer`'s router through `tower::ServiceExt`
 //! so we exercise the actual route table the TCP listener assembles (not
@@ -76,26 +82,19 @@ async fn assert_not_found(method: Method, path: &str) {
             .unwrap(),
     );
     let resp = router.oneshot(req).await.expect("oneshot");
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "{method} {path} must not be on admin listener"
+    let status = resp.status();
+    // 405 (Method Not Allowed) also satisfies "not served" — it
+    // happens when a sibling route on the same path uses a different
+    // method (e.g. admin serves GET /v1/sessions but not POST).
+    assert!(
+        status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+        "{method} {path} must not be on admin listener (got {status})"
     );
-}
-
-#[tokio::test]
-async fn sessions_list_is_404_on_admin() {
-    assert_not_found(Method::GET, "/v1/sessions").await;
 }
 
 #[tokio::test]
 async fn create_session_is_404_on_admin() {
     assert_not_found(Method::POST, "/v1/sessions").await;
-}
-
-#[tokio::test]
-async fn get_session_is_404_on_admin() {
-    assert_not_found(Method::GET, "/v1/sessions/any").await;
 }
 
 #[tokio::test]

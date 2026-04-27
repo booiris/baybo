@@ -9,6 +9,7 @@ pub mod jobs;
 pub mod llm;
 pub mod logs;
 pub mod memory;
+pub mod sessions;
 pub mod skills;
 pub mod status;
 pub mod tools;
@@ -34,6 +35,7 @@ use crate::server::AdminState;
     tags(
         (name = "status", description = "Gateway process status"),
         (name = "config", description = "Read and mutate on-disk AuraConfig"),
+        (name = "sessions", description = "Conversation sessions (list, detail, fork)"),
         (name = "jobs", description = "Async operation tracking"),
         (name = "cron", description = "Scheduled prompts / tool calls"),
         (name = "memory", description = "Long-term memory entries"),
@@ -57,6 +59,7 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
     let v1 = OpenApiRouter::new()
         .merge(status::routes())
         .merge(config::routes())
+        .merge(sessions::routes())
         .merge(jobs::routes())
         .merge(cron::routes())
         .merge(memory::routes())

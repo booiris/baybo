@@ -100,6 +100,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/jobs/{id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["accept_job"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/jobs/{id}/cancel": {
         parameters: {
             query?: never;
@@ -110,6 +126,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["cancel_job"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/jobs/{id}/submit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["submit_job"];
         delete?: never;
         options?: never;
         head?: never;
@@ -191,6 +223,54 @@ export interface paths {
         put?: never;
         post?: never;
         delete: operations["delete_memory"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_sessions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_session"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/fork": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["fork_session"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -347,6 +427,10 @@ export interface components {
         ErrorBody: {
             error: string;
         };
+        /** @description Body for `POST /v1/sessions/{id}/fork`. */
+        ForkSessionRequest: {
+            at_job_id: string;
+        };
         /** @description Mirror of [`aura_model::HostPattern`]. */
         HostPattern: {
             /** @enum {string} */
@@ -359,6 +443,14 @@ export interface components {
         };
         /** @description Mirror of [`aura_job::Job`]. */
         Job: {
+            /**
+             * @description Acceptance policy discriminator: `"auto"`, `"auto_submit"`,
+             *     or `"manual"`. Per-policy detail (the chosen `Acceptor`) is
+             *     not surfaced in v1 to keep the public schema small.
+             */
+            acceptance: string;
+            /** Format: date-time */
+            accepted_at?: string | null;
             /** Format: date-time */
             completed_at?: string | null;
             /** Format: date-time */
@@ -369,10 +461,20 @@ export interface components {
             kind: components["schemas"]["OperationKind"];
             output?: Record<string, never> | null;
             parent_job_id?: string | null;
+            /**
+             * @description Recovery policy discriminator: `"auto_resume"`, `"manual"`,
+             *     `"abandon"`. Same reasoning as `acceptance` for the lack of
+             *     nested detail.
+             */
+            recovery: string;
+            /** Format: int32 */
+            recovery_attempts: number;
             session_id: string;
             /** Format: date-time */
             started_at?: string | null;
             status: components["schemas"]["JobStatus"];
+            /** Format: date-time */
+            submitted_at?: string | null;
             trace_span_id?: string | null;
         };
         /**
@@ -488,6 +590,57 @@ export interface components {
             /** @enum {string} */
             type: "user_message_handling";
         };
+        /**
+         * @description Mirror of [`aura_model::ParentLinkKind`].
+         * @enum {string}
+         */
+        ParentLinkKind: "sub_agent" | "fork" | "cron_chain" | "system_continuation";
+        /**
+         * @description Detail-form `Session`. Metadata-only on the admin surface — the
+         *     message transcript is intentionally omitted so a leaked admin
+         *     token can't pull chat content. Use the trace export endpoint
+         *     (`GET /v1/traces/{session_id}`) to pull the full call chain
+         *     instead.
+         */
+        SessionDetail: components["schemas"]["SessionSummary"] & {
+            /** @description `SessionState.active_skills` snapshot. */
+            active_skills: string[];
+            /**
+             * Format: int32
+             * @description Number of context-compression passes performed in the session.
+             */
+            compression_count: number;
+        };
+        /** @description Cross-session reference; mirror of [`aura_model::SessionParentLink`]. */
+        SessionParentLink: {
+            at_job_id: string;
+            at_span_id?: string | null;
+            kind: components["schemas"]["ParentLinkKind"];
+            session_id: string;
+        };
+        /**
+         * @description List-form `Session`. Excludes the message transcript so list
+         *     responses stay small.
+         */
+        SessionSummary: {
+            channel: components["schemas"]["ChannelType"];
+            /** Format: date-time */
+            created_at: string;
+            id: string;
+            /** Format: date-time */
+            last_active: string;
+            message_count: number;
+            parent_link?: null | components["schemas"]["SessionParentLink"];
+            trigger: components["schemas"]["SessionTrigger"];
+            user_id: string;
+        };
+        /**
+         * @description Mirror of [`aura_model::SessionTrigger`]. Discriminator-only —
+         *     per-variant payload (cron job id, system kind extras) lives on
+         *     [`SessionDetail`] adjacent fields when relevant.
+         * @enum {string}
+         */
+        SessionTrigger: "user" | "cron" | "system" | "parent";
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -902,6 +1055,14 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
+                            /**
+                             * @description Acceptance policy discriminator: `"auto"`, `"auto_submit"`,
+                             *     or `"manual"`. Per-policy detail (the chosen `Acceptor`) is
+                             *     not surfaced in v1 to keep the public schema small.
+                             */
+                            acceptance: string;
+                            /** Format: date-time */
+                            accepted_at?: string | null;
                             /** Format: date-time */
                             completed_at?: string | null;
                             /** Format: date-time */
@@ -912,10 +1073,20 @@ export interface operations {
                             kind: components["schemas"]["OperationKind"];
                             output?: Record<string, never> | null;
                             parent_job_id?: string | null;
+                            /**
+                             * @description Recovery policy discriminator: `"auto_resume"`, `"manual"`,
+                             *     `"abandon"`. Same reasoning as `acceptance` for the lack of
+                             *     nested detail.
+                             */
+                            recovery: string;
+                            /** Format: int32 */
+                            recovery_attempts: number;
                             session_id: string;
                             /** Format: date-time */
                             started_at?: string | null;
                             status: components["schemas"]["JobStatus"];
+                            /** Format: date-time */
+                            submitted_at?: string | null;
                             trace_span_id?: string | null;
                         }[];
                     };
@@ -982,6 +1153,56 @@ export interface operations {
             };
         };
     };
+    accept_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted job record */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Job"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Accept failed (illegal transition or store error) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     cancel_job: {
         parameters: {
             query?: never;
@@ -1013,6 +1234,56 @@ export interface operations {
                 };
             };
             /** @description Cancel failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    submit_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Submitted job record */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Job"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Submit failed (illegal transition or store error) */
             500: {
                 headers: {
                     [name: string]: unknown;
@@ -1254,6 +1525,152 @@ export interface operations {
                 };
             };
             /** @description Memory store error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_sessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All sessions, newest-active first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            channel: components["schemas"]["ChannelType"];
+                            /** Format: date-time */
+                            created_at: string;
+                            id: string;
+                            /** Format: date-time */
+                            last_active: string;
+                            message_count: number;
+                            parent_link?: null | components["schemas"]["SessionParentLink"];
+                            trigger: components["schemas"]["SessionTrigger"];
+                            user_id: string;
+                        }[];
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session store error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session detail (metadata only — transcript intentionally omitted; pull the trace for call-chain content). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDetail"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    fork_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Parent session id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ForkSessionRequest"];
+            };
+        };
+        responses: {
+            /** @description Newly created child session. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDetail"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Parent session or referenced job not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Fork failed */
             500: {
                 headers: {
                     [name: string]: unknown;

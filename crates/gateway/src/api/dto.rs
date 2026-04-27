@@ -349,10 +349,31 @@ pub struct Job {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Acceptance policy discriminator: `"auto"`, `"auto_submit"`,
+    /// or `"manual"`. Per-policy detail (the chosen `Acceptor`) is
+    /// not surfaced in v1 to keep the public schema small.
+    pub acceptance: String,
+    /// Recovery policy discriminator: `"auto_resume"`, `"manual"`,
+    /// `"abandon"`. Same reasoning as `acceptance` for the lack of
+    /// nested detail.
+    pub recovery: String,
+    pub submitted_at: Option<DateTime<Utc>>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub recovery_attempts: u32,
 }
 
 impl From<aura_job::Job> for Job {
     fn from(v: aura_job::Job) -> Self {
+        let acceptance = match &v.acceptance {
+            aura_job::AcceptancePolicy::Auto => "auto",
+            aura_job::AcceptancePolicy::AutoSubmit { .. } => "auto_submit",
+            aura_job::AcceptancePolicy::Manual { .. } => "manual",
+        };
+        let recovery = match &v.recovery {
+            aura_job::RecoveryPolicy::AutoResume { .. } => "auto_resume",
+            aura_job::RecoveryPolicy::Manual => "manual",
+            aura_job::RecoveryPolicy::Abandon => "abandon",
+        };
         Self {
             id: v.id,
             session_id: v.session_id,
@@ -366,8 +387,140 @@ impl From<aura_job::Job> for Job {
             created_at: v.created_at,
             started_at: v.started_at,
             completed_at: v.completed_at,
+            acceptance: acceptance.to_owned(),
+            recovery: recovery.to_owned(),
+            submitted_at: v.submitted_at,
+            accepted_at: v.accepted_at,
+            recovery_attempts: v.recovery_attempts,
         }
     }
+}
+
+// ── Session ──────────────────────────────────────────────────────────
+
+/// Mirror of [`aura_model::SessionTrigger`]. Discriminator-only —
+/// per-variant payload (cron job id, system kind extras) lives on
+/// [`SessionDetail`] adjacent fields when relevant.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTrigger {
+    User,
+    Cron,
+    System,
+    Parent,
+}
+
+impl From<&aura_model::SessionTrigger> for SessionTrigger {
+    fn from(v: &aura_model::SessionTrigger) -> Self {
+        match v {
+            aura_model::SessionTrigger::User => Self::User,
+            aura_model::SessionTrigger::Cron { .. } => Self::Cron,
+            aura_model::SessionTrigger::System { .. } => Self::System,
+            aura_model::SessionTrigger::Parent { .. } => Self::Parent,
+        }
+    }
+}
+
+/// Mirror of [`aura_model::ParentLinkKind`].
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentLinkKind {
+    SubAgent,
+    Fork,
+    CronChain,
+    SystemContinuation,
+}
+
+impl From<aura_model::ParentLinkKind> for ParentLinkKind {
+    fn from(v: aura_model::ParentLinkKind) -> Self {
+        match v {
+            aura_model::ParentLinkKind::SubAgent => Self::SubAgent,
+            aura_model::ParentLinkKind::Fork => Self::Fork,
+            aura_model::ParentLinkKind::CronChain => Self::CronChain,
+            aura_model::ParentLinkKind::SystemContinuation => Self::SystemContinuation,
+        }
+    }
+}
+
+/// Cross-session reference; mirror of [`aura_model::SessionParentLink`].
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SessionParentLink {
+    pub session_id: String,
+    pub kind: ParentLinkKind,
+    pub at_job_id: String,
+    pub at_span_id: Option<String>,
+}
+
+impl From<&aura_model::SessionParentLink> for SessionParentLink {
+    fn from(v: &aura_model::SessionParentLink) -> Self {
+        Self {
+            session_id: v.session_id.clone(),
+            kind: v.kind.into(),
+            at_job_id: v.at_job_id.clone(),
+            at_span_id: v.at_span_id.clone(),
+        }
+    }
+}
+
+/// List-form `Session`. Excludes the message transcript so list
+/// responses stay small.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SessionSummary {
+    pub id: String,
+    pub user_id: String,
+    pub channel: ChannelType,
+    pub trigger: SessionTrigger,
+    pub parent_link: Option<SessionParentLink>,
+    pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+    pub message_count: usize,
+}
+
+impl From<&aura_model::Session> for SessionSummary {
+    fn from(v: &aura_model::Session) -> Self {
+        Self {
+            id: v.id.clone(),
+            user_id: v.user.id.clone(),
+            channel: v.channel.clone().into(),
+            trigger: (&v.trigger).into(),
+            parent_link: v.parent_link.as_ref().map(Into::into),
+            created_at: v.created_at,
+            last_active: v.last_active,
+            message_count: v.messages.len(),
+        }
+    }
+}
+
+/// Detail-form `Session`. Metadata-only on the admin surface — the
+/// message transcript is intentionally omitted so a leaked admin
+/// token can't pull chat content. Use the trace export endpoint
+/// (`GET /v1/traces/{session_id}`) to pull the full call chain
+/// instead.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SessionDetail {
+    #[serde(flatten)]
+    pub summary: SessionSummary,
+    /// `SessionState.active_skills` snapshot.
+    pub active_skills: Vec<String>,
+    /// Number of context-compression passes performed in the session.
+    pub compression_count: u32,
+}
+
+impl From<aura_model::Session> for SessionDetail {
+    fn from(v: aura_model::Session) -> Self {
+        let summary = SessionSummary::from(&v);
+        Self {
+            summary,
+            active_skills: v.state.active_skills.clone(),
+            compression_count: v.state.compression_count,
+        }
+    }
+}
+
+/// Body for `POST /v1/sessions/{id}/fork`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ForkSessionRequest {
+    pub at_job_id: String,
 }
 
 // ── CronJob ──────────────────────────────────────────────────────────

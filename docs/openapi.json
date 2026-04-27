@@ -498,9 +498,23 @@
                           "session_id",
                           "kind",
                           "status",
-                          "created_at"
+                          "created_at",
+                          "acceptance",
+                          "recovery",
+                          "recovery_attempts"
                         ],
                         "properties": {
+                          "acceptance": {
+                            "type": "string",
+                            "description": "Acceptance policy discriminator: `\"auto\"`, `\"auto_submit\"`,\nor `\"manual\"`. Per-policy detail (the chosen `Acceptor`) is\nnot surfaced in v1 to keep the public schema small."
+                          },
+                          "accepted_at": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "format": "date-time"
+                          },
                           "completed_at": {
                             "type": [
                               "string",
@@ -542,6 +556,15 @@
                               "null"
                             ]
                           },
+                          "recovery": {
+                            "type": "string",
+                            "description": "Recovery policy discriminator: `\"auto_resume\"`, `\"manual\"`,\n`\"abandon\"`. Same reasoning as `acceptance` for the lack of\nnested detail."
+                          },
+                          "recovery_attempts": {
+                            "type": "integer",
+                            "format": "int32",
+                            "minimum": 0
+                          },
                           "session_id": {
                             "type": "string"
                           },
@@ -554,6 +577,13 @@
                           },
                           "status": {
                             "$ref": "#/components/schemas/JobStatus"
+                          },
+                          "submitted_at": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "format": "date-time"
                           },
                           "trace_span_id": {
                             "type": [
@@ -643,6 +673,67 @@
         }
       }
     },
+    "/v1/jobs/{id}/accept": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "accept_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Accepted job record",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Accept failed (illegal transition or store error)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/jobs/{id}/cancel": {
       "post": {
         "tags": [
@@ -683,6 +774,67 @@
           },
           "500": {
             "description": "Cancel failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/submit": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "submit_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Submitted job record",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Submit failed (illegal transition or store error)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1107,6 +1259,226 @@
           },
           "500": {
             "description": "Memory store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "list_sessions",
+        "responses": {
+          "200": {
+            "description": "All sessions, newest-active first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "List-form `Session`. Excludes the message transcript so list\nresponses stay small.",
+                        "required": [
+                          "id",
+                          "user_id",
+                          "channel",
+                          "trigger",
+                          "created_at",
+                          "last_active",
+                          "message_count"
+                        ],
+                        "properties": {
+                          "channel": {
+                            "$ref": "#/components/schemas/ChannelType"
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "last_active": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "message_count": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "parent_link": {
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/components/schemas/SessionParentLink"
+                              }
+                            ]
+                          },
+                          "trigger": {
+                            "$ref": "#/components/schemas/SessionTrigger"
+                          },
+                          "user_id": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Session store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session detail (metadata only — transcript intentionally omitted; pull the trace for call-chain content).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/fork": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "fork_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Parent session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Newly created child session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Parent session or referenced job not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Fork failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1552,6 +1924,18 @@
           }
         }
       },
+      "ForkSessionRequest": {
+        "type": "object",
+        "description": "Body for `POST /v1/sessions/{id}/fork`.",
+        "required": [
+          "at_job_id"
+        ],
+        "properties": {
+          "at_job_id": {
+            "type": "string"
+          }
+        }
+      },
       "HostPattern": {
         "oneOf": [
           {
@@ -1601,9 +1985,23 @@
           "session_id",
           "kind",
           "status",
-          "created_at"
+          "created_at",
+          "acceptance",
+          "recovery",
+          "recovery_attempts"
         ],
         "properties": {
+          "acceptance": {
+            "type": "string",
+            "description": "Acceptance policy discriminator: `\"auto\"`, `\"auto_submit\"`,\nor `\"manual\"`. Per-policy detail (the chosen `Acceptor`) is\nnot surfaced in v1 to keep the public schema small."
+          },
+          "accepted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
           "completed_at": {
             "type": [
               "string",
@@ -1645,6 +2043,15 @@
               "null"
             ]
           },
+          "recovery": {
+            "type": "string",
+            "description": "Recovery policy discriminator: `\"auto_resume\"`, `\"manual\"`,\n`\"abandon\"`. Same reasoning as `acceptance` for the lack of\nnested detail."
+          },
+          "recovery_attempts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
           "session_id": {
             "type": "string"
           },
@@ -1657,6 +2064,13 @@
           },
           "status": {
             "$ref": "#/components/schemas/JobStatus"
+          },
+          "submitted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
           },
           "trace_span_id": {
             "type": [
@@ -2012,6 +2426,131 @@
         ],
         "description": "Mirror of [`aura_job::OperationKind`]."
       },
+      "ParentLinkKind": {
+        "type": "string",
+        "description": "Mirror of [`aura_model::ParentLinkKind`].",
+        "enum": [
+          "sub_agent",
+          "fork",
+          "cron_chain",
+          "system_continuation"
+        ]
+      },
+      "SessionDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SessionSummary"
+          },
+          {
+            "type": "object",
+            "required": [
+              "active_skills",
+              "compression_count"
+            ],
+            "properties": {
+              "active_skills": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "`SessionState.active_skills` snapshot."
+              },
+              "compression_count": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Number of context-compression passes performed in the session.",
+                "minimum": 0
+              }
+            }
+          }
+        ],
+        "description": "Detail-form `Session`. Metadata-only on the admin surface — the\nmessage transcript is intentionally omitted so a leaked admin\ntoken can't pull chat content. Use the trace export endpoint\n(`GET /v1/traces/{session_id}`) to pull the full call chain\ninstead."
+      },
+      "SessionParentLink": {
+        "type": "object",
+        "description": "Cross-session reference; mirror of [`aura_model::SessionParentLink`].",
+        "required": [
+          "session_id",
+          "kind",
+          "at_job_id"
+        ],
+        "properties": {
+          "at_job_id": {
+            "type": "string"
+          },
+          "at_span_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ParentLinkKind"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "SessionSummary": {
+        "type": "object",
+        "description": "List-form `Session`. Excludes the message transcript so list\nresponses stay small.",
+        "required": [
+          "id",
+          "user_id",
+          "channel",
+          "trigger",
+          "created_at",
+          "last_active",
+          "message_count"
+        ],
+        "properties": {
+          "channel": {
+            "$ref": "#/components/schemas/ChannelType"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_active": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "message_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "parent_link": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SessionParentLink"
+              }
+            ]
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/SessionTrigger"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        }
+      },
+      "SessionTrigger": {
+        "type": "string",
+        "description": "Mirror of [`aura_model::SessionTrigger`]. Discriminator-only —\nper-variant payload (cron job id, system kind extras) lives on\n[`SessionDetail`] adjacent fields when relevant.",
+        "enum": [
+          "user",
+          "cron",
+          "system",
+          "parent"
+        ]
+      },
       "SetConfigRequest": {
         "type": "object",
         "description": "`PUT /v1/config` body.",
@@ -2154,6 +2693,10 @@
     {
       "name": "config",
       "description": "Read and mutate on-disk AuraConfig"
+    },
+    {
+      "name": "sessions",
+      "description": "Conversation sessions (list, detail, fork)"
     },
     {
       "name": "jobs",
