@@ -6,9 +6,17 @@
 by side against the same manager graph:
 
 1. **Admin listener** — TCP, bearer-token authenticated. Surfaces the
-   operator controls (config, jobs, cron, memory, traces, skills, tools,
-   channels-list, llm, status) that mirror the CLI command families. No
-   chat content or session data flows here.
+   operator controls (config, sessions, jobs, cron, memory, traces,
+   skills, tools, channels-list, llm, status, logs) that mirror the
+   CLI command families. Sessions are metadata-only (`GET
+   /v1/sessions/{id}` omits the transcript by design). Live chat
+   traffic flows over channel-listener WebSocket frames, not HTTP
+   routes — the admin listener has no chat-write surface. Trace
+   export (`GET /v1/traces/{session_id}`) does still surface the full
+   sanitized call-chain JSON, so anyone holding the admin token can
+   pull chat-equivalent content from there. Introducing a separate
+   transcript-tier auth that covers both sessions and traces is a
+   tracked follow-up.
 2. **Channel listener** — loopback TCP (`127.0.0.1:<ephemeral>`),
    authenticated by either the TUI pre-shared key or a per-subprocess
    token. The chosen port is published to `<workspace>/channel.port`

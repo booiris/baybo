@@ -76,6 +76,12 @@ forwards each `Notice` as a `Frame::Notice` with a lower-case
 `"warn"` / `"error"` level string so third-party SDKs don't need a
 typed enum to render it.
 
+### Structured progress events
+
+`AgentOutput::Progress { job_id, span_id, span_index, kind, summary, structured, … }` carries fine-grained step events from the agent loop: `SpanStarted`, `ToolStarted { tool_name }`, `ToolCompleted { tool_name, ok }`, `SpanCompleted`, plus reserved `JobSubmitted` / `JobAccepted` / `SubAgentSpawned` / `SubAgentCompleted` for future emitters. The agent loop opens an iteration via `ObservabilityRecorder::open_iteration` (PR3) at the top of each ReAct round and sends `SpanStarted`. Tool dispatch wraps with `ToolStarted` / `ToolCompleted`. A `ProgressGuard` in the agent loop guarantees `SpanCompleted` fires even when an iteration body bubbles a `?`-error, so consumers never see a half-open span. `summary` is empty for span boundaries (UI derives the label from `kind` + `span_index`); tool variants get a short human label. `structured` is reserved for kind-specific extras renderers may surface (token counts, latency).
+
+The gateway translates `AgentOutput::Progress` into `Frame::Progress`, which carries the discriminator as a snake_case string in `progress_kind` and per-kind extras in a free-form `detail` map. Older sidecars that don't decode the new tag drop the frame silently — Progress is purely additive UX, never load-bearing. Tool names flowing through Progress are scrubbed by `SecurityGateway::sanitize_llm_response` (which now also walks `tool_call.name`) so a hallucinated secret-shaped name can't reach a sidecar.
+
 ### Unified message mapping
 
 All platforms map to the same `IncomingMessage` structure via

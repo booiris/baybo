@@ -70,7 +70,7 @@ Parallel tool calls within a turn each go through the gate independently; the ga
 
 ### Long-running model
 
-Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentSupervisor` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; sessions are resolved dynamically at trigger time.
+Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; the Router mints a fresh UUID-id session per fire stamped with `SessionTrigger::Cron { cron_job_id, scheduled_fire_time }`. Each cron actor is one-shot: spawned, sent the `CronTrigger`, then sent `Shutdown` directly via the spawner-returned `Sender` without registering with the supervisor — so per-fire actor handles don't accumulate.
 
 `AgentMessage::CronTrigger` carries a `TriggerAction` (from `aura-cron`). The `AgentActor` branches on the variant:
 
@@ -83,11 +83,17 @@ Cron jobs flow through the Actor model and observability chain: `CronScheduler` 
 
 ### Rollback mechanism
 
-`Rollback` message → read snapshot from `TraceCollector` → `fork_from(target_node)` → restore session messages and context state from snapshot.
+`Rollback` message → read snapshot from `TraceCollector` → `fork_from(target_node)` (in-session branch via parent/child pointers) → restore session messages and context state from snapshot. Cross-session forks (user "branch this conversation" via `POST /v1/sessions/{id}/fork`) are a separate flow — they create a new `Session` with `parent_link.kind = Fork` and don't touch the parent's trace tree.
+
+### Span boundaries and progress events
+
+The agent loop opens an iteration via `ObservabilityRecorder::open_iteration(span_index)` at the top of every ReAct round. The returned `IterationGuard` (RAII) stamps every `TraceNode` created inside its scope with the same `span_id` / `span_index` and a `SpanRole` (LLM / Tool / System) derived from `OperationKind`. Drop closes the iteration even on `?`-bubbled errors, so a later cron-driven tool call on the same recorder never inherits a stale span.
+
+A separate `ProgressGuard` in the agent loop runs alongside `IterationGuard` and emits `AgentOutput::Progress` events on the channel: `SpanStarted` at iteration top, `ToolStarted` / `ToolCompleted` around each tool dispatch, and `SpanCompleted` either via explicit `finish()` on the happy path or via `Drop::drop` (using `try_send`) on any error path — consumers always see a matched span boundary.
 
 ### Startup recovery
 
-On system startup, before accepting any messages, `JobManager::recover_interrupted()` scans all non-terminal jobs left over from a prior run. `InProgress` jobs are moved to `Stuck` (their executing context was lost); other non-terminal states are left unchanged. This is called once in `main()` after constructing the `JobManager`.
+On system startup, before accepting any messages, `JobManager::bootstrap_recovery()` runs `recover_interrupted` → `reconcile_auto_chains` → `apply_recovery_policy` in the only correct order. See `docs/modules/job.md` for the per-step semantics. This is called once in `main()` after constructing the `JobManager`.
 
 ### Router's upstream responsibilities
 
@@ -109,7 +115,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `skills` | `AgentLoop` parses and executes skills |
 | `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager` |
 | `workspace` | Identity files for system prompt |
-| `cron` | Provides `CronJob`, `CronExecution` domain types; `CronScheduler` in agent manages lifecycle, converts between domain and storage row types |
+| `cron` | Owns `CronJob` / `CronExecution` types AND the `CronScheduler` (background tick + trigger dispatch). `Router::handle_cron_trigger` consumes the events the scheduler emits |
 | `context` | Conversation window and compression |
 | `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager`; startup recovery via `recover_interrupted()` |
 | `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |
