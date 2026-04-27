@@ -77,9 +77,10 @@ impl ObservabilityRecorder {
             let mut collector = self.trace_collector.lock();
             collector.end_span(handle.span_handle, result);
         }
+        // `complete` walks the job's AcceptancePolicy; for the default
+        // Auto policy this also fires Submit + Accept, so the manual
+        // chain is no longer needed.
         self.job_manager.complete(&handle.job_id, output).await?;
-        self.job_manager.submit(&handle.job_id).await?;
-        self.job_manager.accept(&handle.job_id).await?;
         Ok(())
     }
 

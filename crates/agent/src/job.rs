@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use aura_job::{Job, JobError, JobStatus, JobTransition, OperationKind};
+use aura_job::{
+    AcceptancePolicy, Job, JobError, JobStatus, JobTransition, OperationKind, RecoveryPolicy,
+};
 use aura_storage::JobStore;
 
 type Result<T> = std::result::Result<T, JobError>;
@@ -11,6 +13,15 @@ type Result<T> = std::result::Result<T, JobError>;
 /// This manager is a thin persistence orchestrator.
 pub struct JobManager {
     store: Arc<dyn JobStore>,
+}
+
+/// Outcome of one `apply_recovery_policy` pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryStats {
+    /// Stuck jobs moved to `Abandoned` (policy = Abandon, or AutoResume past max_attempts).
+    pub abandoned: usize,
+    /// Stuck jobs left unchanged (waiting for an external resumer).
+    pub left_stuck: usize,
 }
 
 impl JobManager {
@@ -34,16 +45,30 @@ impl JobManager {
         self.persist(job, transition).await
     }
 
+    /// Move a job from `InProgress` to `Completed` and apply its
+    /// `AcceptancePolicy`. Under the default `Auto` policy the manager
+    /// also walks `Completed → Submitted → Accepted` so user-facing
+    /// flows never see the verifier seam. `AutoSubmit` stops at
+    /// `Submitted`; `Manual` stops at `Completed`.
     pub async fn complete(&self, job_id: &str, output: serde_json::Value) -> Result<()> {
-        let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
-        self.persist(job, transition).await
+        let mut job = self.load_job(job_id).await?;
+        let transition = job.complete(output)?;
+        self.persist_in_place(&job, transition).await?;
+        self.apply_acceptance_policy(&mut job).await
     }
 
+    /// Move a job from `Completed` to `Submitted`. Use this when the
+    /// job's `AcceptancePolicy` is `AutoSubmit` or `Manual` and an
+    /// external submitter is signalling that the agent's output is
+    /// ready for verification.
     pub async fn submit(&self, job_id: &str) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.submit()).await?;
         self.persist(job, transition).await
     }
 
+    /// Move a job from `Submitted` to `Accepted`. Used by Manual /
+    /// AutoSubmit acceptors (user, validator, or the timeout
+    /// scheduler) to record a positive verdict.
     pub async fn accept(&self, job_id: &str) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.accept()).await?;
         self.persist(job, transition).await
@@ -52,6 +77,23 @@ impl JobManager {
     pub async fn fail(&self, job_id: &str, error: &str) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.fail(error)).await?;
         self.persist(job, transition).await
+    }
+
+    async fn apply_acceptance_policy(&self, job: &mut Job) -> Result<()> {
+        match job.acceptance.clone() {
+            AcceptancePolicy::Auto => {
+                let t = job.submit()?;
+                self.persist_in_place(job, t).await?;
+                let t = job.accept()?;
+                self.persist_in_place(job, t).await?;
+            }
+            AcceptancePolicy::AutoSubmit { .. } => {
+                let t = job.submit()?;
+                self.persist_in_place(job, t).await?;
+            }
+            AcceptancePolicy::Manual { .. } => {}
+        }
+        Ok(())
     }
 
     /// Look up a job by id.
@@ -80,6 +122,38 @@ impl JobManager {
         let (job, transition) = self.apply(job_id, |j| j.cancel(reason)).await?;
         self.persist(job, transition).await?;
         self.load_job(job_id).await
+    }
+
+    /// Apply each `Stuck` job's `RecoveryPolicy`. Jobs whose policy
+    /// is `Abandon` (or `AutoResume` that has exceeded `max_attempts`)
+    /// are moved to `Abandoned`; the rest are left for an external
+    /// resumer to drive `Stuck → InProgress` when ready.
+    ///
+    /// Intended to run after `recover_interrupted` on startup, then
+    /// periodically thereafter.
+    pub async fn apply_recovery_policy(&self) -> Result<RecoveryStats> {
+        let stuck = self.store.list_by_status(JobStatus::Stuck).await?;
+        let mut stats = RecoveryStats::default();
+        for mut job in stuck {
+            let abandon_reason = match &job.recovery {
+                RecoveryPolicy::Abandon => Some("recovery policy: abandon".to_string()),
+                RecoveryPolicy::AutoResume { max_attempts }
+                    if job.recovery_attempts >= *max_attempts =>
+                {
+                    Some(format!("max recovery attempts ({max_attempts}) reached"))
+                }
+                _ => None,
+            };
+            match abandon_reason {
+                Some(reason) => {
+                    let t = job.abandon(&reason)?;
+                    self.persist(job, t).await?;
+                    stats.abandoned += 1;
+                }
+                None => stats.left_stuck += 1,
+            }
+        }
+        Ok(stats)
     }
 
     /// Recover jobs that were interrupted by a system restart.
@@ -126,6 +200,15 @@ impl JobManager {
         Ok(())
     }
 
+    /// Persist a job that the caller still owns by mutable reference.
+    /// Used by `complete()` to chain multiple transitions on the same
+    /// `Job` value without reloading between them.
+    async fn persist_in_place(&self, job: &Job, transition: JobTransition) -> Result<()> {
+        self.store.save(job).await?;
+        self.store.record_transition(&transition).await?;
+        Ok(())
+    }
+
     async fn load_job(&self, job_id: &str) -> Result<Job> {
         self.store
             .get(job_id)
@@ -148,6 +231,20 @@ impl JobManager {
 
     async fn get_history(&self, job_id: &str) -> Result<Vec<JobTransition>> {
         self.store.get_transitions(job_id).await
+    }
+
+    async fn set_acceptance(&self, job_id: &str, acceptance: AcceptancePolicy) -> Result<()> {
+        let mut job = self.load_job(job_id).await?;
+        job.acceptance = acceptance;
+        self.store.save(&job).await?;
+        Ok(())
+    }
+
+    async fn set_recovery(&self, job_id: &str, recovery: RecoveryPolicy) -> Result<()> {
+        let mut job = self.load_job(job_id).await?;
+        job.recovery = recovery;
+        self.store.save(&job).await?;
+        Ok(())
     }
 }
 
@@ -253,23 +350,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_success_path() {
+    async fn auto_acceptance_chains_complete_to_accepted() {
         let mgr = make_manager();
         let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         assert_eq!(job.status, JobStatus::Pending);
+        assert!(matches!(job.acceptance, AcceptancePolicy::Auto));
 
         mgr.start(&job.id).await.unwrap();
         mgr.complete(&job.id, serde_json::json!({"ok": true}))
             .await
             .unwrap();
-        mgr.submit(&job.id).await.unwrap();
-        mgr.accept(&job.id).await.unwrap();
+
+        let final_job = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(final_job.status, JobStatus::Accepted);
+        assert!(final_job.submitted_at.is_some());
+        assert!(final_job.accepted_at.is_some());
 
         let history = mgr.get_history(&job.id).await.unwrap();
         assert_eq!(history.len(), 4);
-        assert_eq!(history[0].from, JobStatus::Pending);
         assert_eq!(history[0].to, JobStatus::InProgress);
+        assert_eq!(history[1].to, JobStatus::Completed);
+        assert_eq!(history[2].to, JobStatus::Submitted);
         assert_eq!(history[3].to, JobStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn auto_submit_acceptance_stops_at_submitted() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_acceptance(
+            &job.id,
+            AcceptancePolicy::AutoSubmit {
+                acceptor: aura_job::Acceptor::User,
+            },
+        )
+        .await
+        .unwrap();
+
+        mgr.start(&job.id).await.unwrap();
+        mgr.complete(&job.id, serde_json::json!(null))
+            .await
+            .unwrap();
+
+        let after = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(after.status, JobStatus::Submitted);
+        assert!(after.accepted_at.is_none());
+
+        // External acceptor signs off later.
+        mgr.accept(&job.id).await.unwrap();
+        let final_job = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(final_job.status, JobStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn manual_acceptance_stops_at_completed() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_acceptance(
+            &job.id,
+            AcceptancePolicy::Manual {
+                submitter: aura_job::Acceptor::User,
+                acceptor: aura_job::Acceptor::User,
+            },
+        )
+        .await
+        .unwrap();
+
+        mgr.start(&job.id).await.unwrap();
+        mgr.complete(&job.id, serde_json::json!(null))
+            .await
+            .unwrap();
+
+        let after = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(after.status, JobStatus::Completed);
+        assert!(after.submitted_at.is_none());
+
+        mgr.submit(&job.id).await.unwrap();
+        mgr.accept(&job.id).await.unwrap();
+        let final_job = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(final_job.status, JobStatus::Accepted);
     }
 
     #[tokio::test]
@@ -294,9 +453,12 @@ mod tests {
         mgr.complete(&job.id, serde_json::json!(null))
             .await
             .unwrap();
-        mgr.submit(&job.id).await.unwrap();
-        mgr.accept(&job.id).await.unwrap();
 
+        let final_job = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(final_job.status, JobStatus::Accepted);
+
+        // Pending→InProgress, InProgress→Stuck, Stuck→InProgress,
+        // InProgress→Completed, Completed→Submitted, Submitted→Accepted.
         let history = mgr.get_history(&job.id).await.unwrap();
         assert_eq!(history.len(), 6);
     }
@@ -343,13 +505,23 @@ mod tests {
     async fn recover_interrupted_moves_in_progress_to_stuck() {
         let mgr = make_manager();
 
-        // Create jobs in various states
         let pending_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
 
         let in_progress_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         mgr.start(&in_progress_job.id).await.unwrap();
 
+        // Manual acceptance keeps the job in `Completed` so the test can
+        // verify recover_interrupted leaves non-InProgress states alone.
         let completed_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_acceptance(
+            &completed_job.id,
+            AcceptancePolicy::Manual {
+                submitter: aura_job::Acceptor::User,
+                acceptor: aura_job::Acceptor::User,
+            },
+        )
+        .await
+        .unwrap();
         mgr.start(&completed_job.id).await.unwrap();
         mgr.complete(&completed_job.id, serde_json::json!(null))
             .await
@@ -360,22 +532,17 @@ mod tests {
         mgr.complete(&accepted_job.id, serde_json::json!(null))
             .await
             .unwrap();
-        mgr.submit(&accepted_job.id).await.unwrap();
-        mgr.accept(&accepted_job.id).await.unwrap();
 
         let failed_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
         mgr.start(&failed_job.id).await.unwrap();
         mgr.fail(&failed_job.id, "err").await.unwrap();
 
-        // Recover — only the InProgress job should transition
         let count = mgr.recover_interrupted().await.unwrap();
         assert_eq!(count, 1);
 
-        // Verify the in_progress job is now Stuck
         let job = mgr.store.get(&in_progress_job.id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Stuck);
 
-        // Verify others unchanged
         let job = mgr.store.get(&pending_job.id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
 
@@ -394,6 +561,76 @@ mod tests {
         let mgr = make_manager();
         let count = mgr.recover_interrupted().await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_recovery_policy_abandons_when_policy_is_abandon() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_recovery(&job.id, RecoveryPolicy::Abandon)
+            .await
+            .unwrap();
+        mgr.start(&job.id).await.unwrap();
+        mgr.stuck(&job.id, "hung").await.unwrap();
+
+        let stats = mgr.apply_recovery_policy().await.unwrap();
+        assert_eq!(stats.abandoned, 1);
+        assert_eq!(stats.left_stuck, 0);
+
+        let final_job = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(final_job.status, JobStatus::Abandoned);
+    }
+
+    #[tokio::test]
+    async fn apply_recovery_policy_abandons_when_max_attempts_exhausted() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_recovery(&job.id, RecoveryPolicy::AutoResume { max_attempts: 1 })
+            .await
+            .unwrap();
+        mgr.start(&job.id).await.unwrap();
+        mgr.stuck(&job.id, "hung").await.unwrap();
+        mgr.recover(&job.id, "first retry").await.unwrap();
+        mgr.stuck(&job.id, "hung again").await.unwrap();
+
+        let stats = mgr.apply_recovery_policy().await.unwrap();
+        assert_eq!(stats.abandoned, 1);
+
+        let final_job = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(final_job.status, JobStatus::Abandoned);
+    }
+
+    #[tokio::test]
+    async fn apply_recovery_policy_leaves_stuck_when_policy_is_manual() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_recovery(&job.id, RecoveryPolicy::Manual)
+            .await
+            .unwrap();
+        mgr.start(&job.id).await.unwrap();
+        mgr.stuck(&job.id, "hung").await.unwrap();
+
+        let stats = mgr.apply_recovery_policy().await.unwrap();
+        assert_eq!(stats.abandoned, 0);
+        assert_eq!(stats.left_stuck, 1);
+
+        let still_stuck = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(still_stuck.status, JobStatus::Stuck);
+    }
+
+    #[tokio::test]
+    async fn apply_recovery_policy_leaves_stuck_when_attempts_remain() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_recovery(&job.id, RecoveryPolicy::AutoResume { max_attempts: 3 })
+            .await
+            .unwrap();
+        mgr.start(&job.id).await.unwrap();
+        mgr.stuck(&job.id, "hung").await.unwrap();
+
+        let stats = mgr.apply_recovery_policy().await.unwrap();
+        assert_eq!(stats.abandoned, 0);
+        assert_eq!(stats.left_stuck, 1);
     }
 
     #[tokio::test]
