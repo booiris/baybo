@@ -12,7 +12,7 @@ use aura_agent::SessionManager;
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_pairing::PairingService;
 use aura_security::SecretVault;
-use aura_storage::ChannelBotStore;
+use aura_storage::{BlobStore, ChannelBotStore};
 
 use tokio::sync::mpsc;
 
@@ -67,4 +67,10 @@ pub struct WsChannelState {
     /// triples get a short code back via [`aura_channels::wire::Frame::Notice`]
     /// and their message is dropped. See `docs/modules/pairing.md`.
     pub pairing: Arc<PairingService>,
+    /// Backing store for non-text media. Sidecars upload via
+    /// `POST /v1/blobs`, the agent emits replies that reference blobs
+    /// the gateway already has, and `GET /v1/blobs/{id}` lets sidecars
+    /// fetch outbound bytes back. The wire only carries `blob_id`s; this
+    /// store is the source of truth for the actual bytes.
+    pub blob_store: Arc<dyn BlobStore>,
 }

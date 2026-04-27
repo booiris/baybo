@@ -17,6 +17,7 @@
 //!   a single `Message` frame on the wire.
 
 pub(crate) mod adapter;
+pub(crate) mod blobs;
 pub mod bot_reconciler;
 pub mod control;
 pub(crate) mod handshake;

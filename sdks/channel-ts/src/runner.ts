@@ -454,6 +454,9 @@ async function pumpOutbound(
           user_id: msg.userId,
           channel_type: channel.channelType,
           ...(msg.botId ? { bot_id: msg.botId } : {}),
+          ...(msg.attachments && msg.attachments.length > 0
+            ? { attachments: msg.attachments }
+            : {}),
         }),
       );
     }
@@ -507,6 +510,9 @@ function dispatchFrame(
             sessionId: frame.session_id,
             userId: frame.user_id,
             content: frame.content,
+            ...(frame.attachments && frame.attachments.length > 0
+              ? { attachments: frame.attachments }
+              : {}),
           }),
         "onMessage",
         logger,

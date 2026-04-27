@@ -17,9 +17,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::wire::{self, Frame, Message as WireMessage};
+use aura_channels::wire::{self, AttachmentKind, Frame, Message as WireMessage, WireAttachment};
 use aura_channels::{AgentOutput, Channel, ChannelError, NoticeLevel};
 use aura_model::{ChannelType, ContentBlock};
+use aura_storage::BlobStore;
 use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ChannelApprovalGate};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket};
 use futures::SinkExt;
@@ -63,6 +64,7 @@ impl Sidecar {
         channel_type: ChannelType,
         session_id: Option<String>,
         sink: WsSink,
+        blob_store: Arc<dyn BlobStore>,
     ) -> Self {
         let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(OUTBOUND_BUFFER);
         let (output_tx, mut output_rx) = mpsc::channel::<AgentOutput>(OUTBOUND_BUFFER);
@@ -72,9 +74,11 @@ impl Sidecar {
         // drops (which closes `output_tx`).
         let translator_tx = frame_tx.clone();
         let translator_ct = channel_type.clone();
+        let translator_blobs = Arc::clone(&blob_store);
         tokio::spawn(async move {
             while let Some(output) = output_rx.recv().await {
-                let frame = agent_output_to_frame(output, &translator_ct);
+                let frame =
+                    agent_output_to_frame(output, &translator_ct, translator_blobs.as_ref()).await;
                 if translator_tx.send(frame).await.is_err() {
                     break;
                 }
@@ -195,7 +199,11 @@ fn build_approval_gate(queue: ApprovalQueue, frame_tx: mpsc::Sender<Frame>) -> C
     )
 }
 
-fn agent_output_to_frame(output: AgentOutput, channel_type: &ChannelType) -> Frame {
+async fn agent_output_to_frame(
+    output: AgentOutput,
+    channel_type: &ChannelType,
+    blob_store: &dyn BlobStore,
+) -> Frame {
     match output {
         AgentOutput::Delta {
             session_id,
@@ -208,7 +216,7 @@ fn agent_output_to_frame(output: AgentOutput, channel_type: &ChannelType) -> Fra
             text,
         },
         AgentOutput::Message(response) => {
-            let content = flatten_content(&response.content);
+            let (content, attachments) = split_content(&response.content, blob_store).await;
             Frame::Message(WireMessage {
                 content,
                 session_id: response.session_id,
@@ -221,6 +229,7 @@ fn agent_output_to_frame(output: AgentOutput, channel_type: &ChannelType) -> Fra
                 // Outbound messages don't need `bot_id` — the sidecar
                 // recovers it from its own `user_id → bot_id` map.
                 bot_id: String::new(),
+                attachments,
             })
         }
         AgentOutput::Notice {
@@ -244,15 +253,116 @@ fn agent_output_to_frame(output: AgentOutput, channel_type: &ChannelType) -> Fra
     }
 }
 
-fn flatten_content(blocks: &[ContentBlock]) -> String {
-    let mut out = String::new();
+/// Walk the agent's content blocks and split them into the wire's
+/// `(text, attachments)` shape. Text blocks fold into a single newline-
+/// joined string; media blocks become `WireAttachment` entries with
+/// metadata pulled from the blob store. A blob whose `stat` fails is
+/// dropped from the outbound — the agent's intent of "send this media"
+/// can't be honored without a known mime/size, and surfacing a partial
+/// payload would mislead the sidecar (and ultimately the user).
+async fn split_content(
+    blocks: &[ContentBlock],
+    blob_store: &dyn BlobStore,
+) -> (String, Vec<WireAttachment>) {
+    let mut text = String::new();
+    let mut attachments = Vec::new();
     for block in blocks {
-        if let ContentBlock::Text(text) = block {
-            if !out.is_empty() {
-                out.push('\n');
+        match block {
+            ContentBlock::Text(t) => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(t);
             }
-            out.push_str(text);
+            ContentBlock::Image { blob, mime_type } => {
+                if let Some(att) = stat_attachment(
+                    blob_store,
+                    AttachmentKind::Image,
+                    &blob.blob_id,
+                    Some(mime_type.clone()),
+                    None,
+                )
+                .await
+                {
+                    attachments.push(att);
+                }
+            }
+            ContentBlock::Audio { blob, mime_type } => {
+                if let Some(att) = stat_attachment(
+                    blob_store,
+                    AttachmentKind::Audio,
+                    &blob.blob_id,
+                    Some(mime_type.clone()),
+                    None,
+                )
+                .await
+                {
+                    attachments.push(att);
+                }
+            }
+            ContentBlock::File {
+                blob,
+                filename,
+                mime_type,
+            } => {
+                if let Some(att) = stat_attachment(
+                    blob_store,
+                    AttachmentKind::File,
+                    &blob.blob_id,
+                    Some(mime_type.clone()),
+                    Some(filename.clone()),
+                )
+                .await
+                {
+                    attachments.push(att);
+                }
+            }
+            // ToolUse / ToolResult / Thinking are agent-internal and
+            // never propagate to channel-facing frames.
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Thinking { .. } => {}
         }
     }
-    out
+    (text, attachments)
+}
+
+async fn stat_attachment(
+    blob_store: &dyn BlobStore,
+    kind: AttachmentKind,
+    blob_id: &str,
+    mime_override: Option<String>,
+    filename: Option<String>,
+) -> Option<WireAttachment> {
+    match blob_store.stat(blob_id).await {
+        Ok(meta) => {
+            // Channel attachments are capped at 100 MiB by the
+            // upload handler (see `crate::channel::blobs`), so a
+            // u32 size always fits. Anything larger is a `BlobStore`
+            // bug and we surface it as a drop rather than ship a
+            // truncated value down the wire.
+            let size = match u32::try_from(meta.size) {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        blob_id = %meta.blob_id,
+                        size = meta.size,
+                        "attachment exceeds u32 size cap; dropping",
+                    );
+                    return None;
+                }
+            };
+            Some(WireAttachment {
+                kind,
+                blob_id: meta.blob_id,
+                mime_type: mime_override.unwrap_or(meta.mime_type),
+                size,
+                filename,
+            })
+        }
+        Err(e) => {
+            tracing::warn!(blob_id, error = %e, "attachment blob stat failed; dropping");
+            None
+        }
+    }
 }

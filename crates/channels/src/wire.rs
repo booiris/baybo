@@ -25,6 +25,53 @@ pub enum WireError {
     Decode(#[from] rmp_serde::decode::Error),
 }
 
+/// Discriminator on a [`WireAttachment`]. Maps 1:1 to the matching
+/// [`aura_model::ContentBlock`] variant on either side of the bridge.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum AttachmentKind {
+    Image,
+    Audio,
+    File,
+}
+
+/// Reference to a media payload that travels alongside a [`Message`].
+/// The bytes themselves never ride the WS — they live in the gateway's
+/// `BlobStore` and are uploaded / fetched out-of-band via
+/// `POST/GET /v1/blobs/*` (HTTP, same channel-token auth as the WS).
+/// The wire only carries the content-addressed `blob_id` so the frame
+/// stays small even for 100 MiB attachments and head-of-line blocking
+/// can't take out unrelated traffic on the same connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub struct WireAttachment {
+    pub kind: AttachmentKind,
+    /// Content-addressed id from the `BlobStore` (`"sha256:<64hex>"`).
+    pub blob_id: String,
+    pub mime_type: String,
+    /// Byte length of the underlying blob. Sidecars consume this to
+    /// short-circuit a download when the platform's send limit is
+    /// smaller than the blob. `u32` (4 GiB) is plenty given the
+    /// gateway's 100 MiB upload cap, and avoids the TS-side
+    /// `BigInt` round-trip that the default `@msgpack/msgpack`
+    /// encoder rejects.
+    pub size: u32,
+    /// Original filename for `File` kind. Servers ignore for image /
+    /// audio (where the platform usually picks its own name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub filename: Option<String>,
+}
+
 /// The canonical sidecar-to-aura (or aura-to-sidecar) message. A single
 /// connection may carry messages for many `user_id`s — the sidecar
 /// multiplexes its users onto one WebSocket.
@@ -41,6 +88,11 @@ pub enum WireError {
 /// pairing gate so the `(channel_type, bot_id, user_id)` triple can
 /// gate messages per-bot. Additive; default empty keeps old sidecars
 /// wire-compatible.
+///
+/// `attachments` carries non-text media (image / audio / file). The
+/// bytes ride the HTTP `/v1/blobs/*` side-channel; this list only
+/// references them by `blob_id`. Additive; default empty keeps old
+/// sidecars wire-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
@@ -55,6 +107,8 @@ pub struct Message {
     pub channel_type: ChannelType,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bot_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<WireAttachment>,
 }
 
 /// Frame envelope. Tagged on the `kind` field so the receive side
@@ -297,6 +351,7 @@ mod tests {
             user_id: "u1".into(),
             channel_type: ChannelType::from("slack"),
             bot_id: "prod-bot".into(),
+            attachments: Vec::new(),
         });
         let bytes = encode(&frame).unwrap();
         assert_eq!(frame, decode(&bytes).unwrap());
@@ -313,8 +368,65 @@ mod tests {
             user_id: "u1".into(),
             channel_type: ChannelType::from("slack"),
             bot_id: String::new(),
+            attachments: Vec::new(),
         });
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_message_with_attachments() {
+        let frame = Frame::Message(Message {
+            content: "look at this".into(),
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            channel_type: ChannelType::from("weixin"),
+            bot_id: "prod-bot".into(),
+            attachments: vec![
+                WireAttachment {
+                    kind: AttachmentKind::Image,
+                    blob_id: format!("sha256:{}", "0".repeat(64)),
+                    mime_type: "image/png".into(),
+                    size: 1024,
+                    filename: None,
+                },
+                WireAttachment {
+                    kind: AttachmentKind::File,
+                    blob_id: format!("sha256:{}", "1".repeat(64)),
+                    mime_type: "application/pdf".into(),
+                    size: 4096,
+                    filename: Some("report.pdf".into()),
+                },
+            ],
+        });
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn message_attachments_field_omitted_when_empty() {
+        // Old sidecars that predate `attachments` encode the same five
+        // fields they always did. The new field's `skip_serializing_if`
+        // keeps the wire identical when unused, and `serde_default`
+        // fills `Vec::new()` when decoding either direction.
+        let frame = Frame::Message(Message {
+            content: "hi".into(),
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            channel_type: ChannelType::from("slack"),
+            bot_id: String::new(),
+            attachments: Vec::new(),
+        });
+        let encoded = encode(&frame).unwrap();
+        // MessagePack with `to_vec_named` writes field names as bare
+        // utf-8 strings — if the `attachments` key was emitted at all,
+        // the literal would be present in the output. Use that as a
+        // wire-level proxy for "omitted on empty" without pulling in a
+        // dynamic-value MessagePack dep.
+        let as_str = String::from_utf8_lossy(&encoded);
+        assert!(
+            !as_str.contains("attachments"),
+            "attachments key should be omitted when empty",
+        );
+        assert_eq!(frame, decode(&encoded).unwrap());
     }
 
     #[test]

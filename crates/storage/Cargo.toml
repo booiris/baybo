@@ -16,16 +16,22 @@ aura-trace = { workspace = true }
 aura-job = { workspace = true }
 
 async-trait = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libsql = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 aura-context = { workspace = true }
+libc = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

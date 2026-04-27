@@ -37,8 +37,9 @@ anyhow = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 tokio-stream = { workspace = true }
+bytes = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -81,7 +82,6 @@ zstd = { workspace = true }
 [dev-dependencies]
 aura-gateway = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
-bytes = { workspace = true }
 chrono = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }

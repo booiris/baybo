@@ -118,6 +118,10 @@ impl WsTransport {
             channel_type: msg.message.channel,
             // TUI is session-scoped and bypasses the bot-pairing gate.
             bot_id: String::new(),
+            // The TUI is text-only on the input side; media attachments
+            // arrive via the agent and are rendered by the chat view's
+            // own placeholder logic.
+            attachments: Vec::new(),
         };
 
         self.client

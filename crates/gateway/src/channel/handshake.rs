@@ -80,7 +80,7 @@ pub(crate) fn validate_register(
                 );
             }
         }
-        AuthedClient::Subprocess { pid, label } => {
+        AuthedClient::Subprocess { pid, label, .. } => {
             let identity = tokens
                 .lookup(&token)
                 .ok_or_else(|| "token not registered".to_string())?;
@@ -142,6 +142,7 @@ mod tests {
         AuthedClient::Subprocess {
             pid,
             label: label.to_string(),
+            channel_type: Some(label.to_string()),
         }
     }
 
@@ -305,6 +306,7 @@ mod tests {
             user_id: String::new(),
             channel_type: ChannelType::from("slack"),
             bot_id: String::new(),
+            attachments: Vec::new(),
         });
         let authed = subprocess(1, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();

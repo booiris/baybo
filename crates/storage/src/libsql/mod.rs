@@ -1,3 +1,4 @@
+mod blob;
 mod channel_bot;
 mod channel_pairing;
 mod channel_session;
@@ -10,6 +11,7 @@ mod session;
 mod skill_risk;
 mod trace;
 
+pub use blob::LibsqlBlobStore;
 pub use channel_bot::LibsqlChannelBotStore;
 pub use channel_pairing::LibsqlChannelPairingStore;
 pub use channel_session::LibsqlChannelSessionStore;
@@ -258,6 +260,16 @@ impl LibsqlPool {
                     created_at   INTEGER NOT NULL,
                     deleted_at   INTEGER,
                     PRIMARY KEY (channel_type, bot_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS blobs (
+                    blob_id           TEXT PRIMARY KEY,
+                    mime_type         TEXT NOT NULL,
+                    size              INTEGER NOT NULL,
+                    uploader_identity TEXT,
+                    read_token        TEXT,
+                    created_at        INTEGER NOT NULL,
+                    deleted_at        INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS channel_pairings (

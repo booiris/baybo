@@ -289,6 +289,7 @@ pub fn build_channel_router(
         secret_vault: Arc::clone(&deps.secret_vault),
         bot_reconciler: Arc::clone(&deps.bot_reconciler),
         pairing,
+        blob_store: deps.stores.blob.clone(),
     };
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_channel_auth` has stripped `?token=…`.

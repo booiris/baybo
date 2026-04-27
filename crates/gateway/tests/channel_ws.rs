@@ -108,6 +108,7 @@ async fn channel_ws_end_to_end() {
         user_id: "user-1".into(),
         channel_type: slack.clone(),
         bot_id: "prod-bot".into(),
+        attachments: Vec::new(),
     };
     send_frame(&mut client, &Frame::Message(outbound.clone()))
         .await
@@ -379,6 +380,7 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
         user_id: "alice".into(),
         channel_type: slack.clone(),
         bot_id: "prod-bot".into(),
+        attachments: Vec::new(),
     };
     send_frame(&mut client, &Frame::Message(inbound.clone()))
         .await

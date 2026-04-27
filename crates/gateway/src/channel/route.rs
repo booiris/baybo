@@ -6,9 +6,9 @@
 
 use std::time::Duration;
 
-use aura_channels::wire::{self, Frame};
+use aura_channels::wire::{self, AttachmentKind, Frame, WireAttachment};
 use aura_channels::{ChannelError, IncomingMessage, Message as AgentMessage};
-use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
+use aura_model::{BlobRef, ChannelType, ContentBlock, MessageMetadata, User};
 use axum::Router;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
@@ -36,7 +36,9 @@ const SIDECAR_LOG_MAX_BYTES: usize = 1024;
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn routes() -> Router<WsChannelState> {
-    Router::new().route("/channel-ws", get(ws_handler))
+    Router::new()
+        .route("/channel-ws", get(ws_handler))
+        .merge(super::blobs::routes())
 }
 
 async fn ws_handler(
@@ -70,7 +72,12 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     let channel_type = outcome.channel_type;
     let session_id = outcome.session_id;
 
-    let sidecar = Sidecar::build(channel_type.clone(), session_id.clone(), sink);
+    let sidecar = Sidecar::build(
+        channel_type.clone(),
+        session_id.clone(),
+        sink,
+        std::sync::Arc::clone(&state.blob_store),
+    );
 
     if let Err(err) = state
         .registry
@@ -450,13 +457,15 @@ async fn run_inbound_loop(
                             name: None,
                             channel: channel_type.clone(),
                         };
+                        let content =
+                            wire_to_content_blocks(wire_msg.content, wire_msg.attachments);
                         let incoming = IncomingMessage {
                             message: AgentMessage {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 session_id,
                                 channel: channel_type.clone(),
                                 sender,
-                                content: vec![ContentBlock::Text(wire_msg.content)],
+                                content,
                                 timestamp: Utc::now(),
                                 reply_to: None,
                                 metadata: MessageMetadata::default(),
@@ -604,4 +613,95 @@ fn short_hash(raw: &str) -> String {
     let mut h = DefaultHasher::new();
     raw.hash(&mut h);
     format!("{:04x}", (h.finish() & 0xFFFF) as u16)
+}
+
+/// Translate the wire-level `(content, attachments)` pair into the
+/// agent-facing `Vec<ContentBlock>`. Empty text drops the leading
+/// `Text` block so a "media-only" message doesn't carry a phantom
+/// empty string. Attachments are appended in the order the sidecar
+/// sent them — the agent / LLM gets to decide ordering semantics.
+fn wire_to_content_blocks(content: String, attachments: Vec<WireAttachment>) -> Vec<ContentBlock> {
+    let mut blocks = Vec::with_capacity(attachments.len() + usize::from(!content.is_empty()));
+    if !content.is_empty() {
+        blocks.push(ContentBlock::Text(content));
+    }
+    for att in attachments {
+        let blob = BlobRef {
+            blob_id: att.blob_id,
+        };
+        blocks.push(match att.kind {
+            AttachmentKind::Image => ContentBlock::Image {
+                blob,
+                mime_type: att.mime_type,
+            },
+            AttachmentKind::Audio => ContentBlock::Audio {
+                blob,
+                mime_type: att.mime_type,
+            },
+            AttachmentKind::File => ContentBlock::File {
+                blob,
+                filename: att.filename.unwrap_or_default(),
+                mime_type: att.mime_type,
+            },
+        });
+    }
+    blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aura_channels::wire::AttachmentKind;
+
+    fn att(kind: AttachmentKind, mime: &str, filename: Option<&str>) -> WireAttachment {
+        WireAttachment {
+            kind,
+            blob_id: format!("sha256:{}", "0".repeat(64)),
+            mime_type: mime.into(),
+            size: 7,
+            filename: filename.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn text_only_yields_single_text_block() {
+        let blocks = wire_to_content_blocks("hi".into(), Vec::new());
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t == "hi"));
+    }
+
+    #[test]
+    fn empty_text_with_attachments_skips_leading_text() {
+        let blocks = wire_to_content_blocks(
+            String::new(),
+            vec![att(AttachmentKind::Image, "image/png", None)],
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn text_and_attachments_appear_in_order() {
+        let blocks = wire_to_content_blocks(
+            "look".into(),
+            vec![
+                att(AttachmentKind::Audio, "audio/wav", None),
+                att(AttachmentKind::File, "application/pdf", Some("a.pdf")),
+            ],
+        );
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t == "look"));
+        assert!(matches!(&blocks[1], ContentBlock::Audio { .. }));
+        match &blocks[2] {
+            ContentBlock::File {
+                filename,
+                mime_type,
+                ..
+            } => {
+                assert_eq!(filename, "a.pdf");
+                assert_eq!(mime_type, "application/pdf");
+            }
+            other => panic!("expected File block, got {other:?}"),
+        }
+    }
 }

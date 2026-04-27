@@ -36,7 +36,16 @@ use axum::response::Response;
 #[derive(Debug, Clone)]
 pub enum AuthedClient {
     Tui,
-    Subprocess { pid: u32, label: String },
+    Subprocess {
+        pid: u32,
+        label: String,
+        /// Channel type the token is bound to (mirrors
+        /// [`ClientIdentity::bound_channel_type`]). `None` for legacy
+        /// tokens minted before this field existed; handlers that need
+        /// to gate on channel type (pairing, blob upload) must reject
+        /// in that case.
+        channel_type: Option<String>,
+    },
 }
 
 impl AuthedClient {
@@ -47,6 +56,7 @@ impl AuthedClient {
             AuthedClient::Subprocess {
                 pid: identity.pid,
                 label: identity.label,
+                channel_type: identity.bound_channel_type,
             }
         }
     }
@@ -95,7 +105,7 @@ pub async fn require_channel_auth(
                 AuthedClient::Tui => {
                     tracing::debug!(%path, "channel auth: accepted via TUI token");
                 }
-                AuthedClient::Subprocess { pid, label } => {
+                AuthedClient::Subprocess { pid, label, .. } => {
                     tracing::debug!(
                         %path, pid, label = %label,
                         "channel auth: accepted via subprocess token",

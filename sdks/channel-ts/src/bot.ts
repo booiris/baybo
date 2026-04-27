@@ -10,17 +10,35 @@ import type {
   UserInbound,
 } from "./channel.js";
 import type { Logger } from "./logger.js";
+import type { WireAttachment } from "./wire.js";
 
 /**
  * One native-platform inbound event flowing from the transport into
  * the channel. `chat` and `platformUserId` are the platform's own
  * identifiers (Telegram chat id, Discord channel id, …) kept opaque
  * so the channel doesn't have to know each platform's shape.
+ *
+ * `attachments` is populated by sidecars whose platform delivers
+ * non-text media (images, voice, files). Each entry must reference a
+ * blob the sidecar has already uploaded via `POST /v1/blobs` (use the
+ * `uploadBlob` helper). Sidecars that don't speak media omit the field.
  */
 export interface BotInboundEvent<ChatId> {
   chat: ChatId;
   platformUserId: string;
   content: string;
+  attachments?: WireAttachment[];
+}
+
+/**
+ * Outbound media payload handed to {@link BotPlatform.sendMedia}. The
+ * sidecar receives an already-resolved list of `WireAttachment`s
+ * referencing blobs the gateway holds; use `fetchBlob` to pull the
+ * actual bytes when the platform's send API needs them inline.
+ */
+export interface BotMediaPayload {
+  text: string;
+  attachments: WireAttachment[];
 }
 
 /**
@@ -126,6 +144,22 @@ export interface BotPlatform<BotHandle, ChatId> {
 
   /** Deliver an outbound text message on a specific bot+chat pair. */
   sendText(handle: BotHandle, chat: ChatId, text: string): Promise<void>;
+
+  /**
+   * Deliver an outbound message that carries non-text media. Called by
+   * {@link BotChannel.onMessage} only when the agent attached
+   * `WireAttachment`s. Sidecars that implement this should fetch the
+   * referenced blobs via `fetchBlob`, upload them to the platform, and
+   * post the combined message. Omit the method to fall through to
+   * `sendText` with the text body only — attachments will be dropped
+   * with a warning, so platforms that need media support **must**
+   * implement this.
+   */
+  sendMedia?(
+    handle: BotHandle,
+    chat: ChatId,
+    payload: BotMediaPayload,
+  ): Promise<void>;
 
   /**
    * Optional platform-specific renderer for out-of-band notices.
@@ -412,10 +446,26 @@ export class BotChannel<BotHandle, ChatId>
       );
       return;
     }
+    const hasMedia = msg.attachments !== undefined && msg.attachments.length > 0;
     try {
-      await this.platform.sendText(route.handle, route.chat, msg.content);
+      if (hasMedia && this.platform.sendMedia) {
+        await this.platform.sendMedia(route.handle, route.chat, {
+          text: msg.content,
+          attachments: msg.attachments!,
+        });
+      } else {
+        if (hasMedia) {
+          // Platform doesn't implement sendMedia — surface this loudly
+          // because the user's reply just lost its non-text payload.
+          // The text part still ships so the conversation isn't broken.
+          this.logger.warn(
+            `dropping ${msg.attachments!.length} attachment(s) — platform does not implement sendMedia`,
+          );
+        }
+        await this.platform.sendText(route.handle, route.chat, msg.content);
+      }
     } catch (err) {
-      this.logger.error("sendText failed", err);
+      this.logger.error(hasMedia ? "sendMedia failed" : "sendText failed", err);
     }
   }
 
@@ -600,6 +650,9 @@ export class BotChannel<BotHandle, ChatId>
       userId,
       content: ev.content,
       botId,
+      ...(ev.attachments && ev.attachments.length > 0
+        ? { attachments: ev.attachments }
+        : {}),
     });
   }
 
