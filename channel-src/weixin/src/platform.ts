@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 
-import type { Logger, StartBotCommand } from "@aura/channel-sdk";
+import type { Logger, StartBotCommand, WireAttachment } from "@aura/channel-sdk";
+import { fetchBlob } from "@aura/channel-sdk";
 import type {
+  BotMediaPayload,
   BotPlatform,
   BotStartHooks,
 } from "@aura/channel-sdk/bot";
@@ -15,6 +17,7 @@ import { WeixinConfigManager } from "./api/config-cache.js";
 import { sendMessage, sendTyping } from "./api/endpoints.js";
 import { MessageItemType, MessageState, MessageType, TypingStatus } from "./api/types.js";
 import { sanitizeMarkdown, StreamingMarkdownFilter } from "./messaging/markdown-filter.js";
+import { sendWeixinMediaBytes } from "./messaging/send-media.js";
 import { runPollLoop } from "./runtime/poll-loop.js";
 import type { AuthBlob, RuntimeState, WeixinBotHandle, WeixinChat } from "./types.js";
 import type { WeixinApprovals } from "./approvals.js";
@@ -180,6 +183,77 @@ export class WeixinPlatform implements BotPlatform<WeixinBotHandle, WeixinChat> 
     }
   }
 
+  async sendMedia(
+    handle: WeixinBotHandle,
+    chat: WeixinChat,
+    payload: BotMediaPayload,
+  ): Promise<void> {
+    assertSessionActive(handle.accountId);
+    if (!handle.state.cdnBaseUrl) {
+      // Without a CDN endpoint we can't upload — surface a single
+      // text-only message with the placeholder so the user sees
+      // *something*. Operators on a private cloud need to set
+      // `AURA_WEIXIN_CDN_BASE_URL` for media to actually flow.
+      this.logger.warn(
+        "weixin sendMedia: cdnBaseUrl unset; falling back to text",
+      );
+      const fallback = mediaFallbackText(payload.text, payload.attachments);
+      await this.sendText(handle, chat, fallback);
+      return;
+    }
+    const contextToken = handle.state.contextTokens.get(chat.toUserId);
+    const opts = {
+      baseUrl: handle.state.baseUrl,
+      token: handle.state.botToken,
+      ...(contextToken !== undefined ? { contextToken } : {}),
+    };
+    const filteredText = payload.text ? sanitizeMarkdown(payload.text) : "";
+    try {
+      // Each attachment ships as its own iLink message — the protocol
+      // demands one item per request. The caption rides with the
+      // first attachment only so the user doesn't see it duplicated.
+      let captionRemaining = filteredText;
+      for (const att of payload.attachments) {
+        const bytes = await this.fetchAttachment(att);
+        if (!bytes) continue;
+        await sendWeixinMediaBytes({
+          bytes,
+          mimeType: att.mime_type,
+          ...(att.filename ? { filename: att.filename } : {}),
+          to: chat.toUserId,
+          text: captionRemaining,
+          opts,
+          cdnBaseUrl: handle.state.cdnBaseUrl,
+          logger: this.logger,
+        });
+        captionRemaining = "";
+      }
+      void this.cancelTyping(handle, chat);
+    } catch (err) {
+      if (isSessionExpired(err)) {
+        pauseSession(handle.accountId);
+        this.logger.error(
+          `weixin bot '${handle.accountId}' sendMedia hit errcode ${SESSION_EXPIRED_ERRCODE}; pausing`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  /** Pull blob bytes from the gateway. `null` on miss so the loop
+   * skips the attachment instead of aborting the whole reply. */
+  private async fetchAttachment(att: WireAttachment): Promise<Buffer | null> {
+    try {
+      const { bytes } = await fetchBlob(att.blob_id);
+      return Buffer.from(bytes);
+    } catch (err) {
+      this.logger.error(
+        `weixin sendMedia: fetchBlob failed blob_id=${att.blob_id} err=${String(err)}`,
+      );
+      return null;
+    }
+  }
+
   async notifyTyping(handle: WeixinBotHandle, chat: WeixinChat): Promise<void> {
     if (!handle.state.contextTokens.has(chat.toUserId)) return;
     try {
@@ -202,6 +276,17 @@ export class WeixinPlatform implements BotPlatform<WeixinBotHandle, WeixinChat> 
       this.logger.debug(`weixin notifyTyping ignored error: ${String(err)}`);
     }
   }
+}
+
+/** Build a degraded text fallback when `sendMedia` can't actually
+ * upload. Lists the attachment kinds + sizes so the user knows what
+ * was meant to flow, even though it didn't. */
+function mediaFallbackText(text: string, attachments: WireAttachment[]): string {
+  const lines = attachments.map(
+    (a) => `[${a.kind}: ${a.mime_type} ${(a.size / 1024).toFixed(0)} KiB]`,
+  );
+  if (text) lines.unshift(text);
+  return lines.join("\n");
 }
 
 function isSessionExpired(err: unknown): boolean {

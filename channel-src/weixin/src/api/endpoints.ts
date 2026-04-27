@@ -9,6 +9,8 @@ import type {
   GetConfigResp,
   GetUpdatesReq,
   GetUpdatesResp,
+  GetUploadUrlReq,
+  GetUploadUrlResp,
   SendMessageReq,
   SendTypingReq,
 } from "./types.js";
@@ -115,4 +117,33 @@ export async function sendTyping(
     timeoutMs: params.timeoutMs ?? DEFAULT_CONFIG_TIMEOUT_MS,
     label: "sendTyping",
   });
+}
+
+/** Pre-signed CDN upload URL for one media file. Caller AES-encrypts
+ * the bytes and POSTs them to the returned URL. */
+export async function getUploadUrl(
+  params: GetUploadUrlReq & WeixinApiOptions,
+): Promise<GetUploadUrlResp> {
+  const rawText = await apiPostFetch({
+    baseUrl: params.baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      filekey: params.filekey,
+      media_type: params.media_type,
+      to_user_id: params.to_user_id,
+      rawsize: params.rawsize,
+      rawfilemd5: params.rawfilemd5,
+      filesize: params.filesize,
+      thumb_rawsize: params.thumb_rawsize,
+      thumb_rawfilemd5: params.thumb_rawfilemd5,
+      thumb_filesize: params.thumb_filesize,
+      no_need_thumb: params.no_need_thumb,
+      aeskey: params.aeskey,
+      base_info: buildBaseInfo(),
+    }),
+    ...(params.token !== undefined ? { token: params.token } : {}),
+    timeoutMs: params.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+    label: "getUploadUrl",
+  });
+  return JSON.parse(rawText) as GetUploadUrlResp;
 }
