@@ -66,9 +66,9 @@ export function TracesPage() {
     };
     return (
       <span
-        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${map[status]}`}
+        className={`inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${map[status]}`}
       >
-        {status}
+        <span>{status}</span>
       </span>
     );
   };
@@ -96,7 +96,7 @@ export function TracesPage() {
 
       <div className="flex-1 flex flex-col min-h-0 bg-white border-[3px] border-black rounded-md shadow-brutal">
         <div className="flex-1 overflow-auto overscroll-none">
-          <table className="w-full border-collapse table-fixed">
+          <table className="w-full border-separate border-spacing-0 table-fixed">
             <thead>
               <tr>
                 <th className={`${thCell} w-[160px]`}>Create Time</th>
@@ -119,11 +119,10 @@ export function TracesPage() {
                   </td>
                 </tr>
               )}
-              {items.map((session, idx) => {
+              {items.map((session) => {
                 const createTs = splitTimestamp(session.createTime);
                 const activeTs = splitTimestamp(session.activeTime);
-                const notLast = idx !== items.length - 1;
-                const cell = `px-6 py-4 align-top ${notLast ? 'border-b border-black' : ''}`;
+                const cell = `px-6 py-4 align-middle border-b border-black`;
                 return (
                   <tr 
                     key={session.id} 
@@ -184,7 +183,7 @@ export function TracesPage() {
               <SelectBox
                 value={pageSize}
                 onChange={(e) => setPageSize(Number(e.target.value))}
-                className="!py-1 !px-2 !pr-8 text-[0.85rem] h-8"
+                className="h-8 px-2"
               >
                 {PAGE_SIZE_OPTIONS.map((opt) => (
                   <option key={opt} value={opt}>

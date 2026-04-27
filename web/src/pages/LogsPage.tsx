@@ -1,18 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
-  RiAlertFill,
-  RiBug2Fill,
   RiBroadcastLine,
-  RiCloseCircleFill,
   RiDownloadLine,
   RiEyeLine,
-  RiInformationFill,
-  RiPulseLine,
   RiRefreshLine,
   RiLoader4Line,
 } from 'react-icons/ri';
-import type { IconType } from 'react-icons';
 import { Button } from '../components/Button';
 import { IconButton } from '../components/IconButton';
 import { SearchBox } from '../components/SearchBox';
@@ -28,12 +22,12 @@ type ApiLogLevel = components['schemas']['LogLevel'];
 const DEFAULT_PAGE_SIZE = 50;
 const PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500];
 
-const LEVEL_META: Record<ApiLogLevel, { className: string; Icon: IconType }> = {
-  error: { className: 'bg-err text-white', Icon: RiCloseCircleFill },
-  warn: { className: 'bg-warn text-white', Icon: RiAlertFill },
-  info: { className: 'bg-info text-white', Icon: RiInformationFill },
-  debug: { className: 'bg-gray-200 text-ink border-ink', Icon: RiBug2Fill },
-  trace: { className: 'bg-gray-100 text-ink-soft border-ink-soft', Icon: RiPulseLine },
+const LEVEL_META: Record<ApiLogLevel, { className: string }> = {
+  error: { className: 'bg-err text-white' },
+  warn: { className: 'bg-warn text-white' },
+  info: { className: 'bg-info text-white' },
+  debug: { className: 'bg-gray-200 text-ink border-ink' },
+  trace: { className: 'bg-gray-100 text-ink-soft border-ink-soft' },
 };
 
 const thCell =
@@ -248,13 +242,12 @@ export function LogsPage() {
   const badge = useMemo(
     () =>
       ({ level: lvl }: { level: ApiLogLevel }) => {
-        const { className, Icon } = LEVEL_META[lvl];
+        const { className } = LEVEL_META[lvl];
         return (
           <span
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
+            className={`inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
           >
-            <Icon className="text-[0.85rem]" />
-            {lvl}
+            <span>{lvl}</span>
           </span>
         );
       },
@@ -300,7 +293,7 @@ export function LogsPage() {
         <SelectBox
           value={level}
           onChange={(e) => setLevel(e.target.value as 'all' | ApiLogLevel)}
-          className="!py-2 !px-3 !pr-8 text-[0.9rem] h-10"
+          className="h-10 px-3"
         >
           <option value="all">All Levels</option>
           <option value="error">Error</option>
@@ -350,7 +343,7 @@ export function LogsPage() {
 
       <div className="flex-1 flex flex-col min-h-0 bg-white border-[3px] border-black rounded-md shadow-brutal">
         <div ref={scrollRef} className="flex-1 overflow-auto overscroll-none">
-          <table className="w-full border-collapse">
+          <table className="w-full border-separate border-spacing-0">
           <thead>
             <tr>
               <th className={`${thCell} w-[160px]`}>Timestamp</th>
@@ -371,10 +364,9 @@ export function LogsPage() {
                 </td>
               </tr>
             )}
-            {items.map((log, idx) => {
+            {items.map((log) => {
               const { date, time } = splitTimestamp(log.timestamp);
-              const notLast = idx !== items.length - 1;
-              const cell = `px-6 py-4 align-top ${notLast ? 'border-b border-black' : ''}`;
+              const cell = `px-6 py-4 align-middle border-b border-black`;
               return (
                 <tr key={log.id} className="hover:bg-gray-50">
                   <td className={cell}>
@@ -424,7 +416,7 @@ export function LogsPage() {
               <SelectBox
                 value={pageSize}
                 onChange={(e) => setPageSize(Number(e.target.value))}
-                className="!py-1 !px-2 !pr-8 text-[0.85rem] h-8"
+                className="h-8 px-2"
               >
                 {PAGE_SIZE_OPTIONS.map((opt) => (
                   <option key={opt} value={opt}>
@@ -460,7 +452,7 @@ export function LogsPage() {
 
 function LogDetailModal({ entry, onClose }: { entry: LogEntry; onClose: () => void }) {
   const { date, time } = splitTimestamp(entry.timestamp);
-  const { className, Icon } = LEVEL_META[entry.level];
+  const { className } = LEVEL_META[entry.level];
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
@@ -475,9 +467,8 @@ function LogDetailModal({ entry, onClose }: { entry: LogEntry; onClose: () => vo
         <header className="flex items-center justify-between px-6 py-4 border-b-2 border-black">
           <div className="flex items-center gap-3">
             <span
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
+              className={`inline-flex items-center px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
             >
-              <Icon className="text-[0.85rem]" />
               {entry.level}
             </span>
             <code className="font-mono text-[0.9rem]">{entry.target}</code>

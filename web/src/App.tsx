@@ -7,6 +7,7 @@ import { LoginScreen } from './components/LoginScreen';
 import { LogsPage } from './pages/LogsPage';
 import { TracesPage } from './pages/TracesPage';
 import { TraceSessionPage } from './pages/TraceSessionPage';
+import { CronPage } from './pages/CronPage';
 import { useAuth } from './api/auth';
 
 export default function App() {
@@ -19,7 +20,9 @@ export default function App() {
     ? ['Traces', decodeURIComponent(location.pathname.split('/').pop()!)] 
     : location.pathname.startsWith('/traces') 
       ? ['Traces'] 
-      : ['System Logs'];
+      : location.pathname.startsWith('/cron')
+        ? ['Cron Jobs']
+        : ['System Logs'];
 
   useEffect(() => {
     if (!token || !client) {
@@ -72,6 +75,7 @@ export default function App() {
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/traces" element={<TracesPage />} />
           <Route path="/traces/:id" element={<TraceSessionPage />} />
+          <Route path="/cron" element={<CronPage />} />
           <Route path="*" element={<Navigate to="/logs" replace />} />
         </Routes>
       </main>

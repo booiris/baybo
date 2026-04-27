@@ -22,6 +22,12 @@
 }
 
 @layer base {
+  *,
+  *::before,
+  *::after {
+    scrollbar-gutter: stable;
+  }
+
   html,
   body,
   #root {

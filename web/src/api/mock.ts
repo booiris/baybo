@@ -100,6 +100,50 @@ function generateMockSessions(count: number): TraceSession[] {
 
 export const MOCK_TRACES = import.meta.env.DEV ? generateMockSessions(150) : [];
 
+// --- Cron Mock Data ---
+
+function generateMockCrons(count: number): components['schemas']['CronJob'][] {
+  const crons: components['schemas']['CronJob'][] = [];
+  const now = Date.now();
+  const channels = ['telegram', 'weixin', 'discord', 'tui', 'http'];
+  const statuses: components['schemas']['CronStatus'][] = ['enabled', 'disabled', 'enabled', 'enabled'];
+  const schedules = ['0 9 * * *', '*/30 * * * *', '0 0 * * 1', '0 18 * * 1-5'];
+  const prompts = [
+    'Summarize my unread messages',
+    'Generate a daily weather report',
+    'Check for new releases in my watched repos',
+    'Reminder: Weekly sync starting in 10 minutes',
+  ];
+
+  for (let i = 0; i < count; i++) {
+    const isCron = Math.random() > 0.2;
+    const createdAt = new Date(now - i * 1000 * 60 * 60 * 24);
+    const updatedAt = new Date(now - i * 1000 * 60 * 60 * 2);
+    
+    crons.push({
+      id: `cron-${Math.random().toString(36).substring(2, 9)}`,
+      user_id: `user-${Math.floor(Math.random() * 100)}`,
+      channel: channels[Math.floor(Math.random() * channels.length)],
+      status: statuses[Math.floor(Math.random() * statuses.length)],
+      schedule: isCron 
+        ? { kind: 'cron', expr: schedules[Math.floor(Math.random() * schedules.length)] }
+        : { kind: 'at', time: new Date(now + Math.random() * 1000 * 60 * 60 * 24).toISOString() },
+      action: {
+        kind: 'prompt',
+        prompt: prompts[Math.floor(Math.random() * prompts.length)],
+      },
+      last_triggered_at: Math.random() > 0.3 ? new Date(now - Math.random() * 1000 * 60 * 60).toISOString() : null,
+      next_trigger_at: new Date(now + Math.random() * 1000 * 60 * 60).toISOString(),
+      created_at: createdAt.toISOString(),
+      updated_at: updatedAt.toISOString(),
+      origin_session_id: `session-${Math.random().toString(36).substring(2, 6)}`,
+    });
+  }
+  return crons;
+}
+
+export const MOCK_CRONS = import.meta.env.DEV ? generateMockCrons(20) : [];
+
 export interface TraceSpan {
   id: string;
   type: 'llm_call' | 'tool_call';
