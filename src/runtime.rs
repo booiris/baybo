@@ -262,10 +262,23 @@ pub async fn build_managers(
     ));
 
     let job_manager = JobManager::new(stores.job.clone());
-    match job_manager.recover_interrupted().await {
-        Ok(0) => {}
-        Ok(n) => info!(count = n, "recovered interrupted jobs from prior run"),
-        Err(e) => tracing::warn!(error = %e, "failed to recover interrupted jobs"),
+    match job_manager.bootstrap_recovery().await {
+        Ok(stats) => {
+            if stats.interrupted > 0
+                || stats.reconciled > 0
+                || stats.recovery.abandoned > 0
+                || stats.recovery.left_stuck > 0
+            {
+                info!(
+                    interrupted = stats.interrupted,
+                    reconciled = stats.reconciled,
+                    abandoned = stats.recovery.abandoned,
+                    left_stuck = stats.recovery.left_stuck,
+                    "job bootstrap recovery completed",
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "job bootstrap recovery failed"),
     }
     let job_manager = Arc::new(job_manager);
 

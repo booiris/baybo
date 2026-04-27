@@ -24,6 +24,17 @@ pub struct RecoveryStats {
     pub left_stuck: usize,
 }
 
+/// Aggregated outcome of `bootstrap_recovery`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapRecoveryStats {
+    /// Number of `InProgress` jobs moved to `Stuck`.
+    pub interrupted: usize,
+    /// Number of `Auto`-policy jobs forward-filled past `Completed`/`Submitted`.
+    pub reconciled: usize,
+    /// Outcome of the recovery-policy pass.
+    pub recovery: RecoveryStats,
+}
+
 impl JobManager {
     pub fn new(store: Arc<dyn JobStore>) -> Self {
         Self { store }
@@ -50,11 +61,32 @@ impl JobManager {
     /// also walks `Completed → Submitted → Accepted` so user-facing
     /// flows never see the verifier seam. `AutoSubmit` stops at
     /// `Submitted`; `Manual` stops at `Completed`.
+    ///
+    /// All chained transitions are applied to the in-memory `Job` first
+    /// and persisted with a single `store.save` so a crash cannot leave
+    /// an `Auto` job stranded between `Completed` and `Accepted`. The
+    /// per-transition records are appended afterwards; if appending one
+    /// fails the job is already in its final state and `reconcile_auto_chains`
+    /// will not need to act, only the audit trail loses a row.
     pub async fn complete(&self, job_id: &str, output: serde_json::Value) -> Result<()> {
         let mut job = self.load_job(job_id).await?;
-        let transition = job.complete(output)?;
-        self.persist_in_place(&job, transition).await?;
-        self.apply_acceptance_policy(&mut job).await
+        let mut transitions = Vec::with_capacity(3);
+        transitions.push(job.complete(output)?);
+        match job.acceptance.clone() {
+            AcceptancePolicy::Auto => {
+                transitions.push(job.submit()?);
+                transitions.push(job.accept()?);
+            }
+            AcceptancePolicy::AutoSubmit { .. } => {
+                transitions.push(job.submit()?);
+            }
+            AcceptancePolicy::Manual { .. } => {}
+        }
+        self.store.save(&job).await?;
+        for t in transitions {
+            self.store.record_transition(&t).await?;
+        }
+        Ok(())
     }
 
     /// Move a job from `Completed` to `Submitted`. Use this when the
@@ -77,23 +109,6 @@ impl JobManager {
     pub async fn fail(&self, job_id: &str, error: &str) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.fail(error)).await?;
         self.persist(job, transition).await
-    }
-
-    async fn apply_acceptance_policy(&self, job: &mut Job) -> Result<()> {
-        match job.acceptance.clone() {
-            AcceptancePolicy::Auto => {
-                let t = job.submit()?;
-                self.persist_in_place(job, t).await?;
-                let t = job.accept()?;
-                self.persist_in_place(job, t).await?;
-            }
-            AcceptancePolicy::AutoSubmit { .. } => {
-                let t = job.submit()?;
-                self.persist_in_place(job, t).await?;
-            }
-            AcceptancePolicy::Manual { .. } => {}
-        }
-        Ok(())
     }
 
     /// Look up a job by id.
@@ -124,13 +139,72 @@ impl JobManager {
         self.load_job(job_id).await
     }
 
+    /// Run the full startup recovery sequence in the only correct order:
+    ///
+    /// 1. `recover_interrupted` (`InProgress → Stuck` for jobs cut short
+    ///    by a process exit).
+    /// 2. `reconcile_auto_chains` (forward-fill `Auto`-policy jobs that
+    ///    were stranded mid-acceptance — only happens for legacy data
+    ///    or a partially-applied save; `complete()` itself is now
+    ///    crash-safe).
+    /// 3. `apply_recovery_policy` (move `Stuck` jobs to `Abandoned` if
+    ///    their policy says so).
+    ///
+    /// Returns each step's result tuple.
+    pub async fn bootstrap_recovery(&self) -> Result<BootstrapRecoveryStats> {
+        let interrupted = self.recover_interrupted().await?;
+        let reconciled = self.reconcile_auto_chains().await?;
+        let recovery = self.apply_recovery_policy().await?;
+        Ok(BootstrapRecoveryStats {
+            interrupted,
+            reconciled,
+            recovery,
+        })
+    }
+
+    /// Forward-fill `Auto`-policy jobs whose acceptance chain stopped
+    /// short. Drives `Completed → Submitted → Accepted` and
+    /// `Submitted → Accepted` for jobs whose `acceptance` is `Auto`,
+    /// using a single in-memory transition batch per job.
+    ///
+    /// `AutoSubmit` and `Manual` jobs in those states are intentional —
+    /// they are waiting for an external acceptor — and are left alone.
+    pub async fn reconcile_auto_chains(&self) -> Result<usize> {
+        let mut moved = 0usize;
+        for status in [JobStatus::Completed, JobStatus::Submitted] {
+            let jobs = self.store.list_by_status(status.clone()).await?;
+            for mut job in jobs {
+                if !matches!(job.acceptance, AcceptancePolicy::Auto) {
+                    continue;
+                }
+                let mut transitions = Vec::with_capacity(2);
+                if job.status == JobStatus::Completed {
+                    transitions.push(job.submit()?);
+                }
+                if job.status == JobStatus::Submitted {
+                    transitions.push(job.accept()?);
+                }
+                if transitions.is_empty() {
+                    continue;
+                }
+                self.store.save(&job).await?;
+                for t in transitions {
+                    self.store.record_transition(&t).await?;
+                }
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
     /// Apply each `Stuck` job's `RecoveryPolicy`. Jobs whose policy
     /// is `Abandon` (or `AutoResume` that has exceeded `max_attempts`)
     /// are moved to `Abandoned`; the rest are left for an external
     /// resumer to drive `Stuck → InProgress` when ready.
     ///
     /// Intended to run after `recover_interrupted` on startup, then
-    /// periodically thereafter.
+    /// periodically thereafter; or use `bootstrap_recovery` to chain
+    /// the canonical sequence.
     pub async fn apply_recovery_policy(&self) -> Result<RecoveryStats> {
         let stuck = self.store.list_by_status(JobStatus::Stuck).await?;
         let mut stats = RecoveryStats::default();
@@ -196,15 +270,6 @@ impl JobManager {
     /// Persist the updated job and its transition record.
     async fn persist(&self, job: Job, transition: JobTransition) -> Result<()> {
         self.store.save(&job).await?;
-        self.store.record_transition(&transition).await?;
-        Ok(())
-    }
-
-    /// Persist a job that the caller still owns by mutable reference.
-    /// Used by `complete()` to chain multiple transitions on the same
-    /// `Job` value without reloading between them.
-    async fn persist_in_place(&self, job: &Job, transition: JobTransition) -> Result<()> {
-        self.store.save(job).await?;
         self.store.record_transition(&transition).await?;
         Ok(())
     }
@@ -631,6 +696,130 @@ mod tests {
         let stats = mgr.apply_recovery_policy().await.unwrap();
         assert_eq!(stats.abandoned, 0);
         assert_eq!(stats.left_stuck, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_recovery_policy_on_empty_store_returns_zero() {
+        let mgr = make_manager();
+        let stats = mgr.apply_recovery_policy().await.unwrap();
+        assert_eq!(stats.abandoned, 0);
+        assert_eq!(stats.left_stuck, 0);
+    }
+
+    /// Drop the second-to-last transition record from a job's history.
+    /// Simulates a stranded `Auto` job that was saved as `Submitted` in
+    /// some earlier process before this PR's in-memory-atomic complete()
+    /// landed — i.e. exactly the case `reconcile_auto_chains` exists for.
+    async fn force_status(mgr: &JobManager, job_id: &str, status: JobStatus) {
+        let mut job = mgr.store.get(job_id).await.unwrap().unwrap();
+        job.status = status;
+        mgr.store.save(&job).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_auto_chains_advances_completed_auto_to_accepted() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        force_status(&mgr, &job.id, JobStatus::Completed).await;
+
+        let moved = mgr.reconcile_auto_chains().await.unwrap();
+        assert_eq!(moved, 1);
+
+        let final_job = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(final_job.status, JobStatus::Accepted);
+        assert!(final_job.submitted_at.is_some());
+        assert!(final_job.accepted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn reconcile_auto_chains_advances_submitted_auto_to_accepted() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        force_status(&mgr, &job.id, JobStatus::Submitted).await;
+
+        let moved = mgr.reconcile_auto_chains().await.unwrap();
+        assert_eq!(moved, 1);
+
+        let final_job = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(final_job.status, JobStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn reconcile_auto_chains_leaves_manual_completed_alone() {
+        let mgr = make_manager();
+        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_acceptance(
+            &job.id,
+            AcceptancePolicy::Manual {
+                submitter: aura_job::Acceptor::User,
+                acceptor: aura_job::Acceptor::User,
+            },
+        )
+        .await
+        .unwrap();
+        force_status(&mgr, &job.id, JobStatus::Completed).await;
+
+        let moved = mgr.reconcile_auto_chains().await.unwrap();
+        assert_eq!(moved, 0);
+
+        let still = mgr.store.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(still.status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_recovery_chains_steps_in_order() {
+        let mgr = make_manager();
+
+        // Stuck-with-Abandon job: should become Abandoned by step 3.
+        let abandon_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.set_recovery(&abandon_job.id, RecoveryPolicy::Abandon)
+            .await
+            .unwrap();
+        mgr.start(&abandon_job.id).await.unwrap();
+        mgr.stuck(&abandon_job.id, "hung").await.unwrap();
+
+        // InProgress job from a "previous run": step 1 → Stuck;
+        // step 3 with default AutoResume keeps it Stuck.
+        let crashed_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        mgr.start(&crashed_job.id).await.unwrap();
+
+        // Auto job stranded at Submitted: step 2 → Accepted.
+        let stranded_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
+        force_status(&mgr, &stranded_job.id, JobStatus::Submitted).await;
+
+        let stats = mgr.bootstrap_recovery().await.unwrap();
+        assert_eq!(stats.interrupted, 1);
+        assert_eq!(stats.reconciled, 1);
+        assert_eq!(stats.recovery.abandoned, 1);
+        assert_eq!(stats.recovery.left_stuck, 1);
+
+        assert_eq!(
+            mgr.store
+                .get(&abandon_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            JobStatus::Abandoned
+        );
+        assert_eq!(
+            mgr.store
+                .get(&crashed_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            JobStatus::Stuck
+        );
+        assert_eq!(
+            mgr.store
+                .get(&stranded_job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            JobStatus::Accepted
+        );
     }
 
     #[tokio::test]
