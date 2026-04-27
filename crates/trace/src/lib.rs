@@ -21,12 +21,16 @@ pub type Result<T> = std::result::Result<T, TraceError>;
 pub type TraceNodeId = String;
 
 /// The full trace tree for a single session.
+///
+/// In-session branches (used by the rollback path) live in the tree
+/// itself via `parent`/`children` pointers. Cross-session forks (user
+/// "branch this conversation") are now expressed via
+/// `aura_model::Session::parent_link`, not on this struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTrace {
     pub session_id: String,
     pub root: TraceNodeId,
     pub nodes: HashMap<TraceNodeId, TraceNode>,
-    pub forks: Vec<ForkRecord>,
     pub active_leaf: TraceNodeId,
 }
 
@@ -154,16 +158,6 @@ pub enum SpanResult {
     Error {
         error: String,
     },
-}
-
-/// Record of a trace fork (branch) operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForkRecord {
-    pub id: String,
-    pub from_node: TraceNodeId,
-    pub fork_root: TraceNodeId,
-    pub reason: String,
-    pub created_at: DateTime<Utc>,
 }
 
 /// Handle returned by `begin_span` to later complete the span with `end_span`.

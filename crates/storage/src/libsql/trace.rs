@@ -6,8 +6,8 @@ use chrono::Utc;
 use super::LibsqlPool;
 use crate::trace::{Result, TraceStore};
 use aura_trace::{
-    ExecutionProvenance, ForkRecord, SessionTrace, SpanInput, SpanResult, SpanRole, TraceError,
-    TraceFilter, TraceNode, TraceNodeId, TraceSpan,
+    ExecutionProvenance, SessionTrace, SpanInput, SpanResult, SpanRole, TraceError, TraceFilter,
+    TraceNode, TraceNodeId, TraceSpan,
 };
 
 pub struct LibsqlTraceStore {
@@ -118,32 +118,6 @@ impl TraceStore for LibsqlTraceStore {
             .map_err(|e| ie(format!("upsert trace_node {}: {e}", node.id)))?;
         }
 
-        // Soft-delete old forks; current forks are revived below.
-        tx.execute(
-            "UPDATE trace_forks SET deleted_at = ?1 WHERE session_id = ?2 AND deleted_at IS NULL",
-            libsql::params![ts, sid.clone()],
-        )
-        .await
-        .map_err(|e| ie(format!("soft-delete trace_forks: {e}")))?;
-
-        for fork in &trace.forks {
-            tx.execute(
-                "INSERT OR REPLACE INTO trace_forks
-                    (id, session_id, from_node, fork_root, reason, created_at, deleted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-                libsql::params![
-                    fork.id.clone(),
-                    sid.clone(),
-                    fork.from_node.clone(),
-                    fork.fork_root.clone(),
-                    fork.reason.clone(),
-                    fork.created_at.to_rfc3339()
-                ],
-            )
-            .await
-            .map_err(|e| ie(format!("upsert trace_fork {}: {e}", fork.id)))?;
-        }
-
         tx.commit().await.map_err(|e| ie(format!("commit: {e}")))?;
         Ok(())
     }
@@ -170,14 +144,10 @@ impl TraceStore for LibsqlTraceStore {
         // Load all live nodes.
         let nodes = self.load_nodes(conn, session_id).await?;
 
-        // Load forks.
-        let forks = self.load_forks(conn, session_id).await?;
-
         Ok(Some(SessionTrace {
             session_id: session_id.to_string(),
             root,
             nodes,
-            forks,
             active_leaf,
         }))
     }
@@ -212,13 +182,11 @@ impl TraceStore for LibsqlTraceStore {
         let mut traces = Vec::new();
         for (sid, root, leaf) in headers {
             let nodes = self.load_nodes(conn, &sid).await?;
-            let forks = self.load_forks(conn, &sid).await?;
 
             let trace = SessionTrace {
                 session_id: sid,
                 root,
                 nodes,
-                forks,
                 active_leaf: leaf,
             };
 
@@ -334,42 +302,6 @@ impl LibsqlTraceStore {
         }
 
         Ok(nodes)
-    }
-
-    /// Load fork records for a session.
-    async fn load_forks(
-        &self,
-        conn: &libsql::Connection,
-        session_id: &str,
-    ) -> Result<Vec<ForkRecord>> {
-        let mut rows = conn
-            .query(
-                "SELECT id, from_node, fork_root, reason, created_at
-                 FROM trace_forks WHERE session_id = ?1 AND deleted_at IS NULL ORDER BY created_at",
-                libsql::params![session_id.to_string()],
-            )
-            .await
-            .map_err(|e| ie(format!("query trace_forks: {e}")))?;
-
-        let mut forks = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| ie(format!("row: {e}")))? {
-            let id: String = row.get(0).map_err(|e| ie(format!("get: {e}")))?;
-            let from_node: String = row.get(1).map_err(|e| ie(format!("get: {e}")))?;
-            let fork_root: String = row.get(2).map_err(|e| ie(format!("get: {e}")))?;
-            let reason: String = row.get(3).map_err(|e| ie(format!("get: {e}")))?;
-            let created_str: String = row.get(4).map_err(|e| ie(format!("get: {e}")))?;
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            forks.push(ForkRecord {
-                id,
-                from_node,
-                fork_root,
-                reason,
-                created_at,
-            });
-        }
-        Ok(forks)
     }
 
     /// Convert a single database row into a `TraceNode` (with empty children;
@@ -525,7 +457,6 @@ mod tests {
             session_id: session_id.to_string(),
             root: node_id.clone(),
             nodes,
-            forks: vec![],
             active_leaf: node_id,
         }
     }
@@ -590,7 +521,6 @@ mod tests {
             session_id: session_id.to_string(),
             root: root_id,
             nodes,
-            forks: vec![],
             active_leaf: child_id,
         }
     }
@@ -682,27 +612,6 @@ mod tests {
         let results = store.query_traces(filter).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_id, "s1");
-    }
-
-    #[tokio::test]
-    async fn forks_round_trip() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
-
-        let mut trace = make_trace("s1");
-        trace.forks.push(ForkRecord {
-            id: "fork-1".to_string(),
-            from_node: "n1".to_string(),
-            fork_root: "n1-fork".to_string(),
-            reason: "rollback".to_string(),
-            created_at: Utc::now(),
-        });
-        store.save_trace(&trace).await.unwrap();
-
-        let loaded = store.load_trace("s1").await.unwrap().unwrap();
-        assert_eq!(loaded.forks.len(), 1);
-        assert_eq!(loaded.forks[0].id, "fork-1");
-        assert_eq!(loaded.forks[0].reason, "rollback");
     }
 
     #[tokio::test]

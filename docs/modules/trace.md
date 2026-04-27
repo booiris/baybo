@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `trace` crate defines domain types for call-chain tracing (`SessionTrace`, `TraceNode`, `TraceSpan`, `SpanHandle`, `SpanInput`, `SpanResult`, `ExecutionProvenance`, `ForkRecord`, `TraceFilter`) and provides tree, fork, and snapshot utility functions.
+The `trace` crate defines domain types for call-chain tracing (`SessionTrace`, `TraceNode`, `TraceSpan`, `SpanHandle`, `SpanInput`, `SpanResult`, `SpanRole`, `ExecutionProvenance`, `TraceFilter`) and provides tree, fork, and snapshot utility functions. Cross-session forks (user "branch this conversation") are expressed via `aura_model::Session::parent_link`, not as records inside the trace tree; `fork::fork_from` only creates an in-session branch under a chosen ancestor for the rollback path.
 
 Business logic (`TraceCollector` — span lifecycle management and persistence) lives in `agent::trace`. The `TraceStore` trait is defined in `storage::trace`.
 
@@ -47,7 +47,7 @@ Branching creates a new branch below the target node without overwriting the ori
 - `TraceCollector` (in `agent::trace`) should lock only for short critical sections, never across `await`
 - Apply uniform sanitization to `SpanResult::Error` to prevent sensitive data leaking through exception paths
 - `save_trace()` should save the whole tree in one transaction
-- Storage uses columnar schema: `session_traces` (metadata), `trace_nodes` (one row per node with queryable columns), `trace_forks` (fork records). `children` lists are derived from `parent_id` on load.
+- Storage uses columnar schema: `session_traces` (metadata), `trace_nodes` (one row per node with queryable columns including the ReAct-iteration `span_id`/`span_index`/`span_role`). `children` lists are derived from `parent_id` on load. There is no separate forks table — in-session branches are recoverable from `parent`/`children` pointers; cross-session forks live on `Session.parent_link`.
 
 ## Collaboration
 

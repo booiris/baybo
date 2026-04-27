@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use aura_model::{ChannelType, ChatMessage, Session, SessionState, SessionTrigger, User};
+use aura_model::{
+    ChannelType, ChatMessage, ParentLinkKind, Session, SessionParentLink, SessionState,
+    SessionTrigger, User,
+};
 use aura_storage::{SessionStore, StorageError};
 use chrono::{Duration, Utc};
 use tracing::{debug, warn};
@@ -38,8 +41,64 @@ impl SessionManager {
         channel: ChannelType,
         trigger: SessionTrigger,
     ) -> Result<Session> {
-        self.create_session_with_id(uuid::Uuid::new_v4().to_string(), user, channel, trigger)
+        self.create_session_with_id(
+            uuid::Uuid::new_v4().to_string(),
+            user,
+            channel,
+            trigger,
+            None,
+        )
+        .await
+    }
+
+    /// Branch an existing session into a new one. The child carries
+    /// `parent_link.kind = Fork` pointing at `parent_session_id` /
+    /// `at_job_id` and starts with a copy of the parent's `messages`
+    /// so the agent loop on the child sees the conversation history.
+    /// Edits on the child don't mutate the parent's record.
+    ///
+    /// `at_job_id` is stored as an opaque marker for now — message-
+    /// level truncation at that exact cutoff requires job-tagged
+    /// messages, which is a follow-up. `at_job_id` is not validated
+    /// here; the caller (gateway API) is responsible for confirming
+    /// the job exists before invoking `fork_session`.
+    ///
+    /// Errors with `SessionError::NotFound` if the parent doesn't exist.
+    pub async fn fork_session(&self, parent_session_id: &str, at_job_id: &str) -> Result<Session> {
+        let parent = self
+            .store
+            .get(parent_session_id)
             .await
+            .map_err(wrap)?
+            .ok_or_else(|| SessionError::NotFound(format!("parent session {parent_session_id}")))?;
+        let parent_link = SessionParentLink {
+            session_id: parent.id.clone(),
+            kind: ParentLinkKind::Fork,
+            at_job_id: at_job_id.to_owned(),
+            at_span_id: None,
+        };
+        let now = Utc::now();
+        let child = Session {
+            id: uuid::Uuid::new_v4().to_string(),
+            user: parent.user.clone(),
+            channel: parent.channel.clone(),
+            trigger: SessionTrigger::Parent {
+                link_kind: ParentLinkKind::Fork,
+            },
+            parent_link: Some(parent_link),
+            messages: parent.messages.clone(),
+            created_at: now,
+            last_active: now,
+            state: SessionState::default(),
+        };
+        self.store.save(&child).await.map_err(wrap)?;
+        debug!(
+            child_id = %child.id,
+            parent_id = %parent.id,
+            at_job_id,
+            "forked session"
+        );
+        Ok(child)
     }
 
     async fn create_session_with_id(
@@ -48,6 +107,7 @@ impl SessionManager {
         user: User,
         channel: ChannelType,
         trigger: SessionTrigger,
+        parent_link: Option<SessionParentLink>,
     ) -> Result<Session> {
         let now = Utc::now();
         let session = Session {
@@ -55,7 +115,7 @@ impl SessionManager {
             user,
             channel,
             trigger,
-            parent_link: None,
+            parent_link,
             messages: Vec::new(),
             created_at: now,
             last_active: now,
@@ -83,6 +143,7 @@ impl SessionManager {
                         user,
                         channel,
                         SessionTrigger::User,
+                        None,
                     )
                     .await;
             }
@@ -90,8 +151,14 @@ impl SessionManager {
             return Ok(session);
         }
         debug!(session_id, "session not found, creating new session");
-        self.create_session_with_id(session_id.to_string(), user, channel, SessionTrigger::User)
-            .await
+        self.create_session_with_id(
+            session_id.to_string(),
+            user,
+            channel,
+            SessionTrigger::User,
+            None,
+        )
+        .await
     }
 
     pub async fn get(&self, session_id: &str) -> Result<Option<Session>> {
@@ -388,6 +455,79 @@ mod tests {
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
         let err = mgr.delete("nonexistent").await.unwrap_err();
+        assert!(matches!(err, SessionError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn fork_session_creates_child_with_parent_link_and_history() {
+        use aura_model::{ChatMessage, ContentBlock, ParentLinkKind, Role, SessionTrigger};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store.clone(), Duration::minutes(30));
+
+        let mut parent = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+        parent.messages.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("hello".into())],
+        });
+        store.save(&parent).await.unwrap();
+
+        let child = mgr.fork_session(&parent.id, "job-7").await.unwrap();
+        assert_ne!(child.id, parent.id);
+        assert_eq!(child.user.id, parent.user.id);
+        assert_eq!(child.channel, parent.channel);
+        assert_eq!(
+            child.messages.len(),
+            parent.messages.len(),
+            "child copies the parent's history at fork time"
+        );
+        let link = child.parent_link.as_ref().expect("fork sets parent_link");
+        assert_eq!(link.session_id, parent.id);
+        assert_eq!(link.kind, ParentLinkKind::Fork);
+        assert_eq!(link.at_job_id, "job-7");
+        assert!(matches!(
+            child.trigger,
+            SessionTrigger::Parent {
+                link_kind: ParentLinkKind::Fork
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fork_session_child_history_is_independent_of_parent() {
+        use aura_model::{ChatMessage, ContentBlock, Role};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store.clone(), Duration::minutes(30));
+
+        let parent = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+        let mut child = mgr.fork_session(&parent.id, "job-1").await.unwrap();
+
+        // Mutate the child's history; the parent on disk must stay clean.
+        child.messages.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("only-on-child".into())],
+        });
+        store.save(&child).await.unwrap();
+
+        let parent_reloaded = store.get(&parent.id).await.unwrap().unwrap();
+        assert!(
+            parent_reloaded.messages.is_empty(),
+            "parent history must not be mutated by edits on a forked child"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_errors_when_parent_missing() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let err = mgr.fork_session("nonexistent", "job-1").await.unwrap_err();
         assert!(matches!(err, SessionError::NotFound(_)));
     }
 

@@ -149,6 +149,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_link_round_trips_through_libsql() {
+        use aura_model::{ParentLinkKind, SessionParentLink, SessionTrigger};
+
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut session = make_session("forked-child");
+        session.trigger = SessionTrigger::Parent {
+            link_kind: ParentLinkKind::Fork,
+        };
+        session.parent_link = Some(SessionParentLink {
+            session_id: "parent-id".to_string(),
+            kind: ParentLinkKind::Fork,
+            at_job_id: "job-42".to_string(),
+            at_span_id: None,
+        });
+        store.save(&session).await.unwrap();
+
+        let loaded = store.get("forked-child").await.unwrap().unwrap();
+        let link = loaded.parent_link.expect("parent_link survives round-trip");
+        assert_eq!(link.session_id, "parent-id");
+        assert_eq!(link.kind, ParentLinkKind::Fork);
+        assert_eq!(link.at_job_id, "job-42");
+        assert!(matches!(
+            loaded.trigger,
+            SessionTrigger::Parent {
+                link_kind: ParentLinkKind::Fork
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn test_session_crud() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSessionStore::new(pool);

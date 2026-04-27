@@ -1499,7 +1499,6 @@ fn make_trace(session: &str, started_at: DateTime<Utc>) -> SessionTrace {
         session_id: session.into(),
         root: node_id.clone(),
         nodes,
-        forks: vec![],
         active_leaf: node_id,
     }
 }
@@ -1826,7 +1825,6 @@ fn make_trace_with_snapshot(
         session_id: session.into(),
         root: root_id,
         nodes,
-        forks: vec![],
         active_leaf: child_id,
     }
 }

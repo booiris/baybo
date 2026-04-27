@@ -1,47 +1,36 @@
-//! Fork and rollback helper logic.
-
-use chrono::Utc;
-use uuid::Uuid;
+//! In-session branch helpers.
+//!
+//! Used by the rollback path to attach a fresh "fork-root" trace node
+//! under an arbitrary ancestor so subsequent spans land on a new
+//! branch without overwriting the original chain. Cross-session forks
+//! (user "branch this conversation") live on
+//! `aura_model::Session::parent_link` and never touch this module.
 
 use crate::tree::{create_root_node, set_active_leaf};
-use crate::{ForkRecord, SessionTrace, TraceNodeId};
+use crate::{SessionTrace, TraceNodeId};
 
-pub fn fork_from(
-    trace: &mut SessionTrace,
-    from_node: TraceNodeId,
-    reason: &str,
-) -> crate::Result<String> {
-    // Verify the source node exists.
+/// Attach a new branch under `from_node` and move `active_leaf` to it.
+/// Returns the id of the freshly created branch root so callers can
+/// thread it through their own bookkeeping (snapshot lookup, cost
+/// attribution, etc.).
+pub fn fork_from(trace: &mut SessionTrace, from_node: TraceNodeId) -> crate::Result<TraceNodeId> {
     if !trace.nodes.contains_key(&from_node) {
         return Err(crate::TraceError::NotFound(format!(
             "trace node {from_node}"
         )));
     }
 
-    // Create a new node to serve as the fork root.
     let (fork_root_id, mut fork_root_node) = create_root_node(&trace.session_id);
     fork_root_node.parent = Some(from_node.clone());
 
-    // Register the fork root as a child of from_node.
     if let Some(parent) = trace.nodes.get_mut(&from_node) {
         parent.children.push(fork_root_id.clone());
     }
-
     trace.nodes.insert(fork_root_id.clone(), fork_root_node);
 
-    let fork_id = Uuid::new_v4().to_string();
-    let record = ForkRecord {
-        id: fork_id.clone(),
-        from_node,
-        fork_root: fork_root_id.clone(),
-        reason: reason.to_owned(),
-        created_at: Utc::now(),
-    };
-    trace.forks.push(record);
+    set_active_leaf(trace, fork_root_id.clone());
 
-    set_active_leaf(trace, fork_root_id);
-
-    Ok(fork_id)
+    Ok(fork_root_id)
 }
 
 #[cfg(test)]
@@ -58,7 +47,6 @@ mod tests {
             session_id: "test-session".to_owned(),
             root: root_id.clone(),
             nodes,
-            forks: Vec::new(),
             active_leaf: root_id,
         }
     }
@@ -68,20 +56,20 @@ mod tests {
         let mut trace = make_trace();
         let root_id = trace.root.clone();
 
-        let fork_id = fork_from(&mut trace, root_id.clone(), "retry").unwrap();
-        assert!(!fork_id.is_empty());
-        assert_eq!(trace.forks.len(), 1);
-        assert_eq!(trace.forks[0].from_node, root_id);
+        let fork_root = fork_from(&mut trace, root_id.clone()).unwrap();
+        assert!(!fork_root.is_empty());
+        assert_eq!(trace.active_leaf, fork_root);
 
-        // active_leaf should have moved to the fork root
-        assert_ne!(trace.active_leaf, root_id);
-        assert_eq!(trace.active_leaf, trace.forks[0].fork_root);
+        let fork_node = trace.nodes.get(&fork_root).unwrap();
+        assert_eq!(fork_node.parent.as_ref(), Some(&root_id));
+        let parent = trace.nodes.get(&root_id).unwrap();
+        assert!(parent.children.contains(&fork_root));
     }
 
     #[test]
     fn fork_from_missing_node_fails() {
         let mut trace = make_trace();
-        let result = fork_from(&mut trace, "nonexistent".to_owned(), "oops");
+        let result = fork_from(&mut trace, "nonexistent".to_owned());
         assert!(result.is_err());
     }
 }

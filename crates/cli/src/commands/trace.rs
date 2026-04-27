@@ -36,7 +36,6 @@ fn trace_summary(trace: &SessionTrace) -> Value {
     json!({
         "session": trace.session_id,
         "nodes": trace.nodes.len(),
-        "forks": trace.forks.len(),
         "active_leaf": trace.active_leaf,
         "latest_started_at": latest_started_at(trace).map(|t| t.to_rfc3339()),
     })
@@ -68,13 +67,12 @@ async fn list(ctx: &CommandContext, session: Option<&str>, limit: usize) -> Resu
 
     let rows: Vec<Value> = traces.iter().map(trace_summary).collect();
     let mut human =
-        String::from("session                               nodes  forks  latest_started_at\n");
+        String::from("session                               nodes  latest_started_at\n");
     for t in &traces {
         human.push_str(&format!(
-            "{:<37}  {:<5}  {:<5}  {}\n",
+            "{:<37}  {:<5}  {}\n",
             t.session_id,
             t.nodes.len(),
-            t.forks.len(),
             latest_started_at(t)
                 .map(|d| d.to_rfc3339())
                 .unwrap_or_else(|| "(empty)".into()),
@@ -117,18 +115,16 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "root": trace.root,
         "active_leaf": trace.active_leaf,
         "nodes": trace.nodes.len(),
-        "forks": trace.forks.len(),
         "latest_started_at": latest_started_at(&trace).map(|t| t.to_rfc3339()),
         "span_kinds": kinds_json,
     });
 
     let mut human = format!(
-        "session:      {}\nroot:         {}\nactive_leaf:  {}\nnodes:        {}\nforks:        {}\nlatest:       {}",
+        "session:      {}\nroot:         {}\nactive_leaf:  {}\nnodes:        {}\nlatest:       {}",
         trace.session_id,
         trace.root,
         trace.active_leaf,
         trace.nodes.len(),
-        trace.forks.len(),
         latest_started_at(&trace)
             .map(|t| t.to_rfc3339())
             .unwrap_or_else(|| "(empty)".into()),

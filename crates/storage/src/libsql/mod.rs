@@ -149,18 +149,6 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_trace_nodes_span
                     ON trace_nodes(session_id, job_id, span_id, span_index);
 
-                CREATE TABLE IF NOT EXISTS trace_forks (
-                    id         TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    from_node  TEXT NOT NULL,
-                    fork_root  TEXT NOT NULL,
-                    reason     TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    deleted_at INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS idx_trace_forks_session
-                    ON trace_forks(session_id);
-
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,
                     encrypted_value BLOB NOT NULL,
@@ -297,7 +285,20 @@ impl LibsqlPool {
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
 
         self.migrate_trace_nodes_span_columns().await?;
+        self.migrate_drop_trace_forks().await?;
 
+        Ok(())
+    }
+
+    /// Drop the legacy `trace_forks` table on databases that still
+    /// have it. Cross-session forks live on `Session.parent_link`
+    /// now; in-session branches are recoverable from `trace_nodes`'
+    /// parent/child pointers alone, so the side table is redundant.
+    async fn migrate_drop_trace_forks(&self) -> anyhow::Result<()> {
+        self.conn
+            .execute("DROP TABLE IF EXISTS trace_forks", ())
+            .await
+            .map_err(|e| anyhow::anyhow!("drop trace_forks: {e}"))?;
         Ok(())
     }
 

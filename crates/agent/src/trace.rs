@@ -49,7 +49,6 @@ impl TraceCollector {
             session_id: session_id.to_owned(),
             root: root_id.clone(),
             nodes,
-            forks: Vec::new(),
             active_leaf: root_id,
         };
 
@@ -180,14 +179,11 @@ impl TraceCollector {
         &self.session_trace.active_leaf
     }
 
-    /// Fork the trace tree from the specified node, creating a new branch.
-    ///
-    /// Used by the rollback mechanism: `AgentActor` reads the snapshot
-    /// attached to (or nearest to) `from_node`, then forks the trace so
-    /// subsequent spans are recorded on the new branch.
-    pub fn fork_from(&mut self, from_node: TraceNodeId) -> Result<String> {
-        let fork_id = aura_trace::fork::fork_from(&mut self.session_trace, from_node, "")?;
-        Ok(fork_id)
+    /// Branch the trace tree at `from_node` so subsequent spans land on
+    /// a new chain. Used by the rollback path after the caller has
+    /// pulled the snapshot via `find_snapshot_at`.
+    pub fn fork_from(&mut self, from_node: TraceNodeId) -> Result<TraceNodeId> {
+        aura_trace::fork::fork_from(&mut self.session_trace, from_node)
     }
 
     /// Find the nearest context snapshot at or above the given node.
