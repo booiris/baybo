@@ -17,6 +17,7 @@ const QR_LONG_POLL_TIMEOUT_MS = 35_000;
 
 export const DEFAULT_ILINK_BOT_TYPE = "3";
 export const FIXED_BASE_URL = "https://ilinkai.weixin.qq.com";
+export const DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 
 const activeLogins = new Map<string, ActiveLogin>();
 
