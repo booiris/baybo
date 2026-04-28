@@ -122,6 +122,8 @@ impl WsTransport {
             // arrive via the agent and are rendered by the chat view's
             // own placeholder logic.
             attachments: Vec::new(),
+            // TUI is session-scoped — dedup is not relevant.
+            platform_msg_id: String::new(),
         };
 
         self.client

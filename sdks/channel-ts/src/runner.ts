@@ -454,6 +454,9 @@ async function pumpOutbound(
           user_id: msg.userId,
           channel_type: channel.channelType,
           ...(msg.botId ? { bot_id: msg.botId } : {}),
+          ...(msg.platformMsgId
+            ? { platform_msg_id: msg.platformMsgId }
+            : {}),
           ...(msg.attachments && msg.attachments.length > 0
             ? { attachments: msg.attachments }
             : {}),

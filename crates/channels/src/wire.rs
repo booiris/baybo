@@ -109,6 +109,15 @@ pub struct Message {
     pub bot_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<WireAttachment>,
+    /// Platform-native message id (Telegram `update_id`, Weixin
+    /// `msg_id`, …). When non-empty the gateway dedups inbound traffic
+    /// per `(channel_type, bot_id, platform_msg_id)` so a sidecar that
+    /// replays its long-poll buffer after a restart doesn't double-fire
+    /// the agent. Sidecars without a stable platform id (or that don't
+    /// care to dedup) leave it empty. Additive; default empty keeps old
+    /// sidecars wire-compatible.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform_msg_id: String,
 }
 
 /// One slash command published to a sidecar's native command surface
@@ -406,6 +415,7 @@ mod tests {
             channel_type: ChannelType::from("slack"),
             bot_id: "prod-bot".into(),
             attachments: Vec::new(),
+            platform_msg_id: String::new(),
         });
         let bytes = encode(&frame).unwrap();
         assert_eq!(frame, decode(&bytes).unwrap());
@@ -423,6 +433,7 @@ mod tests {
             channel_type: ChannelType::from("slack"),
             bot_id: String::new(),
             attachments: Vec::new(),
+            platform_msg_id: String::new(),
         });
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
@@ -451,6 +462,7 @@ mod tests {
                     filename: Some("report.pdf".into()),
                 },
             ],
+            platform_msg_id: String::new(),
         });
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
@@ -468,6 +480,7 @@ mod tests {
             channel_type: ChannelType::from("slack"),
             bot_id: String::new(),
             attachments: Vec::new(),
+            platform_msg_id: String::new(),
         });
         let encoded = encode(&frame).unwrap();
         // MessagePack with `to_vec_named` writes field names as bare
