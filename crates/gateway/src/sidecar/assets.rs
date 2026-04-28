@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use aura_workspace::paths::{CACHE_RUNTIME_SUBDIR, aura_cache_root};
 use thiserror::Error;
@@ -24,7 +24,7 @@ mod generated {
 }
 
 pub(crate) use generated::BUN_VERSION;
-use generated::{BUN_RUNTIME_ZST, BUN_TARGET, SIDECARS, SidecarAsset};
+use generated::{BUN_RUNTIME_ZST, BUN_TARGET, SIDECARS, SidecarAsset, SidecarAuxAsset};
 
 #[derive(Debug, Error)]
 pub enum SidecarError {
@@ -121,17 +121,56 @@ fn install_bun(cache_root: &Path) -> Result<PathBuf, SidecarError> {
 }
 
 fn install_sidecar(cache_root: &Path, asset: &SidecarAsset) -> Result<PathBuf, SidecarError> {
-    let dir = cache_root.join("sidecars");
+    let dir = cache_root
+        .join("sidecars")
+        .join(format!("{}-{}", asset.channel_type, asset.content_hash));
     mkdir_all(&dir)?;
     // Hash-keyed: a bundle content change lands at a fresh filename
-    // without ever rewriting a live one. Old hashes linger on disk by
-    // design (see the module comment's "don't delete old" note).
-    let dest = dir.join(format!("{}-{}.js", asset.channel_type, asset.content_hash));
-    if dest.exists() {
-        return Ok(dest);
+    // without ever rewriting a live one. Auxiliary files live next to
+    // index.js so packages that resolve assets from import.meta.url
+    // can find them.
+    let dest = dir.join("index.js");
+    if !dest.exists() {
+        decompress_to(asset.bundle_zst, &dest, "sidecar bundle", None)?;
     }
-    decompress_to(asset.bundle_zst, &dest, "sidecar bundle", None)?;
+    for aux in asset.aux_assets {
+        install_aux_asset(&dir, aux)?;
+    }
     Ok(dest)
+}
+
+fn install_aux_asset(dir: &Path, asset: &SidecarAuxAsset) -> Result<(), SidecarError> {
+    let rel = safe_relative_path(asset.name)?;
+    let dest = dir.join(rel);
+    if let Some(parent) = dest.parent() {
+        mkdir_all(parent)?;
+    }
+    if dest.exists() {
+        return Ok(());
+    }
+    decompress_to(asset.content_zst, &dest, "sidecar aux asset", None)
+}
+
+fn safe_relative_path(raw: &str) -> Result<&Path, SidecarError> {
+    let path = Path::new(raw);
+    if raw.is_empty() || path.is_absolute() {
+        return Err(SidecarError::Io {
+            path: PathBuf::from(raw),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "unsafe aux asset path"),
+        });
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => {
+                return Err(SidecarError::Io {
+                    path: PathBuf::from(raw),
+                    source: io::Error::new(io::ErrorKind::InvalidInput, "unsafe aux asset path"),
+                });
+            }
+        }
+    }
+    Ok(path)
 }
 
 fn decompress_to(
@@ -227,6 +266,48 @@ fn ensure_mode(path: &Path, mode: u32) -> Result<(), SidecarError> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn zst(bytes: &[u8]) -> &'static [u8] {
+        Box::leak(zstd::bulk::compress(bytes, 1).unwrap().into_boxed_slice())
+    }
+
+    #[test]
+    fn install_sidecar_places_aux_assets_next_to_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_assets: &'static [SidecarAuxAsset] = Box::leak(
+            vec![SidecarAuxAsset {
+                name: "silk.wasm",
+                content_zst: zst(b"wasm bytes"),
+            }]
+            .into_boxed_slice(),
+        );
+        let asset = SidecarAsset {
+            channel_type: "weixin",
+            bundle_zst: zst(b"console.log('weixin');"),
+            content_hash: "fixture",
+            aux_assets,
+        };
+
+        let bundle = install_sidecar(dir.path(), &asset).unwrap();
+
+        assert_eq!(
+            bundle.file_name().and_then(|s| s.to_str()),
+            Some("index.js")
+        );
+        assert_eq!(fs::read(&bundle).unwrap(), b"console.log('weixin');");
+        assert_eq!(
+            fs::read(bundle.parent().unwrap().join("silk.wasm")).unwrap(),
+            b"wasm bytes"
+        );
+    }
+
+    #[test]
+    fn safe_relative_path_rejects_escape_paths() {
+        assert!(safe_relative_path("").is_err());
+        assert!(safe_relative_path("../silk.wasm").is_err());
+        assert!(safe_relative_path("/tmp/silk.wasm").is_err());
+        assert!(safe_relative_path("silk.wasm").is_ok());
+    }
 
     #[test]
     fn ensure_mode_repairs_non_executable_cached_bun() {

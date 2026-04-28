@@ -23,9 +23,10 @@
 //! one-liner — `cargo build` itself never fails because of sidecar
 //! packaging trouble.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use sha2::Digest;
@@ -336,6 +337,31 @@ fn list_dir_entries(dir: &Path) -> Vec<PathBuf> {
 /// output is cached for unchanged sidecar inputs and the binary ships
 /// to every user, paying the build-time cost is the right tradeoff.
 const ZSTD_LEVEL: i32 = 19;
+const SIDECAR_CACHE_SCHEMA_VERSION: &str = "2";
+
+struct AuxAsset {
+    name: String,
+    src: PathBuf,
+}
+
+struct BuiltSidecar {
+    name: String,
+    bundle_path: PathBuf,
+    content_hash: String,
+    aux_assets: Vec<AuxAsset>,
+}
+
+struct EmittedAuxAsset {
+    name: String,
+    zst_path: PathBuf,
+}
+
+struct EmittedSidecar {
+    name: String,
+    bundle_zst: PathBuf,
+    content_hash: String,
+    aux_assets: Vec<EmittedAuxAsset>,
+}
 
 fn embed_sidecars(ws_root: &Path) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
@@ -457,7 +483,7 @@ fn embed_sidecars(ws_root: &Path) {
         return;
     }
 
-    let mut entries: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut entries: Vec<BuiltSidecar> = Vec::new();
     let mut bundling_failures = 0usize;
     for dir in &sidecar_dirs {
         let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("?");
@@ -466,11 +492,33 @@ fn embed_sidecars(ws_root: &Path) {
             println!("cargo:warning=sidecar '{name}' has no src/index.ts; skipping",);
             continue;
         }
+        let aux_assets = match sidecar_aux_assets(dir) {
+            Ok(assets) => assets,
+            Err(e) => {
+                bundling_failures += 1;
+                let msg = format!("collect aux assets for sidecar '{name}' failed: {e}");
+                sidecar_failure(strict, &msg);
+                continue;
+            }
+        };
         let bundle_path = cache_dir.join(format!("{name}.js"));
         match bundle_with_bun(&host_bun, &entry_ts, &bundle_path) {
             Ok(()) => {
-                let hash = sha256_hex(&bundle_path);
-                entries.push((name.to_string(), bundle_path, hash));
+                let hash = match sidecar_content_hash(&bundle_path, &aux_assets) {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        bundling_failures += 1;
+                        let msg = format!("hash sidecar '{name}' failed: {e}");
+                        sidecar_failure(strict, &msg);
+                        continue;
+                    }
+                };
+                entries.push(BuiltSidecar {
+                    name: name.to_string(),
+                    bundle_path,
+                    content_hash: hash,
+                    aux_assets,
+                });
             }
             Err(e) => {
                 bundling_failures += 1;
@@ -496,15 +544,47 @@ fn embed_sidecars(ws_root: &Path) {
         return;
     }
 
-    let mut emitted: Vec<(String, PathBuf, String)> = Vec::new(); // (name, zst_path, hash)
-    for (name, bundle, hash) in &entries {
-        let zst_path = cache_dir.join(format!("{name}.js.zst"));
-        if let Err(e) = compress_file(bundle, &zst_path) {
+    let mut emitted: Vec<EmittedSidecar> = Vec::new();
+    for entry in &entries {
+        let zst_path = cache_dir.join(format!("{}.js.zst", entry.name));
+        if let Err(e) = compress_file(&entry.bundle_path, &zst_path) {
+            let name = entry.name.as_str();
             let msg = format!("compress sidecar '{name}' failed: {e}");
             sidecar_failure(strict, &msg);
             continue;
         }
-        emitted.push((name.clone(), zst_path, hash.clone()));
+        let mut aux_assets = Vec::new();
+        let mut aux_failed = false;
+        for (idx, aux) in entry.aux_assets.iter().enumerate() {
+            let aux_zst = cache_dir.join(format!(
+                "{}.aux.{}.{}.zst",
+                entry.name,
+                idx,
+                sanitized_filename(&aux.name)
+            ));
+            if let Err(e) = compress_file(&aux.src, &aux_zst) {
+                let msg = format!(
+                    "compress aux asset '{}' for sidecar '{}' failed: {e}",
+                    aux.name, entry.name
+                );
+                sidecar_failure(strict, &msg);
+                aux_failed = true;
+                break;
+            }
+            aux_assets.push(EmittedAuxAsset {
+                name: aux.name.clone(),
+                zst_path: aux_zst,
+            });
+        }
+        if aux_failed {
+            continue;
+        }
+        emitted.push(EmittedSidecar {
+            name: entry.name.clone(),
+            bundle_zst: zst_path,
+            content_hash: entry.content_hash.clone(),
+            aux_assets,
+        });
     }
 
     if emitted.len() == entries.len()
@@ -749,6 +829,8 @@ fn sidecar_input_fingerprint(
 
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    hasher.update(SIDECAR_CACHE_SCHEMA_VERSION.as_bytes());
+    hasher.update([0]);
     hasher.update(bun_version.as_bytes());
     hasher.update([0]);
     hasher.update(host_target.as_bytes());
@@ -774,6 +856,11 @@ fn sidecar_input_roots(ws_root: &Path, sidecar_dirs: &[PathBuf]) -> Vec<PathBuf>
         paths.push(dir.join("package.json"));
         paths.push(dir.join("tsconfig.json"));
         paths.push(dir.join("bunfig.toml"));
+        if let Ok(aux_assets) = sidecar_aux_assets(dir) {
+            for aux in aux_assets {
+                paths.push(aux.src);
+            }
+        }
     }
     paths.sort();
     paths.dedup();
@@ -879,13 +966,104 @@ fn compress_file(src: &Path, dst: &Path) -> Result<(), String> {
     fs::write(dst, &compressed).map_err(|e| format!("write {}: {e}", dst.display()))
 }
 
-fn sha256_hex(path: &Path) -> String {
+fn sidecar_content_hash(bundle: &Path, aux_assets: &[AuxAsset]) -> Result<String, String> {
     use sha2::{Digest, Sha256};
-    let bytes = fs::read(path).unwrap_or_default();
-    let digest = Sha256::digest(&bytes);
-    // 16 hex chars (8 bytes) — enough to key a cache directory without
-    // bloating the filename.
-    hex_short(&digest, 16)
+    let mut hasher = Sha256::new();
+    hasher.update(b"bundle");
+    hasher.update([0]);
+    let bundle_bytes = fs::read(bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
+    hasher.update(&bundle_bytes);
+    hasher.update([0]);
+    for aux in aux_assets {
+        hasher.update(b"aux");
+        hasher.update([0]);
+        hasher.update(aux.name.as_bytes());
+        hasher.update([0]);
+        let bytes = fs::read(&aux.src).map_err(|e| format!("read {}: {e}", aux.src.display()))?;
+        hasher.update(&bytes);
+        hasher.update([0]);
+    }
+    Ok(hex_short(&hasher.finalize(), 16))
+}
+
+fn sidecar_aux_assets(dir: &Path) -> Result<Vec<AuxAsset>, String> {
+    let package_json = dir.join("package.json");
+    if !package_json.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&package_json)
+        .map_err(|e| format!("read {}: {e}", package_json.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", package_json.display()))?;
+    let Some(assets) = value
+        .get("aura")
+        .and_then(|v| v.get("auxAssets"))
+        .and_then(|v| v.as_array())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for asset in assets {
+        let src = asset
+            .get("src")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "aura.auxAssets entries require string `src`".to_string())?;
+        let name = asset
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "aura.auxAssets entries require string `name`".to_string())?;
+        validate_aux_name(name)?;
+        let src_path = dir.join(src);
+        if !src_path.exists() {
+            return Err(format!(
+                "aux asset source '{}' does not exist",
+                src_path.display()
+            ));
+        }
+        out.push(AuxAsset {
+            name: name.to_string(),
+            src: src_path,
+        });
+    }
+    Ok(out)
+}
+
+fn validate_aux_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("aux asset name must not be empty".to_string());
+    }
+    if name.contains(['\t', '\n', '\r']) {
+        return Err(format!(
+            "aux asset name '{name}' contains a control character"
+        ));
+    }
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Err(format!("aux asset name '{name}' must be relative"));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => {
+                return Err(format!(
+                    "aux asset name '{name}' contains an unsafe component"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sanitized_filename(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    sanitized
 }
 
 fn hex_short(bytes: &[u8], len: usize) -> String {
@@ -909,7 +1087,7 @@ fn emit_sidecar_assets(
     bun_version: &str,
     bun_target: &str,
     bun_zst_path: Option<&Path>,
-    sidecars: &[(String, PathBuf, String)],
+    sidecars: &[EmittedSidecar],
 ) {
     let mut out = fs::File::create(generated).expect("create sidecar_assets.rs");
     writeln!(out, "// @generated by build.rs — do not edit.").unwrap();
@@ -928,20 +1106,39 @@ fn emit_sidecar_assets(
     }
     writeln!(
         out,
+        "pub(crate) struct SidecarAuxAsset {{ \
+         pub name: &'static str, \
+         pub content_zst: &'static [u8] \
+         }}",
+    )
+    .unwrap();
+    writeln!(
+        out,
         "pub(crate) struct SidecarAsset {{ \
          pub channel_type: &'static str, \
          pub bundle_zst: &'static [u8], \
-         pub content_hash: &'static str \
+         pub content_hash: &'static str, \
+         pub aux_assets: &'static [SidecarAuxAsset] \
          }}",
     )
     .unwrap();
     writeln!(out, "pub(crate) const SIDECARS: &[SidecarAsset] = &[").unwrap();
-    for (name, zst_path, hash) in sidecars {
+    for sidecar in sidecars {
         writeln!(
             out,
-            "    SidecarAsset {{ channel_type: {name:?}, bundle_zst: include_bytes!({zst_path:?}), content_hash: {hash:?} }},",
+            "    SidecarAsset {{ channel_type: {:?}, bundle_zst: include_bytes!({:?}), content_hash: {:?}, aux_assets: &[",
+            sidecar.name, sidecar.bundle_zst, sidecar.content_hash,
         )
         .unwrap();
+        for aux in &sidecar.aux_assets {
+            writeln!(
+                out,
+                "        SidecarAuxAsset {{ name: {:?}, content_zst: include_bytes!({:?}) }},",
+                aux.name, aux.zst_path,
+            )
+            .unwrap();
+        }
+        writeln!(out, "    ] }},").unwrap();
     }
     writeln!(out, "];").unwrap();
 }
@@ -952,7 +1149,7 @@ fn write_empty_sidecar_assets(generated: &Path, bun_version: &str, bun_target: &
 
 struct SidecarCache {
     bun_zst: PathBuf,
-    sidecars: Vec<(String, PathBuf, String)>,
+    sidecars: Vec<EmittedSidecar>,
 }
 
 fn load_sidecar_cache(cache_dir: &Path) -> Result<Option<SidecarCache>, String> {
@@ -967,40 +1164,92 @@ fn load_sidecar_cache(cache_dir: &Path) -> Result<Option<SidecarCache>, String> 
         return Ok(None);
     }
 
-    let mut sidecars = Vec::new();
+    let mut sidecars: BTreeMap<String, EmittedSidecar> = BTreeMap::new();
     for line in raw.lines() {
         let mut parts = line.split('\t');
         let kind = parts.next().unwrap_or_default();
-        if kind != "sidecar" {
-            continue;
+        match kind {
+            "sidecar" => {
+                let name = parts.next().unwrap_or_default();
+                let hash = parts.next().unwrap_or_default();
+                if name.is_empty() || hash.is_empty() {
+                    return Err(format!(
+                        "invalid sidecar cache manifest entry in {}",
+                        manifest.display()
+                    ));
+                }
+                let zst_path = cache_dir.join(format!("{name}.js.zst"));
+                if !zst_path.exists() {
+                    return Ok(None);
+                }
+                sidecars.insert(
+                    name.to_string(),
+                    EmittedSidecar {
+                        name: name.to_string(),
+                        bundle_zst: zst_path,
+                        content_hash: hash.to_string(),
+                        aux_assets: Vec::new(),
+                    },
+                );
+            }
+            "aux" => {
+                let sidecar_name = parts.next().unwrap_or_default();
+                let asset_name = parts.next().unwrap_or_default();
+                let zst_name = parts.next().unwrap_or_default();
+                if sidecar_name.is_empty() || asset_name.is_empty() || zst_name.is_empty() {
+                    return Err(format!(
+                        "invalid aux cache manifest entry in {}",
+                        manifest.display()
+                    ));
+                }
+                let zst_path = cache_dir.join(zst_name);
+                if !zst_path.exists() {
+                    return Ok(None);
+                }
+                let Some(sidecar) = sidecars.get_mut(sidecar_name) else {
+                    return Err(format!(
+                        "aux cache manifest entry before sidecar in {}",
+                        manifest.display()
+                    ));
+                };
+                sidecar.aux_assets.push(EmittedAuxAsset {
+                    name: asset_name.to_string(),
+                    zst_path,
+                });
+            }
+            _ => {}
         }
-        let name = parts.next().unwrap_or_default();
-        let hash = parts.next().unwrap_or_default();
-        if name.is_empty() || hash.is_empty() {
-            return Err(format!(
-                "invalid sidecar cache manifest entry in {}",
-                manifest.display()
-            ));
-        }
-        let zst_path = cache_dir.join(format!("{name}.js.zst"));
-        if !zst_path.exists() {
-            return Ok(None);
-        }
-        sidecars.push((name.to_string(), zst_path, hash.to_string()));
     }
 
-    Ok(Some(SidecarCache { bun_zst, sidecars }))
+    Ok(Some(SidecarCache {
+        bun_zst,
+        sidecars: sidecars.into_values().collect(),
+    }))
 }
 
 fn write_sidecar_cache_manifest(
     cache_dir: &Path,
-    sidecars: &[(String, PathBuf, String)],
+    sidecars: &[EmittedSidecar],
 ) -> Result<(), String> {
     fs::create_dir_all(cache_dir).map_err(|e| format!("mkdir {}: {e}", cache_dir.display()))?;
     let manifest = cache_dir.join("manifest.tsv");
     let mut out = String::new();
-    for (name, _path, hash) in sidecars {
-        out.push_str(&format!("sidecar\t{name}\t{hash}\n"));
+    for sidecar in sidecars {
+        out.push_str(&format!(
+            "sidecar\t{}\t{}\n",
+            sidecar.name, sidecar.content_hash
+        ));
+        for aux in &sidecar.aux_assets {
+            let zst_name = aux
+                .zst_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| format!("invalid aux zst path {}", aux.zst_path.display()))?;
+            out.push_str(&format!(
+                "aux\t{}\t{}\t{}\n",
+                sidecar.name, aux.name, zst_name
+            ));
+        }
     }
     fs::write(&manifest, out).map_err(|e| format!("write {}: {e}", manifest.display()))
 }
