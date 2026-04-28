@@ -104,6 +104,33 @@ impl ApprovalHandle {
         }
     }
 
+    /// Forward a request to the gate WITHOUT consulting the session
+    /// approval cache. Use when an access is meaningfully different
+    /// from a previously-cached one (e.g. an *unsandboxed* re-run of a
+    /// command whose sandboxed run was already approved): the cache
+    /// entry covers the original privilege but not the elevated one,
+    /// so we must always re-prompt. Never persists the decision —
+    /// follow-up calls always re-prompt too.
+    pub async fn request_uncached(
+        &self,
+        tool: &str,
+        session_id: &str,
+        user: &User,
+        accesses: Vec<ResourceAccess>,
+        params_preview: String,
+    ) -> ApprovalDecision {
+        let req = ApprovalRequest {
+            call_id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            user_id: user.id.clone(),
+            tool: tool.to_string(),
+            accesses,
+            params_preview,
+            description: None,
+        };
+        self.gate.request(req).await
+    }
+
     /// Forward a request to the gate, filtered by the session approval
     /// cache. Returns `Approve` without prompting when every access is
     /// already covered. On `ApproveAlways`, persists the (uncovered)

@@ -30,6 +30,7 @@ tracing = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
 glob = { workspace = true }
+shell-words = { workspace = true }
 walkdir = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
