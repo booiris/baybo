@@ -439,6 +439,145 @@ async fn pairing_gate_rejects_unpaired_then_admits_after_approve() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 }
 
+/// `/new` end-to-end for a sidecar channel: the gateway intercepts
+/// the slash command, repoints the `(channel_type, user_id) →
+/// session_id` mapping to a fresh aura session, and replies on the
+/// same WS with a confirmation Frame::Message. The next ordinary
+/// inbound from the same user must resolve to a *different* session
+/// than the pre-/new mapping. This exercises the route.rs
+/// `try_handle` integration that the unit tests in
+/// `channel::slash::tests` cannot reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slash_new_resets_session_for_sidecar() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+
+    let mut tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let channel_tokens = tg.channel_tokens.clone();
+    let pairing_store = tg.deps.stores.channel_pairing.clone();
+    let shutdown = tg.shutdown.clone();
+
+    let server = ChannelServer::bind(&tg.deps, port_file.clone(), channel_tokens.clone())
+        .expect("bind ChannelServer");
+    let port = server.port();
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    let weixin = ChannelType::weixin();
+
+    let handle = channel_tokens.mint(ClientIdentity {
+        pid: std::process::id(),
+        label: "weixin".into(),
+        bound_channel_type: Some(ChannelType::WEIXIN.into()),
+    });
+    let token = handle.token().to_string();
+
+    // Pre-approve the (weixin, prod-bot, user-1) triple so the
+    // pairing gate doesn't intercept us.
+    let now = chrono::Utc::now().timestamp();
+    let row = pairing_store
+        .upsert_pending(&weixin, "prod-bot", "user-1", "TESTCD", now, now + 600)
+        .await
+        .expect("seed pending pairing");
+    pairing_store
+        .approve_by_code(&row.code, now)
+        .await
+        .expect("approve pairing");
+
+    let mut client = connect_register(port, &token, weixin.clone())
+        .await
+        .expect("sidecar handshake");
+
+    // 1. Establish an initial session by sending a normal inbound.
+    let initial = WireMessage {
+        content: "hi".into(),
+        session_id: String::new(),
+        user_id: "user-1".into(),
+        channel_type: weixin.clone(),
+        bot_id: "prod-bot".into(),
+        attachments: Vec::new(),
+    };
+    send_frame(&mut client, &Frame::Message(initial.clone()))
+        .await
+        .expect("send initial");
+    let first = tokio::time::timeout(Duration::from_secs(2), tg.incoming_rx.recv())
+        .await
+        .expect("intake timeout")
+        .expect("intake closed");
+    let first_session = first.message.session_id.clone();
+    assert!(!first_session.is_empty(), "first session id missing");
+
+    // 2. Sidecar forwards `/new` from the user. The gateway must NOT
+    //    deliver this to the router intake; it must echo a Message
+    //    confirmation back on the same WS instead.
+    let slash = WireMessage {
+        content: "/new".into(),
+        session_id: String::new(),
+        user_id: "user-1".into(),
+        channel_type: weixin.clone(),
+        bot_id: "prod-bot".into(),
+        attachments: Vec::new(),
+    };
+    send_frame(&mut client, &Frame::Message(slash))
+        .await
+        .expect("send /new");
+
+    let reply = tokio::time::timeout(Duration::from_secs(2), recv_message(&mut client))
+        .await
+        .expect("slash reply timeout")
+        .expect("slash reply recv");
+    assert_eq!(reply.user_id, "user-1");
+    assert_eq!(reply.channel_type, weixin);
+    assert!(
+        reply.content.contains("fresh session"),
+        "unexpected reply content: {}",
+        reply.content,
+    );
+    assert_ne!(reply.session_id, "");
+    assert_ne!(
+        reply.session_id, first_session,
+        "/new must mint a new aura session, not return the old one",
+    );
+
+    // Router intake must NOT have received the `/new` itself.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), tg.incoming_rx.recv())
+            .await
+            .is_err(),
+        "/new leaked past the slash dispatcher into the router intake",
+    );
+
+    // 3. The next ordinary inbound from the same user must resolve to
+    //    the *new* session id, proving the channel mapping was
+    //    repointed (not just that the slash reply alone happened).
+    let after = WireMessage {
+        content: "hi again".into(),
+        session_id: String::new(),
+        user_id: "user-1".into(),
+        channel_type: weixin.clone(),
+        bot_id: "prod-bot".into(),
+        attachments: Vec::new(),
+    };
+    send_frame(&mut client, &Frame::Message(after))
+        .await
+        .expect("send post-/new inbound");
+    let second = tokio::time::timeout(Duration::from_secs(2), tg.incoming_rx.recv())
+        .await
+        .expect("post-/new intake timeout")
+        .expect("intake closed");
+    assert_ne!(
+        second.message.session_id, first_session,
+        "post-/new inbound still resolved to the old session",
+    );
+    assert_eq!(second.message.session_id, reply.session_id);
+
+    shutdown.trigger();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+}
+
 async fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
     let start = tokio::time::Instant::now();
     while tokio::time::Instant::now().duration_since(start) < deadline {

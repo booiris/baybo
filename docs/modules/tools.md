@@ -24,15 +24,17 @@ permission rules.
 | `Bash`                                                                                                                                                                                                                                                                | implemented | `sh -c`; no env/cwd persistence across calls                                                                |
 | `Glob`, `Grep`                                                                                                                                                                                                                                                        | implemented | basic walkdir + regex; will be upgraded if throughput becomes an issue                                      |
 | `WebFetch`                                                                                                                                                                                                                                                            | implemented | returns raw body; no side-channel LLM extraction yet                                                        |
+| `SendFile`                                                                                                                                                                                                                                                            | implemented | streams a local file into `BlobStore` and returns a channel attachment                                      |
 | `Echo`                                                                                                                                                                                                                                                                | debug-only  | returns params verbatim; registered only under `debug_assertions` for round-trip smoke-testing              |
 | `CronCreate`, `CronDelete`, `CronList`                                                                                                                                                                                                                                | implemented | exported from `aura_cron::agent_tools` (not `aura-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `src/runtime.rs` after the scheduler is constructed |
 | `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `Skill`, `Task*`/`TodoWrite`, `ToolSearch`, `WebSearch`, `Team*`                                                          | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed |
 
-`ToolRegistry::with_defaults()` registers the implemented set with
+`ToolRegistry::with_defaults(blob_store)` registers the implemented set with
 `TrustLevel::Trusted` manifests declaring their capabilities
-(`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). Stubs exist so downstream
-can register them once their backing subsystem is ready without having to
-invent the tool name/schema at that point.
+(`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). `SendFile` is part of this
+default set and uses the supplied `BlobStore` to stage channel attachments.
+Stubs exist so downstream can register them once their backing subsystem is
+ready without having to invent the tool name/schema at that point.
 
 ## Design Decisions
 

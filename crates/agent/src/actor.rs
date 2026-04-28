@@ -185,10 +185,14 @@ impl AgentActor {
 
         match tool_result {
             Ok(output) => {
-                let text = match &output {
-                    ToolOutput::Text(t) => t.clone(),
-                    ToolOutput::Json(v) => {
-                        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+                let (text, attachments) = match &output {
+                    ToolOutput::Text(t) => (t.clone(), Vec::new()),
+                    ToolOutput::Json(v) => (
+                        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
+                        Vec::new(),
+                    ),
+                    ToolOutput::WithAttachments { text, attachments } => {
+                        (text.clone(), attachments.clone())
                     }
                     ToolOutput::Error(e) => {
                         // Tool returned an error output — fall back to LLM
@@ -200,11 +204,16 @@ impl AgentActor {
                     }
                 };
 
+                // Carry attachments through so a cron-scheduled SendFile actually
+                // delivers the file — without this, the user would see the textual
+                // confirmation but never receive the attachment.
+                let mut content = vec![ContentBlock::Text(format!("[cron:{job_id}] {text}"))];
+                content.extend(attachments);
                 let response = OutgoingMessage {
                     session_id: self.session.id.clone(),
                     user_id: self.session.user.id.clone(),
                     channel: self.session.user.channel.clone(),
-                    content: vec![ContentBlock::Text(format!("[cron:{job_id}] {text}"))],
+                    content,
                     reply_to: None,
                     metadata: MessageMetadata::default(),
                 };

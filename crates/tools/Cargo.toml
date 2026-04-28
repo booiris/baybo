@@ -13,7 +13,10 @@ test-support = []
 [dependencies]
 aura-model = { workspace = true }
 aura-security = { workspace = true }
+aura-storage = { workspace = true }
 aura-workspace = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
@@ -27,6 +30,7 @@ tracing = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
 glob = { workspace = true }
+shell-words = { workspace = true }
 walkdir = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
@@ -46,4 +50,5 @@ axum = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+aura-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

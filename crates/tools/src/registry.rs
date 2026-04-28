@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aura_storage::BlobStore;
 use parking_lot::RwLock;
 use serde_json::Value;
 
@@ -34,9 +35,9 @@ impl ToolRegistry {
         }
     }
 
-    pub fn with_defaults() -> Self {
+    pub fn with_defaults(blob_store: Arc<dyn BlobStore>) -> Self {
         let mut registry = Self::new();
-        for (tool, manifest) in crate::builtin::default_tools() {
+        for (tool, manifest) in crate::builtin::default_tools(blob_store) {
             registry.register(tool, manifest);
         }
         registry
@@ -166,5 +167,24 @@ impl ToolRegistry {
             return Some(m.clone());
         }
         self.builtin_manifests.get(name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aura_storage::BlobStore;
+    use aura_storage::test_support::MemoryBlobStore;
+
+    use super::ToolRegistry;
+
+    #[test]
+    fn defaults_register_send_file() {
+        let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
+        let registry = ToolRegistry::with_defaults(blob_store);
+
+        assert!(registry.get("SendFile").is_some());
+        assert!(registry.get_manifest("SendFile").is_some());
     }
 }

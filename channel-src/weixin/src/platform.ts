@@ -8,6 +8,7 @@ import type {
   BotStartHooks,
 } from "@aura/channel-sdk/bot";
 
+import { DEFAULT_CDN_BASE_URL } from "./auth/login-qr.js";
 import {
   SESSION_EXPIRED_ERRCODE,
   assertSessionActive,
@@ -80,7 +81,7 @@ export class WeixinPlatform implements BotPlatform<WeixinBotHandle, WeixinChat> 
       accountId: cmd.botId,
       botToken: blob.botToken,
       baseUrl: blob.baseUrl,
-      cdnBaseUrl: blob.cdnBaseUrl ?? "",
+      cdnBaseUrl: blob.cdnBaseUrl?.trim() || DEFAULT_CDN_BASE_URL,
       userId: blob.userId,
       getUpdatesBuf: "",
       configMgr,

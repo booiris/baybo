@@ -145,7 +145,11 @@ impl SandboxRunner for BwrapRunner {
                 "bwrap backend ignores allowed_hosts; egress is still all-or-nothing per network_policy. Per-host enforcement is deferred — see docs/todo/sandbox-os-isolation.md"
             );
         }
-        let bwrap_argv = build_bwrap_argv(&spec);
+        let workspace_symlink_mount = spec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
+        let bwrap_argv = build_bwrap_argv(&spec, workspace_symlink_mount.as_ref());
 
         let limits_set = spec.resource_limits.memory_max_bytes.is_some()
             || spec.resource_limits.pids_max.is_some();

@@ -16,7 +16,10 @@ use aura_model::TrustLevel;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::{ExecSandbox, SandboxedOutput, Tool, ToolContext, ToolManifest, ToolOutput};
+use crate::{
+    ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, SandboxedOutput, Tool,
+    ToolContext, ToolManifest, ToolOutput,
+};
 
 /// `Tool` that returns its serialized parameters as text. Trust level
 /// is `Trusted` by default so the tool isn't blocked by approval gates
@@ -176,6 +179,39 @@ impl ExecSandbox for FakeExecSandbox {
             timeout,
         });
         Ok(self.response.lock().clone())
+    }
+}
+
+/// `ApprovalGate` that records every request and returns a configurable
+/// decision. Test harness for mid-execute approval flows like the
+/// Bash-tool unsandboxed-retry path.
+pub struct FakeApprovalGate {
+    requests: Arc<Mutex<Vec<ApprovalRequest>>>,
+    decision: Arc<Mutex<ApprovalDecision>>,
+}
+
+impl FakeApprovalGate {
+    pub fn new(decision: ApprovalDecision) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            decision: Arc::new(Mutex::new(decision)),
+        }
+    }
+
+    pub fn set_decision(&self, decision: ApprovalDecision) {
+        *self.decision.lock() = decision;
+    }
+
+    pub fn requests(&self) -> Vec<ApprovalRequest> {
+        self.requests.lock().clone()
+    }
+}
+
+#[async_trait]
+impl ApprovalGate for FakeApprovalGate {
+    async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+        self.requests.lock().push(req);
+        *self.decision.lock()
     }
 }
 

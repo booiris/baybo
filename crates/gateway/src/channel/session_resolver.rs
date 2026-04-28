@@ -124,6 +124,12 @@ impl ChannelSessionResolver {
             .await
             .map_err(|e| ResolverError::Store(e.to_string()))?;
 
+        tracing::info!(
+            %channel_type,
+            user_id_hash = %super::short_hash(user_id),
+            session_id = %session.id,
+            "channel mapping repointed to fresh session (/new)",
+        );
         Ok(session.id)
     }
 }

@@ -2,6 +2,7 @@ import type { RegistrationResult } from "@aura/channel-sdk";
 import qrcode from "qrcode-terminal";
 
 import {
+  DEFAULT_CDN_BASE_URL,
   DEFAULT_ILINK_BOT_TYPE,
   FIXED_BASE_URL,
   startWeixinLoginWithQr,
@@ -70,12 +71,12 @@ export async function runLogin(): Promise<RegistrationResult> {
     throw new Error("登录失败：服务器未返回 botToken。");
   }
 
-  const cdnBaseUrl = process.env.AURA_WEIXIN_CDN_BASE_URL ?? "";
+  const cdnBaseUrl = process.env.AURA_WEIXIN_CDN_BASE_URL || DEFAULT_CDN_BASE_URL;
   const blob: AuthBlob = {
     version: 1,
     botToken: result.botToken,
     baseUrl: result.baseUrl || apiBaseUrl,
-    ...(cdnBaseUrl ? { cdnBaseUrl } : {}),
+    cdnBaseUrl,
     userId: result.userId || "",
     accountId: normalizeBotId(result.accountId),
     createdAt: new Date().toISOString(),

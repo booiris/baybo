@@ -255,8 +255,17 @@ impl SandboxRunner for DockerRunner {
                 "docker backend ignores allowed_hosts; egress is still all-or-nothing per network_policy. Per-host enforcement is deferred — see docs/todo/sandbox-os-isolation.md"
             );
         }
+        let workspace_symlink_mount = spec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
         let container_name = unique_container_name();
-        let argv = build_docker_argv(&spec, self.effective_image(), &container_name);
+        let argv = build_docker_argv(
+            &spec,
+            workspace_symlink_mount.as_ref(),
+            self.effective_image(),
+            &container_name,
+        );
         let mut cmd = Command::new(&self.binary);
         cmd.args(&argv)
             .stdout(Stdio::piped())

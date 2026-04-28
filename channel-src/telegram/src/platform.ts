@@ -3,7 +3,7 @@ import type {
   StartBotCommand,
   WireAttachment,
 } from "@aura/channel-sdk";
-import { fetchBlob, uploadBlob } from "@aura/channel-sdk";
+import { fetchBlobStream, uploadBlob } from "@aura/channel-sdk";
 import type {
   BotInboundEvent,
   BotMediaPayload,
@@ -113,15 +113,18 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
     // doesn't see it duplicated across a multi-photo reply.
     let captionRemaining = payload.text;
     for (const att of payload.attachments) {
-      const bytes = await this.fetchAttachmentBytes(att);
-      if (!bytes) continue;
+      const stream = await this.openAttachmentStream(att);
+      if (!stream) continue;
       try {
-        await sendTelegramAttachment(bot, chat, att, bytes, captionRemaining);
+        await sendTelegramAttachment(bot, chat, att, stream, captionRemaining);
         captionRemaining = "";
       } catch (err) {
         this.logger.error(
           `telegram sendMedia failed for kind=${att.kind} blob_id=${att.blob_id}: ${String(err)}`,
         );
+        // grammy may have only partially consumed the stream on error.
+        // Cancel so the underlying connection doesn't dangle.
+        stream.cancel().catch(() => {});
       }
     }
     // If every attachment failed to fetch but a caption remains, fall
@@ -137,15 +140,15 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
     }
   }
 
-  private async fetchAttachmentBytes(
+  private async openAttachmentStream(
     att: WireAttachment,
-  ): Promise<Buffer | null> {
+  ): Promise<ReadableStream<Uint8Array> | null> {
     try {
-      const { bytes } = await fetchBlob(att.blob_id);
-      return Buffer.from(bytes);
+      const { stream } = await fetchBlobStream(att.blob_id);
+      return stream;
     } catch (err) {
       this.logger.error(
-        `telegram sendMedia: fetchBlob failed blob_id=${att.blob_id} err=${String(err)}`,
+        `telegram sendMedia: fetchBlobStream failed blob_id=${att.blob_id} err=${String(err)}`,
       );
       return null;
     }
