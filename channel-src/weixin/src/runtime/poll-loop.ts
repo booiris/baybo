@@ -3,12 +3,18 @@ import { uploadBlob } from "@aura/channel-sdk";
 import type { BotInboundEvent, BotStartHooks } from "@aura/channel-sdk/bot";
 import { composeAuraUserId } from "@aura/channel-sdk/bot";
 
-import { SESSION_EXPIRED_ERRCODE, pauseSession } from "../api/session-guard.js";
+import {
+  SESSION_EXPIRED_ERRCODE,
+  getRemainingPauseMs,
+  isSessionPaused,
+  pauseSession,
+} from "../api/session-guard.js";
 import { getUpdates } from "../api/endpoints.js";
 import type { WeixinMessage } from "../api/types.js";
 import {
   decodeMediaItem,
   findDownloadableMedia,
+  mediaFallbackText,
   type InboundMedia,
 } from "../media/media-download.js";
 import { extractPlainText } from "../messaging/inbound.js";
@@ -16,17 +22,28 @@ import type { WeixinChat, WeixinBotHandle } from "../types.js";
 
 const ERROR_BACKOFF_MS = 30_000;
 const ERROR_THRESHOLD = 3;
+// Wake interval while waiting out a SESSION_EXPIRED pause. The actual
+// pause duration is set by `pauseSession` (1 hour today), but we wake
+// every 60 s so an early resume (e.g. operator manually clears the
+// pause via a future API) takes effect promptly. Cheap — one timer per
+// bot, only while paused.
+const PAUSE_RECHECK_MS = 60_000;
 
 /**
- * Drives one bot's long-poll inbound loop. Resolves when the abort
- * controller fires or when the server returns errcode -14 (session
- * expired) — both are terminal for this bot and BotChannel's
- * `waitForExit` contract treats a resolved promise as the bot having
- * stopped.
+ * Drives one bot's long-poll inbound loop. Resolves only when the abort
+ * controller fires (operator-initiated stop or sidecar shutdown).
+ *
+ * SESSION_EXPIRED handling: errcode -14 marks the iLink session as
+ * paused via `pauseSession` (1 h cooldown by default). Instead of
+ * exiting and forcing the gateway to restart the bot — which would
+ * just hit the same -14 again on the next reconcile tick and loop —
+ * we sleep inside the loop until the cooldown elapses, then retry.
+ * This way the bot stays alive in BotChannel routing and self-recovers
+ * once the platform-side session is usable again.
  *
  * `get_updates_buf` is in-memory only; a sidecar restart replays the
- * most recent updates from an empty cursor. Downstream session
- * dedup in aura handles the duplicates.
+ * most recent updates from an empty cursor. The gateway's
+ * `(channel_type, bot_id, platform_msg_id)` dedup catches the replay.
  *
  * Media is decoded inline: the first downloadable item is decrypted
  * via the iLink CDN, uploaded to the gateway's blob store, and
@@ -47,6 +64,20 @@ export async function runPollLoop(
   );
 
   while (!state.abort.signal.aborted) {
+    if (isSessionPaused(state.accountId)) {
+      const remainingMs = getRemainingPauseMs(state.accountId);
+      const sleepMs = Math.min(PAUSE_RECHECK_MS, Math.max(remainingMs, 1_000));
+      logger.warn(
+        `weixin bot '${state.accountId}' session paused (~${Math.ceil(remainingMs / 60_000)} min remaining); sleeping ${Math.ceil(sleepMs / 1000)}s before retry`,
+      );
+      try {
+        await abortableSleep(sleepMs, state.abort.signal);
+      } catch {
+        return;
+      }
+      continue;
+    }
+
     try {
       const resp = await getUpdates({
         baseUrl: state.baseUrl,
@@ -57,10 +88,11 @@ export async function runPollLoop(
 
       if (resp.errcode === SESSION_EXPIRED_ERRCODE || resp.ret === SESSION_EXPIRED_ERRCODE) {
         logger.error(
-          `weixin bot '${state.accountId}' session expired (errcode=${SESSION_EXPIRED_ERRCODE}); pausing & exiting poll loop`,
+          `weixin bot '${state.accountId}' session expired (errcode=${SESSION_EXPIRED_ERRCODE}); pausing — will resume after cooldown`,
         );
         pauseSession(state.accountId);
-        return;
+        // Loop top picks up the pause guard on the next iteration.
+        continue;
       }
 
       if (resp.get_updates_buf !== undefined) {
@@ -113,15 +145,32 @@ async function dispatchInboundMessage(
     attachment = await downloadAndUpload(handle, logger, msg, mediaItem);
   }
 
-  // A bare image with no caption produces empty text + an attachment.
-  // We still emit so the agent sees the media; pure no-ops (no text
-  // and no media) drop here.
-  if (!text && !attachment) return;
+  // Bare media + decode/upload failure (network, unpaired user, …)
+  // would otherwise produce empty content + no attachment and we'd drop
+  // the inbound silently. The pairing gate lives upstream of this
+  // sidecar, so a swallowed media-only message means a brand-new user
+  // never receives their pairing code. Surface a short stub instead so
+  // the gateway sees a real frame.
+  let content = text;
+  if (mediaItem && !attachment && !content) {
+    content = mediaFallbackText(mediaItem);
+  }
+
+  if (!content && !attachment) return;
+
+  // iLink's `message_id` is unique per upstream message. Threading it
+  // through enables the gateway's
+  // `(channel_type, bot_id, platform_msg_id)` dedup so a sidecar
+  // restart that replays `get_updates_buf` doesn't re-fire the agent
+  // on every message in the buffer.
+  const platformMsgId =
+    msg.message_id !== undefined ? String(msg.message_id) : undefined;
 
   const ev: BotInboundEvent<WeixinChat> = {
     chat: { toUserId: fromUserId },
     platformUserId: fromUserId,
-    content: text,
+    content,
+    ...(platformMsgId ? { platformMsgId } : {}),
     ...(attachment ? { attachments: [attachment] } : {}),
   };
   // Suppress lint about unused state — state is used implicitly via
