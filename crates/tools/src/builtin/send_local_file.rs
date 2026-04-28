@@ -1,7 +1,7 @@
 //! `SendFile` — stream a local file to the user as a channel attachment.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use aura_model::{ContentBlock, TrustLevel};
@@ -11,11 +11,27 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::io::ReaderStream;
 
+use super::paths::require_absolute;
 use crate::{
     ResourceAccess, Tool, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
 };
 
 const MAX_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_MIB: u64 = MAX_BYTES / 1024 / 1024;
+
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Send a local file to the user as a channel attachment (Telegram \
+         document/photo/video, WeChat file, …). The file is streamed from \
+         disk; supports any MIME up to {MAX_MIB} MiB. Sensitive paths (SSH \
+         keys, .env, /etc/shadow, …) are blocked. After calling, write \
+         only a brief textual confirmation — do NOT paste the file's \
+         contents into your reply. Use this instead of pasting binary or \
+         large text into messages.\n\n\
+         PATHS: `path` MUST be an absolute filesystem path. Relative paths \
+         are rejected."
+    )
+});
 
 pub struct SendFileTool {
     blob_store: Arc<dyn BlobStore>,
@@ -43,13 +59,7 @@ impl Tool for SendFileTool {
     }
 
     fn description(&self) -> &str {
-        "Send a local file to the user as a channel attachment (Telegram \
-         document/photo/video, WeChat file, …). The file is streamed from \
-         disk; supports any MIME up to 100 MiB. Sensitive paths (SSH keys, \
-         .env, /etc/shadow, …) are blocked. After calling, write only a \
-         brief textual confirmation — do NOT paste the file's contents \
-         into your reply. Use this instead of pasting binary or large \
-         text into messages."
+        &DESCRIPTION
     }
 
     fn parameters_schema(&self) -> Value {
@@ -88,6 +98,8 @@ impl Tool for SendFileTool {
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+
+        require_absolute(&p.path, "SendFile", "path")?;
 
         if aura_security::is_sensitive_path(&p.path) {
             tracing::warn!(path = %p.path.display(), "SendFile refused sensitive path");
@@ -264,6 +276,20 @@ mod tests {
         assert!(
             msg.contains("sensitive path") || msg.contains("credential-bearing"),
             "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_relative_path() {
+        let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
+        let tool = SendFileTool::new(store);
+        let err = tool
+            .execute(json!({ "path": "rel.txt" }), &ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
+            "got: {err:?}"
         );
     }
 

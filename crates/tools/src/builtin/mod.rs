@@ -33,6 +33,7 @@ pub mod edit;
 pub mod glob_tool;
 pub mod grep;
 pub mod now;
+pub(crate) mod paths;
 pub mod read;
 pub mod send_local_file;
 pub mod todo;

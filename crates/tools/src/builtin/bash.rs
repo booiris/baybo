@@ -9,39 +9,24 @@
 //! changes do NOT persist across invocations.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::paths::require_absolute;
 use crate::{ApprovalDecision, ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 
-pub struct BashTool;
-
-#[derive(Debug, Deserialize)]
-struct Params {
-    command: String,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-    #[serde(default)]
-    cwd: Option<PathBuf>,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-#[async_trait]
-impl Tool for BashTool {
-    fn name(&self) -> &str {
-        "Bash"
-    }
-
-    fn description(&self) -> &str {
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
         "Execute a shell command in a fresh `sh -c` process. Environment \
          changes and `cd` do not persist across invocations. Each of \
-         stdout and stderr is truncated at 64 KiB.\n\n\
+         stdout and stderr is truncated at {MAX_OUTPUT_KIB} KiB.\n\n\
          IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:\n\
          - File-content viewers (`cat`, `head`, `tail`, `less`, `more`, \
          `tac`) and file-driven text processors (`sed`, `awk`) are \
@@ -64,7 +49,7 @@ impl Tool for BashTool {
          (`LANG=C ls`), pipelines/redirects/substitution/chaining \
          (`ls; rm`, `ls | head`, `ls $(cat …)`) — falls back to the \
          sandboxed path with the normal approval gate. The fast lane is \
-         strictly an optimisation; nothing is rejected for shape.\n\
+         strictly an optimization; nothing is rejected for shape.\n\
          Reserve Bash for system commands, git operations, build/test, \
          and terminal tasks that require shell execution.\n\n\
          PATHS: Any directory or file argument inside the command (cd, ls, \
@@ -76,6 +61,30 @@ impl Tool for BashTool {
          similar walks against unknown directories without first checking \
          their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a \
          shallow `find -maxdepth 2`). Large trees can hang the process."
+    )
+});
+
+pub struct BashTool;
+
+#[derive(Debug, Deserialize)]
+struct Params {
+    command: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[async_trait]
+impl Tool for BashTool {
+    fn name(&self) -> &str {
+        "Bash"
+    }
+
+    fn description(&self) -> &str {
+        &DESCRIPTION
     }
 
     fn parameters_schema(&self) -> Value {
@@ -123,13 +132,8 @@ impl Tool for BashTool {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        if let Some(dir) = &p.cwd
-            && !dir.is_absolute()
-        {
-            return Err(ToolError::InvalidParams(format!(
-                "Bash `cwd` must be an absolute path, got `{}`",
-                dir.display()
-            )));
+        if let Some(dir) = &p.cwd {
+            require_absolute(dir, "Bash", "cwd")?;
         }
 
         let timeout = p
@@ -404,23 +408,32 @@ async fn run_unsandboxed(
         .spawn()
         .map_err(|e| ToolError::Execution(format!("spawn `{program}`: {e}")))?;
 
-    let mut stdout_pipe = child
+    let stdout_pipe = child
         .stdout
         .take()
         .ok_or_else(|| ToolError::Execution("child stdout pipe missing".into()))?;
-    let mut stderr_pipe = child
+    let stderr_pipe = child
         .stderr
         .take()
         .ok_or_else(|| ToolError::Execution("child stderr pipe missing".into()))?;
 
+    // Cap unsandboxed stdout/stderr at MAX_OUTPUT_BYTES + slack so a
+    // runaway producer (`ls -R /`, `du /`) can't OOM us. Dropping the
+    // limited reader closes our end of the pipe; the child gets EPIPE on
+    // its next write and exits early.
+    let read_cap = (MAX_OUTPUT_BYTES + 1024) as u64;
     let stdout_task = tokio::spawn(async move {
         let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf).await;
+        let mut limited = stdout_pipe.take(read_cap);
+        let _ = limited.read_to_end(&mut buf).await;
+        drop(limited);
         buf
     });
     let stderr_task = tokio::spawn(async move {
         let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf).await;
+        let mut limited = stderr_pipe.take(read_cap);
+        let _ = limited.read_to_end(&mut buf).await;
+        drop(limited);
         buf
     });
 

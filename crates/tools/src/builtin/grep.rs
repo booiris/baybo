@@ -6,15 +6,39 @@
 //! the `grep`/`ignore` crates once we know we need that throughput.
 
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_HITS: usize = 500;
+const MAX_FILES_VISITED: usize = 50_000;
+const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
+
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Search file contents with a regular expression. Always use this \
+         instead of Bash commands like grep or rg. `output_mode` may be \
+         `content` (matching lines), `files_with_matches` (default, paths \
+         only), or `count` (match counts per file). Supports file-type \
+         filtering via the `glob` parameter. Sensitive paths (SSH/AWS/GPG \
+         configs, .env, /etc/shadow, …) are pruned from the walk so their \
+         contents never enter the result.\n\n\
+         PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
+         Relative paths and omission are rejected.\n\n\
+         BEFORE SEARCHING: For an unfamiliar directory, first probe its \
+         scale with `Glob` (e.g. count entries) and narrow the search root \
+         or `glob` filter accordingly. Walks stop after {MAX_FILES_VISITED} \
+         files visited, individual files larger than {MAX_FILE_MIB} MiB are \
+         skipped, and per-mode results are capped at {MAX_HITS}."
+    )
+});
 
 pub struct GrepTool;
 
@@ -41,17 +65,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents with a regular expression. Always use this \
-         instead of Bash commands like grep or rg. `output_mode` may be \
-         `content` (matching lines), `files_with_matches` (default, paths \
-         only), or `count` (match counts per file). Supports file-type \
-         filtering via the `glob` parameter.\n\n\
-         PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
-         Relative paths and omission are rejected.\n\n\
-         BEFORE SEARCHING: For an unfamiliar directory, first probe its \
-         scale with `Glob` (e.g. count entries) and narrow the search root \
-         or `glob` filter accordingly. Walking huge unfiltered trees can \
-         hang the process."
+        &DESCRIPTION
     }
 
     fn parameters_schema(&self) -> Value {
@@ -88,12 +102,7 @@ impl Tool for GrepTool {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        if !p.path.is_absolute() {
-            return Err(ToolError::InvalidParams(format!(
-                "Grep `path` must be an absolute path, got `{}`",
-                p.path.display()
-            )));
-        }
+        require_absolute(&p.path, "Grep", "path")?;
 
         let base = p.path.clone();
         tokio::task::spawn_blocking(move || run_grep(&base, &p))
@@ -120,12 +129,15 @@ fn run_grep(base: &std::path::Path, p: &Params) -> crate::Result<ToolOutput> {
     let mut content_hits: Vec<String> = Vec::new();
     let mut counts: Vec<(PathBuf, usize)> = Vec::new();
     let mut total_hits = 0usize;
+    let mut visited = 0usize;
+    let mut walk_truncated = false;
 
-    for entry in walkdir::WalkDir::new(base)
+    let walker = walkdir::WalkDir::new(base)
         .follow_links(false)
         .into_iter()
-        .filter_map(Result::ok)
-    {
+        .filter_entry(|e| !aura_security::is_sensitive_path(e.path()));
+
+    for entry in walker.filter_map(Result::ok) {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -138,6 +150,18 @@ fn run_grep(base: &std::path::Path, p: &Params) -> crate::Result<ToolOutput> {
             if !f.is_match(name) {
                 continue;
             }
+        }
+
+        visited += 1;
+        if visited > MAX_FILES_VISITED {
+            walk_truncated = true;
+            break;
+        }
+
+        if let Ok(meta) = path.metadata()
+            && meta.len() > MAX_FILE_BYTES
+        {
+            continue;
         }
 
         let Ok(contents) = std::fs::read_to_string(path) else {
@@ -157,8 +181,10 @@ fn run_grep(base: &std::path::Path, p: &Params) -> crate::Result<ToolOutput> {
 
         if file_hits > 0 {
             if p.output_mode == "files_with_matches" {
-                files_with_matches.push(path.to_path_buf());
-            } else if p.output_mode == "count" {
+                if files_with_matches.len() < MAX_HITS {
+                    files_with_matches.push(path.to_path_buf());
+                }
+            } else if p.output_mode == "count" && counts.len() < MAX_HITS {
                 counts.push((path.to_path_buf(), file_hits));
             }
         }
@@ -170,18 +196,39 @@ fn run_grep(base: &std::path::Path, p: &Params) -> crate::Result<ToolOutput> {
             if total_hits > MAX_HITS {
                 s.push_str(&format!("\n… [truncated: {total_hits} total matches]"));
             }
+            if walk_truncated {
+                s.push_str(&format!(
+                    "\n… [walk truncated after {MAX_FILES_VISITED} files visited]"
+                ));
+            }
             s
         }
-        "count" => counts
-            .into_iter()
-            .map(|(p, n)| format!("{}: {n}", p.display()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        "files_with_matches" => files_with_matches
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        "count" => {
+            let mut s = counts
+                .into_iter()
+                .map(|(p, n)| format!("{}: {n}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if walk_truncated {
+                s.push_str(&format!(
+                    "\n… [walk truncated after {MAX_FILES_VISITED} files visited]"
+                ));
+            }
+            s
+        }
+        "files_with_matches" => {
+            let mut s = files_with_matches
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if walk_truncated {
+                s.push_str(&format!(
+                    "\n… [walk truncated after {MAX_FILES_VISITED} files visited]"
+                ));
+            }
+            s
+        }
         other => {
             return Err(ToolError::InvalidParams(format!(
                 "unknown output_mode `{other}`"
@@ -287,6 +334,39 @@ mod tests {
             matches!(err, ToolError::InvalidParams(_)),
             "expected InvalidParams, got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn skips_sensitive_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        tokio::fs::create_dir(&ssh).await.unwrap();
+        // Plant a "matching" line inside what looks like a private key.
+        tokio::fs::write(ssh.join("id_rsa"), "AKIA-needle-leak")
+            .await
+            .unwrap();
+        // And a regular file with the same needle so we know the search ran.
+        tokio::fs::write(dir.path().join("ok.txt"), "AKIA-needle-leak")
+            .await
+            .unwrap();
+
+        let out = GrepTool
+            .execute(
+                json!({
+                    "pattern": "needle",
+                    "path": dir.path(),
+                    "output_mode": "content"
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!();
+        };
+        assert!(s.contains("ok.txt"), "regular file should match: {s}");
+        assert!(!s.contains("id_rsa"), "sensitive file leaked: {s}");
+        assert!(!s.contains(".ssh"), "sensitive dir leaked: {s}");
     }
 
     #[tokio::test]

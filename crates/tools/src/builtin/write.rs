@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 pub struct WriteTool;
@@ -27,7 +28,9 @@ impl Tool for WriteTool {
          Always use this instead of Bash commands like echo with \
          redirection or cat with heredoc. Prefer `Edit` for modifying \
          existing files — only use `Write` for new files or complete \
-         rewrites. Parent directories must already exist."
+         rewrites. Parent directories must already exist.\n\n\
+         PATHS: `file_path` MUST be an absolute filesystem path. Relative \
+         paths are rejected."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -56,6 +59,8 @@ impl Tool for WriteTool {
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+
+        require_absolute(&p.file_path, "Write", "file_path")?;
 
         tokio::fs::write(&p.file_path, &p.content)
             .await
@@ -101,5 +106,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "hi");
+    }
+
+    #[tokio::test]
+    async fn rejects_relative_path() {
+        let err = WriteTool
+            .execute(json!({ "file_path": "rel.txt", "content": "x" }), &ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
+            "got: {err:?}"
+        );
     }
 }

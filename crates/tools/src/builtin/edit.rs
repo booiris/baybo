@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 pub struct EditTool;
@@ -31,7 +32,9 @@ impl Tool for EditTool {
          Replace `old_string` with `new_string`; when `replace_all` is \
          false (default), `old_string` must appear exactly once — otherwise \
          the tool fails without touching the file. Provide enough surrounding \
-         context in `old_string` to ensure a unique match."
+         context in `old_string` to ensure a unique match.\n\n\
+         PATHS: `file_path` MUST be an absolute filesystem path. Relative \
+         paths are rejected."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -64,6 +67,8 @@ impl Tool for EditTool {
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+
+        require_absolute(&p.file_path, "Edit", "file_path")?;
 
         if p.old_string == p.new_string {
             return Err(ToolError::InvalidParams(
@@ -157,6 +162,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("matches 2 times"));
+    }
+
+    #[tokio::test]
+    async fn rejects_relative_path() {
+        let err = EditTool
+            .execute(
+                json!({ "file_path": "rel.txt", "old_string": "a", "new_string": "b" }),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
