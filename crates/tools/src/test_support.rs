@@ -211,7 +211,7 @@ impl FakeApprovalGate {
 impl ApprovalGate for FakeApprovalGate {
     async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
         self.requests.lock().push(req);
-        self.decision.lock().clone()
+        *self.decision.lock()
     }
 }
 
