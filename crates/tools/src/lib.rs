@@ -192,6 +192,14 @@ pub enum ToolOutput {
     Text(String),
     Json(Value),
     Error(String),
+    /// Tool result that also delivers attachments to the user channel.
+    /// `text` is what the LLM sees as the tool result; `attachments`
+    /// are hoisted into the assistant's `OutgoingMessage` by the agent
+    /// loop and the channel sidecar then sends them out-of-band.
+    WithAttachments {
+        text: String,
+        attachments: Vec<aura_model::ContentBlock>,
+    },
 }
 
 /// Definition visible to the LLM for function calling.

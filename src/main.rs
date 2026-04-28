@@ -102,10 +102,10 @@ async fn main() -> anyhow::Result<()> {
     // ---------------- argv dispatch (one-shot command + exit) ----------------
     //
     // Everything reaching this point is a one-shot argv command (Tui,
-    // Completion, Gateway, None are all handled above). Argv mode needs
+    // Completion, Gateway, None are all handled above). Argv mode builds
     // only the lightweight inspection set (skills, tools, channels,
-    // workspace, optional LLM) — building the whole manager graph for
-    // `aura status` would needlessly open libsql and recover jobs.
+    // workspace, optional LLM). It opens storage for BlobStore-backed
+    // tool metadata, but avoids the full manager graph and job recovery.
     init_tracing(TracingMode::Stdout);
 
     let cmd = cli.command.expect("non-command branches handled above");
@@ -123,7 +123,8 @@ async fn main() -> anyhow::Result<()> {
         }
         reg
     };
-    let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults());
+    let stores = aura_storage::Store::open(boot::storage_db_path(&config.workspace)).await?;
+    let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults(stores.blob.clone()));
     let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
         workspace_root.clone(),
     ));

@@ -244,6 +244,10 @@ impl AgentLoop {
         // activity — breaking any channel-side behavior keyed on the tool
         // call (e.g. the TUI cron-recurring hint).
         let mut accumulated_tool_uses: Vec<ContentBlock> = Vec::new();
+        // Side-channel attachments emitted by tools (e.g. send_local_file).
+        // Hoisted into the final OutgoingMessage so the channel sidecar
+        // delivers them out-of-band; never echoed back to the LLM.
+        let mut accumulated_attachments: Vec<ContentBlock> = Vec::new();
         loop {
             if iterations >= self.policy.max_iterations {
                 warn!(max = self.policy.max_iterations, "max iterations reached");
@@ -291,6 +295,7 @@ impl AgentLoop {
                 // the assistant's reply.
                 let mut final_blocks = response_blocks.clone();
                 final_blocks.extend(std::mem::take(&mut accumulated_tool_uses));
+                final_blocks.extend(std::mem::take(&mut accumulated_attachments));
 
                 let final_text = aura_llm::multimodal::extract_text(&response_blocks);
 
@@ -387,6 +392,10 @@ impl AgentLoop {
                     Ok(ToolOutput::Json(v)) => {
                         serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
                     }
+                    Ok(ToolOutput::WithAttachments { text, attachments }) => {
+                        accumulated_attachments.extend(attachments.iter().cloned());
+                        text.clone()
+                    }
                     Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
                     Err(e) => {
                         if let Some(denied) = e.downcast_ref::<aura_tools::ToolError>()
@@ -431,14 +440,18 @@ impl AgentLoop {
             session.state.approved_resources = approved.lock().clone();
         }
 
-        // If we exhausted iterations, return what we have
+        // If we exhausted iterations, return what we have. Tail-append any
+        // attachments the tools produced so the user still receives the
+        // file even when the agent ran out of reasoning budget.
+        let mut content = vec![ContentBlock::Text(
+            "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
+        )];
+        content.extend(std::mem::take(&mut accumulated_attachments));
         Ok(OutgoingMessage {
             session_id: session.id.clone(),
             user_id: session.user.id.clone(),
             channel: session.channel.clone(),
-            content: vec![ContentBlock::Text(
-                "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
-            )],
+            content,
             reply_to: None,
             metadata: Default::default(),
         })

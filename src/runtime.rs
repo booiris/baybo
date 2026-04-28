@@ -213,7 +213,6 @@ pub async fn build_managers(
         }
         reg
     };
-    let mut tool_registry = Arc::new(ToolRegistry::with_defaults());
     let workspace = Arc::new(WorkspaceManager::new(workspace_root.clone()));
     let channels_registry = Arc::new(ChannelRegistry::new());
 
@@ -221,6 +220,7 @@ pub async fn build_managers(
     // handed to a manager is a cheap `stores.xxx.clone()` so the bundle
     // itself stays intact for the graph + downstream consumers.
     let stores = Store::open(boot::storage_db_path(&config.workspace)).await?;
+    let mut tool_registry = Arc::new(ToolRegistry::with_defaults(stores.blob.clone()));
 
     // Built after `stores` so `build_llm_client` can wire the blob
     // store in as a `BlobFetcher` — without it, multimodal user
