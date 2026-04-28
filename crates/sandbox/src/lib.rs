@@ -3,6 +3,9 @@ pub mod bootstrap;
 pub mod error;
 pub mod spec;
 
+mod symlink_mount;
+pub use symlink_mount::{WorkspaceSymlinkMount, workspace_symlink_mount_for};
+
 #[cfg(all(target_os = "linux", feature = "linux"))]
 pub mod bwrap;
 #[cfg(feature = "docker")]

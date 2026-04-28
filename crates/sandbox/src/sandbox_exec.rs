@@ -60,7 +60,11 @@ pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
 impl SandboxRunner for SandboxExecRunner {
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
         validate_spec(&spec)?;
-        let profile = render_sbpl_profile(&spec);
+        let workspace_symlink_mount = spec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
+        let profile = render_sbpl_profile(&spec, workspace_symlink_mount.as_ref());
         // SBPL allows writes only inside the workspace. Carve out a
         // per-invocation scratch dir under the workspace and route
         // `$TMPDIR` / `$TMP` / `$TEMP` there so callers respecting those

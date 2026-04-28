@@ -82,6 +82,13 @@ There is no shared "policy" type beyond `SandboxSpec` itself.
   inside and outside the container so absolute paths line up for the
   `cwd` validation in `SandboxAdapter` and for any path the tool
   emits.
+- **Symlinked cwd spelling**: when a caller supplies an explicit `cwd`
+  whose canonical target is inside `SandboxSpec.workspace_root`, the
+  backend also exposes that requested spelling inside the sandbox
+  (`source = cwd.canonicalize()`, `destination = cwd`). This is a
+  convenience mount only; the security decision stays anchored on the
+  canonical workspace root. The sandbox does not parse arbitrary shell
+  command strings to discover path spellings.
 - **Network**: `--network none` for `NetworkPolicy::None`, `--network
   bridge` for `All`. We avoid `--network host` because Docker Desktop
   on macOS does not expose host networking — `bridge` works
