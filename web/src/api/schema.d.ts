@@ -589,6 +589,16 @@ export interface components {
             session_id: string;
             /** @enum {string} */
             type: "user_message_handling";
+        } | {
+            child_job_id: string;
+            child_session_id: string;
+            /** @enum {string} */
+            type: "sub_agent_spawn";
+        } | {
+            from: components["schemas"]["JobStatus"];
+            to: components["schemas"]["JobStatus"];
+            /** @enum {string} */
+            type: "acceptance";
         };
         /**
          * @description Mirror of [`aura_model::ParentLinkKind`].

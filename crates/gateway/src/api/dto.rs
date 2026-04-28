@@ -297,13 +297,35 @@ impl From<aura_job::JobStatus> for JobStatus {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationKind {
-    LlmCall { model: String },
-    ToolExecution { tool_name: String },
-    SkillExecution { skill_name: String },
-    CronExecution { cron_job_id: String },
-    ContextCompression { strategy: String },
-    MemoryOperation { operation: String },
-    UserMessageHandling { session_id: String },
+    LlmCall {
+        model: String,
+    },
+    ToolExecution {
+        tool_name: String,
+    },
+    SkillExecution {
+        skill_name: String,
+    },
+    CronExecution {
+        cron_job_id: String,
+    },
+    ContextCompression {
+        strategy: String,
+    },
+    MemoryOperation {
+        operation: String,
+    },
+    UserMessageHandling {
+        session_id: String,
+    },
+    SubAgentSpawn {
+        child_session_id: String,
+        child_job_id: String,
+    },
+    Acceptance {
+        from: JobStatus,
+        to: JobStatus,
+    },
 }
 
 impl From<aura_job::OperationKind> for OperationKind {
@@ -328,6 +350,17 @@ impl From<aura_job::OperationKind> for OperationKind {
             aura_job::OperationKind::UserMessageHandling { session_id } => {
                 Self::UserMessageHandling { session_id }
             }
+            aura_job::OperationKind::SubAgentSpawn {
+                child_session_id,
+                child_job_id,
+            } => Self::SubAgentSpawn {
+                child_session_id,
+                child_job_id,
+            },
+            aura_job::OperationKind::Acceptance { from, to } => Self::Acceptance {
+                from: from.into(),
+                to: to.into(),
+            },
         }
     }
 }

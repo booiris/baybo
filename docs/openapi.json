@@ -2422,6 +2422,50 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "child_session_id",
+              "child_job_id",
+              "type"
+            ],
+            "properties": {
+              "child_job_id": {
+                "type": "string"
+              },
+              "child_session_id": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "sub_agent_spawn"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "from",
+              "to",
+              "type"
+            ],
+            "properties": {
+              "from": {
+                "$ref": "#/components/schemas/JobStatus"
+              },
+              "to": {
+                "$ref": "#/components/schemas/JobStatus"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "acceptance"
+                ]
+              }
+            }
           }
         ],
         "description": "Mirror of [`aura_job::OperationKind`]."

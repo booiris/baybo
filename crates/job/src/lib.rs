@@ -2,7 +2,7 @@ mod error;
 mod operation;
 
 pub use error::JobError;
-pub use operation::OperationKind;
+pub use operation::{JobKind, OperationKind};
 
 use std::time::Duration;
 
@@ -182,6 +182,14 @@ mod duration_secs {
 }
 
 /// A tracked unit of asynchronous work within a session.
+///
+/// `kind` is currently `OperationKind` (per-operation granularity:
+/// one Job per LLM call, one per tool call, etc.). The plan tracks a
+/// follow-up that switches `kind` to [`JobKind`] (turn-level: one
+/// Job per user message / cron fire / system action / sub-agent
+/// delegation) and removes the per-operation Jobs in favour of a
+/// single turn-level Job referenced by every span via
+/// `parent_job_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
@@ -759,5 +767,43 @@ mod tests {
         let t = job.mark_interrupted().unwrap();
         assert!(t.is_none());
         assert_eq!(job.status, JobStatus::Failed);
+    }
+
+    #[test]
+    fn job_kind_serde_round_trip() {
+        for kind in [
+            JobKind::UserMessage,
+            JobKind::CronExecution {
+                cron_job_id: "cron-7".into(),
+            },
+            JobKind::SystemAction {
+                trigger: "periodic_review".into(),
+            },
+            JobKind::SubAgentDelegation {
+                tool_call_id: "call-99".into(),
+            },
+        ] {
+            let s = serde_json::to_string(&kind).unwrap();
+            let _: JobKind = serde_json::from_str(&s).unwrap();
+        }
+    }
+
+    #[test]
+    fn operation_kind_subagent_and_acceptance_round_trip() {
+        let spawn = OperationKind::SubAgentSpawn {
+            child_session_id: "child-sess".into(),
+            child_job_id: "child-job".into(),
+        };
+        let s = serde_json::to_string(&spawn).unwrap();
+        assert!(s.contains("sub_agent_spawn"));
+        let _: OperationKind = serde_json::from_str(&s).unwrap();
+
+        let accept = OperationKind::Acceptance {
+            from: JobStatus::Submitted,
+            to: JobStatus::Accepted,
+        };
+        let s = serde_json::to_string(&accept).unwrap();
+        assert!(s.contains("acceptance"));
+        let _: OperationKind = serde_json::from_str(&s).unwrap();
     }
 }
