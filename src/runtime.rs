@@ -498,6 +498,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         Arc::clone(&graph.channels_registry),
         Arc::clone(&graph.security_gateway),
     )
+    .with_shutdown_grace(std::time::Duration::from_secs(
+        graph.config.gateway.shutdown_grace_secs,
+    ))
     .with_actor_spawner(Box::new(move |session, response_tx| {
         let agent_loop = AgentLoop::new(
             Arc::clone(&actor_llm_client),
@@ -538,10 +541,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             recorder,
         );
         let (sender, mailbox) = mpsc::channel(buffer);
-        tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             actor.run(mailbox).await;
         });
-        sender
+        (sender, join_handle)
     }));
 
     // Attach cron triggers eagerly — a caller who forgot to plumb the

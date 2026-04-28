@@ -57,11 +57,18 @@ impl RateLimiter {
 
 /// A callback that creates and spawns a new AgentActor for a given session.
 ///
-/// Returns the mailbox sender for communicating with the spawned actor.
-/// The closure captures all dependencies needed to construct an actor
+/// Returns the mailbox sender plus the `JoinHandle` of the spawned
+/// task so the supervisor can await it during graceful shutdown. The
+/// closure captures all dependencies needed to construct an actor
 /// (AgentLoop, HookManager, ObservabilityRecorder, etc.).
-pub type ActorSpawner =
-    Box<dyn Fn(Session, mpsc::Sender<AgentOutput>) -> mpsc::Sender<AgentMessage> + Send + Sync>;
+pub type ActorSpawner = Box<
+    dyn Fn(
+            Session,
+            mpsc::Sender<AgentOutput>,
+        ) -> (mpsc::Sender<AgentMessage>, tokio::task::JoinHandle<()>)
+        + Send
+        + Sync,
+>;
 
 /// Routes incoming messages to the appropriate AgentActor.
 pub struct Router {
@@ -73,11 +80,18 @@ pub struct Router {
     rate_limiter: RateLimiter,
     actor_spawner: Option<ActorSpawner>,
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    /// Maximum time `run`'s graceful-shutdown phase will wait for
+    /// actor `JoinHandle`s to drain before letting the runtime's
+    /// `TaskTracker` abort survivors. Five seconds is enough for any
+    /// well-behaved actor to drain its mailbox + flush trace; the
+    /// runtime's signal handler caps total exit time anyway.
+    shutdown_grace: std::time::Duration,
 }
 
 /// Default rate limit: 30 requests per 60 seconds per user.
 const DEFAULT_RATE_LIMIT_REQUESTS: usize = 30;
 const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const DEFAULT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Router {
     pub fn new(
@@ -98,7 +112,14 @@ impl Router {
             ),
             actor_spawner: None,
             cron_trigger_rx: None,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
+    }
+
+    /// Override the actor-shutdown grace window. Defaults to 5s.
+    pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
     }
 
     /// Set a `CostGuard` for quota checks before routing messages.
@@ -163,7 +184,7 @@ impl Router {
             }
         }
 
-        self.supervisor.shutdown_all().await;
+        self.supervisor.shutdown_all(self.shutdown_grace).await;
     }
 
     /// Handle a cron trigger by minting a fresh session and routing a
@@ -175,13 +196,15 @@ impl Router {
     /// belongs to memory + skill loading, not to a shared mutable
     /// transcript.
     ///
-    /// The spawned actor is intentionally NOT registered with the
-    /// supervisor: each cron session is one-shot and has no follow-up
-    /// traffic, so registering would just accumulate dangling actor
-    /// handles in the supervisor's map. We send `CronTrigger` followed
-    /// by `Shutdown`; the actor processes the trigger (FIFO), exits on
-    /// Shutdown, and its mailbox closes when this function returns and
-    /// drops the sender.
+    /// The spawned actor is intentionally NOT keyed by `session_id`
+    /// in the supervisor: each cron session is one-shot and has no
+    /// follow-up traffic, so a session-id entry would just accumulate
+    /// dangling sender handles. We do hand the actor's `JoinHandle`
+    /// to the supervisor via `track` so process-exit waits for any
+    /// in-flight cron work. Then we send `CronTrigger` followed by
+    /// `Shutdown`; the actor processes the trigger (FIFO), exits on
+    /// Shutdown, and its mailbox closes when this function returns
+    /// and drops the sender.
     async fn handle_cron_trigger(&mut self, event: CronTriggerEvent) -> anyhow::Result<()> {
         let user = User {
             id: event.user_id.clone(),
@@ -214,13 +237,12 @@ impl Router {
         );
 
         let response_tx = self.supervisor.response_tx().clone();
-        // The spawner returns only the actor's sender; its tokio JoinHandle
-        // is dropped inside the closure. Process-exit therefore can't wait
-        // for in-flight cron work — same gap as registered actors, since
-        // `AgentSupervisor::shutdown_all` only forwards `Shutdown` messages
-        // and never awaits joins. A future PR can plumb a `JoinSet` through
-        // the spawner contract to fix that across all actor flows.
-        let sender = spawner(session, response_tx);
+        let (sender, join_handle) = spawner(session, response_tx);
+        // Cron actors are one-shot — no follow-up traffic — so we
+        // don't register them by `session_id`, but the supervisor
+        // does track the JoinHandle so process exit can await any
+        // in-flight cron work via `shutdown_all`.
+        self.supervisor.track(join_handle);
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
@@ -315,8 +337,9 @@ impl Router {
             if let Some(ref spawner) = self.actor_spawner {
                 info!(session_id = %session_id, "creating new actor for session");
                 let response_tx = self.supervisor.response_tx().clone();
-                let sender = spawner(session, response_tx);
-                self.supervisor.register(session_id.clone(), sender);
+                let (sender, join_handle) = spawner(session, response_tx);
+                self.supervisor
+                    .register(session_id.clone(), sender, join_handle);
 
                 // Retry routing now that the actor exists.
                 let re_routed = self
