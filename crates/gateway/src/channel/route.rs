@@ -614,7 +614,7 @@ async fn enforce_pairing(
             tracing::warn!(
                 %channel_type,
                 %bot_id,
-                user_id_hash = %short_hash(user_id),
+                user_id_hash = %super::short_hash(user_id),
                 "pairing required; returning code and dropping message",
             );
             let text = format!(
@@ -638,23 +638,12 @@ async fn enforce_pairing(
                 error = %e,
                 %channel_type,
                 %bot_id,
-                user_id_hash = %short_hash(user_id),
+                user_id_hash = %super::short_hash(user_id),
                 "pairing check failed; dropping message",
             );
             false
         }
     }
-}
-
-/// Deterministic short hash of an identifier for log attribution.
-/// Four hex chars is enough to distinguish concurrent pendings in a
-/// tracing log without leaking the raw id.
-fn short_hash(raw: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    raw.hash(&mut h);
-    format!("{:04x}", (h.finish() & 0xFFFF) as u16)
 }
 
 /// Translate the wire-level `(content, attachments)` pair into the

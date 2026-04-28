@@ -33,3 +33,14 @@ pub use history::TuiHistoryStore;
 pub use route::routes;
 pub use session_resolver::ChannelSessionResolver;
 pub use state::WsChannelState;
+
+/// Deterministic short hash of an identifier for log attribution.
+/// Four hex chars distinguish concurrent pendings in a tracing log
+/// without leaking the raw id.
+pub(crate) fn short_hash(raw: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    raw.hash(&mut h);
+    format!("{:04x}", (h.finish() & 0xFFFF) as u16)
+}

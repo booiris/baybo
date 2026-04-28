@@ -51,6 +51,25 @@ pub(crate) async fn try_handle(
     user_id: &str,
 ) -> SlashOutcome {
     let trimmed = content.trim();
+    // Diagnostic dump for "why didn't my /command fire?" reports. The
+    // hex of the first 32 bytes catches the usual culprits: a full-
+    // width `／` (U+FF0F → `ef bc 8f`), a BOM (`ef bb bf`), a zero-
+    // width space (`e2 80 8b`), or any leading whitespace the
+    // sidecar's text extractor failed to strip. Off by default at
+    // `info` so grep is enough to find a single `/new` invocation.
+    let head_hex: String = trimmed
+        .as_bytes()
+        .iter()
+        .take(32)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    tracing::debug!(
+        %channel_type,
+        len = trimmed.len(),
+        head_hex = %head_hex,
+        "slash dispatch entry",
+    );
     let Some(rest) = trimmed.strip_prefix('/') else {
         return SlashOutcome::PassThrough;
     };
