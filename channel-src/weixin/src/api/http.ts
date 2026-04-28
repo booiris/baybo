@@ -1,20 +1,14 @@
 import crypto from "node:crypto";
 
-// Inlined at bundle time via tsconfig's `resolveJsonModule` (bun's
-// bundler replaces this with a const object literal in the single-file
-// output). A runtime `readFileSync("../../package.json")` would break
-// once the sidecar is extracted to
-// `$XDG_CACHE_HOME/aura/sidecars/weixin-<hash>.js` — a single JS file
-// with no sibling `package.json` — silently zeroing the iLink app
-// identity on every outbound request. The `with { type: "json" }`
-// attribute is required by Node 22+ at runtime (used by the
-// `node --test` suite); tsc needs `module: ESNext` for the syntax.
-import pkg from "../../package.json" with { type: "json" };
-
 import type { BaseInfo } from "./types.js";
 
-const CHANNEL_VERSION: string = pkg.version ?? "unknown";
-const ILINK_APP_ID: string = pkg.ilink_appid ?? "";
+// Source of truth: `package.json` (`version`, `ilink_appid`). Kept as
+// plain literals instead of `import pkg from "../../package.json"` so
+// the bundler doesn't inline the entire package.json (dependencies,
+// scripts, build metadata, …) into the single-file sidecar bundle.
+// Update both fields here if package.json changes.
+const CHANNEL_VERSION = "0.1.0";
+const ILINK_APP_ID = "bot";
 
 export function buildClientVersion(version: string): number {
   const parts = version.split(".").map((p) => parseInt(p, 10));
@@ -24,7 +18,7 @@ export function buildClientVersion(version: string): number {
   return ((major & 0xff) << 16) | ((minor & 0xff) << 8) | (patch & 0xff);
 }
 
-const ILINK_APP_CLIENT_VERSION: number = buildClientVersion(pkg.version ?? "0.0.0");
+const ILINK_APP_CLIENT_VERSION: number = buildClientVersion(CHANNEL_VERSION);
 
 export function buildBaseInfo(): BaseInfo {
   return { channel_version: CHANNEL_VERSION };

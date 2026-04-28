@@ -53,6 +53,15 @@ export interface UserInbound {
    */
   botId?: string;
   /**
+   * Platform-native message id (Telegram `update_id`, Weixin `msg_id`,
+   * …). When set, the gateway dedups inbound traffic per
+   * `(channelType, botId, platformMsgId)` — protects against the
+   * sidecar replaying its long-poll buffer after a restart, or any
+   * other path that surfaces the same upstream event twice. Channels
+   * without a stable platform id can omit it.
+   */
+  platformMsgId?: string;
+  /**
    * Non-text payloads attached to the user's message. Each entry
    * references a blob the sidecar already uploaded via
    * `POST /v1/blobs`; the gateway's wire-side conversion turns them

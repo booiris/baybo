@@ -230,6 +230,7 @@ async fn agent_output_to_frame(
                 // recovers it from its own `user_id → bot_id` map.
                 bot_id: String::new(),
                 attachments,
+                platform_msg_id: String::new(),
             })
         }
         AgentOutput::Notice {

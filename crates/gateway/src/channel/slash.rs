@@ -127,6 +127,7 @@ fn reply(channel_type: &ChannelType, user_id: &str, session_id: &str, text: &str
         // `user_id → bot_id` map.
         bot_id: String::new(),
         attachments: Vec::new(),
+        platform_msg_id: String::new(),
     }
 }
 

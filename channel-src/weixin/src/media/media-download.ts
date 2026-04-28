@@ -16,6 +16,7 @@ import { downloadAndDecryptBuffer, downloadPlainCdnBuffer } from "../cdn/pic-dec
 import { MessageItemType, type MessageItem, type WeixinMessage } from "../api/types.js";
 
 import { getMimeFromFilename } from "./mime.js";
+import { silkToWav } from "./silk-to-wav.js";
 
 /**
  * Decoded media buffer + the metadata the gateway upload needs. The
@@ -44,6 +45,30 @@ export function isMediaItem(item: MessageItem): boolean {
     || kind === MessageItemType.FILE
     || kind === MessageItemType.VOICE
   );
+}
+
+/**
+ * Short Chinese label for a media item kind. Used as a stand-in body
+ * when media decode/upload fails (network, unpaired user, oversized
+ * file, …) so a media-only message still lands at the gateway. Without
+ * this, an unpaired user's first message being a bare image silently
+ * vanishes and they never get the pairing code.
+ */
+export function mediaFallbackText(item: MessageItem): string {
+  switch (item.type) {
+    case MessageItemType.IMAGE:
+      return "[图片]";
+    case MessageItemType.VIDEO:
+      return "[视频]";
+    case MessageItemType.VOICE:
+      return "[语音]";
+    case MessageItemType.FILE: {
+      const name = item.file_item?.file_name;
+      return name ? `[文件: ${name}]` : "[文件]";
+    }
+    default:
+      return "[媒体]";
+  }
 }
 
 /**
@@ -225,11 +250,15 @@ async function decodeVoice(
       ...(v.media.full_url ? { fullUrl: v.media.full_url } : {}),
       logger,
     });
-    // SILK → WAV transcoding lands in P4.3. For now ship the raw
-    // bytes as `audio/silk` so the agent at least sees the
-    // attachment exists; an LLM that doesn't speak silk falls back
-    // to the placeholder text path.
-    return { kind: "audio", bytes: silkBytes, mimeType: "audio/silk" };
+    // Transcode SILK → 24 kHz mono PCM WAV so downstream LLM/audio
+    // pipelines (Whisper, gpt-4o-audio, …) accept the payload
+    // directly. On transcode failure we fall back to the raw bytes
+    // as `audio/silk` — the attachment still surfaces, just without
+    // the universal-format guarantee.
+    const wavBytes = await silkToWav(silkBytes, logger);
+    return wavBytes !== null
+      ? { kind: "audio", bytes: wavBytes, mimeType: "audio/wav" }
+      : { kind: "audio", bytes: silkBytes, mimeType: "audio/silk" };
   } catch (err) {
     logger.error(`inbound voice decode failed: ${String(err)}`);
     return null;

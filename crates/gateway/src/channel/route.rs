@@ -430,6 +430,24 @@ async fn run_inbound_loop(
                                     );
                                     continue;
                                 }
+                                // Dedup before pairing so a replay
+                                // storm can't re-fire pairing-code
+                                // notices either. Sidecars that omit
+                                // `platform_msg_id` always pass through
+                                // — opt-in design.
+                                if !state.inbound_dedup.check_and_record(
+                                    channel_type,
+                                    &wire_msg.bot_id,
+                                    &wire_msg.platform_msg_id,
+                                ) {
+                                    tracing::debug!(
+                                        %channel_type,
+                                        bot_id = %wire_msg.bot_id,
+                                        platform_msg_id = %wire_msg.platform_msg_id,
+                                        "duplicate inbound; dropping",
+                                    );
+                                    continue;
+                                }
                                 // Pairing gate: unknown / expired-pending
                                 // triples get a short code back via Notice
                                 // and the message is dropped before any

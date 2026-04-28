@@ -7,7 +7,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { findDownloadableMedia, isMediaItem } from "../dist/media/media-download.js";
+import {
+  findDownloadableMedia,
+  isMediaItem,
+  mediaFallbackText,
+} from "../dist/media/media-download.js";
 import { MessageItemType } from "../dist/api/types.js";
 
 const downloadable = (type, key) => ({
@@ -89,4 +93,34 @@ test("returns null when media item has neither encrypt_query_param nor full_url"
     item_list: [{ type: MessageItemType.IMAGE, image_item: { media: {} } }],
   };
   assert.equal(findDownloadableMedia(msg), null);
+});
+
+test("mediaFallbackText emits short Chinese stubs per kind", () => {
+  assert.equal(
+    mediaFallbackText({ type: MessageItemType.IMAGE }),
+    "[图片]",
+  );
+  assert.equal(
+    mediaFallbackText({ type: MessageItemType.VIDEO }),
+    "[视频]",
+  );
+  assert.equal(
+    mediaFallbackText({ type: MessageItemType.VOICE }),
+    "[语音]",
+  );
+  assert.equal(
+    mediaFallbackText({ type: MessageItemType.FILE }),
+    "[文件]",
+  );
+  assert.equal(
+    mediaFallbackText({
+      type: MessageItemType.FILE,
+      file_item: { file_name: "report.pdf" },
+    }),
+    "[文件: report.pdf]",
+  );
+  assert.equal(
+    mediaFallbackText({ type: MessageItemType.TEXT }),
+    "[媒体]",
+  );
 });

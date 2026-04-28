@@ -30,6 +30,15 @@ export interface BotInboundEvent<ChatId> {
   chat: ChatId;
   platformUserId: string;
   content: string;
+  /**
+   * Platform-native message id (Telegram `update_id`, Weixin `msg_id`,
+   * …). Forwarded to the gateway as `Message.platform_msg_id` so the
+   * gateway can dedup if the sidecar replays the same upstream event
+   * (long-poll buffer replay after restart, transient retries).
+   * Sidecars without a stable id can omit it; dedup is then disabled
+   * for that frame.
+   */
+  platformMsgId?: string;
   attachments?: WireAttachment[];
 }
 
@@ -764,6 +773,7 @@ export class BotChannel<BotHandle, ChatId>
       userId,
       content: ev.content,
       botId,
+      ...(ev.platformMsgId ? { platformMsgId: ev.platformMsgId } : {}),
       ...(ev.attachments && ev.attachments.length > 0
         ? { attachments: ev.attachments }
         : {}),

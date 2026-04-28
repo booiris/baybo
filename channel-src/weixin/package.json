@@ -8,6 +8,14 @@
     "aura-channel-weixin": "./dist/index.js"
   },
   "ilink_appid": "bot",
+  "aura": {
+    "auxAssets": [
+      {
+        "src": "node_modules/silk-wasm/lib/silk.wasm",
+        "name": "silk.wasm"
+      }
+    ]
+  },
   "scripts": {
     "build": "tsc",
     "check": "tsc --noEmit",
@@ -16,7 +24,8 @@
   },
   "dependencies": {
     "@aura/channel-sdk": "workspace:*",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "silk-wasm": "^3.7.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

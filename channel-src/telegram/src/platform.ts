@@ -170,6 +170,13 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
         ? { chatId: chat.id, threadId }
         : { chatId: chat.id };
 
+    // grammy acks each batch via offset, so a duplicate is rare in
+    // steady-state — but a sidecar restart between long-poll fetch and
+    // ack window can replay messages the server still holds. Use
+    // `update.update_id` (bot-scoped, globally unique) as the dedup key
+    // so the gateway can drop replays.
+    const platformMsgId = String(ctx.update.update_id);
+
     const media = pickInboundMedia(message);
     if (media) {
       // Caption (text accompanying the media) or empty when the user
@@ -203,6 +210,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
           chat: address,
           platformUserId: String(from.id),
           content: caption ? `${caption}\n${stub}` : stub,
+          platformMsgId,
         });
         return;
       }
@@ -210,6 +218,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
         chat: address,
         platformUserId: String(from.id),
         content: caption,
+        platformMsgId,
         attachments: [attachment],
       });
       return;
@@ -221,6 +230,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
       chat: address,
       platformUserId: String(from.id),
       content: text,
+      platformMsgId,
     });
   }
 

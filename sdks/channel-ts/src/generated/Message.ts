@@ -24,4 +24,14 @@ import type { WireAttachment } from "./WireAttachment";
  * references them by `blob_id`. Additive; default empty keeps old
  * sidecars wire-compatible.
  */
-export type Message = { content: string, session_id: string, user_id: string, channel_type: string, bot_id?: string, attachments?: Array<WireAttachment>, };
+export type Message = { content: string, session_id: string, user_id: string, channel_type: string, bot_id?: string, attachments?: Array<WireAttachment>, 
+/**
+ * Platform-native message id (Telegram `update_id`, Weixin
+ * `msg_id`, …). When non-empty the gateway dedups inbound traffic
+ * per `(channel_type, bot_id, platform_msg_id)` so a sidecar that
+ * replays its long-poll buffer after a restart doesn't double-fire
+ * the agent. Sidecars without a stable platform id (or that don't
+ * care to dedup) leave it empty. Additive; default empty keeps old
+ * sidecars wire-compatible.
+ */
+platform_msg_id?: string, };

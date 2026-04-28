@@ -78,6 +78,7 @@ ureq = { workspace = true }
 sha2 = { workspace = true }
 zip = { workspace = true }
 zstd = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 aura-gateway = { workspace = true, features = ["test-support"] }
