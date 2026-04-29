@@ -3,10 +3,19 @@
 //! direct-`execvp` fast path (no `sh`, no sandbox, no approval) WHEN
 //! the command is a clean argv. Anything that needs a shell — wrappers,
 //! env-var prefixes, pipelines, redirection, substitution, chaining —
-//! falls back to the sandboxed + approval path. File-content viewers
-//! (`cat`, `head`, `tail`, `sed`, `awk`, …) are rejected at the tool
-//! layer to force the Read/Edit tools. Environment variables and `cd`
-//! changes do NOT persist across invocations.
+//! falls back to the sandboxed path. The sandboxed path also runs
+//! without prompting unless the command tokens contain a file-delete
+//! (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, `find … -delete`)
+//! or a destructive `git` invocation (`clean -f`, `reset --hard`,
+//! `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/
+//! `--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`,
+//! `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`),
+//! in which case the approval gate fires before the sandbox spawn. If
+//! the sandbox itself refuses the command, the user is offered an
+//! unsandboxed retry through a separate approval prompt. File-content
+//! viewers (`cat`, `head`, `tail`, `sed`, `awk`, …) are rejected at the
+//! tool layer to force the Read/Edit tools. Environment variables and
+//! `cd` changes do NOT persist across invocations.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -48,8 +57,18 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
          `timeout 5 ls`, `nohup ls`, `nice ls`), env-var prefixes \
          (`LANG=C ls`), pipelines/redirects/substitution/chaining \
          (`ls; rm`, `ls | head`, `ls $(cat …)`) — falls back to the \
-         sandboxed path with the normal approval gate. The fast lane is \
-         strictly an optimization; nothing is rejected for shape.\n\
+         sandboxed path. The fast lane is strictly an optimization; \
+         nothing is rejected for shape.\n\
+         APPROVAL: sandboxed commands run without prompting by default. \
+         The pre-execution approval gate only fires when the command \
+         tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, \
+         `srm`, `wipe`, or `find … -delete`) or a destructive `git` \
+         operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/\
+         `--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/\
+         `--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, \
+         `update-ref -d`, `filter-branch`, `filter-repo`); a separate \
+         prompt also fires if the sandbox refuses the command (e.g. cwd \
+         outside workspace) and an unsandboxed retry is available.\n\
          Reserve Bash for system commands, git operations, build/test, \
          and terminal tasks that require shell execution.\n\n\
          DEFAULT CWD: If `cwd` is omitted, Aura runs the command from the \
@@ -75,8 +94,6 @@ struct Params {
     timeout_ms: Option<u64>,
     #[serde(default)]
     cwd: Option<PathBuf>,
-    #[serde(default)]
-    description: Option<String>,
 }
 
 #[async_trait]
@@ -95,14 +112,25 @@ impl Tool for BashTool {
             "properties": {
                 "command":    { "type": "string", "description": "The shell command to run" },
                 "timeout_ms": { "type": "integer", "minimum": 1, "description": "Per-command timeout in ms (falls back to the tool context timeout)" },
-                "cwd":        { "type": "string", "description": "Working directory for the command" },
-                "description": {
-                    "type": "string",
-                    "description": "Clear, concise description of what this command does in active voice (5-10 words). Examples: `ls` → \"List files in current directory\"; `git status` → \"Show working tree status\"; `npm install` → \"Install package dependencies\"."
-                }
+                "cwd":        { "type": "string", "description": "Working directory for the command" }
             },
             "required": ["command"]
         })
+    }
+
+    fn call_label(&self, params: &Value) -> Option<String> {
+        let cmd = params.get("command").and_then(|v| v.as_str())?;
+        if contains_delete_command(cmd) {
+            Some(
+                "Destructive command: contains a file-delete operation \
+                 (rm / rmdir / git clean / git reset --hard / …). The \
+                 action is irreversible — review the command and the \
+                 target paths carefully before approving."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
@@ -110,24 +138,28 @@ impl Tool for BashTool {
             .get("command")
             .and_then(|v| v.as_str())
             .map(|s| match classify(s) {
-                BashClass::Sandboxed => vec![ResourceAccess::ExecCommand {
-                    command: s.to_string(),
-                }],
+                // Sandboxed commands skip the pre-execution approval
+                // gate by default. The sandbox itself constrains
+                // filesystem and network reach, and a separate
+                // mid-execution prompt covers the unsandboxed retry
+                // path when the sandbox refuses or the command looks
+                // network-blocked. The exception: file-delete tokens
+                // (rm, rmdir, …, find -delete) still pop the prompt
+                // because a sandboxed delete inside the workspace is
+                // both legitimate AND irreversible.
+                BashClass::Sandboxed if contains_delete_command(s) => {
+                    vec![ResourceAccess::ExecCommand {
+                        command: s.to_string(),
+                    }]
+                }
                 // Metadata: bypass approval; FileToolRedirect: tool will
                 // reject before it ever reaches a sandbox spawn — no
-                // point asking.
-                BashClass::Metadata | BashClass::FileToolRedirect => Vec::new(),
+                // point asking. Sandboxed-without-delete: see above.
+                BashClass::Sandboxed | BashClass::Metadata | BashClass::FileToolRedirect => {
+                    Vec::new()
+                }
             })
             .unwrap_or_default()
-    }
-
-    fn call_label(&self, params: &Value) -> Option<String> {
-        params
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
@@ -144,7 +176,6 @@ impl Tool for BashTool {
             .unwrap_or(ctx.timeout);
 
         let command = p.command;
-        let description = p.description;
         let cwd_ref: Option<&Path> = Some(p.cwd.as_deref().unwrap_or(ctx.workspace_root.as_path()));
 
         let out = match classify(&command) {
@@ -224,9 +255,6 @@ impl Tool for BashTool {
         });
         if let Some(hint) = interpret_exit(&command, out.exit_code) {
             result["return_code_interpretation"] = Value::String(hint.into());
-        }
-        if let Some(desc) = description {
-            result["description"] = Value::String(desc);
         }
 
         Ok(ToolOutput::Json(result))
@@ -327,6 +355,298 @@ fn first_token(command: &str) -> Option<&str> {
 const FORBIDDEN_METACHARS: &[char] = &[
     ';', '&', '|', '$', '`', '<', '>', '(', ')', '{', '}', '\n', '\r',
 ];
+
+/// argv0s that delete files. Compared against the argv0 of each
+/// sub-command (after env-prefix unwrapping) and against tokens that
+/// follow a known wrapper or `find`'s `-exec`/`-execdir`/`-ok`/`-okdir`
+/// primary. `mv` is intentionally absent — it relocates rather than
+/// destroys; `dd`, `truncate`, and `>` redirection can also wipe data
+/// but are too noisy to gate on. Path-prefixed forms (`/usr/bin/rm`)
+/// are normalised through `strip_path` before matching. `-delete` is
+/// the `find` primary, not an argv0, so it lives outside this list and
+/// is checked as "appears anywhere in the argv".
+const STANDALONE_DELETE_TOKENS: &[&str] = &["rm", "rmdir", "unlink", "shred", "srm", "wipe"];
+
+/// Wrappers whose argv0 is itself benign but whose first non-flag
+/// argument is the actual command being executed. We descend into the
+/// wrapped command position rather than parsing each wrapper's flag
+/// grammar perfectly — false positives (one extra approval prompt for
+/// `xargs grep rm file` etc.) are tolerable; missing a real
+/// `xargs rm` / `nohup rm` / `sudo rm` is not.
+const WRAPPER_COMMANDS: &[&str] = &[
+    "xargs", "nohup", "nice", "ionice", "timeout", "sudo", "doas", "env", "command", "exec",
+];
+
+/// True when ANY sub-command of `command` performs a destructive
+/// operation: a standalone delete argv0 (`rm`/`rmdir`/…), `find -delete`
+/// (or `-exec rm`), or a known destructive `git` invocation (see
+/// [`git_args_are_destructive`]). Used by `accessed_resources` to
+/// decide whether the pre-execution approval gate should fire on the
+/// sandboxed path.
+fn contains_delete_command(command: &str) -> bool {
+    split_into_subcommands(command)
+        .iter()
+        .any(|sub| subcommand_is_destructive(sub))
+}
+
+fn subcommand_is_destructive(tokens: &[&str]) -> bool {
+    // Run each raw token through shell_words so that the argv we
+    // actually compare matches what `sh -c` would exec — quotes and
+    // backslash escapes are removed (`'rm'`, `"rm"`, `r'm'`,
+    // `/bin/'rm'`, `\rm`, `"git" reset --hard`, …). Without this step,
+    // surrounding the argv0 with quotes silently bypasses the approval
+    // gate. We fail closed (return true) on parse errors or any token
+    // that yields more than one word: shell ambiguity should escalate
+    // to a prompt, not slip through.
+    let mut unquoted: Vec<String> = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        match shell_words::split(tok) {
+            Ok(mut words) if words.len() <= 1 => {
+                unquoted.push(words.pop().unwrap_or_default());
+            }
+            _ => return true,
+        }
+    }
+
+    // `-delete` is a find primary — it can appear anywhere in the argv
+    // and there's no need to identify a "command position" first.
+    if unquoted.iter().any(|t| t == "-delete") {
+        return true;
+    }
+
+    // `-exec`/`-execdir`/`-ok`/`-okdir` followed by a destructive
+    // wrapped command. `find` semantics: the next token IS the wrapped
+    // argv0; the rest of the argv until `;`/`+` is its argv. We don't
+    // bother parsing the terminator — the argv0 check is enough.
+    for idx in 0..unquoted.len() {
+        if matches!(
+            unquoted[idx].as_str(),
+            "-exec" | "-execdir" | "-ok" | "-okdir"
+        ) && let Some(wrapped) = unquoted.get(idx + 1)
+            && argv0_is_destructive(wrapped, &unquoted[idx + 2..])
+        {
+            return true;
+        }
+    }
+
+    // Identify the sub-command's argv0 — skip env-var assignments
+    // (`KEY=val` prefix) so `LANG=C rm /foo` is recognised correctly.
+    let mut i = 0;
+    while i < unquoted.len() && is_env_assignment(&unquoted[i]) {
+        i += 1;
+    }
+    let Some(argv0) = unquoted.get(i) else {
+        return false;
+    };
+    let rest = &unquoted[i + 1..];
+
+    if argv0_is_destructive(argv0, rest) {
+        return true;
+    }
+
+    // Wrapper case (`xargs rm`, `nohup rm`, `sudo rm`, `LANG=C nice rm`,
+    // …). We don't model each wrapper's flag grammar — any non-flag
+    // token in `rest` is treated as a potential wrapped argv0. This
+    // accepts a few false positives (`xargs grep rm file` would prompt
+    // because `rm` could be the wrapped argv0) in exchange for catching
+    // the common destructive patterns the previous flat-token detector
+    // covered.
+    if WRAPPER_COMMANDS.contains(&strip_path(argv0)) {
+        for (rel_idx, tok) in rest.iter().enumerate() {
+            if tok.starts_with('-') {
+                continue;
+            }
+            if argv0_is_destructive(tok, &rest[rel_idx + 1..]) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn argv0_is_destructive(argv0: &str, rest: &[String]) -> bool {
+    let bare = strip_path(argv0);
+    if STANDALONE_DELETE_TOKENS.contains(&bare) {
+        return true;
+    }
+    if bare == "git" {
+        let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+        return git_args_are_destructive(&args);
+    }
+    false
+}
+
+/// True if `tok` looks like a leading `KEY=value` env assignment.
+/// Bash treats one or more such tokens at the start of a sub-command as
+/// per-invocation env overrides, with the actual argv0 starting after
+/// them. We use the conservative shape `[A-Za-z_][A-Za-z0-9_]*=…`.
+fn is_env_assignment(tok: &str) -> bool {
+    let Some(eq) = tok.find('=') else {
+        return false;
+    };
+    let key = &tok[..eq];
+    if key.is_empty() {
+        return false;
+    }
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `args` is the slice after the literal `git` token. Skip leading
+/// global options (which can take a separate value or embed one with
+/// `=`), then match known destructive subcommand+flag combinations.
+/// The match arms intentionally stay narrow — `git checkout .`, `git
+/// restore`, `git stash pop`, and `git reset --soft` rewrite working
+/// state but don't strictly delete, and gating them under approval is
+/// noisy enough to outweigh the safety win.
+fn git_args_are_destructive(args: &[&str]) -> bool {
+    let mut i = 0;
+    while let Some(&a) = args.get(i) {
+        if matches!(
+            a,
+            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+        ) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        if matches!(a, "-p" | "-P") {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(&sub) = args.get(i) else {
+        return false;
+    };
+    let rest = &args[i + 1..];
+    match sub {
+        "clean" => rest.iter().any(|a| is_git_clean_destructive_flag(a)),
+        "reset" => rest.contains(&"--hard"),
+        "branch" => rest
+            .iter()
+            .any(|a| matches!(*a, "-d" | "-D" | "--delete" | "--delete-merged")),
+        "tag" => rest.iter().any(|a| matches!(*a, "-d" | "--delete")),
+        "push" => rest.iter().any(|a| {
+            matches!(
+                *a,
+                "-f" | "-d" | "--force" | "--force-with-lease" | "--delete"
+            ) || a.starts_with("--force-with-lease=")
+                || a.starts_with("--force-if-includes")
+        }),
+        "stash" => matches!(rest.first().copied(), Some("drop") | Some("clear")),
+        "worktree" => matches!(rest.first().copied(), Some("remove")),
+        "update-ref" => rest.iter().any(|a| matches!(*a, "-d" | "--delete")),
+        "filter-branch" | "filter-repo" => true,
+        // `git rm <pathspec>` removes files from the index (and the
+        // working tree unless `--cached`). Always destructive.
+        "rm" => true,
+        _ => false,
+    }
+}
+
+/// `git clean` only deletes when invoked with `-f`/`--force` (or a
+/// combined short flag containing `f`, e.g. `-fd`, `-fdx`). `-n` /
+/// `--dry-run` and `-i` / `--interactive` alone don't delete; we don't
+/// model `-n` cancelling `-f` — a false-positive prompt for a dry-run
+/// that also passes `-f` is acceptable.
+fn is_git_clean_destructive_flag(arg: &str) -> bool {
+    if arg == "-f" || arg == "--force" {
+        return true;
+    }
+    if arg.starts_with("--") {
+        return false;
+    }
+    if let Some(rest) = arg.strip_prefix('-') {
+        return !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_alphabetic())
+            && rest.contains('f');
+    }
+    false
+}
+
+/// Lightweight tokenizer that respects single- and double-quoted regions
+/// and splits the command into one token-list per sub-command. A
+/// sub-command boundary is `;`, `|`, `&`, `(`, `)`, or backtick (the
+/// last splits even inside double quotes, since command substitution
+/// fires there). Whitespace is a token boundary that stays inside the
+/// current sub-command. Not a full shell parser — variable expansion,
+/// `$(…)` content, and escapes inside single quotes are not
+/// interpreted; the goal is "find argv0s per sub-command, well enough
+/// to drive a security heuristic". The `$` of `$(…)` is left as a
+/// stray token in the outer sub-command and the inner contents form
+/// their own sub-command, which is enough for delete-detection.
+fn split_into_subcommands(command: &str) -> Vec<Vec<&str>> {
+    let bytes = command.as_bytes();
+    let mut subs: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !in_single && b == b'\\' && i + 1 < bytes.len() {
+            if start.is_none() {
+                start = Some(i);
+            }
+            i += 2;
+            continue;
+        }
+        if !in_double && b == b'\'' {
+            if start.is_none() {
+                start = Some(i);
+            }
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && b == b'"' {
+            if start.is_none() {
+                start = Some(i);
+            }
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        let outside_quotes = !in_single && !in_double;
+        let is_subcmd_separator = (outside_quotes && matches!(b, b';' | b'|' | b'&' | b'(' | b')'))
+            || (!in_single && b == b'`');
+        let is_token_separator = outside_quotes && b.is_ascii_whitespace();
+        if is_subcmd_separator {
+            if let Some(s) = start.take() {
+                current.push(&command[s..i]);
+            }
+            if !current.is_empty() {
+                subs.push(std::mem::take(&mut current));
+            }
+        } else if is_token_separator {
+            if let Some(s) = start.take() {
+                current.push(&command[s..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+        i += 1;
+    }
+    if let Some(s) = start {
+        current.push(&command[s..]);
+    }
+    if !current.is_empty() {
+        subs.push(current);
+    }
+    subs
+}
 
 fn parse_metadata_argv(command: &str) -> crate::Result<(String, Vec<String>)> {
     let parts = shell_words::split(command)
@@ -814,34 +1134,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn description_param_round_trips() {
-        let (_fake, sandbox) = fake_with_response(SandboxedOutput::default());
-        let out = BashTool
-            .execute(
-                json!({ "command": "echo hi", "description": "Print greeting" }),
-                &ctx_with(Some(sandbox)),
-            )
-            .await
-            .unwrap();
-        let ToolOutput::Json(v) = out else { panic!() };
-        assert_eq!(v["description"], "Print greeting");
-    }
-
-    #[test]
-    fn bash_call_label_extracts_description() {
-        assert_eq!(
-            BashTool.call_label(&json!({ "command": "ls", "description": "List files" })),
-            Some("List files".into())
-        );
-        assert_eq!(BashTool.call_label(&json!({ "command": "ls" })), None);
-        // Whitespace-only / empty descriptions don't surface a label.
-        assert_eq!(
-            BashTool.call_label(&json!({ "command": "ls", "description": "   " })),
-            None
-        );
-    }
-
-    #[tokio::test]
     async fn sandbox_err_with_approval_approve_falls_back_to_unsandboxed() {
         let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(FailingExecSandbox {
             message: "cwd `/etc` outside workspace".into(),
@@ -1171,7 +1463,9 @@ mod tests {
     }
 
     #[test]
-    fn accessed_resources_skips_metadata_and_file_tool_redirect() {
+    fn accessed_resources_only_prompts_for_delete_tokens() {
+        // Metadata fast lane and the FileToolRedirect rejection both
+        // bypass approval — neither needs it.
         let resources = BashTool.accessed_resources(&json!({ "command": "ls /etc" }));
         assert!(resources.is_empty(), "metadata must not request approval");
 
@@ -1181,12 +1475,78 @@ mod tests {
             "content-read is rejected before sandbox; no approval needed"
         );
 
-        let resources = BashTool.accessed_resources(&json!({ "command": "echo hi" }));
-        assert_eq!(
-            resources.len(),
-            1,
-            "default path still declares ExecCommand"
-        );
+        // Sandboxed-but-non-destructive: the sandbox is the gate, no
+        // approval prompt fires up front.
+        for cmd in ["echo hi", "git status", "cargo build", "ls /tmp; ls /var"] {
+            let resources = BashTool.accessed_resources(&json!({ "command": cmd }));
+            assert!(
+                resources.is_empty(),
+                "{cmd:?} must skip pre-execution approval, got {resources:?}"
+            );
+        }
+
+        // Sandboxed AND destructive: pre-execution approval fires.
+        for cmd in [
+            "rm /tmp/foo",
+            "rm -rf /workspace/scratch",
+            "/usr/bin/rm /tmp/x",
+            "rmdir /tmp/empty",
+            "unlink /tmp/foo",
+            "shred -u secret",
+            "find . -name '*.tmp' -delete",
+            "find /tmp -type f -exec rm {} \\;",
+            "ls /tmp; rm -rf /tmp/scratch",
+            "git status && rm /tmp/foo",
+            "echo hi | xargs rm",
+            "git rm src/legacy.rs",
+            // git destructive ops must also pop approval.
+            "git clean -fd",
+            "git reset --hard origin/main",
+            "git branch -D feature",
+            "git push --force origin main",
+            "git stash drop",
+            "git worktree remove /tmp/wt",
+        ] {
+            let resources = BashTool.accessed_resources(&json!({ "command": cmd }));
+            assert_eq!(
+                resources.len(),
+                1,
+                "{cmd:?} should declare ExecCommand for approval, got {resources:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_command_call_label_warns_user() {
+        // Delete-bearing commands surface a warning label that the
+        // approval UI renders alongside the JSON preview, so the user
+        // notices the irreversible action before clicking through.
+        for cmd in [
+            "rm /tmp/foo",
+            "rm -rf /workspace/scratch",
+            "find . -delete",
+            "git clean -fd",
+            "git reset --hard origin/main",
+            "xargs rm",
+        ] {
+            let label = BashTool.call_label(&json!({ "command": cmd }));
+            let label = label.unwrap_or_else(|| panic!("expected warning label for {cmd:?}"));
+            assert!(
+                label.contains("Destructive") && label.contains("irreversible"),
+                "warning must mention destructive + irreversible for {cmd:?}, got {label:?}"
+            );
+        }
+
+        // Benign commands surface no label so the prompt stays clean
+        // (and the approval gate doesn't fire at all for these — the
+        // label only appears as part of the overall warning UX).
+        for cmd in ["echo hi", "git status", "cargo build", "ls /tmp"] {
+            assert_eq!(
+                BashTool.call_label(&json!({ "command": cmd })),
+                None,
+                "benign command {cmd:?} must not surface a warning label"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1242,16 +1602,337 @@ mod tests {
     }
 
     #[test]
-    fn metadata_with_metachars_declares_exec_command_for_approval() {
-        // Sandboxed reclassification means the approval gate sees an
-        // ExecCommand resource — the user gets the prompt (or auto-mode
-        // policy decides) rather than the request being silently dropped.
-        let resources =
-            BashTool.accessed_resources(&json!({ "command": "ls /tmp; cat /etc/passwd" }));
+    fn metadata_with_metachars_routes_to_sandbox_without_blanket_approval() {
+        // Once a metadata command grows shell metachars it falls back
+        // to the sandboxed path. The sandbox is the gate; the approval
+        // prompt only fires if a delete token is in the mix. The
+        // earlier assumption ("metachars => approval") no longer
+        // holds — callers should rely on the sandbox + delete-token
+        // detection instead.
+        let benign = BashTool.accessed_resources(&json!({ "command": "ls /tmp; cat /etc/passwd" }));
+        assert!(
+            benign.is_empty(),
+            "non-destructive metachar command must skip approval: {benign:?}"
+        );
+
+        let destructive =
+            BashTool.accessed_resources(&json!({ "command": "ls /tmp; rm -rf /workspace" }));
         assert_eq!(
-            resources.len(),
+            destructive.len(),
             1,
-            "expected one ExecCommand: {resources:?}"
+            "destructive metachar command must still prompt: {destructive:?}"
+        );
+    }
+
+    #[test]
+    fn contains_delete_command_handles_quoting_and_paths() {
+        // Real delete invocations.
+        for cmd in [
+            "rm /foo",
+            "rm -rf /foo",
+            "/usr/bin/rm /foo",
+            "rmdir /foo",
+            "unlink /foo",
+            "shred -u secret.txt",
+            "srm sensitive",
+            "wipe -r /foo",
+            "find . -delete",
+            "find . -name foo -delete",
+            "ls; rm /foo",
+            "git status && rmdir /foo",
+            "echo go | xargs rm",
+            "(rm /foo)",
+            "$(rm /foo)",
+            "git rm path/to/file",
+        ] {
+            assert!(
+                contains_delete_command(cmd),
+                "expected delete detection for {cmd:?}"
+            );
+        }
+
+        // Quoted strings that contain "rm" as a substring must NOT
+        // false-match — the literal rm token is inside an opaque
+        // quoted region.
+        for cmd in [
+            "echo 'this is harmless rm text'",
+            "echo \"saying rm here is fine\"",
+            "grep 'rm' file.txt",
+            "git log --grep='rm fix'",
+        ] {
+            assert!(
+                !contains_delete_command(cmd),
+                "quoted rm must not trigger detection in {cmd:?}"
+            );
+        }
+
+        // Substring-only matches (rmail, format, removal, …) MUST NOT
+        // trigger detection. The token equality check covers this.
+        for cmd in [
+            "rmail user",
+            "format /dev/sdb",
+            "echo removal in progress",
+            "grep -rm 5 needle .",
+        ] {
+            assert!(
+                !contains_delete_command(cmd),
+                "substring of delete word must not trigger in {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_delete_command_handles_wrappers_and_env_prefix() {
+        // Wrappers descend into their wrapped command. Each line is an
+        // explicit destructive invocation that must trigger detection.
+        for cmd in [
+            "xargs rm",
+            "xargs -I {} rm /tmp/foo",
+            "xargs -n 5 rm",
+            "xargs -P 4 -n 1 rm",
+            "xargs -0 rm",
+            "echo go | xargs rm",
+            "find /tmp -print0 | xargs -0 -n 5 rm",
+            "nohup rm /foo",
+            "sudo rm /foo",
+            "sudo -u root rm /foo",
+            "doas rm /foo",
+            "nice rm /foo",
+            "ionice rm /foo",
+            "timeout 5 rm /foo",
+            "env rm /foo",
+            "env LANG=C rm /foo",
+            "command rm /foo",
+            "exec rm /foo",
+            "xargs git clean -f",
+            "sudo git reset --hard origin/main",
+            "xargs git rm",
+        ] {
+            assert!(
+                contains_delete_command(cmd),
+                "wrapper-wrapped destructive must trigger in {cmd:?}"
+            );
+        }
+
+        // `KEY=VAL` env-var prefixes don't shift the argv0 — the actual
+        // argv0 still gets checked.
+        for cmd in [
+            "LANG=C rm /foo",
+            "LC_ALL=C TZ=UTC rm -rf /tmp/scratch",
+            "GIT_DIR=/tmp/g git clean -f",
+        ] {
+            assert!(
+                contains_delete_command(cmd),
+                "env-prefixed destructive must trigger in {cmd:?}"
+            );
+        }
+
+        // Wrapper chains where the wrapped command is benign — must not
+        // trigger even though our wrapper-descent is intentionally
+        // aggressive about scanning every non-flag token.
+        for cmd in [
+            "nohup grep foo /tmp/file",
+            "sudo cat /etc/passwd",
+            "timeout 30 cargo build",
+            "env LANG=C ls /tmp",
+            "xargs ls",
+        ] {
+            assert!(
+                !contains_delete_command(cmd),
+                "wrapper around benign command must NOT trigger in {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_delete_command_skips_argument_tokens() {
+        // Non-wrapper commands take their tokens as ARGUMENTS, not as
+        // potential argv0s. `grep rm`, `echo rm`, `printf rm` must NOT
+        // trigger — the prior flat-token scan false-positived these.
+        for cmd in [
+            "grep rm /etc/passwd",
+            "grep 'rm' file.txt",
+            "echo rm",
+            "echo \"will rm later\"",
+            "printf 'rm %s\\n' x",
+            "awk '/rm/' file.txt",
+            "find /tmp -name rm",
+            "sed 's/foo/rm/' file",
+            // unrelated commands whose args mention delete-like words
+            "ls /tmp/rm.bak",
+            "stat -c '%n' rm.txt",
+            // git pathspecs containing 'rm' as a path are not git rm
+            "git log -- path/rm.rs",
+            "git diff path/rm.rs",
+        ] {
+            assert!(
+                !contains_delete_command(cmd),
+                "non-wrapper argument token must NOT trigger detection in {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_delete_command_unquotes_argv0() {
+        // Codex flagged the prior shape: surrounding the argv0 with
+        // quotes (or splicing them mid-word) used to slip past the
+        // delete detector because the token text still carried the
+        // quote chars. shell_words::split on each token now mirrors
+        // what `sh -c` actually execs.
+        for cmd in [
+            "'rm' /tmp/foo",
+            "\"rm\" /tmp/foo",
+            "/bin/'rm' /tmp/foo",
+            "/usr/bin/\"rm\" /tmp/foo",
+            "r'm' /tmp/foo",
+            "r\"m\" /tmp/foo",
+            "\"r\"\"m\" /tmp/foo",
+            "\\rm /tmp/foo",
+            "\"git\" reset --hard",
+            "'git' clean -f",
+            "'git' rm src/legacy.rs",
+            "\"git\" -C /tmp/repo clean -fd",
+        ] {
+            assert!(
+                contains_delete_command(cmd),
+                "quoted argv0 must still trigger detection in {cmd:?}"
+            );
+        }
+
+        // Unmatched quotes / parse errors fail closed — the user gets
+        // a prompt rather than a silent bypass.
+        for cmd in ["'rm /tmp/foo", "\"git reset --hard"] {
+            assert!(
+                contains_delete_command(cmd),
+                "shell parse error must fail closed in {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_delete_command_catches_destructive_git() {
+        // Real destructive git invocations across the supported subcommands
+        // and global-option shapes.
+        for cmd in [
+            "git clean -f",
+            "git clean -fd",
+            "git clean -fdx",
+            "git clean --force",
+            "git -C /tmp/repo clean -f",
+            "git -c color.ui=false clean -f",
+            "git --git-dir=/tmp/g clean -fd",
+            "git --git-dir /tmp/g --work-tree /tmp/w clean -f",
+            "git -p clean -f",
+            "git reset --hard",
+            "git reset --hard HEAD",
+            "git reset --hard origin/main",
+            "git branch -d topic",
+            "git branch -D feature",
+            "git branch --delete topic",
+            "git branch --delete --force topic",
+            "git tag -d v1",
+            "git tag --delete v1",
+            "git push -f",
+            "git push --force",
+            "git push --force-with-lease",
+            "git push --force-with-lease=origin/main",
+            "git push --force-if-includes origin main",
+            "git push --delete origin feature",
+            "git push -d origin feature",
+            "git stash drop",
+            "git stash drop stash@{1}",
+            "git stash clear",
+            "git worktree remove /tmp/wt",
+            "git update-ref -d refs/heads/x",
+            "git update-ref --delete refs/heads/x",
+            "git filter-branch --tree-filter 'true' HEAD",
+            "git filter-repo --invert-paths --path secret",
+            // Pipelines / chains: the destructive sub-command sits next
+            // to a benign one and must still be flagged.
+            "git status; git clean -f",
+            "git fetch && git reset --hard origin/main",
+        ] {
+            assert!(
+                contains_delete_command(cmd),
+                "expected destructive-git detection for {cmd:?}"
+            );
+        }
+
+        // Benign git invocations must NOT trigger.
+        for cmd in [
+            "git status",
+            "git log --oneline",
+            "git diff",
+            "git diff --stat",
+            "git branch",
+            "git branch -a",
+            "git branch -m new-name",
+            "git branch -v",
+            "git tag",
+            "git tag -l",
+            "git tag v1",
+            "git tag --sort=-v:refname",
+            "git push",
+            "git push origin main",
+            "git push --tags",
+            "git fetch",
+            "git pull",
+            "git checkout main",
+            "git checkout .",
+            "git restore .",
+            "git restore --staged .",
+            "git stash",
+            "git stash push",
+            "git stash list",
+            "git stash apply",
+            "git stash pop",
+            "git reset HEAD",
+            "git reset --soft HEAD~",
+            "git reset --mixed HEAD~",
+            "git clean -n",
+            "git clean -dn",
+            "git clean -i",
+            "git worktree list",
+            "git worktree add /tmp/wt feature",
+            "git update-ref refs/heads/x abc123",
+            "git rebase -i HEAD~3",
+            "git commit --amend",
+        ] {
+            assert!(
+                !contains_delete_command(cmd),
+                "benign git command must not trigger detection in {cmd:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn benign_sandboxed_command_runs_without_pre_approval_prompt() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"clean\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+
+        // The pre-execution gate is wired through the registry, not
+        // BashTool::execute itself, so no prompt fires here regardless.
+        // What this test pins is the *resource declaration*: empty for
+        // benign commands so the registry has nothing to gate.
+        let resources = BashTool.accessed_resources(&json!({ "command": "git status" }));
+        assert!(resources.is_empty());
+
+        let out = BashTool
+            .execute(json!({ "command": "git status" }), &ctx)
+            .await
+            .expect("benign command must run");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 0);
+        assert!(
+            gate.requests().is_empty(),
+            "benign command must not pop any in-flight approval prompt: {:?}",
+            gate.requests()
         );
     }
 
