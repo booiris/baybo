@@ -5,7 +5,7 @@ use aura_channels::register_wire::{MAX_FRAME_BYTES, PromptKind, RegisterIn, Regi
 use aura_channels::registration::{Prompter, RegistrationResult};
 use std::path::PathBuf;
 
-use aura_gateway::{NODE_BINARY_ENV, SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
+use aura_gateway::{BUN_BINARY_ENV, SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
 use aura_model::ChannelType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
@@ -37,20 +37,16 @@ pub async fn run_registration(
         ))
     })?;
 
-    let mut cmd = Command::new(node_binary());
-    // Mirror the supervisor's `--no-deprecation` flag — node-fetch@2
-    // and whatwg-url@5 trip DEP0040/DEP0169, which the operator can't
-    // act on and which would clutter the registration prompt output.
-    cmd.arg("--no-deprecation");
+    let mut cmd = Command::new(bun_binary());
     cmd.arg(bundle);
     scrubbed_env(&mut cmd);
     drive(cmd, prompter, timeout).await
 }
 
-fn node_binary() -> PathBuf {
-    std::env::var_os(NODE_BINARY_ENV)
+fn bun_binary() -> PathBuf {
+    std::env::var_os(BUN_BINARY_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("node"))
+        .unwrap_or_else(|| PathBuf::from("bun"))
 }
 
 async fn drive(

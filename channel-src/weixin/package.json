@@ -18,7 +18,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --main-fields=module,main --outfile=dist/bundle.mjs --banner:js=\"import{createRequire as __aR}from'node:module';const require=__aR(import.meta.url);\"",
+    "bundle": "bun build src/index.ts --target=bun --minify --outfile=dist/bundle.mjs",
     "check": "tsc --noEmit",
     "start": "node dist/index.js",
     "test": "node --test 'test/**/*.test.mjs'"
@@ -31,7 +31,6 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
-    "esbuild": "^0.25.0",
     "typescript": "^5.6.0"
   },
   "engines": {

@@ -2,16 +2,17 @@
 //!
 //! The gateway ships each in-tree sidecar (`channel-src/*`) as a
 //! zstd-compressed JS bundle, baked in at build time by `build.rs`.
-//! Sidecars run on the host's `node` binary (resolved from `PATH`) —
-//! no JS runtime is shipped inside the gateway binary. At boot the
-//! gateway materialises every embedded bundle to the user's cache
-//! directory (once per bundle hash) and hands [`ChannelSpawner`] a
-//! `Command` so every sidecar runs as a supervised subprocess.
+//! Sidecars run on the host's `bun` binary (resolved from `PATH`,
+//! override with [`BUN_BINARY_ENV`]) — no JS runtime is shipped
+//! inside the gateway binary. At boot the gateway materialises every
+//! embedded bundle to the user's cache directory (once per bundle
+//! hash) and hands [`ChannelSpawner`] a `Command` so every sidecar
+//! runs as a supervised subprocess.
 //!
 //! Layout on disk (`$XDG_CACHE_HOME/aura/` or `~/.cache/aura/`):
 //!
 //! ```text
-//! sidecars/<channel>-<hash>/bundle.mjs   # plain ESM, run by node
+//! sidecars/<channel>-<hash>/bundle.mjs   # bun-built, run by bun
 //! sidecars/<channel>-<hash>/<aux...>     # any aux assets (e.g. silk.wasm)
 //! ```
 //!
@@ -27,4 +28,4 @@ mod assets;
 mod supervisor;
 
 pub use assets::{SidecarError, SidecarRuntime};
-pub use supervisor::{NODE_BINARY_ENV, SidecarSupervisor};
+pub use supervisor::{BUN_BINARY_ENV, SidecarSupervisor};

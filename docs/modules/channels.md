@@ -132,34 +132,37 @@ drives it: at gateway boot, [`SidecarRuntime::install`]
 materialises each sidecar's JS bundle to
 `$XDG_CACHE_HOME/aura/sidecars/<channel>-<hash>/bundle.mjs` (plus any
 declared aux assets next to it), then one supervised task per embedded
-channel type runs `Command::new("node").arg(bundle).spawn()`
+channel type runs `Command::new("bun").arg(bundle).spawn()`
 through `ChannelSpawner` and restarts on exit with exponential
-backoff (500ms → 30s, reset after ≥60s of stable uptime). The `node`
-executable is resolved from `PATH`; set `AURA_NODE_BIN` to point at a
-specific install (e.g. an nvm-managed copy). Shutdown fans out via the
-shared `ShutdownSignal` — children are SIGKILLed and awaited. Bringing
-up a custom sidecar out-of-tree is still possible: export the two env
-vars yourself (or pass `wsUrl` / `token` to `runChannel`) and run the
-process however you like.
+backoff (500ms → 30s, reset after ≥60s of stable uptime). The `bun`
+executable is resolved from `PATH`; set `AURA_BUN_BIN` to point at a
+specific install. Shutdown fans out via the shared `ShutdownSignal` —
+children are SIGKILLed and awaited. Bringing up a custom sidecar
+out-of-tree is still possible: export the two env vars yourself (or
+pass `wsUrl` / `token` to `runChannel`) and run the process however
+you like.
 
 **Embedded sidecar toolchain.** `crates/gateway/build.rs` runs
 `pnpm --filter <pkg> bundle` for each `channel-src/*` package; the
-`bundle` script in each `package.json` invokes esbuild
-(`--bundle --platform=node --format=esm --target=node20 --minify`) to
-emit a single self-contained `dist/bundle.mjs`. The output, plus any
-`aura.auxAssets` declared in the package (e.g. weixin's `silk.wasm`),
-is zstd-compressed into `target/sidecar-cache/<fingerprint>/` and
-embedded via `include_bytes!`. Sidecar packaging is keyed by the
-relevant sidecar inputs (workspace lockfiles, `channel-src/*`
-sources/configs, and `sdks/channel-ts/dist`): if those inputs are
-unchanged, a later `cargo build` reuses the cached compressed bundles
-instead of re-running esbuild. esbuild's node target inlines the real
-`ws` npm package, but the channel SDK still stays within the WHATWG
-`WebSocket` API (auth token rides in a `?token=…` query-string rather
-than a custom HTTP header) so the SDK works untouched on either
-runtime. Failures (missing `node_modules`, esbuild error, missing
-`pnpm`) degrade to `cargo:warning=…` + empty assets — `cargo build`
-still succeeds, the supervisor just logs "embedded sidecar runtime
+`bundle` script in each `package.json` invokes
+`bun build --target=bun --minify` to emit a single self-contained
+`dist/bundle.mjs`. The output, plus any `aura.auxAssets` declared in
+the package (e.g. weixin's `silk.wasm`), is zstd-compressed into
+`target/sidecar-cache/<fingerprint>/` and embedded via
+`include_bytes!`. Sidecar packaging is keyed by the relevant sidecar
+inputs (workspace lockfiles, `channel-src/*` sources/configs, and
+`sdks/channel-ts/dist`): if those inputs are unchanged, a later
+`cargo build` reuses the cached compressed bundles instead of
+re-running bun. `--target=bun` substitutes bun's own polyfills for
+`ws` (WHATWG `WebSocket`) and `node-fetch` (bun's native fetch); the
+channel SDK is careful to stay within WHATWG `WebSocket` (auth token
+rides in a `?token=…` query-string rather than a custom HTTP header)
+so the same bundle would also run on node, but bun is what we ship
+against because the bun-substituted output dodges several runtime
+landmines in node-fetch@2 / whatwg-url@5 / dual-package CJS deps.
+Failures (missing `node_modules`, bun bundle error, missing `pnpm`)
+degrade to `cargo:warning=…` + empty assets — `cargo build` still
+succeeds, the supervisor just logs "embedded sidecar runtime
 unavailable" and skips the spawn loop. Set `AURA_REQUIRE_SIDECARS=1`
 to flip those degrades into hard build failures for release CI.
 Raw wire types are re-exported under the `./wire` subpath for advanced
@@ -180,7 +183,7 @@ cleanup.
 
 `aura channel add` is a separate, one-shot mode of the same bundle
 that runs the channel at runtime. The CLI spawns
-`node <bundle>` with `AURA_CHANNEL_MODE=register` set; the SDK's
+`bun <bundle>` with `AURA_CHANNEL_MODE=register` set; the SDK's
 [`runSidecar`] notices the env var and dispatches into the channel's
 optional `register(ctx)` hook instead of the normal `runChannel` path.
 There is no WebSocket and no capability token in this mode — the

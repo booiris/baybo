@@ -44,5 +44,5 @@ pub use crate::installer::{
 };
 pub use crate::log_buffer::{LogBuffer, LogBufferLayer, LogLevel, LogPage, LogQuery, LogRecord};
 pub use crate::server::{GatewayDeps, GatewayServer};
-pub use crate::sidecar::{NODE_BINARY_ENV, SidecarError, SidecarRuntime, SidecarSupervisor};
+pub use crate::sidecar::{BUN_BINARY_ENV, SidecarError, SidecarRuntime, SidecarSupervisor};
 pub use crate::spawn::{ChannelSpawner, ChildHandle, SIDECAR_ENV_ALLOWLIST};

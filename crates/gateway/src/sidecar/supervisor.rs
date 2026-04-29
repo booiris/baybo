@@ -4,8 +4,8 @@
 //! restart loop once at least one bot is registered for it. The
 //! supervisor polls [`ChannelBotStore`] on a short tick, and the first
 //! time a channel reports live bots it materialises a
-//! `tokio::process::Command` pointed at `node <bundle>` (with `node`
-//! resolved from `PATH` or [`NODE_BINARY_ENV`]), hands it to
+//! `tokio::process::Command` pointed at `bun <bundle>` (with `bun`
+//! resolved from `PATH` or [`BUN_BINARY_ENV`]), hands it to
 //! [`ChannelSpawner`] (which injects the channel WS URL + a fresh
 //! capability token via env vars — see `spawn.rs`), and starts waiting
 //! on the child. On exit, back off and restart. On shutdown, SIGKILL
@@ -55,11 +55,10 @@ use super::assets::SidecarRuntime;
 
 const SIDECAR_PIPE_LINE_MAX_BYTES: usize = 1024;
 
-/// Override for the `node` binary used to run sidecars. Resolved
-/// lazily at spawn time so a node install elsewhere on disk (e.g. nvm,
-/// asdf) can be pointed at without rebuilding. Defaults to `node`
-/// from `PATH`.
-pub const NODE_BINARY_ENV: &str = "AURA_NODE_BIN";
+/// Override for the `bun` binary used to run sidecars. Resolved
+/// lazily at spawn time so a bun install elsewhere on disk can be
+/// pointed at without rebuilding. Defaults to `bun` from `PATH`.
+pub const BUN_BINARY_ENV: &str = "AURA_BUN_BIN";
 
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -74,13 +73,13 @@ const BOT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 type ChannelLogWriter = Arc<RedactingMakeWriter<NonBlocking>>;
 
-/// Resolve the `node` executable path used to run sidecars. Honours
-/// the `AURA_NODE_BIN` override; otherwise relies on `PATH` resolution
+/// Resolve the `bun` executable path used to run sidecars. Honours
+/// the `AURA_BUN_BIN` override; otherwise relies on `PATH` resolution
 /// inside `Command::new`.
-pub(crate) fn node_binary() -> PathBuf {
-    std::env::var_os(NODE_BINARY_ENV)
+pub(crate) fn bun_binary() -> PathBuf {
+    std::env::var_os(BUN_BINARY_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("node"))
+        .unwrap_or_else(|| PathBuf::from("bun"))
 }
 
 /// Drives the restart loop for every embedded sidecar that has at
@@ -201,19 +200,11 @@ impl SidecarSupervisor {
             Some(p) => p.to_owned(),
             None => return,
         };
-        let node = node_binary();
+        let bun = bun_binary();
 
         let mut backoff = BACKOFF_MIN;
         while !shutdown.is_shutdown() {
-            let mut cmd = Command::new(&node);
-            // `--no-deprecation` silences node's deprecation warnings
-            // (DEP0040 from `whatwg-url@5`'s `require("punycode")`,
-            // DEP0169 from `node-fetch@2`'s `url.parse()`, and
-            // anything else third-party deps trip in future node
-            // versions). Sidecars are bundled third-party JS — the
-            // operator can't act on these warnings, they only add
-            // noise to `telegram.log`.
-            cmd.arg("--no-deprecation");
+            let mut cmd = Command::new(&bun);
             cmd.arg(&bundle);
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
