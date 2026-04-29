@@ -52,6 +52,8 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
          strictly an optimization; nothing is rejected for shape.\n\
          Reserve Bash for system commands, git operations, build/test, \
          and terminal tasks that require shell execution.\n\n\
+         DEFAULT CWD: If `cwd` is omitted, Aura runs the command from the \
+         workspace work directory and exports `PWD` with the same value.\n\n\
          PATHS: Any directory or file argument inside the command (cd, ls, \
          mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional \
          `cwd` parameter MUST also be absolute when provided — relative \
@@ -143,7 +145,7 @@ impl Tool for BashTool {
 
         let command = p.command;
         let description = p.description;
-        let cwd_ref: Option<&Path> = p.cwd.as_deref();
+        let cwd_ref: Option<&Path> = Some(p.cwd.as_deref().unwrap_or(ctx.workspace_root.as_path()));
 
         let out = match classify(&command) {
             BashClass::FileToolRedirect => {
@@ -398,6 +400,7 @@ async fn run_unsandboxed(
     cmd.args(args);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
+        cmd.env("PWD", dir);
     }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -500,6 +503,15 @@ mod tests {
             sandbox,
             approval: None,
         }
+    }
+
+    fn ctx_with_workspace(
+        sandbox: Option<Arc<dyn crate::ExecSandbox>>,
+        workspace_root: PathBuf,
+    ) -> ToolContext {
+        let mut ctx = ctx_with(sandbox);
+        ctx.workspace_root = workspace_root;
+        ctx
     }
 
     fn ctx_with_approval(
@@ -1040,6 +1052,40 @@ mod tests {
             !v["stdout"].as_str().unwrap_or("").is_empty(),
             "pwd should print the current working directory"
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_pwd_defaults_to_workspace_root() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let ctx = ctx_with_workspace(None, workspace.path().to_path_buf());
+
+        let out = BashTool
+            .execute(json!({ "command": "pwd" }), &ctx)
+            .await
+            .expect("pwd must run on metadata fast path");
+        let ToolOutput::Json(v) = out else { panic!() };
+        let stdout = v["stdout"].as_str().unwrap_or("").trim();
+        let actual = Path::new(stdout).canonicalize().expect("pwd output path");
+        let expected = workspace.path().canonicalize().expect("workspace path");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_runner_exports_pwd_from_effective_cwd() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let out = run_unsandboxed("env", &[], Some(workspace.path()), Duration::from_secs(5))
+            .await
+            .expect("env must run");
+        let stdout = String::from_utf8(out.stdout).expect("env stdout");
+        let pwd = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("PWD="))
+            .expect("PWD in env");
+        let actual = Path::new(pwd).canonicalize().expect("PWD path");
+        let expected = workspace.path().canonicalize().expect("workspace path");
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

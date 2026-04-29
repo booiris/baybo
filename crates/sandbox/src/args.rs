@@ -114,7 +114,16 @@ pub(crate) fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
             }
         }
     }
+    out.push(("PWD".into(), effective_pwd(spec)));
     out
+}
+
+pub(crate) fn effective_pwd(spec: &SandboxSpec) -> String {
+    spec.cwd
+        .as_deref()
+        .unwrap_or(spec.workspace_root.as_path())
+        .display()
+        .to_string()
 }
 
 /// Build the `docker run …` argv for the cross-platform fallback runner.
@@ -543,6 +552,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_env_sets_pwd_to_workspace_when_cwd_missing() {
+        let spec = spec_for(NetworkPolicy::None, "/tmp/ws");
+        let env = resolve_env(&spec);
+        assert_eq!(
+            env.iter()
+                .find_map(|(k, v)| (k == "PWD").then_some(v.as_str())),
+            Some("/tmp/ws")
+        );
+    }
+
+    #[test]
+    fn resolve_env_sets_pwd_to_explicit_cwd() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/ws");
+        spec.cwd = Some(PathBuf::from("/tmp/ws/subdir"));
+        let env = resolve_env(&spec);
+        assert_eq!(
+            env.iter()
+                .find_map(|(k, v)| (k == "PWD").then_some(v.as_str())),
+            Some("/tmp/ws/subdir")
+        );
+    }
+
+    #[test]
     fn bwrap_argv_terminates_args_with_double_dash() {
         let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
         let strs = argv_strs(&argv);
@@ -656,6 +688,22 @@ mod tests {
         let strs = argv_strs(&argv);
         let i = strs.iter().position(|a| a == "-v").expect("-v present");
         assert_eq!(strs[i + 1], "/tmp/myws:/tmp/myws");
+    }
+
+    #[test]
+    fn docker_argv_exports_pwd_to_workspace() {
+        let argv = build_docker_argv(
+            &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            None,
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        assert!(
+            strs.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "PWD=/tmp/myws"),
+            "expected docker env PWD=/tmp/myws in argv: {strs:?}"
+        );
     }
 
     #[test]

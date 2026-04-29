@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::SandboxRunner;
-use crate::args::render_sbpl_profile;
+use crate::args::{effective_pwd, render_sbpl_profile};
 use crate::bootstrap::{SandboxAvailability, locate_binary, parse_version};
 use crate::error::SandboxError;
 use crate::spec::{Backend, EnvPolicy, SandboxOutput, SandboxSpec, StdinSource};
@@ -80,6 +80,7 @@ impl SandboxRunner for SandboxExecRunner {
         cmd.arg("env").arg("-i");
         cmd.arg("PATH=/usr/bin:/bin:/usr/sbin:/sbin");
         cmd.arg(format!("HOME={}", spec.workspace_root.display()));
+        cmd.arg(format!("PWD={}", effective_pwd(&spec)));
         cmd.arg(format!("TMPDIR={}", scratch_path.display()));
         cmd.arg(format!("TMP={}", scratch_path.display()));
         cmd.arg(format!("TEMP={}", scratch_path.display()));
