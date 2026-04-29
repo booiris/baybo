@@ -188,7 +188,9 @@ impl Tool for BashTool {
                     res = sandbox.spawn_command(Path::new("sh"), &args, cwd_ref, None, timeout) => res,
                 };
                 match attempt {
-                    Ok(out) => out,
+                    Ok(out) => {
+                        maybe_escalate_for_network(&command, cwd_ref, timeout, ctx, out).await?
+                    }
                     Err(sandbox_err) => {
                         // Sandbox infrastructure refused the command (cwd
                         // outside workspace, bwrap setup failure, runner
@@ -334,6 +336,104 @@ fn parse_metadata_argv(command: &str) -> crate::Result<(String, Vec<String>)> {
         .next()
         .ok_or_else(|| ToolError::InvalidParams("metadata command was empty".into()))?;
     Ok((program, iter.collect()))
+}
+
+/// Lower-cased substrings that imply the sandbox blocked DNS or network.
+/// Includes generic L4 phrases like "connection refused" / "connection
+/// timed out" — they will sometimes fire for local IPC or unrelated
+/// services, but the cost is one extra approval prompt that the user
+/// can deny, and the upside is catching tools that surface only a bare
+/// L4 error when a sandbox blackholes outbound traffic.
+const NETWORK_FAILURE_PATTERNS: &[&str] = &[
+    "could not resolve host",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "getaddrinfo failed",
+    "nodename nor servname provided",
+    "network is unreachable",
+    "no route to host",
+    "connection refused",
+    "connection timed out",
+    "curl: (6)",
+    "curl: (7)",
+    "curl: (28)",
+    "wget: unable to resolve",
+    "eai_again",
+    "enotfound",
+    "etimedout",
+    "econnrefused",
+    "dial tcp",
+];
+
+fn looks_like_network_failure(stderr: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(stderr).to_lowercase();
+    NETWORK_FAILURE_PATTERNS.iter().any(|pat| s.contains(pat))
+}
+
+/// When a sandboxed `Bash` invocation returns a non-zero exit AND its
+/// stderr matches a high-signal network-block pattern, ask the user
+/// whether to retry the SAME command unsandboxed (which inherits the
+/// host's network). On approve, the unsandboxed run replaces `out`. On
+/// deny or missing approval handle, `out` is returned unchanged so the
+/// command's actual failure is still surfaced to the agent.
+///
+/// Bypasses the approval cache: a prior approval for the sandboxed run
+/// does not cover the elevated unsandboxed-with-network path, and we
+/// never persist auto-approve here either.
+async fn maybe_escalate_for_network(
+    command: &str,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    ctx: &ToolContext,
+    out: crate::SandboxedOutput,
+) -> crate::Result<crate::SandboxedOutput> {
+    if out.exit_code == 0 || !looks_like_network_failure(&out.stderr) {
+        return Ok(out);
+    }
+    let Some(approval) = ctx.approval.as_ref() else {
+        return Ok(out);
+    };
+
+    let stderr_excerpt = {
+        let raw = String::from_utf8_lossy(&out.stderr);
+        let trimmed: String = raw.lines().take(5).collect::<Vec<_>>().join("\n");
+        if trimmed.is_empty() {
+            "<empty>".to_string()
+        } else {
+            trimmed
+        }
+    };
+    let preview = format!(
+        "Sandboxed `Bash` exited {exit} and stderr looks like a network block.\n\
+         Command : {command}\n\
+         Stderr  : {stderr_excerpt}\n\
+         Approve to retry the SAME command WITHOUT the OS sandbox \
+         (full host network, no workspace cwd guard, no resource limits).",
+        exit = out.exit_code
+    );
+    let decision = approval
+        .request_uncached(
+            "Bash",
+            &ctx.session_id,
+            &ctx.user,
+            vec![ResourceAccess::ExecCommand {
+                command: command.to_string(),
+            }],
+            preview,
+        )
+        .await;
+    match decision {
+        ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
+            let args = ["-c".to_string(), command.to_string()];
+            tokio::select! {
+                _ = ctx.cancellation_token.cancelled() => {
+                    Err(ToolError::Execution("cancelled".into()))
+                }
+                res = run_unsandboxed("sh", &args, cwd, timeout) => res,
+            }
+        }
+        ApprovalDecision::Deny => Ok(out),
+    }
 }
 
 async fn prompt_and_run_unsandboxed_retry(
@@ -837,6 +937,157 @@ mod tests {
         assert!(
             gate.requests().is_empty(),
             "no approval prompt for non-zero exit: {:?}",
+            gate.requests()
+        );
+    }
+
+    #[test]
+    fn network_failure_patterns_match_known_signals() {
+        assert!(looks_like_network_failure(
+            b"curl: (6) Could not resolve host: example.com\n"
+        ));
+        assert!(looks_like_network_failure(
+            b"wget: unable to resolve host address 'foo.bar'\n"
+        ));
+        assert!(looks_like_network_failure(
+            b"ping: connect: Network is unreachable\n"
+        ));
+        assert!(looks_like_network_failure(
+            b"fatal: unable to access 'https://x/': Could not resolve host: x\n"
+        ));
+        assert!(looks_like_network_failure(
+            b"dial tcp: lookup api.foo.com on 8.8.8.8:53: no such host\n"
+        ));
+        assert!(looks_like_network_failure(b"npm ERR! errno EAI_AGAIN\n"));
+        assert!(looks_like_network_failure(
+            b"getaddrinfo failed: Name or service not known\n"
+        ));
+        // Generic L4 errors are now matched on purpose. Yes, they will
+        // sometimes fire on local IPC; the cost is a denyable prompt
+        // and the upside is catching tools that surface only a bare
+        // L4 message when a sandbox blackholes outbound traffic.
+        assert!(looks_like_network_failure(
+            b"curl: (7) Failed to connect to example.com port 443: Connection refused\n"
+        ));
+        assert!(looks_like_network_failure(
+            b"curl: (28) Connection timed out after 30000 ms\n"
+        ));
+        assert!(looks_like_network_failure(
+            b"node: Error: connect ECONNREFUSED 1.2.3.4:443\n"
+        ));
+        assert!(looks_like_network_failure(
+            b"node: Error: connect ETIMEDOUT 1.2.3.4:443\n"
+        ));
+        // True negatives — unrelated failure modes.
+        assert!(!looks_like_network_failure(b"some other failure\n"));
+        assert!(!looks_like_network_failure(b"permission denied\n"));
+    }
+
+    #[tokio::test]
+    async fn network_stderr_with_approval_falls_back_to_unsandboxed() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 6,
+            stdout: Vec::new(),
+            stderr: b"curl: (6) Could not resolve host: example.com\n".to_vec(),
+            timed_out: false,
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+
+        // Approved → unsandboxed retry runs `sh -c "echo ok"` on the
+        // host with full network. We don't actually reach the network;
+        // we just verify the host-shell path took over (exit 0).
+        let out = BashTool
+            .execute(json!({ "command": "echo ok" }), &ctx)
+            .await
+            .expect("approved network-escalation retry must succeed");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 0);
+
+        let reqs = gate.requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "expected exactly one network-escalation prompt: {reqs:?}"
+        );
+        assert!(
+            reqs[0].params_preview.contains("network block")
+                && reqs[0].params_preview.contains("Could not resolve host")
+                && reqs[0].params_preview.contains("WITHOUT the OS sandbox"),
+            "preview missing network-escalation context: {}",
+            reqs[0].params_preview
+        );
+    }
+
+    #[tokio::test]
+    async fn network_stderr_with_deny_returns_original_sandbox_output() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 6,
+            stdout: Vec::new(),
+            stderr: b"curl: (6) Could not resolve host: example.com\n".to_vec(),
+            timed_out: false,
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+
+        let out = BashTool
+            .execute(json!({ "command": "curl https://example.com" }), &ctx)
+            .await
+            .expect("deny returns original output, not an error");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 6);
+        assert!(
+            v["stderr"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Could not resolve host"),
+            "denied retry must surface the original sandboxed stderr: {v:?}"
+        );
+        assert_eq!(
+            gate.requests().len(),
+            1,
+            "deny still costs exactly one prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_stderr_without_approval_handle_returns_original_output() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 6,
+            stdout: Vec::new(),
+            stderr: b"curl: (6) Could not resolve host: example.com\n".to_vec(),
+            timed_out: false,
+        });
+        // No approval handle wired — fall back silently to the
+        // sandboxed result rather than erroring out.
+        let ctx = ctx_with(Some(sandbox));
+        let out = BashTool
+            .execute(json!({ "command": "curl https://example.com" }), &ctx)
+            .await
+            .expect("no approval handle must surface original output");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 6);
+    }
+
+    #[tokio::test]
+    async fn non_network_failure_does_not_trigger_escalation_prompt() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: b"oops something else broke\n".to_vec(),
+            timed_out: false,
+        });
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+        let out = BashTool
+            .execute(json!({ "command": "do-thing" }), &ctx)
+            .await
+            .expect("non-network non-zero exit just returns out");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 1);
+        assert!(
+            gate.requests().is_empty(),
+            "non-network failure must NOT prompt: {:?}",
             gate.requests()
         );
     }
