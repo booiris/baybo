@@ -132,12 +132,10 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = [
 ] }
 rmp-serde = "1"
 ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
-# Sidecar embedding: zstd decompresses bun + JS bundles at runtime; ureq
-# + zip run only in `crates/gateway/build.rs` to fetch the pinned bun
-# release at compile time.
+# Sidecar embedding: zstd decompresses each esbuild-produced JS bundle
+# at runtime. Bundles themselves are produced by `pnpm bundle` in
+# `crates/gateway/build.rs`.
 zstd = "0.13"
-ureq = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
 # MCP client: rmcp for the protocol + transports, oauth2 for the
 # authorization-code-with-PKCE flow, `open` to launch the user's browser
 # during `aura mcp add` against an OAuth-protected HTTP server, base64 for

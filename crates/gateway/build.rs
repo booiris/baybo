@@ -9,23 +9,25 @@
 //!   `$OUT_DIR/webui_assets.rs` with one compressed `include_bytes!`
 //!   arm per asset. The runtime lazily decompresses the table on first
 //!   request.
-//! * **Sidecars** — fetches the pinned `bun` release (version in
-//!   `.bun-version` at the repo root), uses it to bundle each
-//!   `channel-src/*` package into a single JS blob, zstd-compresses
-//!   both the runtime and each bundle, and emits
-//!   `$OUT_DIR/sidecar_assets.rs` that the gateway's `sidecar` module
-//!   consumes.
+//! * **Sidecars** — runs `pnpm --filter @aura/channel-<name> bundle`
+//!   for each `channel-src/*` package (each script invokes `esbuild`
+//!   to produce a single self-contained ESM file at `dist/bundle.mjs`),
+//!   zstd-compresses the bundle plus any aux assets declared in
+//!   `package.json`, and emits `$OUT_DIR/sidecar_assets.rs` that the
+//!   gateway's `sidecar` module consumes. Sidecars are spawned at
+//!   runtime with the host's `node` binary (resolved from `PATH`) —
+//!   no JS runtime is shipped inside the gateway binary.
 //!
-//! The sidecar pipeline degrades gracefully: if the download fails,
-//! node_modules aren't populated, or bun chokes on a bundle, we emit an
-//! assets file with empty slices and print `cargo:warning=…`. The
-//! gateway supervisor then skips spawning sidecars and logs a
+//! The sidecar pipeline degrades gracefully: if `pnpm` is missing,
+//! `node_modules` aren't populated, or esbuild chokes on a bundle, we
+//! emit an assets file with empty slices and print `cargo:warning=…`.
+//! The gateway supervisor then skips spawning sidecars and logs a
 //! one-liner — `cargo build` itself never fails because of sidecar
 //! packaging trouble.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -337,7 +339,7 @@ fn list_dir_entries(dir: &Path) -> Vec<PathBuf> {
 /// output is cached for unchanged sidecar inputs and the binary ships
 /// to every user, paying the build-time cost is the right tradeoff.
 const ZSTD_LEVEL: i32 = 19;
-const SIDECAR_CACHE_SCHEMA_VERSION: &str = "2";
+const SIDECAR_CACHE_SCHEMA_VERSION: &str = "3";
 
 struct AuxAsset {
     name: String,
@@ -368,55 +370,13 @@ fn embed_sidecars(ws_root: &Path) {
     let generated = out_dir.join("sidecar_assets.rs");
     let strict = sidecars_required();
 
-    let bun_version = match read_bun_version(ws_root) {
-        Ok(v) => v,
-        Err(e) => {
-            sidecar_failure(strict, &e);
-            write_empty_sidecar_assets(&generated, "unknown", "unknown");
-            return;
-        }
-    };
-
-    emit_rerun_if_changed(&ws_root.join(".bun-version"));
     println!("cargo:rerun-if-env-changed={STRICT_SIDECARS_ENV}");
-
-    // `host_target` is the bun build needs to actually exec on this
-    // machine to bundle TS → JS. `runtime_target` is the bun we ship
-    // inside the binary so it can exec on the final aura host.
-    // Conflating the two silently broke `cargo build --target ≠ host`
-    // (host couldn't exec the target binary, bundling failed, build
-    // succeeded with empty sidecars).
-    let Some(host_target) = detect_host_bun_target() else {
-        let msg = format!(
-            "unsupported build host for bun (os={}, arch={}); sidecars disabled",
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-        );
-        sidecar_failure(strict, &msg);
-        write_empty_sidecar_assets(&generated, &bun_version, "unsupported-host");
-        return;
-    };
-    let Some(runtime_target) = detect_runtime_bun_target() else {
-        let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-        let msg =
-            format!("unsupported runtime target for bun (os={os}, arch={arch}); sidecars disabled");
-        sidecar_failure(strict, &msg);
-        write_empty_sidecar_assets(&generated, &bun_version, "unsupported-target");
-        return;
-    };
 
     // `channel-src/` holds one directory per in-tree sidecar.
     let sidecars_dir = ws_root.join("channel-src");
     let sidecar_dirs = list_sidecar_dirs(&sidecars_dir);
     let cache_root = ws_root.join("target").join("sidecar-cache");
-    let input_fingerprint = match sidecar_input_fingerprint(
-        ws_root,
-        &bun_version,
-        &host_target,
-        &runtime_target,
-        &sidecar_dirs,
-    ) {
+    let input_fingerprint = match sidecar_input_fingerprint(ws_root, &sidecar_dirs) {
         Ok(fingerprint) => fingerprint,
         Err(e) => {
             println!("cargo:warning=hash sidecar inputs failed ({e}); rebuilding sidecars");
@@ -432,13 +392,7 @@ fn embed_sidecars(ws_root: &Path) {
     if !input_fingerprint.is_empty() {
         match load_sidecar_cache(&cache_dir) {
             Ok(Some(cache)) => {
-                emit_sidecar_assets(
-                    &generated,
-                    &bun_version,
-                    &runtime_target,
-                    Some(cache.bun_zst.as_path()),
-                    &cache.sidecars,
-                );
+                emit_sidecar_assets(&generated, &cache);
                 return;
             }
             Ok(None) => {}
@@ -448,38 +402,13 @@ fn embed_sidecars(ws_root: &Path) {
         }
     }
 
-    let host_bun = match ensure_bun(ws_root, &bun_version, &host_target) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("host bun download failed ({e}); sidecars disabled");
-            sidecar_failure(strict, &msg);
-            write_empty_sidecar_assets(&generated, &bun_version, &runtime_target);
-            return;
-        }
-    };
-    let runtime_bun = if runtime_target == host_target {
-        host_bun.clone()
-    } else {
-        match ensure_bun(ws_root, &bun_version, &runtime_target) {
-            Ok(p) => p,
-            Err(e) => {
-                let msg = format!(
-                    "runtime bun download failed for {runtime_target} ({e}); sidecars disabled"
-                );
-                sidecar_failure(strict, &msg);
-                write_empty_sidecar_assets(&generated, &bun_version, &runtime_target);
-                return;
-            }
-        }
-    };
-
     if let Err(e) = fs::create_dir_all(&cache_dir) {
         let msg = format!(
             "create sidecar cache dir {} failed: {e}",
             cache_dir.display()
         );
         sidecar_failure(strict, &msg);
-        write_empty_sidecar_assets(&generated, &bun_version, &runtime_target);
+        write_empty_sidecar_assets(&generated);
         return;
     }
 
@@ -492,6 +421,34 @@ fn embed_sidecars(ws_root: &Path) {
             println!("cargo:warning=sidecar '{name}' has no src/index.ts; skipping",);
             continue;
         }
+        let pkg_name = match read_package_name(&dir.join("package.json")) {
+            Ok(n) => n,
+            Err(e) => {
+                bundling_failures += 1;
+                let msg = format!("read sidecar '{name}' package.json failed: {e}");
+                sidecar_failure(strict, &msg);
+                continue;
+            }
+        };
+        match bundle_with_pnpm(ws_root, &pkg_name) {
+            Ok(()) => {}
+            Err(e) => {
+                bundling_failures += 1;
+                let msg = format!("bundling sidecar '{name}' failed: {e}");
+                sidecar_failure(strict, &msg);
+                continue;
+            }
+        }
+        let bundle_src = dir.join("dist/bundle.mjs");
+        if !bundle_src.exists() {
+            bundling_failures += 1;
+            let msg = format!(
+                "bundling sidecar '{name}' produced no {}",
+                bundle_src.display()
+            );
+            sidecar_failure(strict, &msg);
+            continue;
+        }
         let aux_assets = match sidecar_aux_assets(dir) {
             Ok(assets) => assets,
             Err(e) => {
@@ -501,31 +458,31 @@ fn embed_sidecars(ws_root: &Path) {
                 continue;
             }
         };
-        let bundle_path = cache_dir.join(format!("{name}.js"));
-        match bundle_with_bun(&host_bun, &entry_ts, &bundle_path) {
-            Ok(()) => {
-                let hash = match sidecar_content_hash(&bundle_path, &aux_assets) {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        bundling_failures += 1;
-                        let msg = format!("hash sidecar '{name}' failed: {e}");
-                        sidecar_failure(strict, &msg);
-                        continue;
-                    }
-                };
-                entries.push(BuiltSidecar {
-                    name: name.to_string(),
-                    bundle_path,
-                    content_hash: hash,
-                    aux_assets,
-                });
-            }
+        let bundle_path = cache_dir.join(format!("{name}.mjs"));
+        if let Err(e) = fs::copy(&bundle_src, &bundle_path) {
+            bundling_failures += 1;
+            let msg = format!(
+                "copy bundle for sidecar '{name}' from {} failed: {e}",
+                bundle_src.display()
+            );
+            sidecar_failure(strict, &msg);
+            continue;
+        }
+        let hash = match sidecar_content_hash(&bundle_path, &aux_assets) {
+            Ok(hash) => hash,
             Err(e) => {
                 bundling_failures += 1;
-                let msg = format!("bundling sidecar '{name}' failed: {e}");
+                let msg = format!("hash sidecar '{name}' failed: {e}");
                 sidecar_failure(strict, &msg);
+                continue;
             }
-        }
+        };
+        entries.push(BuiltSidecar {
+            name: name.to_string(),
+            bundle_path,
+            content_hash: hash,
+            aux_assets,
+        });
     }
     if strict && bundling_failures > 0 {
         // sidecar_failure has already paniced above, but defensively
@@ -533,20 +490,9 @@ fn embed_sidecars(ws_root: &Path) {
         panic!("{STRICT_SIDECARS_ENV} is set but {bundling_failures} sidecar(s) failed to bundle",);
     }
 
-    // Compress bun + each bundle into the content-addressed sidecar
-    // cache. The generated Rust then points `include_bytes!` at those
-    // absolute paths.
-    let bun_zst = cache_dir.join("bun.zst");
-    if let Err(e) = compress_file(&runtime_bun, &bun_zst) {
-        let msg = format!("compress bun runtime failed: {e}");
-        sidecar_failure(strict, &msg);
-        write_empty_sidecar_assets(&generated, &bun_version, &runtime_target);
-        return;
-    }
-
     let mut emitted: Vec<EmittedSidecar> = Vec::new();
     for entry in &entries {
-        let zst_path = cache_dir.join(format!("{}.js.zst", entry.name));
+        let zst_path = cache_dir.join(format!("{}.mjs.zst", entry.name));
         if let Err(e) = compress_file(&entry.bundle_path, &zst_path) {
             let name = entry.name.as_str();
             let msg = format!("compress sidecar '{name}' failed: {e}");
@@ -593,13 +539,7 @@ fn embed_sidecars(ws_root: &Path) {
         println!("cargo:warning=write sidecar cache manifest failed: {e}");
     }
 
-    emit_sidecar_assets(
-        &generated,
-        &bun_version,
-        &runtime_target,
-        Some(&bun_zst),
-        &emitted,
-    );
+    emit_sidecar_assets(&generated, &emitted);
 }
 
 /// Opt-in CI/release gate: when set to `1`/`true`, any sidecar
@@ -623,172 +563,6 @@ fn sidecar_failure(strict: bool, msg: &str) {
     println!("cargo:warning={msg}");
 }
 
-fn read_bun_version(ws_root: &Path) -> Result<String, String> {
-    let path = ws_root.join(".bun-version");
-    let raw = fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "read {}: {e}; sidecars disabled (create the file with a bun version number)",
-            path.display()
-        )
-    })?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{} is empty", path.display()));
-    }
-    // Defend against paste errors ("v1.2.18\n" → "1.2.18").
-    Ok(trimmed.trim_start_matches('v').to_owned())
-}
-
-/// bun release naming for the **host** that runs `build.rs` — i.e.
-/// the bun we'll exec to bundle TS → JS at compile time.
-fn detect_host_bun_target() -> Option<String> {
-    bun_target(std::env::consts::OS, std::env::consts::ARCH)
-}
-
-/// bun release naming for the cargo **target** triple — i.e. the bun
-/// we compress into the binary so it can exec on the final aura host.
-/// Different from the host when cross-compiling.
-fn detect_runtime_bun_target() -> Option<String> {
-    let os = std::env::var("CARGO_CFG_TARGET_OS").ok()?;
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").ok()?;
-    bun_target(&os, &arch)
-}
-
-fn bun_target(os: &str, arch: &str) -> Option<String> {
-    match (os, arch) {
-        ("linux", "x86_64") => Some("linux-x64".into()),
-        ("linux", "aarch64") => Some("linux-aarch64".into()),
-        ("macos", "x86_64") => Some("darwin-x64".into()),
-        ("macos", "aarch64") => Some("darwin-aarch64".into()),
-        _ => None,
-    }
-}
-
-/// Download + cache the pinned bun release. Cache path sits under
-/// `target/bun-cache/` so a `cargo clean` wipes it, but any other
-/// rebuild reuses the extracted binary. Returns a path to the
-/// executable-bit-set `bun` on disk. Verifies the downloaded zip's
-/// sha256 against `.bun-shasums` — mismatch is a hard fail;
-/// missing entry downgrades to an unverified download with a loud
-/// cargo:warning.
-fn ensure_bun(ws_root: &Path, version: &str, target: &str) -> Result<PathBuf, String> {
-    let cache_dir = ws_root.join("target").join("bun-cache");
-    fs::create_dir_all(&cache_dir).map_err(|e| format!("mkdir cache: {e}"))?;
-    let dest = cache_dir.join(format!("bun-{version}-{target}"));
-    if dest.exists() {
-        // Cache hit: trust. The shasum check ran at the original
-        // download, and `target/` is under the user's build tree.
-        return Ok(dest);
-    }
-
-    let expected_sha = load_pinned_sha(ws_root, target);
-    println!(
-        "cargo:rerun-if-changed={}",
-        ws_root.join(".bun-shasums").display(),
-    );
-
-    let url =
-        format!("https://github.com/oven-sh/bun/releases/download/bun-v{version}/bun-{target}.zip");
-    println!("cargo:warning=downloading bun {version} for {target}...");
-    let resp = ureq::get(&url)
-        .call()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-
-    let mut zip_bytes = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut zip_bytes)
-        .map_err(|e| format!("read zip body: {e}"))?;
-
-    let got_sha = sha256_hex_full(&zip_bytes);
-    match expected_sha {
-        Some(expected) if expected == got_sha => {}
-        Some(expected) => {
-            // Hard fail, not a graceful-degrade condition. A sha
-            // mismatch means either `.bun-shasums` is wrong or the
-            // release bytes changed underneath us — in either case
-            // we must not silently ship an unpinned binary.
-            panic!(
-                "sha256 mismatch for bun-{target}.zip:\n  expected {expected}\n  got      {got_sha}\n\
-                 The pinned release was replaced or the download was tampered with. Refusing to build.\n\
-                 If the version bump is intentional, update .bun-shasums and commit.",
-            );
-        }
-        None => {
-            println!(
-                "cargo:warning=no pinned sha256 for bun-{target}.zip in .bun-shasums; \
-                 proceeding UNVERIFIED (computed {got_sha}). \
-                 Add this line to .bun-shasums to pin:",
-            );
-            println!("cargo:warning={got_sha}  bun-{target}.zip");
-        }
-    }
-
-    // Upstream zip layout: `bun-{target}/bun`.
-    let reader = std::io::Cursor::new(&zip_bytes);
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| format!("open zip: {e}"))?;
-    let inner_name = format!("bun-{target}/bun");
-    let mut entry = archive
-        .by_name(&inner_name)
-        .map_err(|e| format!("{inner_name} not in zip: {e}"))?;
-
-    let tmp = dest.with_extension("part");
-    let mut out = fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    std::io::copy(&mut entry, &mut out).map_err(|e| format!("extract bun: {e}"))?;
-    drop(entry);
-    drop(out);
-
-    // Set +x before the rename so the final name is never a
-    // non-executable file that a concurrent build would find first.
-    set_executable(&tmp)?;
-    fs::rename(&tmp, &dest).map_err(|e| format!("rename extracted bun: {e}"))?;
-    Ok(dest)
-}
-
-/// Parse `.bun-shasums` (SHASUMS256-style: `<hex> <2sp> <filename>`)
-/// and pluck the entry matching `bun-{target}.zip`. Returns `None`
-/// on file-not-found or no-matching-line — the caller downgrades to
-/// an unverified download with a warning.
-fn load_pinned_sha(ws_root: &Path, target: &str) -> Option<String> {
-    let raw = fs::read_to_string(ws_root.join(".bun-shasums")).ok()?;
-    let needle = format!("bun-{target}.zip");
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Expected: "<64-hex>  <filename>". Accept any whitespace
-        // between the two so hand-edited files don't trip on tabs.
-        let mut parts = line.split_whitespace();
-        let hex = parts.next()?;
-        let name = parts.next()?;
-        if name == needle && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Some(hex.to_ascii_lowercase());
-        }
-    }
-    None
-}
-
-fn sha256_hex_full(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for b in digest {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn set_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).map_err(|e| format!("chmod: {e}"))
-}
-
 fn list_sidecar_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let Ok(reader) = fs::read_dir(root) else {
@@ -804,13 +578,7 @@ fn list_sidecar_dirs(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn sidecar_input_fingerprint(
-    ws_root: &Path,
-    bun_version: &str,
-    host_target: &str,
-    runtime_target: &str,
-    sidecar_dirs: &[PathBuf],
-) -> Result<String, String> {
+fn sidecar_input_fingerprint(ws_root: &Path, sidecar_dirs: &[PathBuf]) -> Result<String, String> {
     let input_roots = sidecar_input_roots(ws_root, sidecar_dirs);
     println!(
         "cargo:rerun-if-changed={}",
@@ -831,12 +599,6 @@ fn sidecar_input_fingerprint(
     let mut hasher = Sha256::new();
     hasher.update(SIDECAR_CACHE_SCHEMA_VERSION.as_bytes());
     hasher.update([0]);
-    hasher.update(bun_version.as_bytes());
-    hasher.update([0]);
-    hasher.update(host_target.as_bytes());
-    hasher.update([0]);
-    hasher.update(runtime_target.as_bytes());
-    hasher.update([0]);
     for path in &input_roots {
         hash_path_state(&mut hasher, ws_root, path)?;
     }
@@ -855,12 +617,6 @@ fn sidecar_input_roots(ws_root: &Path, sidecar_dirs: &[PathBuf]) -> Vec<PathBuf>
         paths.push(dir.join("src"));
         paths.push(dir.join("package.json"));
         paths.push(dir.join("tsconfig.json"));
-        paths.push(dir.join("bunfig.toml"));
-        if let Ok(aux_assets) = sidecar_aux_assets(dir) {
-            for aux in aux_assets {
-                paths.push(aux.src);
-            }
-        }
     }
     paths.sort();
     paths.dedup();
@@ -928,31 +684,35 @@ fn hash_path_state(hasher: &mut sha2::Sha256, ws_root: &Path, path: &Path) -> Re
     Ok(())
 }
 
-/// `bun build <entry> --target=bun --minify --outfile=<out>`.
-///
-/// `--target=bun` is the leaner option (~60 KB smaller bundle after
-/// zstd) because bun substitutes its own polyfill for the `ws` npm
-/// package and the polyfill is WHATWG-`WebSocket`-backed. The
-/// channel SDK is careful to stay within WHATWG — it puts the auth
-/// token in the URL query (`?token=…`) rather than a custom HTTP
-/// header, since the standard `WebSocket` constructor can't set
-/// request headers. If the SDK ever needs to send headers again,
-/// flip this back to `--target=node` so the real `ws` library is
-/// inlined.
-fn bundle_with_bun(bun: &Path, entry: &Path, out_file: &Path) -> Result<(), String> {
-    let output = Command::new(bun)
-        .arg("build")
-        .arg(entry)
-        .arg("--target=bun")
-        .arg("--minify")
-        .arg("--outfile")
-        .arg(out_file)
+fn read_package_name(package_json: &Path) -> Result<String, String> {
+    let raw = fs::read_to_string(package_json)
+        .map_err(|e| format!("read {}: {e}", package_json.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", package_json.display()))?;
+    value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{} has no string `name`", package_json.display()))
+}
+
+/// Run `pnpm --filter <pkg> bundle` inside the workspace. The script
+/// is defined in each sidecar's `package.json` and invokes esbuild to
+/// emit a single self-contained `dist/bundle.mjs` for the host's
+/// `node` to consume at runtime.
+fn bundle_with_pnpm(ws_root: &Path, pkg_name: &str) -> Result<(), String> {
+    let output = Command::new("pnpm")
+        .arg("--filter")
+        .arg(pkg_name)
+        .arg("bundle")
+        .current_dir(ws_root)
         .output()
-        .map_err(|e| format!("spawn bun: {e}"))?;
+        .map_err(|e| format!("spawn pnpm: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "bun build exited {}: {}",
+            "pnpm bundle exited {}: stdout={}, stderr={}",
             output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         ));
     }
@@ -1082,28 +842,9 @@ fn hex_short(bytes: &[u8], len: usize) -> String {
     out
 }
 
-fn emit_sidecar_assets(
-    generated: &Path,
-    bun_version: &str,
-    bun_target: &str,
-    bun_zst_path: Option<&Path>,
-    sidecars: &[EmittedSidecar],
-) {
+fn emit_sidecar_assets(generated: &Path, sidecars: &[EmittedSidecar]) {
     let mut out = fs::File::create(generated).expect("create sidecar_assets.rs");
     writeln!(out, "// @generated by build.rs — do not edit.").unwrap();
-    writeln!(out, "pub(crate) const BUN_VERSION: &str = {bun_version:?};",).unwrap();
-    writeln!(out, "pub(crate) const BUN_TARGET: &str = {bun_target:?};").unwrap();
-    if sidecars.is_empty() {
-        writeln!(out, "pub(crate) const BUN_RUNTIME_ZST: &[u8] = &[];").unwrap();
-    } else if let Some(path) = bun_zst_path {
-        writeln!(
-            out,
-            "pub(crate) const BUN_RUNTIME_ZST: &[u8] = include_bytes!({path:?});",
-        )
-        .unwrap();
-    } else {
-        writeln!(out, "pub(crate) const BUN_RUNTIME_ZST: &[u8] = &[];").unwrap();
-    }
     writeln!(
         out,
         "pub(crate) struct SidecarAuxAsset {{ \
@@ -1143,26 +884,17 @@ fn emit_sidecar_assets(
     writeln!(out, "];").unwrap();
 }
 
-fn write_empty_sidecar_assets(generated: &Path, bun_version: &str, bun_target: &str) {
-    emit_sidecar_assets(generated, bun_version, bun_target, None, &[]);
+fn write_empty_sidecar_assets(generated: &Path) {
+    emit_sidecar_assets(generated, &[]);
 }
 
-struct SidecarCache {
-    bun_zst: PathBuf,
-    sidecars: Vec<EmittedSidecar>,
-}
-
-fn load_sidecar_cache(cache_dir: &Path) -> Result<Option<SidecarCache>, String> {
+fn load_sidecar_cache(cache_dir: &Path) -> Result<Option<Vec<EmittedSidecar>>, String> {
     let manifest = cache_dir.join("manifest.tsv");
     if !manifest.exists() {
         return Ok(None);
     }
     let raw =
         fs::read_to_string(&manifest).map_err(|e| format!("read {}: {e}", manifest.display()))?;
-    let bun_zst = cache_dir.join("bun.zst");
-    if !bun_zst.exists() {
-        return Ok(None);
-    }
 
     let mut sidecars: BTreeMap<String, EmittedSidecar> = BTreeMap::new();
     for line in raw.lines() {
@@ -1178,7 +910,7 @@ fn load_sidecar_cache(cache_dir: &Path) -> Result<Option<SidecarCache>, String> 
                         manifest.display()
                     ));
                 }
-                let zst_path = cache_dir.join(format!("{name}.js.zst"));
+                let zst_path = cache_dir.join(format!("{name}.mjs.zst"));
                 if !zst_path.exists() {
                     return Ok(None);
                 }
@@ -1221,10 +953,7 @@ fn load_sidecar_cache(cache_dir: &Path) -> Result<Option<SidecarCache>, String> 
         }
     }
 
-    Ok(Some(SidecarCache {
-        bun_zst,
-        sidecars: sidecars.into_values().collect(),
-    }))
+    Ok(Some(sidecars.into_values().collect()))
 }
 
 fn write_sidecar_cache_manifest(

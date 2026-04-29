@@ -104,8 +104,8 @@ Two flavours of token end up in the table:
   uniqueness + same-UID-only delivery already cover the threat
   model.
 
-For runtimes whose WebSocket client cannot set custom headers (bun's
-WHATWG client, browser-style clients) the listener also accepts
+For runtimes whose WebSocket client cannot set custom headers (any
+WHATWG `WebSocket`, browser-style clients) the listener also accepts
 `?token=<hex>` on the upgrade URL. The auth middleware strips the
 query parameter from the request URI before the inner `TraceLayer`
 runs so the secret never lands in structured logs.

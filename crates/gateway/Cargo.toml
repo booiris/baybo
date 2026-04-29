@@ -71,12 +71,10 @@ zstd = { workspace = true }
 tempfile = { workspace = true }
 
 [build-dependencies]
-# build.rs fetches the pinned bun release (version in `.bun-version` at
-# the repo root) and bundles each `channel-src/*` sidecar into a JS
-# payload. Both are zstd-compressed before `include_bytes!`.
-ureq = { workspace = true }
+# build.rs runs `pnpm --filter <sidecar> bundle` (which invokes esbuild)
+# to produce a single ESM file per channel-src/* package, hashes the
+# inputs, and zstd-compresses each bundle before `include_bytes!`.
 sha2 = { workspace = true }
-zip = { workspace = true }
 zstd = { workspace = true }
 serde_json = { workspace = true }
 

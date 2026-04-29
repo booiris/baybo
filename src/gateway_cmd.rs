@@ -405,8 +405,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
             } else {
                 tracing::info!(
                     channel_types = ?channel_types,
-                    bun_version = aura_gateway::sidecar::bun_version(),
-                    bun_target = runtime.bun_target(),
                     channel_port,
                     "sidecar supervisor active; channels start on first registered bot",
                 );

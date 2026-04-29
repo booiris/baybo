@@ -149,7 +149,7 @@ fn check_channel_token(
 ) -> std::result::Result<Option<AuthedClient>, StatusCode> {
     // Header first, then `?token=` query. The query form lets sidecar
     // runtimes whose WebSocket client can't set custom HTTP headers
-    // (bun's native WHATWG WebSocket, any browser-style client) still
+    // (any WHATWG `WebSocket`, browser-style clients) still
     // authenticate — a loopback-only listener's access logs stay
     // same-UID-local, so the usual "don't put secrets in URLs"
     // warning doesn't bite here.

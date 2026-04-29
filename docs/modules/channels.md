@@ -129,37 +129,39 @@ builds is `ws://127.0.0.1:<port>/v1/channel-ws` where `<port>` comes
 from [`ChannelServer::port`] after it binds on `127.0.0.1:0`.
 [`SidecarSupervisor`] (`crates/gateway/src/sidecar/supervisor.rs`)
 drives it: at gateway boot, [`SidecarRuntime::install`]
-materialises the pinned `bun` runtime and each sidecar's JS bundle
-to `$XDG_CACHE_HOME/aura/{runtime, sidecars}/`, then one supervised
-task per embedded channel type `Command::new(bun).arg(bundle).spawn()`s
+materialises each sidecar's JS bundle to
+`$XDG_CACHE_HOME/aura/sidecars/<channel>-<hash>/bundle.mjs` (plus any
+declared aux assets next to it), then one supervised task per embedded
+channel type runs `Command::new("node").arg(bundle).spawn()`
 through `ChannelSpawner` and restarts on exit with exponential
-backoff (500ms → 30s, reset after ≥60s of stable uptime). Shutdown
-fans out via the shared `ShutdownSignal` — children are SIGKILLed
-and awaited. Bringing up a custom sidecar out-of-tree is still
-possible: export the two env vars yourself (or pass `wsUrl` /
-`token` to `runChannel`) and run the process however you like.
+backoff (500ms → 30s, reset after ≥60s of stable uptime). The `node`
+executable is resolved from `PATH`; set `AURA_NODE_BIN` to point at a
+specific install (e.g. an nvm-managed copy). Shutdown fans out via the
+shared `ShutdownSignal` — children are SIGKILLed and awaited. Bringing
+up a custom sidecar out-of-tree is still possible: export the two env
+vars yourself (or pass `wsUrl` / `token` to `runChannel`) and run the
+process however you like.
 
-**Embedded sidecar toolchain.** `crates/gateway/build.rs` fetches the
-bun release pinned in `.bun-version` at the repo root into
-`target/bun-cache/` (one-time, cached across rebuilds), verifies the
-downloaded zip's sha256 against `.bun-shasums` (mismatch = hard-fail
-panic; missing entry for the current target = loud cargo:warning +
-unverified download with the line to paste in), runs
-`bun build --target=bun --minify` over each
-`channel-src/*/src/index.ts`, and zstd-compresses both the runtime
-and every bundle before `include_bytes!`. Sidecar packaging is keyed by
-the relevant sidecar inputs (workspace lockfiles, `channel-src/*`
+**Embedded sidecar toolchain.** `crates/gateway/build.rs` runs
+`pnpm --filter <pkg> bundle` for each `channel-src/*` package; the
+`bundle` script in each `package.json` invokes esbuild
+(`--bundle --platform=node --format=esm --target=node20 --minify`) to
+emit a single self-contained `dist/bundle.mjs`. The output, plus any
+`aura.auxAssets` declared in the package (e.g. weixin's `silk.wasm`),
+is zstd-compressed into `target/sidecar-cache/<fingerprint>/` and
+embedded via `include_bytes!`. Sidecar packaging is keyed by the
+relevant sidecar inputs (workspace lockfiles, `channel-src/*`
 sources/configs, and `sdks/channel-ts/dist`): if those inputs are
 unchanged, a later `cargo build` reuses the cached compressed bundles
-instead of re-running bun. `--target=bun` lets bun
-substitute its own WS polyfill for the `ws` npm package — the
-channel SDK stays within the WHATWG `WebSocket` API (auth token
-rides in a `?token=…` query-string rather than a custom HTTP
-header, since the standard constructor can't set headers). Other
-failures (no network,
-missing `node_modules`, bun error) degrade to `cargo:warning=…` +
-empty assets — `cargo build` still succeeds, the supervisor just
-logs "embedded sidecar runtime unavailable" and skips the spawn loop.
+instead of re-running esbuild. esbuild's node target inlines the real
+`ws` npm package, but the channel SDK still stays within the WHATWG
+`WebSocket` API (auth token rides in a `?token=…` query-string rather
+than a custom HTTP header) so the SDK works untouched on either
+runtime. Failures (missing `node_modules`, esbuild error, missing
+`pnpm`) degrade to `cargo:warning=…` + empty assets — `cargo build`
+still succeeds, the supervisor just logs "embedded sidecar runtime
+unavailable" and skips the spawn loop. Set `AURA_REQUIRE_SIDECARS=1`
+to flip those degrades into hard build failures for release CI.
 Raw wire types are re-exported under the `./wire` subpath for advanced
 callers. There is no Rust SDK — the TUI
 has its own private WS client, and the server is authoritative on the
@@ -178,7 +180,7 @@ cleanup.
 
 `aura channel add` is a separate, one-shot mode of the same bundle
 that runs the channel at runtime. The CLI spawns
-`bun <bundle>` with `AURA_CHANNEL_MODE=register` set; the SDK's
+`node <bundle>` with `AURA_CHANNEL_MODE=register` set; the SDK's
 [`runSidecar`] notices the env var and dispatches into the channel's
 optional `register(ctx)` hook instead of the normal `runChannel` path.
 There is no WebSocket and no capability token in this mode — the

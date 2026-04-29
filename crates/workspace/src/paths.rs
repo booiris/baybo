@@ -113,9 +113,6 @@ pub const CHANNEL_LOGS_SUBDIR: &str = "channel";
 /// Aura subdirectory under `$XDG_CACHE_HOME` (or `$HOME/.cache`).
 pub const CACHE_SUBDIR: &str = "aura";
 
-/// Subdirectory holding extracted bun runtimes inside the cache.
-pub const CACHE_RUNTIME_SUBDIR: &str = "runtime";
-
 // ---------------------------------------------------------------------------
 // Environment variables tied to path resolution
 // ---------------------------------------------------------------------------
