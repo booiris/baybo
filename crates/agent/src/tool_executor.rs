@@ -8,7 +8,7 @@ use aura_job::OperationKind;
 use aura_model::TrustLevel;
 use aura_model::User;
 
-use aura_sandbox::{NetworkPolicy, SandboxRunner};
+use aura_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use aura_tools::{
     ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalRequest, ApprovedResource,
     ExecSandbox, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
@@ -213,21 +213,35 @@ impl ToolExecutor {
         }
 
         // Build per-call sandbox adapter for tools declaring ExecCommand.
+        // ExecCommand-capable tools (today: only `Bash`) get the
+        // permissive filesystem model: workspace_root + $HOME bound RW
+        // (FHS roots stay RO), with a denylist of credential vaults
+        // (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker`,
+        // plus the agent's own state dir under `~/.aura`) masked by
+        // per-call tmpfs. Network is granted unconditionally — shells
+        // are general-purpose and almost always need git/cargo/npm to
+        // reach upstream. Tighter isolation is still available for
+        // CodeBuilder (which constructs its own SandboxSpec with
+        // `FilesystemPolicy::Workspace`).
         let sandbox: Option<Arc<dyn ExecSandbox>> = if let Some(manifest) =
             self.tool_registry.get_manifest(tool_name)
             && manifest.capabilities.contains(&ToolCapability::ExecCommand)
         {
-            let policy = if manifest.capabilities.contains(&ToolCapability::Http) {
-                NetworkPolicy::All
-            } else {
-                NetworkPolicy::None
-            };
             self.sandbox_runner.as_ref().map(|runner| {
-                Arc::new(SandboxAdapter::new(
-                    Arc::clone(runner),
-                    self.workspace_root.clone(),
-                    policy,
-                )) as Arc<dyn ExecSandbox>
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                let aura_state = std::env::var_os("AURA_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| home.as_ref().map(|h| h.join(".aura")));
+                let extra_root = home.clone().unwrap_or_else(|| self.workspace_root.clone());
+                let denied = default_sensitive_denylist(home.as_deref(), aura_state.as_deref());
+                Arc::new(
+                    SandboxAdapter::new(
+                        Arc::clone(runner),
+                        self.workspace_root.clone(),
+                        NetworkPolicy::All,
+                    )
+                    .with_permissive_filesystem(extra_root, denied),
+                ) as Arc<dyn ExecSandbox>
             })
         } else {
             None

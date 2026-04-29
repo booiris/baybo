@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::WorkspaceSymlinkMount;
-use crate::spec::{EnvPolicy, NetworkPolicy, SandboxSpec};
+use crate::spec::{EnvPolicy, FilesystemPolicy, NetworkPolicy, SandboxSpec};
 
 const BWRAP_RO_ROOTS: &[&str] = &[
     "/usr",
@@ -34,42 +34,92 @@ pub fn build_bwrap_argv(
         NetworkPolicy::None => push(&mut argv, "--unshare-net"),
         NetworkPolicy::All => push(&mut argv, "--share-net"),
     }
-    push(&mut argv, "--proc");
-    push(&mut argv, "/proc");
-    push(&mut argv, "--dev");
-    push(&mut argv, "/dev");
-    push(&mut argv, "--tmpfs");
-    push(&mut argv, "/tmp");
 
-    for root in BWRAP_RO_ROOTS {
-        argv.push(OsString::from("--ro-bind-try"));
-        argv.push(OsString::from(*root));
-        argv.push(OsString::from(*root));
-    }
+    match &spec.filesystem_policy {
+        FilesystemPolicy::Workspace => {
+            push(&mut argv, "--proc");
+            push(&mut argv, "/proc");
+            push(&mut argv, "--dev");
+            push(&mut argv, "/dev");
+            push(&mut argv, "--tmpfs");
+            push(&mut argv, "/tmp");
 
-    argv.push(OsString::from("--bind"));
-    argv.push(spec.workspace_root.as_os_str().to_owned());
-    argv.push(spec.workspace_root.as_os_str().to_owned());
+            for root in BWRAP_RO_ROOTS {
+                argv.push(OsString::from("--ro-bind-try"));
+                argv.push(OsString::from(*root));
+                argv.push(OsString::from(*root));
+            }
 
-    // Mount a validated symlink spelling of the requested cwd so the
-    // sandbox can chdir to the path the caller supplied. bwrap creates
-    // the intermediate directories on the tmpfs root automatically.
-    if let Some(mount) = workspace_symlink_mount {
-        argv.push(OsString::from("--bind"));
-        argv.push(mount.source().as_os_str().to_owned());
-        argv.push(mount.destination().as_os_str().to_owned());
-    }
+            argv.push(OsString::from("--bind"));
+            argv.push(spec.workspace_root.as_os_str().to_owned());
+            argv.push(spec.workspace_root.as_os_str().to_owned());
 
-    for path in &spec.readable_paths {
-        argv.push(OsString::from("--ro-bind-try"));
-        argv.push(path.as_os_str().to_owned());
-        argv.push(path.as_os_str().to_owned());
-    }
+            // Mount a validated symlink spelling of the requested cwd
+            // so the sandbox can chdir to the path the caller supplied.
+            // bwrap creates the intermediate directories on the tmpfs
+            // root automatically.
+            if let Some(mount) = workspace_symlink_mount {
+                argv.push(OsString::from("--bind"));
+                argv.push(mount.source().as_os_str().to_owned());
+                argv.push(mount.destination().as_os_str().to_owned());
+            }
 
-    for path in &spec.writable_paths {
-        argv.push(OsString::from("--bind"));
-        argv.push(path.as_os_str().to_owned());
-        argv.push(path.as_os_str().to_owned());
+            for path in &spec.readable_paths {
+                argv.push(OsString::from("--ro-bind-try"));
+                argv.push(path.as_os_str().to_owned());
+                argv.push(path.as_os_str().to_owned());
+            }
+
+            for path in &spec.writable_paths {
+                argv.push(OsString::from("--bind"));
+                argv.push(path.as_os_str().to_owned());
+                argv.push(path.as_os_str().to_owned());
+            }
+        }
+        FilesystemPolicy::Permissive {
+            extra_root,
+            denied_paths,
+        } => {
+            push(&mut argv, "--proc");
+            push(&mut argv, "/proc");
+            push(&mut argv, "--dev");
+            push(&mut argv, "/dev");
+            push(&mut argv, "--tmpfs");
+            push(&mut argv, "/tmp");
+
+            // FHS roots stay RO so installed binaries and resolver
+            // config still work. `--ro-bind-try` is forgiving on hosts
+            // where one of these doesn't exist (e.g. `/lib64` on some
+            // Debian flavours).
+            for root in BWRAP_RO_ROOTS {
+                argv.push(OsString::from("--ro-bind-try"));
+                argv.push(OsString::from(*root));
+                argv.push(OsString::from(*root));
+            }
+
+            // workspace_root is always RW so the project the agent was
+            // launched in stays writable even when it lives outside
+            // `extra_root` (e.g. `/data/proj` while $HOME is
+            // `/home/u`). bwrap accepts overlapping binds; if the
+            // workspace already sits inside extra_root, the second
+            // bind is a redundant no-op.
+            argv.push(OsString::from("--bind"));
+            argv.push(spec.workspace_root.as_os_str().to_owned());
+            argv.push(spec.workspace_root.as_os_str().to_owned());
+
+            argv.push(OsString::from("--bind-try"));
+            argv.push(extra_root.as_os_str().to_owned());
+            argv.push(extra_root.as_os_str().to_owned());
+
+            // Each denied path becomes an empty per-call tmpfs that
+            // hides the host directory underneath. Non-existent paths
+            // are silently skipped at the SandboxAdapter layer so
+            // bwrap never sees a `--tmpfs <missing>` line.
+            for path in denied_paths {
+                argv.push(OsString::from("--tmpfs"));
+                argv.push(path.as_os_str().to_owned());
+            }
+        }
     }
 
     for (k, v) in resolve_env(spec) {
@@ -271,57 +321,123 @@ pub fn render_sbpl_profile(
     s.push_str("(allow process-exec)\n");
     s.push_str("(allow signal (target self))\n\n");
 
-    s.push_str("(allow file-read*\n");
-    for p in [
-        "/usr",
-        "/System",
-        "/Library",
-        "/private/var/db/dyld",
-        "/private/etc",
-        "/bin",
-        "/sbin",
-        "/private/tmp",
-    ] {
-        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(Path::new(p))));
-    }
-    s.push_str(&format!(
-        "  (subpath \"{}\")\n",
-        sbpl_quote(&spec.workspace_root)
-    ));
-    if let Some(mount) = workspace_symlink_mount {
-        s.push_str(&format!(
-            "  (subpath \"{}\")\n",
-            sbpl_quote(mount.destination())
-        ));
-    }
-    for p in &spec.readable_paths {
-        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
-    }
-    for p in &spec.writable_paths {
-        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
-    }
-    s.push_str(")\n\n");
+    match &spec.filesystem_policy {
+        FilesystemPolicy::Workspace => {
+            s.push_str("(allow file-read*\n");
+            for p in [
+                "/usr",
+                "/System",
+                "/Library",
+                "/private/var/db/dyld",
+                "/private/etc",
+                "/bin",
+                "/sbin",
+                "/private/tmp",
+            ] {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(Path::new(p))));
+            }
+            s.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "  (subpath \"{}\")\n",
+                    sbpl_quote(mount.destination())
+                ));
+            }
+            for p in &spec.readable_paths {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            }
+            for p in &spec.writable_paths {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            }
+            s.push_str(")\n\n");
 
-    // Workspace is the only host path the child may write to. Host temp
-    // directories (`/private/tmp`, `/private/var/folders`) are deliberately
-    // excluded — the macOS runner sets `TMPDIR` to a per-invocation
-    // scratch dir under the workspace so anything respecting `$TMPDIR`
-    // lands in the workspace bind instead of leaking onto the host.
-    s.push_str("(allow file-write*\n");
-    s.push_str(&format!(
-        "  (subpath \"{}\")\n",
-        sbpl_quote(&spec.workspace_root)
-    ));
-    if let Some(mount) = workspace_symlink_mount {
-        s.push_str(&format!(
-            "  (subpath \"{}\")\n",
-            sbpl_quote(mount.destination())
-        ));
+            // Workspace is the only host path the child may write to.
+            // Host temp directories (`/private/tmp`,
+            // `/private/var/folders`) are deliberately excluded — the
+            // macOS runner sets `TMPDIR` to a per-invocation scratch
+            // dir under the workspace so anything respecting `$TMPDIR`
+            // lands in the workspace bind instead of leaking onto the
+            // host.
+            s.push_str("(allow file-write*\n");
+            s.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "  (subpath \"{}\")\n",
+                    sbpl_quote(mount.destination())
+                ));
+            }
+            for p in &spec.writable_paths {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            }
+            s.push_str(")\n\n");
+        }
+        FilesystemPolicy::Permissive {
+            extra_root,
+            denied_paths,
+        } => {
+            // Allow read on the FHS-mac equivalent + workspace +
+            // extra_root; allow write on workspace + extra_root only.
+            // Then deny read+write on each sensitive subpath via
+            // last-match-wins so credential vaults stay opaque even
+            // though they sit under `extra_root`.
+            s.push_str("(allow file-read*\n");
+            for p in [
+                "/usr",
+                "/System",
+                "/Library",
+                "/private/var/db/dyld",
+                "/private/etc",
+                "/bin",
+                "/sbin",
+            ] {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(Path::new(p))));
+            }
+            s.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(extra_root)));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "  (subpath \"{}\")\n",
+                    sbpl_quote(mount.destination())
+                ));
+            }
+            s.push_str(")\n\n");
+
+            s.push_str("(allow file-write*\n");
+            s.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(extra_root)));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "  (subpath \"{}\")\n",
+                    sbpl_quote(mount.destination())
+                ));
+            }
+            s.push_str(")\n\n");
+
+            for p in denied_paths {
+                s.push_str(&format!(
+                    "(deny file-read* (subpath \"{}\"))\n",
+                    sbpl_quote(p)
+                ));
+                s.push_str(&format!(
+                    "(deny file-write* (subpath \"{}\"))\n",
+                    sbpl_quote(p)
+                ));
+            }
+            s.push('\n');
+        }
     }
-    for p in &spec.writable_paths {
-        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
-    }
-    s.push_str(")\n\n");
 
     s.push_str("(allow mach-lookup)\n");
     s.push_str("(allow ipc-posix-shm)\n");
@@ -396,6 +512,7 @@ mod tests {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: crate::spec::ResourceLimits::default(),
+            filesystem_policy: FilesystemPolicy::default(),
         }
     }
 
@@ -497,6 +614,81 @@ mod tests {
         assert!(
             write_block.contains("(subpath \"/home/u/proj/.aura/work\")"),
             "requested symlink path must be writable: {write_block}"
+        );
+    }
+
+    #[test]
+    fn bwrap_argv_permissive_binds_workspace_and_extra_root_rw_and_masks_denied_paths() {
+        // Pick workspace_root OUTSIDE extra_root so we exercise the
+        // case where the project lives outside $HOME (e.g.
+        // `/data/proj` while $HOME is `/home/agent`).
+        let mut spec = spec_for(NetworkPolicy::All, "/data/proj");
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/agent"),
+            denied_paths: vec![
+                PathBuf::from("/home/agent/.ssh"),
+                PathBuf::from("/home/agent/.aws"),
+            ],
+        };
+        let argv = build_bwrap_argv(&spec, None);
+        let strs = argv_strs(&argv);
+
+        // No host-root bind. Workspace and extra_root each get an
+        // explicit RW bind; extra_root uses --bind-try because $HOME
+        // can be missing on minimal containers / CI environments.
+        assert!(
+            !strs
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/" && w[2] == "/"),
+            "permissive mode must NOT bind host root: {strs:?}"
+        );
+        assert!(
+            strs.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/data/proj" && w[2] == "/data/proj"),
+            "workspace must be RW-bound: {strs:?}"
+        );
+        assert!(
+            strs.windows(3)
+                .any(|w| w[0] == "--bind-try" && w[1] == "/home/agent" && w[2] == "/home/agent"),
+            "extra_root ($HOME) must be RW-bound (try): {strs:?}"
+        );
+
+        for denied in ["/home/agent/.ssh", "/home/agent/.aws"] {
+            assert!(
+                strs.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == denied),
+                "denied path {denied} must be masked by tmpfs: {strs:?}"
+            );
+        }
+
+        // FHS roots stay RO-bound so binaries / resolver config work.
+        for ro in ["/usr", "/bin", "/etc"] {
+            assert!(
+                strs.windows(2)
+                    .any(|w| w[0] == "--ro-bind-try" && w[1] == ro),
+                "permissive mode must keep {ro} RO-bound: {strs:?}"
+            );
+        }
+
+        // --share-net still respected via NetworkPolicy.
+        assert!(strs.contains(&"--share-net".to_string()));
+    }
+
+    #[test]
+    fn bwrap_argv_workspace_default_path_unchanged_when_permissive_off() {
+        // Sanity: the existing strict-workspace argv shape is preserved
+        // when filesystem_policy stays at its default Workspace variant.
+        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
+        let strs = argv_strs(&argv);
+        assert!(
+            strs.windows(2)
+                .any(|w| w[0] == "--ro-bind-try" && w[1] == "/usr"),
+            "workspace mode must keep /usr RO bind: {strs:?}"
+        );
+        assert!(
+            !strs
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/" && w[2] == "/"),
+            "workspace mode must NOT bind host root: {strs:?}"
         );
     }
 

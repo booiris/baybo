@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_sandbox::{
-    EnvPolicy, ResourceLimits, SandboxOutput, SandboxRunner, SandboxSpec, StdinSource,
+    EnvPolicy, FilesystemPolicy, ResourceLimits, SandboxOutput, SandboxRunner, SandboxSpec,
+    StdinSource,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -63,6 +64,7 @@ pub(crate) fn build_sandbox_spec(
             memory_max_bytes: Some(plan.memory_max_bytes),
             pids_max: Some(plan.pids_max),
         },
+        filesystem_policy: FilesystemPolicy::Workspace,
     }
 }
 

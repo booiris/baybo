@@ -41,6 +41,7 @@ async fn echo_through_bwrap() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: ResourceLimits::unlimited(),
+            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("sandboxed run");

@@ -166,7 +166,7 @@ impl SessionLlmLogger {
             .append(true)
             .open(&path)
             .await?;
-        file.write_all(&line).await?;
+        file.write_all(line).await?;
         file.flush().await?;
         Ok(())
     }

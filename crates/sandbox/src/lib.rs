@@ -20,7 +20,8 @@ use async_trait::async_trait;
 pub use bootstrap::SandboxAvailability;
 pub use error::SandboxError;
 pub use spec::{
-    Backend, EnvPolicy, NetworkPolicy, ResourceLimits, SandboxOutput, SandboxSpec, StdinSource,
+    Backend, EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, SandboxOutput,
+    SandboxSpec, StdinSource, default_sensitive_denylist,
 };
 
 #[async_trait]

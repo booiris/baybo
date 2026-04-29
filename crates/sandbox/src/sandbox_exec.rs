@@ -173,6 +173,7 @@ mod tests {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: ResourceLimits::unlimited(),
+            filesystem_policy: crate::spec::FilesystemPolicy::default(),
         }
     }
 
