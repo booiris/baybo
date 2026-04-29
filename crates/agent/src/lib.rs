@@ -29,7 +29,10 @@ pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};
 pub use service::{ShutdownSignal, TaskTracker};
 pub use session::SessionManager;
-pub use session_log::{LlmCallOutcome, LlmCallRecord, SessionLlmLogger};
+pub use session_log::{
+    LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
+    SessionMessageRecord,
+};
 pub use supervisor::AgentSupervisor;
 pub use tool_executor::ToolExecutor;
 pub use trace::TraceCollector;

@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use aura_llm::{ChatRequest, LlmResponse};
+use aura_model::ChatMessage;
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Serializer};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const FILE_EXTENSION: &str = "jsonl";
 
@@ -14,7 +18,7 @@ const FILE_EXTENSION: &str = "jsonl";
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum LlmCallOutcome {
     Ok {
-        response: LlmResponse,
+        response: LlmResponseMeta,
         latency_ms: u64,
     },
     Err {
@@ -29,26 +33,76 @@ pub struct LlmCallRecord {
     pub session_id: String,
     pub provider: String,
     pub model: String,
-    #[serde(serialize_with = "serialize_request_without_tools")]
-    pub request: ChatRequest,
+    pub request: LlmRequestMeta,
     #[serde(flatten)]
     pub outcome: LlmCallOutcome,
 }
 
-fn serialize_request_without_tools<S>(req: &ChatRequest, s: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    use serde::ser::SerializeStruct;
-    let tool_names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
-    let mut st = s.serialize_struct("ChatRequest", 3)?;
-    st.serialize_field("messages", &req.messages)?;
-    st.serialize_field("temperature", &req.temperature)?;
-    st.serialize_field("tools", &tool_names)?;
-    st.end()
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmRequestMeta {
+    pub message_count: usize,
+    pub message_bytes: usize,
+    pub messages_sha256: String,
+    pub temperature: Option<f32>,
+    pub tools: Vec<String>,
 }
 
-/// Append-only JSONL writer for per-session LLM call traces.
+impl LlmRequestMeta {
+    pub fn from_request(req: &ChatRequest) -> serde_json::Result<Self> {
+        let messages = serde_json::to_vec(&req.messages)?;
+        Ok(Self {
+            message_count: req.messages.len(),
+            message_bytes: messages.len(),
+            messages_sha256: sha256_hex(&messages),
+            temperature: req.temperature,
+            tools: req.tools.iter().map(|t| t.name.clone()).collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmResponseMeta {
+    pub content_bytes: usize,
+    pub content_sha256: String,
+    pub content_block_count: usize,
+    pub tool_call_count: usize,
+    pub thinking_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_sha256: Option<String>,
+    pub usage: aura_llm::TokenUsage,
+}
+
+impl LlmResponseMeta {
+    pub fn from_response(response: &LlmResponse) -> Self {
+        let content = response.content.as_bytes();
+        let thinking = response.thinking.as_ref().map(|value| value.as_bytes());
+        Self {
+            content_bytes: content.len(),
+            content_sha256: sha256_hex(content),
+            content_block_count: response.content_blocks.len(),
+            tool_call_count: response.tool_calls.len(),
+            thinking_bytes: thinking.map_or(0, <[u8]>::len),
+            thinking_sha256: thinking.map(sha256_hex),
+            usage: response.usage,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionMessageRecord {
+    pub timestamp: DateTime<Utc>,
+    pub session_id: String,
+    pub message_id: String,
+    pub parent_id: Option<String>,
+    pub message: ChatMessage,
+}
+
+#[derive(Default)]
+struct SessionLogState {
+    last_message_id_by_session: HashMap<String, String>,
+}
+
+/// Append-only JSONL writer for per-session events.
 ///
 /// One file per session at `<base_dir>/<sanitized_session_id>.jsonl`. The
 /// writer holds a process-local mutex so concurrent calls within the same
@@ -57,14 +111,14 @@ where
 /// `log()` issues a single `write_all` for the line + newline.
 pub struct SessionLlmLogger {
     base_dir: PathBuf,
-    write_lock: Mutex<()>,
+    state: Mutex<SessionLogState>,
 }
 
 impl SessionLlmLogger {
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
             base_dir,
-            write_lock: Mutex::new(()),
+            state: Mutex::new(SessionLogState::default()),
         }
     }
 
@@ -73,12 +127,39 @@ impl SessionLlmLogger {
     }
 
     pub async fn log(&self, record: &LlmCallRecord) -> io::Result<()> {
-        let safe_id = sanitize_session_id(&record.session_id);
+        self.log_llm_call(record).await
+    }
+
+    pub async fn log_llm_call(&self, record: &LlmCallRecord) -> io::Result<()> {
+        let mut line = typed_record_line("llm_call", record)?;
+        let _guard = self.state.lock().await;
+        self.write_line(&record.session_id, &mut line).await
+    }
+
+    pub async fn log_message(&self, session_id: &str, message: &ChatMessage) -> io::Result<String> {
+        let mut state = self.state.lock().await;
+        let parent_id = state.last_message_id_by_session.get(session_id).cloned();
+        let message_id = Uuid::new_v4().to_string();
+        let record = SessionMessageRecord {
+            timestamp: Utc::now(),
+            session_id: session_id.to_string(),
+            message_id: message_id.clone(),
+            parent_id,
+            message: message.clone(),
+        };
+        let mut line = typed_record_line("message", &record)?;
+        self.write_line(&record.session_id, &mut line).await?;
+        state
+            .last_message_id_by_session
+            .insert(session_id.to_string(), message_id.clone());
+        Ok(message_id)
+    }
+
+    async fn write_line(&self, session_id: &str, line: &mut Vec<u8>) -> io::Result<()> {
+        let safe_id = sanitize_session_id(session_id);
         let path = self.base_dir.join(format!("{safe_id}.{FILE_EXTENSION}"));
-        let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
 
-        let _guard = self.write_lock.lock().await;
         fs::create_dir_all(&self.base_dir).await?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -89,6 +170,26 @@ impl SessionLlmLogger {
         file.flush().await?;
         Ok(())
     }
+}
+
+fn typed_record_line<T: Serialize>(record_type: &'static str, record: &T) -> io::Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct TypedRecord<'a, T: Serialize> {
+        #[serde(rename = "type")]
+        record_type: &'static str,
+        #[serde(flatten)]
+        record: &'a T,
+    }
+
+    serde_json::to_vec(&TypedRecord {
+        record_type,
+        record,
+    })
+    .map_err(io::Error::other)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Map a session id to a filesystem-safe stem. Path separators, NULs,
@@ -144,6 +245,14 @@ mod tests {
         }
     }
 
+    fn sample_request_meta() -> LlmRequestMeta {
+        LlmRequestMeta::from_request(&sample_request()).unwrap()
+    }
+
+    fn sample_response_meta() -> LlmResponseMeta {
+        LlmResponseMeta::from_response(&sample_response())
+    }
+
     #[tokio::test]
     async fn appends_one_line_per_call() {
         let tmp = tempdir().unwrap();
@@ -154,9 +263,9 @@ mod tests {
             session_id: "sess-1".into(),
             provider: "openai".into(),
             model: "gpt-x".into(),
-            request: sample_request(),
+            request: sample_request_meta(),
             outcome: LlmCallOutcome::Ok {
-                response: sample_response(),
+                response: sample_response_meta(),
                 latency_ms: 12,
             },
         };
@@ -170,13 +279,50 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for line in lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["type"], "llm_call");
             assert_eq!(v["session_id"], "sess-1");
             assert_eq!(v["model"], "gpt-x");
             assert_eq!(v["outcome"], "ok");
             assert_eq!(v["request"]["temperature"], 0.7);
             assert_eq!(v["request"]["tools"], serde_json::json!(["noop"]));
+            assert_eq!(v["request"]["message_count"], 1);
+            assert!(v["request"]["messages"].is_null());
+            assert!(v["request"]["messages_sha256"].as_str().unwrap().len() == 64);
             assert_eq!(v["response"]["usage"]["input_tokens"], 4);
         }
+    }
+
+    #[tokio::test]
+    async fn appends_message_records_to_same_session_file() {
+        let tmp = tempdir().unwrap();
+        let logger = SessionLlmLogger::new(tmp.path().to_path_buf());
+        let first = ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("hello".into())],
+        };
+        let second = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("hi".into())],
+        };
+
+        let first_id = logger.log_message("sess-1", &first).await.unwrap();
+        let second_id = logger.log_message("sess-1", &second).await.unwrap();
+
+        let raw = tokio::fs::read_to_string(tmp.path().join("sess-1.jsonl"))
+            .await
+            .unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], "message");
+        assert_eq!(lines[0]["message_id"], first_id);
+        assert!(lines[0]["parent_id"].is_null());
+        assert_eq!(lines[0]["message"]["role"], "user");
+        assert_eq!(lines[1]["message_id"], second_id);
+        assert_eq!(lines[1]["parent_id"], first_id);
+        assert_eq!(lines[1]["message"]["role"], "assistant");
     }
 
     #[tokio::test]
@@ -189,7 +335,7 @@ mod tests {
             session_id: "sess-2".into(),
             provider: "anthropic".into(),
             model: "claude-x".into(),
-            request: sample_request(),
+            request: sample_request_meta(),
             outcome: LlmCallOutcome::Err {
                 error: "rate limited".into(),
                 latency_ms: 50,
@@ -215,9 +361,9 @@ mod tests {
             session_id: "../etc/passwd".into(),
             provider: "p".into(),
             model: "m".into(),
-            request: sample_request(),
+            request: sample_request_meta(),
             outcome: LlmCallOutcome::Ok {
-                response: sample_response(),
+                response: sample_response_meta(),
                 latency_ms: 1,
             },
         };

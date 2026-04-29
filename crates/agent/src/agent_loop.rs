@@ -23,7 +23,9 @@ use crate::error_recovery::ErrorHandler;
 use crate::observability::ObservabilityRecorder;
 use crate::policy::ExecutionPolicy;
 use crate::security::SecurityGateway;
-use crate::session_log::{LlmCallOutcome, LlmCallRecord, SessionLlmLogger};
+use crate::session_log::{
+    LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
+};
 use crate::soul::Soul;
 use crate::tool_executor::ToolExecutor;
 
@@ -150,8 +152,7 @@ impl AgentLoop {
         parent_job_id: Option<&str>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<OutgoingMessage> {
-        // Ensure system prompt is present
-        self.ensure_system_prompt(session);
+        self.ensure_system_prompt(session).await;
 
         // Recall relevant memories
         let memories = self
@@ -171,7 +172,7 @@ impl AgentLoop {
                     "[Memory Context]\n{memory_text}"
                 ))],
             };
-            self.context_manager.append(session, &memory_msg).await?;
+            self.append_context_message(session, &memory_msg).await?;
         }
 
         // Append user message (auto-compresses if over token budget)
@@ -179,7 +180,7 @@ impl AgentLoop {
             role: Role::User,
             content: user_content.clone(),
         };
-        self.context_manager.append(session, &user_msg).await?;
+        self.append_context_message(session, &user_msg).await?;
 
         // Skill selection: `SkillRegistry::select` returns exactly the
         // one skill invoked by `/<cmd>`, or the full registered set
@@ -226,12 +227,13 @@ impl AgentLoop {
         }
 
         for skill in &active_skills {
-            session.messages.push(ChatMessage {
+            let skill_msg = ChatMessage {
                 role: Role::System,
                 content: vec![ContentBlock::Text(aura_skills::render::render_skill_block(
                     skill,
                 ))],
-            });
+            };
+            self.push_session_message(session, skill_msg).await;
         }
 
         session.state.active_skills = active_skills.iter().map(|s| s.name.clone()).collect();
@@ -312,7 +314,7 @@ impl AgentLoop {
                     role: Role::Assistant,
                     content: response_blocks,
                 };
-                self.context_manager.append(session, &assistant_msg).await?;
+                self.append_context_message(session, &assistant_msg).await?;
 
                 // Maybe store memory
                 if let Err(e) = self.memory_manager.maybe_store(session, &final_text).await {
@@ -356,7 +358,7 @@ impl AgentLoop {
                 role: Role::Assistant,
                 content: assistant_blocks,
             };
-            self.context_manager.append(session, &assistant_msg).await?;
+            self.append_context_message(session, &assistant_msg).await?;
 
             // Execute tool calls. Approved resources are shared via a
             // Mutex so concurrent tool calls (when supported) see each
@@ -430,7 +432,7 @@ impl AgentLoop {
                         content: wrapped,
                     }],
                 };
-                self.context_manager.append(session, &tool_msg).await?;
+                self.append_context_message(session, &tool_msg).await?;
 
                 // Auto-snapshot after tool execution if the interval has been reached
                 self.maybe_take_snapshot(session, recorder).await;
@@ -560,7 +562,7 @@ impl AgentLoop {
                     session,
                     &request,
                     LlmCallOutcome::Ok {
-                        response: response.clone(),
+                        response: LlmResponseMeta::from_response(&response),
                         latency_ms,
                     },
                 )
@@ -655,16 +657,57 @@ impl AgentLoop {
             return;
         };
         let info = self.llm_client.model_info();
+        let request = match LlmRequestMeta::from_request(request) {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!(error = %e, "failed to summarize llm request for session log");
+                return;
+            }
+        };
         let record = LlmCallRecord {
             timestamp: chrono::Utc::now(),
             session_id: session.id.clone(),
             provider: info.provider.clone(),
             model: info.id.clone(),
-            request: request.clone(),
+            request,
             outcome,
         };
-        if let Err(e) = logger.log(&record).await {
+        if let Err(e) = logger.log_llm_call(&record).await {
             warn!(error = %e, "failed to append session llm log");
+        }
+    }
+
+    async fn append_context_message(
+        &mut self,
+        session: &mut Session,
+        message: &ChatMessage,
+    ) -> anyhow::Result<()> {
+        self.context_manager.append(session, message).await?;
+        self.write_session_message_log(session, message).await;
+        Ok(())
+    }
+
+    async fn push_session_message(&self, session: &mut Session, message: ChatMessage) {
+        session.messages.push(message.clone());
+        self.write_session_message_log(session, &message).await;
+    }
+
+    async fn insert_session_message(
+        &self,
+        session: &mut Session,
+        index: usize,
+        message: ChatMessage,
+    ) {
+        session.messages.insert(index, message.clone());
+        self.write_session_message_log(session, &message).await;
+    }
+
+    async fn write_session_message_log(&self, session: &Session, message: &ChatMessage) {
+        let Some(logger) = self.session_log.as_ref() else {
+            return;
+        };
+        if let Err(e) = logger.log_message(&session.id, message).await {
+            warn!(error = %e, "failed to append session message log");
         }
     }
 
@@ -795,19 +838,17 @@ impl AgentLoop {
         }
     }
 
-    fn ensure_system_prompt(&self, session: &mut Session) {
+    async fn ensure_system_prompt(&self, session: &mut Session) {
         let has_system = session
             .messages
             .first()
             .is_some_and(|m| m.role == Role::System);
         if !has_system {
-            session.messages.insert(
-                0,
-                ChatMessage {
-                    role: Role::System,
-                    content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
-                },
-            );
+            let msg = ChatMessage {
+                role: Role::System,
+                content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
+            };
+            self.insert_session_message(session, 0, msg).await;
         }
     }
 
