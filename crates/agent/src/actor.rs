@@ -12,7 +12,6 @@ use tracing::{debug, error, info, warn};
 use crate::agent_loop::AgentLoop;
 use crate::observability::ObservabilityRecorder;
 use crate::tool_executor::ToolExecutor;
-use aura_trace::TraceNodeId;
 
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
@@ -24,11 +23,6 @@ pub enum AgentMessage {
         job_id: String,
         action: TriggerAction,
     },
-    /// Roll back the session to a previous trace node.
-    ///
-    /// Reads the nearest snapshot from `TraceCollector`, forks the trace tree,
-    /// and restores the session messages and context state from the snapshot.
-    Rollback { target_node: TraceNodeId },
     /// Gracefully shut down this actor.
     Shutdown,
 }
@@ -104,21 +98,6 @@ impl AgentActor {
                             job_id = %job_id,
                             error = %e,
                             "failed to handle cron trigger"
-                        );
-                    }
-                    self.flush_trace().await;
-                }
-                AgentMessage::Rollback { target_node } => {
-                    debug!(
-                        session_id = %self.session.id,
-                        target = %target_node,
-                        "received rollback request"
-                    );
-                    if let Err(e) = self.handle_rollback(target_node).await {
-                        error!(
-                            session_id = %self.session.id,
-                            error = %e,
-                            "failed to handle rollback"
                         );
                     }
                     self.flush_trace().await;
@@ -248,12 +227,6 @@ impl AgentActor {
                 "failed to flush trace after turn"
             );
         }
-    }
-
-    async fn handle_rollback(&mut self, target_node: TraceNodeId) -> anyhow::Result<()> {
-        self.agent_loop
-            .rollback(&mut self.session, &self.recorder, target_node)
-            .await
     }
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {

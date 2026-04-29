@@ -44,7 +44,6 @@ libc = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-aura-context = { workspace = true }
 aura-cron = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

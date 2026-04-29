@@ -158,21 +158,6 @@ fn rate_limit_fields_must_be_positive() {
 }
 
 #[test]
-fn trace_snapshot_interval_required_when_enabled() {
-    let mut c = AuraConfig::default();
-    c.trace.auto_snapshot = true;
-    c.trace.snapshot_interval = 0;
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "trace.snapshot_interval"));
-
-    // disabled snapshot allows zero interval
-    let mut c = AuraConfig::default();
-    c.trace.auto_snapshot = false;
-    c.trace.snapshot_interval = 0;
-    assert!(c.validate().is_ok());
-}
-
-#[test]
 fn full_roundtrip_via_json() {
     let config = AuraConfig::default();
     let json = serde_json::to_string(&config).expect("serialize");

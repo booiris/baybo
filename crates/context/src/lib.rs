@@ -1,12 +1,10 @@
 pub mod budget;
 pub mod error;
-pub mod snapshot;
 pub mod strategy;
 pub mod tokenizer;
 
 pub use budget::TokenBudget;
 pub use error::ContextError;
-pub use snapshot::ContextSnapshot;
 pub use strategy::CompressionStrategy;
 pub use strategy::SummarizeCallback;
 pub use strategy::summarize::Summarize;
@@ -34,12 +32,12 @@ pub struct CompressStats {
     pub latency: Duration,
 }
 
-/// Manages session context: appending messages with automatic compression,
-/// token budget tracking, and snapshots.
+/// Manages session context: appending messages with automatic compression
+/// and token budget tracking.
 ///
 /// This is a concrete struct, not a trait. The only extension point is the
 /// `CompressionStrategy` injected at construction — the management logic
-/// (append, budget check, snapshot) is invariant.
+/// (append, budget check) is invariant.
 pub struct ContextManager {
     tokenizer: Arc<dyn Tokenizer>,
     strategy: Box<dyn CompressionStrategy>,
@@ -176,25 +174,6 @@ impl ContextManager {
     /// Read-only access to the token budget.
     pub fn budget(&self) -> &TokenBudget {
         &self.budget
-    }
-
-    /// Create a snapshot of the current session context.
-    pub fn snapshot(&self, session: &Session) -> ContextSnapshot {
-        ContextSnapshot {
-            messages: session.messages.clone(),
-            token_count: self.budget.current(),
-        }
-    }
-
-    /// Restore the session context from a previously captured snapshot.
-    pub fn restore(
-        &mut self,
-        session: &mut Session,
-        snapshot: &ContextSnapshot,
-    ) -> crate::Result<()> {
-        session.messages = snapshot.messages.clone();
-        self.budget.update(snapshot.token_count);
-        Ok(())
     }
 
     fn count_tokens(&self, messages: &[ChatMessage]) -> usize {
@@ -345,34 +324,6 @@ mod tests {
 
         assert!(stats.is_none());
         assert_eq!(session.messages.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn snapshot_and_restore() {
-        let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
-
-        ctx.append(&mut session, &make_msg(Role::System, "sys"))
-            .await
-            .unwrap();
-        ctx.append(&mut session, &make_msg(Role::User, "hello"))
-            .await
-            .unwrap();
-
-        let snap = ctx.snapshot(&session);
-        assert_eq!(snap.messages.len(), 2);
-        assert!(snap.token_count > 0);
-
-        // Mutate
-        ctx.append(&mut session, &make_msg(Role::Assistant, "hi"))
-            .await
-            .unwrap();
-        assert_eq!(session.messages.len(), 3);
-
-        // Restore
-        ctx.restore(&mut session, &snap).unwrap();
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(ctx.budget().current(), snap.token_count);
     }
 
     #[tokio::test]

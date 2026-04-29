@@ -3,10 +3,9 @@ use std::sync::Arc;
 use crate::cost::CostTracker;
 use crate::job::JobManager;
 use crate::trace::TraceCollector;
-use aura_context::ContextSnapshot;
 use aura_job::OperationKind;
 use aura_storage::CostRecord;
-use aura_trace::{ExecutionProvenance, SpanHandle, SpanInput, SpanResult, TraceNodeId};
+use aura_trace::{ExecutionProvenance, SpanHandle, SpanInput, SpanResult};
 use chrono::Utc;
 use parking_lot::Mutex;
 use tracing::warn;
@@ -135,40 +134,5 @@ impl ObservabilityRecorder {
         };
         store.save_trace(&trace).await?;
         Ok(())
-    }
-
-    /// Check whether the auto-snapshot policy says a snapshot should be taken now.
-    ///
-    /// Returns the active leaf node id when a snapshot is due, so the caller
-    /// can create a `ContextSnapshot` and pass it to `attach_snapshot`.
-    pub async fn maybe_snapshot(&self) -> Option<TraceNodeId> {
-        let collector = self.trace_collector.lock();
-        if collector.should_auto_snapshot() {
-            Some(collector.active_leaf().clone())
-        } else {
-            None
-        }
-    }
-
-    /// Attach a context snapshot to the specified trace node.
-    pub async fn attach_snapshot(
-        &self,
-        node_id: &TraceNodeId,
-        snapshot: ContextSnapshot,
-    ) -> anyhow::Result<()> {
-        let mut collector = self.trace_collector.lock();
-        Ok(collector.attach_snapshot(node_id, snapshot)?)
-    }
-
-    /// Find the nearest context snapshot at or above `target_node`, then fork
-    /// the trace tree so subsequent spans are recorded on a new branch.
-    ///
-    /// Returns the snapshot that was found.  The caller uses it to restore
-    /// the session's message history and context budget.
-    pub async fn rollback_to(&self, target_node: &TraceNodeId) -> anyhow::Result<ContextSnapshot> {
-        let mut collector = self.trace_collector.lock();
-        let snapshot = collector.find_snapshot_at(target_node)?;
-        collector.fork_from(target_node.clone())?;
-        Ok(snapshot)
     }
 }

@@ -590,24 +590,6 @@ pub enum TraceCmd {
         /// Session id whose trace to inspect.
         id: String,
     },
-    /// Print the nearest stored context snapshot for a trace node. Walks
-    /// the ancestor chain from `--node` (defaults to `active_leaf`) and
-    /// returns the first node carrying a `context_snapshot`. Read-only:
-    /// this does **not** take a new live snapshot (live-snapshot capture
-    /// still requires the session context the CLI does not hold).
-    Snapshot {
-        /// Session id whose trace to inspect.
-        id: String,
-        /// Trace node id to start the lookup from. Defaults to the
-        /// session's `active_leaf`.
-        #[arg(long)]
-        node: Option<String>,
-        /// Include the full message bodies in the response. Off by
-        /// default — a summary (role + token count + message count) is
-        /// usually enough for operators.
-        #[arg(long)]
-        full: bool,
-    },
     /// Export a session's trace as pretty JSON. Prints to stdout unless
     /// `--out <path>` is given, which writes the file in argv mode. Requires
     /// `--yes` under slash mode because the write path is operator-controlled.

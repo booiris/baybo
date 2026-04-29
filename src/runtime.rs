@@ -457,8 +457,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let policy = boot::to_execution_policy(&graph.config.agent);
     let token_budget = boot::to_token_budget(&graph.config.agent.context);
     let keep_recent = graph.config.agent.context.keep_recent;
-    let auto_snapshot = graph.config.trace.auto_snapshot;
-    let snapshot_interval = graph.config.trace.snapshot_interval;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
     let (response_tx, response_rx) = mpsc::channel(buffer);
@@ -507,8 +505,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
             &session.id,
             Arc::clone(&actor_trace_store),
-            auto_snapshot,
-            snapshot_interval,
         )));
         let recorder = Arc::new(ObservabilityRecorder::new(
             Arc::clone(&actor_job_manager),

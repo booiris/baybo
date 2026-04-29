@@ -12,7 +12,7 @@ Core responsibilities:
 - **Long-running execution**: cron scheduling, background notifications
 - **Unified observability**: wrapping Job, Trace, and Cost through `ObservabilityRecorder`
 - **Cost management**: `CostTracker` for recording, `CostGuard` for spending limits (in `agent::cost`)
-- **Runtime logic**: error recovery, timeout control, rollback
+- **Runtime logic**: error recovery, timeout control
 
 It does not own low-level storage or backend implementation — it consumes Store traits from `storage` through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
 
@@ -20,7 +20,7 @@ It does not own low-level storage or backend implementation — it consumes Stor
 
 ### Actor isolation model
 
-One Actor per session: natural serialization within a session (no context races), natural concurrency across sessions. All control messages (rollback, timeout, cron) route to the same actor.
+One Actor per session: natural serialization within a session (no context races), natural concurrency across sessions. All control messages (timeout, cron) route to the same actor.
 
 ### Main execution path (AgentLoop)
 
@@ -81,10 +81,6 @@ Cron jobs flow through the Actor model and observability chain: `CronScheduler` 
 
 `aura_cron::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-cron` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot pull in `aura-cron` without creating a circular dependency. `src/main.rs` registers them after the scheduler is constructed, via `Arc::get_mut(&mut tool_registry)` while no other clones exist yet.
 
-### Rollback mechanism
-
-`Rollback` message → read snapshot from `TraceCollector` → `fork_from(target_node)` → restore session messages and context state from snapshot.
-
 ### Startup recovery
 
 On system startup, before accepting any messages, `JobManager::recover_interrupted()` scans all non-terminal jobs left over from a prior run. `InProgress` jobs are moved to `Stuck` (their executing context was lost); other non-terminal states are left unchanged. This is called once in `main()` after constructing the `JobManager`.
@@ -112,7 +108,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `cron` | Provides `CronJob`, `CronExecution` domain types; `CronScheduler` in agent manages lifecycle, converts between domain and storage row types |
 | `context` | Conversation window and compression |
 | `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager`; startup recovery via `recover_interrupted()` |
-| `trace` | Provides domain types and tree/fork/snapshot utilities used by `agent::trace::TraceCollector` |
+| `trace` | Provides domain types and tree/fork utilities used by `agent::trace::TraceCollector` |
 | `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |

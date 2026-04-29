@@ -35,11 +35,11 @@ Bottom-up along the dependency graph:
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
 - **workspace** — Identity files and long-running configuration.
 - **cron** — Cron job domain types (`CronJob`, `CronExecution`, `CronStatus`, `CronRunMode`, `CronError`). Standard cron syntax.
-- **context** — Context appending, compression, snapshots, restoration.
+- **context** — Context appending and compression.
 
 ### Runtime and Observability Layer
 
-- **trace** — Trace domain types (SessionTrace, TraceNode, SpanHandle) and tree/fork/snapshot utilities.
+- **trace** — Trace domain types (SessionTrace, TraceNode, SpanHandle) and tree/fork utilities.
 - **job** — Job domain types (Job, JobStatus, JobTransition) and state machine. Owns OperationKind.
 - **hook** — Lifecycle extension points.
 
@@ -92,6 +92,6 @@ bootstrap ──► config + all domain crates it assembles (entry point only)
 - Logs, Trace, and Job must not record sensitive plaintext — only placeholders or sanitized summaries
 - Tool/skill extensions must carry source, version, hash, trust level, and capability declarations
 - The Job state machine is fixed: `Pending → InProgress → Completed → Submitted → Accepted` (with `Failed` and `Stuck` branches)
-- Multimedia passed by reference — no raw binary in sessions, snapshots, or Trace
+- Multimedia passed by reference — no raw binary in sessions or Trace
 - Hot reload, tool updates, identity changes, and config changes must leave provenance records in Trace
 - Cron and background execution must all enter Job and Trace

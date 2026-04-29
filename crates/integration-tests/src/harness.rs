@@ -225,8 +225,6 @@ impl AgentTestHarnessBuilder {
         let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
             &session.id,
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
-            false,
-            100,
         )));
         let recorder = Arc::new(ObservabilityRecorder::new(
             job_manager,

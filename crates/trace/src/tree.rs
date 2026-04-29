@@ -24,7 +24,6 @@ pub fn create_root_node(session_id: &str) -> (TraceNodeId, TraceNode) {
             ended_at: Some(Utc::now()),
             result: None,
         },
-        context_snapshot: None,
     };
     (id, node)
 }
@@ -54,7 +53,6 @@ pub fn attach_child(
             ended_at: None,
             result: None,
         },
-        context_snapshot: None,
     };
 
     // Insert the child node first, then update the parent's children list.

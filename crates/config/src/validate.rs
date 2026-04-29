@@ -6,7 +6,6 @@ use crate::gateway::GatewayConfig;
 use crate::llm::LlmConfig;
 use crate::session::SessionConfig;
 use crate::tools::ToolsConfig;
-use crate::trace::TraceConfig;
 use crate::workspace::WorkspaceConfig;
 
 impl AuraConfig {
@@ -20,7 +19,6 @@ impl AuraConfig {
         validate_session(&self.session, &mut errors);
         validate_channels(&self.channels, &mut errors);
         validate_tools(&self.tools, &mut errors);
-        validate_trace(&self.trace, &mut errors);
         validate_cost(&self.cost, &mut errors);
         validate_workspace(&self.workspace, &mut errors);
         validate_gateway(&self.gateway, &mut errors);
@@ -171,15 +169,6 @@ fn validate_tools(tools: &ToolsConfig, errors: &mut Vec<ValidationError>) {
         errors.push(ValidationError::new(
             "tools.default_timeout_ms",
             "must be >= 100",
-        ));
-    }
-}
-
-fn validate_trace(trace: &TraceConfig, errors: &mut Vec<ValidationError>) {
-    if trace.auto_snapshot && trace.snapshot_interval == 0 {
-        errors.push(ValidationError::new(
-            "trace.snapshot_interval",
-            "must be >= 1 when auto_snapshot is true",
         ));
     }
 }

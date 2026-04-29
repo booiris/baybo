@@ -137,7 +137,6 @@ impl LibsqlPool {
                     result     TEXT,
                     started_at TEXT NOT NULL,
                     ended_at   TEXT,
-                    snapshot   TEXT,
                     deleted_at INTEGER,
                     PRIMARY KEY (session_id, id)
                 );

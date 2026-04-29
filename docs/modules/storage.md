@@ -62,7 +62,7 @@ Table schemas are created centrally in `LibsqlPool::init_db()`, but each Store s
 
 ### JSON field strategy
 
-Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) are stored as JSON. Trace tables use a columnar schema: `session_traces` holds only metadata (root, active_leaf, timestamps); `trace_nodes` stores one row per node with queryable columns (`kind`, `started_at`, `parent_id`, etc.) and JSON for complex fields (`provenance`, `input`, `result`, `snapshot`); `trace_forks` stores fork records. Children lists are derived from `parent_id` on load. The security requirement still applies: values must already be sanitized.
+Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) are stored as JSON. Trace tables use a columnar schema: `session_traces` holds only metadata (root, active_leaf, timestamps); `trace_nodes` stores one row per node with queryable columns (`kind`, `started_at`, `parent_id`, etc.) and JSON for complex fields (`provenance`, `input`, `result`); `trace_forks` stores fork records. Children lists are derived from `parent_id` on load. The security requirement still applies: values must already be sanitized.
 
 ### Transaction boundaries
 

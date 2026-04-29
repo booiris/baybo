@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 aura-model = { workspace = true }
 aura-job = { workspace = true }
-aura-context = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

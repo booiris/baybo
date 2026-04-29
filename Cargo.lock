@@ -314,7 +314,6 @@ dependencies = [
  "aura-agent",
  "aura-channels",
  "aura-config",
- "aura-context",
  "aura-cron",
  "aura-gateway",
  "aura-job",
@@ -687,7 +686,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-context",
  "aura-job",
  "aura-model",
  "aura-trace",
@@ -754,7 +752,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aura-context",
  "aura-job",
  "aura-model",
  "chrono",

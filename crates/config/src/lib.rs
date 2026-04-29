@@ -23,7 +23,6 @@ pub mod security;
 pub mod session;
 pub mod skills;
 pub mod tools;
-pub mod trace;
 mod validate;
 pub mod workspace;
 
@@ -44,7 +43,6 @@ pub use crate::security::SecurityConfig;
 pub use crate::session::SessionConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
 pub use crate::tools::{ToolsConfig, TrustLevelConfig};
-pub use crate::trace::TraceConfig;
 pub use crate::workspace::WorkspaceConfig;
 
 /// Root configuration object for Aura.
@@ -61,7 +59,6 @@ pub struct AuraConfig {
     pub security: SecurityConfig,
     pub skills: SkillsConfig,
     pub tools: ToolsConfig,
-    pub trace: TraceConfig,
     pub cost: CostConfig,
     pub workspace: WorkspaceConfig,
     pub gateway: GatewayConfig,

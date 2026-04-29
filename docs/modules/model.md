@@ -18,7 +18,7 @@ Contents:
 
 ### Media by reference, not inline
 
-Multimedia content (`ContentBlock::Image/Audio/File`) uses `BlobRef` (id) instead of embedding raw binary data. This prevents `Session`, `ContextSnapshot`, and `Trace` from growing without bound, and allows media to live in separate object/blob storage.
+Multimedia content (`ContentBlock::Image/Audio/File`) uses `BlobRef` (id) instead of embedding raw binary data. This prevents `Session` and `Trace` from growing without bound, and allows media to live in separate object/blob storage.
 
 ### Thread safety
 

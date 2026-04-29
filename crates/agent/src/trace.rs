@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_context::ContextSnapshot;
 use aura_job::OperationKind;
 use aura_storage::TraceStore;
 use aura_trace::tree::{attach_child, create_root_node, set_active_leaf};
@@ -13,20 +12,12 @@ use aura_trace::{
 pub struct TraceCollector {
     session_trace: SessionTrace,
     store: Arc<dyn TraceStore>,
-    auto_snapshot: bool,
-    snapshot_interval: usize,
-    spans_since_snapshot: usize,
 }
 
 type Result<T> = std::result::Result<T, TraceError>;
 
 impl TraceCollector {
-    pub fn new(
-        session_id: &str,
-        store: Arc<dyn TraceStore>,
-        auto_snapshot: bool,
-        snapshot_interval: usize,
-    ) -> Self {
+    pub fn new(session_id: &str, store: Arc<dyn TraceStore>) -> Self {
         let (root_id, root_node) = create_root_node(session_id);
         let mut nodes = HashMap::new();
         nodes.insert(root_id.clone(), root_node);
@@ -42,9 +33,6 @@ impl TraceCollector {
         Self {
             session_trace,
             store,
-            auto_snapshot,
-            snapshot_interval,
-            spans_since_snapshot: 0,
         }
     }
 
@@ -84,7 +72,6 @@ impl TraceCollector {
         };
 
         set_active_leaf(&mut self.session_trace, node_id.clone());
-        self.spans_since_snapshot += 1;
 
         SpanHandle { node_id }
     }
@@ -112,49 +99,8 @@ impl TraceCollector {
         (Arc::clone(&self.store), self.session_trace.clone())
     }
 
-    pub fn should_auto_snapshot(&self) -> bool {
-        self.auto_snapshot
-            && aura_trace::snapshot::should_snapshot(
-                self.spans_since_snapshot,
-                self.snapshot_interval,
-            )
-    }
-
-    pub fn attach_snapshot(
-        &mut self,
-        node_id: &TraceNodeId,
-        snapshot: ContextSnapshot,
-    ) -> Result<()> {
-        let node = self
-            .session_trace
-            .nodes
-            .get_mut(node_id)
-            .ok_or_else(|| TraceError::NotFound(format!("trace node {node_id}")))?;
-        node.context_snapshot = Some(snapshot);
-        self.spans_since_snapshot = 0;
-        Ok(())
-    }
-
     pub fn active_leaf(&self) -> &TraceNodeId {
         &self.session_trace.active_leaf
-    }
-
-    /// Fork the trace tree from the specified node, creating a new branch.
-    ///
-    /// Used by the rollback mechanism: `AgentActor` reads the snapshot
-    /// attached to (or nearest to) `from_node`, then forks the trace so
-    /// subsequent spans are recorded on the new branch.
-    pub fn fork_from(&mut self, from_node: TraceNodeId) -> Result<String> {
-        let fork_id = aura_trace::fork::fork_from(&mut self.session_trace, from_node, "")?;
-        Ok(fork_id)
-    }
-
-    /// Find the nearest context snapshot at or above the given node.
-    ///
-    /// Walks the parent chain until a node with an attached `ContextSnapshot`
-    /// is found. Used by the rollback mechanism to restore session state.
-    pub fn find_snapshot_at(&self, node_id: &TraceNodeId) -> Result<ContextSnapshot> {
-        aura_trace::snapshot::find_nearest_snapshot(&self.session_trace, node_id)
     }
 }
 
@@ -216,7 +162,7 @@ mod tests {
 
     fn make_collector() -> TraceCollector {
         let store = Arc::new(MemoryTraceStore::new());
-        TraceCollector::new("sess-1", store, true, 3)
+        TraceCollector::new("sess-1", store)
     }
 
     #[test]
@@ -250,93 +196,13 @@ mod tests {
         assert!(node.span.result.is_some());
     }
 
-    #[test]
-    fn auto_snapshot_triggers_at_interval() {
-        let mut collector = make_collector();
-
-        for _ in 0..2 {
-            let h = collector.begin_span(
-                OperationKind::ToolExecution {
-                    tool_name: "t".to_owned(),
-                },
-                None,
-                ExecutionProvenance::default(),
-                SpanInput::None,
-            );
-            collector.end_span(
-                h,
-                SpanResult::SkillResult {
-                    output: String::new(),
-                },
-            );
-        }
-        assert!(!collector.should_auto_snapshot());
-
-        let h = collector.begin_span(
-            OperationKind::ToolExecution {
-                tool_name: "t".to_owned(),
-            },
-            None,
-            ExecutionProvenance::default(),
-            SpanInput::None,
-        );
-        collector.end_span(
-            h,
-            SpanResult::SkillResult {
-                output: String::new(),
-            },
-        );
-        assert!(collector.should_auto_snapshot());
-    }
-
     #[tokio::test]
     async fn flush_persists_trace() {
         let store = Arc::new(MemoryTraceStore::new());
-        let collector = TraceCollector::new("sess-flush", store.clone(), false, 0);
+        let collector = TraceCollector::new("sess-flush", store.clone());
         collector.flush().await.unwrap();
 
         let loaded = store.load_trace("sess-flush").await.unwrap();
         assert!(loaded.is_some());
-    }
-
-    #[test]
-    fn fork_creates_new_branch() {
-        let mut collector = make_collector();
-        let root = collector.session_trace().root.clone();
-
-        let fork_id = collector.fork_from(root.clone()).unwrap();
-        assert!(!fork_id.is_empty());
-        assert_ne!(collector.active_leaf(), &root);
-    }
-
-    #[test]
-    fn snapshot_lookup_walks_parent_chain() {
-        let mut collector = make_collector();
-        let root_id = collector.session_trace().root.clone();
-
-        let snap = ContextSnapshot {
-            messages: Vec::new(),
-            token_count: 42,
-        };
-        collector.attach_snapshot(&root_id, snap.clone()).unwrap();
-
-        let handle = collector.begin_span(
-            OperationKind::ToolExecution {
-                tool_name: "x".to_owned(),
-            },
-            None,
-            ExecutionProvenance::default(),
-            SpanInput::None,
-        );
-        let child_id = handle.node_id.clone();
-        collector.end_span(
-            handle,
-            SpanResult::SkillResult {
-                output: String::new(),
-            },
-        );
-
-        let found = collector.find_snapshot_at(&child_id).unwrap();
-        assert_eq!(found.token_count, 42);
     }
 }

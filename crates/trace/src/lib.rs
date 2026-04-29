@@ -1,12 +1,10 @@
 pub mod error;
 pub mod fork;
-pub mod snapshot;
 pub mod tree;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use aura_context::ContextSnapshot;
 use aura_job::OperationKind;
 use aura_model::{ChatMessage, ContentBlock};
 use chrono::{DateTime, Utc};
@@ -37,7 +35,6 @@ pub struct TraceNode {
     pub parent: Option<TraceNodeId>,
     pub children: Vec<TraceNodeId>,
     pub span: TraceSpan,
-    pub context_snapshot: Option<ContextSnapshot>,
 }
 
 /// Details of a traced operation span.

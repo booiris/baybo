@@ -15,7 +15,7 @@ use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
 use aura_tools::{ToolOutput, ToolRegistry};
-use aura_trace::{ExecutionProvenance, SpanInput, SpanResult, TraceNodeId};
+use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -279,9 +279,6 @@ impl AgentLoop {
                 .call_llm_with_retry(session, recorder, parent_job_id, iter_delta_tx)
                 .await?;
 
-            // Auto-snapshot after LLM call if the interval has been reached
-            self.maybe_take_snapshot(session, recorder).await;
-
             // If no tool calls, we have the final response
             if response.tool_calls.is_empty() {
                 // Use content_blocks when available, falling back to the text string.
@@ -433,9 +430,6 @@ impl AgentLoop {
                     }],
                 };
                 self.append_context_message(session, &tool_msg).await?;
-
-                // Auto-snapshot after tool execution if the interval has been reached
-                self.maybe_take_snapshot(session, recorder).await;
             }
 
             // Flush accumulated approvals back into session state.
@@ -825,19 +819,6 @@ impl AgentLoop {
         }
     }
 
-    /// If the trace collector's auto-snapshot interval has been reached,
-    /// capture a context snapshot and attach it to the current active leaf node.
-    async fn maybe_take_snapshot(&self, session: &Session, recorder: &ObservabilityRecorder) {
-        if let Some(node_id) = recorder.maybe_snapshot().await {
-            let snapshot = self.context_manager.snapshot(session);
-            if let Err(e) = recorder.attach_snapshot(&node_id, snapshot).await {
-                warn!(error = %e, "failed to attach auto context snapshot");
-            } else {
-                debug!(node_id = %node_id, "auto context snapshot attached");
-            }
-        }
-    }
-
     async fn ensure_system_prompt(&self, session: &mut Session) {
         let has_system = session
             .messages
@@ -931,27 +912,6 @@ impl AgentLoop {
         {
             debug!("notice receiver dropped; skipping skill risk notice");
         }
-    }
-
-    /// Roll back the session to a previous trace node.
-    ///
-    /// Reads the snapshot from `ObservabilityRecorder`, forks the trace tree,
-    /// and restores the session messages and context budget from the snapshot.
-    pub async fn rollback(
-        &mut self,
-        session: &mut Session,
-        recorder: &ObservabilityRecorder,
-        target_node: TraceNodeId,
-    ) -> anyhow::Result<()> {
-        let snapshot = recorder.rollback_to(&target_node).await?;
-        self.context_manager.restore(session, &snapshot)?;
-        info!(
-            target = %target_node,
-            restored_messages = snapshot.messages.len(),
-            restored_tokens = snapshot.token_count,
-            "session rolled back"
-        );
-        Ok(())
     }
 }
 

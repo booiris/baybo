@@ -89,13 +89,12 @@ impl TraceStore for LibsqlTraceStore {
             let result_json: Option<String> = node.span.result.as_ref().map(ser).transpose()?;
             let started = node.span.started_at.to_rfc3339();
             let ended: Option<String> = node.span.ended_at.map(|t| t.to_rfc3339());
-            let snap_json: Option<String> = node.context_snapshot.as_ref().map(ser).transpose()?;
 
             tx.execute(
                 "INSERT OR REPLACE INTO trace_nodes
                     (id, session_id, parent_id, kind, job_id, provenance,
-                     input, result, started_at, ended_at, snapshot, deleted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL)",
+                     input, result, started_at, ended_at, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
                 libsql::params![
                     node.id.clone(),
                     sid.clone(),
@@ -106,8 +105,7 @@ impl TraceStore for LibsqlTraceStore {
                     input_json,
                     result_json.unwrap_or_default(),
                     started,
-                    ended.unwrap_or_default(),
-                    snap_json.unwrap_or_default()
+                    ended.unwrap_or_default()
                 ],
             )
             .await
@@ -246,7 +244,7 @@ impl TraceStore for LibsqlTraceStore {
         let mut rows = conn
             .query(
                 "SELECT id, parent_id, kind, job_id, provenance, input,
-                        result, started_at, ended_at, snapshot
+                        result, started_at, ended_at
                  FROM trace_nodes
                  WHERE session_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 libsql::params![session_id.to_string(), node_id.clone()],
@@ -299,7 +297,7 @@ impl LibsqlTraceStore {
         let mut rows = conn
             .query(
                 "SELECT id, parent_id, kind, job_id, provenance, input,
-                        result, started_at, ended_at, snapshot
+                        result, started_at, ended_at
                  FROM trace_nodes
                  WHERE session_id = ?1 AND deleted_at IS NULL
                  ORDER BY started_at",
@@ -378,7 +376,6 @@ impl LibsqlTraceStore {
         let result_raw: String = row.get(6).map_err(|e| ie(format!("get result: {e}")))?;
         let started_str: String = row.get(7).map_err(|e| ie(format!("get started: {e}")))?;
         let ended_raw: String = row.get(8).map_err(|e| ie(format!("get ended: {e}")))?;
-        let snap_raw: String = row.get(9).map_err(|e| ie(format!("get snap: {e}")))?;
 
         let parent = if parent_raw.is_empty() {
             None
@@ -424,12 +421,6 @@ impl LibsqlTraceStore {
             Some(job_raw)
         };
 
-        let context_snapshot = if snap_raw.is_empty() {
-            None
-        } else {
-            Some(de(&snap_raw)?)
-        };
-
         Ok(TraceNode {
             id,
             parent,
@@ -443,7 +434,6 @@ impl LibsqlTraceStore {
                 ended_at,
                 result,
             },
-            context_snapshot,
         })
     }
 }
@@ -451,9 +441,7 @@ impl LibsqlTraceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_context::ContextSnapshot;
     use aura_job::OperationKind;
-    use aura_model::ChatMessage;
     use aura_trace::SpanResult;
 
     fn make_trace(session_id: &str) -> SessionTrace {
@@ -473,7 +461,6 @@ mod tests {
                 ended_at: None,
                 result: None,
             },
-            context_snapshot: None,
         };
         let mut nodes = HashMap::new();
         nodes.insert(node_id.clone(), node);
@@ -504,7 +491,6 @@ mod tests {
                 ended_at: Some(Utc::now()),
                 result: None,
             },
-            context_snapshot: None,
         };
         let child = TraceNode {
             id: child_id.clone(),
@@ -531,7 +517,6 @@ mod tests {
                     latency: std::time::Duration::from_millis(100),
                 }),
             },
-            context_snapshot: None,
         };
         let mut nodes = HashMap::new();
         nodes.insert(root_id.clone(), root);
@@ -653,26 +638,5 @@ mod tests {
         assert_eq!(loaded.forks.len(), 1);
         assert_eq!(loaded.forks[0].id, "fork-1");
         assert_eq!(loaded.forks[0].reason, "rollback");
-    }
-
-    #[tokio::test]
-    async fn snapshot_preserved() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
-
-        let mut trace = make_trace("s1");
-        trace.nodes.get_mut("n1").unwrap().context_snapshot = Some(ContextSnapshot {
-            messages: vec![ChatMessage {
-                role: aura_model::Role::User,
-                content: vec![aura_model::ContentBlock::Text("hi".to_string())],
-            }],
-            token_count: 42,
-        });
-        store.save_trace(&trace).await.unwrap();
-
-        let loaded = store.load_trace("s1").await.unwrap().unwrap();
-        let snap = loaded.nodes["n1"].context_snapshot.as_ref().unwrap();
-        assert_eq!(snap.token_count, 42);
-        assert_eq!(snap.messages.len(), 1);
     }
 }
