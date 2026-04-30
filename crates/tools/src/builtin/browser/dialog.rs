@@ -9,12 +9,29 @@ use crate::builtin::browser::schema::{call_sidecar, schema_object};
 use crate::{Tool, ToolContext, ToolError, ToolOutput};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Params {
-    action: String,
+    action: DialogAction,
     #[serde(default)]
     prompt_text: Option<String>,
     #[serde(default)]
     dialog_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum DialogAction {
+    Accept,
+    Dismiss,
+}
+
+impl DialogAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            DialogAction::Accept => "accept",
+            DialogAction::Dismiss => "dismiss",
+        }
+    }
 }
 
 pub struct BrowserDialogTool {
@@ -67,17 +84,11 @@ impl Tool for BrowserDialogTool {
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-        if p.action != "accept" && p.action != "dismiss" {
-            return Err(ToolError::InvalidParams(format!(
-                "browser_dialog: action must be `accept` or `dismiss`, got `{}`",
-                p.action
-            )));
-        }
         let result = call_sidecar(
             &self.client,
             "dialog",
             json!({
-                "action": p.action,
+                "action": p.action.as_str(),
                 "prompt_text": p.prompt_text,
                 "dialog_id": p.dialog_id,
             }),

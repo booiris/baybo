@@ -125,8 +125,22 @@ function walkPageSource(args: {
   // single snapshot; agents that hold a ref across multiple
   // snapshots without re-snapshotting are responsible for the
   // staleness window themselves.
-  const stale = document.querySelectorAll(`[${refAttr}]`);
-  for (const el of stale) el.removeAttribute(refAttr);
+  //
+  // Use `querySelector` in a loop rather than `querySelectorAll` so
+  // we don't build a full NodeList of every annotated element up
+  // front — on a hostile 100k-node page that buffer dominates
+  // wall-clock time even before our walker budget kicks in. The
+  // single-match form short-circuits per call. Cap at `maxNodes`
+  // (or 10k, whichever is larger): the walker downstream still
+  // bounds at `maxNodes`, and any stale refs beyond the cap are
+  // caught by the uniqueness assertion in `resolveRef`
+  // (handlers.ts) when the agent tries to act on them.
+  const stripCap = Math.max(maxNodes, 10_000);
+  for (let i = 0; i < stripCap; i++) {
+    const el = document.querySelector(`[${refAttr}]`);
+    if (!el) break;
+    el.removeAttribute(refAttr);
+  }
 
   const seq = { next: 1 };
   // Mutable counter + flag so the walker can self-bound. Once

@@ -209,9 +209,14 @@ export function buildHandlers(manager: BrowserManager): Record<string, RpcHandle
       const state = await manager.acquire(params.context_id);
       const session = await state.ctx.newCDPSession(state.page);
       try {
+        // Return CDP's raw result directly — every other handler in
+        // this file returns the result un-wrapped, and the Rust
+        // `browser_cdp` consumer just surfaces this as
+        // `ToolOutput::Json` to the agent. A wrapper object would
+        // force the LLM to dereference `.result.<field>` in every
+        // CDP-aware prompt.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const result = await (session as any).send(method, cdpParams ?? {});
-        return { success: true, method, result };
+        return await (session as any).send(method, cdpParams ?? {});
       } finally {
         await session.detach().catch(() => null);
       }

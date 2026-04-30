@@ -6,9 +6,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
-use crate::builtin::browser::client::{BrowserRpcError, BrowserSidecarClient};
+use crate::builtin::browser::client::BrowserSidecarClient;
 use crate::{ToolContext, ToolError};
 
 /// Forward an RPC to the sidecar with the tool's timeout +
@@ -23,29 +22,16 @@ pub(crate) async fn call_sidecar<P: Serialize>(
 ) -> Result<Value, ToolError> {
     let raw = serde_json::to_value(params)
         .map_err(|e| ToolError::InvalidParams(format!("encode {method} params: {e}")))?;
-    let token = clone_cancel(&ctx.cancellation_token);
     client
-        .call(method, raw, &ctx.session_id, ctx.timeout, token)
+        .call(
+            method,
+            raw,
+            &ctx.session_id,
+            ctx.timeout,
+            ctx.cancellation_token.clone(),
+        )
         .await
         .map_err(ToolError::from)
-}
-
-fn clone_cancel(t: &CancellationToken) -> CancellationToken {
-    t.clone()
-}
-
-/// Build a `BrowserRpcError::Sidecar` with a stable error code; used
-/// by the trait's concrete impl when the sidecar returns
-/// `{ "error": { code, message } }`.
-#[allow(dead_code)]
-pub(crate) fn sidecar_error(
-    code: impl Into<String>,
-    message: impl Into<String>,
-) -> BrowserRpcError {
-    BrowserRpcError::Sidecar {
-        code: code.into(),
-        message: message.into(),
-    }
 }
 
 /// Truncate a string to at most `max` characters at a UTF-8 boundary,

@@ -119,9 +119,9 @@ The directory layout (`channel-src/*`, `tool-src/*`) is just file-system organis
 
 Build-time enforcement: a sidecar without `aura.domain` (or with an invalid one — must match `[a-z0-9_]+`) is a hard `cargo build` error. New sidecars can't silently default into the wrong family.
 
-## Channel-domain Sidecars (`channel-src/*`)
+## Tool-domain Sidecars (`tool-src/*`)
 
-Channel sidecars live under `channel-src/*` and declare `"aura": { "domain": "channel" }`.
+Tool sidecars live under `tool-src/*` and declare `"aura": { "domain": "browser" }` (or future tool-family domains). Today the only tool sidecar is `browser`.
 
 - IPC: tool sidecars connect *back* to the gateway over WebSocket at `/v1/tool-ws` (msgpack frames, see `crates/gateway/src/tool_ws/`). Synchronous request/response with `id` correlation — different shape from the channel-ws frame protocol, deliberately. Auth reuses the channel-auth middleware: the gateway mints a token bound to label `tool/browser` in `ChannelTokenTable` and the supervisor injects it as `AURA_TOOL_WS_TOKEN` in the child env. The route handler verifies `AuthedClient::Subprocess { label }` matches the expected label so a token bound to a different family can't reach this endpoint.
 - Lifecycle: `gateway_cmd::start` mints the `tool/browser` token, spawns `aura_gateway::tool_ws::ToolSidecarSupervisor` whenever `SidecarRuntime::bundle_for("browser")` returns a path, and shares a single `WsBrowserSidecarClient` between the route handler and the `ToolRegistry` via `ManagerGraph::tool_ws_client`. Without an embedded bundle the supervisor is silently skipped and `browser_*` tool calls return `BrowserRpcError::Disconnected` until a sidecar registers (e.g. an external container connecting in with the same `AURA_TOOL_WS_TOKEN`).

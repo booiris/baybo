@@ -9,8 +9,25 @@ use crate::builtin::browser::schema::{call_sidecar, schema_object};
 use crate::{Tool, ToolContext, ToolError, ToolOutput};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Params {
-    direction: String,
+    direction: Direction,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum Direction {
+    Up,
+    Down,
+}
+
+impl Direction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+        }
+    }
 }
 
 pub struct BrowserScrollTool {
@@ -49,16 +66,10 @@ impl Tool for BrowserScrollTool {
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-        if p.direction != "up" && p.direction != "down" {
-            return Err(ToolError::InvalidParams(format!(
-                "browser_scroll: direction must be `up` or `down`, got `{}`",
-                p.direction
-            )));
-        }
         let result = call_sidecar(
             &self.client,
             "scroll",
-            json!({ "direction": p.direction }),
+            json!({ "direction": p.direction.as_str() }),
             ctx,
         )
         .await?;

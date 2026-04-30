@@ -235,10 +235,10 @@ pub async fn build_managers(
     // Browser-tool plumbing: the WS client is a stateless handle the
     // tools call into. The gateway's tool_ws server attaches a live
     // socket when a sidecar registers; until then every browser_*
-    // call fails fast with `Disconnected`. Constructed unconditionally
-    // so non-gateway entry points (TUI direct, CLI commands that
-    // build a graph) at least have the tools defined — calls just
-    // return a clean error string if no gateway is running.
+    // call fails fast with `Disconnected`. `build_managers` is only
+    // invoked from `gateway_cmd::start` today — direct `aura` argv
+    // paths take the simpler `ToolRegistry::with_defaults` route in
+    // `main.rs` and never see browser tools at all.
     let tool_ws_client = aura_gateway::tool_ws::WsBrowserSidecarClient::new();
     let browser_client_for_registry: Arc<dyn aura_tools::builtin::browser::BrowserSidecarClient> =
         Arc::new(tool_ws_client.clone());

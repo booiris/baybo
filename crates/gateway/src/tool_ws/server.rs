@@ -159,9 +159,16 @@ async fn run_connection(socket: WebSocket, state: ToolWsState) {
     // Generation-tagged detach. Only clears the active outbound when
     // *this* connection's guard is still current; if a newer sidecar
     // has registered in the meantime, our close fires a no-op detach
-    // and the new connection's queue stays live.
+    // and the new connection's queue stays live. Either way, by the
+    // time we get here the Sender we handed to `attach` has already
+    // been dropped (detach cleared the slot, or a prior `attach`
+    // replaced it), so the writer task's `recv()` returns None and
+    // it exits on its own — `.await` lets it finish a half-written
+    // frame instead of cutting it mid-send like `abort()` would.
     state.client.detach(attach_guard);
-    writer_task.abort();
+    if let Err(e) = writer_task.await {
+        tracing::debug!(error = %e, "tool-ws writer task did not finish cleanly");
+    }
     tracing::info!(sidecar_id = %sidecar_id, "tool-ws sidecar disconnected");
 }
 

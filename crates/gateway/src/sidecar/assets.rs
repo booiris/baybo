@@ -108,9 +108,11 @@ impl SidecarRuntime {
             .map(|s| s.name.as_str())
     }
 
-    /// Every distinct domain present in the embedded asset table.
-    /// Order is iteration order of the asset table (sorted by name
-    /// at build time); duplicates are removed.
+    /// Every distinct domain present in the embedded asset table,
+    /// alphabetically sorted. Sorted (rather than iteration-order
+    /// of the asset table) so the boot log lines stay deterministic
+    /// build-to-build even when a new sidecar's name shifts the
+    /// underlying table order.
     pub fn domains(&self) -> impl Iterator<Item = &str> {
         let mut seen: Vec<&str> = Vec::new();
         for s in &self.sidecars {
@@ -118,6 +120,7 @@ impl SidecarRuntime {
                 seen.push(s.domain.as_str());
             }
         }
+        seen.sort_unstable();
         seen.into_iter()
     }
 
