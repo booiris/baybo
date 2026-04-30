@@ -81,6 +81,22 @@ pub(crate) fn validate_register(
             }
         }
         AuthedClient::Subprocess { pid, label, .. } => {
+            // Tokens minted for non-channel sidecars (currently:
+            // `tool/browser` for the browser tool sidecar, see
+            // `gateway_cmd::start`) live in the same
+            // `ChannelTokenTable` so the channel-auth middleware can
+            // accept them on `/v1/tool-ws`. They MUST NOT be admitted
+            // here — a leaked tool token presented at /v1/channel-ws
+            // would otherwise pass identity check and (since
+            // `bound_channel_type` is `None` for tool tokens) skip the
+            // binding gate too. Reject by label prefix so any future
+            // non-channel family that adopts the same convention is
+            // covered automatically.
+            if label.starts_with("tool/") {
+                return Err(format!(
+                    "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
+                ));
+            }
             let identity = tokens
                 .lookup(&token)
                 .ok_or_else(|| "token not registered".to_string())?;
@@ -331,6 +347,31 @@ mod tests {
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(
             err.contains("bound to channel_type 'slack'") && err.contains("'discord'"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn rejects_subprocess_with_tool_label_on_channel_ws() {
+        // The browser tool sidecar mints a token under label
+        // "tool/browser" (see gateway_cmd::start). That token lives in
+        // the same ChannelTokenTable so /v1/tool-ws can accept it via
+        // the channel-auth middleware. If the sidecar (or anyone who
+        // leaked the token) presented it at /v1/channel-ws, the
+        // identity check would pass and `bound_channel_type=None`
+        // would let it through the binding gate too. The label
+        // prefix rule fences this off.
+        let tokens = ChannelTokenTable::new();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 0,
+            label: "tool/browser".into(),
+            bound_channel_type: None,
+        });
+        let frame = register(handle.token(), "telegram", PROTOCOL_VERSION);
+        let authed = subprocess(0, "tool/browser");
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(
+            err.contains("tool/browser") && err.contains("reserved for tool sidecars"),
             "got: {err}",
         );
     }

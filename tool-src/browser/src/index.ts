@@ -166,10 +166,10 @@ async function main(): Promise<void> {
         process.stderr.write(`tool-ws decode failed: ${msg}\n`);
         return;
       }
-      void handleFrame(frame);
+      handleFrame(frame);
     });
 
-    async function handleFrame(frame: ToolFrame): Promise<void> {
+    function handleFrame(frame: ToolFrame): void {
       switch (frame.kind) {
         case "register_ack": {
           if (!frame.ok) {
@@ -186,8 +186,26 @@ async function main(): Promise<void> {
           return;
         }
         case "rpc_request": {
-          const reply = await dispatch(handlers, frame);
-          send(reply);
+          // Don't await: `ws` invokes the message handler
+          // sequentially, so awaiting here would serialise
+          // concurrent tool calls (a slow `screenshot` blocking a
+          // `snapshot`). Fire and resolve in the background —
+          // `dispatch` already converts handler errors into
+          // `rpc_error` frames; the `.catch` arm only fires for
+          // truly unexpected throws (out-of-memory, native crash).
+          dispatch(handlers, frame).then(
+            (reply) => send(reply),
+            (e: unknown) => {
+              const msg = e instanceof Error ? e.message : String(e);
+              process.stderr.write(`tool-ws dispatch threw: ${msg}\n`);
+              send({
+                kind: "rpc_error",
+                id: frame.id,
+                code: "DISPATCH_PANIC",
+                message: msg,
+              });
+            },
+          );
           return;
         }
         case "ping": {

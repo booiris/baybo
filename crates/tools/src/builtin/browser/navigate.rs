@@ -87,6 +87,21 @@ impl Tool for BrowserNavigateTool {
         validate_url_with(&p.url, false)
             .map_err(|e| ToolError::InvalidParams(format!("browser_navigate: {e}")))?;
         let result = call_sidecar(&self.client, "navigate", json!({ "url": p.url }), ctx).await?;
+
+        // Re-validate the final URL Rust-side. The sidecar's
+        // per-request hook in `network_policy.ts` already aborts a
+        // redirect that lands on a blocked IP literal mid-navigation,
+        // so this is belt-and-braces — but it makes the rejection
+        // visible in the agent's tool result rather than only in the
+        // sidecar's per-request abort + half-loaded page state.
+        // Hostnames pass through (DNS-level SSRF stays sidecar-side).
+        if let Some(final_url) = result.get("url").and_then(|v| v.as_str())
+            && let Err(e) = validate_url_with(final_url, false)
+        {
+            return Err(ToolError::Execution(format!(
+                "browser_navigate: redirect landed on blocked URL ({final_url}): {e}",
+            )));
+        }
         Ok(ToolOutput::Json(result))
     }
 }

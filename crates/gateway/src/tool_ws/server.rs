@@ -30,6 +30,17 @@ use super::frame::{PROTOCOL_VERSION, ToolFrame, decode, encode};
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Cap on a single inbound WS frame (and message). 16 MiB is well
+/// above any plausible RPC payload (the largest is `screenshot`
+/// which is itself bounded to 16 MiB of decoded PNG → ~22 MiB of
+/// b64 inside the frame, but screenshots flow gateway → sidecar
+/// only as the *response*; on this inbound side the largest
+/// realistic payload is a snapshot of a few hundred KB). A
+/// hostile or buggy sidecar that sends a multi-GB frame would
+/// otherwise be decoded into one Vec under axum's default
+/// 64 MiB limit.
+const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct ToolWsState {
     /// Sidecar id the gateway expects in the Register frame. Today
@@ -68,7 +79,9 @@ async fn ws_handler(
         );
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| run_connection(socket, state))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| run_connection(socket, state))
         .into_response()
 }
 
@@ -127,7 +140,8 @@ async fn run_connection(socket: WebSocket, state: ToolWsState) {
 
     tracing::info!(sidecar_id = %sidecar_id, "tool-ws sidecar registered");
 
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ToolFrame>();
+    let (outbound_tx, mut outbound_rx) =
+        mpsc::channel::<ToolFrame>(super::client::OUTBOUND_CHAN_CAPACITY);
     let attach_guard = state.client.attach(outbound_tx);
 
     let writer_task = tokio::spawn(async move {

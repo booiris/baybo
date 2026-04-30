@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::builtin::browser::client::BrowserSidecarClient;
 use crate::builtin::browser::schema::{call_sidecar, schema_object};
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 /// Hard cap on decoded screenshot bytes. A `full_page=true` capture
 /// of a giant page would otherwise land as a single tokio frame and
@@ -62,6 +62,20 @@ impl Tool for BrowserScreenshotTool {
             }),
             &[],
         )
+    }
+
+    fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        // Screenshot can capture whatever is on the active page —
+        // including PII the user opened in a previous step (an email
+        // tab, a banking dashboard, …) that they did not intend the
+        // LLM to see. Always prompt. The cache key splits viewport
+        // vs full-page so the user can grant the cheaper variant
+        // without auto-approving the heavier exfil surface.
+        let full = params.get("full_page").and_then(|v| v.as_bool()) == Some(true);
+        let mode = if full { "full_page" } else { "viewport" };
+        vec![ResourceAccess::ExecCommand {
+            command: format!("browser_screenshot: {mode}"),
+        }]
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {

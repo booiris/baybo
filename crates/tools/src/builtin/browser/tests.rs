@@ -37,8 +37,33 @@ impl BrowserSidecarClient for DeadClient {
     }
 }
 
+/// Stub client that returns a fixed JSON Value for every call. Used
+/// by tests that need to exercise post-RPC logic (e.g. navigate's
+/// final-URL re-validation) without standing up a real sidecar.
+struct CannedClient {
+    response: Value,
+}
+
+#[async_trait]
+impl BrowserSidecarClient for CannedClient {
+    async fn call(
+        &self,
+        _method: &str,
+        _params: Value,
+        _context_id: &str,
+        _timeout: Duration,
+        _cancellation_token: CancellationToken,
+    ) -> Result<Value, BrowserRpcError> {
+        Ok(self.response.clone())
+    }
+}
+
 fn dead() -> Arc<dyn BrowserSidecarClient> {
     Arc::new(DeadClient)
+}
+
+fn canned(response: Value) -> Arc<dyn BrowserSidecarClient> {
+    Arc::new(CannedClient { response })
 }
 
 fn blob_store() -> Arc<dyn aura_storage::BlobStore> {
@@ -297,9 +322,10 @@ fn tool_ctx() -> crate::ToolContext {
 #[test]
 fn passive_tools_do_not_prompt() {
     // Click / type / scroll / back / press / dialog / snapshot /
-    // screenshot / get_images all rely on a prior `navigate` having
-    // fired the Http approval. None of them declares access on
-    // their own.
+    // get_images all rely on a prior `navigate` having fired the
+    // Http approval. None of them declares access on their own.
+    // (screenshot is intentionally NOT in this list — it always
+    // prompts because of the PII-exfil surface.)
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(BrowserSnapshotTool::new(dead())),
         Box::new(BrowserClickTool::new(dead())),
@@ -308,7 +334,6 @@ fn passive_tools_do_not_prompt() {
         Box::new(BrowserBackTool::new(dead())),
         Box::new(BrowserPressTool::new(dead())),
         Box::new(BrowserGetImagesTool::new(dead())),
-        Box::new(BrowserScreenshotTool::new(dead(), blob_store())),
         Box::new(BrowserDialogTool::new(dead())),
     ];
     for t in &tools {
@@ -319,4 +344,76 @@ fn passive_tools_do_not_prompt() {
             t.name()
         );
     }
+}
+
+// ---------- navigate: post-RPC redirect re-validation ----------
+
+#[tokio::test]
+async fn navigate_rejects_redirect_to_blocked_literal_ip() {
+    // The sidecar reports the post-redirect URL in its response.
+    // Even though the per-request hook in network_policy.ts already
+    // aborts on a blocked IP, the agent should see a clean
+    // ToolError::Execution rather than a half-loaded page.
+    let client = canned(serde_json::json!({
+        "title": "evil",
+        "url": "http://10.0.0.1/loot",
+        "snapshot": "",
+    }));
+    let tool = BrowserNavigateTool::new(client);
+    let ctx = tool_ctx();
+    let err = tool
+        .execute(serde_json::json!({ "url": "https://example.com/" }), &ctx)
+        .await
+        .expect_err("redirect to RFC1918 must surface as error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("redirect landed") && msg.contains("10.0.0.1"),
+        "expected redirect error mentioning 10.0.0.1, got: {msg}",
+    );
+}
+
+#[tokio::test]
+async fn navigate_accepts_redirect_to_public_host() {
+    // Hostname destinations pass through — DNS-level SSRF stays
+    // sidecar-side. This test pins that the Rust-side re-validation
+    // doesn't accidentally reject legitimate hostname redirects.
+    let client = canned(serde_json::json!({
+        "title": "ok",
+        "url": "https://docs.example.com/page",
+        "snapshot": "",
+    }));
+    let tool = BrowserNavigateTool::new(client);
+    let ctx = tool_ctx();
+    let out = tool
+        .execute(serde_json::json!({ "url": "https://example.com/" }), &ctx)
+        .await
+        .expect("hostname redirect must pass");
+    assert!(matches!(out, crate::ToolOutput::Json(_)));
+}
+
+#[test]
+fn screenshot_always_prompts_with_mode_split() {
+    let tool = BrowserScreenshotTool::new(dead(), blob_store());
+    let viewport = tool.accessed_resources(&json!({}));
+    let full = tool.accessed_resources(&json!({ "full_page": true }));
+    assert!(matches!(
+        viewport.first(),
+        Some(ResourceAccess::ExecCommand { command }) if command.contains("viewport")
+    ));
+    assert!(matches!(
+        full.first(),
+        Some(ResourceAccess::ExecCommand { command }) if command.contains("full_page")
+    ));
+    // Viewport vs full_page must hash to different cache keys so
+    // approving one doesn't silently approve the heavier exfil
+    // surface.
+    let v_cmd = match &viewport[0] {
+        ResourceAccess::ExecCommand { command } => command.clone(),
+        _ => panic!(),
+    };
+    let f_cmd = match &full[0] {
+        ResourceAccess::ExecCommand { command } => command.clone(),
+        _ => panic!(),
+    };
+    assert_ne!(v_cmd, f_cmd);
 }

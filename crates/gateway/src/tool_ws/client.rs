@@ -27,6 +27,15 @@ use super::frame::ToolFrame;
 
 type PendingTx = oneshot::Sender<Result<Value, BrowserRpcError>>;
 
+/// Bound on the per-connection outbound queue. The writer task
+/// drains this and pushes onto the WebSocket sink; a sidecar that
+/// stalls causes back-pressure here rather than uncapped memory
+/// growth. 256 frames is well above any plausible burst (each tool
+/// call emits one RpcRequest; periodic Pong is one frame; events
+/// are bounded sidecar-side at 256 too) and small enough to fail
+/// fast when the sidecar genuinely hangs.
+pub(crate) const OUTBOUND_CHAN_CAPACITY: usize = 256;
+
 /// Opaque handle the route handler keeps for its connection.
 /// `attach` returns one; `detach` only clears the active outbound
 /// when the generation matches the currently-attached one — this
@@ -37,7 +46,7 @@ pub struct AttachGuard(u64);
 
 #[derive(Clone)]
 struct ActiveAttach {
-    outbound: mpsc::UnboundedSender<ToolFrame>,
+    outbound: mpsc::Sender<ToolFrame>,
     generation: u64,
 }
 
@@ -74,7 +83,7 @@ impl WsBrowserSidecarClient {
     /// outbound and *bumps* the generation, so the old connection's
     /// eventual `detach` becomes a no-op and any in-flight RPCs the
     /// new connection just took over keep their pending entries.
-    pub fn attach(&self, outbound: mpsc::UnboundedSender<ToolFrame>) -> AttachGuard {
+    pub fn attach(&self, outbound: mpsc::Sender<ToolFrame>) -> AttachGuard {
         let generation = self.state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut slot = self.state.outbound.write();
         *slot = Some(ActiveAttach {
@@ -156,9 +165,13 @@ impl WsBrowserSidecarClient {
                     .as_ref()
                     .map(|a| a.outbound.clone());
                 if let Some(tx) = tx
-                    && tx.send(ToolFrame::Pong { ts }).is_err()
+                    && let Err(e) = tx.try_send(ToolFrame::Pong { ts })
                 {
-                    tracing::debug!("tool-ws: pong queue closed");
+                    // try_send (not send().await) keeps `dispatch_inbound`
+                    // synchronous; a full or closed queue means the
+                    // sidecar is stalled — skip the pong and let the
+                    // socket time out naturally.
+                    tracing::debug!(?e, "tool-ws: pong drop (queue full or closed)");
                 }
             }
             ToolFrame::Pong { .. } => {}
@@ -214,9 +227,20 @@ impl BrowserSidecarClient for WsBrowserSidecarClient {
             method: method.to_string(),
             params: wrapped,
         };
-        if outbound.send(frame).is_err() {
+        // try_send so a stalled sidecar (writer not draining) fails
+        // fast instead of letting the caller hang on an unbounded
+        // queue. A full queue is treated the same as a disconnect
+        // for the agent's purposes — both mean the call cannot make
+        // progress. The Transport variant carries a dedicated message
+        // so logs can distinguish the two.
+        if let Err(e) = outbound.try_send(frame) {
             self.state.pending.remove(&id);
-            return Err(BrowserRpcError::Disconnected);
+            return match e {
+                mpsc::error::TrySendError::Full(_) => Err(BrowserRpcError::Transport(
+                    "outbound queue full (sidecar stalled)".into(),
+                )),
+                mpsc::error::TrySendError::Closed(_) => Err(BrowserRpcError::Disconnected),
+            };
         }
 
         let pending = Arc::clone(&self.state);
@@ -261,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn call_with_pre_cancelled_token_returns_cancelled() {
         let client = WsBrowserSidecarClient::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let _guard = client.attach(tx);
         // Drain frames the call sends so the queue doesn't back up.
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -280,9 +304,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_returns_transport_when_outbound_full() {
+        // Stalled sidecar (writer not draining the queue): the
+        // bounded outbound mpsc fills up and `try_send` reports
+        // Full. The agent must see a fast-failing Transport error
+        // rather than hanging.
+        let client = WsBrowserSidecarClient::new();
+        // Capacity 1 channel, never drained.
+        let (tx, _rx) = mpsc::channel::<ToolFrame>(1);
+        let _guard = client.attach(tx);
+        // First call lands the slot.
+        let c1 = client.clone();
+        let h1 = tokio::spawn(async move {
+            c1.call(
+                "x",
+                json!({}),
+                "s",
+                Duration::from_millis(50),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        // Give the first call time to enqueue.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Second call now hits a full queue.
+        let err = client
+            .call(
+                "y",
+                json!({}),
+                "s",
+                Duration::from_secs(2),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BrowserRpcError::Transport(ref m) if m.contains("queue full")),
+            "expected Transport queue-full, got {err:?}",
+        );
+        // First call still pending; let it time out.
+        let r1 = h1.await.unwrap();
+        assert!(matches!(r1, Err(BrowserRpcError::Timeout(_))));
+    }
+
+    #[tokio::test]
     async fn call_times_out_when_no_response() {
         let client = WsBrowserSidecarClient::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let _guard = client.attach(tx);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let err = client
@@ -305,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn detach_fails_all_pending_calls_with_disconnected() {
         let client = WsBrowserSidecarClient::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let guard = client.attach(tx);
         let c1 = client.clone();
         let c2 = client.clone();
@@ -348,9 +416,9 @@ mod tests {
         // calls detach(guard_A), the active sidecar (B) must NOT be
         // dropped and B's in-flight RPCs must NOT be failed.
         let client = WsBrowserSidecarClient::new();
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
+        let (tx_a, _rx_a) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let guard_a = client.attach(tx_a);
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let _guard_b = client.attach(tx_b);
         assert!(client.is_attached());
 
@@ -398,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_inbound_resolves_matching_id() {
         let client = WsBrowserSidecarClient::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let _guard = client.attach(tx);
         let c2 = client.clone();
         let h = tokio::spawn(async move {
@@ -428,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_inbound_rpc_error_is_surfaced() {
         let client = WsBrowserSidecarClient::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let _guard = client.attach(tx);
         let c2 = client.clone();
         let h = tokio::spawn(async move {
@@ -480,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn ping_triggers_pong_when_attached() {
         let client = WsBrowserSidecarClient::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let _guard = client.attach(tx);
         client.dispatch_inbound(ToolFrame::Ping { ts: 42 });
         let frame = rx.recv().await.expect("pong queued");
@@ -496,7 +564,7 @@ mod tests {
         // `value` so the sidecar always sees an object — keeps the
         // `context_id` injection unconditional.
         let client = WsBrowserSidecarClient::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(super::OUTBOUND_CHAN_CAPACITY);
         let _guard = client.attach(tx);
         // No async needed — the call_inner happens-once, but call()
         // is async. Use `block_on` via a runtime built explicitly.

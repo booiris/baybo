@@ -49,6 +49,16 @@ pub use type_text::BrowserTypeTool;
 /// when (and only when) a browser sidecar is reachable — when no
 /// client is plumbed in, the tools are silently absent and the LLM
 /// won't see them.
+///
+/// Capability ceiling: `browser_cdp` and `browser_console` declare
+/// [`ToolCapability::ExecCommand`] because they let the agent run
+/// arbitrary code in the page (or, for CDP, against the browser
+/// itself). Every other browser tool is capability-free at the
+/// manifest level — its runtime risk is gated by the per-call
+/// approval surface in `accessed_resources` (e.g. `navigate` prompts
+/// for literal-IP hosts; `screenshot` always prompts for PII-exfil).
+/// A downstream tool policy that wants to forbid raw scripting
+/// without disabling all browsing can match on `ExecCommand` here.
 pub fn tools(
     client: Arc<dyn BrowserSidecarClient>,
     blob_store: Arc<dyn BlobStore>,

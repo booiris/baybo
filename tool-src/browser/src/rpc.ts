@@ -5,7 +5,20 @@ import { Packr, Unpackr } from "msgpackr";
 // msgpackr emit standard maps that match `rmp_serde::to_vec_named` on
 // the Rust side.
 const packr = new Packr({ useRecords: false });
-const unpackr = new Unpackr({ useRecords: false });
+// Mirror the gateway's MAX_WS_MESSAGE_BYTES (16 MiB) on the sidecar
+// side. msgpackr's Unpackr is willing to allocate strings/maps as
+// large as the wire bytes it sees — a hostile or buggy gateway frame
+// would otherwise OOM the sidecar before any application-level cap
+// fires. The pre-decode byte gate in `decode()` is the primary fence;
+// these maxArraySize/maxMapSize options are a defense-in-depth cap on
+// pathological frames that *fit* under the byte limit but still
+// declare obscene array/map counts.
+export const MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024;
+const unpackr = new Unpackr({
+  useRecords: false,
+  maxArraySize: 1_000_000,
+  maxMapSize: 1_000_000,
+});
 
 export const PROTOCOL_VERSION = 1;
 
@@ -24,6 +37,11 @@ export function encode(frame: ToolFrame): Buffer {
 }
 
 export function decode(bytes: Uint8Array): ToolFrame {
+  if (bytes.byteLength > MAX_WS_MESSAGE_BYTES) {
+    throw new Error(
+      `tool-ws frame too large (${bytes.byteLength} > ${MAX_WS_MESSAGE_BYTES} bytes)`,
+    );
+  }
   const obj = unpackr.unpack(Buffer.from(bytes)) as ToolFrame;
   if (!obj || typeof (obj as { kind?: unknown }).kind !== "string") {
     throw new Error("decoded frame missing `kind` discriminant");
