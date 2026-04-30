@@ -314,7 +314,7 @@ pub fn build_channel_router(
 
     let v1_inner = if let Some(client) = deps.tool_ws_client.clone() {
         let tool_ws_state = crate::tool_ws::ToolWsState {
-            expected_sidecar_id: Arc::new("browser".to_string()),
+            expected_sidecar_id: Arc::new(crate::sidecar::domains::BROWSER.to_string()),
             expected_label: Arc::new(deps.tool_ws_sidecar_label.clone()),
             client,
         };

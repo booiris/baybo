@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve as resolvePath, sep } from "node:path";
+import { dirname, resolve as resolvePath, sep } from "node:path";
 
 import {
   type Browser,
@@ -30,9 +30,26 @@ const FORBIDDEN_PROFILE_PREFIXES = [
   // Linux Chrome / Chromium
   ".config/google-chrome",
   ".config/chromium",
-  // macOS Chrome / Chromium
+  // Linux Brave / Edge / Vivaldi / Opera
+  ".config/BraveSoftware",
+  ".config/microsoft-edge",
+  ".config/vivaldi",
+  ".config/opera",
+  // Snap / Flatpak Chromium variants
+  "snap/chromium/common/chromium",
+  "snap/firefox/common/.mozilla/firefox",
+  ".var/app/org.chromium.Chromium",
+  ".var/app/com.google.Chrome",
+  ".var/app/com.brave.Browser",
+  ".var/app/com.microsoft.Edge",
+  ".var/app/org.mozilla.firefox",
+  // macOS Chrome / Chromium / Brave / Edge / Vivaldi / Opera
   "Library/Application Support/Google/Chrome",
   "Library/Application Support/Chromium",
+  "Library/Application Support/BraveSoftware",
+  "Library/Application Support/Microsoft Edge",
+  "Library/Application Support/Vivaldi",
+  "Library/Application Support/com.operasoftware.Opera",
   // Firefox (any platform)
   ".mozilla/firefox",
   "Library/Application Support/Firefox",
@@ -268,19 +285,55 @@ export class BrowserManager {
    */
   private assertSafeProfileDir(dir: string): void {
     const home = homedir();
-    const resolved = resolvePath(dir);
-    const homeRel = resolved.startsWith(home + sep)
-      ? resolved.slice(home.length + 1)
-      : null;
-    if (homeRel) {
+    // Two checks against two paths:
+    //  1. The lexical resolve (handles `..`) — catches an explicit
+    //     path under a known browser profile dir.
+    //  2. The realpath of the deepest existing parent + the missing
+    //     tail — catches symlink-based escape (operator points at
+    //     `/tmp/aura-trick` which is a symlink to `~/.config/google-chrome`).
+    // Either match → refuse to start.
+    const lexical = resolvePath(dir);
+    const real = realResolveExistingParent(lexical);
+    for (const candidate of new Set([lexical, real])) {
+      const rel = candidate.startsWith(home + sep)
+        ? candidate.slice(home.length + 1)
+        : null;
+      if (!rel) continue;
       for (const forbidden of FORBIDDEN_PROFILE_PREFIXES) {
-        if (homeRel === forbidden || homeRel.startsWith(forbidden + sep)) {
+        if (rel === forbidden || rel.startsWith(forbidden + sep)) {
           throw new Error(
-            `browser sidecar refuses to use system browser profile dir '${resolved}'; ` +
+            `browser sidecar refuses to use system browser profile dir ` +
+              `(lexical='${lexical}', real='${real}'); ` +
               `set AURA_BROWSER_PROFILE_DIR to a path under \$XDG_CACHE_HOME/aura/browser/...`,
           );
         }
       }
     }
   }
+}
+
+/**
+ * Resolve symlinks for the deepest existing ancestor of `dir`, then
+ * re-append the missing tail. The profile dir typically doesn't
+ * exist yet (created by `mkdirSync` after this check), so a plain
+ * `fs.realpathSync(dir)` would throw ENOENT. Walking up to find the
+ * deepest existing parent lets us still detect the case where the
+ * operator symlinks `~/aura-cache → ~/.config/google-chrome`.
+ */
+function realResolveExistingParent(p: string): string {
+  let head = p;
+  const tail: string[] = [];
+  while (head && head !== sep && head !== dirname(head)) {
+    try {
+      statSync(head);
+      // Exists. realpath this prefix and append the tail.
+      const realHead = realpathSync(head);
+      return tail.length === 0 ? realHead : resolvePath(realHead, ...tail.reverse());
+    } catch {
+      // Not yet created — walk up.
+      tail.push(head.slice(dirname(head).length + 1));
+      head = dirname(head);
+    }
+  }
+  return p;
 }

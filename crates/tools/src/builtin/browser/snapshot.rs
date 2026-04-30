@@ -9,6 +9,7 @@ use crate::builtin::browser::schema::{call_sidecar, schema_object};
 use crate::{Tool, ToolContext, ToolError, ToolOutput};
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Params {
     #[serde(default)]
     full: bool,
@@ -51,9 +52,8 @@ impl Tool for BrowserSnapshotTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
-        let p: Params = serde_json::from_value(params)
-            .map_err(|e| ToolError::InvalidParams(e.to_string()))
-            .unwrap_or_default();
+        let p: Params =
+            serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let result = call_sidecar(&self.client, "snapshot", json!({ "full": p.full }), ctx).await?;
         // The sidecar returns either { "text": "..." } (preferred) or a
         // raw string. Surface as Text so the LLM sees plain markup.

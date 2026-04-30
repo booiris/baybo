@@ -21,7 +21,7 @@ use crate::{ResourceAccess, Tool};
 /// Stub client that fails every RPC. Lets us instantiate tools so
 /// we can poke their `parameters_schema` / `accessed_resources` /
 /// `call_label` without any real WS plumbing.
-struct DeadClient;
+pub(crate) struct DeadClient;
 
 #[async_trait]
 impl BrowserSidecarClient for DeadClient {
@@ -240,6 +240,56 @@ fn cdp_missing_method_still_prompts() {
         matches!(acc.first(), Some(ResourceAccess::ExecCommand { .. })),
         "cdp must prompt even when method is absent, got {acc:?}"
     );
+}
+
+// ---------- params: deny_unknown_fields on snapshot/screenshot ----------
+
+#[tokio::test]
+async fn snapshot_rejects_typo_param() {
+    // `fulll` (typo of `full`) used to silently coerce to default
+    // because the original code ate `serde_json::from_value` errors
+    // via `.unwrap_or_default()`. Now it must surface as
+    // InvalidParams.
+    let tool = BrowserSnapshotTool::new(dead());
+    let ctx = tool_ctx();
+    let err = tool
+        .execute(json!({ "fulll": true }), &ctx)
+        .await
+        .expect_err("typo'd param must error");
+    assert!(
+        matches!(err, crate::ToolError::InvalidParams(_)),
+        "expected InvalidParams, got {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn screenshot_rejects_typo_param() {
+    let tool = BrowserScreenshotTool::new(dead(), blob_store());
+    let ctx = tool_ctx();
+    let err = tool
+        .execute(json!({ "ful_page": true }), &ctx)
+        .await
+        .expect_err("typo'd param must error");
+    assert!(
+        matches!(err, crate::ToolError::InvalidParams(_)),
+        "expected InvalidParams, got {err:?}",
+    );
+}
+
+fn tool_ctx() -> crate::ToolContext {
+    crate::ToolContext {
+        session_id: "test-session".to_string(),
+        user: aura_model::User {
+            id: "u".into(),
+            name: None,
+            channel: aura_model::ChannelType::tui(),
+        },
+        timeout: std::time::Duration::from_millis(100),
+        cancellation_token: CancellationToken::new(),
+        workspace_root: std::path::PathBuf::from("/tmp"),
+        sandbox: None,
+        approval: None,
+    }
 }
 
 // ---------- non-prompting tools ----------

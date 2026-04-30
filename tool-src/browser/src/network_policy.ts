@@ -198,7 +198,15 @@ export async function resolveAndCheck(
     return { host, safe: [stripped], blocked: [] };
   }
 
-  const lc = host.toLowerCase();
+  // WHATWG URL preserves a trailing dot on the hostname, so
+  // `new URL("http://localhost./").hostname === "localhost."`. The
+  // resolver still treats trailing-dot FQDNs as the same name, so a
+  // naive `lc === "localhost"` check would let `localhost.` through
+  // the alias gate (the IP-level isBlockedIp would still catch
+  // loopback in production, but any single-label internal hostname
+  // — `metadata.`, corporate split-horizon names — would slip past).
+  // Strip the trailing dot before alias matching.
+  const lc = host.toLowerCase().replace(/\.$/, "");
   if (
     !allowLoopback &&
     (lc === "localhost" || lc === "localhost.localdomain" || lc.endsWith(".localhost"))

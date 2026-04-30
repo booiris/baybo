@@ -199,6 +199,18 @@ test("resolveAndCheck blocks localhost alias", async () => {
   await assert.rejects(() => resolveAndCheck("foo.localhost"));
 });
 
+test("resolveAndCheck blocks trailing-dot localhost FQDNs", async () => {
+  // WHATWG URL preserves the trailing dot on hostname:
+  //   new URL("http://localhost./").hostname === "localhost."
+  // The pre-fix alias check did `lc === "localhost"` which let the
+  // trailing-dot form through to dns.lookup. IP-level check still
+  // catches loopback in production, but any single-label internal
+  // hostname (`metadata.`, corporate split-horizon names) would slip.
+  await assert.rejects(() => resolveAndCheck("localhost."));
+  await assert.rejects(() => resolveAndCheck("foo.localhost."));
+  await assert.rejects(() => resolveAndCheck("localhost.localdomain."));
+});
+
 test("resolveAndCheck permits localhost alias when allowLoopback=true", async () => {
   const r = await resolveAndCheck("localhost", true);
   assert.ok(r.safe.length > 0, "expected at least one safe address");

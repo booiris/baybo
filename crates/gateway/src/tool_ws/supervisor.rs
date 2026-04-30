@@ -92,7 +92,7 @@ impl ToolSidecarSupervisor {
             cmd.arg(&self.config.bundle_path);
             cmd.env("AURA_TOOL_WS_URL", &self.config.ws_url);
             cmd.env("AURA_TOOL_WS_TOKEN", &self.config.ws_token);
-            cmd.env("AURA_TOOL_SIDECAR_ID", "browser");
+            cmd.env("AURA_TOOL_SIDECAR_ID", crate::sidecar::domains::BROWSER);
             if let Some(p) = &self.config.chromium_executable {
                 cmd.env("AURA_CHROMIUM_BIN", p);
             }

@@ -63,22 +63,37 @@ function defaultProfileDir(): string {
 
 async function main(): Promise<void> {
   const env = readEnv();
+
+  // Declare connection-state vars BEFORE constructing BrowserManager.
+  // The manager's constructor receives an `emitEvent` closure that
+  // references `pendingEvents` / `flushEvents`; if either of those
+  // were declared after `new BrowserManager(...)`, any synchronous
+  // emit during construction would hit a TDZ ReferenceError. Even
+  // though no current path emits synchronously, the ordering is the
+  // load-bearing invariant — keep them above the constructor call.
+  let socket: WebSocket | null = null;
+  let backoff = RECONNECT_MIN_MS;
+  let pingTimer: NodeJS.Timeout | null = null;
+  const pendingEvents: ToolFrame[] = [];
+  const PENDING_EVENTS_MAX = 256;
+
   const manager = new BrowserManager({
     profileDir: env.profileDir,
     chromiumExecutable: env.chromiumExecutable,
     noSandbox: env.noSandbox,
     allowLoopback: env.allowLoopback,
     emitEvent: (name, data) => {
+      // Bounded queue: a long disconnect during a chatty session
+      // (dialog floods, console.error storms) would otherwise grow
+      // unbounded across reconnects. Drop oldest on overflow.
+      if (pendingEvents.length >= PENDING_EVENTS_MAX) {
+        pendingEvents.shift();
+      }
       pendingEvents.push({ kind: "event", name, data });
       flushEvents();
     },
   });
   const handlers = buildHandlers(manager);
-
-  let socket: WebSocket | null = null;
-  let backoff = RECONNECT_MIN_MS;
-  let pingTimer: NodeJS.Timeout | null = null;
-  const pendingEvents: ToolFrame[] = [];
 
   function flushEvents(): void {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;

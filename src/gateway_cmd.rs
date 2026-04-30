@@ -470,7 +470,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
             // token minted earlier as `tool_browser_token`); the
             // `WsBrowserSidecarClient` already plumbed through the
             // tool registry receives the live socket on Register.
-            if let Some(bundle_path) = runtime.bundle_for("browser") {
+            if let Some(bundle_path) = runtime.bundle_for(aura_gateway::sidecar::domains::BROWSER) {
                 let tool_ws_url = format!("ws://127.0.0.1:{channel_port}/v1/tool-ws");
                 let no_sandbox =
                     parse_bool_env(std::env::var("AURA_BROWSER_NO_SANDBOX").ok().as_deref());
