@@ -35,6 +35,18 @@ use crate::tool_executor::ToolExecutor;
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
 
+/// Cap on attachments carried into the final `OutgoingMessage`. Tools
+/// like `browser_screenshot` and `send_local_file` push into a
+/// per-turn `accumulated_attachments` vec; without a cap a chatty
+/// agent (multi-iteration browse, page-each screenshot, …) would
+/// dump every blob produced over the loop into one channel message.
+/// 16 is well above any plausible "user asked for N artifacts" case
+/// and small enough that a runaway loop doesn't drown the channel.
+/// FIFO eviction: keep the newest, drop the oldest — older
+/// screenshots from earlier iterations are typically stale anyway
+/// (page state has moved on).
+const MAX_ATTACHMENTS_PER_TURN: usize = 16;
+
 /// Compute the byte index at which it is safe to flush `pending` to the
 /// output stream. Anything after that index is withheld because it might
 /// be the beginning of a `[{REDACTED_SECRET_...}]` placeholder split
@@ -62,6 +74,22 @@ fn safe_flush_boundary(pending: &str) -> usize {
         return pending.len() - 1;
     }
     pending.len()
+}
+
+/// Append `items` into `dst` while keeping `dst.len() <=
+/// MAX_ATTACHMENTS_PER_TURN` via FIFO eviction. Used for the
+/// per-turn `accumulated_attachments` vec so a runaway loop can't
+/// drown the final `OutgoingMessage` in stale screenshots.
+fn push_bounded<I: IntoIterator<Item = ContentBlock>>(dst: &mut Vec<ContentBlock>, items: I) {
+    for item in items {
+        if dst.len() >= MAX_ATTACHMENTS_PER_TURN {
+            // Drop the oldest. Cheap on a small Vec; stable order
+            // matters because the channel renders attachments in
+            // arrival order.
+            dst.remove(0);
+        }
+        dst.push(item);
+    }
 }
 
 /// Outcome of the skill risk assessor for a single candidate. `run()`
@@ -393,7 +421,7 @@ impl AgentLoop {
                         serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
                     }
                     Ok(ToolOutput::WithAttachments { text, attachments }) => {
-                        accumulated_attachments.extend(attachments.iter().cloned());
+                        push_bounded(&mut accumulated_attachments, attachments.iter().cloned());
                         text.clone()
                     }
                     Ok(ToolOutput::MultiModalText { text, llm_images }) => {
@@ -402,7 +430,7 @@ impl AgentLoop {
                         // sees them through the standard multimodal user
                         // path) AND the final OutgoingMessage (so the
                         // user channel renders them too).
-                        accumulated_attachments.extend(llm_images.iter().cloned());
+                        push_bounded(&mut accumulated_attachments, llm_images.iter().cloned());
                         llm_visible_images.extend(llm_images.iter().cloned());
                         text.clone()
                     }
@@ -985,5 +1013,59 @@ mod stream_buffer_tests {
     fn high_water_forces_flush() {
         let s: String = "a".repeat(200) + "[";
         assert_eq!(safe_flush_boundary(&s), s.len());
+    }
+}
+
+#[cfg(test)]
+mod attachment_bound_tests {
+    use super::{MAX_ATTACHMENTS_PER_TURN, push_bounded};
+    use aura_model::{BlobRef, ContentBlock};
+
+    fn img(tag: &str) -> ContentBlock {
+        ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: format!("sha256:{tag}"),
+            },
+            mime_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn under_cap_keeps_everything() {
+        let mut v: Vec<ContentBlock> = Vec::new();
+        push_bounded(&mut v, vec![img("a"), img("b"), img("c")]);
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn over_cap_evicts_oldest_first() {
+        let mut v: Vec<ContentBlock> = Vec::new();
+        let pushed: Vec<ContentBlock> = (0..MAX_ATTACHMENTS_PER_TURN + 5)
+            .map(|i| img(&format!("{i:0>2}")))
+            .collect();
+        push_bounded(&mut v, pushed);
+        assert_eq!(v.len(), MAX_ATTACHMENTS_PER_TURN);
+        // Newest 16 survive; the first 5 (00..04) evicted.
+        match &v[0] {
+            ContentBlock::Image { blob, .. } => {
+                assert!(
+                    blob.blob_id.ends_with("05"),
+                    "oldest survivor should be 05, got {}",
+                    blob.blob_id
+                );
+            }
+            _ => panic!("expected image"),
+        }
+        match v.last().unwrap() {
+            ContentBlock::Image { blob, .. } => {
+                let last = format!("{:0>2}", MAX_ATTACHMENTS_PER_TURN + 4);
+                assert!(
+                    blob.blob_id.ends_with(&last),
+                    "newest should be {last}, got {}",
+                    blob.blob_id
+                );
+            }
+            _ => panic!("expected image"),
+        }
     }
 }

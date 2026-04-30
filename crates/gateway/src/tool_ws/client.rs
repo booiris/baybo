@@ -25,7 +25,18 @@ use uuid::Uuid;
 
 use super::frame::ToolFrame;
 
-type PendingTx = oneshot::Sender<Result<Value, BrowserRpcError>>;
+/// Per-pending entry: the oneshot to resolve, plus the generation
+/// of the `attach` whose outbound queue carried (or would have
+/// carried) this RPC's request frame. When a fresh `attach` lands,
+/// any pending entry whose `generation < current` is failed with
+/// `Disconnected` immediately — its frame either rode the now-dead
+/// previous outbound queue or was waiting for a reply that won't
+/// come, and the agent is better off surfacing the disconnect right
+/// away than waiting on the per-call timeout.
+struct PendingEntry {
+    tx: oneshot::Sender<Result<Value, BrowserRpcError>>,
+    generation: u64,
+}
 
 /// Bound on the per-connection outbound queue. The writer task
 /// drains this and pushes onto the WebSocket sink; a sidecar that
@@ -58,7 +69,7 @@ struct ClientState {
     /// queueing anything (we don't buffer RPCs across disconnects —
     /// the caller's tool surface decides whether to retry).
     outbound: RwLock<Option<ActiveAttach>>,
-    pending: DashMap<String, PendingTx>,
+    pending: DashMap<String, PendingEntry>,
     /// Monotonic generation. Each successful `attach` increments
     /// this and tags the new active outbound; a `detach` whose
     /// guard's generation doesn't match current is a no-op.
@@ -80,16 +91,36 @@ impl WsBrowserSidecarClient {
     /// the route handler must pass that guard back to [`detach`] on
     /// connection close. A second concurrent `attach` (operator
     /// reconnect, race between two valid tokens) replaces the active
-    /// outbound and *bumps* the generation, so the old connection's
-    /// eventual `detach` becomes a no-op and any in-flight RPCs the
-    /// new connection just took over keep their pending entries.
+    /// outbound and *bumps* the generation. Any in-flight RPC whose
+    /// pending entry was emitted on the previous generation's queue
+    /// is failed immediately with `Disconnected` — its request
+    /// either rode a dead socket or is waiting on a reply that will
+    /// never arrive, and the agent is better off surfacing the
+    /// disconnect now than waiting on the per-call timeout.
     pub fn attach(&self, outbound: mpsc::Sender<ToolFrame>) -> AttachGuard {
         let generation = self.state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut slot = self.state.outbound.write();
-        *slot = Some(ActiveAttach {
-            outbound,
-            generation,
-        });
+        {
+            let mut slot = self.state.outbound.write();
+            *slot = Some(ActiveAttach {
+                outbound,
+                generation,
+            });
+        }
+        // Walk pending and fail every entry whose generation predates
+        // the new attach. Snapshot the keys first so we don't hold a
+        // dashmap shard guard across the oneshot resolution.
+        let stale_keys: Vec<String> = self
+            .state
+            .pending
+            .iter()
+            .filter(|e| e.value().generation < generation)
+            .map(|e| e.key().clone())
+            .collect();
+        for k in stale_keys {
+            if let Some((_, entry)) = self.state.pending.remove(&k) {
+                let _ = entry.tx.send(Err(BrowserRpcError::Disconnected));
+            }
+        }
         AttachGuard(generation)
     }
 
@@ -131,8 +162,8 @@ impl WsBrowserSidecarClient {
         // hold the dashmap shard guard while resolving the oneshots.
         let keys: Vec<String> = self.state.pending.iter().map(|e| e.key().clone()).collect();
         for k in keys {
-            if let Some((_, tx)) = self.state.pending.remove(&k) {
-                let _ = tx.send(Err(BrowserRpcError::Disconnected));
+            if let Some((_, entry)) = self.state.pending.remove(&k) {
+                let _ = entry.tx.send(Err(BrowserRpcError::Disconnected));
             }
         }
     }
@@ -141,15 +172,17 @@ impl WsBrowserSidecarClient {
     pub fn dispatch_inbound(&self, frame: ToolFrame) {
         match frame {
             ToolFrame::RpcResult { id, result } => {
-                if let Some((_, tx)) = self.state.pending.remove(&id) {
-                    let _ = tx.send(Ok(result));
+                if let Some((_, entry)) = self.state.pending.remove(&id) {
+                    let _ = entry.tx.send(Ok(result));
                 } else {
                     tracing::debug!(id = %id, "tool-ws: RpcResult for unknown call");
                 }
             }
             ToolFrame::RpcError { id, code, message } => {
-                if let Some((_, tx)) = self.state.pending.remove(&id) {
-                    let _ = tx.send(Err(BrowserRpcError::Sidecar { code, message }));
+                if let Some((_, entry)) = self.state.pending.remove(&id) {
+                    let _ = entry
+                        .tx
+                        .send(Err(BrowserRpcError::Sidecar { code, message }));
                 } else {
                     tracing::debug!(id = %id, code = %code, "tool-ws: RpcError for unknown call");
                 }
@@ -192,13 +225,20 @@ impl BrowserSidecarClient for WsBrowserSidecarClient {
         timeout: Duration,
         cancellation_token: CancellationToken,
     ) -> Result<Value, BrowserRpcError> {
-        let outbound = self
-            .state
-            .outbound
-            .read()
-            .as_ref()
-            .map(|a| a.outbound.clone())
-            .ok_or(BrowserRpcError::Disconnected)?;
+        // Snapshot the active outbound *and* its generation under one
+        // read-lock so the pending entry is tagged with exactly the
+        // generation that owns the queue we'll send on. If `attach`
+        // races between the snapshot and the `pending.insert`, that's
+        // OK — the new attach's `attach()` only fails entries whose
+        // gen is *strictly less* than its own, so an in-flight
+        // tagged with the new gen survives.
+        let (outbound, generation) = {
+            let slot = self.state.outbound.read();
+            match slot.as_ref() {
+                Some(a) => (a.outbound.clone(), a.generation),
+                None => return Err(BrowserRpcError::Disconnected),
+            }
+        };
 
         // Inject context_id into the params object so the sidecar
         // knows which BrowserContext to route to. If the caller passed
@@ -220,7 +260,9 @@ impl BrowserSidecarClient for WsBrowserSidecarClient {
 
         let id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        self.state.pending.insert(id.clone(), tx);
+        self.state
+            .pending
+            .insert(id.clone(), PendingEntry { tx, generation });
 
         let frame = ToolFrame::RpcRequest {
             id: id.clone(),
@@ -407,6 +449,92 @@ mod tests {
         assert!(matches!(r1, Err(BrowserRpcError::Disconnected)));
         assert!(matches!(r2, Err(BrowserRpcError::Disconnected)));
         assert_eq!(client.state.pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_fails_stale_pending_immediately() {
+        // RPC fires under attach gen=1. Sidecar dies; supervisor
+        // restarts; new attach gen=2 lands. Without generation-tag
+        // fail-fast, the gen=1 pending oneshot would only resolve
+        // via the per-call timeout (up to minutes for long browser
+        // ops). With generation tagging, attach() walks pending and
+        // fails every entry whose gen < current with Disconnected.
+        let client = WsBrowserSidecarClient::new();
+        let (tx_1, mut rx_1) = mpsc::channel::<ToolFrame>(super::OUTBOUND_CHAN_CAPACITY);
+        let _guard_1 = client.attach(tx_1);
+
+        // Spawn an in-flight RPC under attach gen=1.
+        let c = client.clone();
+        let h = tokio::spawn(async move {
+            c.call(
+                "navigate",
+                json!({}),
+                "s",
+                Duration::from_secs(60),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        // Wait for the RpcRequest to land in attach 1's queue, so
+        // we know the pending entry has been recorded with gen=1.
+        let _frame = rx_1.recv().await.expect("RpcRequest queued");
+
+        // Sidecar restarts: a new attach lands. The stale RPC should
+        // resolve immediately, NOT after its timeout.
+        let (tx_2, _rx_2) = mpsc::channel::<ToolFrame>(super::OUTBOUND_CHAN_CAPACITY);
+        let _guard_2 = client.attach(tx_2);
+
+        let started = std::time::Instant::now();
+        let res = h.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stale RPC must resolve immediately, took {:?}",
+            started.elapsed(),
+        );
+        assert!(
+            matches!(res, Err(BrowserRpcError::Disconnected)),
+            "expected Disconnected, got {res:?}",
+        );
+        // No leak.
+        assert_eq!(client.state.pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_does_not_fail_pending_of_current_generation() {
+        // Sanity: when a fresh `attach` lands but no prior RPC was
+        // outstanding, *and* a new RPC fires under the new gen,
+        // that RPC must NOT be killed by attach itself (it's at
+        // current gen, not stale).
+        let client = WsBrowserSidecarClient::new();
+        let (tx, mut rx) = mpsc::channel::<ToolFrame>(super::OUTBOUND_CHAN_CAPACITY);
+        let _guard = client.attach(tx);
+
+        let c = client.clone();
+        let h = tokio::spawn(async move {
+            c.call(
+                "x",
+                json!({}),
+                "s",
+                Duration::from_secs(2),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        let frame = rx.recv().await.expect("RpcRequest queued");
+        let id = match frame {
+            ToolFrame::RpcRequest { id, .. } => id,
+            other => panic!("expected RpcRequest, got {other:?}"),
+        };
+        // A second `attach` after the call has registered its pending
+        // entry would normally fail it via the new generation gate —
+        // but here we skip the second attach and just verify the
+        // round trip works under a single generation.
+        client.dispatch_inbound(ToolFrame::RpcResult {
+            id,
+            result: json!({ "ok": true }),
+        });
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(res["ok"], true);
     }
 
     #[tokio::test]
