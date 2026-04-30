@@ -4,6 +4,18 @@ import type { RpcHandler } from "./rpc.js";
 import { buildSnapshot } from "./snapshot.js";
 
 /**
+ * Cap on `page.goto` / `page.goBack`. Playwright's implicit default is
+ * 30 s; we surface it explicitly so an unresponsive target site
+ * fails fast instead of hanging until either Playwright's invisible
+ * timer fires or the RPC-layer timeout kicks in (whichever the
+ * caller set as `ctx.timeout`). 30 s matches Playwright's default
+ * and is well below any reasonable per-tool timeout the agent loop
+ * configures, so the RPC timeout stays the upper bound and this
+ * cap is the lower bound on noticing a stuck navigation.
+ */
+const NAVIGATION_TIMEOUT_MS = 30_000;
+
+/**
  * Resolve a `@eN` ref to a Playwright locator. The `eN` id is minted
  * by `snapshot.ts::walkPageSource` as a per-context nonce-suffixed
  * attribute (`data-aura-ref-<hex>`) on the element itself, so
@@ -69,7 +81,10 @@ export function buildHandlers(manager: BrowserManager): Record<string, RpcHandle
         throw err;
       }
       const state = await manager.acquire(params.context_id);
-      await state.page.goto(url, { waitUntil: "domcontentloaded" });
+      await state.page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: NAVIGATION_TIMEOUT_MS,
+      });
       state.url = state.page.url();
       const sup = manager.supervisorSnapshot(params.context_id);
       const text = await buildSnapshot(state.page, sup, false, state.refAttr);
@@ -118,7 +133,9 @@ export function buildHandlers(manager: BrowserManager): Record<string, RpcHandle
 
     async back(params) {
       const state = await manager.acquire(params.context_id);
-      await state.page.goBack({ waitUntil: "domcontentloaded" }).catch(() => null);
+      await state.page
+        .goBack({ waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS })
+        .catch(() => null);
       state.url = state.page.url();
       return { url: state.url };
     },

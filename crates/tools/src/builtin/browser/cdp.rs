@@ -16,6 +16,7 @@ const METHOD_LABEL_MAX: usize = 80;
 const PARAM_DIGEST_LEN: usize = 12;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Params {
     method: String,
     #[serde(default)]

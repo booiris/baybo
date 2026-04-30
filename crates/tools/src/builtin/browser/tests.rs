@@ -267,38 +267,110 @@ fn cdp_missing_method_still_prompts() {
     );
 }
 
-// ---------- params: deny_unknown_fields on snapshot/screenshot ----------
+// ---------- params: deny_unknown_fields across every Params-bearing tool ----------
+//
+// Every tool that deserialises a `Params` struct must reject unknown
+// fields rather than silently coercing them to defaults — typos like
+// `reff` instead of `ref` would otherwise pass validation and the
+// agent never finds out why the click did nothing. Sweep below
+// double-covers each tool: a payload that is otherwise well-formed
+// but has one extra field, plus a typo of the real field. Both
+// must surface as `InvalidParams`.
 
 #[tokio::test]
-async fn snapshot_rejects_typo_param() {
-    // `fulll` (typo of `full`) used to silently coerce to default
-    // because the original code ate `serde_json::from_value` errors
-    // via `.unwrap_or_default()`. Now it must surface as
-    // InvalidParams.
-    let tool = BrowserSnapshotTool::new(dead());
-    let ctx = tool_ctx();
-    let err = tool
-        .execute(json!({ "fulll": true }), &ctx)
-        .await
-        .expect_err("typo'd param must error");
-    assert!(
-        matches!(err, crate::ToolError::InvalidParams(_)),
-        "expected InvalidParams, got {err:?}",
-    );
-}
+async fn every_params_tool_rejects_unknown_fields() {
+    let blob = blob_store();
+    // (name, tool, with_extra, with_typo). `with_extra` is a
+    // valid-shape payload with one extra unknown field; `with_typo`
+    // is the same payload with a misspelled key. Both must surface
+    // as `InvalidParams` rather than silently coercing to the
+    // default.
+    let cases: Vec<(&str, Box<dyn Tool>, Value, Value)> = vec![
+        (
+            "snapshot",
+            Box::new(BrowserSnapshotTool::new(dead())),
+            json!({ "full": true, "extra": 1 }),
+            json!({ "fulll": true }),
+        ),
+        (
+            "screenshot",
+            Box::new(BrowserScreenshotTool::new(dead(), blob.clone())),
+            json!({ "full_page": false, "extra": 1 }),
+            json!({ "ful_page": true }),
+        ),
+        (
+            "click",
+            Box::new(BrowserClickTool::new(dead())),
+            json!({ "ref": "@e1", "extra": 1 }),
+            json!({ "reff": "@e1" }),
+        ),
+        (
+            "type",
+            Box::new(BrowserTypeTool::new(dead())),
+            json!({ "ref": "@e1", "text": "hi", "extra": 1 }),
+            json!({ "ref": "@e1", "txet": "hi" }),
+        ),
+        (
+            "press",
+            Box::new(BrowserPressTool::new(dead())),
+            json!({ "key": "Enter", "extra": 1 }),
+            json!({ "kye": "Enter" }),
+        ),
+        (
+            "scroll",
+            Box::new(BrowserScrollTool::new(dead())),
+            json!({ "direction": "down", "extra": 1 }),
+            json!({ "directon": "down" }),
+        ),
+        (
+            "dialog",
+            Box::new(BrowserDialogTool::new(dead())),
+            json!({ "action": "accept", "extra": 1 }),
+            json!({ "acton": "accept" }),
+        ),
+        (
+            "console",
+            Box::new(BrowserConsoleTool::new(dead())),
+            json!({ "expression": "1+1", "extra": 1 }),
+            json!({ "expresion": "1+1" }),
+        ),
+        (
+            "cdp",
+            Box::new(BrowserCdpTool::new(dead())),
+            json!({ "method": "Browser.getVersion", "extra": 1 }),
+            json!({ "metho": "Browser.getVersion" }),
+        ),
+        (
+            "navigate",
+            Box::new(BrowserNavigateTool::new(dead())),
+            json!({ "url": "https://example.com/", "extra": 1 }),
+            json!({ "ulr": "https://example.com/" }),
+        ),
+    ];
 
-#[tokio::test]
-async fn screenshot_rejects_typo_param() {
-    let tool = BrowserScreenshotTool::new(dead(), blob_store());
     let ctx = tool_ctx();
-    let err = tool
-        .execute(json!({ "ful_page": true }), &ctx)
-        .await
-        .expect_err("typo'd param must error");
-    assert!(
-        matches!(err, crate::ToolError::InvalidParams(_)),
-        "expected InvalidParams, got {err:?}",
-    );
+    for (name, tool, with_extra, with_typo) in &cases {
+        let err = tool
+            .execute(with_extra.clone(), &ctx)
+            .await
+            .expect_err(&format!(
+                "{name}: extra field must surface as InvalidParams"
+            ));
+        assert!(
+            matches!(err, crate::ToolError::InvalidParams(_)),
+            "{name}: expected InvalidParams for extra field, got {err:?}",
+        );
+        let err = tool
+            .execute(with_typo.clone(), &ctx)
+            .await
+            .expect_err(&format!(
+                "{name}: typo'd field must surface as InvalidParams"
+            ));
+        assert!(
+            matches!(err, crate::ToolError::InvalidParams(_)),
+            "{name}: expected InvalidParams for typo, got {err:?}",
+        );
+    }
 }
 
 fn tool_ctx() -> crate::ToolContext {

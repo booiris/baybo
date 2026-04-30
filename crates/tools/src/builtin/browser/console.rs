@@ -11,6 +11,7 @@ use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 const EXPR_LABEL_MAX: usize = 80;
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Params {
     #[serde(default)]
     clear: bool,

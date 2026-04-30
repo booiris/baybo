@@ -12,6 +12,7 @@ use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 const CALL_LABEL_MAX: usize = 120;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Params {
     url: String,
 }

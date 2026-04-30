@@ -9,6 +9,7 @@ use crate::builtin::browser::schema::{call_sidecar, schema_object};
 use crate::{Tool, ToolContext, ToolError, ToolOutput};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Params {
     key: String,
 }

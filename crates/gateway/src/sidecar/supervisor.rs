@@ -42,13 +42,14 @@ use aura_agent::service::ShutdownSignal;
 use aura_model::ChannelType;
 use aura_security::{LeakDetector, RedactingMakeWriter};
 use aura_storage::ChannelBotStore;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::log_buffer::{LogBuffer, LogLevel};
+use crate::sidecar::pipe_pump::{LineOutcome, drain_until_newline, read_capped_line};
 use crate::spawn::ChannelSpawner;
 
 use super::assets::SidecarRuntime;
@@ -357,18 +358,21 @@ async fn drain_pipe<R>(
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let mut lines = BufReader::new(reader).lines();
+    // Two-stage cap. `read_capped_line` keeps the read buffer
+    // bounded at PIPE_LINE_READ_BUF_MAX (64 KiB) — a sidecar that
+    // emits a multi-GB unbroken stream without a newline can no
+    // longer OOM the supervisor. The display-side cap below
+    // (SIDECAR_PIPE_LINE_MAX_BYTES = 1024) trims what we write to
+    // the LogBuffer / file / terminal. Cap-hits get a dedicated
+    // suffix so an operator sees the difference between a normal
+    // long line and a runaway stream.
+    let mut reader = BufReader::new(reader);
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
     loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                let trimmed = truncate_utf8(line, SIDECAR_PIPE_LINE_MAX_BYTES);
-                if let Some(mw) = file_writer.as_ref() {
-                    write_line_to_file(mw, stream.tag(), &trimmed);
-                }
-                tee_to_terminal(stream, &channel_type, &trimmed);
-                buffer.push_external(level, target.clone(), trimmed);
-            }
-            Ok(None) => break,
+        buf.clear();
+        let outcome = match read_capped_line(&mut reader, &mut buf).await {
+            Ok(LineOutcome::Eof) => break,
+            Ok(o) => o,
             Err(e) => {
                 let msg = format!("[aura] sidecar pipe read error: {e}");
                 if let Some(mw) = file_writer.as_ref() {
@@ -378,6 +382,46 @@ async fn drain_pipe<R>(
                 buffer.push_external(LogLevel::Warn, target.clone(), msg);
                 break;
             }
+        };
+        // Strip trailing CRLF/LF for cleaner log output (mirrors
+        // `BufReader::lines`'s behaviour the previous impl relied on).
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        let raw = String::from_utf8_lossy(&buf);
+        let cap_hit = outcome == LineOutcome::CapHit;
+        let suffix = if cap_hit {
+            " [...truncated, line exceeded read cap]"
+        } else if raw.len() > SIDECAR_PIPE_LINE_MAX_BYTES {
+            " [...truncated]"
+        } else {
+            ""
+        };
+        let cut_at = if raw.len() > SIDECAR_PIPE_LINE_MAX_BYTES {
+            let mut cut = SIDECAR_PIPE_LINE_MAX_BYTES;
+            while cut > 0 && !raw.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            cut
+        } else {
+            raw.len()
+        };
+        let mut trimmed = raw[..cut_at].to_owned();
+        trimmed.push_str(suffix);
+        if let Some(mw) = file_writer.as_ref() {
+            write_line_to_file(mw, stream.tag(), &trimmed);
+        }
+        tee_to_terminal(stream, &channel_type, &trimmed);
+        buffer.push_external(level, target.clone(), trimmed);
+
+        // After a cap-hit flush, resync at the next newline so the
+        // remainder of the unbounded line isn't emitted as if it
+        // were a fresh line.
+        if cap_hit {
+            let _ = drain_until_newline(&mut reader).await;
         }
     }
 }
@@ -411,20 +455,6 @@ async fn join_pipe_readers(
     if let Some(t) = stderr {
         let _ = t.await;
     }
-}
-
-fn truncate_utf8(text: String, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut cut = max_bytes;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut out = text;
-    out.truncate(cut);
-    out.push_str(" [...truncated]");
-    out
 }
 
 #[cfg(test)]
@@ -530,17 +560,62 @@ mod tests {
         assert!(rec.message.len() <= SIDECAR_PIPE_LINE_MAX_BYTES + " [...truncated]".len());
     }
 
-    #[test]
-    fn truncate_utf8_respects_char_boundary() {
-        let s: String = "é".repeat(10);
-        let out = truncate_utf8(s, 5);
-        assert!(out.is_char_boundary(out.len() - " [...truncated]".len()));
-        assert!(out.ends_with("[...truncated]"));
-    }
+    #[tokio::test]
+    async fn pipe_bounds_unbroken_stream_at_read_cap() {
+        // Regression: a sidecar that emits a huge unbroken stream
+        // (no newline) must not OOM the supervisor. Pre-migration
+        // `BufReader::lines()` had no per-line cap; with pipe_pump
+        // every read is bounded by PIPE_LINE_READ_BUF_MAX (64 KiB)
+        // and a cap-hit gets emitted as a truncated line with the
+        // dedicated suffix so an operator sees the real cause.
+        use crate::sidecar::pipe_pump::PIPE_LINE_READ_BUF_MAX;
+        let buf = LogBuffer::new(8);
+        let (reader, mut writer) = tokio::io::duplex(PIPE_LINE_READ_BUF_MAX * 4);
+        let drain = tokio::spawn(drain_pipe(
+            reader,
+            Arc::clone(&buf),
+            None,
+            "t".to_string(),
+            "sidecar::t::stdout".to_string(),
+            Stream::Stdout,
+            LogLevel::Info,
+        ));
+        // Two cap-fulls + a final "tail\n" so the drain returns.
+        let blast = "y".repeat(PIPE_LINE_READ_BUF_MAX * 2);
+        writer.write_all(blast.as_bytes()).await.unwrap();
+        writer.write_all(b"tail\n").await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
 
-    #[test]
-    fn truncate_utf8_noop_under_cap() {
-        let s = "hello".to_string();
-        assert_eq!(truncate_utf8(s.clone(), 10), s);
+        let page = buf.query(&LogQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        // Each cap-hit emits exactly one record + the trailing
+        // "tail" line after we drain past the next newline. So
+        // we expect 1 cap-hit record (since the drain after the
+        // first cap consumes the rest of the unbroken blast and
+        // the "tail" newline) — but the suffix tells us either
+        // way. Assert there is at least one cap-hit record.
+        let cap_hit = page
+            .items
+            .iter()
+            .any(|r| r.message.contains("exceeded read cap"));
+        assert!(
+            cap_hit,
+            "expected a cap-hit truncation record, got: {:?}",
+            page.items.iter().map(|r| &r.message).collect::<Vec<_>>(),
+        );
+        // No record exceeds the display cap (1024) plus the
+        // suffix, even though the input was 128 KiB.
+        for rec in &page.items {
+            assert!(
+                rec.message.len()
+                    <= SIDECAR_PIPE_LINE_MAX_BYTES
+                        + " [...truncated, line exceeded read cap]".len(),
+                "record exceeded display cap: len={}",
+                rec.message.len(),
+            );
+        }
     }
 }
