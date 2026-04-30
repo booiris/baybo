@@ -25,6 +25,7 @@
 //! signal.
 
 mod assets;
+pub(crate) mod pipe_pump;
 mod supervisor;
 
 pub use assets::{SidecarError, SidecarRuntime, domains};

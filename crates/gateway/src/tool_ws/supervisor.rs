@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use aura_agent::service::ShutdownSignal;
 use aura_cron::Shutdown;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
 
@@ -90,17 +90,13 @@ impl ToolSidecarSupervisor {
             let node = node_binary();
             let mut cmd = Command::new(&node);
             cmd.arg(&self.config.bundle_path);
-            // Start with a clean env and re-add only what the sidecar
-            // strictly needs. Inheriting the gateway's full env leaks
-            // RUST_LOG, vault paths, and any host secrets into the
-            // child's `/proc/<pid>/environ`, widening the blast
-            // radius of a renderer escape. PATH is required so node
-            // can still resolve dynamic linker stubs and any system
-            // tools playwright invokes (uname, getconf, ...). HOME +
-            // XDG_CACHE_HOME are needed so the sidecar can compute
-            // its profile dir under $XDG_CACHE_HOME/aura/...
+            // Scrub inherited env down to the central allowlist so a
+            // renderer escape can't read RUST_LOG, vault paths, or
+            // operator secrets out of `/proc/<pid>/environ`. Sharing
+            // `SIDECAR_ENV_ALLOWLIST` with the channel spawner keeps
+            // the two sidecar families' scrubbing rules in lockstep.
             cmd.env_clear();
-            for key in ["PATH", "HOME", "USER", "LANG", "XDG_CACHE_HOME", "TMPDIR"] {
+            for key in crate::spawn::SIDECAR_ENV_ALLOWLIST {
                 if let Ok(v) = std::env::var(key) {
                     cmd.env(key, v);
                 }
@@ -187,33 +183,25 @@ async fn back_off(backoff: &mut Duration, shutdown: &ShutdownSignal) -> bool {
     }
 }
 
-/// Hard cap on bytes accumulated into a single log line before we
-/// force a flush. `BufReader::lines()` itself has no per-line cap
-/// and would happily buffer a multi-GB unbroken stream into one
-/// allocation before yielding — a misbehaving sidecar dumping a
-/// no-newline blast OOMs the supervisor before `PIPE_LINE_MAX_BYTES`
-/// truncation runs. The fill_buf / consume loop below caps it.
-const PIPE_LINE_READ_BUF_MAX: usize = 64 * 1024;
-
 fn spawn_pipe_pump<R: AsyncRead + Unpin + Send + 'static>(
     pipe: R,
     target: &'static str,
 ) -> tokio::task::JoinHandle<()> {
+    use crate::sidecar::pipe_pump::{LineOutcome, drain_until_newline, read_capped_line};
     tokio::spawn(async move {
         let mut reader = BufReader::new(pipe);
         let mut buf: Vec<u8> = Vec::with_capacity(1024);
         loop {
             buf.clear();
-            let outcome = read_capped_line(&mut reader, &mut buf).await;
-            match outcome {
+            let outcome = match read_capped_line(&mut reader, &mut buf).await {
                 Ok(LineOutcome::Eof) => return,
-                Ok(LineOutcome::Newline) | Ok(LineOutcome::CapHit) => {}
+                Ok(o) => o,
                 Err(e) => {
                     tracing::debug!(error = %e, subsystem = target, "tool sidecar pipe read failed");
                     return;
                 }
-            }
-            // Strip trailing newline for cleaner log output.
+            };
+            // Strip trailing CRLF/LF for cleaner log output.
             if buf.last() == Some(&b'\n') {
                 buf.pop();
                 if buf.last() == Some(&b'\r') {
@@ -221,91 +209,33 @@ fn spawn_pipe_pump<R: AsyncRead + Unpin + Send + 'static>(
                 }
             }
             let raw = String::from_utf8_lossy(&buf);
-            let cap_hit = matches!(outcome, Ok(LineOutcome::CapHit));
-            let trimmed = if raw.len() > PIPE_LINE_MAX_BYTES {
+            let cap_hit = outcome == LineOutcome::CapHit;
+            let suffix = if cap_hit {
+                " [...truncated, line exceeded read cap]"
+            } else if raw.len() > PIPE_LINE_MAX_BYTES {
+                " [...truncated]"
+            } else {
+                ""
+            };
+            let cut_at = if raw.len() > PIPE_LINE_MAX_BYTES {
                 let mut cut = PIPE_LINE_MAX_BYTES;
                 while cut > 0 && !raw.is_char_boundary(cut) {
                     cut -= 1;
                 }
-                let mut s = raw[..cut].to_owned();
-                s.push_str(if cap_hit {
-                    " [...truncated, line exceeded read cap]"
-                } else {
-                    " [...truncated]"
-                });
-                s
-            } else if cap_hit {
-                let mut s = raw.into_owned();
-                s.push_str(" [...truncated, line exceeded read cap]");
-                s
+                cut
             } else {
-                raw.into_owned()
+                raw.len()
             };
+            let mut trimmed = raw[..cut_at].to_owned();
+            trimmed.push_str(suffix);
             tracing::info!(target: "tool_sidecar", subsystem = target, "{trimmed}");
 
-            // After a cap-hit flush, drain bytes until the next
-            // newline so we resync at a line boundary instead of
-            // emitting the next chunk as if it were a new line.
+            // After a cap-hit flush, resync at the next line boundary
+            // instead of emitting the next chunk as if it were a new
+            // line.
             if cap_hit {
                 let _ = drain_until_newline(&mut reader).await;
             }
         }
     })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineOutcome {
-    /// Reached `\n` within the cap.
-    Newline,
-    /// Hit `PIPE_LINE_READ_BUF_MAX` first; caller flushes + drains.
-    CapHit,
-    /// EOF before any data on this iteration.
-    Eof,
-}
-
-/// Read into `out` until either `\n` or the byte cap. Uses
-/// `fill_buf` / `consume` so we never allocate beyond the cap.
-async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-    out: &mut Vec<u8>,
-) -> std::io::Result<LineOutcome> {
-    while out.len() < PIPE_LINE_READ_BUF_MAX {
-        let avail = reader.fill_buf().await?;
-        if avail.is_empty() {
-            return Ok(if out.is_empty() {
-                LineOutcome::Eof
-            } else {
-                LineOutcome::Newline
-            });
-        }
-        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
-            let take = (pos + 1).min(PIPE_LINE_READ_BUF_MAX - out.len());
-            out.extend_from_slice(&avail[..take]);
-            reader.consume(take);
-            return Ok(LineOutcome::Newline);
-        }
-        let take = avail.len().min(PIPE_LINE_READ_BUF_MAX - out.len());
-        out.extend_from_slice(&avail[..take]);
-        reader.consume(take);
-    }
-    Ok(LineOutcome::CapHit)
-}
-
-/// Discard input up to and including the next `\n`, so a cap-hit
-/// flush can resume on a clean line boundary.
-async fn drain_until_newline<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<()> {
-    loop {
-        let avail = reader.fill_buf().await?;
-        if avail.is_empty() {
-            return Ok(());
-        }
-        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
-            reader.consume(pos + 1);
-            return Ok(());
-        }
-        let len = avail.len();
-        reader.consume(len);
-    }
 }

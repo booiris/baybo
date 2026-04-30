@@ -126,14 +126,12 @@ function walkPageSource(args: {
   // snapshots without re-snapshotting are responsible for the
   // staleness window themselves.
   //
-  // Use `querySelector` in a loop rather than `querySelectorAll` so
-  // we don't build a full NodeList of every annotated element up
-  // front — on a hostile 100k-node page that buffer dominates
-  // wall-clock time even before our walker budget kicks in. The
-  // single-match form short-circuits per call. Cap at `maxNodes`
-  // (or 10k, whichever is larger): the walker downstream still
-  // bounds at `maxNodes`, and any stale refs beyond the cap are
-  // caught by the uniqueness assertion in `resolveRef`
+  // `querySelectorAll` materialises a full NodeList of every match
+  // before we touch the first element — on a hostile page with many
+  // pre-stamped annotations the buffer cost dominates. Looping
+  // `querySelector` avoids that allocation. The cap on the loop
+  // (max(maxNodes, 10k)) bounds total work; any leftover stale refs
+  // beyond it are caught by `resolveRef`'s uniqueness check
   // (handlers.ts) when the agent tries to act on them.
   const stripCap = Math.max(maxNodes, 10_000);
   for (let i = 0; i < stripCap; i++) {

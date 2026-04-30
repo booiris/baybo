@@ -114,14 +114,10 @@ impl SidecarRuntime {
     /// build-to-build even when a new sidecar's name shifts the
     /// underlying table order.
     pub fn domains(&self) -> impl Iterator<Item = &str> {
-        let mut seen: Vec<&str> = Vec::new();
-        for s in &self.sidecars {
-            if !seen.contains(&s.domain.as_str()) {
-                seen.push(s.domain.as_str());
-            }
-        }
-        seen.sort_unstable();
-        seen.into_iter()
+        let mut domains: Vec<&str> = self.sidecars.iter().map(|s| s.domain.as_str()).collect();
+        domains.sort_unstable();
+        domains.dedup();
+        domains.into_iter()
     }
 
     /// Domain of the sidecar named `name`. `None` if no sidecar by

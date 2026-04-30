@@ -36,16 +36,19 @@ pub const ENV_CHANNEL_URL: &str = "AURA_CHANNEL_URL";
 /// [`CHANNEL_TOKEN_HEADER`].
 pub const ENV_CHANNEL_TOKEN: &str = "AURA_CHANNEL_TOKEN";
 
-/// Env vars a supervised channel sidecar is allowed to inherit from
-/// the gateway. Anything else (`OPENAI_API_KEY`, every `AURA_*` from
-/// the operator's shell, cloud / proxy creds, …) is scrubbed before
-/// `execve` so a compromised JS bundle can't read the gateway's
-/// secret env. Mirrors the registration-mode allowlist used by
-/// `cli::commands::channel::register::scrubbed_env`; both call sites
-/// import this constant so they can't drift apart.
+/// Env vars a supervised sidecar (channel or tool) is allowed to
+/// inherit from the gateway. Anything else (`OPENAI_API_KEY`, every
+/// `AURA_*` from the operator's shell, cloud / proxy creds, …) is
+/// scrubbed before `execve` so a compromised JS bundle can't read
+/// the gateway's secret env. Both `ChannelSpawner::spawn` and
+/// `tool_ws::ToolSidecarSupervisor` import this constant so the
+/// scrubbing rules can't drift apart. Also mirrors the
+/// registration-mode allowlist in
+/// `cli::commands::channel::register::scrubbed_env`.
 pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",
+    "USER",
     "TERM",
     "LANG",
     "LC_ALL",
@@ -57,6 +60,10 @@ pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
     "LC_MONETARY",
     "TZ",
     "TMPDIR",
+    // Browser tool sidecar resolves its profile dir under
+    // `$XDG_CACHE_HOME/aura/browser/...`. Channel sidecars don't
+    // need it but inheriting it costs nothing.
+    "XDG_CACHE_HOME",
 ];
 
 /// Spawns channel-plugin subprocesses and mints their tokens. Cheap

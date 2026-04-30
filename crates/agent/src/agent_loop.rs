@@ -83,9 +83,9 @@ fn safe_flush_boundary(pending: &str) -> usize {
 fn push_bounded<I: IntoIterator<Item = ContentBlock>>(dst: &mut Vec<ContentBlock>, items: I) {
     for item in items {
         if dst.len() >= MAX_ATTACHMENTS_PER_TURN {
-            // Drop the oldest. Cheap on a small Vec; stable order
-            // matters because the channel renders attachments in
-            // arrival order.
+            // Stable order: channels render attachments in arrival
+            // order, so FIFO eviction keeps the surviving set
+            // chronologically coherent.
             dst.remove(0);
         }
         dst.push(item);

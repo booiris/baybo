@@ -154,12 +154,9 @@ fn cache_discriminator(params: &Value) -> String {
     feed(&mut hasher, params, "target_id");
     feed(&mut hasher, params, "frame_id");
     let digest = hasher.finalize();
-    let mut hex = String::with_capacity(PARAM_DIGEST_LEN);
-    for byte in digest.iter().take(PARAM_DIGEST_LEN.div_ceil(2)) {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    hex.truncate(PARAM_DIGEST_LEN);
-    hex
+    let mut s = hex::encode(digest);
+    s.truncate(PARAM_DIGEST_LEN);
+    s
 }
 
 #[cfg(test)]

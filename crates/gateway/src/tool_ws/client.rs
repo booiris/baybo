@@ -99,23 +99,28 @@ impl WsBrowserSidecarClient {
     /// disconnect now than waiting on the per-call timeout.
     pub fn attach(&self, outbound: mpsc::Sender<ToolFrame>) -> AttachGuard {
         let generation = self.state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Hold the slot's write-lock across the pending walk so a
+        // concurrent `call()` can't snapshot the *old* generation,
+        // get blocked on the slot, then insert a pending entry tagged
+        // with the old gen *after* the walk has finished. With the
+        // lock held, every concurrent `call()` either sees the new
+        // slot (and tags its pending with `generation`) or sees the
+        // old one already-replaced and re-snapshots.
+        let stale_keys: Vec<String>;
         {
             let mut slot = self.state.outbound.write();
             *slot = Some(ActiveAttach {
                 outbound,
                 generation,
             });
+            stale_keys = self
+                .state
+                .pending
+                .iter()
+                .filter(|e| e.value().generation < generation)
+                .map(|e| e.key().clone())
+                .collect();
         }
-        // Walk pending and fail every entry whose generation predates
-        // the new attach. Snapshot the keys first so we don't hold a
-        // dashmap shard guard across the oneshot resolution.
-        let stale_keys: Vec<String> = self
-            .state
-            .pending
-            .iter()
-            .filter(|e| e.value().generation < generation)
-            .map(|e| e.key().clone())
-            .collect();
         for k in stale_keys {
             if let Some((_, entry)) = self.state.pending.remove(&k) {
                 let _ = entry.tx.send(Err(BrowserRpcError::Disconnected));

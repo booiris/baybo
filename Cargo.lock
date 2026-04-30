@@ -706,6 +706,7 @@ dependencies = [
  "dashmap",
  "futures",
  "glob",
+ "hex",
  "htmd",
  "iana-time-zone",
  "oauth2",
