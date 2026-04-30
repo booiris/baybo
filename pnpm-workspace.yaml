@@ -1,4 +1,5 @@
 packages:
   - "sdks/*"
   - "channel-src/*"
+  - "tool-src/*"
   - "web"

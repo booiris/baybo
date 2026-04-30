@@ -108,6 +108,19 @@ pub struct GatewayDeps {
     /// (avoiding a double-send on the first tick) and so the
     /// disconnect path can `forget` the cached bots.
     pub bot_reconciler: Arc<crate::channel::ChannelBotReconciler>,
+    /// Shared `WsBrowserSidecarClient` the tool family calls into.
+    /// `build_channel_router` mounts `/v1/tool-ws` against this same
+    /// instance so the registered sidecar's outbound queue is wired
+    /// into the client's `attach`. `None` when the gateway boots
+    /// without an embedded browser sidecar (a release build with no
+    /// `tool-src/browser` bundle, or `--features no-browser` in the
+    /// future) — the route is then simply absent.
+    pub tool_ws_client: Option<crate::tool_ws::WsBrowserSidecarClient>,
+    /// Channel-token label the browser sidecar's mint uses. Mirrors
+    /// the `bound_label` in [`crate::tool_ws::server::ToolWsState`].
+    /// Held here (rather than hardcoded) so the gateway start path
+    /// owns the label string in one place.
+    pub tool_ws_sidecar_label: String,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -297,9 +310,21 @@ pub fn build_channel_router(
     // Outer-to-inner layer application means "outer" = "first to
     // observe the request", so an outer TraceLayer would log the
     // raw token-bearing URI before auth rewrites it.
-    let v1_inner = crate::channel::routes()
-        .with_state(ws_state)
-        .layer(TraceLayer::new_for_http());
+    let channel_router: Router<()> = crate::channel::routes().with_state(ws_state);
+
+    let v1_inner = if let Some(client) = deps.tool_ws_client.clone() {
+        let tool_ws_state = crate::tool_ws::ToolWsState {
+            expected_sidecar_id: Arc::new("browser".to_string()),
+            expected_label: Arc::new(deps.tool_ws_sidecar_label.clone()),
+            client,
+        };
+        let tool_ws_router: Router<()> = crate::tool_ws::routes().with_state(tool_ws_state);
+        channel_router
+            .merge(tool_ws_router)
+            .layer(TraceLayer::new_for_http())
+    } else {
+        channel_router.layer(TraceLayer::new_for_http())
+    };
     let v1 = channel_auth::attach(v1_inner, auth_state);
     Router::new()
         .merge(api::health::routes().layer(TraceLayer::new_for_http()))

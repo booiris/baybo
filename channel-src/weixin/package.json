@@ -9,6 +9,7 @@
   },
   "ilink_appid": "bot",
   "aura": {
+    "domain": "channel",
     "auxAssets": [
       {
         "src": "node_modules/silk-wasm/lib/silk.wasm",

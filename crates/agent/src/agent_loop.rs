@@ -386,6 +386,7 @@ impl AgentLoop {
                     )
                     .await;
 
+                let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
                 let raw_result_text = match &tool_result {
                     Ok(ToolOutput::Text(s)) => s.clone(),
                     Ok(ToolOutput::Json(v)) => {
@@ -393,6 +394,16 @@ impl AgentLoop {
                     }
                     Ok(ToolOutput::WithAttachments { text, attachments }) => {
                         accumulated_attachments.extend(attachments.iter().cloned());
+                        text.clone()
+                    }
+                    Ok(ToolOutput::MultiModalText { text, llm_images }) => {
+                        // LLM-visible images go in BOTH directions: a
+                        // follow-up User-role message (so the next turn
+                        // sees them through the standard multimodal user
+                        // path) AND the final OutgoingMessage (so the
+                        // user channel renders them too).
+                        accumulated_attachments.extend(llm_images.iter().cloned());
+                        llm_visible_images.extend(llm_images.iter().cloned());
                         text.clone()
                     }
                     Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
@@ -430,6 +441,28 @@ impl AgentLoop {
                     }],
                 };
                 self.append_context_message(session, &tool_msg).await?;
+
+                // ToolResult.content is text-only; provider adapters
+                // serialize it as plain text. To get images back into
+                // the LLM's view, follow with a User-role message that
+                // carries the same images plus a marker tying them to
+                // this tool call. Vision-capable providers fetch the
+                // blob bytes via the existing user_content_for_block
+                // path; non-vision providers fall back to a text stub.
+                if !llm_visible_images.is_empty() {
+                    let mut content: Vec<ContentBlock> =
+                        Vec::with_capacity(llm_visible_images.len() + 1);
+                    content.push(ContentBlock::Text(format!(
+                        "[image attachment(s) returned by tool `{}` (tool_use_id={})]",
+                        tool_call.name, tool_call.id
+                    )));
+                    content.extend(llm_visible_images);
+                    let image_msg = ChatMessage {
+                        role: Role::User,
+                        content,
+                    };
+                    self.append_context_message(session, &image_msg).await?;
+                }
             }
 
             // Flush accumulated approvals back into session state.

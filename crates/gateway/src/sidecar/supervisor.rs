@@ -131,7 +131,11 @@ impl SidecarSupervisor {
         let mut guards: Vec<WorkerGuard> = Vec::new();
         let mut started: HashSet<String> = HashSet::new();
 
-        let embedded: Vec<String> = this.runtime.channel_types().map(String::from).collect();
+        let embedded: Vec<String> = this
+            .runtime
+            .names_in_domain(crate::sidecar::domains::CHANNEL)
+            .map(String::from)
+            .collect();
         if embedded.is_empty() {
             shutdown.wait().await;
             return;

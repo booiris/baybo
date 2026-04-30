@@ -36,8 +36,19 @@ impl ToolRegistry {
     }
 
     pub fn with_defaults(blob_store: Arc<dyn BlobStore>) -> Self {
+        Self::with_defaults_and_browser(blob_store, None)
+    }
+
+    /// Like [`Self::with_defaults`] but also registers the browser
+    /// tool family. Pass `None` for `browser_client` to keep them
+    /// out — the gateway hands a real client in once
+    /// `/v1/tool-ws` is wired and a sidecar has registered.
+    pub fn with_defaults_and_browser(
+        blob_store: Arc<dyn BlobStore>,
+        browser_client: Option<Arc<dyn crate::builtin::browser::BrowserSidecarClient>>,
+    ) -> Self {
         let mut registry = Self::new();
-        for (tool, manifest) in crate::builtin::default_tools(blob_store) {
+        for (tool, manifest) in crate::builtin::default_tools(blob_store, browser_client) {
             registry.register(tool, manifest);
         }
         registry

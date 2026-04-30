@@ -27,5 +27,5 @@
 mod assets;
 mod supervisor;
 
-pub use assets::{SidecarError, SidecarRuntime};
+pub use assets::{SidecarError, SidecarRuntime, domains};
 pub use supervisor::{BUN_BINARY_ENV, SidecarSupervisor};

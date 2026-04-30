@@ -26,9 +26,11 @@ use std::sync::Arc;
 use aura_model::TrustLevel;
 use aura_storage::BlobStore;
 
+use crate::builtin::browser::BrowserSidecarClient;
 use crate::{Tool, ToolCapability, ToolManifest};
 
 pub mod bash;
+pub mod browser;
 pub mod edit;
 pub mod glob_tool;
 pub mod grep;
@@ -37,6 +39,7 @@ pub(crate) mod paths;
 pub mod read;
 pub mod send_local_file;
 pub mod todo;
+pub(crate) mod url_policy;
 pub mod web_fetch;
 pub mod write;
 
@@ -59,7 +62,15 @@ pub use write::WriteTool;
 /// Each entry pairs an [`Arc<dyn Tool>`] with the [`ToolManifest`] describing
 /// its governance ceiling. `ToolExecutor::validate_trust` compares this
 /// manifest against the runtime trust policy before executing.
-pub fn default_tools(blob_store: Arc<dyn BlobStore>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
+///
+/// `browser_client`: when `Some`, registers all 12 `browser_*` tools
+/// against the supplied sidecar client. When `None` (default for CLI
+/// commands and any path that doesn't run the gateway), browser tools
+/// are simply absent from the registry and the LLM never sees them.
+pub fn default_tools(
+    blob_store: Arc<dyn BlobStore>,
+    browser_client: Option<Arc<dyn BrowserSidecarClient>>,
+) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
         trusted(ReadTool, vec![ToolCapability::ReadFile]),
@@ -75,9 +86,12 @@ pub fn default_tools(blob_store: Arc<dyn BlobStore>) -> Vec<(Arc<dyn Tool>, Tool
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
         trusted(WebFetchTool::default(), vec![ToolCapability::Http]),
-        send_local_file::tool(blob_store),
+        send_local_file::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
     ];
+    if let Some(client) = browser_client {
+        tools.extend(browser::tools(client, blob_store));
+    }
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));
     tools

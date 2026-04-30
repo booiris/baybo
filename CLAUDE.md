@@ -84,6 +84,68 @@ Every in-tree channel sidecar under `channel-src/*` ships inside the aura binary
 - Why bun (not node + esbuild): with `--target=bun`, bun's bundler substitutes its own polyfills for the npm packages our sidecars pull in transitively (`ws` → bun's WHATWG WebSocket, `node-fetch@2` → bun's native fetch, etc.). That sidesteps several traps the node + esbuild combo hits: `node-fetch@2` + `whatwg-url@5` emit `DEP0040`/`DEP0169` warnings on every Bot API call; esbuild's minifier mangles `node-fetch@2`'s async stack badly enough that `bot.init()` deadlocks; `silk-wasm`'s dual-package `main: lib/index.cjs` references `__filename` which doesn't exist in ESM scope. bun ducks all three by replacing the offending packages outright at bundle time.
 - Forcing a strict release build: set `AURA_REQUIRE_SIDECARS=1` to turn any sidecar packaging failure into a hard `cargo build` error (the gateway boots fine without sidecars during local backend hacking, but a release build with no embedded channels is almost always a packaging mistake).
 
+## Sidecar Domains (recently redesigned)
+
+Every embedded sidecar self-declares a **domain** in its `package.json`:
+
+```json
+"aura": { "domain": "channel" }   // telegram, weixin, …
+"aura": { "domain": "browser" }   // browser
+```
+
+Domain is a free string; well-known ones live as constants in `aura_gateway::sidecar::domains` (`CHANNEL`, `BROWSER`). The runtime API is per-domain rather than `Channel | Tool`-binary, so adding a new domain (`code_exec`, `db`, …) is just declaring it in a new sidecar's package.json — no enum, no runtime, no CLI changes required:
+
+```rust
+SidecarRuntime::install()                             // materialise every embedded bundle
+    .domains()                                        // ["channel", "browser", …]
+    .names_in_domain(domains::CHANNEL)                // ["telegram", "weixin"]
+    .names_in_domain(domains::BROWSER)                // ["browser"]
+    .domain_of("telegram")                            // Some("channel")
+    .bundle_for("browser")                            // Some(<materialised path>)
+```
+
+Adding a new domain:
+1. Pick a directory (existing `tool-src/` or a new `<x>-src/`) and add it to `pnpm-workspace.yaml` and `crates/gateway/build.rs`.
+2. Add a sidecar package with `"aura": { "domain": "your_domain" }`.
+3. Add a constant `pub const YOUR_DOMAIN: &str = "your_domain"` to `crates/gateway/src/sidecar/assets.rs::domains` (optional but recommended to avoid typos).
+4. Iterate `runtime.names_in_domain(domains::YOUR_DOMAIN)` in whatever supervisor / route / CLI code dispatches that family.
+
+The existing surfaces wire to specific domains:
+- `aura channel list/add` filters `runtime.names_in_domain(domains::CHANNEL)` — never sees other domains.
+- `SidecarSupervisor` (channel restart loop) iterates `domains::CHANNEL`.
+- `ToolSidecarSupervisor` looks up the browser bundle by name (`bundle_for("browser")`).
+
+The directory layout (`channel-src/*`, `tool-src/*`) is just file-system organisation; runtime classification is by `aura.domain`. A new domain doesn't have to live under a domain-named directory.
+
+Build-time enforcement: a sidecar without `aura.domain` (or with an invalid one — must match `[a-z0-9_]+`) is a hard `cargo build` error. New sidecars can't silently default into the wrong family.
+
+## Channel-domain Sidecars (`channel-src/*`)
+
+Channel sidecars live under `channel-src/*` and declare `"aura": { "domain": "channel" }`.
+
+- IPC: tool sidecars connect *back* to the gateway over WebSocket at `/v1/tool-ws` (msgpack frames, see `crates/gateway/src/tool_ws/`). Synchronous request/response with `id` correlation — different shape from the channel-ws frame protocol, deliberately. Auth reuses the channel-auth middleware: the gateway mints a token bound to label `tool/browser` in `ChannelTokenTable` and the supervisor injects it as `AURA_TOOL_WS_TOKEN` in the child env. The route handler verifies `AuthedClient::Subprocess { label }` matches the expected label so a token bound to a different family can't reach this endpoint.
+- Lifecycle: `gateway_cmd::start` mints the `tool/browser` token, spawns `aura_gateway::tool_ws::ToolSidecarSupervisor` whenever `SidecarRuntime::bundle_for("browser")` returns a path, and shares a single `WsBrowserSidecarClient` between the route handler and the `ToolRegistry` via `ManagerGraph::tool_ws_client`. Without an embedded bundle the supervisor is silently skipped and `browser_*` tool calls return `BrowserRpcError::Disconnected` until a sidecar registers (e.g. an external container connecting in with the same `AURA_TOOL_WS_TOKEN`).
+- Runtime: tool sidecars run on **node** (channel sidecars use bun). The bundle is produced by `esbuild --platform=node` and inlines the npm `ws` package; bun's runtime substitutes `ws` with its own WebSocket and breaks the `Sec-WebSocket-Accept` handshake against axum (`Unexpected server response: 101`). Override the node binary with `AURA_NODE_BIN=/path/to/node`. Channel sidecars are unchanged and still use `AURA_BUN_BIN`.
+- Bundling: `tool-src/browser/esbuild.config.mjs` produces a self-contained `dist/bundle.mjs` (2.4 MB raw, **497 KB after zstd** in the embedded asset table) — playwright + ws + msgpackr inlined. Two non-trivial workarounds documented in the config: (1) a `createRequire` + `__dirname` banner so plain Node ESM can satisfy the bundled CommonJS modules' built-in lookups; (2) an `onLoad` plugin that rewrites the one `require.resolve("../../../package.json")` call playwright-core makes at module load time (used only for stack-trace prefix filtering), since esbuild can't statically inline that path.
+- Browser tool prereq: Playwright's bundled Chromium must be installed once: `pnpm --filter @aura/tool-browser exec playwright install chromium`. Override with `AURA_CHROMIUM_BIN` to point at a system binary.
+- Isolation guarantee (enforced in `tool-src/browser/src/manager.ts`): the agent's browser data **never** touches the user's normal Chrome/Firefox profile. The sidecar always uses Playwright's bundled Chromium with a dedicated `userDataDir` under `$XDG_CACHE_HOME/aura/browser/profile` (override via `AURA_BROWSER_PROFILE_DIR`). The manager refuses to start if `userDataDir` resolves under a platform default profile path. Per-Aura-session `BrowserContext` isolation means cookies / localStorage / IndexedDB never bleed across sessions either.
+- Docker / external mode: an out-of-process container can connect to `/v1/tool-ws` directly using the same channel token (the supervisor's `AURA_TOOL_WS_TOKEN` is the authoritative copy today; surfacing it through gateway config so a remote container can read it is a follow-up). When that path is taken the local supervisor still runs alongside; the route accepts whichever client registers first.
+- Smoke test: `crates/gateway/tests/tool_ws_smoke.rs` runs the real bundled sidecar end-to-end against the materialised embedded bundle (production path). Three tests, all gated `#[ignore]`. Run after `pnpm install && pnpm --filter @aura/tool-browser bundle && pnpm --filter @aura/tool-browser exec playwright install chromium && cargo build`:
+  ```
+  cargo test -p aura-gateway --test tool_ws_smoke -- --ignored --nocapture
+  ```
+  - `browser_smoke_ssrf_guard_fires_via_real_sidecar` — drives `navigate` to `http://10.0.0.1/`, asserts the in-sidecar SSRF policy returns `BLOCKED_BY_SSRF_POLICY` over the WS hop. Doesn't need Chromium (assertSafeUrl runs before manager.acquire).
+  - `browser_smoke_navigate_and_snapshot_through_real_chromium` — binds a 127.0.0.1 HTTP server, sets `AURA_BROWSER_ALLOW_LOOPBACK=1` (test-only escape hatch) + `AURA_BROWSER_NO_SANDBOX=1`, navigates real Chromium, asserts the snapshot picks up an `@eN` ref for the button, then clicks via that ref. The served HTML pre-sets a different-named `data-aura-ref` attribute, so this also confirms the nonce'd `data-aura-ref-<hex>` defeats static pre-pollution and the locator uniqueness check guards against ambiguous matches.
+  - `browser_smoke_hostile_dom_is_bounded` — adversarial regression: serves a 5,000-button page, asserts the snapshot completes in ~hundreds of ms (not a hang) and contains the truncation marker. Catches future regressions of the page-side `walkPageSource` budget.
+- TS unit tests: `pnpm --filter @aura/tool-browser test` runs `tool-src/browser/test/network_policy.test.mjs` against the compiled module — covers the IPv6 expander + every SSRF deny range incl. IPv4-mapped hex forms (`::ffff:7f00:1` etc.) WHATWG URL canonicalises into.
+
+### Known limitations
+
+- **DNS rebinding window between the sidecar's pre-flight resolve and Chromium's connect**: `tool-src/browser/src/network_policy.ts::resolveAndCheck` runs in Node and returns vetted addresses; `route.continue()` then lets Chromium do its own DNS lookup before opening the socket. An attacker controlling authoritative DNS for a hostname can return a public IP to Node and a blocked one (cloud metadata, RFC1918) to Chromium milliseconds later. `browser_navigate` doesn't prompt for hostnames (only literal public IPs), so the agent has no human-in-the-loop checkpoint here. Two known-correct fixes, both substantial rewrites, deferred:
+  1. Run Chromium with `--host-resolver-rules` pointing at a sidecar-owned resolver that pins the addresses our `resolveAndCheck` already vetted.
+  2. Replace `route.continue()` with `route.fulfill` + sidecar-owned HTTP fetch — breaks SNI / Host header semantics and is non-trivial to keep page-equivalent.
+  Until one of these lands, treat browser navigation to a non-vetted hostname the way you'd treat a `WebFetch` to that hostname: SSRF is best-effort, not a security boundary against an active adversary controlling DNS.
+
 ## Dependency Management
 
 - All dependency versions are managed centrally in the root `Cargo.toml` under `[workspace.dependencies]`.

@@ -184,7 +184,10 @@ fn installed_runtime() -> Result<SidecarRuntime> {
 }
 
 fn offered_channels(runtime: &SidecarRuntime) -> Vec<ChannelType> {
-    let mut channels: Vec<ChannelType> = runtime.channel_types().map(ChannelType::from).collect();
+    let mut channels: Vec<ChannelType> = runtime
+        .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
+        .map(ChannelType::from)
+        .collect();
     channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     channels
 }

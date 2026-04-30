@@ -185,6 +185,17 @@ pub struct ManagerGraph {
     /// `wire_router` twice panics loudly instead of silently handing
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+
+    /// Sidecar client that drives the browser tool family. Always
+    /// constructed (cheap — just an `Arc<ClientState>` with no I/O);
+    /// the gateway's `tool_ws` endpoint attaches a live WebSocket via
+    /// [`aura_gateway::tool_ws::WsBrowserSidecarClient::attach`] when
+    /// a sidecar registers, and tools that fire before that get a
+    /// clean `BrowserRpcError::Disconnected`. Held here so
+    /// `gateway_cmd.rs` can plumb the same instance into both
+    /// `GatewayDeps` (for the WS route) and the `ToolRegistry`
+    /// already wrapped in `Arc`.
+    pub tool_ws_client: aura_gateway::tool_ws::WsBrowserSidecarClient,
 }
 
 /// Resolve every domain manager, tying them together with the shared
@@ -220,7 +231,21 @@ pub async fn build_managers(
     // handed to a manager is a cheap `stores.xxx.clone()` so the bundle
     // itself stays intact for the graph + downstream consumers.
     let stores = Store::open(boot::storage_db_path(&config.workspace)).await?;
-    let mut tool_registry = Arc::new(ToolRegistry::with_defaults(stores.blob.clone()));
+
+    // Browser-tool plumbing: the WS client is a stateless handle the
+    // tools call into. The gateway's tool_ws server attaches a live
+    // socket when a sidecar registers; until then every browser_*
+    // call fails fast with `Disconnected`. Constructed unconditionally
+    // so non-gateway entry points (TUI direct, CLI commands that
+    // build a graph) at least have the tools defined — calls just
+    // return a clean error string if no gateway is running.
+    let tool_ws_client = aura_gateway::tool_ws::WsBrowserSidecarClient::new();
+    let browser_client_for_registry: Arc<dyn aura_tools::builtin::browser::BrowserSidecarClient> =
+        Arc::new(tool_ws_client.clone());
+    let mut tool_registry = Arc::new(ToolRegistry::with_defaults_and_browser(
+        stores.blob.clone(),
+        Some(browser_client_for_registry),
+    ));
 
     // Built after `stores` so `build_llm_client` can wire the blob
     // store in as a `BlobFetcher` — without it, multimodal user
@@ -416,6 +441,7 @@ pub async fn build_managers(
         secret_vault,
         stores,
         cron_trigger_rx: Some(cron_trigger_rx),
+        tool_ws_client,
     })
 }
 

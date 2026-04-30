@@ -227,7 +227,8 @@ impl SecurityGateway {
                 self.log_injection_warnings_in_value("tool_output", v);
                 sanitize_value(v, &self.leak_detector, &self.minter, &mut mints);
             }
-            aura_tools::ToolOutput::WithAttachments { text, .. } => {
+            aura_tools::ToolOutput::WithAttachments { text, .. }
+            | aura_tools::ToolOutput::MultiModalText { text, .. } => {
                 self.log_injection_warnings("tool_output", text);
                 sanitize_string(text, &self.leak_detector, &self.minter, &mut mints);
             }

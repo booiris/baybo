@@ -241,27 +241,35 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // of a "temporary" token: any TUI still holding the previous
     // generation's value must reconnect via the freshly published
     // vault entry.
-    let (token, tui_token) = {
+    let (token, tui_token, tool_browser_token) = {
         let vault = runtime::build_secret_vault(&config).await?;
         let admin_token = AdminToken::new(Arc::clone(&vault)).mint_if_absent().await?;
         let tui_token = aura_gateway::generate_token();
+        // Tool-sidecar token minted up front (rather than later
+        // alongside `channel_tokens.register`) so it can be folded
+        // into the leak detector before tracing fires up — otherwise
+        // any subsequent log line that accidentally echoed it would
+        // sit in `aura.log` until shutdown.
+        let tool_browser_token = aura_gateway::generate_token();
         vault
             .store_secret(TUI_TOKEN_VAULT_KEY, tui_token.as_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("publish TUI token to vault: {e}"))?;
-        (admin_token, tui_token)
+        (admin_token, tui_token, tool_browser_token)
     };
 
-    // Build the leak detector (with both gateway tokens registered as
-    // `LeakAction::Replace` rules) BEFORE initialising tracing so log
-    // lines that accidentally echo either credential are masked on
-    // disk. Pass the same `Arc<LeakDetector>` into `build_managers` so
-    // the runtime graph's SecurityGateway uses the same rule set.
+    // Build the leak detector (with every gateway-minted token
+    // registered as a `LeakAction::Replace` rule) BEFORE initialising
+    // tracing so log lines that accidentally echo any credential are
+    // masked on disk. Pass the same `Arc<LeakDetector>` into
+    // `build_managers` so the runtime graph's SecurityGateway uses
+    // the same rule set.
     let leak_detector = runtime::build_leak_detector(
         &config.security,
         &[
             ("gateway.admin_token", token.as_str()),
             (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
+            ("tool.browser.ws_token", tool_browser_token.as_str()),
         ],
     );
     let log_dir = workspace_paths.logs_dir();
@@ -337,6 +345,21 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
 
+    // Browser-tool sidecar token was generated up front (above, with
+    // tui_token) so the leak detector covers it. Register it in the
+    // channel token table now so `/v1/tool-ws` channel-auth admits
+    // the sidecar connection. Held for the rest of `start` via
+    // `_tool_browser_token_handle`.
+    const TOOL_BROWSER_LABEL: &str = "tool/browser";
+    let _tool_browser_token_handle = channel_tokens.register(
+        tool_browser_token.clone(),
+        ClientIdentity {
+            pid: 0,
+            label: TOOL_BROWSER_LABEL.to_string(),
+            bound_channel_type: None,
+        },
+    );
+
     // CLI-driven bot add/remove writes straight to libsql + vault. The
     // reconciler polls those stores on a short tick and pushes
     // `StartBot` / `StopBot` frames to whichever sidecars are
@@ -376,6 +399,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         stores: graph.stores.clone(),
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
+        tool_ws_client: Some(graph.tool_ws_client.clone()),
+        tool_ws_sidecar_label: TOOL_BROWSER_LABEL.to_string(),
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to
@@ -399,18 +424,34 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // own restart loop driven by the shared shutdown signal.
     match SidecarRuntime::install() {
         Ok(runtime) => {
-            let channel_types: Vec<String> = runtime.channel_types().map(String::from).collect();
-            if channel_types.is_empty() {
+            // Per-domain breakdown for the boot log so operators can
+            // see at a glance which families are embedded in this
+            // build (channel: telegram, weixin; browser: browser; …).
+            let domains: Vec<&str> = runtime.domains().collect();
+            if domains.is_empty() {
                 tracing::info!("no embedded sidecars in this build");
             } else {
-                tracing::info!(
-                    channel_types = ?channel_types,
-                    channel_port,
-                    "sidecar supervisor active; channels start on first registered bot",
-                );
+                for domain in &domains {
+                    let names: Vec<&str> = runtime.names_in_domain(domain).collect();
+                    tracing::info!(
+                        domain = %domain,
+                        sidecars = ?names,
+                        channel_port,
+                        "sidecar runtime materialised",
+                    );
+                }
+            }
+            let runtime = Arc::new(runtime);
+
+            // Channel sidecars: lazy spawn keyed on registered bots.
+            let channel_only: Vec<String> = runtime
+                .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
+                .map(String::from)
+                .collect();
+            if !channel_only.is_empty() {
                 let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
                 let supervisor = SidecarSupervisor::new(
-                    Arc::new(runtime),
+                    Arc::clone(&runtime),
                     spawner,
                     Arc::clone(&log_buffer),
                     workspace_paths.channel_logs_dir(),
@@ -421,6 +462,44 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                 task_tracker.track(tokio::spawn(async move {
                     supervisor.run(sv_shutdown).await;
                 }));
+            }
+
+            // Browser tool sidecar: started unconditionally when its
+            // bundle is embedded. The supervisor connects back to the
+            // gateway over `/v1/tool-ws` (using the dedicated channel
+            // token minted earlier as `tool_browser_token`); the
+            // `WsBrowserSidecarClient` already plumbed through the
+            // tool registry receives the live socket on Register.
+            if let Some(bundle_path) = runtime.bundle_for("browser") {
+                let tool_ws_url = format!("ws://127.0.0.1:{channel_port}/v1/tool-ws");
+                let no_sandbox =
+                    parse_bool_env(std::env::var("AURA_BROWSER_NO_SANDBOX").ok().as_deref());
+                if no_sandbox {
+                    tracing::warn!(
+                        "AURA_BROWSER_NO_SANDBOX=1 — Chromium will launch without its \
+                         renderer sandbox. Only safe inside an outer sandbox (rootless \
+                         docker, gVisor, …)."
+                    );
+                }
+                let cfg = aura_gateway::tool_ws::ToolSidecarConfig {
+                    bundle_path: bundle_path.to_path_buf(),
+                    ws_url: tool_ws_url,
+                    ws_token: tool_browser_token.clone(),
+                    chromium_executable: None,
+                    profile_dir: None,
+                    no_sandbox,
+                };
+                let tool_supervisor = aura_gateway::tool_ws::ToolSidecarSupervisor::new(cfg);
+                let sv_shutdown = shutdown.clone();
+                task_tracker.track(tokio::spawn(async move {
+                    tool_supervisor.run(sv_shutdown).await;
+                }));
+                tracing::info!(channel_port, "browser tool sidecar supervisor started");
+            } else {
+                tracing::info!(
+                    "browser tool sidecar bundle not embedded; \
+                     browser_* tools will return Disconnected until a sidecar registers",
+                );
             }
         }
         Err(e) => {
@@ -470,4 +549,11 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     task_tracker.shutdown().await;
     tracing::info!("gateway shutdown complete");
     Ok(())
+}
+
+fn parse_bool_env(s: Option<&str>) -> bool {
+    match s.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) => matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+        None => false,
+    }
 }

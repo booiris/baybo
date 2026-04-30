@@ -30,6 +30,7 @@ pub mod sidecar;
 pub mod spawn;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod tool_ws;
 
 pub use crate::auth::{
     AdminToken, CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TUI_CLIENT_LABEL,
