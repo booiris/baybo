@@ -80,18 +80,25 @@ pub(crate) fn validate_register(
                 );
             }
         }
+        AuthedClient::Tool { label } => {
+            // Tool sidecars (browser MCP server today; future
+            // code_exec, db_query, …) live in the same
+            // `ChannelTokenTable` so the channel-auth middleware
+            // accepts them for `/v1/blobs` uploads. They MUST NOT be
+            // admitted here — a leaked tool token presented at
+            // /v1/channel-ws would otherwise impersonate a channel.
+            return Err(format!(
+                "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
+            ));
+        }
         AuthedClient::Subprocess { pid, label, .. } => {
-            // Tokens minted for non-channel sidecars (currently:
-            // `tool/browser` for the browser tool sidecar, see
-            // `gateway_cmd::start`) live in the same
-            // `ChannelTokenTable` so the channel-auth middleware can
-            // accept them on `/v1/tool-ws`. They MUST NOT be admitted
-            // here — a leaked tool token presented at /v1/channel-ws
-            // would otherwise pass identity check and (since
-            // `bound_channel_type` is `None` for tool tokens) skip the
-            // binding gate too. Reject by label prefix so any future
-            // non-channel family that adopts the same convention is
-            // covered automatically.
+            // Defence in depth: `AuthedClient::from_identity` already
+            // routes any `tool/*` label into the `Tool` arm above, so
+            // we shouldn't see one here in production. But a future
+            // refactor (or a test that constructs `Subprocess`
+            // directly) could bypass `from_identity` — keep the
+            // prefix rejection so a leaked tool token can never
+            // register a channel by sneaking in via this arm.
             if label.starts_with("tool/") {
                 return Err(format!(
                     "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",

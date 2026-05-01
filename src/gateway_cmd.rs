@@ -241,15 +241,21 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // of a "temporary" token: any TUI still holding the previous
     // generation's value must reconnect via the freshly published
     // vault entry.
-    let (token, tui_token) = {
+    let (token, tui_token, browser_tool_token) = {
         let vault = runtime::build_secret_vault(&config).await?;
         let admin_token = AdminToken::new(Arc::clone(&vault)).mint_if_absent().await?;
         let tui_token = aura_gateway::generate_token();
+        // Browser tool sidecar token: minted up front so the leak
+        // detector can mask it before tracing starts. Lives in the
+        // ChannelTokenTable under the `tool/browser` label, which the
+        // auth middleware classifies as `AuthedClient::Tool` (bypasses
+        // pairing on /v1/blobs, rejected from /v1/channel-ws).
+        let browser_tool_token = aura_gateway::generate_token();
         vault
             .store_secret(TUI_TOKEN_VAULT_KEY, tui_token.as_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("publish TUI token to vault: {e}"))?;
-        (admin_token, tui_token)
+        (admin_token, tui_token, browser_tool_token)
     };
 
     // Build the leak detector (with every gateway-minted token
@@ -263,6 +269,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         &[
             ("gateway.admin_token", token.as_str()),
             (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
+            ("tool.browser.upload_token", browser_tool_token.as_str()),
         ],
     );
     let log_dir = workspace_paths.logs_dir();
@@ -336,6 +343,25 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         },
     );
 
+    // Browser tool sidecar token — registered NOW (before
+    // `mcp_reconciler.set_embedded` re-spawns the browser MCP child
+    // with the upload token in its env) so the first POST to
+    // /v1/blobs from the child finds a live entry. The handle is
+    // held for the lifetime of `start`; on shutdown it drops and
+    // revokes the in-memory entry.
+    let _browser_tool_handle = channel_tokens.register(
+        browser_tool_token.clone(),
+        ClientIdentity {
+            pid: std::process::id(),
+            label: format!("{}browser", aura_gateway::TOOL_CLIENT_LABEL_PREFIX),
+            // None: tool sidecars are session-scoped (like TUI), not
+            // bound to a channel type. The handshake gate rejects
+            // tool/* labels from /v1/channel-ws; only the blob
+            // upload path uses this token.
+            bound_channel_type: None,
+        },
+    );
+
     let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
 
     // CLI-driven bot add/remove writes straight to libsql + vault. The
@@ -392,6 +418,28 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();
     let channel_url = format!("ws://127.0.0.1:{channel_port}/v1/channel-ws");
+
+    // Now that the channel listener is bound and the port file will be
+    // written by `channel_server.run()`, refresh the embedded MCP
+    // profiles with the blob-upload env wired in. The browser MCP
+    // child reads `AURA_CHANNEL_PORT_FILE` lazily on its first big
+    // screenshot upload — by that time the file exists on disk.
+    {
+        let blob_upload = aura_gateway::sidecar::blob_upload_env(&port_file, &browser_tool_token);
+        let profiles = match aura_gateway::SidecarRuntime::install() {
+            Ok(rt) => aura_gateway::collect_profiles(&rt, &graph.config, Some(blob_upload)),
+            Err(e) => {
+                tracing::info!(
+                    error = %e,
+                    "embedded sidecar runtime unavailable; skipping post-bind MCP profile refresh",
+                );
+                Vec::new()
+            }
+        };
+        graph
+            .mcp_reconciler
+            .set_embedded(aura_tools::mcp::embedded_servers(&profiles));
+    }
 
     // Channel-sidecar supervisor (telegram / weixin / …). The channel
     // TCP listener is already bound above so the kernel's listen queue

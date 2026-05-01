@@ -15,7 +15,7 @@ pub use access_rule::{AccessRule, AuraToolMeta, CallLabelRule, ResourceKind};
 pub use config::{McpFile, McpServerEntry, McpTransportConfig, OAuthConfig, TrustLevelConfig};
 pub use embedded::EmbeddedMcpServer;
 pub use error::{McpError, McpResult};
-pub use profile::{EmbeddedMcpProfile, browser_mcp_profile, embedded_servers};
+pub use profile::{BlobUploadEnv, EmbeddedMcpProfile, browser_mcp_profile, embedded_servers};
 pub use reconciler::McpReconciler;
 pub use tool::McpTool;
 pub use transport::{McpServerSession, connect};

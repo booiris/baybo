@@ -172,6 +172,12 @@ pub struct ManagerGraph {
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
+    /// Live reconciler handle. `gateway_cmd::start` reaches into this
+    /// to call `set_embedded` after the channel TCP listener has bound
+    /// — that's when the browser MCP profile can finally include a
+    /// blob-upload env (port-file path + tool token) without racing
+    /// the bind. TUI / direct-CLI paths never touch it.
+    pub mcp_reconciler: Arc<McpReconciler>,
     /// Cloneable bundle of every libsql-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
@@ -406,7 +412,15 @@ pub async fn build_managers(
     // entries.
     let embedded_mcp_servers: Vec<EmbeddedMcpServer> = match aura_gateway::SidecarRuntime::install()
     {
-        Ok(rt) => aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(&rt, &config)),
+        // `blob_upload: None` here. The reconciler is set up before
+        // the channel TCP listener is bound and the tool token is
+        // registered in `ChannelTokenTable`, so the upload path stays
+        // disabled until `gateway_cmd::start` calls
+        // `mcp_reconciler.set_embedded(...)` post-bind with the wired
+        // [`BlobUploadEnv`]. Until then every screenshot inlines.
+        Ok(rt) => {
+            aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(&rt, &config, None))
+        }
         Err(e) => {
             tracing::info!(
                 error = %e,
@@ -425,6 +439,7 @@ pub async fn build_managers(
         mcp_cancel,
     );
     mcp_reconciler.spawn();
+    let mcp_reconciler_for_graph = Arc::clone(&mcp_reconciler);
 
     Ok(ManagerGraph {
         config,
@@ -443,6 +458,7 @@ pub async fn build_managers(
         cost_tracker,
         hook_manager,
         secret_vault,
+        mcp_reconciler: mcp_reconciler_for_graph,
         stores,
         cron_trigger_rx: Some(cron_trigger_rx),
     })

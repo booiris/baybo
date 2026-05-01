@@ -1,3 +1,4 @@
+import { maybeUpload } from "./blob_upload.js";
 import type { BrowserManager } from "./manager.js";
 import { assertSafeUrl } from "./network_policy.js";
 import { buildSnapshot } from "./snapshot.js";
@@ -19,7 +20,12 @@ const NAVIGATION_TIMEOUT_MS = 30_000;
  */
 export type ContentBlock =
   | { type: "text"; text: string }
-  | { type: "image"; data: string; mimeType: string };
+  | { type: "image"; data: string; mimeType: string }
+  /** MCP `ResourceLink`: URI + metadata. Aura's content adapter
+   *  parses URIs of form `aura://blob/<blob_id>` and constructs a
+   *  `ContentBlock::Image` from the existing blob — no second
+   *  download. Other URIs are elided. */
+  | { type: "resource_link"; uri: string; name: string; mimeType?: string };
 
 export type CallResult = {
   content: ContentBlock[];
@@ -183,16 +189,31 @@ export function buildHandlers(manager: BrowserManager): Record<string, ToolHandl
       const state = await manager.acquire(args.context_id);
       const buf = await state.page.screenshot({ fullPage, type: "png" });
       const url = state.page.url();
-      // Two parts: a JSON text summary so the LLM has the URL +
-      // approximate size in its tool-result, and the inline image bytes
-      // the Aura content adapter pipes into the blob store and surfaces
-      // to a vision-capable LLM via MultiModalText.
+      // Hybrid: small captures inline as `Image`, large ones POST to
+      // the gateway's `/v1/blobs` and surface a `ResourceLink` whose
+      // URI the Aura content adapter parses (`aura://blob/<id>`) into
+      // a `BlobRef` directly — no second download. `maybeUpload`
+      // returns null when bytes <= 2 MiB OR when the upload env isn't
+      // wired (non-gateway smoke-test paths), so this keeps working
+      // out-of-band.
+      const blobId = await maybeUpload(buf, "image/png");
+      const summary = JSON.stringify({ url, bytes: buf.length });
+      if (blobId !== null) {
+        return {
+          content: [
+            { type: "text", text: summary },
+            {
+              type: "resource_link",
+              uri: `aura://blob/${blobId}`,
+              name: "screenshot.png",
+              mimeType: "image/png",
+            },
+          ],
+        };
+      }
       return {
         content: [
-          {
-            type: "text",
-            text: JSON.stringify({ url, bytes: buf.length }),
-          },
+          { type: "text", text: summary },
           {
             type: "image",
             data: buf.toString("base64"),

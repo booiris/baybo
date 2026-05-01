@@ -32,8 +32,8 @@ pub mod spawn;
 pub mod test_support;
 
 pub use crate::auth::{
-    AdminToken, CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TUI_CLIENT_LABEL,
-    TUI_TOKEN_VAULT_KEY, TokenHandle, constant_time_eq, generate_token,
+    AdminToken, CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
+    TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY, TokenHandle, constant_time_eq, generate_token,
 };
 pub use crate::channel::{ChannelControlError, ChannelControlRegistry};
 pub use crate::channel_listener::ChannelServer;

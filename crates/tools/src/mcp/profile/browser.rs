@@ -34,6 +34,15 @@ use crate::ToolCapability;
 /// - `bundle_path`: the materialised `dist/bundle.mjs` path
 ///   (`runtime.bundle_for("browser")`).
 ///
+/// `blob_upload` lets large screenshots stream out via the gateway's
+/// `/v1/blobs` endpoint instead of inlining 16 MiB of base64 in the
+/// MCP frame. The TS sidecar reads `AURA_CHANNEL_PORT_FILE` lazily
+/// on first upload to discover the gateway's loopback port (avoids
+/// the boot-order chicken-and-egg of "child needs port at spawn time
+/// but bind happens later"); the token must be live in the
+/// `ChannelTokenTable` before the first upload could fire. `None`
+/// disables the streaming path — every screenshot inlines.
+///
 /// Keeping `command` + `bundle_path` as plain inputs (rather than
 /// reaching into `aura-gateway::SidecarRuntime` from here) is what
 /// lets this module live in `aura-tools` without a dependency cycle.
@@ -44,6 +53,7 @@ pub fn browser_mcp_profile(
     chrome_path: Option<&Path>,
     profile_dir: Option<&Path>,
     allow_loopback: bool,
+    blob_upload: Option<BlobUploadEnv<'_>>,
     command: String,
     bundle_path: &Path,
 ) -> Option<EmbeddedMcpProfile> {
@@ -67,6 +77,13 @@ pub fn browser_mcp_profile(
     if allow_loopback {
         extra_env.insert("AURA_BROWSER_ALLOW_LOOPBACK".into(), "1".into());
     }
+    if let Some(up) = blob_upload {
+        extra_env.insert(
+            "AURA_CHANNEL_PORT_FILE".into(),
+            up.port_file.display().to_string(),
+        );
+        extra_env.insert("AURA_BLOB_UPLOAD_TOKEN".into(), up.token.into());
+    }
     Some(EmbeddedMcpProfile {
         server_name: "browser".into(),
         command,
@@ -77,6 +94,20 @@ pub fn browser_mcp_profile(
         capabilities: vec![ToolCapability::Http, ToolCapability::ExecCommand],
         extra_env,
     })
+}
+
+/// Where the browser MCP child should `POST /v1/blobs` for large
+/// screenshots, and the token to authenticate with. The port itself
+/// isn't passed — the child reads `port_file` lazily on first
+/// upload, sidestepping the boot-order race.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobUploadEnv<'a> {
+    /// Path the channel TCP listener writes its bound port to (e.g.
+    /// `<workspace>/state/channel.port`).
+    pub port_file: &'a Path,
+    /// Channel-token registered against a `tool/<sidecar>` label —
+    /// `AuthedClient::Tool` bypasses pairing on `/v1/blobs`.
+    pub token: &'a str,
 }
 
 #[cfg(test)]
@@ -93,6 +124,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 "node".into(),
                 Path::new("/x.mjs"),
             )
@@ -108,6 +140,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             "node".into(),
             Path::new("/x.mjs"),
         )
@@ -127,6 +160,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             "node".into(),
             Path::new("/x.mjs"),
         )
@@ -142,10 +176,38 @@ mod tests {
             Some(&PathBuf::from("/opt/chrome")),
             None,
             false,
+            None,
             "node".into(),
             Path::new("/x.mjs"),
         )
         .expect("profile when enabled");
         assert_eq!(p.extra_env.get("AURA_CHROMIUM_BIN").unwrap(), "/opt/chrome");
+    }
+
+    #[test]
+    fn blob_upload_env_lands_in_env() {
+        let port_file = PathBuf::from("/var/aura/state/channel.port");
+        let p = browser_mcp_profile(
+            true,
+            false,
+            None,
+            None,
+            false,
+            Some(BlobUploadEnv {
+                port_file: &port_file,
+                token: "secret123",
+            }),
+            "node".into(),
+            Path::new("/x.mjs"),
+        )
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env.get("AURA_CHANNEL_PORT_FILE").unwrap(),
+            "/var/aura/state/channel.port"
+        );
+        assert_eq!(
+            p.extra_env.get("AURA_BLOB_UPLOAD_TOKEN").unwrap(),
+            "secret123"
+        );
     }
 }

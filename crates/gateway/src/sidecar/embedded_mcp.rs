@@ -7,10 +7,10 @@
 //! and the per-domain composition that turns the operator's
 //! [`AuraConfig`] into the profile list the reconciler consumes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aura_config::AuraConfig;
-use aura_tools::mcp::{EmbeddedMcpProfile, browser_mcp_profile};
+use aura_tools::mcp::{BlobUploadEnv, EmbeddedMcpProfile, browser_mcp_profile};
 
 use crate::sidecar::SidecarRuntime;
 
@@ -40,7 +40,11 @@ pub fn node_binary() -> PathBuf {
 /// Adding a future tool-domain MCP server (code_exec, db_query, …) is
 /// one more entry in the array literal — `runtime::build_managers`
 /// stays unchanged.
-pub fn collect_profiles(runtime: &SidecarRuntime, config: &AuraConfig) -> Vec<EmbeddedMcpProfile> {
+pub fn collect_profiles(
+    runtime: &SidecarRuntime,
+    config: &AuraConfig,
+    blob_upload: Option<BlobUploadEnv<'_>>,
+) -> Vec<EmbeddedMcpProfile> {
     let node_cmd = node_binary().display().to_string();
     [runtime.bundle_for("browser").and_then(|bundle| {
         browser_mcp_profile(
@@ -49,6 +53,7 @@ pub fn collect_profiles(runtime: &SidecarRuntime, config: &AuraConfig) -> Vec<Em
             config.browser.chrome_path.as_deref(),
             config.browser.profile_dir.as_deref(),
             config.browser.allow_loopback,
+            blob_upload,
             node_cmd.clone(),
             bundle,
         )
@@ -56,6 +61,14 @@ pub fn collect_profiles(runtime: &SidecarRuntime, config: &AuraConfig) -> Vec<Em
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// Convenience: build a [`BlobUploadEnv`] from the workspace channel
+/// port-file path and a registered tool-sidecar token. The token must
+/// be live in the gateway's `ChannelTokenTable` under a `tool/<name>`
+/// label before the first upload could fire.
+pub fn blob_upload_env<'a>(port_file: &'a Path, token: &'a str) -> BlobUploadEnv<'a> {
+    BlobUploadEnv { port_file, token }
 }
 
 #[cfg(test)]
@@ -79,7 +92,7 @@ mod tests {
         let cfg = AuraConfig::default();
         assert!(!cfg.browser.enable, "default browser config is opt-in");
         assert!(
-            collect_profiles(&rt, &cfg).is_empty(),
+            collect_profiles(&rt, &cfg, None).is_empty(),
             "browser.enable=false must keep the profile list empty even when the bundle is embedded",
         );
     }
@@ -99,7 +112,7 @@ mod tests {
         }
         let mut cfg = AuraConfig::default();
         cfg.browser.enable = true;
-        let profiles = collect_profiles(&rt, &cfg);
+        let profiles = collect_profiles(&rt, &cfg, None);
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].server_name, "browser");
     }

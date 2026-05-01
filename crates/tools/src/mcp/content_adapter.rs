@@ -1,19 +1,39 @@
 //! Convert rmcp `Content` arrays into [`ToolOutput`].
 //!
 //! Replaces the old `format_content` helper which silently elided every
-//! non-text variant. Now `Image` content materialises into the
-//! gateway's [`BlobStore`] and reaches a vision-capable model through
-//! [`ToolOutput::MultiModalText`]. Audio / Resource / ResourceLink
-//! still elide for now (no current consumer); add adapters when one
-//! lands.
+//! non-text variant. Two image paths now reach a vision-capable model
+//! through [`ToolOutput::MultiModalText`]:
+//!
+//!   1. **Inline `Image`** — base64 in the MCP frame. Decoded here,
+//!      stored in the gateway's [`BlobStore`], and surfaced as a
+//!      [`aura_model::ContentBlock::Image`]. 16 MiB cap.
+//!   2. **`ResourceLink` with an `aura://blob/<id>` URI** — for the
+//!      browser MCP server's large screenshots. Bytes already landed
+//!      in the blob store via the sidecar's earlier
+//!      `POST /v1/blobs`; the URI's path is the blob_id, so we just
+//!      construct a [`aura_model::BlobRef`] directly. No second
+//!      download, no size cap (the cap rides on the upload endpoint).
+//!
+//! Other `ResourceLink` URI schemes are elided — handing arbitrary
+//! `http://...` URIs to a fetcher would create a generic SSRF surface
+//! every MCP server could exploit. Audio + EmbeddedResource also
+//! elide for now (no current consumer).
 
 use std::sync::Arc;
 
+use aura_model::BlobRef;
 use aura_storage::BlobStore;
 use base64::Engine;
 use rmcp::model::{Annotated, RawContent};
 
 use crate::{ToolError, ToolOutput};
+
+/// URI scheme reserved for "this blob is already in the gateway's
+/// BlobStore — here is its id". Embedded MCP servers (the browser
+/// sidecar today) emit `aura://blob/<sha256:hex>` after streaming
+/// bytes via `POST /v1/blobs`. The adapter parses the path and
+/// produces a [`aura_model::BlobRef`] without a second fetch.
+const AURA_BLOB_URI_PREFIX: &str = "aura://blob/";
 
 /// Hard cap on decoded image bytes per `Image` content part. Mirrors
 /// the cap the deleted `browser_screenshot` enforced — well above any
@@ -48,7 +68,24 @@ pub async fn adapt_call_result(
             }
             RawContent::Audio(_) => text_parts.push("[audio content elided]".into()),
             RawContent::Resource(_) => text_parts.push("[resource content elided]".into()),
-            RawContent::ResourceLink(_) => text_parts.push("[resource link elided]".into()),
+            RawContent::ResourceLink(link) => match parse_aura_blob_uri(&link.uri) {
+                Some(blob_id) => {
+                    let mime = link
+                        .mime_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".into());
+                    images.push(aura_model::ContentBlock::Image {
+                        blob: BlobRef { blob_id },
+                        mime_type: mime,
+                    });
+                }
+                None => {
+                    // Non-aura:// URI — could be any http://, file://, …
+                    // Fetching arbitrary URIs from MCP servers would be
+                    // a generic SSRF surface, so we elide.
+                    text_parts.push(format!("[external resource link elided: {}]", link.uri));
+                }
+            },
         }
     }
 
@@ -75,6 +112,18 @@ pub async fn adapt_call_result(
         text
     };
     Ok(ToolOutput::multi_modal_text(display_text, images))
+}
+
+/// Parse `aura://blob/<blob_id>` and return the `<blob_id>` portion.
+/// Returns `None` when the URI doesn't match the prefix or when the
+/// blob_id segment is empty / contains a path separator (defensive
+/// against a sidecar trying to navigate into an unrelated blob).
+fn parse_aura_blob_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix(AURA_BLOB_URI_PREFIX)?;
+    if rest.is_empty() || rest.contains('/') || rest.contains('\\') {
+        return None;
+    }
+    Some(rest.to_string())
 }
 
 async fn decode_image(
@@ -119,7 +168,7 @@ async fn decode_image(
 mod tests {
     use super::*;
     use aura_storage::test_support::MemoryBlobStore;
-    use rmcp::model::{Annotated, RawImageContent, RawTextContent};
+    use rmcp::model::{Annotated, RawImageContent, RawResource, RawTextContent};
 
     fn text(s: &str) -> Annotated<RawContent> {
         Annotated {
@@ -206,6 +255,91 @@ mod tests {
                 assert_eq!(llm_images.len(), 1);
             }
             other => panic!("expected MultiModalText, got {other:?}"),
+        }
+    }
+
+    fn resource_link(uri: &str, mime: Option<&str>) -> Annotated<RawContent> {
+        Annotated {
+            raw: RawContent::ResourceLink(RawResource {
+                uri: uri.into(),
+                name: "x".into(),
+                title: None,
+                description: None,
+                mime_type: mime.map(str::to_owned),
+                size: None,
+                icons: None,
+                meta: None,
+            }),
+            annotations: None,
+        }
+    }
+
+    #[test]
+    fn aura_blob_uri_parser_accepts_well_formed() {
+        assert_eq!(
+            parse_aura_blob_uri("aura://blob/sha256:abc123"),
+            Some("sha256:abc123".to_string()),
+        );
+    }
+
+    #[test]
+    fn aura_blob_uri_parser_rejects_path_traversal() {
+        // A sidecar embedding `..` in the blob id would otherwise let
+        // it construct a BlobRef with whatever path component it
+        // wants. Defensive check before the BlobStore lookup.
+        assert!(parse_aura_blob_uri("aura://blob/sha256:..").is_some()); // colon ok
+        assert!(parse_aura_blob_uri("aura://blob/foo/bar").is_none());
+        assert!(parse_aura_blob_uri("aura://blob/foo\\bar").is_none());
+        assert!(parse_aura_blob_uri("aura://blob/").is_none());
+    }
+
+    #[test]
+    fn aura_blob_uri_parser_rejects_other_schemes() {
+        assert!(parse_aura_blob_uri("http://gateway/v1/blobs/abc").is_none());
+        assert!(parse_aura_blob_uri("file:///tmp/x").is_none());
+        assert!(parse_aura_blob_uri("aura://other/abc").is_none());
+    }
+
+    #[tokio::test]
+    async fn aura_blob_resource_link_becomes_image_block() {
+        let blob_store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let parts = vec![
+            text("here it is"),
+            resource_link("aura://blob/sha256:deadbeef", Some("image/png")),
+        ];
+        let out = adapt_call_result(&parts, false, Some(&blob_store))
+            .await
+            .unwrap();
+        match out {
+            ToolOutput::MultiModalText { text, llm_images } => {
+                assert_eq!(text, "here it is");
+                assert_eq!(llm_images.len(), 1);
+                match &llm_images[0] {
+                    aura_model::ContentBlock::Image { blob, mime_type } => {
+                        assert_eq!(blob.blob_id, "sha256:deadbeef");
+                        assert_eq!(mime_type, "image/png");
+                    }
+                    other => panic!("expected Image block, got {other:?}"),
+                }
+            }
+            other => panic!("expected MultiModalText, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn external_resource_link_is_elided() {
+        let blob_store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let parts = vec![resource_link(
+            "https://attacker.example/secret",
+            Some("image/png"),
+        )];
+        let out = adapt_call_result(&parts, false, Some(&blob_store))
+            .await
+            .unwrap();
+        // Elided to text — no fetch attempt, no image surfaced.
+        match out {
+            ToolOutput::Text(s) => assert!(s.contains("external resource link elided")),
+            other => panic!("expected Text (elided), got {other:?}"),
         }
     }
 
