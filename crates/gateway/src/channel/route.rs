@@ -186,7 +186,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         // failure here just means the sidecar runs without command UI.
         if let Err(e) = sidecar
             .send_frame(Frame::SlashManifest {
-                commands: super::slash::manifest(),
+                commands: super::slash::manifest(&channel_type),
             })
             .await
         {
