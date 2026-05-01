@@ -91,11 +91,22 @@ impl McpTunnelRouter {
     /// matching tunnel. Returns `false` when the tunnel is gone
     /// (agent unregistered between request and reply) — the frame is
     /// dropped silently in that case.
+    ///
+    /// The DashMap read guard is dropped *before* awaiting the mpsc
+    /// send; otherwise a full inbound buffer + concurrent tunnel
+    /// drop would deadlock. `Drop::close_tunnel` calls
+    /// `DashMap::remove`, which blocks on outstanding read guards;
+    /// holding one across the bounded-channel `send().await` lets a
+    /// blocked send pin the guard while the would-be cleanup waits
+    /// behind it.
     pub async fn forward_inbound(&self, tunnel_id: &str, payload: Vec<u8>) -> bool {
-        let Some(entry) = self.inbound.get(tunnel_id) else {
-            return false;
+        let tx = {
+            let Some(entry) = self.inbound.get(tunnel_id) else {
+                return false;
+            };
+            entry.value().tx.clone()
         };
-        entry.value().tx.send(payload).await.is_ok()
+        tx.send(payload).await.is_ok()
     }
 
     /// Drop every tunnel routed through `channel_type`. Called when
@@ -214,6 +225,49 @@ mod tests {
         // The drained tunnel's receiver wakes with `None` (sender
         // dropped) instead of blocking forever.
         assert_eq!(lark.next_inbound().await, None);
+    }
+
+    /// Codex review regression: `forward_inbound` previously held a
+    /// DashMap read guard across `tx.send().await`. With a full
+    /// buffer the send blocked waiting for the receiver to drain;
+    /// dropping the tunnel called `DashMap::remove` which itself
+    /// blocked behind the held read guard. Result: stuck WS inbound
+    /// task. Verify the cleanup path completes when the buffer is
+    /// full and the tunnel is dropped concurrently.
+    #[tokio::test]
+    async fn forward_inbound_does_not_deadlock_when_buffer_full_and_tunnel_drops() {
+        let router = Arc::new(McpTunnelRouter::new());
+        let tunnel = router.open(ChannelType::from("lark"));
+        let id = tunnel.id().to_string();
+
+        // Fill the buffer. Sends complete because no one's reading
+        // but nothing is blocked yet.
+        for _ in 0..super::TUNNEL_BUFFER {
+            assert!(router.forward_inbound(&id, vec![0]).await);
+        }
+
+        // Spawn a forward that will block on a full buffer.
+        let router_clone = Arc::clone(&router);
+        let id_for_send = id.clone();
+        let blocked_send =
+            tokio::spawn(async move { router_clone.forward_inbound(&id_for_send, vec![1]).await });
+
+        // Yield so the spawned task gets to its first await.
+        tokio::task::yield_now().await;
+
+        // Drop the tunnel handle. Drop runs `close_tunnel` which
+        // does `DashMap::remove` — must NOT block behind the read
+        // guard the forward held.
+        drop(tunnel);
+
+        // The blocked send should now complete because the receiver
+        // half was dropped (channel closed → send returns Err →
+        // forward_inbound returns false).
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), blocked_send)
+            .await
+            .expect("forward_inbound deadlocked when tunnel dropped concurrently")
+            .unwrap();
+        assert!(!result, "send into a dropped tunnel must return false");
     }
 
     #[tokio::test]
