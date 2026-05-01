@@ -301,10 +301,9 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let mcp_tunnel_router = Arc::new(aura_gateway::channel::McpTunnelRouter::new(Arc::clone(
         &channel_control,
     )));
-    let sidecar_mcp_manager = Arc::new(aura_gateway::channel::SidecarMcpManager::new(
-        Arc::clone(&mcp_tunnel_router),
-        Arc::clone(&channel_capabilities),
-    ));
+    let sidecar_mcp_manager = Arc::new(aura_gateway::channel::SidecarMcpManager::new(Arc::clone(
+        &mcp_tunnel_router,
+    )));
 
     let run_handle = runtime::wire_router(
         &mut graph,

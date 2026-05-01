@@ -194,6 +194,17 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         }
         let sent = push_live_bots(&state, &channel_type, &sidecar).await;
         state.bot_reconciler.seed(channel_type.clone(), sent);
+        // Eagerly attach an rmcp session for this channel if the
+        // sidecar advertised `mcp_tunnel`. The handshake runs in the
+        // background — `run_inbound_loop` below has to be live for
+        // `Frame::Mcp` replies to reach the rmcp client, so we
+        // can't await it here.
+        if negotiated_capabilities
+            .iter()
+            .any(|c| c == super::handshake::CAP_MCP_TUNNEL)
+        {
+            state.sidecar_mcp_manager.attach(channel_type.clone());
+        }
     }
 
     run_inbound_loop(
