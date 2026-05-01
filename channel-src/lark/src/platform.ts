@@ -14,9 +14,15 @@ import type {
 import * as lark from "@larksuiteoapi/node-sdk";
 
 import type { LarkApprovals } from "./approvals.js";
-import { parseStartBotCredentials } from "./auth/credentials.js";
+import {
+  parseBotRuntimeConfig,
+  parseStartBotCredentials,
+  type BotRuntimeConfig,
+} from "./auth/credentials.js";
 import { downloadResourceAsAttachment } from "./media/inbound.js";
 import { sendLarkAttachments } from "./media/outbound.js";
+import { cleanInboundContent } from "./messaging/inbound.js";
+import { LarkStreamingSession } from "./streaming.js";
 
 export const CHANNEL_TYPE = "lark";
 
@@ -35,7 +41,23 @@ export interface LarkChat {
   chatId: string;
 }
 
+interface BotState {
+  handle: lark.LarkChannel;
+  config: BotRuntimeConfig;
+}
+
 export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
+  // Per-bot runtime state: streaming/reaction toggles. Keyed on
+  // `botId` (StartBot is idempotent at the SDK layer).
+  private readonly bots = new Map<string, BotState>();
+  // Per-userId streaming session: at most one card streams to a given
+  // (channelType, botId, chatKey, platformUserId) tuple at a time.
+  // Aura's gateway already serialises a session's outbound, so the
+  // map collisions only happen across distinct sessions in the same
+  // chat — those collisions are correct (interleaving cards would be
+  // worse).
+  private readonly streams = new Map<string, LarkStreamingSession>();
+
   constructor(
     private readonly logger: Logger,
     private readonly approvals: LarkApprovals,
@@ -45,7 +67,24 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     handle: lark.LarkChannel,
     chat: LarkChat,
     text: string,
+    userId: string,
   ): Promise<void> {
+    const stream = this.streams.get(userId);
+    if (stream) {
+      // Finalise the live streaming card with the canonical body.
+      // BotChannel cancelled typing already; nothing else to do.
+      this.streams.delete(userId);
+      try {
+        await stream.finish(text);
+        return;
+      } catch (err) {
+        this.logger.warn(
+          `lark streaming finalise failed; falling back to plain send: ${String(err)}`,
+        );
+        // Fall through to a plain `send` so the user still sees the
+        // reply even when the SDK's stream pipeline broke.
+      }
+    }
     await handle.send(chat.chatId, { text });
   }
 
@@ -54,11 +93,19 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     chat: LarkChat,
     notice: AgentNotice,
   ): Promise<void> {
+    // Notices are out-of-band: even mid-stream, they should land as a
+    // separate message with the warn/error prefix the user expects.
+    // Don't try to fold them into the streaming card.
     const prefix = notice.level === "error" ? "❌" : "⚠️";
-    await this.sendText(handle, chat, `${prefix} ${notice.text}`);
+    await handle.send(chat.chatId, { text: `${prefix} ${notice.text}` });
   }
 
   async stopBot(handle: lark.LarkChannel): Promise<void> {
+    const botId = this.botIdFromHandle(handle);
+    if (botId !== null) {
+      this.purgeBotStreams(botId);
+      this.bots.delete(botId);
+    }
     try {
       await handle.disconnect();
     } catch (err) {
@@ -66,17 +113,71 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     }
   }
 
+  private botIdFromHandle(handle: lark.LarkChannel): string | null {
+    for (const [botId, state] of this.bots) {
+      if (state.handle === handle) return botId;
+    }
+    return null;
+  }
+
+  private purgeBotStreams(botId: string): void {
+    const prefix = `${CHANNEL_TYPE}_${botId}_`;
+    for (const [userId, stream] of this.streams) {
+      if (!userId.startsWith(prefix)) continue;
+      this.streams.delete(userId);
+      // Best-effort flush so the SDK's stream() promise resolves and
+      // the producer's buffer is freed; if the channel is already
+      // disconnected this rejects and we swallow.
+      void stream.finish().catch(() => undefined);
+    }
+  }
+
   async sendMedia(
     handle: lark.LarkChannel,
     chat: LarkChat,
     payload: BotMediaPayload,
+    userId: string,
   ): Promise<void> {
+    // Media + streaming card don't compose: media wants its own
+    // attachments and a caption, while the card holds markdown.
+    // Finalise the stream with whatever caption text exists, then
+    // ship the attachments separately. The user sees the card with
+    // the caption text and a follow-up media message.
+    const stream = this.streams.get(userId);
+    if (stream) {
+      this.streams.delete(userId);
+      try {
+        await stream.finish(payload.text);
+      } catch (err) {
+        this.logger.debug(
+          `lark streaming finalise failed before sendMedia: ${String(err)}`,
+        );
+      }
+    }
     await sendLarkAttachments({
       channel: handle,
       chat,
       payload,
       logger: this.logger,
     });
+  }
+
+  async onAgentDelta(
+    handle: lark.LarkChannel,
+    chat: LarkChat,
+    userId: string,
+    text: string,
+  ): Promise<void> {
+    if (text.length === 0) return;
+    const botId = this.botIdFromHandle(handle);
+    const config = botId ? this.bots.get(botId)?.config : undefined;
+    if (config && !config.streaming) return;
+    let stream = this.streams.get(userId);
+    if (!stream) {
+      stream = new LarkStreamingSession(handle, chat.chatId, this.logger);
+      this.streams.set(userId, stream);
+    }
+    stream.append(text);
   }
 
   async startBot(
@@ -87,6 +188,8 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     username?: string;
   }> {
     const creds = parseStartBotCredentials(cmd);
+    const config = parseBotRuntimeConfig(cmd);
+
     const channel = lark.createLarkChannel({
       appId: creds.appId,
       appSecret: creds.appSecret,
@@ -95,13 +198,14 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       // The SDK's safety pipeline already covers what openclaw's
       // `inbound/dedup.ts` does (replay filter, stale-message cutoff)
       // and what `policy.ts` does (group/DM/mention-required gates).
-      // Phase 2 surfaces these knobs to operator config; for the MVP
-      // the SDK defaults plus mention-required-in-groups are fine.
+      // Phase 2 keeps these knobs at the SDK defaults; per-bot policy
+      // overrides (allowlists, dmMode toggles) wait for Phase 3 when
+      // operator UX for them is built out.
       policy: { requireMention: true, dmMode: "open" },
     });
 
     channel.on("message", (msg) =>
-      this.dispatchInbound(channel, cmd.botId, msg, hooks.emit),
+      this.dispatchInbound(channel, cmd.botId, msg, hooks.emit, config),
     );
     channel.on("cardAction", (ev) => this.approvals.handleCardAction(ev));
     // The SDK fires `error` for outbound failures (rate_limited,
@@ -119,6 +223,12 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     await channel.connect();
     const username = channel.botIdentity?.name;
 
+    // Stash state only after `connect()` succeeds; on failure we never
+    // entered live state, so leaving the map untouched keeps the
+    // soft-error path clean. The handle is the same instance that
+    // BotChannel will pass back to `stopBot` later.
+    this.bots.set(cmd.botId, { handle: channel, config });
+
     return username ? { handle: channel, username } : { handle: channel };
   }
 
@@ -127,6 +237,7 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     botId: string,
     msg: lark.NormalizedMessage,
     emit: (ev: BotInboundEvent<LarkChat>) => void,
+    config: BotRuntimeConfig,
   ): Promise<void> {
     const address: LarkChat = { chatId: msg.chatId };
     const platformUserId = msg.senderId;
@@ -165,8 +276,19 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       if (att) attachments.push(att);
     }
 
-    const content = msg.content;
+    const content = cleanInboundContent(msg.content, msg.mentions);
     if (!content && attachments.length === 0) return;
+
+    if (config.reactionEcho) {
+      // Best-effort acknowledgement; failures are debug-level. We do
+      // NOT await — reaction round-trips can take 1–2s and we don't
+      // want to delay the agent's first delta on an Asia-region link.
+      void channel.addReaction(platformMsgId, "OK").catch((err: unknown) => {
+        this.logger.debug(
+          `lark inbound reaction-echo failed message=${platformMsgId}: ${String(err)}`,
+        );
+      });
+    }
 
     emit({
       chat: address,

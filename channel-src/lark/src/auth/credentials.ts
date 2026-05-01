@@ -13,7 +13,19 @@ export interface AppCredentials {
   domain: lark.Domain | string;
 }
 
+export interface BotRuntimeConfig {
+  /** Stream agent deltas through CardKit v2; default on. */
+  streaming: boolean;
+  /** Post a 👍 reaction on every accepted inbound; default off. */
+  reactionEcho: boolean;
+}
+
 const DEFAULT_BASE_URL = "https://open.feishu.cn";
+
+const DEFAULT_BOT_RUNTIME_CONFIG: BotRuntimeConfig = {
+  streaming: true,
+  reactionEcho: false,
+};
 
 export function parseStartBotCredentials(cmd: StartBotCommand): AppCredentials {
   const appId = cmd.token.trim();
@@ -28,6 +40,38 @@ export function parseStartBotCredentials(cmd: StartBotCommand): AppCredentials {
   }
   const baseUrl = (cmd.metadata["base_url"] ?? DEFAULT_BASE_URL).trim();
   return { appId, appSecret, domain: domainFromBaseUrl(baseUrl) };
+}
+
+/**
+ * Extract per-bot runtime knobs from `StartBot.metadata`. Operator-set
+ * values flow through plaintext metadata (not the secret vault); empty /
+ * unrecognised values fall back to the defaults so an old aura sidecar
+ * keeps working when a new key is introduced. Booleans accept the
+ * standard idioms (`on/off`, `true/false`, `1/0`, `yes/no`) with leading
+ * / trailing whitespace tolerated.
+ */
+export function parseBotRuntimeConfig(
+  cmd: StartBotCommand,
+): BotRuntimeConfig {
+  return {
+    streaming: parseBool(
+      cmd.metadata["streaming"],
+      DEFAULT_BOT_RUNTIME_CONFIG.streaming,
+    ),
+    reactionEcho: parseBool(
+      cmd.metadata["reaction_echo"],
+      DEFAULT_BOT_RUNTIME_CONFIG.reactionEcho,
+    ),
+  };
+}
+
+function parseBool(value: string | undefined, fallback: boolean): boolean {
+  if (typeof value !== "string") return fallback;
+  const v = value.trim().toLowerCase();
+  if (v === "") return fallback;
+  if (v === "on" || v === "true" || v === "1" || v === "yes") return true;
+  if (v === "off" || v === "false" || v === "0" || v === "no") return false;
+  return fallback;
 }
 
 // Map the three known Lark deployment hosts onto the SDK's typed

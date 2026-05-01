@@ -1,4 +1,5 @@
 import type {
+  AgentDelta,
   AgentMessage,
   AgentNotice,
   ApprovalDecision,
@@ -154,8 +155,19 @@ export interface BotPlatform<BotHandle, ChatId> {
    */
   stopBot(handle: BotHandle): Promise<void>;
 
-  /** Deliver an outbound text message on a specific bot+chat pair. */
-  sendText(handle: BotHandle, chat: ChatId, text: string): Promise<void>;
+  /**
+   * Deliver an outbound text message on a specific bot+chat pair.
+   * `userId` is the composite aura user id the channel routed by, so a
+   * streaming-aware platform can finalise an in-flight stream for that
+   * user instead of posting a fresh message. Implementations that
+   * don't stream can ignore the parameter.
+   */
+  sendText(
+    handle: BotHandle,
+    chat: ChatId,
+    text: string,
+    userId: string,
+  ): Promise<void>;
 
   /**
    * Deliver an outbound message that carries non-text media. Called by
@@ -165,12 +177,14 @@ export interface BotPlatform<BotHandle, ChatId> {
    * post the combined message. Omit the method to fall through to
    * `sendText` with the text body only — attachments will be dropped
    * with a warning, so platforms that need media support **must**
-   * implement this.
+   * implement this. `userId` mirrors the `sendText` arg so streaming
+   * platforms can close a live card before sending media.
    */
   sendMedia?(
     handle: BotHandle,
     chat: ChatId,
     payload: BotMediaPayload,
+    userId: string,
   ): Promise<void>;
 
   /**
@@ -195,6 +209,30 @@ export interface BotPlatform<BotHandle, ChatId> {
    * …); omit otherwise.
    */
   notifyTyping?(handle: BotHandle, chat: ChatId): Promise<void>;
+
+  /**
+   * Optional streaming sink for in-flight agent deltas. When
+   * implemented, the channel routes `Frame::Delta` here after
+   * resolving the route; the platform decides how to throttle and
+   * render (Lark CardKit `cards.stream`, etc.). The channel cancels
+   * any active typing session for the user before invoking, since the
+   * streaming UI replaces the typing indicator. Sidecars without a
+   * streaming primitive omit this method and deltas are dropped on
+   * the floor (today's behaviour).
+   *
+   * `userId` is the composite aura user id; the platform's
+   * `sendText` / `sendMedia` is still called for the terminal frame,
+   * and platforms that opened a stream are responsible for finalising
+   * it there (e.g. by inspecting the user's session state in
+   * `sendText` and closing the stream instead of posting a fresh
+   * message).
+   */
+  onAgentDelta?(
+    handle: BotHandle,
+    chat: ChatId,
+    userId: string,
+    text: string,
+  ): Promise<void>;
 
   /**
    * Optional slash-command registrar. Implement when the platform has
@@ -532,10 +570,15 @@ export class BotChannel<BotHandle, ChatId>
     const hasMedia = msg.attachments !== undefined && msg.attachments.length > 0;
     try {
       if (hasMedia && this.platform.sendMedia) {
-        await this.platform.sendMedia(route.handle, route.chat, {
-          text: msg.content,
-          attachments: msg.attachments!,
-        });
+        await this.platform.sendMedia(
+          route.handle,
+          route.chat,
+          {
+            text: msg.content,
+            attachments: msg.attachments!,
+          },
+          msg.userId,
+        );
       } else {
         if (hasMedia) {
           // Platform doesn't implement sendMedia — surface this loudly
@@ -545,10 +588,44 @@ export class BotChannel<BotHandle, ChatId>
             `dropping ${msg.attachments!.length} attachment(s) — platform does not implement sendMedia`,
           );
         }
-        await this.platform.sendText(route.handle, route.chat, msg.content);
+        await this.platform.sendText(
+          route.handle,
+          route.chat,
+          msg.content,
+          msg.userId,
+        );
       }
     } catch (err) {
       this.logger.error(hasMedia ? "sendMedia failed" : "sendText failed", err);
+    }
+  }
+
+  async onDelta(delta: AgentDelta): Promise<void> {
+    const handler = this.platform.onAgentDelta;
+    if (!handler) {
+      // No streaming surface — keep the typing indicator alive so the
+      // user sees ongoing activity while the agent produces deltas.
+      this.bumpTypingSafety(delta.userId);
+      return;
+    }
+    const route = this.route(delta.userId);
+    if (!route) {
+      this.logger.debug("delta for unknown user; dropping", delta.userId);
+      return;
+    }
+    // Streaming UI replaces typing — cancel the indicator so we don't
+    // double-up and so a wedged typing session can't outlive the turn.
+    this.cancelTyping(delta.userId);
+    try {
+      await handler.call(
+        this.platform,
+        route.handle,
+        route.chat,
+        delta.userId,
+        delta.text,
+      );
+    } catch (err) {
+      this.logger.debug("onAgentDelta failed", err);
     }
   }
 
@@ -568,6 +645,7 @@ export class BotChannel<BotHandle, ChatId>
           route.handle,
           route.chat,
           `${prefix} ${notice.text}`,
+          notice.userId,
         );
       }
     } catch (err) {
@@ -832,6 +910,17 @@ export class BotChannel<BotHandle, ChatId>
     }
     // Agent is alive — proven by this outbound. Reset the quiet-time
     // cap so the ticker can keep going through the rest of the queue.
+    clearTimeout(session.safety);
+    session.safety = setTimeout(
+      () => this.cancelTyping(userId),
+      this.typingSafetyMs,
+    );
+    session.safety.unref?.();
+  }
+
+  private bumpTypingSafety(userId: string): void {
+    const session = this.typingSessions.get(userId);
+    if (session === undefined) return;
     clearTimeout(session.safety);
     session.safety = setTimeout(
       () => this.cancelTyping(userId),
