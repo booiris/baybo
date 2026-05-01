@@ -473,9 +473,10 @@ mod tests {
                         let _ = server_out_tx.send(serde_json::to_vec(&resp).unwrap()).await;
                     }
                     "tools/call" => {
-                        // Echo back both `_meta` keys so the
-                        // assertion below proves the slice 2A → 2E
-                        // → 2F injection lands at the server.
+                        // Echo back all three `_meta` keys so the
+                        // assertion below proves the slice
+                        // 2A → 2E → 2F → 3.6 injection lands at
+                        // the server.
                         let id = v["id"].clone();
                         let session_meta = v["params"]["_meta"]["auraSessionId"]
                             .as_str()
@@ -485,11 +486,15 @@ mod tests {
                             .as_str()
                             .unwrap_or("<missing>")
                             .to_string();
+                        let user_meta = v["params"]["_meta"]["auraUserId"]
+                            .as_str()
+                            .unwrap_or("<missing>")
+                            .to_string();
                         let resp = serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": {
-                                "content": [{ "type": "text", "text": format!("session={session_meta} bot={bot_meta}") }]
+                                "content": [{ "type": "text", "text": format!("session={session_meta} bot={bot_meta} user={user_meta}") }]
                             }
                         });
                         let _ = server_out_tx.send(serde_json::to_vec(&resp).unwrap()).await;
@@ -517,6 +522,7 @@ mod tests {
         let meta = crate::mcp::CallToolMeta {
             aura_session_id: Some("aura-session-42"),
             aura_bot_id: Some("cli_bot_xyz"),
+            aura_user_id: Some("lark_cli_bot_xyz_oc_demo_ou_alice"),
         };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -527,7 +533,10 @@ mod tests {
         .expect("call_tool ok");
         match result {
             ToolOutput::Text(t) => {
-                assert_eq!(t, "session=aura-session-42 bot=cli_bot_xyz");
+                assert_eq!(
+                    t,
+                    "session=aura-session-42 bot=cli_bot_xyz user=lark_cli_bot_xyz_oc_demo_ou_alice"
+                );
             }
             other => panic!("expected Text, got {other:?}"),
         }

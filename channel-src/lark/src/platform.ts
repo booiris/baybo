@@ -74,6 +74,29 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
   // chat — those collisions are correct (interleaving cards would be
   // worse).
   private readonly streams = new Map<string, LarkStreamingSession>();
+  // `auraUserId → { botId, chatId, platformUserId }` cache populated
+  // from each inbound dispatch. The MCP `feishu_ask_user` tool reads
+  // it via `_meta.auraUserId` to figure out which Lark conversation
+  // the agent is replying in — the auraUserId encodes chat + user but
+  // chat ids contain underscores, so a string-decode would be
+  // fragile. The map is the source of truth.
+  private readonly contextByAuraUser = new Map<
+    string,
+    { botId: string; chatId: string; platformUserId: string }
+  >();
+  // One-shot `feishu_ask_user` waiters keyed by
+  // `${botId}|${chatId}|${platformUserId}` — the next inbound from
+  // that thread fulfils the waiter and is NOT forwarded to the
+  // agent (it's the answer to the agent's tool call, not a new
+  // user turn).
+  private readonly pendingQuestions = new Map<
+    string,
+    {
+      resolve: (text: string) => void;
+      reject: (err: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
 
   constructor(
     private readonly logger: Logger,
@@ -105,6 +128,78 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
         if (handles.length === 1) return { kind: "ok", channel: handles[0]! };
         return { kind: "ambiguous", bot_count: handles.length };
       },
+      askUser: (input, prompt, timeoutMs) =>
+        this.askUser(input, prompt, timeoutMs),
+    });
+  }
+
+  /**
+   * Send `prompt` into the conversation we last saw `auraUserId` reply
+   * on, then await the user's next message in that thread.
+   *
+   * Returns the reply text on success, `null` on timeout. The next
+   * inbound matching `(botId, chatId, platformUserId)` is intercepted
+   * in `dispatchInbound` before it would otherwise reach the agent
+   * loop — answering an agent's tool call must NOT also fire a fresh
+   * user turn (the agent would then see the answer twice and could
+   * loop on the same question).
+   */
+  async askUser(
+    input: { auraUserId?: string; auraBotId?: string },
+    prompt: string,
+    timeoutMs: number,
+  ): Promise<{ kind: "ok"; text: string } | { kind: "no_context" } | { kind: "timeout" }> {
+    if (!input.auraUserId) return { kind: "no_context" };
+    const ctx = this.contextByAuraUser.get(input.auraUserId);
+    if (!ctx) return { kind: "no_context" };
+    // Belt-and-braces: if the call carries an explicit auraBotId,
+    // make sure it matches the cached context. Mismatch likely means
+    // the caller (LLM-supplied tool args) crossed wires; fail safe.
+    if (input.auraBotId && input.auraBotId !== ctx.botId) {
+      return { kind: "no_context" };
+    }
+    const state = this.bots.get(ctx.botId);
+    if (!state) return { kind: "no_context" };
+
+    const key = `${ctx.botId}|${ctx.chatId}|${ctx.platformUserId}`;
+    // A second concurrent ask_user against the same thread would
+    // race on the next inbound; the older one is replaced. The
+    // displaced waiter's reject lets the older tool call surface
+    // a clean "superseded" error rather than hanging forever.
+    const existing = this.pendingQuestions.get(key);
+    if (existing) {
+      clearTimeout(existing.timer);
+      existing.reject(
+        new Error("feishu_ask_user superseded by a concurrent call to the same thread"),
+      );
+      this.pendingQuestions.delete(key);
+    }
+
+    try {
+      await state.handle.send(ctx.chatId, { text: prompt });
+    } catch (err) {
+      this.logger.warn(
+        `feishu_ask_user prompt send failed bot=${ctx.botId} chat=${ctx.chatId}: ${String(err)}`,
+      );
+      return { kind: "timeout" };
+    }
+
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingQuestions.delete(key);
+        resolve({ kind: "timeout" });
+      }, timeoutMs);
+      this.pendingQuestions.set(key, {
+        resolve: (text) => {
+          clearTimeout(timer);
+          resolve({ kind: "ok", text });
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+        timer,
+      });
     });
   }
 
@@ -395,6 +490,31 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       address,
       platformUserId,
     );
+
+    // Record the conversation context BEFORE the pending-question
+    // intercept. A reply that fulfils a `feishu_ask_user` waiter
+    // should still update the cache so a follow-up `feishu_ask_user`
+    // against the same auraUserId resolves to the same chat.
+    this.contextByAuraUser.set(auraUserId, {
+      botId,
+      chatId: msg.chatId,
+      platformUserId,
+    });
+
+    // `feishu_ask_user` intercept: if the agent fired an
+    // ask-user tool call against this thread and is still
+    // awaiting a reply, this inbound IS the reply — fulfil the
+    // waiter and skip the normal forward to the gateway. Without
+    // the early return the agent would see the same answer twice
+    // (once as the tool result, once as a new user turn).
+    const askKey = `${botId}|${msg.chatId}|${platformUserId}`;
+    const waiter = this.pendingQuestions.get(askKey);
+    if (waiter) {
+      this.pendingQuestions.delete(askKey);
+      const text = cleanInboundContent(msg.content, msg.mentions) ?? "";
+      waiter.resolve(text);
+      return;
+    }
 
     // Sequentially download up to MAX_ATTACHMENTS_PER_MESSAGE
     // resources. Concurrent downloads were attractive but each helper

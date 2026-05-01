@@ -14,13 +14,20 @@ import { TunnelMcpTransport } from "./transport.js";
  *   right tenant directly.
  * - `auraSessionId`: Aura session id, mostly for traceability. Could
  *   feed a sidecar-side session→bot lookup if we ever need one.
+ * - `auraUserId`: composed Aura user id
+ *   (`<channel>_<bot>_<chatKey>_<userId>`). Tools that need to reach
+ *   back into the platform conversation (e.g. `feishu_ask_user`)
+ *   look this up against a sidecar-local cache that
+ *   `LarkPlatform.dispatchInbound` populates from each inbound
+ *   message.
  *
- * Both are optional — TUI / HTTP sessions don't ride a sidecar bot,
- * so the resolver still needs the slice 2A fallback (single-bot
- * `ok`, multi-bot `ambiguous`). */
+ * All optional — TUI / HTTP sessions don't ride a sidecar bot, so
+ * the resolver still needs the slice 2A fallback (single-bot `ok`,
+ * multi-bot `ambiguous`). */
 export interface LarkResolverInput {
   auraBotId?: string;
   auraSessionId?: string;
+  auraUserId?: string;
 }
 
 /** Result of resolving which `LarkChannel` an MCP tool call should
@@ -37,9 +44,29 @@ export type LarkChannelResolver = (
   input: LarkResolverInput,
 ) => LarkChannelResolution;
 
+export interface LarkAskUserResult {
+  kind: "ok" | "no_context" | "timeout";
+  text?: string;
+}
+
+export type LarkAskUserHandler = (
+  input: LarkResolverInput,
+  prompt: string,
+  timeoutMs: number,
+) => Promise<LarkAskUserResult>;
+
 export interface LarkMcpServerOpts {
   logger: Logger;
   channelResolver: LarkChannelResolver;
+  /**
+   * Implementation of `feishu_ask_user`. Sends the prompt into the
+   * Lark conversation associated with `_meta.auraUserId` and waits
+   * for the user's reply (or a timeout). Splits out so this module
+   * doesn't reach into platform-side state directly. Optional —
+   * tests that don't exercise ask-user can omit it; the default
+   * surfaces `no_context` so the tool still returns a clean error.
+   */
+  askUser?: LarkAskUserHandler;
 }
 
 interface TunnelSession {
@@ -122,16 +149,7 @@ export class LarkMcpServer {
         },
       },
       async (args, extra) => {
-        const meta = extra?._meta as
-          | { auraBotId?: unknown; auraSessionId?: unknown }
-          | undefined;
-        const input: LarkResolverInput = {};
-        if (typeof meta?.auraBotId === "string") {
-          input.auraBotId = meta.auraBotId;
-        }
-        if (typeof meta?.auraSessionId === "string") {
-          input.auraSessionId = meta.auraSessionId;
-        }
+        const input = extractResolverInput(extra);
         const resolution = this.opts.channelResolver(input);
         if (resolution.kind === "none") {
           return toolError(
@@ -164,7 +182,66 @@ export class LarkMcpServer {
         }
       },
     );
+
+    server.registerTool(
+      "feishu_ask_user",
+      {
+        title: "Ask the user a follow-up question",
+        description:
+          "Send a question into the same Feishu chat the user reached you through, then wait up to `timeout_seconds` for their next message and return its text. Use sparingly — only when the user must clarify something the agent cannot infer or look up. Times out cleanly if the user doesn't reply, in which case you should fall back to a best-effort answer instead of asking again.",
+        inputSchema: {
+          prompt: z
+            .string()
+            .min(1)
+            .describe(
+              "The question to send. Be concise — Feishu chats are conversational, so favour a single sentence over a multi-paragraph wall.",
+            ),
+          timeout_seconds: z
+            .number()
+            .int()
+            .min(5)
+            .max(900)
+            .optional()
+            .describe(
+              "Seconds to wait for a reply before timing out. Defaults to 300 (5 minutes); cap is 900 (15 minutes) so the agent loop doesn't pin a per-session actor for hours.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const input = extractResolverInput(extra);
+        const timeoutMs = (args.timeout_seconds ?? 300) * 1000;
+        const askUser =
+          this.opts.askUser ??
+          (async () => ({ kind: "no_context" as const }));
+        const result = await askUser(input, args.prompt, timeoutMs);
+        if (result.kind === "no_context") {
+          return toolError(
+            "feishu_ask_user has no Lark conversation to send the prompt into for this session — the agent must have processed at least one inbound Feishu message before it can ask back",
+          );
+        }
+        if (result.kind === "timeout") {
+          return toolError(
+            `feishu_ask_user timed out after ${args.timeout_seconds ?? 300}s with no reply; proceed with a best-effort answer instead of retrying`,
+          );
+        }
+        return {
+          content: [{ type: "text", text: result.text ?? "" }],
+        };
+      },
+    );
   }
+}
+
+function extractResolverInput(extra: unknown): LarkResolverInput {
+  const meta = (extra as { _meta?: unknown } | undefined)?._meta;
+  const m = meta as
+    | { auraBotId?: unknown; auraSessionId?: unknown; auraUserId?: unknown }
+    | undefined;
+  const input: LarkResolverInput = {};
+  if (typeof m?.auraBotId === "string") input.auraBotId = m.auraBotId;
+  if (typeof m?.auraSessionId === "string") input.auraSessionId = m.auraSessionId;
+  if (typeof m?.auraUserId === "string") input.auraUserId = m.auraUserId;
+  return input;
 }
 
 function toolError(message: string): {

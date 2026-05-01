@@ -104,9 +104,8 @@ test("LarkMcpServer: tools/list advertises feishu_get_chat_info", async () => {
   const last = decodeJson(reply.sent[reply.sent.length - 1]);
   assert.equal(last.id, 2);
   assert.ok(last.result, `expected result, got ${JSON.stringify(last)}`);
-  const tools = last.result.tools;
-  assert.equal(tools.length, 1);
-  assert.equal(tools[0].name, "feishu_get_chat_info");
+  const toolNames = last.result.tools.map((t) => t.name).sort();
+  assert.deepEqual(toolNames, ["feishu_ask_user", "feishu_get_chat_info"]);
   // tools/list never resolves a channel — the resolver only fires on
   // tools/call.
   assert.equal(resolverCalls, 0);
@@ -325,6 +324,125 @@ test("LarkMcpServer: tools/call routes by _meta.auraBotId in multi-bot mode", as
   assert.equal(last.result.isError, undefined);
   const parsed = JSON.parse(last.result.content[0].text);
   assert.equal(parsed.name, "BotB-tenant");
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_ask_user without configured handler surfaces no_context", async () => {
+  // The default opts (no askUser) returns no_context so the test
+  // path stays clean. Production wires LarkPlatform.askUser.
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({ kind: "none" }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-ask-default",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: {
+        name: "feishu_ask_user",
+        arguments: { prompt: "what's your favourite color?" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "ask_user no_context reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 11);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /no Lark conversation/);
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_ask_user routes prompt + auraUserId to askUser handler", async () => {
+  let captured = null;
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({ kind: "none" }),
+    askUser: async (input, prompt, timeoutMs) => {
+      captured = { input, prompt, timeoutMs };
+      return { kind: "ok", text: "blue" };
+    },
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-ask-ok",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: {
+        name: "feishu_ask_user",
+        arguments: {
+          prompt: "what's your favourite color?",
+          timeout_seconds: 60,
+        },
+        _meta: {
+          auraUserId: "lark_cli_a_oc_demo_ou_alice",
+          auraBotId: "cli_a",
+          auraSessionId: "sess-1",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "ask_user reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 12);
+  assert.equal(last.result.isError, undefined);
+  assert.equal(last.result.content[0].text, "blue");
+  assert.deepEqual(captured.input, {
+    auraBotId: "cli_a",
+    auraSessionId: "sess-1",
+    auraUserId: "lark_cli_a_oc_demo_ou_alice",
+  });
+  assert.equal(captured.prompt, "what's your favourite color?");
+  assert.equal(captured.timeoutMs, 60_000);
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_ask_user timeout surfaces structured tool error", async () => {
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({ kind: "none" }),
+    askUser: async () => ({ kind: "timeout" }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-ask-timeout",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 13,
+      method: "tools/call",
+      params: {
+        name: "feishu_ask_user",
+        arguments: { prompt: "still there?", timeout_seconds: 30 },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "ask_user timeout reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 13);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /timed out after 30s/);
 
   await server.shutdown();
 });

@@ -67,9 +67,9 @@ impl McpServerSession {
 }
 
 /// Aura-internal MCP `_meta` keys passed with each `tools/call`.
-/// Both fields are optional — user-configured MCP servers (stdio,
-/// HTTP) typically don't care, but sidecar-hosted servers consume
-/// them for cross-tenant routing.
+/// All three fields are optional — user-configured MCP servers
+/// (stdio, HTTP) typically don't care, but sidecar-hosted servers
+/// consume them for cross-tenant routing and conversation context.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CallToolMeta<'a> {
     /// Aura session id. Lands at `_meta.auraSessionId`. Useful for
@@ -82,6 +82,13 @@ pub struct CallToolMeta<'a> {
     /// instead of falling back to slice 2A's structured "ambiguous"
     /// error.
     pub aura_bot_id: Option<&'a str>,
+    /// Composed Aura user id (`<channel>_<bot>_<chatKey>_<userId>`).
+    /// Lands at `_meta.auraUserId`. Sidecar tools that need to
+    /// reach back to the platform conversation (e.g. `feishu_ask_user`)
+    /// look this up against a sidecar-local cache populated from
+    /// inbound messages — the user id encodes which chat + platform
+    /// user the message originated from.
+    pub aura_user_id: Option<&'a str>,
 }
 
 /// Invoke a tool on an already-connected rmcp peer.
@@ -111,7 +118,10 @@ pub async fn call_tool_via_peer(
     if let Some(args) = arguments {
         request = request.with_arguments(args);
     }
-    if meta.aura_session_id.is_some() || meta.aura_bot_id.is_some() {
+    if meta.aura_session_id.is_some()
+        || meta.aura_bot_id.is_some()
+        || meta.aura_user_id.is_some()
+    {
         let mut rmcp_meta = Meta::new();
         if let Some(id) = meta.aura_session_id {
             rmcp_meta
@@ -122,6 +132,11 @@ pub async fn call_tool_via_peer(
             rmcp_meta
                 .0
                 .insert("auraBotId".into(), Value::String(id.to_string()));
+        }
+        if let Some(id) = meta.aura_user_id {
+            rmcp_meta
+                .0
+                .insert("auraUserId".into(), Value::String(id.to_string()));
         }
         request.meta = Some(rmcp_meta);
     }

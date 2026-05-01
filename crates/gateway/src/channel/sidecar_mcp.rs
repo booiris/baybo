@@ -212,6 +212,7 @@ impl SidecarMcpProvider for SidecarMcpManager {
         let meta = aura_tools::mcp::CallToolMeta {
             aura_session_id: Some(session.id.as_str()),
             aura_bot_id: session.user.bot_id.as_deref(),
+            aura_user_id: Some(session.user.id.as_str()),
         };
         Some(
             aura_tools::mcp::call_tool_via_peer(&peer, inner_name, params, meta)
