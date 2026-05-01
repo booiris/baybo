@@ -36,6 +36,14 @@ use crate::tool_executor::ToolExecutor;
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
 
+/// Hard timeout on sidecar MCP `tools/call` round-trips. Most calls
+/// complete in well under a second; this bound keeps a hung rmcp peer
+/// (sidecar process stuck, network partition, server-side deadlock)
+/// from pinning the per-session actor indefinitely. Tighter than the
+/// local `ToolExecutor::default_timeout` because remote queries
+/// shouldn't take longer than a single HTTP round-trip.
+const SIDECAR_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Cap on the byte length of `params_preview` / `result_preview` carried
 /// in `AgentOutput::ToolCall*` telemetry. The agent's own context-side
 /// `cap_tool_output` is megabytes — way too much to fan out per-frame
@@ -428,39 +436,46 @@ impl AgentLoop {
 
                 // Sidecar MCP tools (e.g. `lark/feishu_get_chat_info`)
                 // are not in the local `ToolRegistry` — they live
-                // behind the channel sidecar's MCP server. The
-                // provider claims the call when the name has a
-                // matching `<channel_type>/` prefix and the
-                // sidecar is connected; otherwise it returns
-                // `None` and we fall through to the local
-                // executor. Sidecar dispatch bypasses the
-                // approval gate / sandbox by design — the call
-                // is a remote query against an already-trusted
-                // tenant API, not a local resource access.
-                let sidecar_dispatch = self
+                // behind the channel sidecar's MCP server. Approval
+                // gate + local sandbox don't apply (the call is a
+                // remote query against an already-trusted tenant
+                // API, not a local resource access), but we still
+                // need the rest of the security pipeline:
+                //   * `reveal_in_value` so placeholder secrets in
+                //     params expand to plaintext for the remote API,
+                //   * a hard timeout so a hung rmcp peer can't pin
+                //     the actor,
+                //   * `sanitize_tool_output` so a remote response
+                //     containing a leaked secret gets minted into a
+                //     placeholder before it reaches the LLM context
+                //     or session log,
+                //   * an observability span so the call shows up in
+                //     traces alongside local tool executions.
+                let claims = self
                     .sidecar_mcp
-                    .execute_for_session(
+                    .claims_tool(session, &tool_call.name)
+                    .await;
+                let tool_result: anyhow::Result<ToolOutput> = if claims {
+                    self.dispatch_sidecar_tool(
                         session,
                         &tool_call.name,
                         tool_call.arguments.clone(),
+                        recorder,
+                        parent_job_id,
                     )
-                    .await;
-                let tool_result: anyhow::Result<ToolOutput> = match sidecar_dispatch {
-                    Some(Ok(output)) => Ok(output),
-                    Some(Err(reason)) => Ok(ToolOutput::Error(reason)),
-                    None => {
-                        self.tool_executor
-                            .execute(
-                                &tool_call.name,
-                                tool_call.arguments.clone(),
-                                &session.id,
-                                &session.user,
-                                &approved,
-                                recorder,
-                                parent_job_id,
-                            )
-                            .await
-                    }
+                    .await
+                } else {
+                    self.tool_executor
+                        .execute(
+                            &tool_call.name,
+                            tool_call.arguments.clone(),
+                            &session.id,
+                            &session.user,
+                            &approved,
+                            recorder,
+                            parent_job_id,
+                        )
+                        .await
                 };
 
                 // Classify the outcome for telemetry before consuming
@@ -581,6 +596,109 @@ impl AgentLoop {
             reply_to: None,
             metadata: Default::default(),
         })
+    }
+
+    /// Dispatch a tool call the sidecar MCP provider has claimed.
+    ///
+    /// Mirrors the security pipeline `ToolExecutor::execute` applies
+    /// to local tools — minus approval gate / sandbox / trust gate
+    /// (sidecar tools are remote tenant-API queries, not local
+    /// resource accesses):
+    ///
+    ///  * `reveal_in_value` on params so placeholder-form secrets
+    ///    expand to plaintext before they ride the rmcp wire.
+    ///  * Observability span via `recorder.begin/succeed/fail` so
+    ///    sidecar tool calls show up in traces alongside local
+    ///    tool executions, with proper elapsed-time accounting.
+    ///  * Hard `SIDECAR_MCP_TIMEOUT` on the rmcp round-trip so a
+    ///    hung peer can't pin the per-session actor.
+    ///  * `sanitize_tool_output` on the result so any secret-looking
+    ///    bytes the remote API returned get minted into placeholders
+    ///    before they reach the LLM context, session log, or
+    ///    telemetry preview.
+    async fn dispatch_sidecar_tool(
+        &self,
+        session: &Session,
+        tool_name: &str,
+        params: Value,
+        recorder: &ObservabilityRecorder,
+        parent_job_id: Option<&str>,
+    ) -> anyhow::Result<ToolOutput> {
+        // Begin the observability span first so denial / timeout
+        // failures still appear in the trace.
+        let handle = recorder
+            .begin(
+                &session.id,
+                OperationKind::ToolExecution {
+                    tool_name: tool_name.to_string(),
+                },
+                parent_job_id,
+                ExecutionProvenance::default(),
+                SpanInput::ToolExecution {
+                    parameters: params.clone(),
+                },
+            )
+            .await?;
+
+        // Reveal placeholders so the remote API receives plaintext.
+        // The pre-reveal `params` was captured in the span input
+        // above; the trace surface keeps placeholder form.
+        let mut params_revealed = params;
+        if let Err(e) = self
+            .security_gateway
+            .reveal_in_value(&mut params_revealed)
+            .await
+        {
+            recorder.fail(handle, &format!("reveal_in_value: {e}")).await?;
+            return Err(e.into());
+        }
+
+        let dispatch_fut = self.sidecar_mcp.execute_for_session(
+            session,
+            tool_name,
+            params_revealed,
+        );
+
+        let started = std::time::Instant::now();
+        let dispatch_result = match tokio::time::timeout(SIDECAR_MCP_TIMEOUT, dispatch_fut).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                let msg = format!(
+                    "sidecar mcp call timed out after {SIDECAR_MCP_TIMEOUT:?}"
+                );
+                recorder.fail(handle, &msg).await?;
+                return Ok(ToolOutput::Error(msg));
+            }
+        };
+        let elapsed = started.elapsed();
+
+        // claims_tool returned true, so dispatch returning None is
+        // a race (sidecar disconnected mid-call). Surface as an
+        // error rather than falling through to local — the tool
+        // doesn't exist locally either.
+        let mut output = match dispatch_result {
+            Some(Ok(out)) => out,
+            Some(Err(reason)) => ToolOutput::Error(reason),
+            None => ToolOutput::Error(
+                "sidecar mcp: tool was claimed at preflight but unavailable at dispatch \
+                 (sidecar likely disconnected); retry on next turn"
+                    .to_string(),
+            ),
+        };
+
+        if let Err(e) = self.security_gateway.sanitize_tool_output(&mut output).await {
+            warn!(error = %e, tool = tool_name, "sidecar mcp: sanitize_tool_output failed");
+        }
+
+        let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
+        let span_result = SpanResult::ToolResult {
+            output: output_value.clone(),
+            success: !matches!(output, ToolOutput::Error(_)),
+            latency: elapsed,
+        };
+        recorder.succeed(handle, output_value, span_result).await?;
+
+        Ok(output)
     }
 
     /// Call the LLM with retry on transient errors using `ErrorHandler`.

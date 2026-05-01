@@ -162,6 +162,20 @@ impl SidecarMcpProvider for SidecarMcpManager {
             .unwrap_or_default()
     }
 
+    async fn claims_tool(&self, session: &Session, name: &str) -> bool {
+        let channel_type = &session.user.channel;
+        let prefix = format!("{channel_type}/");
+        if !name.starts_with(&prefix) {
+            return false;
+        }
+        let Some(slot) = self.sessions.get(channel_type) else {
+            return false;
+        };
+        let slot = slot.value().clone();
+        let guard = slot.lock().await;
+        guard.is_some()
+    }
+
     async fn execute_for_session(
         &self,
         session: &Session,
@@ -301,6 +315,33 @@ mod tests {
         // sessions map carrying exactly one slot.
         manager.attach(ct.clone());
         assert_eq!(manager.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn claims_tool_matches_provider_preflight_contract() {
+        // The agent loop relies on this: if claims_tool returns true,
+        // execute_for_session must claim the call (and vice versa)
+        // so the security pipeline wraps every claimed dispatch.
+        let control = Arc::new(ChannelControlRegistry::new());
+        let router = Arc::new(McpTunnelRouter::new(control));
+        let manager = Arc::new(SidecarMcpManager::new(router));
+
+        let session = dummy_session(ChannelType::from("lark"));
+        // Not attached: claims_tool false, execute None.
+        assert!(!manager.claims_tool(&session, "lark/feishu_get_chat_info").await);
+        assert!(
+            manager
+                .execute_for_session(&session, "lark/feishu_get_chat_info", serde_json::json!({}))
+                .await
+                .is_none()
+        );
+
+        // Wrong-channel prefix: false even when its slot would be
+        // populated. We can't populate without a real handshake, but
+        // the prefix check runs first, so the result is the same.
+        manager.attach(ChannelType::from("lark"));
+        assert!(!manager.claims_tool(&session, "weixin/anything").await);
+        assert!(!manager.claims_tool(&session, "no_prefix_at_all").await);
     }
 
     #[tokio::test]

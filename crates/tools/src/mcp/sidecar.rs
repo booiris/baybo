@@ -141,6 +141,15 @@ pub trait SidecarMcpProvider: Send + Sync {
     /// builtins or user-configured MCP tools.
     async fn tool_definitions_for_session(&self, session: &Session) -> Vec<ToolDefinition>;
 
+    /// Cheap preflight: would [`Self::execute_for_session`] claim a
+    /// call to `name` for `session`? Used by the agent loop to decide
+    /// whether to begin an observability span and apply the timeout
+    /// + sanitize pipeline before invoking dispatch — calling
+    /// `execute_for_session` and getting `None` back leaves the span
+    /// stranded. Implementations must keep this side-effect-free
+    /// (no rmcp round-trip) — a cache lookup at most.
+    async fn claims_tool(&self, session: &Session, name: &str) -> bool;
+
     /// Dispatch a tool call to the sidecar's MCP server.
     ///
     /// Return value:
@@ -178,6 +187,10 @@ pub struct NoSidecarMcp;
 impl SidecarMcpProvider for NoSidecarMcp {
     async fn tool_definitions_for_session(&self, _session: &Session) -> Vec<ToolDefinition> {
         Vec::new()
+    }
+
+    async fn claims_tool(&self, _session: &Session, _name: &str) -> bool {
+        false
     }
 
     async fn execute_for_session(
@@ -246,6 +259,10 @@ mod tests {
                     description: "stub".into(),
                     parameters_schema: serde_json::json!({"type": "object"}),
                 }]
+            }
+
+            async fn claims_tool(&self, session: &Session, name: &str) -> bool {
+                name.starts_with(&format!("{}/", session.user.channel))
             }
 
             async fn execute_for_session(
