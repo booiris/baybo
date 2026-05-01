@@ -29,10 +29,11 @@ use async_trait::async_trait;
 use aura_model::Session;
 use rmcp::service::{RoleClient, RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::ToolDefinition;
+use crate::{ToolDefinition, ToolOutput};
 
 #[derive(Debug, Error)]
 pub enum SidecarTransportError {
@@ -139,18 +140,53 @@ pub trait SidecarMcpProvider: Send + Sync {
     /// `lark/feishu_get_chat_info`) to avoid collisions with
     /// builtins or user-configured MCP tools.
     async fn tool_definitions_for_session(&self, session: &Session) -> Vec<ToolDefinition>;
+
+    /// Dispatch a tool call to the sidecar's MCP server.
+    ///
+    /// Return value:
+    ///  * `None` — `name` is not a sidecar tool for this session
+    ///    (different channel prefix, no matching cached session).
+    ///    The caller should fall back to the local `ToolRegistry`
+    ///    dispatch path.
+    ///  * `Some(Ok(output))` — the rmcp call returned a successful
+    ///    `CallToolResult`.
+    ///  * `Some(Err(reason))` — the rmcp call surfaced an error
+    ///    (transport failure, server-side `isError`, schema
+    ///    mismatch). `reason` is a sanitized diagnostic suitable
+    ///    for the LLM's tool-result message.
+    ///
+    /// The session id is forwarded through `_meta.auraSessionId`
+    /// on the underlying rmcp request so the sidecar can route to
+    /// the right tenant in multi-bot deployments. (Slice 2A's
+    /// structured tool error remains the safety net until sidecars
+    /// implement the session→bot lookup.)
+    async fn execute_for_session(
+        &self,
+        session: &Session,
+        name: &str,
+        params: Value,
+    ) -> Option<Result<ToolOutput, String>>;
 }
 
 /// No-op provider: the AgentLoop default when no sidecar MCP is
 /// wired in (TUI standalone, tests, gateway boots without any
-/// `mcp_tunnel`-capable sidecar). Returns an empty tool list for
-/// every session.
+/// `mcp_tunnel`-capable sidecar). Returns an empty tool list and
+/// claims no tool dispatches.
 pub struct NoSidecarMcp;
 
 #[async_trait]
 impl SidecarMcpProvider for NoSidecarMcp {
     async fn tool_definitions_for_session(&self, _session: &Session) -> Vec<ToolDefinition> {
         Vec::new()
+    }
+
+    async fn execute_for_session(
+        &self,
+        _session: &Session,
+        _name: &str,
+        _params: Value,
+    ) -> Option<Result<ToolOutput, String>> {
+        None
     }
 }
 
@@ -181,20 +217,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_sidecar_mcp_returns_empty() {
+    async fn no_sidecar_mcp_returns_empty_and_does_not_dispatch() {
         let p = NoSidecarMcp;
         let session = dummy_session();
         assert!(
             p.tool_definitions_for_session(&session).await.is_empty(),
             "no-op provider must return zero tools"
         );
+        assert!(
+            p.execute_for_session(&session, "anything", Value::Null)
+                .await
+                .is_none(),
+            "no-op provider must yield None so caller falls back to local tools"
+        );
     }
 
     #[tokio::test]
-    async fn provider_can_return_session_scoped_tools() {
-        // Stub provider that mimics what the gateway-side
-        // SidecarMcpManager will eventually do: return a tool with
-        // a `<channel_type>/<tool_name>` prefix.
+    async fn provider_can_return_session_scoped_tools_and_dispatch() {
         struct Stub;
         #[async_trait]
         impl SidecarMcpProvider for Stub {
@@ -208,6 +247,20 @@ mod tests {
                     parameters_schema: serde_json::json!({"type": "object"}),
                 }]
             }
+
+            async fn execute_for_session(
+                &self,
+                session: &Session,
+                name: &str,
+                _params: Value,
+            ) -> Option<Result<ToolOutput, String>> {
+                let prefix = format!("{}/", session.user.channel);
+                if name.starts_with(&prefix) {
+                    Some(Ok(ToolOutput::Text(format!("called {name}"))))
+                } else {
+                    None
+                }
+            }
         }
 
         let p: Arc<dyn SidecarMcpProvider> = Arc::new(Stub);
@@ -215,6 +268,22 @@ mod tests {
         let tools = p.tool_definitions_for_session(&session).await;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "tui/feishu_get_chat_info");
+
+        match p
+            .execute_for_session(&session, "tui/feishu_get_chat_info", Value::Null)
+            .await
+        {
+            Some(Ok(ToolOutput::Text(t))) => {
+                assert_eq!(t, "called tui/feishu_get_chat_info");
+            }
+            other => panic!("expected Some(Ok(Text)), got {other:?}"),
+        }
+        assert!(
+            p.execute_for_session(&session, "lark/feishu_get_chat_info", Value::Null)
+                .await
+                .is_none(),
+            "wrong-channel prefix must yield None for fallback dispatch",
+        );
     }
 
     struct CapturingSender {
@@ -323,10 +392,9 @@ mod tests {
 
     /// Wire `connect_sidecar` against a fake MCP server running over
     /// the byte-pipe. The server replies to `initialize` + `tools/list`
-    /// and we verify the resulting `McpServerSession` exposes the
-    /// advertised tools. Belongs alongside the transport tests
-    /// because it covers `connect_sidecar` end-to-end without the
-    /// gateway crate.
+    /// + `tools/call` and we verify the resulting `McpServerSession`
+    /// can list and dispatch. The tools/call branch also asserts the
+    /// `_meta.auraSessionId` injection lands at the server.
     #[tokio::test]
     async fn connect_sidecar_round_trips_initialize_and_tools_list() {
         use crate::mcp::transport::connect_sidecar;
@@ -386,6 +454,25 @@ mod tests {
                         });
                         let _ = server_out_tx.send(serde_json::to_vec(&resp).unwrap()).await;
                     }
+                    "tools/call" => {
+                        // Echo the inbound `_meta.auraSessionId` back
+                        // through the result text so the assertion
+                        // below proves the slice 2A → 2E injection
+                        // actually lands at the server.
+                        let id = v["id"].clone();
+                        let session_meta = v["params"]["_meta"]["auraSessionId"]
+                            .as_str()
+                            .unwrap_or("<missing>")
+                            .to_string();
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": format!("session={session_meta}") }]
+                            }
+                        });
+                        let _ = server_out_tx.send(serde_json::to_vec(&resp).unwrap()).await;
+                    }
                     _ => { /* ignore */ }
                 }
             }
@@ -403,6 +490,20 @@ mod tests {
         let tools = session.tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "stub_tool");
+
+        // Dispatch a tools/call with a session id and assert the
+        // server saw it on `_meta.auraSessionId`.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.call_tool("stub_tool", serde_json::json!({}), Some("aura-session-42")),
+        )
+        .await
+        .expect("call_tool within 5s")
+        .expect("call_tool ok");
+        match result {
+            ToolOutput::Text(t) => assert_eq!(t, "session=aura-session-42"),
+            other => panic!("expected Text, got {other:?}"),
+        }
 
         session.shutdown().await;
         let _ = server.await;

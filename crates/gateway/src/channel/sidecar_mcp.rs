@@ -161,6 +161,44 @@ impl SidecarMcpProvider for SidecarMcpManager {
             .map(|c| c.tools.clone())
             .unwrap_or_default()
     }
+
+    async fn execute_for_session(
+        &self,
+        session: &Session,
+        name: &str,
+        params: serde_json::Value,
+    ) -> Option<Result<aura_tools::ToolOutput, String>> {
+        let channel_type = session.user.channel.clone();
+        // Only claim names that match the session's channel prefix.
+        // Mismatch falls back to local dispatch.
+        let prefix = format!("{channel_type}/");
+        let inner_name = name.strip_prefix(&prefix)?;
+
+        // Cache lookup. If the channel never attached or the
+        // background handshake hasn't finished yet, fall back to
+        // local dispatch (LLM gets a NotFound — same as if the
+        // sidecar weren't there at all).
+        let slot = self.sessions.get(&channel_type)?.value().clone();
+        // Drop the slot guard before awaiting the rmcp round-trip
+        // so a concurrent `detach` (e.g. sidecar disconnects mid-
+        // call) can run instead of blocking behind us. Clone the
+        // peer-bearing handle out under the guard, then release.
+        let peer_session = {
+            let guard = slot.lock().await;
+            guard.as_ref().map(|c| c.session.peer())
+        };
+        let peer = peer_session?;
+
+        // The auraSessionId meta lets the sidecar map the call
+        // back to a specific bot in multi-bot deployments. Until
+        // the sidecar grows that lookup, slice 2A's
+        // `LarkChannelResolution::ambiguous` still fails closed.
+        Some(
+            aura_tools::mcp::call_tool_via_peer(&peer, inner_name, params, Some(&session.id))
+                .await
+                .map_err(|e| format!("sidecar mcp {name}: {e}")),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +301,52 @@ mod tests {
         // sessions map carrying exactly one slot.
         manager.attach(ct.clone());
         assert_eq!(manager.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_returns_none_for_unrelated_channel_prefix() {
+        // Even when the session's channel is attached and ready,
+        // a tool name with a different channel prefix doesn't
+        // belong to this provider — the agent loop must fall
+        // through to local dispatch.
+        let control = Arc::new(ChannelControlRegistry::new());
+        let router = Arc::new(McpTunnelRouter::new(control));
+        let manager = Arc::new(SidecarMcpManager::new(router));
+        let lark = ChannelType::from("lark");
+        manager.attach(lark.clone());
+
+        let session = dummy_session(lark);
+        // `read_file` has no channel prefix — local builtin name.
+        assert!(
+            manager
+                .execute_for_session(&session, "read_file", serde_json::json!({}))
+                .await
+                .is_none(),
+            "names without a channel prefix must not be claimed",
+        );
+        // `weixin/whatever` is for a different channel.
+        assert!(
+            manager
+                .execute_for_session(&session, "weixin/whatever", serde_json::json!({}))
+                .await
+                .is_none(),
+            "wrong-channel prefix must not be claimed",
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_returns_none_when_no_attach() {
+        let control = Arc::new(ChannelControlRegistry::new());
+        let router = Arc::new(McpTunnelRouter::new(control));
+        let manager = SidecarMcpManager::new(router);
+        let session = dummy_session(ChannelType::from("lark"));
+        assert!(
+            manager
+                .execute_for_session(&session, "lark/feishu_get_chat_info", serde_json::json!({}))
+                .await
+                .is_none(),
+            "no attach => no claim, agent loop falls through to local dispatch"
+        );
     }
 
     #[tokio::test]

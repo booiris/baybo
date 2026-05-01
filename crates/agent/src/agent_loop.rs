@@ -426,18 +426,42 @@ impl AgentLoop {
                 }
                 let tool_call_started = std::time::Instant::now();
 
-                let tool_result = self
-                    .tool_executor
-                    .execute(
+                // Sidecar MCP tools (e.g. `lark/feishu_get_chat_info`)
+                // are not in the local `ToolRegistry` — they live
+                // behind the channel sidecar's MCP server. The
+                // provider claims the call when the name has a
+                // matching `<channel_type>/` prefix and the
+                // sidecar is connected; otherwise it returns
+                // `None` and we fall through to the local
+                // executor. Sidecar dispatch bypasses the
+                // approval gate / sandbox by design — the call
+                // is a remote query against an already-trusted
+                // tenant API, not a local resource access.
+                let sidecar_dispatch = self
+                    .sidecar_mcp
+                    .execute_for_session(
+                        session,
                         &tool_call.name,
                         tool_call.arguments.clone(),
-                        &session.id,
-                        &session.user,
-                        &approved,
-                        recorder,
-                        parent_job_id,
                     )
                     .await;
+                let tool_result: anyhow::Result<ToolOutput> = match sidecar_dispatch {
+                    Some(Ok(output)) => Ok(output),
+                    Some(Err(reason)) => Ok(ToolOutput::Error(reason)),
+                    None => {
+                        self.tool_executor
+                            .execute(
+                                &tool_call.name,
+                                tool_call.arguments.clone(),
+                                &session.id,
+                                &session.user,
+                                &approved,
+                                recorder,
+                                parent_job_id,
+                            )
+                            .await
+                    }
+                };
 
                 // Classify the outcome for telemetry before consuming
                 // the result for the LLM context. Errors / denials feed

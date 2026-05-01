@@ -15,4 +15,4 @@ pub use sidecar::{
     NoSidecarMcp, SidecarMcpProvider, SidecarSender, SidecarTransport, SidecarTransportError,
 };
 pub use tool::McpTool;
-pub use transport::{McpServerSession, connect, connect_sidecar};
+pub use transport::{McpServerSession, call_tool_via_peer, connect, connect_sidecar};

@@ -5,7 +5,9 @@ use std::sync::Arc;
 use aura_security::SecretVault;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
-use rmcp::model::Tool as RmcpTool;
+use rmcp::model::{
+    Annotated, CallToolRequestParams, Meta, RawContent, Tool as RmcpTool,
+};
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::auth::{AuthClient, AuthorizationManager, CredentialStore, OAuthClientConfig};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -16,6 +18,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use crate::ToolOutput;
 use crate::mcp::config::{McpServerEntry, McpTransportConfig};
 use crate::mcp::credentials::VaultCredentialStore;
 use crate::mcp::error::{McpError, McpResult};
@@ -39,6 +42,99 @@ impl McpServerSession {
     pub async fn shutdown(self) {
         let _ = self.running.cancel().await;
     }
+
+    /// Call a tool on the connected MCP server.
+    ///
+    /// `aura_session_id`, when `Some(id)`, is forwarded through
+    /// `_meta.auraSessionId` so a sidecar that hosts a multi-bot
+    /// MCP server can map the call to the right tenant. The
+    /// session id semantics match `aura_model::Session::id`.
+    ///
+    /// `params` is the LLM-supplied JSON. An object becomes the
+    /// rmcp `arguments`; null means "no arguments". Anything else
+    /// is rejected with a typed error string the caller can
+    /// surface as the LLM tool result.
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        params: Value,
+        aura_session_id: Option<&str>,
+    ) -> Result<ToolOutput, String> {
+        call_tool_via_peer(&self.peer(), name, params, aura_session_id).await
+    }
+}
+
+/// Invoke a tool on an already-connected rmcp peer.
+///
+/// Split out from [`McpServerSession::call_tool`] so callers that
+/// hold only a `Peer<RoleClient>` (e.g. the gateway's
+/// `SidecarMcpManager`, which keeps the sidecar's session inside a
+/// channel-keyed cache) can dispatch without exposing the rmcp
+/// types into their own crate.
+pub async fn call_tool_via_peer(
+    peer: &Peer<RoleClient>,
+    name: &str,
+    params: Value,
+    aura_session_id: Option<&str>,
+) -> Result<ToolOutput, String> {
+    let arguments = match params {
+        Value::Object(map) => Some(map),
+        Value::Null => None,
+        other => {
+            return Err(format!(
+                "MCP tool arguments must be a JSON object; got {}",
+                type_name(&other)
+            ));
+        }
+    };
+    let mut request = CallToolRequestParams::new(name.to_string());
+    if let Some(args) = arguments {
+        request = request.with_arguments(args);
+    }
+    if let Some(id) = aura_session_id {
+        let mut meta = Meta::new();
+        meta.0
+            .insert("auraSessionId".into(), Value::String(id.to_string()));
+        request.meta = Some(meta);
+    }
+    let result = peer
+        .call_tool(request)
+        .await
+        .map_err(|e| format!("call_tool {name}: {e}"))?;
+    let text = format_call_result_content(&result.content);
+    if result.is_error.unwrap_or(false) {
+        Ok(ToolOutput::Error(text))
+    } else {
+        Ok(ToolOutput::Text(text))
+    }
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn format_call_result_content(parts: &[Annotated<RawContent>]) -> String {
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match &part.raw {
+            RawContent::Text(t) => out.push_str(&t.text),
+            RawContent::Image(_) => out.push_str("[image content elided]"),
+            RawContent::Audio(_) => out.push_str("[audio content elided]"),
+            RawContent::Resource(_) => out.push_str("[resource content elided]"),
+            RawContent::ResourceLink(_) => out.push_str("[resource link elided]"),
+        }
+    }
+    out
 }
 
 pub async fn connect(
