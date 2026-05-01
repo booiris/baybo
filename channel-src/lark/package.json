@@ -16,7 +16,9 @@
   },
   "dependencies": {
     "@aura/channel-sdk": "workspace:*",
-    "@larksuiteoapi/node-sdk": "^1.60.0"
+    "@larksuiteoapi/node-sdk": "^1.60.0",
+    "@modelcontextprotocol/sdk": "^1.21.0",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

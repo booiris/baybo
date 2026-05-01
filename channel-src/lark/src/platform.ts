@@ -79,15 +79,23 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     private readonly logger: Logger,
     private readonly approvals: LarkApprovals,
   ) {
-    this.mcpServer = new LarkMcpServer({ logger });
+    this.mcpServer = new LarkMcpServer({
+      logger,
+      // Slice 2A picks the first registered bot. Slice 2B routes per
+      // call via `_meta.auraSessionId` from the JSON-RPC envelope.
+      channelResolver: () => {
+        for (const state of this.bots.values()) return state.handle;
+        return null;
+      },
+    });
   }
 
   async onMcpEnvelope(
-    _tunnelId: string,
+    tunnelId: string,
     payload: Uint8Array,
     reply: import("@aura/channel-sdk").McpReplyHandle,
   ): Promise<void> {
-    await this.mcpServer.handle(payload, reply);
+    await this.mcpServer.accept(tunnelId, payload, reply);
   }
 
   async sendText(
