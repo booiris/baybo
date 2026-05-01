@@ -64,6 +64,96 @@
         }
       }
     },
+    "/v1/channels/{channel_type}/diagnose": {
+      "get": {
+        "tags": [
+          "channels"
+        ],
+        "summary": "Round-trip a diagnose self-test against the sidecar serving\n`:channel_type`. The request is gated by the sidecar's advertised\n`\"diagnose\"` capability — sidecars that don't claim it return\nHTTP 501 instead of timing out.",
+        "operationId": "diagnose_channel",
+        "parameters": [
+          {
+            "name": "channel_type",
+            "in": "path",
+            "description": "Sidecar channel type (e.g. `lark`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "bot_id",
+            "in": "query",
+            "description": "Per-tenant bot id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Diagnose report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "channel_type",
+                    "bot_id",
+                    "checks"
+                  ],
+                  "properties": {
+                    "bot_id": {
+                      "type": "string"
+                    },
+                    "channel_type": {
+                      "type": "string"
+                    },
+                    "checks": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DiagnoseCheckEntry"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No sidecar connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Sidecar lacks `diagnose` capability",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Sidecar did not reply in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/config": {
       "get": {
         "tags": [
@@ -1539,6 +1629,26 @@
           "enabled",
           "disabled"
         ]
+      },
+      "DiagnoseCheckEntry": {
+        "type": "object",
+        "required": [
+          "name",
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "`\"ok\"` / `\"warn\"` / `\"error\"` — string-typed so third-party\nclients can render without a typed enum."
+          }
+        }
       },
       "ErrorBody": {
         "type": "object",
