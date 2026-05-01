@@ -268,13 +268,12 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   // Old `protocol_version` field has been replaced by `capabilities`.
   // Default sidecars advertise nothing → field omitted on the wire.
   assert.equal(fixture.recorded.register.protocol_version, undefined);
-  // The fixture's stub channel implements `onDiagnoseRequested`, so the
-  // runner auto-advertises the `diagnose` capability. Earlier this
-  // field was `undefined` (no hooks → no caps); the assertion below
-  // checks the diagnose entry specifically.
+  // The fixture's stub channel implements `onDiagnoseRequested`,
+  // `onToolCallStarted`, and `onToolCallCompleted`, so the runner
+  // auto-advertises both gating capabilities.
   assert.deepEqual(
-    fixture.recorded.register.capabilities,
-    ["diagnose"],
+    [...fixture.recorded.register.capabilities].sort(),
+    ["diagnose", "tool_telemetry"],
   );
 
   // ---- Server → client -------------------------------------------

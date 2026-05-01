@@ -70,6 +70,9 @@ export async function runChannel(
   // implementation gets both gates opened.
   const derived: string[] = [];
   if (channel.onDiagnoseRequested) derived.push("diagnose");
+  if (channel.onToolCallStarted || channel.onToolCallCompleted) {
+    derived.push("tool_telemetry");
+  }
   const capabilities = Array.from(
     new Set([...(opts.capabilities ?? []), ...derived]),
   );
