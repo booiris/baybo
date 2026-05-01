@@ -20,7 +20,7 @@ const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP];
 /// negotiated set as the intersection with their own advertised
 /// capabilities. Forward-compatible: a peer that doesn't know about a
 /// capability simply doesn't claim it.
-pub(crate) const GATEWAY_CAPABILITIES: &[&str] = &["secrets"];
+pub(crate) const GATEWAY_CAPABILITIES: &[&str] = &["secrets", "diagnose"];
 
 /// Validate the first frame received on a `/v1/channel-ws` upgrade and
 /// produce the `ChannelType` the sidecar is registering as.

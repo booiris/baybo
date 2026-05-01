@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use super::bot_reconciler::ChannelBotReconciler;
 use super::control::ChannelControlRegistry;
 use super::dedup::InboundDedup;
+use super::diagnose::DiagnoseRouter;
 use super::history::TuiHistoryStore;
 use super::session_resolver::ChannelSessionResolver;
 use crate::auth::ChannelTokenTable;
@@ -80,4 +81,14 @@ pub struct WsChannelState {
     /// agent sees each upstream event exactly once. Sidecars that omit
     /// `platform_msg_id` opt out — every frame is admitted.
     pub inbound_dedup: Arc<InboundDedup>,
+    /// Pending diagnose round-trips. The admin endpoint registers a
+    /// waiter here, the inbound loop resolves it when the matching
+    /// `Frame::DiagnoseReply` lands. One router is shared across all
+    /// connected sidecars — request_ids are UUIDs so no collision risk.
+    pub diagnose_router: Arc<DiagnoseRouter>,
+    /// Per-channel-type capability advertisement, captured at register
+    /// time. The admin diagnose endpoint reads this to short-circuit
+    /// requests against sidecars that didn't claim the `"diagnose"`
+    /// capability rather than wait for the round-trip to time out.
+    pub capabilities: Arc<super::diagnose::ChannelCapabilities>,
 }

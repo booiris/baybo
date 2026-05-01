@@ -92,6 +92,13 @@ function startFixture() {
             );
             ws.send(
               encodeFrame({
+                kind: "diagnose_request",
+                request_id: "diag-1",
+                bot_id: "alpha",
+              }),
+            );
+            ws.send(
+              encodeFrame({
                 kind: "approval_requested",
                 call_id: "call-1",
                 session_id: "sess-1",
@@ -127,6 +134,10 @@ function startFixture() {
           }
           case "resolve_approval": {
             recorded.resolveApproval = frame;
+            break;
+          }
+          case "diagnose_reply": {
+            recorded.diagnoseReply = frame;
             break;
           }
           case "sidecar_log": {
@@ -198,6 +209,12 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
     async onApprovalResolved(callId, decision) {
       gotApprovalResolved.calls.push({ callId, decision });
     },
+    async onDiagnoseRequested(req) {
+      return [
+        { name: "bot_id", status: "ok", detail: req.botId },
+        { name: "ws", status: "ok", detail: "connected" },
+      ];
+    },
     async *inbound(signal) {
       yield {
         sessionId: "sess-1",
@@ -251,7 +268,14 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   // Old `protocol_version` field has been replaced by `capabilities`.
   // Default sidecars advertise nothing → field omitted on the wire.
   assert.equal(fixture.recorded.register.protocol_version, undefined);
-  assert.equal(fixture.recorded.register.capabilities, undefined);
+  // The fixture's stub channel implements `onDiagnoseRequested`, so the
+  // runner auto-advertises the `diagnose` capability. Earlier this
+  // field was `undefined` (no hooks → no caps); the assertion below
+  // checks the diagnose entry specifically.
+  assert.deepEqual(
+    fixture.recorded.register.capabilities,
+    ["diagnose"],
+  );
 
   // ---- Server → client -------------------------------------------
   assert.equal(gotDelta.count, 1);
@@ -290,6 +314,23 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   assert.deepEqual(gotApprovalResolved.calls, [
     { callId: "call-2", decision: "approve_always" },
   ]);
+
+  // Diagnose round-trip: the runner advertised the capability (the
+  // stub implements onDiagnoseRequested) and emitted a reply matching
+  // the request_id with the hook's checks.
+  assert.ok(
+    fixture.recorded.register.capabilities?.includes("diagnose"),
+    `register frame should advertise diagnose; got ${JSON.stringify(fixture.recorded.register.capabilities)}`,
+  );
+  assert.ok(
+    fixture.recorded.diagnoseReply,
+    "server received the diagnose_reply",
+  );
+  assert.equal(fixture.recorded.diagnoseReply.request_id, "diag-1");
+  assert.equal(fixture.recorded.diagnoseReply.ok, true);
+  assert.equal(fixture.recorded.diagnoseReply.checks.length, 2);
+  assert.equal(fixture.recorded.diagnoseReply.checks[0].name, "bot_id");
+  assert.equal(fixture.recorded.diagnoseReply.checks[0].detail, "alpha");
 
   // ---- Client → server -------------------------------------------
   assert.ok(inboundYielded.fired, "inbound() generator produced a message");

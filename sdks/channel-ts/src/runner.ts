@@ -63,7 +63,16 @@ export async function runChannel(
       });
   }
 
-  const capabilities = opts.capabilities ?? [];
+  // Auto-advertise capabilities derived from which optional hooks the
+  // channel actually implements. The caller can still add more via
+  // `opts.capabilities`; we union both sets so a sidecar that
+  // explicitly advertises "secrets" alongside an `onDiagnoseRequested`
+  // implementation gets both gates opened.
+  const derived: string[] = [];
+  if (channel.onDiagnoseRequested) derived.push("diagnose");
+  const capabilities = Array.from(
+    new Set([...(opts.capabilities ?? []), ...derived]),
+  );
 
   try {
     let attempt = 0;
@@ -639,6 +648,13 @@ function dispatchFrame(
       );
       return;
     }
+    case "diagnose_request": {
+      // Reply path is mandatory regardless of whether the hook is
+      // implemented — the gateway is blocked on a oneshot waiter and
+      // would otherwise wait the full timeout.
+      void handleDiagnose(frame, channel, ws, logger);
+      return;
+    }
     case "approval_requested": {
       void handleApproval(frame, channel, ws, logger);
       return;
@@ -796,6 +812,52 @@ async function handleApproval(
     );
   } catch (err) {
     logger.error("failed to send resolve_approval", err);
+  }
+}
+
+async function handleDiagnose(
+  frame: Frame & { kind: "diagnose_request" },
+  channel: Channel,
+  ws: WebSocket,
+  logger: Logger,
+): Promise<void> {
+  let reply: Frame;
+  if (!channel.onDiagnoseRequested) {
+    reply = {
+      kind: "diagnose_reply",
+      request_id: frame.request_id,
+      ok: false,
+      checks: [],
+      error: "not_implemented",
+    };
+  } else {
+    try {
+      const checks = await channel.onDiagnoseRequested({ botId: frame.bot_id });
+      reply = {
+        kind: "diagnose_reply",
+        request_id: frame.request_id,
+        ok: true,
+        checks: checks.map((c) => ({
+          name: c.name,
+          status: c.status,
+          detail: c.detail,
+        })),
+      };
+    } catch (err) {
+      reply = {
+        kind: "diagnose_reply",
+        request_id: frame.request_id,
+        ok: false,
+        checks: [],
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+  if (ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(encodeFrame(reply));
+  } catch (err) {
+    logger.error("failed to send diagnose_reply", err);
   }
 }
 

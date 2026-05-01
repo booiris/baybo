@@ -74,6 +74,31 @@ export interface AgentToolCallCompleted {
   durationMs: number;
 }
 
+export type DiagnoseStatus = "ok" | "warn" | "error";
+
+/**
+ * One row in a diagnose report. `status` distinguishes a hard failure
+ * an operator should act on (`error`) from a soft warning (`warn`)
+ * from a healthy probe (`ok`). `detail` is free-form context.
+ */
+export interface DiagnoseCheck {
+  name: string;
+  status: DiagnoseStatus;
+  detail: string;
+}
+
+/**
+ * Inputs passed to {@link Channel.onDiagnoseRequested}. The sidecar
+ * runs whatever self-tests fit its platform (Lark: bot identity
+ * fetch, WSS connectivity, send-roundtrip) and returns a list of
+ * checks. Whole-pipeline failures (the report couldn't even be
+ * assembled) raise an exception from the hook; the SDK runner
+ * translates that into `ok: false` on the wire.
+ */
+export interface DiagnoseRequest {
+  botId: string;
+}
+
 export interface UserInbound {
   sessionId: string;
   userId: string;
@@ -194,6 +219,19 @@ export interface Channel {
   onToolCallStarted?(ev: AgentToolCallStarted): Promise<void>;
 
   onToolCallCompleted?(ev: AgentToolCallCompleted): Promise<void>;
+
+  /**
+   * Self-test hook. Aura's admin endpoint
+   * `GET /v1/admin/channels/<type>/diagnose?bot_id=<id>` round-trips
+   * a request through the WS to this hook; the operator sees the
+   * returned checks rendered in the dashboard. Implement when the
+   * sidecar can run useful probes (auth status, transport
+   * connectivity, send-roundtrip); omit otherwise. Sidecars that
+   * implement the hook MUST advertise the `"diagnose"` capability so
+   * the gateway only routes diagnose requests to peers that can
+   * answer them.
+   */
+  onDiagnoseRequested?(req: DiagnoseRequest): Promise<DiagnoseCheck[]>;
 
   /**
    * Return value is encoded into a `ResolveApproval` frame by the runner.

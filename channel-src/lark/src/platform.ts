@@ -1,5 +1,7 @@
 import type {
   AgentNotice,
+  DiagnoseCheck,
+  DiagnoseRequest,
   Logger,
   StartBotCommand,
   WireAttachment,
@@ -107,6 +109,55 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     // Don't try to fold them into the streaming card.
     const prefix = notice.level === "error" ? "❌" : "⚠️";
     await handle.send(chat.chatId, { text: `${prefix} ${notice.text}` });
+  }
+
+  async onDiagnoseRequested(req: DiagnoseRequest): Promise<DiagnoseCheck[]> {
+    const state = this.bots.get(req.botId);
+    if (!state) {
+      return [
+        {
+          name: "bot_state",
+          status: "error",
+          detail: `bot '${req.botId}' is not currently running on this sidecar`,
+        },
+      ];
+    }
+    const checks: DiagnoseCheck[] = [];
+
+    const identity = state.handle.botIdentity;
+    if (identity) {
+      checks.push({
+        name: "bot_identity",
+        status: "ok",
+        detail: `name=${identity.name} open_id=${identity.openId}`,
+      });
+    } else {
+      checks.push({
+        name: "bot_identity",
+        status: "warn",
+        detail: "botIdentity not yet populated; channel may still be connecting",
+      });
+    }
+
+    // The Lark SDK's connect() resolves only after a successful WS
+    // handshake. If we have a state entry with the live handle here,
+    // the WS was healthy at startup. We don't trigger an extra probe
+    // just to test it — the SDK's auto-reconnect would mask a flap
+    // anyway, and a "send the bot a self-ping" check would require a
+    // real chatId to target.
+    checks.push({
+      name: "transport",
+      status: "ok",
+      detail: "websocket transport attached",
+    });
+
+    checks.push({
+      name: "config",
+      status: "ok",
+      detail: `streaming=${state.config.streaming} reaction_echo=${state.config.reactionEcho}`,
+    });
+
+    return checks;
   }
 
   async stopBot(handle: lark.LarkChannel): Promise<void> {

@@ -289,6 +289,8 @@ async fn recv_message(ws: &mut WsStream) -> Result<WireMessage, ConnectError> {
             | Frame::Notice { .. }
             | Frame::ToolCallStarted { .. }
             | Frame::ToolCallCompleted { .. }
+            | Frame::DiagnoseRequest { .. }
+            | Frame::DiagnoseReply { .. }
             | Frame::ApprovalRequested { .. }
             | Frame::ApprovalResolved { .. }
             | Frame::HistorySnapshot { .. }
@@ -326,7 +328,9 @@ async fn recv_notice(ws: &mut WsStream) -> Result<(String, String, String), Conn
             Frame::Message(_)
             | Frame::Delta { .. }
             | Frame::ToolCallStarted { .. }
-            | Frame::ToolCallCompleted { .. } => continue,
+            | Frame::ToolCallCompleted { .. }
+            | Frame::DiagnoseRequest { .. }
+            | Frame::DiagnoseReply { .. } => continue,
             Frame::ApprovalRequested { .. }
             | Frame::ApprovalResolved { .. }
             | Frame::HistorySnapshot { .. }

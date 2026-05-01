@@ -409,6 +409,63 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(optional))]
         error: Option<String>,
     },
+    /// Server -> client: ask the sidecar to assemble a self-test
+    /// report for `bot_id`. The sidecar replies with
+    /// [`Frame::DiagnoseReply`] using the same `request_id`. The
+    /// admin endpoint `GET /v1/admin/channels/<type>/diagnose`
+    /// originates these requests and round-trips the reply back to
+    /// the operator. Gated by the `"diagnose"` capability advertised
+    /// on `Register` / `RegisterAck`; sidecars that don't claim the
+    /// capability never see the frame.
+    DiagnoseRequest { request_id: String, bot_id: String },
+    /// Client -> server: reply to a [`Frame::DiagnoseRequest`].
+    /// `checks` is an ordered list of self-test results — the SDK
+    /// caps each `name` and `detail` at sensible lengths so a verbose
+    /// sidecar can't pump megabytes of telemetry through this path.
+    /// `ok: false + error` is reserved for whole-pipeline failures
+    /// (the sidecar couldn't even start the report); per-check
+    /// failures live inside `checks` instead.
+    DiagnoseReply {
+        request_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<DiagnoseCheck>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        error: Option<String>,
+    },
+}
+
+/// One result row inside a [`Frame::DiagnoseReply`]. `status`
+/// distinguishes a hard failure that an operator should act on from
+/// a soft warning (degraded but functional). `detail` is free-form
+/// human-readable context: hostnames, error codes, latency, etc.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub struct DiagnoseCheck {
+    pub name: String,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+    pub status: DiagnoseStatus,
+    pub detail: String,
+}
+
+/// Outcome flag on a [`DiagnoseCheck`]. Mirrored as a string union on
+/// the wire so third-party clients don't need a typed enum.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum DiagnoseStatus {
+    Ok,
+    Warn,
+    Error,
 }
 
 /// Operation discriminator on a [`Frame::SecretRequest`].

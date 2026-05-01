@@ -176,6 +176,9 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         state
             .control
             .register(channel_type.clone(), sidecar.frame_tx_clone());
+        state
+            .capabilities
+            .record(channel_type.clone(), negotiated_capabilities.clone());
         // Push the slash-command manifest before any StartBot so the
         // sidecar's `BotChannel` already has the gateway-authored list
         // when it publishes commands on bot startup. Best-effort: a
@@ -205,6 +208,11 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     if session_id.is_none() {
         state.control.unregister(&channel_type);
         state.bot_reconciler.forget(&channel_type);
+        state.capabilities.forget(&channel_type);
+        // Wake any admin-side diagnose waiters with a "disconnected"
+        // reply rather than letting them block until the per-call
+        // timeout fires.
+        state.diagnose_router.drain_for_disconnect();
     }
     unregister_best_effort(&state, &channel_type, session_id.as_deref());
     let _ = sidecar.into_pump().await;
@@ -674,6 +682,19 @@ async fn run_inbound_loop(
                         if let Err(e) = sidecar.send_frame(reply).await {
                             tracing::debug!(error = %e, "secret reply send failed");
                         }
+                    }
+                    Frame::DiagnoseReply {
+                        request_id,
+                        ok,
+                        checks,
+                        error,
+                    } => {
+                        // Resolve the admin-side waiter unconditionally;
+                        // the router silently drops late replies whose
+                        // request_id timed out.
+                        state
+                            .diagnose_router
+                            .resolve(&request_id, ok, checks, error);
                     }
                     other => {
                         tracing::warn!(

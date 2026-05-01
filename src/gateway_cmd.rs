@@ -347,6 +347,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         graph.stores.channel_bot.clone(),
         Arc::clone(&graph.secret_vault),
     ));
+    let diagnose_router = Arc::new(aura_gateway::channel::DiagnoseRouter::new());
+    let channel_capabilities = Arc::new(aura_gateway::channel::ChannelCapabilities::new());
     {
         let reconciler = Arc::clone(&bot_reconciler);
         let shutdown_for_reconciler = shutdown.clone();
@@ -376,6 +378,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         stores: graph.stores.clone(),
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
+        diagnose_router,
+        channel_capabilities,
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to

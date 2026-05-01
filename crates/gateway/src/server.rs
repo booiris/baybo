@@ -108,6 +108,16 @@ pub struct GatewayDeps {
     /// (avoiding a double-send on the first tick) and so the
     /// disconnect path can `forget` the cached bots.
     pub bot_reconciler: Arc<crate::channel::ChannelBotReconciler>,
+    /// Pending diagnose round-trips. Shared between the WS route
+    /// (resolves replies) and the admin endpoint (registers waiters).
+    pub diagnose_router: Arc<crate::channel::DiagnoseRouter>,
+    /// Per-channel-type capability set advertised on `Register`. The
+    /// admin diagnose endpoint reads this to short-circuit before the
+    /// WS round-trip when the sidecar didn't claim `"diagnose"`. Other
+    /// capability gates today are inline in the inbound loop; this map
+    /// exists so admin-side callers can introspect without crossing
+    /// the WS task boundary.
+    pub channel_capabilities: Arc<crate::channel::ChannelCapabilities>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -128,6 +138,8 @@ pub struct AdminState {
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
     pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
     pub secret_vault: Arc<SecretVault>,
+    pub diagnose_router: Arc<crate::channel::DiagnoseRouter>,
+    pub channel_capabilities: Arc<crate::channel::ChannelCapabilities>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
@@ -164,6 +176,8 @@ impl AdminState {
             channel_bot_store: deps.stores.channel_bot.clone(),
             channel_control: Arc::clone(&deps.channel_control),
             secret_vault: Arc::clone(&deps.secret_vault),
+            diagnose_router: Arc::clone(&deps.diagnose_router),
+            channel_capabilities: Arc::clone(&deps.channel_capabilities),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }
     }
@@ -291,6 +305,8 @@ pub fn build_channel_router(
         pairing,
         blob_store: deps.stores.blob.clone(),
         inbound_dedup: Arc::new(crate::channel::InboundDedup::new()),
+        diagnose_router: Arc::clone(&deps.diagnose_router),
+        capabilities: Arc::clone(&deps.channel_capabilities),
     };
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_channel_auth` has stripped `?token=…`.

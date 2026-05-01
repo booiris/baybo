@@ -274,6 +274,10 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
         // prose when the model narrates, so dropping these doesn't
         // strand the user.
         Frame::ToolCallStarted { .. } | Frame::ToolCallCompleted { .. } => None,
+        // Diagnose round-trips happen between the gateway admin
+        // surface and a real sidecar; the TUI is session-scoped and
+        // never participates.
+        Frame::DiagnoseRequest { .. } | Frame::DiagnoseReply { .. } => None,
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
         | Frame::ResolveApproval { .. }
