@@ -284,8 +284,8 @@ async fn push_live_bots(
     state: &WsChannelState,
     channel_type: &ChannelType,
     sidecar: &Sidecar,
-) -> Vec<String> {
-    let mut sent = Vec::new();
+) -> Vec<(String, i64)> {
+    let mut sent: Vec<(String, i64)> = Vec::new();
     let bots = match state.channel_bot_store.list_live(channel_type).await {
         Ok(list) => list,
         Err(e) => {
@@ -332,9 +332,11 @@ async fn push_live_bots(
             }
         };
         let metadata = secrets::load_start_metadata(&state.secret_vault, &row).await;
+        let revision = row.revision;
+        let bot_id = row.bot_id.clone();
         if let Err(e) = sidecar
             .send_frame(Frame::StartBot {
-                bot_id: row.bot_id.clone(),
+                bot_id: bot_id.clone(),
                 token,
                 metadata,
             })
@@ -343,12 +345,12 @@ async fn push_live_bots(
             tracing::warn!(
                 error = %e,
                 %channel_type,
-                bot_id = %row.bot_id,
+                bot_id = %bot_id,
                 "push StartBot failed; WS pump may be closing",
             );
             return sent;
         }
-        sent.push(row.bot_id);
+        sent.push((bot_id, revision));
     }
     sent
 }

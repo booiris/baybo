@@ -258,6 +258,7 @@ impl LibsqlPool {
                     bot_id       TEXT    NOT NULL,
                     created_at   INTEGER NOT NULL,
                     metadata     TEXT    NOT NULL DEFAULT '{}',
+                    revision     INTEGER NOT NULL DEFAULT 0,
                     deleted_at   INTEGER,
                     PRIMARY KEY (channel_type, bot_id)
                 );
@@ -308,6 +309,26 @@ impl LibsqlPool {
             if !msg.contains("duplicate column name") {
                 return Err(anyhow::anyhow!(
                     "failed to migrate channel_bots.metadata: {e}"
+                ));
+            }
+        }
+
+        // Same idempotent ALTER pattern for the rotation revision
+        // column. Existing rows default to 0; the next `put` bumps
+        // them to 1 and the reconciler rotates if the sidecar has a
+        // stale tracked value.
+        let alter_rev = self
+            .conn
+            .execute(
+                "ALTER TABLE channel_bots ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await;
+        if let Err(e) = alter_rev {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(anyhow::anyhow!(
+                    "failed to migrate channel_bots.revision: {e}"
                 ));
             }
         }

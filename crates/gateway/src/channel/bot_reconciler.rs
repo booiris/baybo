@@ -20,7 +20,7 @@
 //!   on re-registration). So a missed tick or a cross-over with the
 //!   initial-register push just turns into a harmless re-send.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,28 +39,61 @@ use super::secrets::load_start_metadata;
 /// add/remove; long enough that the cost is negligible.
 pub const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Bot ids the gateway has already pushed to each connected sidecar.
-/// Keyed by `ChannelType` so two sidecars of different types (future
-/// Discord sidecar) don't collide.
+/// Per-channel tracking of `(bot_id → revision)` already pushed to the
+/// sidecar. Keyed by `ChannelType` so a future Discord sidecar can't
+/// collide with the Telegram one. The revision is the libsql row's
+/// monotonic counter — the reconciler restarts the bot when the
+/// persisted revision overtakes the tracked one (credential rotation
+/// path), and silently no-ops when they match.
 #[derive(Default)]
 struct Tracked {
-    per_channel: HashMap<ChannelType, HashSet<String>>,
+    per_channel: HashMap<ChannelType, HashMap<String, i64>>,
 }
 
 impl Tracked {
-    fn desired_delta(&mut self, channel_type: &ChannelType, desired: HashSet<String>) -> Delta {
+    fn desired_delta(
+        &mut self,
+        channel_type: &ChannelType,
+        desired: HashMap<String, i64>,
+    ) -> Delta {
         let current = self.per_channel.entry(channel_type.clone()).or_default();
-        let to_start: Vec<String> = desired
-            .iter()
-            .filter(|id| !current.contains(*id))
-            .cloned()
-            .collect();
-        let to_stop: Vec<String> = current
-            .iter()
-            .filter(|id| !desired.contains(*id))
-            .cloned()
-            .collect();
-        *current = desired;
+        let mut to_start: Vec<String> = Vec::new();
+        let mut to_stop: Vec<String> = Vec::new();
+
+        for (id, desired_rev) in &desired {
+            match current.get(id) {
+                None => to_start.push(id.clone()),
+                Some(tracked_rev) if tracked_rev < desired_rev => {
+                    // Rotation: stop now, drop the tracked entry, and
+                    // let the next tick re-add it via to_start. Two-
+                    // tick sequence avoids the SDK race where a
+                    // concurrent StartBot would short-circuit on
+                    // "already running" before its companion StopBot
+                    // had time to purge.
+                    to_stop.push(id.clone());
+                }
+                Some(_) => {} // unchanged, leave tracked entry
+            }
+        }
+        for id in current.keys() {
+            if !desired.contains_key(id) {
+                to_stop.push(id.clone());
+            }
+        }
+
+        // Apply the delta to `current`: drop everything we just
+        // emitted a Stop for; refresh revisions for anything still
+        // matching desired.
+        let stops: std::collections::HashSet<&String> = to_stop.iter().collect();
+        let mut new_current: HashMap<String, i64> = HashMap::new();
+        for (id, rev) in &desired {
+            if stops.contains(id) {
+                continue;
+            }
+            new_current.insert(id.clone(), *rev);
+        }
+        *current = new_current;
+
         Delta { to_start, to_stop }
     }
 
@@ -107,15 +140,17 @@ impl ChannelBotReconciler {
         }
     }
 
-    /// Declare that `bot_ids` have already been streamed to the sidecar
-    /// for `channel_type`. Called by the WS route after the initial
-    /// `push_live_bots` burst so the first reconciler tick doesn't
-    /// double-send.
-    pub fn seed(&self, channel_type: ChannelType, bot_ids: Vec<String>) {
+    /// Declare that `bots` (id → revision) have already been streamed
+    /// to the sidecar for `channel_type`. Called by the WS route after
+    /// the initial `push_live_bots` burst so the first reconciler tick
+    /// doesn't double-send. Revision is taken from the rows the route
+    /// pushed; if the operator rotates between the push and the next
+    /// tick the reconciler still detects it.
+    pub fn seed(&self, channel_type: ChannelType, bots: Vec<(String, i64)>) {
         self.tracked
             .lock()
             .per_channel
-            .insert(channel_type, bot_ids.into_iter().collect());
+            .insert(channel_type, bots.into_iter().collect());
     }
 
     /// Drop the cached set for `channel_type`. Called when a sidecar
@@ -161,7 +196,10 @@ impl ChannelBotReconciler {
         };
         let row_by_id: HashMap<String, ChannelBotRow> =
             rows.into_iter().map(|r| (r.bot_id.clone(), r)).collect();
-        let desired: HashSet<String> = row_by_id.keys().cloned().collect();
+        let desired: HashMap<String, i64> = row_by_id
+            .iter()
+            .map(|(id, row)| (id.clone(), row.revision))
+            .collect();
 
         let delta = self.tracked.lock().desired_delta(channel_type, desired);
 
@@ -266,21 +304,25 @@ impl ChannelBotReconciler {
 mod tests {
     use super::*;
 
+    fn desired<const N: usize>(items: [(&str, i64); N]) -> HashMap<String, i64> {
+        items.into_iter().map(|(k, v)| (k.into(), v)).collect()
+    }
+
     #[test]
     fn desired_delta_computes_add_and_remove() {
         let mut tracked = Tracked::default();
         let ct = ChannelType::telegram();
-        let first = tracked.desired_delta(&ct, ["a".into(), "b".into()].into_iter().collect());
+        let first = tracked.desired_delta(&ct, desired([("a", 1), ("b", 1)]));
         let mut starts: Vec<&str> = first.to_start.iter().map(String::as_str).collect();
         starts.sort();
         assert_eq!(starts, vec!["a", "b"]);
         assert!(first.to_stop.is_empty());
 
-        let second = tracked.desired_delta(&ct, ["b".into(), "c".into()].into_iter().collect());
+        let second = tracked.desired_delta(&ct, desired([("b", 1), ("c", 1)]));
         assert_eq!(second.to_start, vec!["c".to_string()]);
         assert_eq!(second.to_stop, vec!["a".to_string()]);
 
-        let third = tracked.desired_delta(&ct, HashSet::new());
+        let third = tracked.desired_delta(&ct, HashMap::new());
         let mut stops: Vec<&str> = third.to_stop.iter().map(String::as_str).collect();
         stops.sort();
         assert_eq!(stops, vec!["b", "c"]);
@@ -288,13 +330,40 @@ mod tests {
     }
 
     #[test]
+    fn revision_bump_emits_stop_then_start_across_two_ticks() {
+        let mut tracked = Tracked::default();
+        let ct = ChannelType::telegram();
+        // Tick 1: initial publish.
+        let first = tracked.desired_delta(&ct, desired([("a", 1)]));
+        assert_eq!(first.to_start, vec!["a".to_string()]);
+        assert!(first.to_stop.is_empty());
+
+        // Tick 2: same revision, no-op.
+        let same = tracked.desired_delta(&ct, desired([("a", 1)]));
+        assert!(same.to_start.is_empty());
+        assert!(same.to_stop.is_empty());
+
+        // Tick 3: rotation — revision bumped. Emit Stop now and drop
+        // the tracked entry so the next tick re-emits Start with the
+        // refreshed creds.
+        let rotate = tracked.desired_delta(&ct, desired([("a", 2)]));
+        assert!(rotate.to_start.is_empty());
+        assert_eq!(rotate.to_stop, vec!["a".to_string()]);
+
+        // Tick 4: same revision still in desired, but tracked entry
+        // is gone after the previous tick, so it goes through to_start.
+        let restart = tracked.desired_delta(&ct, desired([("a", 2)]));
+        assert_eq!(restart.to_start, vec!["a".to_string()]);
+        assert!(restart.to_stop.is_empty());
+    }
+
+    #[test]
     fn forget_clears_channel_state() {
         let mut tracked = Tracked::default();
         let ct = ChannelType::telegram();
-        tracked.desired_delta(&ct, ["a".into()].into_iter().collect());
+        tracked.desired_delta(&ct, desired([("a", 1)]));
         tracked.forget(&ct);
-        // After forget, the next desired_delta treats `a` as new again.
-        let delta = tracked.desired_delta(&ct, ["a".into()].into_iter().collect());
+        let delta = tracked.desired_delta(&ct, desired([("a", 1)]));
         assert_eq!(delta.to_start, vec!["a".to_string()]);
         assert!(delta.to_stop.is_empty());
     }

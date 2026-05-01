@@ -27,11 +27,20 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// Multi-secret channels (Lark's `app_secret`/`encrypt_key`/…, Discord
 /// intents bitmask, …) store any non-token configuration here. Empty
 /// for single-secret channels.
+///
+/// `revision` is a monotonic per-row counter the gateway reconciler
+/// reads to detect credential / metadata rotations on a still-live
+/// row. Every `put` bumps it; the bot reconciler restarts the running
+/// sidecar bot when the persisted revision overtakes what it last
+/// pushed, so a re-registration with rotated tokens or new auxiliary
+/// secrets actually reaches the sidecar instead of being treated as a
+/// no-op "already running" duplicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelBotRow {
     pub channel_type: ChannelType,
     pub bot_id: String,
     pub created_at: i64,
+    pub revision: i64,
     pub metadata: HashMap<String, String>,
 }
 

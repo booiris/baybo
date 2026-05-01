@@ -18,6 +18,31 @@ impl LibsqlChannelBotStore {
     }
 }
 
+fn parse_row(row: &libsql::Row) -> Result<ChannelBotRow> {
+    let channel_type_s: String = row
+        .get(0)
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+    let bot_id: String = row
+        .get(1)
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+    let created_at: i64 = row
+        .get(2)
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+    let revision: i64 = row
+        .get(3)
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+    let metadata_raw: String = row
+        .get(4)
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+    Ok(ChannelBotRow {
+        channel_type: ChannelType::from(channel_type_s.as_str()),
+        bot_id,
+        created_at,
+        revision,
+        metadata: parse_metadata(&metadata_raw),
+    })
+}
+
 fn parse_metadata(raw: &str) -> HashMap<String, String> {
     if raw.is_empty() {
         return HashMap::new();
@@ -41,7 +66,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT channel_type, bot_id, created_at, metadata FROM channel_bots
+                "SELECT channel_type, bot_id, created_at, revision, metadata FROM channel_bots
                  WHERE channel_type = ?1 AND deleted_at IS NULL
                  ORDER BY created_at DESC",
                 libsql::params![channel_type.as_str().to_string()],
@@ -54,24 +79,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
         {
-            let channel_type_s: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let bot_id: String = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let created_at: i64 = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let metadata_raw: String = row
-                .get(3)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            out.push(ChannelBotRow {
-                channel_type: ChannelType::from(channel_type_s.as_str()),
-                bot_id,
-                created_at,
-                metadata: parse_metadata(&metadata_raw),
-            });
+            out.push(parse_row(&row)?);
         }
         Ok(out)
     }
@@ -80,7 +88,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT channel_type, bot_id, created_at, metadata FROM channel_bots
+                "SELECT channel_type, bot_id, created_at, revision, metadata FROM channel_bots
                  WHERE channel_type = ?1 AND bot_id = ?2 AND deleted_at IS NULL",
                 libsql::params![channel_type.as_str().to_string(), bot_id.to_string()],
             )
@@ -93,24 +101,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         else {
             return Ok(None);
         };
-        let channel_type_s: String = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-        let bot_id: String = row
-            .get(1)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-        let created_at: i64 = row
-            .get(2)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-        let metadata_raw: String = row
-            .get(3)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-        Ok(Some(ChannelBotRow {
-            channel_type: ChannelType::from(channel_type_s.as_str()),
-            bot_id,
-            created_at,
-            metadata: parse_metadata(&metadata_raw),
-        }))
+        Ok(Some(parse_row(&row)?))
     }
 
     async fn put(
@@ -122,15 +113,21 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let now = Utc::now().timestamp();
         let metadata_json = serialize_metadata(&metadata)?;
         let conn = self.pool.conn();
+        // The conflict branch bumps `revision` even when nothing
+        // looks different in `metadata`: the bot reconciler treats a
+        // revision change as "rotated, restart"; bumping
+        // unconditionally is safe (a redundant restart) and keeps the
+        // contract honest — every `put` is a re-registration intent.
         conn.execute(
-            "INSERT INTO channel_bots (channel_type, bot_id, created_at, metadata, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, NULL)
+            "INSERT INTO channel_bots (channel_type, bot_id, created_at, metadata, revision, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, 1, NULL)
              ON CONFLICT(channel_type, bot_id) DO UPDATE SET
                  created_at = CASE
                      WHEN channel_bots.deleted_at IS NULL THEN channel_bots.created_at
                      ELSE excluded.created_at
                  END,
                  metadata = excluded.metadata,
+                 revision = channel_bots.revision + 1,
                  deleted_at = NULL",
             libsql::params![
                 channel_type.as_str().to_string(),
@@ -239,7 +236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_on_live_row_is_noop() {
+    async fn put_on_live_row_preserves_created_at_and_bumps_revision() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelBotStore::new(pool);
         store
@@ -251,7 +248,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Second put — created_at must not change on a live-row conflict.
+        assert_eq!(first.revision, 1);
+        // Second put — created_at must not change on a live-row
+        // conflict, but revision must bump so the gateway reconciler
+        // detects the rotation and restarts the running bot.
         store
             .put(&ChannelType::telegram(), "alpha", HashMap::new())
             .await
@@ -262,6 +262,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.created_at, second.created_at);
+        assert_eq!(second.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn revive_after_delete_bumps_revision() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlChannelBotStore::new(pool);
+        store
+            .put(&ChannelType::telegram(), "alpha", HashMap::new())
+            .await
+            .unwrap();
+        let first = store
+            .get(&ChannelType::telegram(), "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .delete(&ChannelType::telegram(), "alpha")
+            .await
+            .unwrap();
+        store
+            .put(&ChannelType::telegram(), "alpha", HashMap::new())
+            .await
+            .unwrap();
+        let revived = store
+            .get(&ChannelType::telegram(), "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        // Revision continues from where it left off — the reconciler
+        // sees a strictly larger value and restarts the bot, which is
+        // the right behaviour after a soft-delete revive (the bot may
+        // have been rotated while it was tombstoned).
+        assert!(revived.revision > first.revision);
     }
 
     #[tokio::test]
