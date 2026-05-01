@@ -265,6 +265,66 @@ mod tests {
         assert_eq!(second.revision, 2);
     }
 
+    /// Codex review regression: existing rows from before the
+    /// revision column existed are filled with the column default
+    /// (originally 0) by the ALTER. The follow-up UPDATE in
+    /// `init_db` migrates them to 1 so the reconciler doesn't read
+    /// `applied == 0` as "never started" and loop StartBot every
+    /// tick. Simulates the upgrade path by directly inserting a
+    /// pre-migration row with revision = 0 and asserting `get`
+    /// observes the migrated value.
+    #[tokio::test]
+    async fn migration_lifts_zero_revision_rows_to_one() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        // Insert a row that simulates a pre-migration record (the
+        // ALTER would have left it at the default of 0 if it landed
+        // before the new UPDATE step). Bypassing `put` means we get
+        // exactly the bug shape Codex flagged.
+        pool.conn()
+            .execute(
+                "INSERT INTO channel_bots (channel_type, bot_id, created_at, metadata, revision, deleted_at)
+                 VALUES ('telegram', 'pre-migration', 1700000000, '{}', 0, NULL)",
+                (),
+            )
+            .await
+            .unwrap();
+        // Sanity-check that the row is at revision 0 right after the
+        // direct insert (i.e. the test setup actually reproduces the
+        // pre-migration shape).
+        let mut rows = pool
+            .conn()
+            .query(
+                "SELECT revision FROM channel_bots WHERE bot_id = 'pre-migration'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let direct_rev: i64 = row.get(0).unwrap();
+        assert_eq!(direct_rev, 0, "direct insert should land at 0");
+
+        // Re-running init_db is the migration path on every gateway
+        // boot; the second invocation must lift the row to 1.
+        // `LibsqlPool::open_in_memory` already called init_db once
+        // during construction, but our INSERT happened after — so we
+        // call init_db again to mirror the upgrade-after-restart
+        // sequence.
+        crate::libsql::LibsqlPool::reinit_db_for_test(&pool)
+            .await
+            .unwrap();
+
+        let store = LibsqlChannelBotStore::new(pool);
+        let migrated = store
+            .get(&ChannelType::telegram(), "pre-migration")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            migrated.revision, 1,
+            "migration must lift revision-0 rows to 1 to break the reconciler StartBot loop",
+        );
+    }
+
     #[tokio::test]
     async fn revive_after_delete_bumps_revision() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();

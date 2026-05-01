@@ -314,9 +314,11 @@ impl LibsqlPool {
         }
 
         // Same idempotent ALTER pattern for the rotation revision
-        // column. Existing rows default to 0; the next `put` bumps
-        // them to 1 and the reconciler rotates if the sidecar has a
-        // stale tracked value.
+        // column. Existing rows default to 0 from the initial ALTER;
+        // the follow-up UPDATE migrates them to 1 so the reconciler
+        // sees a real "running at revision 1" state instead of
+        // mistaking 0 for the "not yet started" sentinel and looping
+        // StartBot on every tick.
         let alter_rev = self
             .conn
             .execute(
@@ -332,7 +334,28 @@ impl LibsqlPool {
                 ));
             }
         }
+        // Idempotent: no-op when every row already has a positive
+        // revision (fresh DBs always insert at 1; rotation always
+        // bumps strictly upward).
+        self.conn
+            .execute(
+                "UPDATE channel_bots SET revision = 1 WHERE revision = 0",
+                (),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to migrate channel_bots.revision rows from 0 to 1: {e}")
+            })?;
 
         Ok(())
+    }
+
+    /// Test-only re-entry for `init_db`. Lets the channel_bot
+    /// migration test simulate an upgrade-after-restart sequence
+    /// without standing up a fresh process. Marked `cfg(test)` so
+    /// it's stripped from release builds.
+    #[cfg(test)]
+    pub(crate) async fn reinit_db_for_test(pool: &LibsqlPool) -> anyhow::Result<()> {
+        pool.init_db().await
     }
 }
