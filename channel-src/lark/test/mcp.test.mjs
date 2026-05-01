@@ -87,7 +87,7 @@ test("LarkMcpServer: tools/list advertises feishu_get_chat_info", async () => {
     logger: noopLogger,
     channelResolver: () => {
       resolverCalls += 1;
-      return null;
+      return { kind: "none" };
     },
   });
   const reply = captureReply();
@@ -128,7 +128,7 @@ test("LarkMcpServer: tools/call routes through getChatInfo", async () => {
 
   const server = new LarkMcpServer({
     logger: noopLogger,
-    channelResolver: () => channel,
+    channelResolver: () => ({ kind: "ok", channel }),
   });
   const reply = captureReply();
   await initialize(server, reply);
@@ -168,7 +168,7 @@ test("LarkMcpServer: tools/call surfaces errors as isError replies", async () =>
   });
   const server = new LarkMcpServer({
     logger: noopLogger,
-    channelResolver: () => channel,
+    channelResolver: () => ({ kind: "ok", channel }),
   });
   const reply = captureReply();
   await initialize(server, reply);
@@ -200,7 +200,7 @@ test("LarkMcpServer: tools/call surfaces errors as isError replies", async () =>
 test("LarkMcpServer: tools/call with no live bot returns a tool error", async () => {
   const server = new LarkMcpServer({
     logger: noopLogger,
-    channelResolver: () => null,
+    channelResolver: () => ({ kind: "none" }),
   });
   const reply = captureReply();
   await initialize(server, reply);
@@ -229,11 +229,48 @@ test("LarkMcpServer: tools/call with no live bot returns a tool error", async ()
   await server.shutdown();
 });
 
+test("LarkMcpServer: multi-bot routing fails closed with structured tool error", async () => {
+  // Codex review regression: when multiple bots are live, a tool
+  // call from bot B's user must NOT silently execute under bot A's
+  // credentials and return A's tenant metadata. Slice 2A fails
+  // closed; slice 2B will route via `_meta.auraSessionId`.
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({ kind: "ambiguous", bot_count: 3 }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-multi",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_chat_info",
+        arguments: { chat_id: "oc_x" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "tools/call ambiguous reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 6);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /multi-bot routing not yet supported/);
+  assert.match(last.result.content[0].text, /3 bots live/);
+
+  await server.shutdown();
+});
+
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {
   const channel = stubChannel(async (chatId) => ({ chatId, name: "X" }));
   const server = new LarkMcpServer({
     logger: noopLogger,
-    channelResolver: () => channel,
+    channelResolver: () => ({ kind: "ok", channel }),
   });
   // Each tunnel gets its own initialize handshake — they're truly
   // independent sessions over the same WS connection.

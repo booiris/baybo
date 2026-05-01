@@ -21,6 +21,15 @@ const MIME_BY_KIND: Record<lark.ResourceDescriptor["type"], string> = {
 // tenant with raised limits would otherwise let a malicious user
 // force the sidecar to allocate the full payload before the gateway
 // could reject it.
+//
+// TODO (Phase 3.x — pairing preflight): Codex flagged that an
+// unpaired `(channel_type, bot_id, user_id)` triple can still force
+// up to MAX_RESOURCE_BYTES of bandwidth + memory before
+// `uploadBlob`'s `pairing_required` rejection lands. The proper fix
+// is a lightweight pairing-check call (new gateway endpoint or
+// frame) that runs before the Lark `downloadResource` so we never
+// fetch bytes for an unapproved peer. The byte cap + per-channel
+// concurrency semaphore bound the worst case in the meantime.
 const MAX_RESOURCE_BYTES = 50 * 1024 * 1024;
 
 // Stickers ride the agent's `image` content block; videos fall back to
