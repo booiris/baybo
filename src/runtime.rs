@@ -438,7 +438,10 @@ pub struct RouterRunHandle {
 /// the graph. The returned handle already has cron triggers attached —
 /// every cron-enqueued session reaches the router regardless of entry
 /// point.
-pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
+pub async fn wire_router(
+    graph: &mut ManagerGraph,
+    sidecar_mcp: Arc<dyn aura_tools::mcp::SidecarMcpProvider>,
+) -> RouterRunHandle {
     let buffer = graph.config.channels.message_buffer_size;
 
     let session_log_dir =
@@ -476,6 +479,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let actor_skill_assessor = Arc::clone(&graph.skill_assessor);
     let actor_security_gateway = Arc::clone(&graph.security_gateway);
     let actor_session_logger = Arc::clone(&session_logger);
+    let actor_sidecar_mcp = sidecar_mcp;
 
     let router = Router::new(
         Arc::clone(&graph.session_manager),
@@ -500,7 +504,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             Arc::clone(&actor_security_gateway),
         )
         .with_skill_assessor(Arc::clone(&actor_skill_assessor))
-        .with_session_log(Arc::clone(&actor_session_logger));
+        .with_session_log(Arc::clone(&actor_session_logger))
+        .with_sidecar_mcp(Arc::clone(&actor_sidecar_mcp));
 
         let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
             &session.id,

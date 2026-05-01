@@ -123,6 +123,12 @@ pub struct GatewayDeps {
     /// caller opened the matching tunnel; the agent-side caller
     /// (lands in slice 2) holds the open tunnel handles.
     pub mcp_tunnel_router: Arc<crate::channel::McpTunnelRouter>,
+    /// Lazy per-session sidecar MCP discovery. Implements the
+    /// `aura_tools::mcp::SidecarMcpProvider` trait the agent loop
+    /// consults. The runtime threads this into `AgentLoop` via
+    /// `with_sidecar_mcp`; the WS route's disconnect path calls
+    /// `detach` to drop cached rmcp sessions.
+    pub sidecar_mcp_manager: Arc<crate::channel::SidecarMcpManager>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -315,6 +321,7 @@ pub fn build_channel_router(
         diagnose_router: Arc::clone(&deps.diagnose_router),
         capabilities: Arc::clone(&deps.channel_capabilities),
         mcp_tunnel_router: Arc::clone(&deps.mcp_tunnel_router),
+        sidecar_mcp_manager: Arc::clone(&deps.sidecar_mcp_manager),
     };
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_channel_auth` has stripped `?token=…`.

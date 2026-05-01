@@ -23,6 +23,7 @@ use super::diagnose::DiagnoseRouter;
 use super::history::TuiHistoryStore;
 use super::mcp_tunnel::McpTunnelRouter;
 use super::session_resolver::ChannelSessionResolver;
+use super::sidecar_mcp::SidecarMcpManager;
 use crate::auth::ChannelTokenTable;
 use crate::log_buffer::LogBuffer;
 
@@ -96,4 +97,10 @@ pub struct WsChannelState {
     /// payloads here; the agent-side MCP client adapter (lands in
     /// slice 2) opens / closes tunnels as needed.
     pub mcp_tunnel_router: Arc<McpTunnelRouter>,
+    /// Lazy per-session sidecar MCP manager. The disconnect path
+    /// calls `detach(channel_type)` so cached rmcp sessions are
+    /// dropped before the tunnel registry drains. Agent loops hold
+    /// the same `Arc` (threaded via `with_sidecar_mcp` in the
+    /// runtime) so tool discovery sees the same cache.
+    pub sidecar_mcp_manager: Arc<SidecarMcpManager>,
 }

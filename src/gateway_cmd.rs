@@ -288,7 +288,29 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         Arc::clone(&leak_detector),
     )
     .await?;
-    let run_handle = runtime::wire_router(&mut graph).await;
+
+    // Channel-side primitives constructed up here so `wire_router`
+    // can capture `sidecar_mcp_manager` into the per-session actor
+    // spawner — the agent loop calls `.with_sidecar_mcp(...)` on it
+    // for lazy per-session MCP discovery. The other channel
+    // primitives (`bot_reconciler`, `diagnose_router`, etc) are
+    // built further down because they don't need to reach into the
+    // actor closure.
+    let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
+    let channel_capabilities = Arc::new(aura_gateway::channel::ChannelCapabilities::new());
+    let mcp_tunnel_router = Arc::new(aura_gateway::channel::McpTunnelRouter::new(Arc::clone(
+        &channel_control,
+    )));
+    let sidecar_mcp_manager = Arc::new(aura_gateway::channel::SidecarMcpManager::new(
+        Arc::clone(&mcp_tunnel_router),
+        Arc::clone(&channel_capabilities),
+    ));
+
+    let run_handle = runtime::wire_router(
+        &mut graph,
+        Arc::clone(&sidecar_mcp_manager) as Arc<dyn aura_tools::mcp::SidecarMcpProvider>,
+    )
+    .await;
 
     // WS-backed sidecars register themselves from the route task when a
     // client connects; nothing to pre-register here.
@@ -335,8 +357,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         },
     );
 
-    let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
-
     // CLI-driven bot add/remove writes straight to libsql + vault. The
     // reconciler polls those stores on a short tick and pushes
     // `StartBot` / `StopBot` frames to whichever sidecars are
@@ -348,10 +368,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         Arc::clone(&graph.secret_vault),
     ));
     let diagnose_router = Arc::new(aura_gateway::channel::DiagnoseRouter::new());
-    let channel_capabilities = Arc::new(aura_gateway::channel::ChannelCapabilities::new());
-    let mcp_tunnel_router = Arc::new(aura_gateway::channel::McpTunnelRouter::new(Arc::clone(
-        &channel_control,
-    )));
     {
         let reconciler = Arc::clone(&bot_reconciler);
         let shutdown_for_reconciler = shutdown.clone();
@@ -384,6 +400,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         diagnose_router,
         channel_capabilities,
         mcp_tunnel_router,
+        sidecar_mcp_manager: Arc::clone(&sidecar_mcp_manager),
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to

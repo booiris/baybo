@@ -214,6 +214,12 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         // reply rather than letting them block until the per-call
         // timeout fires.
         state.diagnose_router.drain_for_disconnect();
+        // Drop the manager's cached rmcp session BEFORE draining
+        // the tunnel registry. `detach` runs `session.shutdown()`
+        // which sends a final `notifications/cancelled` through the
+        // tunnel; if the tunnel were already drained it would just
+        // log a send error. Order matters for clean teardown.
+        state.sidecar_mcp_manager.detach(&channel_type).await;
         // Drop every MCP tunnel routed through this sidecar so
         // agent-side awaiters wake immediately with `None` instead
         // of blocking on a dead pipe.
