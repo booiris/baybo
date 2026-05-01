@@ -14,6 +14,7 @@ use crate::memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
+use aura_tools::mcp::{NoSidecarMcp, SidecarMcpProvider};
 use aura_tools::{ToolOutput, ToolRegistry, preview_params};
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
@@ -117,6 +118,12 @@ pub struct AgentLoop {
     /// error, latency, model metadata) to
     /// `<state>/sessions/<session_id>.jsonl`.
     session_log: Option<Arc<SessionLlmLogger>>,
+    /// Lazy per-session sidecar MCP provider. Defaults to a no-op so
+    /// gateways without any `mcp_tunnel`-capable sidecar (and
+    /// standalone TUI builds) need no extra wiring. The gateway
+    /// substitutes its `SidecarMcpManager` here when a sidecar
+    /// connects.
+    sidecar_mcp: Arc<dyn SidecarMcpProvider>,
 }
 
 impl AgentLoop {
@@ -145,6 +152,7 @@ impl AgentLoop {
             error_handler: ErrorHandler::default(),
             skill_assessor: None,
             session_log: None,
+            sidecar_mcp: Arc::new(NoSidecarMcp),
         }
     }
 
@@ -155,6 +163,11 @@ impl AgentLoop {
 
     pub fn with_session_log(mut self, logger: Arc<SessionLlmLogger>) -> Self {
         self.session_log = Some(logger);
+        self
+    }
+
+    pub fn with_sidecar_mcp(mut self, provider: Arc<dyn SidecarMcpProvider>) -> Self {
+        self.sidecar_mcp = provider;
         self
     }
 
@@ -608,7 +621,7 @@ impl AgentLoop {
             )
             .await?;
 
-        let tool_defs: Vec<ToolDefinitionForLlm> = self
+        let mut tool_defs: Vec<ToolDefinitionForLlm> = self
             .tool_registry
             .tool_definitions()
             .into_iter()
@@ -618,6 +631,19 @@ impl AgentLoop {
                 parameters_schema: td.parameters_schema,
             })
             .collect();
+        // Sidecar MCP tools are session-scoped: discovered on demand
+        // for the current session so multi-bot deployments don't leak
+        // tool surfaces between tenants. Most builds run the no-op
+        // provider and pay no cost.
+        let sidecar_tools = self
+            .sidecar_mcp
+            .tool_definitions_for_session(session)
+            .await;
+        tool_defs.extend(sidecar_tools.into_iter().map(|td| ToolDefinitionForLlm {
+            name: td.name,
+            description: td.description,
+            parameters_schema: td.parameters_schema,
+        }));
 
         let request = ChatRequest {
             messages: session.messages.clone(),

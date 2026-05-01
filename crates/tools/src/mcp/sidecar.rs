@@ -1,4 +1,5 @@
-//! rmcp `Transport` over an opaque byte-pipe.
+//! Sidecar MCP plumbing: byte-pipe transport + lazy per-session
+//! discovery hook.
 //!
 //! Sidecar-hosted MCP servers (Phase 3.3 slice 2B) run inside a
 //! channel sidecar and exchange JSON-RPC envelopes with the gateway
@@ -25,10 +26,13 @@ use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aura_model::Session;
 use rmcp::service::{RoleClient, RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+use crate::ToolDefinition;
 
 #[derive(Debug, Error)]
 pub enum SidecarTransportError {
@@ -102,12 +106,116 @@ impl Transport<RoleClient> for SidecarTransport {
     }
 }
 
+/// Lazy per-session discovery hook for sidecar-hosted MCP tools.
+///
+/// Sidecar MCP servers (e.g. lark's `feishu_get_chat_info`) are
+/// scoped to a specific bot/tenant: a tool call from session A's
+/// agent loop must not silently execute under session B's bot
+/// credentials (slice 2A's structured tool error already enforces
+/// this in the sidecar). To keep that scoping strict on the agent
+/// side, sidecar tools are NOT eagerly registered into the global
+/// [`crate::ToolRegistry`]. Instead, every agent loop turn asks the
+/// provider "what tools are available for *this* session?" and the
+/// provider materialises the per-session view.
+///
+/// Implementations decide their own caching policy. A typical
+/// gateway-side implementation will:
+///  * On first call for a session: open an MCP tunnel to the
+///    sidecar serving `session.user.channel`, run the rmcp
+///    handshake, and snapshot the advertised tools.
+///  * Cache the snapshot per (channel_type, bot_id) so subsequent
+///    turns reuse it.
+///  * Return an empty vector when the session's channel has no
+///    sidecar with `mcp_tunnel` capability — the agent loop just
+///    proceeds with builtin + user-configured tools.
+///
+/// The trait is Send + Sync; `AgentLoop` holds it as
+/// `Arc<dyn SidecarMcpProvider>`.
+#[async_trait]
+pub trait SidecarMcpProvider: Send + Sync {
+    /// Tools the agent loop should expose to the LLM for `session`.
+    /// Names must already be unique within the merged tool list —
+    /// implementations should prefix with the channel/source (e.g.
+    /// `lark/feishu_get_chat_info`) to avoid collisions with
+    /// builtins or user-configured MCP tools.
+    async fn tool_definitions_for_session(&self, session: &Session) -> Vec<ToolDefinition>;
+}
+
+/// No-op provider: the AgentLoop default when no sidecar MCP is
+/// wired in (TUI standalone, tests, gateway boots without any
+/// `mcp_tunnel`-capable sidecar). Returns an empty tool list for
+/// every session.
+pub struct NoSidecarMcp;
+
+#[async_trait]
+impl SidecarMcpProvider for NoSidecarMcp {
+    async fn tool_definitions_for_session(&self, _session: &Session) -> Vec<ToolDefinition> {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use aura_model::{ChannelType, User};
+    use chrono::Utc;
     use rmcp::model::RequestId;
     use tokio::sync::Mutex;
+
+    fn dummy_session() -> Session {
+        let user = User {
+            id: "u".into(),
+            name: None,
+            channel: ChannelType::tui(),
+        };
+        Session {
+            id: "s".into(),
+            user: user.clone(),
+            channel: user.channel.clone(),
+            messages: vec![],
+            created_at: Utc::now(),
+            last_active: Utc::now(),
+            state: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_sidecar_mcp_returns_empty() {
+        let p = NoSidecarMcp;
+        let session = dummy_session();
+        assert!(
+            p.tool_definitions_for_session(&session).await.is_empty(),
+            "no-op provider must return zero tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_can_return_session_scoped_tools() {
+        // Stub provider that mimics what the gateway-side
+        // SidecarMcpManager will eventually do: return a tool with
+        // a `<channel_type>/<tool_name>` prefix.
+        struct Stub;
+        #[async_trait]
+        impl SidecarMcpProvider for Stub {
+            async fn tool_definitions_for_session(
+                &self,
+                session: &Session,
+            ) -> Vec<ToolDefinition> {
+                vec![ToolDefinition {
+                    name: format!("{}/feishu_get_chat_info", session.user.channel),
+                    description: "stub".into(),
+                    parameters_schema: serde_json::json!({"type": "object"}),
+                }]
+            }
+        }
+
+        let p: Arc<dyn SidecarMcpProvider> = Arc::new(Stub);
+        let session = dummy_session();
+        let tools = p.tool_definitions_for_session(&session).await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "tui/feishu_get_chat_info");
+    }
 
     struct CapturingSender {
         out: Arc<Mutex<Vec<Vec<u8>>>>,

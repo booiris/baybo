@@ -11,6 +11,8 @@ pub mod vault_keys;
 pub use config::{McpFile, McpServerEntry, McpTransportConfig, OAuthConfig, TrustLevelConfig};
 pub use error::{McpError, McpResult};
 pub use reconciler::McpReconciler;
-pub use sidecar::{SidecarSender, SidecarTransport, SidecarTransportError};
+pub use sidecar::{
+    NoSidecarMcp, SidecarMcpProvider, SidecarSender, SidecarTransport, SidecarTransportError,
+};
 pub use tool::McpTool;
 pub use transport::{McpServerSession, connect, connect_sidecar};
