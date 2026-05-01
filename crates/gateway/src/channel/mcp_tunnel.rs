@@ -26,8 +26,10 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use aura_channels::wire::Frame;
 use aura_model::ChannelType;
+use aura_tools::mcp::SidecarSender;
 use dashmap::DashMap;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -50,10 +52,13 @@ pub enum McpTunnelError {
 
 /// Shared registry. One per gateway process; threaded into both
 /// `WsChannelState` (for the inbound forwarding path) and the
-/// agent-side caller that opens tunnels.
-#[derive(Default)]
+/// agent-side caller that opens tunnels. Holds an Arc to
+/// [`ChannelControlRegistry`] so opened tunnels are self-contained
+/// — `McpTunnel::send` doesn't need the registry threaded through
+/// every call site.
 pub struct McpTunnelRouter {
     inbound: DashMap<String, TunnelEntry>,
+    control: Arc<ChannelControlRegistry>,
 }
 
 struct TunnelEntry {
@@ -62,8 +67,11 @@ struct TunnelEntry {
 }
 
 impl McpTunnelRouter {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(control: Arc<ChannelControlRegistry>) -> Self {
+        Self {
+            inbound: DashMap::new(),
+            control,
+        }
     }
 
     /// Mint a new tunnel against `channel_type`. The returned
@@ -79,11 +87,19 @@ impl McpTunnelRouter {
                 tx,
             },
         );
-        McpTunnel {
+        let sender = Arc::new(McpTunnelSender {
+            tunnel_id: tunnel_id.clone(),
+            channel_type: channel_type.clone(),
+            control: Arc::clone(&self.control),
+        });
+        let guard = McpTunnelGuard {
             tunnel_id,
-            channel_type,
-            rx,
             router: Arc::clone(self),
+        };
+        McpTunnel {
+            sender,
+            rx,
+            guard: Some(guard),
         }
     }
 
@@ -128,19 +144,21 @@ impl McpTunnelRouter {
 /// [`Self::send`]. Drop the handle to close — the registry entry is
 /// removed and any in-flight `forward_inbound` returns `false`.
 pub struct McpTunnel {
-    tunnel_id: String,
-    channel_type: ChannelType,
+    sender: Arc<McpTunnelSender>,
     rx: mpsc::Receiver<Vec<u8>>,
-    router: Arc<McpTunnelRouter>,
+    /// Holds the registry-cleanup guard. `Option` so
+    /// [`Self::into_transport_parts`] can transfer ownership to the
+    /// caller when an rmcp `Transport` takes over.
+    guard: Option<McpTunnelGuard>,
 }
 
 impl McpTunnel {
     pub fn id(&self) -> &str {
-        &self.tunnel_id
+        &self.sender.tunnel_id
     }
 
     pub fn channel_type(&self) -> &ChannelType {
-        &self.channel_type
+        &self.sender.channel_type
     }
 
     /// Wait for the next inbound JSON-RPC envelope. Returns `None`
@@ -154,12 +172,38 @@ impl McpTunnel {
     /// `Control(NotConnected)` when the sidecar isn't currently
     /// registered — the agent-side caller should treat this as
     /// transient and retry on the next reconcile tick.
-    pub async fn send(
-        &self,
-        control: &ChannelControlRegistry,
-        payload: Vec<u8>,
-    ) -> Result<(), McpTunnelError> {
-        control
+    pub async fn send(&self, payload: Vec<u8>) -> Result<(), McpTunnelError> {
+        self.sender.send_frame(payload).await
+    }
+
+    /// Decompose the tunnel into the parts an rmcp [`Transport`]
+    /// needs: a cloneable sender (so the `'static` send-future can
+    /// own its handle), the inbound receiver, and the registry-
+    /// cleanup guard. Keep the guard alive for the transport's
+    /// lifetime — dropping it closes the tunnel registry entry.
+    ///
+    /// [`Transport`]: rmcp::transport::Transport
+    pub fn into_transport_parts(
+        mut self,
+    ) -> (Arc<dyn SidecarSender>, mpsc::Receiver<Vec<u8>>, McpTunnelGuard) {
+        let guard = self.guard.take().expect("tunnel guard set in open()");
+        let sender: Arc<dyn SidecarSender> = self.sender.clone();
+        let rx = std::mem::replace(&mut self.rx, mpsc::channel(1).1);
+        (sender, rx, guard)
+    }
+}
+
+/// Outbound half of a tunnel. Cloneable + `Send + Sync` so the rmcp
+/// `Transport::send` future can own a handle.
+pub struct McpTunnelSender {
+    tunnel_id: String,
+    channel_type: ChannelType,
+    control: Arc<ChannelControlRegistry>,
+}
+
+impl McpTunnelSender {
+    async fn send_frame(&self, payload: Vec<u8>) -> Result<(), McpTunnelError> {
+        self.control
             .send(
                 &self.channel_type,
                 Frame::Mcp {
@@ -172,7 +216,23 @@ impl McpTunnel {
     }
 }
 
-impl Drop for McpTunnel {
+#[async_trait]
+impl SidecarSender for McpTunnelSender {
+    async fn send(&self, payload: Vec<u8>) -> Result<(), String> {
+        self.send_frame(payload).await.map_err(|e| e.to_string())
+    }
+}
+
+/// RAII handle that unregisters the tunnel from the router on drop.
+/// Held inside `McpTunnel`, or transferred out via
+/// [`McpTunnel::into_transport_parts`] when an rmcp transport owns
+/// the tunnel's lifetime.
+pub struct McpTunnelGuard {
+    tunnel_id: String,
+    router: Arc<McpTunnelRouter>,
+}
+
+impl Drop for McpTunnelGuard {
     fn drop(&mut self) {
         self.router.close_tunnel(&self.tunnel_id);
     }
@@ -182,9 +242,14 @@ impl Drop for McpTunnel {
 mod tests {
     use super::*;
 
+    fn test_router() -> Arc<McpTunnelRouter> {
+        let control = Arc::new(ChannelControlRegistry::new());
+        Arc::new(McpTunnelRouter::new(control))
+    }
+
     #[tokio::test]
     async fn open_returns_unique_tunnel_ids() {
-        let router = Arc::new(McpTunnelRouter::new());
+        let router = test_router();
         let ct = ChannelType::from("lark");
         let a = router.open(ct.clone());
         let b = router.open(ct);
@@ -193,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_inbound_routes_to_matching_tunnel() {
-        let router = Arc::new(McpTunnelRouter::new());
+        let router = test_router();
         let mut tunnel = router.open(ChannelType::from("lark"));
         assert!(router.forward_inbound(tunnel.id(), b"hello".to_vec()).await,);
         let received = tunnel.next_inbound().await;
@@ -202,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_inbound_drops_unknown_tunnel_silently() {
-        let router = McpTunnelRouter::new();
+        let router = test_router();
         let delivered = router
             .forward_inbound("never-opened", b"orphan".to_vec())
             .await;
@@ -211,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_for_channel_only_drops_matching_tunnels() {
-        let router = Arc::new(McpTunnelRouter::new());
+        let router = test_router();
         let mut lark = router.open(ChannelType::from("lark"));
         let mut weixin = router.open(ChannelType::from("weixin"));
 
@@ -236,7 +301,7 @@ mod tests {
     /// full and the tunnel is dropped concurrently.
     #[tokio::test]
     async fn forward_inbound_does_not_deadlock_when_buffer_full_and_tunnel_drops() {
-        let router = Arc::new(McpTunnelRouter::new());
+        let router = test_router();
         let tunnel = router.open(ChannelType::from("lark"));
         let id = tunnel.id().to_string();
 
@@ -272,12 +337,103 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_tunnel_unregisters_it() {
-        let router = Arc::new(McpTunnelRouter::new());
+        let router = test_router();
         let id = {
             let tunnel = router.open(ChannelType::from("lark"));
             tunnel.id().to_string()
         };
         // Tunnel dropped — registry entry should be gone.
         assert!(!router.forward_inbound(&id, b"x".to_vec()).await);
+    }
+
+    /// `into_transport_parts` hands the cleanup guard to the caller;
+    /// the registry entry stays alive as long as the guard does.
+    #[tokio::test]
+    async fn into_transport_parts_keeps_tunnel_alive_via_guard() {
+        let router = test_router();
+        let tunnel = router.open(ChannelType::from("lark"));
+        let id = tunnel.id().to_string();
+        let (sender, _rx, guard) = tunnel.into_transport_parts();
+
+        // Tunnel is still routable while the guard lives, even
+        // though the original `McpTunnel` was decomposed.
+        assert!(router.forward_inbound(&id, b"x".to_vec()).await);
+        // Sender remains usable across clones (rmcp `Transport::send`
+        // future requires `'static`).
+        let _ = Arc::clone(&sender);
+
+        drop(guard);
+        // After the guard drops the registry entry is gone.
+        assert!(!router.forward_inbound(&id, b"y".to_vec()).await);
+    }
+
+    #[tokio::test]
+    async fn sender_send_returns_not_connected_error_string() {
+        let router = test_router();
+        let tunnel = router.open(ChannelType::from("lark"));
+        let (sender, _rx, _guard) = tunnel.into_transport_parts();
+        // No sidecar registered for `lark`, so SidecarSender::send
+        // surfaces the `NotConnected` error as a string.
+        let err = sender.send(b"x".to_vec()).await.unwrap_err();
+        assert!(err.contains("no sidecar"), "got: {err}");
+    }
+
+    /// End-to-end wiring: register a fake sidecar pump on the
+    /// control registry, then drive the tunnel through an
+    /// `aura_tools::SidecarTransport`. Outbound rmcp messages
+    /// arrive as `Frame::Mcp` with the right tunnel_id; inbound
+    /// bytes round-trip through `forward_inbound`.
+    #[tokio::test]
+    async fn end_to_end_through_sidecar_transport() {
+        use aura_tools::mcp::SidecarTransport;
+        use rmcp::service::{RoleClient, RxJsonRpcMessage, TxJsonRpcMessage};
+        use rmcp::transport::Transport;
+
+        let control = Arc::new(ChannelControlRegistry::new());
+        let router = Arc::new(McpTunnelRouter::new(Arc::clone(&control)));
+        let ct = ChannelType::from("lark");
+
+        // Fake sidecar pump.
+        let (pump_tx, mut pump_rx) = mpsc::channel::<Frame>(8);
+        control.register(ct.clone(), pump_tx);
+
+        let tunnel = router.open(ct.clone());
+        let tunnel_id = tunnel.id().to_string();
+        let (sender, rx, _guard) = tunnel.into_transport_parts();
+        let mut transport = SidecarTransport::new(sender, rx);
+
+        // Outbound: a request goes through, lands on the pump as
+        // Frame::Mcp with the right tunnel_id and a JSON payload.
+        let req: TxJsonRpcMessage<RoleClient> = serde_json::from_value(
+            serde_json::json!({"jsonrpc":"2.0","id":42,"method":"tools/list"}),
+        )
+        .unwrap();
+        transport.send(req).await.expect("transport send");
+
+        let frame = pump_rx.recv().await.expect("pump receives frame");
+        match frame {
+            Frame::Mcp { tunnel_id: id, payload } => {
+                assert_eq!(id, tunnel_id);
+                let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(v["id"], 42);
+                assert_eq!(v["method"], "tools/list");
+            }
+            other => panic!("unexpected outbound frame: {other:?}"),
+        }
+
+        // Inbound: bytes pushed through forward_inbound resurface as
+        // a typed Response on the rmcp side.
+        let resp_bytes = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "tools": [] }
+        }))
+        .unwrap();
+        assert!(router.forward_inbound(&tunnel_id, resp_bytes).await);
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), transport.receive())
+            .await
+            .expect("receive resolves")
+            .expect("got message");
+        assert!(matches!(received, RxJsonRpcMessage::<RoleClient>::Response(_)));
     }
 }

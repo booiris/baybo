@@ -36,7 +36,7 @@ pub use control::{ChannelControlError, ChannelControlRegistry};
 pub use dedup::InboundDedup;
 pub use diagnose::{ChannelCapabilities, DiagnoseError, DiagnoseReport, DiagnoseRouter};
 pub use history::TuiHistoryStore;
-pub use mcp_tunnel::{McpTunnel, McpTunnelError, McpTunnelRouter};
+pub use mcp_tunnel::{McpTunnel, McpTunnelError, McpTunnelGuard, McpTunnelRouter, McpTunnelSender};
 pub use route::routes;
 pub use session_resolver::ChannelSessionResolver;
 pub use state::WsChannelState;

@@ -349,7 +349,9 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     ));
     let diagnose_router = Arc::new(aura_gateway::channel::DiagnoseRouter::new());
     let channel_capabilities = Arc::new(aura_gateway::channel::ChannelCapabilities::new());
-    let mcp_tunnel_router = Arc::new(aura_gateway::channel::McpTunnelRouter::new());
+    let mcp_tunnel_router = Arc::new(aura_gateway::channel::McpTunnelRouter::new(Arc::clone(
+        &channel_control,
+    )));
     {
         let reconciler = Arc::clone(&bot_reconciler);
         let shutdown_for_reconciler = shutdown.clone();
