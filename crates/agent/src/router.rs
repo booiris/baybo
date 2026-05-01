@@ -177,6 +177,7 @@ impl Router {
             id: event.user_id.clone(),
             name: None,
             channel: event.channel.clone(),
+            bot_id: None,
         };
 
         debug!(

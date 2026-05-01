@@ -45,10 +45,12 @@ impl McpServerSession {
 
     /// Call a tool on the connected MCP server.
     ///
-    /// `aura_session_id`, when `Some(id)`, is forwarded through
-    /// `_meta.auraSessionId` so a sidecar that hosts a multi-bot
-    /// MCP server can map the call to the right tenant. The
-    /// session id semantics match `aura_model::Session::id`.
+    /// `meta` carries the optional Aura-internal `_meta` keys
+    /// forwarded to the MCP server: `auraSessionId` for traceability,
+    /// `auraBotId` so a sidecar hosting a multi-bot MCP server
+    /// (e.g. Lark) can disambiguate which tenant the call belongs
+    /// to. Both default to `None`; user-configured stdio/http MCP
+    /// servers normally don't care about either.
     ///
     /// `params` is the LLM-supplied JSON. An object becomes the
     /// rmcp `arguments`; null means "no arguments". Anything else
@@ -58,10 +60,28 @@ impl McpServerSession {
         &self,
         name: &str,
         params: Value,
-        aura_session_id: Option<&str>,
+        meta: CallToolMeta<'_>,
     ) -> Result<ToolOutput, String> {
-        call_tool_via_peer(&self.peer(), name, params, aura_session_id).await
+        call_tool_via_peer(&self.peer(), name, params, meta).await
     }
+}
+
+/// Aura-internal MCP `_meta` keys passed with each `tools/call`.
+/// Both fields are optional — user-configured MCP servers (stdio,
+/// HTTP) typically don't care, but sidecar-hosted servers consume
+/// them for cross-tenant routing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallToolMeta<'a> {
+    /// Aura session id. Lands at `_meta.auraSessionId`. Useful for
+    /// sidecar-side audit logging and for sidecars that grow their
+    /// own session→bot lookup.
+    pub aura_session_id: Option<&'a str>,
+    /// Sidecar tenant id (e.g. Lark `app_id`). Lands at
+    /// `_meta.auraBotId`. The sidecar's MCP server resolver uses
+    /// this to pick the right bot when multiple are connected,
+    /// instead of falling back to slice 2A's structured "ambiguous"
+    /// error.
+    pub aura_bot_id: Option<&'a str>,
 }
 
 /// Invoke a tool on an already-connected rmcp peer.
@@ -75,7 +95,7 @@ pub async fn call_tool_via_peer(
     peer: &Peer<RoleClient>,
     name: &str,
     params: Value,
-    aura_session_id: Option<&str>,
+    meta: CallToolMeta<'_>,
 ) -> Result<ToolOutput, String> {
     let arguments = match params {
         Value::Object(map) => Some(map),
@@ -91,11 +111,19 @@ pub async fn call_tool_via_peer(
     if let Some(args) = arguments {
         request = request.with_arguments(args);
     }
-    if let Some(id) = aura_session_id {
-        let mut meta = Meta::new();
-        meta.0
-            .insert("auraSessionId".into(), Value::String(id.to_string()));
-        request.meta = Some(meta);
+    if meta.aura_session_id.is_some() || meta.aura_bot_id.is_some() {
+        let mut rmcp_meta = Meta::new();
+        if let Some(id) = meta.aura_session_id {
+            rmcp_meta
+                .0
+                .insert("auraSessionId".into(), Value::String(id.to_string()));
+        }
+        if let Some(id) = meta.aura_bot_id {
+            rmcp_meta
+                .0
+                .insert("auraBotId".into(), Value::String(id.to_string()));
+        }
+        request.meta = Some(rmcp_meta);
     }
     let result = peer
         .call_tool(request)

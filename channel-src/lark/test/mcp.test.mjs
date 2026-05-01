@@ -229,11 +229,12 @@ test("LarkMcpServer: tools/call with no live bot returns a tool error", async ()
   await server.shutdown();
 });
 
-test("LarkMcpServer: multi-bot routing fails closed with structured tool error", async () => {
+test("LarkMcpServer: multi-bot fails closed when no auraBotId is supplied", async () => {
   // Codex review regression: when multiple bots are live, a tool
   // call from bot B's user must NOT silently execute under bot A's
   // credentials and return A's tenant metadata. Slice 2A fails
-  // closed; slice 2B will route via `_meta.auraSessionId`.
+  // closed; slice 2F lets a caller resolve directly via
+  // `_meta.auraBotId`. Without that meta we still fail closed.
   const server = new LarkMcpServer({
     logger: noopLogger,
     channelResolver: () => ({ kind: "ambiguous", bot_count: 3 }),
@@ -260,8 +261,70 @@ test("LarkMcpServer: multi-bot routing fails closed with structured tool error",
   const last = decodeJson(reply.sent[reply.sent.length - 1]);
   assert.equal(last.id, 6);
   assert.equal(last.result.isError, true);
-  assert.match(last.result.content[0].text, /multi-bot routing not yet supported/);
+  assert.match(last.result.content[0].text, /multi-bot routing requires an .auraBotId. on the call/);
   assert.match(last.result.content[0].text, /3 bots live/);
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: tools/call routes by _meta.auraBotId in multi-bot mode", async () => {
+  // Slice 2F: when the caller supplies `_meta.auraBotId`, the
+  // resolver picks that bot directly even with multiple connected.
+  // This proves the `auraBotId` field reaches the resolver and the
+  // resolver consumes it. The stub records which bot was asked for.
+  let resolverInput = null;
+  const channel = stubChannel(async (chatId) => ({
+    chatId,
+    name: "BotB-tenant",
+    chatType: "group",
+    memberCount: 7,
+  }));
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: (input) => {
+      resolverInput = input;
+      // Mimic LarkPlatform's slice-2F resolver: route to the named
+      // bot when present, otherwise fall back to the slice-2A
+      // 3-state behaviour.
+      if (input.auraBotId === "cli_bot_b") {
+        return { kind: "ok", channel };
+      }
+      return { kind: "ambiguous", bot_count: 2 };
+    },
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-route",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_chat_info",
+        arguments: { chat_id: "oc_b" },
+        _meta: {
+          auraBotId: "cli_bot_b",
+          auraSessionId: "aura-session-77",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "tools/call routed reply");
+
+  assert.deepEqual(resolverInput, {
+    auraBotId: "cli_bot_b",
+    auraSessionId: "aura-session-77",
+  });
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 9);
+  assert.equal(last.result.isError, undefined);
+  const parsed = JSON.parse(last.result.content[0].text);
+  assert.equal(parsed.name, "BotB-tenant");
 
   await server.shutdown();
 });

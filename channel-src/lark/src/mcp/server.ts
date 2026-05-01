@@ -6,20 +6,36 @@ import type * as lark from "@larksuiteoapi/node-sdk";
 
 import { TunnelMcpTransport } from "./transport.js";
 
+/** Aura-internal `_meta` keys forwarded on every `tools/call`.
+ *
+ * - `auraBotId`: bot tenant id (e.g. Lark `app_id`) the originating
+ *   user reached us through. Set on inbound sidecar messages from
+ *   slice 2F-a; lets multi-bot deployments route the call to the
+ *   right tenant directly.
+ * - `auraSessionId`: Aura session id, mostly for traceability. Could
+ *   feed a sidecar-side session→bot lookup if we ever need one.
+ *
+ * Both are optional — TUI / HTTP sessions don't ride a sidecar bot,
+ * so the resolver still needs the slice 2A fallback (single-bot
+ * `ok`, multi-bot `ambiguous`). */
+export interface LarkResolverInput {
+  auraBotId?: string;
+  auraSessionId?: string;
+}
+
 /** Result of resolving which `LarkChannel` an MCP tool call should
- * run against. Slice 2A routes only single-bot deployments; slice 2B
- * adds `_meta.auraSessionId` extraction so calls from a specific
- * agent session find the matching bot. Until then, multi-bot
- * deployments fail closed with `Ambiguous` rather than silently
- * routing through the first bot — that would leak cross-tenant data
- * (a request from bot B's user executing under bot A's credentials,
- * returning A's tenant metadata to B's user). */
+ * run against. The `ambiguous` variant is the fail-closed fallback
+ * when no `auraBotId` is supplied AND multiple bots are connected;
+ * it intentionally rejects the call rather than silently routing
+ * through whichever bot we picked first (cross-tenant leak). */
 export type LarkChannelResolution =
   | { kind: "ok"; channel: lark.LarkChannel }
   | { kind: "none" }
   | { kind: "ambiguous"; bot_count: number };
 
-export type LarkChannelResolver = () => LarkChannelResolution;
+export type LarkChannelResolver = (
+  input: LarkResolverInput,
+) => LarkChannelResolution;
 
 export interface LarkMcpServerOpts {
   logger: Logger;
@@ -105,8 +121,18 @@ export class LarkMcpServer {
             .describe("Feishu chat id (e.g. `oc_xxx` for groups, `p2p_xxx` for DMs)"),
         },
       },
-      async (args) => {
-        const resolution = this.opts.channelResolver();
+      async (args, extra) => {
+        const meta = extra?._meta as
+          | { auraBotId?: unknown; auraSessionId?: unknown }
+          | undefined;
+        const input: LarkResolverInput = {};
+        if (typeof meta?.auraBotId === "string") {
+          input.auraBotId = meta.auraBotId;
+        }
+        if (typeof meta?.auraSessionId === "string") {
+          input.auraSessionId = meta.auraSessionId;
+        }
+        const resolution = this.opts.channelResolver(input);
         if (resolution.kind === "none") {
           return toolError(
             "no Lark bot is currently connected; register one with `aura channel add lark` and retry",
@@ -114,7 +140,7 @@ export class LarkMcpServer {
         }
         if (resolution.kind === "ambiguous") {
           return toolError(
-            `multi-bot routing not yet supported (${resolution.bot_count} bots live); upgrade to the slice with \`_meta.auraSessionId\` injection in the agent's MCP client`,
+            `multi-bot routing requires an \`auraBotId\` on the call (${resolution.bot_count} bots live); none was provided and we will not silently pick one`,
           );
         }
         const channel = resolution.channel;

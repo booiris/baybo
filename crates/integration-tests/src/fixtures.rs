@@ -92,6 +92,7 @@ impl SessionBuilder {
                 id: self.user_id,
                 name: self.user_name,
                 channel: self.channel.clone(),
+            bot_id: None,
             },
             channel: self.channel,
             messages: self.messages,

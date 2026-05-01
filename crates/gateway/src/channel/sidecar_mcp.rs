@@ -203,12 +203,18 @@ impl SidecarMcpProvider for SidecarMcpManager {
         };
         let peer = peer_session?;
 
-        // The auraSessionId meta lets the sidecar map the call
-        // back to a specific bot in multi-bot deployments. Until
-        // the sidecar grows that lookup, slice 2A's
-        // `LarkChannelResolution::ambiguous` still fails closed.
+        // `auraSessionId` rides every call for traceability;
+        // `auraBotId` (set on inbound sidecar messages, threaded
+        // through `Session::user::bot_id`) lets the sidecar's MCP
+        // server resolver pick the right tenant directly. Slice
+        // 2A's `LarkChannelResolution::ambiguous` is the safety
+        // net for sessions without a bot_id (TUI, HTTP, etc).
+        let meta = aura_tools::mcp::CallToolMeta {
+            aura_session_id: Some(session.id.as_str()),
+            aura_bot_id: session.user.bot_id.as_deref(),
+        };
         Some(
-            aura_tools::mcp::call_tool_via_peer(&peer, inner_name, params, Some(&session.id))
+            aura_tools::mcp::call_tool_via_peer(&peer, inner_name, params, meta)
                 .await
                 .map_err(|e| format!("sidecar mcp {name}: {e}")),
         )
@@ -229,6 +235,7 @@ mod tests {
             id: "u".into(),
             name: None,
             channel: channel.clone(),
+            bot_id: None,
         };
         Session {
             id: "s".into(),

@@ -595,6 +595,15 @@ async fn run_inbound_loop(
                             id: wire_msg.user_id.clone(),
                             name: None,
                             channel: channel_type.clone(),
+                            // Sidecars carry the bot tenant on every
+                            // inbound message; thread it through so
+                            // multi-bot MCP routing can disambiguate
+                            // (`_meta.auraBotId` injection downstream).
+                            bot_id: if wire_msg.bot_id.is_empty() {
+                                None
+                            } else {
+                                Some(wire_msg.bot_id.clone())
+                            },
                         };
                         let content =
                             wire_to_content_blocks(wire_msg.content, wire_msg.attachments);

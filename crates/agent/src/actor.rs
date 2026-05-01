@@ -233,6 +233,15 @@ impl AgentActor {
         let message_clone = incoming.message.clone();
         let content = incoming.message.content;
 
+        // Refresh the session's bot context from the most recent
+        // inbound. Sidecars carry `bot_id` on every `Frame::Message`;
+        // the session itself was created without one (the resolver
+        // keys by channel + user, not bot). Treating the latest
+        // message as authoritative for bot context lets multi-bot
+        // MCP routing land the right `_meta.auraBotId` at tool
+        // dispatch time without reshaping `ChannelSessionStore`.
+        self.session.user.bot_id = incoming.message.sender.bot_id.clone();
+
         // PreMessage hook
         let mut hook_ctx = HookContext {
             session_id: self.session.id.clone(),

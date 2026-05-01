@@ -113,6 +113,7 @@ impl TuiAdapter {
                 id: user_id,
                 name: None,
                 channel: ChannelType::tui(),
+                bot_id: None,
             },
             shutdown: Arc::new(Notify::new()),
             slash_handler: None,

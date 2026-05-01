@@ -12,6 +12,15 @@ pub struct User {
     pub id: String,
     pub name: Option<String>,
     pub channel: ChannelType,
+    /// Sidecar tenant id this user reached us through, when known.
+    /// Set on inbound messages from multi-bot sidecars (e.g. Lark
+    /// where a single sidecar serves multiple bot apps); `None` for
+    /// TUI / HTTP / single-tenant channels. Threaded through to
+    /// MCP `tools/call` as `_meta.auraBotId` so a sidecar's MCP
+    /// server can route to the right tenant in multi-bot
+    /// deployments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_id: Option<String>,
 }
 
 /// Open-ended channel identifier, stored as a snake_case string.

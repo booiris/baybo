@@ -31,6 +31,7 @@ fn message_with(text: &str) -> Message {
             id: "user-it".into(),
             name: Some("test".into()),
             channel: ChannelType::tui(),
+            bot_id: None,
         },
         content: vec![ContentBlock::Text(text.into())],
         timestamp: Utc::now(),

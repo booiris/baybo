@@ -82,12 +82,24 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     this.mcpServer = new LarkMcpServer({
       logger,
       // Slice 2A: single-bot deployments resolve to the only bot.
-      // Multi-bot fails closed with `ambiguous` until slice 2B wires
-      // `_meta.auraSessionId` extraction from the JSON-RPC envelope —
-      // silently routing through the first bot would leak cross-
-      // tenant data (a request from bot B's user executing under bot
-      // A's credentials).
-      channelResolver: () => {
+      // Multi-bot disambiguation:
+      //   1. If the call carries `_meta.auraBotId` and that bot is
+      //      live, route to it directly. This is the slice 2F path;
+      //      the gateway threads `Session::user::bot_id` through.
+      //   2. Otherwise, fall back to slice 2A's three-state behaviour:
+      //      single-bot → `ok`, none → `none`, multi-bot → `ambiguous`
+      //      (fail closed; silently picking a bot would leak cross-
+      //      tenant data).
+      channelResolver: ({ auraBotId }) => {
+        if (auraBotId !== undefined) {
+          const state = this.bots.get(auraBotId);
+          if (state) return { kind: "ok", channel: state.handle };
+          // The supplied bot id isn't connected. Don't silently fall
+          // through to single-bot — the caller specifically asked for
+          // a bot we don't have. Surface as `none` so the tool error
+          // matches "the requested tenant isn't reachable".
+          return { kind: "none" };
+        }
         const handles = [...this.bots.values()].map((s) => s.handle);
         if (handles.length === 0) return { kind: "none" };
         if (handles.length === 1) return { kind: "ok", channel: handles[0]! };

@@ -100,6 +100,7 @@ fn seeded_session_manager(ids: &[&str]) -> (Arc<SessionManager>, Vec<String>) {
                 id: "user-1".to_string(),
                 name: Some("Alice".to_string()),
                 channel: ChannelType::tui(),
+                bot_id: None,
             },
             channel: ChannelType::tui(),
             messages: vec![],

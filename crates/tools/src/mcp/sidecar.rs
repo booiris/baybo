@@ -217,6 +217,7 @@ mod tests {
             id: "u".into(),
             name: None,
             channel: ChannelType::tui(),
+            bot_id: None,
         };
         Session {
             id: "s".into(),
@@ -472,12 +473,15 @@ mod tests {
                         let _ = server_out_tx.send(serde_json::to_vec(&resp).unwrap()).await;
                     }
                     "tools/call" => {
-                        // Echo the inbound `_meta.auraSessionId` back
-                        // through the result text so the assertion
-                        // below proves the slice 2A → 2E injection
-                        // actually lands at the server.
+                        // Echo back both `_meta` keys so the
+                        // assertion below proves the slice 2A → 2E
+                        // → 2F injection lands at the server.
                         let id = v["id"].clone();
                         let session_meta = v["params"]["_meta"]["auraSessionId"]
+                            .as_str()
+                            .unwrap_or("<missing>")
+                            .to_string();
+                        let bot_meta = v["params"]["_meta"]["auraBotId"]
                             .as_str()
                             .unwrap_or("<missing>")
                             .to_string();
@@ -485,7 +489,7 @@ mod tests {
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": {
-                                "content": [{ "type": "text", "text": format!("session={session_meta}") }]
+                                "content": [{ "type": "text", "text": format!("session={session_meta} bot={bot_meta}") }]
                             }
                         });
                         let _ = server_out_tx.send(serde_json::to_vec(&resp).unwrap()).await;
@@ -508,17 +512,23 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "stub_tool");
 
-        // Dispatch a tools/call with a session id and assert the
-        // server saw it on `_meta.auraSessionId`.
+        // Dispatch a tools/call with a session id + bot id and
+        // assert the server saw both on `_meta`.
+        let meta = crate::mcp::CallToolMeta {
+            aura_session_id: Some("aura-session-42"),
+            aura_bot_id: Some("cli_bot_xyz"),
+        };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            session.call_tool("stub_tool", serde_json::json!({}), Some("aura-session-42")),
+            session.call_tool("stub_tool", serde_json::json!({}), meta),
         )
         .await
         .expect("call_tool within 5s")
         .expect("call_tool ok");
         match result {
-            ToolOutput::Text(t) => assert_eq!(t, "session=aura-session-42"),
+            ToolOutput::Text(t) => {
+                assert_eq!(t, "session=aura-session-42 bot=cli_bot_xyz");
+            }
             other => panic!("expected Text, got {other:?}"),
         }
 
