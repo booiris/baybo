@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use aura_model::ChannelType;
 use chrono::Utc;
@@ -16,13 +18,30 @@ impl LibsqlChannelBotStore {
     }
 }
 
+fn parse_metadata(raw: &str) -> HashMap<String, String> {
+    if raw.is_empty() {
+        return HashMap::new();
+    }
+    serde_json::from_str(raw).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "channel_bots.metadata is not valid JSON; falling back to empty");
+        HashMap::new()
+    })
+}
+
+fn serialize_metadata(
+    metadata: &HashMap<String, String>,
+) -> std::result::Result<String, StorageError> {
+    serde_json::to_string(metadata)
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("serialize metadata: {e}")))
+}
+
 #[async_trait]
 impl ChannelBotStore for LibsqlChannelBotStore {
     async fn list_live(&self, channel_type: &ChannelType) -> Result<Vec<ChannelBotRow>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT channel_type, bot_id, created_at FROM channel_bots
+                "SELECT channel_type, bot_id, created_at, metadata FROM channel_bots
                  WHERE channel_type = ?1 AND deleted_at IS NULL
                  ORDER BY created_at DESC",
                 libsql::params![channel_type.as_str().to_string()],
@@ -44,10 +63,14 @@ impl ChannelBotStore for LibsqlChannelBotStore {
             let created_at: i64 = row
                 .get(2)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let metadata_raw: String = row
+                .get(3)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             out.push(ChannelBotRow {
                 channel_type: ChannelType::from(channel_type_s.as_str()),
                 bot_id,
                 created_at,
+                metadata: parse_metadata(&metadata_raw),
             });
         }
         Ok(out)
@@ -57,7 +80,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT channel_type, bot_id, created_at FROM channel_bots
+                "SELECT channel_type, bot_id, created_at, metadata FROM channel_bots
                  WHERE channel_type = ?1 AND bot_id = ?2 AND deleted_at IS NULL",
                 libsql::params![channel_type.as_str().to_string(), bot_id.to_string()],
             )
@@ -79,26 +102,42 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let created_at: i64 = row
             .get(2)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+        let metadata_raw: String = row
+            .get(3)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
         Ok(Some(ChannelBotRow {
             channel_type: ChannelType::from(channel_type_s.as_str()),
             bot_id,
             created_at,
+            metadata: parse_metadata(&metadata_raw),
         }))
     }
 
-    async fn put(&self, channel_type: &ChannelType, bot_id: &str) -> Result<()> {
+    async fn put(
+        &self,
+        channel_type: &ChannelType,
+        bot_id: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
         let now = Utc::now().timestamp();
+        let metadata_json = serialize_metadata(&metadata)?;
         let conn = self.pool.conn();
         conn.execute(
-            "INSERT INTO channel_bots (channel_type, bot_id, created_at, deleted_at)
-             VALUES (?1, ?2, ?3, NULL)
+            "INSERT INTO channel_bots (channel_type, bot_id, created_at, metadata, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, NULL)
              ON CONFLICT(channel_type, bot_id) DO UPDATE SET
                  created_at = CASE
                      WHEN channel_bots.deleted_at IS NULL THEN channel_bots.created_at
                      ELSE excluded.created_at
                  END,
+                 metadata = excluded.metadata,
                  deleted_at = NULL",
-            libsql::params![channel_type.as_str().to_string(), bot_id.to_string(), now,],
+            libsql::params![
+                channel_type.as_str().to_string(),
+                bot_id.to_string(),
+                now,
+                metadata_json,
+            ],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql upsert: {e}")))?;
@@ -141,8 +180,14 @@ mod tests {
     async fn put_then_list_and_get() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelBotStore::new(pool);
-        store.put(&ChannelType::telegram(), "alpha").await.unwrap();
-        store.put(&ChannelType::telegram(), "beta").await.unwrap();
+        store
+            .put(&ChannelType::telegram(), "alpha", HashMap::new())
+            .await
+            .unwrap();
+        store
+            .put(&ChannelType::telegram(), "beta", HashMap::new())
+            .await
+            .unwrap();
 
         let rows = store.list_live(&ChannelType::telegram()).await.unwrap();
         let ids: Vec<&str> = rows.iter().map(|r| r.bot_id.as_str()).collect();
@@ -165,7 +210,10 @@ mod tests {
     async fn delete_hides_then_put_revives() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelBotStore::new(pool);
-        store.put(&ChannelType::telegram(), "alpha").await.unwrap();
+        store
+            .put(&ChannelType::telegram(), "alpha", HashMap::new())
+            .await
+            .unwrap();
         store
             .delete(&ChannelType::telegram(), "alpha")
             .await
@@ -177,7 +225,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        store.put(&ChannelType::telegram(), "alpha").await.unwrap();
+        store
+            .put(&ChannelType::telegram(), "alpha", HashMap::new())
+            .await
+            .unwrap();
         assert!(
             store
                 .get(&ChannelType::telegram(), "alpha")
@@ -191,14 +242,20 @@ mod tests {
     async fn put_on_live_row_is_noop() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelBotStore::new(pool);
-        store.put(&ChannelType::telegram(), "alpha").await.unwrap();
+        store
+            .put(&ChannelType::telegram(), "alpha", HashMap::new())
+            .await
+            .unwrap();
         let first = store
             .get(&ChannelType::telegram(), "alpha")
             .await
             .unwrap()
             .unwrap();
         // Second put — created_at must not change on a live-row conflict.
-        store.put(&ChannelType::telegram(), "alpha").await.unwrap();
+        store
+            .put(&ChannelType::telegram(), "alpha", HashMap::new())
+            .await
+            .unwrap();
         let second = store
             .get(&ChannelType::telegram(), "alpha")
             .await
@@ -211,8 +268,14 @@ mod tests {
     async fn channel_types_are_isolated() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelBotStore::new(pool);
-        store.put(&ChannelType::telegram(), "x").await.unwrap();
-        store.put(&ChannelType::discord(), "x").await.unwrap();
+        store
+            .put(&ChannelType::telegram(), "x", HashMap::new())
+            .await
+            .unwrap();
+        store
+            .put(&ChannelType::discord(), "x", HashMap::new())
+            .await
+            .unwrap();
         assert_eq!(
             store
                 .list_live(&ChannelType::telegram())

@@ -6,6 +6,7 @@ use std::time::Duration;
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(600);
 
 use aura_channels::registration::{Prompter, RegistrationResult};
+use aura_channels::vault_keys;
 use aura_gateway::SidecarRuntime;
 use aura_model::ChannelType;
 use aura_security::SecretVault;
@@ -171,8 +172,24 @@ impl Prompter for CliPrompter {
     }
 }
 
-fn secret_name(channel_type: &ChannelType, bot_id: &str) -> String {
-    format!("channel.{}.bot.{}.token", channel_type.as_str(), bot_id)
+/// Per-key validation for aux metadata + secret keys. Mirrors
+/// [`validate_bot_id`]'s charset (plus `.` so dotted-key conventions
+/// like `oauth.refresh` round-trip cleanly through the vault prefix).
+fn validate_aux_key(kind: &str, key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 64 {
+        return Err(CliError::Config(format!(
+            "{kind} key must be 1-64 characters: '{key}'"
+        )));
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(CliError::Config(format!(
+            "{kind} key may contain only alphanumerics, '-', '_', '.': '{key}'"
+        )));
+    }
+    Ok(())
 }
 
 fn installed_runtime() -> Result<SidecarRuntime> {
@@ -196,8 +213,14 @@ async fn persist_bot_registration(
     result: &RegistrationResult,
 ) -> Result<()> {
     validate_bot_id(&result.bot_id)?;
+    for key in result.metadata.keys() {
+        validate_aux_key("metadata", key)?;
+    }
+    for key in result.secrets.keys() {
+        validate_aux_key("secret", key)?;
+    }
 
-    let key = secret_name(ct, &result.bot_id);
+    let key = vault_keys::primary_token(ct, &result.bot_id);
     let token = result.token.clone();
     retry_on_busy("vault.store_secret", || {
         vault.store_secret(&key, token.as_bytes())
@@ -205,12 +228,29 @@ async fn persist_bot_registration(
     .await
     .map_err(|e| CliError::Manager(format!("store secret '{key}' in vault: {e}")))?;
 
+    // Auxiliary credentials (Lark `app_secret`, etc.) ride the same
+    // vault as the primary token so they're encrypted at rest and
+    // redacted in logs. The `config.` prefix is server-validated by
+    // the gateway when it merges them into `Frame::StartBot.metadata`,
+    // so a stale config key from a previous registration can't sneak
+    // back in if we don't sweep it here — `remove_bot` does that via
+    // `bot_vault_prefix`.
+    for (config_key, value) in &result.secrets {
+        let name = vault_keys::config(ct, &result.bot_id, config_key);
+        let bytes = value.clone().into_bytes();
+        retry_on_busy("vault.store_secret", || vault.store_secret(&name, &bytes))
+            .await
+            .map_err(|e| CliError::Manager(format!("store secret '{name}' in vault: {e}")))?;
+    }
+
     let ct_for_put = ct.clone();
     let bot_id_owned = result.bot_id.clone();
+    let metadata_owned = result.metadata.clone();
     retry_on_busy("channel_bots.put", || {
         let ct = ct_for_put.clone();
         let id = bot_id_owned.clone();
-        async move { store.put(&ct, &id).await }
+        let metadata = metadata_owned.clone();
+        async move { store.put(&ct, &id, metadata).await }
     })
     .await
     .map_err(|e| CliError::Manager(format!("register bot metadata: {e}")))?;
@@ -320,12 +360,18 @@ async fn remove_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     })
     .await
     .map_err(|e| CliError::Manager(format!("soft-delete bot metadata: {e}")))?;
-    let secret_name_owned = secret_name(&ct, &bot_id);
-    retry_on_busy("vault.delete_secret", || {
-        vault.delete_secret(&secret_name_owned)
+    // Sweep the entire per-bot vault namespace in one shot — primary
+    // token, registration-time `config.*` credentials, and any
+    // runtime-minted `user.*` UATs. Without this, a future
+    // re-registration under the same `bot_id` would resurrect the
+    // soft-deleted secrets the SDK had stashed for OAuth flows
+    // (Codex review finding: orphan namespaces survive removal).
+    let prefix = vault_keys::bot_prefix(&ct, &bot_id);
+    retry_on_busy("vault.delete_secrets_with_prefix", || {
+        vault.delete_secrets_with_prefix(&prefix)
     })
     .await
-    .map_err(|e| CliError::Manager(format!("soft-delete vault token: {e}")))?;
+    .map_err(|e| CliError::Manager(format!("sweep vault prefix '{prefix}': {e}")))?;
 
     let human = format!(
         "Deregistered {} bot '{}'. A running gateway will stop it within a few seconds.",
@@ -383,13 +429,15 @@ mod tests {
         let result = RegistrationResult {
             bot_id: "123456789".into(),
             token: "123456789:hunter2".into(),
+            metadata: std::collections::HashMap::new(),
+            secrets: std::collections::HashMap::new(),
         };
 
         persist_bot_registration(&vault, &store, &channel_type, &result)
             .await
             .unwrap();
 
-        let key = secret_name(&channel_type, "123456789");
+        let key = vault_keys::primary_token(&channel_type, "123456789");
         let saved = vault.get_secret(&key).await.unwrap().unwrap();
         assert_eq!(saved.as_bytes(), result.token.as_bytes());
         assert!(
@@ -398,6 +446,124 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_routes_metadata_to_row_and_secrets_to_vault() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store: Arc<dyn ChannelBotStore> = Arc::new(LibsqlChannelBotStore::new(pool));
+        let vault = Arc::new(SecretVault::new(
+            EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap(),
+            Arc::new(MemorySecretStore::new()),
+        ));
+        let channel_type = ChannelType::from("lark");
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("base_url".into(), "https://open.feishu.cn".into());
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert("app_secret".into(), "shh-app".into());
+        secrets.insert("encrypt_key".into(), "shh-encrypt".into());
+
+        let result = RegistrationResult {
+            bot_id: "lark-bot".into(),
+            token: "primary-token".into(),
+            metadata,
+            secrets,
+        };
+        persist_bot_registration(&vault, &store, &channel_type, &result)
+            .await
+            .unwrap();
+
+        // Non-secret metadata round-trips on the row, in the clear.
+        let row = store
+            .get(&channel_type, "lark-bot")
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            row.metadata.get("base_url").map(String::as_str),
+            Some("https://open.feishu.cn"),
+        );
+        // Secret-shaped fields land in the vault under per-key
+        // `config.*` names — never in `channel_bots.metadata`.
+        assert!(!row.metadata.contains_key("app_secret"));
+        let app_secret = vault
+            .get_secret(&vault_keys::config(&channel_type, "lark-bot", "app_secret"))
+            .await
+            .unwrap()
+            .expect("app_secret in vault");
+        assert_eq!(app_secret.as_bytes(), b"shh-app");
+        let encrypt_key = vault
+            .get_secret(&vault_keys::config(
+                &channel_type,
+                "lark-bot",
+                "encrypt_key",
+            ))
+            .await
+            .unwrap()
+            .expect("encrypt_key in vault");
+        assert_eq!(encrypt_key.as_bytes(), b"shh-encrypt");
+    }
+
+    #[tokio::test]
+    async fn remove_bot_sweeps_per_bot_vault_namespace() {
+        // Codex review regression: deregistering a bot must not leave
+        // OAuth UATs / config secrets behind under the same `bot_id`,
+        // otherwise a re-register inherits orphaned credentials.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store: Arc<dyn ChannelBotStore> = Arc::new(LibsqlChannelBotStore::new(pool));
+        let vault = Arc::new(SecretVault::new(
+            EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap(),
+            Arc::new(MemorySecretStore::new()),
+        ));
+        let channel_type = ChannelType::from("lark");
+
+        // Initial registration: token + a config secret + a runtime
+        // user UAT (the SDK's `secrets()` API path, simulated here).
+        let result = RegistrationResult {
+            bot_id: "lark-bot".into(),
+            token: "primary".into(),
+            metadata: std::collections::HashMap::new(),
+            secrets: std::collections::HashMap::from([("app_secret".into(), "shh-app".into())]),
+        };
+        persist_bot_registration(&vault, &store, &channel_type, &result)
+            .await
+            .unwrap();
+        // Mint a fake UAT under the runtime per-user namespace.
+        let uat_key = format!(
+            "{}user.uid-1",
+            vault_keys::bot_prefix(&channel_type, "lark-bot")
+        );
+        vault
+            .store_secret(&uat_key, b"refresh-token")
+            .await
+            .unwrap();
+
+        // Removal sweep — token, config.*, and user.* all gone.
+        let prefix = vault_keys::bot_prefix(&channel_type, "lark-bot");
+        vault.delete_secrets_with_prefix(&prefix).await.unwrap();
+        store.delete(&channel_type, "lark-bot").await.unwrap();
+
+        assert!(
+            vault
+                .get_secret(&vault_keys::primary_token(&channel_type, "lark-bot"))
+                .await
+                .unwrap()
+                .is_none(),
+            "primary token should be swept",
+        );
+        assert!(
+            vault
+                .get_secret(&vault_keys::config(&channel_type, "lark-bot", "app_secret"))
+                .await
+                .unwrap()
+                .is_none(),
+            "config.app_secret should be swept",
+        );
+        assert!(
+            vault.get_secret(&uat_key).await.unwrap().is_none(),
+            "user.* UAT should be swept",
         );
     }
 }

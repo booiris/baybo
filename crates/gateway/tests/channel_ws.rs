@@ -14,7 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::wire::{self, Frame, Message as WireMessage, PROTOCOL_VERSION};
+use aura_channels::wire::{self, Frame, Message as WireMessage};
 use aura_channels::{AgentOutput, OutgoingMessage};
 use aura_gateway::channel_listener::ChannelServer;
 use aura_gateway::test_support::build_test_deps;
@@ -240,7 +240,7 @@ async fn connect_register(
         &Frame::Register {
             token: token.to_string(),
             channel_type,
-            protocol_version: PROTOCOL_VERSION,
+            capabilities: Vec::new(),
             session_id: None,
         },
     )
@@ -248,7 +248,9 @@ async fn connect_register(
 
     match recv_frame(&mut ws).await? {
         Frame::RegisterAck { ok: true, .. } => Ok(ws),
-        Frame::RegisterAck { ok: false, reason } => Err(ConnectError::RegistrationRejected(
+        Frame::RegisterAck {
+            ok: false, reason, ..
+        } => Err(ConnectError::RegistrationRejected(
             reason.unwrap_or_else(|| "no reason given".to_string()),
         )),
         _ => Err(ConnectError::ProtocolViolation("expected RegisterAck")),
@@ -290,13 +292,15 @@ async fn recv_message(ws: &mut WsStream) -> Result<WireMessage, ConnectError> {
             | Frame::HistorySnapshot { .. }
             | Frame::StartBot { .. }
             | Frame::StopBot { .. }
-            | Frame::SlashManifest { .. } => continue,
+            | Frame::SlashManifest { .. }
+            | Frame::SecretReply { .. } => continue,
             Frame::Register { .. }
             | Frame::RegisterAck { .. }
             | Frame::ResolveApproval { .. }
             | Frame::HistoryAppend { .. }
             | Frame::SidecarLog { .. }
-            | Frame::BotStatus { .. } => {
+            | Frame::BotStatus { .. }
+            | Frame::SecretRequest { .. } => {
                 return Err(ConnectError::ProtocolViolation(
                     "unexpected frame kind post-handshake",
                 ));
@@ -323,13 +327,15 @@ async fn recv_notice(ws: &mut WsStream) -> Result<(String, String, String), Conn
             | Frame::HistorySnapshot { .. }
             | Frame::StartBot { .. }
             | Frame::StopBot { .. }
-            | Frame::SlashManifest { .. } => continue,
+            | Frame::SlashManifest { .. }
+            | Frame::SecretReply { .. } => continue,
             Frame::Register { .. }
             | Frame::RegisterAck { .. }
             | Frame::ResolveApproval { .. }
             | Frame::HistoryAppend { .. }
             | Frame::SidecarLog { .. }
-            | Frame::BotStatus { .. } => {
+            | Frame::BotStatus { .. }
+            | Frame::SecretRequest { .. } => {
                 return Err(ConnectError::ProtocolViolation(
                     "unexpected frame kind post-handshake",
                 ));
@@ -856,7 +862,7 @@ async fn connect_register_tui_with_snapshot(
         &Frame::Register {
             token: String::new(),
             channel_type: ChannelType::from(ChannelType::TUI),
-            protocol_version: PROTOCOL_VERSION,
+            capabilities: Vec::new(),
             session_id: Some(session_id.to_owned()),
         },
     )
@@ -864,7 +870,9 @@ async fn connect_register_tui_with_snapshot(
 
     match recv_frame(&mut ws).await? {
         Frame::RegisterAck { ok: true, .. } => {}
-        Frame::RegisterAck { ok: false, reason } => {
+        Frame::RegisterAck {
+            ok: false, reason, ..
+        } => {
             return Err(ConnectError::RegistrationRejected(
                 reason.unwrap_or_else(|| "no reason given".to_string()),
             ));

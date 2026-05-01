@@ -6,6 +6,7 @@ mod types;
 
 pub mod register_wire;
 pub mod registration;
+pub mod vault_keys;
 pub mod wire;
 
 pub use channel::Channel;

@@ -74,6 +74,31 @@ impl SecretStore for LibsqlSecretStore {
         Ok(names)
     }
 
+    async fn list_with_prefix(&self, prefix: &str) -> crate::secret::Result<Vec<String>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT name FROM secrets \
+                 WHERE substr(name, 1, length(?1)) = ?1 \
+                 AND deleted_at IS NULL",
+                libsql::params![prefix.to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let mut names = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let name: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            names.push(name);
+        }
+        Ok(names)
+    }
+
     async fn delete(&self, name: &str) -> crate::secret::Result<()> {
         let now = chrono::Utc::now().timestamp();
         let conn = self.pool.conn();
@@ -85,6 +110,27 @@ impl SecretStore for LibsqlSecretStore {
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete error: {e}")))?;
         Ok(())
+    }
+
+    async fn delete_with_prefix(&self, prefix: &str) -> crate::secret::Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.pool.conn();
+        // `substr` instead of `LIKE` so a prefix containing `%` or `_`
+        // (sqlite's LIKE wildcards) matches literally. Our channel
+        // prefix shape is `channel.<ascii>.bot.<ascii>.` today, but the
+        // helper stays correct under future identifier rules.
+        let count = conn
+            .execute(
+                "UPDATE secrets SET deleted_at = ?2 \
+                 WHERE substr(name, 1, length(?1)) = ?1 \
+                 AND deleted_at IS NULL",
+                libsql::params![prefix.to_string(), now],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql delete_with_prefix: {e}"))
+            })?;
+        Ok(count as usize)
     }
 }
 

@@ -7,13 +7,12 @@
 //! built-in TUI has a private Rust WS client (`crates/tui/src/client/
 //! ws.rs`) that rides on these same types.
 
+use std::collections::HashMap;
+
 use aura_model::{ChannelType, ResourceAccess};
 use aura_tools::ApprovalDecision;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-/// Wire-format version this protocol speaks. Bump on breaking frame changes.
-pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Error surface for frame encode/decode.
 #[derive(Debug, Error)]
@@ -166,18 +165,36 @@ pub enum Frame {
     ///   today). Multiple such clients of the same channel type may
     ///   coexist as long as their session ids differ. Agent output for
     ///   `sid` is routed back to this specific connection.
+    ///
+    /// `capabilities` advertises the optional non-core wire frames the
+    /// peer can speak (e.g. `"secrets"` for [`Frame::SecretRequest`]).
+    /// Empty / missing means "core frames only" — the gateway will
+    /// never push a non-core frame to a sidecar that didn't claim its
+    /// capability. Forward-compatible: legacy v1 sidecars that send no
+    /// `capabilities` field decode here as `vec![]`. The legacy
+    /// `protocol_version` field on the wire is silently ignored.
     Register {
         token: String,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         channel_type: ChannelType,
-        protocol_version: u16,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts-export", ts(optional))]
         session_id: Option<String>,
     },
     /// Server response to `Register`. `ok: false` carries a
-    /// human-readable reason.
-    RegisterAck { ok: bool, reason: Option<String> },
+    /// human-readable reason. `capabilities` mirrors the gateway's own
+    /// advertised set so the sidecar SDK can gate optional helpers
+    /// (e.g. throw `CapabilityMissingError` from `secrets()`).
+    /// Forward-compatible: legacy gateways that send no `capabilities`
+    /// decode here as `vec![]`.
+    RegisterAck {
+        ok: bool,
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
     /// A user-visible message flowing in either direction. Inbound
     /// from a channel it is user input; outbound it is the agent's
     /// final response for a turn.
@@ -281,7 +298,22 @@ pub enum Frame {
     /// stable label and `token` is the @BotFather token. Sidecars
     /// reply with [`Frame::BotStatus`] to ack; a failure on
     /// startup is surfaced via `ok: false + message`.
-    StartBot { bot_id: String, token: String },
+    ///
+    /// `metadata` carries channel-specific auxiliary credentials and
+    /// configuration the sidecar needs at startup beyond the primary
+    /// `token` — e.g. Lark's `(app_secret, encrypt_key, verification_token,
+    /// base_url)` quartet, Discord intents bitmask, Slack signing-secret.
+    /// Free-form key/value strings; the gateway treats them opaquely
+    /// and just plumbs the row's stored map through. Default empty for
+    /// single-secret channels (Telegram, Weixin); legacy sidecars that
+    /// predate this field decode it as `{}`.
+    StartBot {
+        bot_id: String,
+        token: String,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        #[cfg_attr(feature = "ts-export", ts(type = "Record<string, string>"))]
+        metadata: HashMap<String, String>,
+    },
     /// Server -> client: detach a previously-attached bot. The
     /// sidecar stops polling for that bot and drops its in-process
     /// state. Any in-flight approval / message tied to that bot is
@@ -305,6 +337,74 @@ pub enum Frame {
     /// that don't surface client-side autocomplete may ignore this.
     /// Additive; older sidecars decode the unknown tag as a no-op.
     SlashManifest { commands: Vec<SlashCommandSpec> },
+    /// Client -> server: sidecar-initiated request against the
+    /// gateway's encrypted secret vault. Persists per-bot tokens
+    /// (Lark per-user UATs, Discord OAuth refresh tokens, …) under a
+    /// scope the gateway derives server-side as
+    /// `channel.<channel_type>.bot.<bot_id>.user.<key>`. The sidecar
+    /// can never claim a `bot_id` it doesn't own; the gateway
+    /// validates against [`aura_storage::ChannelBotStore`]. Gated by
+    /// the `"secrets"` capability advertised on
+    /// [`Frame::Register`] / [`Frame::RegisterAck`].
+    SecretRequest {
+        request_id: String,
+        bot_id: String,
+        op: SecretOp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        value: Option<String>,
+    },
+    /// Server -> client: reply to a [`Frame::SecretRequest`]. `ok: true`
+    /// fills in `value` for `Get` and `keys` for `List`. `ok: false`
+    /// carries an `error` tag the SDK throws as a typed error
+    /// (`bot_unknown` / `key_too_long` / `value_too_large` /
+    /// `quota_exceeded` / `internal`).
+    SecretReply {
+        request_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        keys: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        error: Option<String>,
+    },
+}
+
+/// Operation discriminator on a [`Frame::SecretRequest`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum SecretOp {
+    Get,
+    Set,
+    Delete,
+    List,
+}
+
+/// Per-`(channel_type, bot_id)` body limits enforced by the gateway
+/// before the request reaches the vault. The SDK mirrors the same
+/// limits client-side so a misbehaving caller surfaces them as a
+/// `RangeError` instead of an opaque server reject.
+pub mod secret_limits {
+    /// Hard cap on the UTF-8 byte length of a [`super::SecretOp::Set`]
+    /// `value`.
+    pub const MAX_VALUE_BYTES: usize = 64 * 1024;
+    /// Hard cap on the UTF-8 byte length of a `key`.
+    pub const MAX_KEY_BYTES: usize = 256;
+    /// Maximum number of live keys per `(channel_type, bot_id)` scope.
+    /// Exceeding it on `Set` is rejected with `quota_exceeded`.
+    pub const MAX_KEYS_PER_SCOPE: usize = 10_000;
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -317,22 +417,6 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
     rmp_serde::from_slice(bytes).map_err(WireError::from)
 }
 
-/// Regenerates `sdks/channel-ts/src/generated/constants.ts` with
-/// Rust-authored values so the TS SDK doesn't keep its own copy of
-/// `PROTOCOL_VERSION` (and any future wire-level constants).
-/// Pairs with the `ts-rs`-driven type exports above; both run under
-/// the same `ts-export` feature gate and land in the same directory.
-#[cfg(all(test, feature = "ts-export"))]
-#[test]
-fn export_constants() {
-    let out = format!(
-        "// This file was generated by aura-channels. Do not edit this file manually.\n\
-         export const PROTOCOL_VERSION = {PROTOCOL_VERSION};\n"
-    );
-    std::fs::write("../../sdks/channel-ts/src/generated/constants.ts", out)
-        .expect("write generated constants.ts");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,7 +426,7 @@ mod tests {
         let frame = Frame::Register {
             token: "deadbeef".into(),
             channel_type: ChannelType::from("slack"),
-            protocol_version: PROTOCOL_VERSION,
+            capabilities: vec!["secrets".into()],
             session_id: None,
         };
         let bytes = encode(&frame).unwrap();
@@ -355,7 +439,7 @@ mod tests {
         let frame = Frame::Register {
             token: String::new(),
             channel_type: ChannelType::from("tui"),
-            protocol_version: PROTOCOL_VERSION,
+            capabilities: Vec::new(),
             session_id: Some("sess-abc".into()),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -363,21 +447,56 @@ mod tests {
 
     #[test]
     fn register_without_session_field_decodes_with_none() {
-        // Old sidecars that predate `session_id` encode only three
-        // fields. The additive schema must still deserialize — treating
-        // the missing field as None keeps the wire protocol at v1 for
-        // backward compatibility.
+        // Old sidecars that predate `session_id` encode only their
+        // required fields. Missing optional fields must decode as
+        // None / default values so the wire protocol stays
+        // forward-compatible.
         let frame = Frame::Register {
             token: "deadbeef".into(),
             channel_type: ChannelType::from("slack"),
-            protocol_version: PROTOCOL_VERSION,
+            capabilities: Vec::new(),
             session_id: None,
         };
         let encoded = encode(&frame).unwrap();
-        // The encoded form should not contain a session_id key because
-        // `skip_serializing_if` omits it when None.
         let decoded = decode(&encoded).unwrap();
         assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn legacy_register_with_protocol_version_decodes() {
+        // Old v1 sidecars send a `protocol_version: 1` field. The new
+        // gateway must silently drop the unknown field (rmp-serde's
+        // default for struct deserialization) and decode the rest.
+        // Hand-encode the legacy shape with rmp_serde so we never
+        // accidentally regress this compatibility window.
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum LegacyFrame {
+            Register {
+                token: String,
+                channel_type: ChannelType,
+                protocol_version: u16,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                session_id: Option<String>,
+            },
+        }
+        let legacy = LegacyFrame::Register {
+            token: "deadbeef".into(),
+            channel_type: ChannelType::from("slack"),
+            protocol_version: 1,
+            session_id: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            Frame::Register {
+                token: "deadbeef".into(),
+                channel_type: ChannelType::from("slack"),
+                capabilities: Vec::new(),
+                session_id: None,
+            }
+        );
     }
 
     #[test]
@@ -501,6 +620,17 @@ mod tests {
         let frame = Frame::RegisterAck {
             ok: false,
             reason: Some("bad token".into()),
+            capabilities: Vec::new(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_ack_with_capabilities() {
+        let frame = Frame::RegisterAck {
+            ok: true,
+            reason: None,
+            capabilities: vec!["secrets".into(), "abort".into()],
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
@@ -607,6 +737,84 @@ mod tests {
         let frame = Frame::StartBot {
             bot_id: "prod-bot".into(),
             token: "123:ABC".into(),
+            metadata: HashMap::new(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_start_bot_with_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("app_secret".into(), "deadbeef".into());
+        metadata.insert("base_url".into(), "https://open.feishu.cn".into());
+        let frame = Frame::StartBot {
+            bot_id: "lark-bot".into(),
+            token: "app_id_token".into(),
+            metadata,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn start_bot_metadata_omitted_when_empty() {
+        let frame = Frame::StartBot {
+            bot_id: "prod-bot".into(),
+            token: "123:ABC".into(),
+            metadata: HashMap::new(),
+        };
+        let bytes = encode(&frame).unwrap();
+        let as_str = String::from_utf8_lossy(&bytes);
+        assert!(
+            !as_str.contains("metadata"),
+            "metadata key should be omitted when empty",
+        );
+        assert_eq!(frame, decode(&bytes).unwrap());
+    }
+
+    #[test]
+    fn round_trip_secret_request() {
+        let frame = Frame::SecretRequest {
+            request_id: "req-1".into(),
+            bot_id: "lark-bot".into(),
+            op: SecretOp::Set,
+            key: Some("uat/userA".into()),
+            value: Some("ya29...".into()),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_secret_reply_get() {
+        let frame = Frame::SecretReply {
+            request_id: "req-1".into(),
+            ok: true,
+            value: Some("ya29...".into()),
+            keys: None,
+            error: None,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_secret_reply_list() {
+        let frame = Frame::SecretReply {
+            request_id: "req-2".into(),
+            ok: true,
+            value: None,
+            keys: Some(vec!["uat/a".into(), "uat/b".into()]),
+            error: None,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_secret_reply_err() {
+        let frame = Frame::SecretReply {
+            request_id: "req-3".into(),
+            ok: false,
+            value: None,
+            keys: None,
+            error: Some("bot_unknown".into()),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

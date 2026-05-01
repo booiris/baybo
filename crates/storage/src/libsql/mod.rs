@@ -257,6 +257,7 @@ impl LibsqlPool {
                     channel_type TEXT    NOT NULL,
                     bot_id       TEXT    NOT NULL,
                     created_at   INTEGER NOT NULL,
+                    metadata     TEXT    NOT NULL DEFAULT '{}',
                     deleted_at   INTEGER,
                     PRIMARY KEY (channel_type, bot_id)
                 );
@@ -289,6 +290,28 @@ impl LibsqlPool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
+
+        // Live databases predating the column need an ALTER on top of
+        // the IF NOT EXISTS table creation above. The column has a
+        // default so existing rows fill in `'{}'` automatically; the
+        // duplicate-column error sqlite raises on a rerun is the
+        // expected idempotent path.
+        let alter = self
+            .conn
+            .execute(
+                "ALTER TABLE channel_bots ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
+                (),
+            )
+            .await;
+        if let Err(e) = alter {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(anyhow::anyhow!(
+                    "failed to migrate channel_bots.metadata: {e}"
+                ));
+            }
+        }
+
         Ok(())
     }
 }

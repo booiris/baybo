@@ -18,6 +18,10 @@
     "./bot": {
       "types": "./dist/bot.d.ts",
       "import": "./dist/bot.js"
+    },
+    "./secrets": {
+      "types": "./dist/secrets.d.ts",
+      "import": "./dist/secrets.js"
     }
   },
   "files": [

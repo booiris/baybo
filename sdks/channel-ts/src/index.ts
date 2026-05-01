@@ -39,3 +39,10 @@ export type {
   FetchBlobStreamResult,
   UploadBlobResult,
 } from "./blobs.js";
+export {
+  CapabilityMissingError,
+  SecretBotUnknownError,
+  SecretQuotaExceededError,
+  secrets,
+} from "./secrets.js";
+export type { Secrets, SecretsScope } from "./secrets.js";

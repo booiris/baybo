@@ -28,11 +28,12 @@ use aura_agent::service::ShutdownSignal;
 use aura_channels::wire::Frame;
 use aura_model::ChannelType;
 use aura_security::SecretVault;
-use aura_storage::ChannelBotStore;
+use aura_storage::{ChannelBotRow, ChannelBotStore};
 use parking_lot::Mutex;
 
 use super::control::{ChannelControlError, ChannelControlRegistry};
 use super::route::bot_secret_name;
+use super::secrets::load_start_metadata;
 
 /// Default polling cadence. Short enough to feel interactive for CLI
 /// add/remove; long enough that the cost is negligible.
@@ -147,7 +148,7 @@ impl ChannelBotReconciler {
     }
 
     async fn reconcile_channel(&self, channel_type: &ChannelType) {
-        let desired_rows = match self.store.list_live(channel_type).await {
+        let rows = match self.store.list_live(channel_type).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -158,11 +159,20 @@ impl ChannelBotReconciler {
                 return;
             }
         };
-        let desired: HashSet<String> = desired_rows.into_iter().map(|r| r.bot_id).collect();
+        let row_by_id: HashMap<String, ChannelBotRow> =
+            rows.into_iter().map(|r| (r.bot_id.clone(), r)).collect();
+        let desired: HashSet<String> = row_by_id.keys().cloned().collect();
 
         let delta = self.tracked.lock().desired_delta(channel_type, desired);
 
         for bot_id in &delta.to_start {
+            let Some(row) = row_by_id.get(bot_id) else {
+                // The desired set was just derived from the same map,
+                // so a miss can only happen if a concurrent libsql
+                // mutation raced this branch. Skip and let the next
+                // tick reconverge.
+                continue;
+            };
             let Some(token) = self.load_token(channel_type, bot_id).await else {
                 // Mark the bot as not-yet-sent so a later tick retries
                 // (the token might have been inserted between the row
@@ -175,9 +185,11 @@ impl ChannelBotReconciler {
                     .remove(bot_id);
                 continue;
             };
+            let metadata = load_start_metadata(&self.vault, row).await;
             let frame = Frame::StartBot {
                 bot_id: bot_id.clone(),
                 token,
+                metadata,
             };
             self.push(channel_type, frame, bot_id, "StartBot").await;
         }
@@ -192,7 +204,17 @@ impl ChannelBotReconciler {
     async fn load_token(&self, channel_type: &ChannelType, bot_id: &str) -> Option<String> {
         let name = bot_secret_name(channel_type, bot_id);
         match self.vault.get_secret(&name).await {
-            Ok(Some(v)) => Some(String::from_utf8_lossy(v.as_bytes()).into_owned()),
+            Ok(Some(v)) => match String::from_utf8(v.as_bytes().to_vec()) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    tracing::warn!(
+                        %channel_type,
+                        %bot_id,
+                        "bot token was not valid UTF-8; will retry next tick",
+                    );
+                    None
+                }
+            },
             Ok(None) => {
                 tracing::warn!(
                     %channel_type,

@@ -68,9 +68,32 @@ impl SecretStore for MemorySecretStore {
         Ok(self.data.lock().keys().cloned().collect())
     }
 
+    async fn list_with_prefix(&self, prefix: &str) -> SecretResult<Vec<String>> {
+        Ok(self
+            .data
+            .lock()
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
     async fn delete(&self, name: &str) -> SecretResult<()> {
         self.data.lock().remove(name);
         Ok(())
+    }
+
+    async fn delete_with_prefix(&self, prefix: &str) -> SecretResult<usize> {
+        let mut guard = self.data.lock();
+        let matches: Vec<String> = guard
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        for name in &matches {
+            guard.remove(name);
+        }
+        Ok(matches.len())
     }
 }
 

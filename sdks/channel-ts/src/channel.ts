@@ -102,10 +102,19 @@ export type NoticeLevel = "warn" | "error";
  * operator-chosen label and `token` is the @BotFather token; other
  * sidecars can repurpose the same shape for whatever per-tenant
  * identity they multiplex.
+ *
+ * `metadata` carries any auxiliary key/value configuration the
+ * gateway has stored for this bot beyond the primary token (Lark's
+ * `app_secret` / `encrypt_key` / `verification_token` / `base_url`,
+ * Discord intents bitmask, etc.). The map is always present but is
+ * empty for single-secret channels (Telegram, Weixin); the runner
+ * supplies a frozen object so a sidecar can't accidentally mutate
+ * the wire payload.
  */
 export interface StartBotCommand {
   botId: string;
   token: string;
+  metadata: Readonly<Record<string, string>>;
 }
 
 /** Control-plane: aura is telling the sidecar to detach a tenant. */
@@ -235,6 +244,15 @@ export interface RunOptions {
    * `protocol_violation`, `decode`) always propagate.
    */
   reconnect?: boolean | ReconnectPolicy;
+
+  /**
+   * Optional capability strings advertised on the `Register` frame so
+   * the gateway only sends frames the sidecar speaks. Available
+   * strings: `"secrets"` (gates {@link secrets} client). Forward-
+   * compatible: a sidecar that doesn't claim a capability simply
+   * doesn't get the matching frame.
+   */
+  capabilities?: ReadonlyArray<string>;
 }
 
 export interface ReconnectPolicy {

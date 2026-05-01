@@ -19,7 +19,8 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 
 use super::adapter::Sidecar;
-use super::handshake::validate_register;
+use super::handshake::{GATEWAY_CAPABILITIES, validate_register};
+use super::secrets;
 use super::state::WsChannelState;
 use crate::auth::AuthedClient;
 use crate::log_buffer::LogLevel;
@@ -71,6 +72,15 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
 
     let channel_type = outcome.channel_type;
     let session_id = outcome.session_id;
+    // Intersection of what the peer claimed and what the gateway can
+    // actually serve. Outbound sends of optional frames check this set
+    // before emitting; inbound rejects optional frames the peer didn't
+    // claim.
+    let negotiated_capabilities: Vec<String> = outcome
+        .peer_capabilities
+        .into_iter()
+        .filter(|cap| GATEWAY_CAPABILITIES.contains(&cap.as_str()))
+        .collect();
 
     let sidecar = Sidecar::build(
         channel_type.clone(),
@@ -94,6 +104,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
             .send_frame(Frame::RegisterAck {
                 ok: false,
                 reason: Some(reason.clone()),
+                capabilities: gateway_capabilities_vec(),
             })
             .await
         {
@@ -107,6 +118,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     tracing::info!(
         channel_type = %channel_type,
         session_id = ?session_id,
+        capabilities = ?negotiated_capabilities,
         "channel-ws client registered"
     );
 
@@ -114,6 +126,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         .send_frame(Frame::RegisterAck {
             ok: true,
             reason: None,
+            capabilities: gateway_capabilities_vec(),
         })
         .await
     {
@@ -185,6 +198,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         &channel_type,
         &sidecar,
         session_id.as_deref(),
+        &negotiated_capabilities,
     )
     .await;
 
@@ -232,12 +246,23 @@ async fn receive_register(
     }
 }
 
+fn gateway_capabilities_vec() -> Vec<String> {
+    GATEWAY_CAPABILITIES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
 async fn send_ack_and_close(
     sink: &mut SplitSink<WebSocket, AxumWsMessage>,
     ok: bool,
     reason: Option<String>,
 ) {
-    let frame = Frame::RegisterAck { ok, reason };
+    let frame = Frame::RegisterAck {
+        ok,
+        reason,
+        capabilities: gateway_capabilities_vec(),
+    };
     match wire::encode(&frame) {
         Ok(bytes) => {
             if let Err(e) = sink.send(AxumWsMessage::Binary(bytes.into())).await {
@@ -275,7 +300,18 @@ async fn push_live_bots(
     for row in bots {
         let secret_name = bot_secret_name(channel_type, &row.bot_id);
         let token = match state.secret_vault.get_secret(&secret_name).await {
-            Ok(Some(v)) => String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            Ok(Some(v)) => match String::from_utf8(v.as_bytes().to_vec()) {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!(
+                        %channel_type,
+                        bot_id = %row.bot_id,
+                        secret = %secret_name,
+                        "bot token was not valid UTF-8; skipping StartBot",
+                    );
+                    continue;
+                }
+            },
             Ok(None) => {
                 tracing::warn!(
                     %channel_type,
@@ -295,10 +331,12 @@ async fn push_live_bots(
                 continue;
             }
         };
+        let metadata = secrets::load_start_metadata(&state.secret_vault, &row).await;
         if let Err(e) = sidecar
             .send_frame(Frame::StartBot {
                 bot_id: row.bot_id.clone(),
                 token,
+                metadata,
             })
             .await
         {
@@ -315,10 +353,12 @@ async fn push_live_bots(
     sent
 }
 
-/// Deterministic vault key for a bot token. Kept in one place so the
-/// admin API and the route layer agree on where the token lives.
+/// Deterministic vault key for a bot token. Thin alias over
+/// [`aura_channels::vault_keys::primary_token`] so existing route /
+/// reconciler call sites keep their short name while the canonical
+/// layout lives in `aura-channels`.
 pub(crate) fn bot_secret_name(channel_type: &ChannelType, bot_id: &str) -> String {
-    format!("channel.{}.bot.{}.token", channel_type.as_str(), bot_id)
+    aura_channels::vault_keys::primary_token(channel_type, bot_id)
 }
 
 /// Push one forwarded sidecar log line into the shared `LogBuffer`.
@@ -364,7 +404,9 @@ async fn run_inbound_loop(
     channel_type: &ChannelType,
     sidecar: &Sidecar,
     connection_session_id: Option<&str>,
+    negotiated_capabilities: &[String],
 ) {
+    let secrets_enabled = negotiated_capabilities.iter().any(|c| c == "secrets");
     while let Some(msg) = source.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -591,6 +633,44 @@ async fn run_inbound_loop(
                                 detail = message.as_deref().unwrap_or(""),
                                 "sidecar ack: bot failed",
                             );
+                        }
+                    }
+                    Frame::SecretRequest {
+                        request_id,
+                        bot_id,
+                        op,
+                        key,
+                        value,
+                    } => {
+                        if !secrets_enabled {
+                            // Sidecar didn't claim the capability but
+                            // sent the frame anyway. Reply with a
+                            // typed error so the SDK surfaces the
+                            // mismatch instead of timing out.
+                            let reply = Frame::SecretReply {
+                                request_id,
+                                ok: false,
+                                value: None,
+                                keys: None,
+                                error: Some("capability_disabled".into()),
+                            };
+                            if let Err(e) = sidecar.send_frame(reply).await {
+                                tracing::debug!(error = %e, "secret reply send failed");
+                            }
+                            continue;
+                        }
+                        let reply = secrets::handle_request(
+                            state,
+                            channel_type,
+                            request_id,
+                            bot_id,
+                            op,
+                            key,
+                            value,
+                        )
+                        .await;
+                        if let Err(e) = sidecar.send_frame(reply).await {
+                            tracing::debug!(error = %e, "secret reply send failed");
                         }
                     }
                     other => {

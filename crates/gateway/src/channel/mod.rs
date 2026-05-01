@@ -24,6 +24,7 @@ pub(crate) mod dedup;
 pub(crate) mod handshake;
 pub(crate) mod history;
 pub mod route;
+pub(crate) mod secrets;
 pub(crate) mod session_resolver;
 pub(crate) mod slash;
 pub mod state;

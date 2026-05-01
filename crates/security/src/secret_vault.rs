@@ -55,6 +55,28 @@ impl SecretVault {
             .await
             .map_err(|e| SecurityError::Storage(e.to_string()))
     }
+
+    /// Live names whose key starts with `prefix`. Lets callers scan a
+    /// scoped subtree (e.g. `channel.<channel_type>.bot.<bot_id>.`)
+    /// without pulling every name in the store into memory.
+    pub async fn list_secrets_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        self.store
+            .list_with_prefix(prefix)
+            .await
+            .map_err(|e| SecurityError::Storage(e.to_string()))
+    }
+
+    /// Soft-delete every secret whose name starts with `prefix`. Used
+    /// to sweep a per-bot namespace
+    /// (`channel.<channel_type>.bot.<bot_id>.`) on bot removal — the
+    /// caller knows the prefix shape; the vault only enforces it
+    /// literally. Returns the number of names touched.
+    pub async fn delete_secrets_with_prefix(&self, prefix: &str) -> Result<usize> {
+        self.store
+            .delete_with_prefix(prefix)
+            .await
+            .map_err(|e| SecurityError::Storage(e.to_string()))
+    }
 }
 
 #[cfg(test)]

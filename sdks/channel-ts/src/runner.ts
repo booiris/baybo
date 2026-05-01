@@ -16,7 +16,11 @@ import {
   type WireLogLevel,
 } from "./logger.js";
 import {
-  PROTOCOL_VERSION,
+  installSecretsClient,
+  resetSecretsClient,
+  SecretRouter,
+} from "./secrets.js";
+import {
   decodeFrame,
   encodeFrame,
   type Frame,
@@ -59,13 +63,22 @@ export async function runChannel(
       });
   }
 
+  const capabilities = opts.capabilities ?? [];
+
   try {
     let attempt = 0;
     let delay = policy?.initialDelayMs ?? 0;
 
     while (!rootAbort.signal.aborted) {
       try {
-        await runOnce(channel, wsUrl, token, rootAbort.signal, logger);
+        await runOnce(
+          channel,
+          wsUrl,
+          token,
+          rootAbort.signal,
+          logger,
+          capabilities,
+        );
       } catch (err) {
         if (rootAbort.signal.aborted) return;
         if (!policy || !isTransient(err)) throw err;
@@ -121,6 +134,7 @@ async function runOnce(
   token: string,
   rootSignal: AbortSignal,
   logger: Logger,
+  sidecarCapabilities: ReadonlyArray<string>,
 ): Promise<void> {
   const connAbort = new AbortController();
   const onRootAbort = () => connAbort.abort();
@@ -138,8 +152,16 @@ async function runOnce(
 
   try {
     await waitOpen(ws);
-    await performRegister(ws, frames, channel.channelType, token);
-    logger.info("registered");
+    const negotiated = await performRegister(
+      ws,
+      frames,
+      channel.channelType,
+      token,
+      sidecarCapabilities,
+    );
+    logger.info(
+      `registered (caps: ${[...negotiated].join(",") || "core-only"})`,
+    );
 
     connAbort.signal.addEventListener("abort", () => safeClose(ws), {
       once: true,
@@ -149,12 +171,24 @@ async function runOnce(
       logger.setWireSink(makeWireSink(ws));
     }
 
+    const secretRouter = new SecretRouter(ws, negotiated, logger);
+    installSecretsClient(secretRouter);
+
     try {
       const outbound = pumpOutbound(channel, ws, connAbort.signal, logger);
-      const inbound = pumpInbound(channel, ws, frames, connAbort, logger);
+      const inbound = pumpInbound(
+        channel,
+        ws,
+        frames,
+        connAbort,
+        logger,
+        secretRouter,
+      );
       await Promise.all([outbound, inbound]);
     } finally {
       if (hasWireSink(logger)) logger.setWireSink(null);
+      secretRouter.close();
+      resetSecretsClient(secretRouter);
     }
   } finally {
     connAbort.abort();
@@ -298,13 +332,17 @@ async function performRegister(
   frames: FrameQueue,
   channelType: string,
   token: string,
-): Promise<void> {
+  sidecarCapabilities: ReadonlyArray<string>,
+): Promise<ReadonlySet<string>> {
+  const advertised = sidecarCapabilities.length > 0
+    ? Array.from(new Set(sidecarCapabilities))
+    : undefined;
   ws.send(
     encodeFrame({
       kind: "register",
       token,
       channel_type: channelType,
-      protocol_version: PROTOCOL_VERSION,
+      ...(advertised !== undefined ? { capabilities: advertised } : {}),
     }),
   );
   const ack = await frames.pop();
@@ -320,6 +358,15 @@ async function performRegister(
       "register_rejected",
     );
   }
+  // Negotiated set is the intersection of what we advertised and what
+  // the gateway claims it can serve. Both ends use this to gate any
+  // optional frame send: throwing locally is preferable to having the
+  // peer drop the frame on the floor.
+  const gatewayCaps = new Set(ack.capabilities ?? []);
+  const sidecarCaps = new Set(sidecarCapabilities);
+  return new Set(
+    [...sidecarCaps].filter((cap) => gatewayCaps.has(cap)),
+  );
 }
 
 function safeClose(ws: WebSocket): void {
@@ -480,6 +527,7 @@ async function pumpInbound(
   frames: FrameQueue,
   controller: AbortController,
   logger: Logger,
+  secretRouter: SecretRouter,
 ): Promise<void> {
   while (!controller.signal.aborted) {
     let frame: Frame;
@@ -494,6 +542,10 @@ async function pumpInbound(
         return;
       }
       throw err;
+    }
+    if (frame.kind === "secret_reply") {
+      secretRouter.deliver(frame);
+      continue;
     }
     dispatchFrame(frame, channel, ws, logger);
   }
@@ -575,7 +627,12 @@ function dispatchFrame(
         "onStartBot",
         frame.bot_id,
         channel.onStartBot
-          ? () => channel.onStartBot!({ botId: frame.bot_id, token: frame.token })
+          ? () =>
+              channel.onStartBot!({
+                botId: frame.bot_id,
+                token: frame.token,
+                metadata: Object.freeze({ ...(frame.metadata ?? {}) }),
+              })
           : null,
         ws,
         logger,
@@ -607,12 +664,17 @@ function dispatchFrame(
     case "history_append":
     case "history_snapshot":
       return;
+    // `secret_reply` is intercepted by `pumpInbound` before reaching
+    // here, but the exhaustive switch needs the arm.
+    case "secret_reply":
+      return;
     // These are client->server shapes the sidecar will never receive.
     case "register":
     case "register_ack":
     case "resolve_approval":
     case "sidecar_log":
     case "bot_status":
+    case "secret_request":
       logger.warn("unexpected server->client frame", frame.kind);
       return;
   }

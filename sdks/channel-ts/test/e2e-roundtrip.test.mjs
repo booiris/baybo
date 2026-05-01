@@ -19,7 +19,7 @@ import {
   runChannel,
   defaultLogger,
 } from "../dist/index.js";
-import { decodeFrame, encodeFrame, PROTOCOL_VERSION } from "../dist/wire.js";
+import { decodeFrame, encodeFrame } from "../dist/wire.js";
 
 const TOKEN = "fixture-token-abc";
 
@@ -41,7 +41,14 @@ function startFixture() {
         switch (frame.kind) {
           case "register": {
             recorded.register = frame;
-            ws.send(encodeFrame({ kind: "register_ack", ok: true, reason: null }));
+            ws.send(
+              encodeFrame({
+                kind: "register_ack",
+                ok: true,
+                reason: null,
+                capabilities: ["secrets"],
+              }),
+            );
 
             // Stream some server → client frames now that the handshake is done.
             ws.send(
@@ -209,7 +216,10 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   assert.equal(fixture.recorded.register.kind, "register");
   assert.equal(fixture.recorded.register.token, TOKEN);
   assert.equal(fixture.recorded.register.channel_type, "fixture");
-  assert.equal(fixture.recorded.register.protocol_version, PROTOCOL_VERSION);
+  // Old `protocol_version` field has been replaced by `capabilities`.
+  // Default sidecars advertise nothing → field omitted on the wire.
+  assert.equal(fixture.recorded.register.protocol_version, undefined);
+  assert.equal(fixture.recorded.register.capabilities, undefined);
 
   // ---- Server → client -------------------------------------------
   assert.equal(gotDelta.count, 1);
