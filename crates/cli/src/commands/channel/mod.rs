@@ -228,13 +228,23 @@ async fn persist_bot_registration(
     .await
     .map_err(|e| CliError::Manager(format!("store secret '{key}' in vault: {e}")))?;
 
-    // Auxiliary credentials (Lark `app_secret`, etc.) ride the same
-    // vault as the primary token so they're encrypted at rest and
-    // redacted in logs. The `config.` prefix is server-validated by
-    // the gateway when it merges them into `Frame::StartBot.metadata`,
-    // so a stale config key from a previous registration can't sneak
-    // back in if we don't sweep it here — `remove_bot` does that via
-    // `bot_vault_prefix`.
+    // Sweep stale config secrets from any previous registration of
+    // this `(channel_type, bot_id)` BEFORE writing the new set. Without
+    // this, dropping or renaming an auxiliary credential leaves the
+    // old vault entry in place, and `load_start_metadata` revives it
+    // on the next StartBot — re-registration would silently restore
+    // creds the operator believed they removed.
+    let config_sweep = vault_keys::config_prefix(ct, &result.bot_id);
+    retry_on_busy("vault.delete_secrets_with_prefix", || {
+        vault.delete_secrets_with_prefix(&config_sweep)
+    })
+    .await
+    .map_err(|e| {
+        CliError::Manager(format!(
+            "sweep stale config secrets under '{config_sweep}': {e}"
+        ))
+    })?;
+
     for (config_key, value) in &result.secrets {
         let name = vault_keys::config(ct, &result.bot_id, config_key);
         let bytes = value.clone().into_bytes();
@@ -565,5 +575,74 @@ mod tests {
             vault.get_secret(&uat_key).await.unwrap().is_none(),
             "user.* UAT should be swept",
         );
+    }
+
+    #[tokio::test]
+    async fn re_registration_sweeps_dropped_config_secrets() {
+        // Codex review regression: re-registering with a smaller secret
+        // map must drop the omitted keys from the vault. Otherwise an
+        // operator who removed a credential during re-registration
+        // would silently keep it live for the next StartBot.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store: Arc<dyn ChannelBotStore> = Arc::new(LibsqlChannelBotStore::new(pool));
+        let vault = Arc::new(SecretVault::new(
+            EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap(),
+            Arc::new(MemorySecretStore::new()),
+        ));
+        let channel_type = ChannelType::from("lark");
+
+        let initial = RegistrationResult {
+            bot_id: "lark-bot".into(),
+            token: "primary".into(),
+            metadata: std::collections::HashMap::new(),
+            secrets: std::collections::HashMap::from([
+                ("app_secret".into(), "shh-app".into()),
+                ("encrypt_key".into(), "shh-encrypt".into()),
+            ]),
+        };
+        persist_bot_registration(&vault, &store, &channel_type, &initial)
+            .await
+            .unwrap();
+
+        // Re-register with `encrypt_key` dropped — only `app_secret`
+        // (rotated to a new value) survives.
+        let updated = RegistrationResult {
+            bot_id: "lark-bot".into(),
+            token: "primary-rotated".into(),
+            metadata: std::collections::HashMap::new(),
+            secrets: std::collections::HashMap::from([("app_secret".into(), "shh-rotated".into())]),
+        };
+        persist_bot_registration(&vault, &store, &channel_type, &updated)
+            .await
+            .unwrap();
+
+        // The dropped key is gone from the vault; no zombie credential.
+        assert!(
+            vault
+                .get_secret(&vault_keys::config(
+                    &channel_type,
+                    "lark-bot",
+                    "encrypt_key"
+                ))
+                .await
+                .unwrap()
+                .is_none(),
+            "encrypt_key should be swept on re-register",
+        );
+        // The rotated value lands under the same key.
+        let app_secret = vault
+            .get_secret(&vault_keys::config(&channel_type, "lark-bot", "app_secret"))
+            .await
+            .unwrap()
+            .expect("app_secret in vault");
+        assert_eq!(app_secret.as_bytes(), b"shh-rotated");
+        // Token rotation lands too (independent of the config sweep,
+        // but worth asserting the same call writes both).
+        let token = vault
+            .get_secret(&vault_keys::primary_token(&channel_type, "lark-bot"))
+            .await
+            .unwrap()
+            .expect("token in vault");
+        assert_eq!(token.as_bytes(), b"primary-rotated");
     }
 }
