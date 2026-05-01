@@ -36,13 +36,25 @@ use crate::tool_executor::ToolExecutor;
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
 
-/// Hard timeout on sidecar MCP `tools/call` round-trips. Most calls
-/// complete in well under a second; this bound keeps a hung rmcp peer
-/// (sidecar process stuck, network partition, server-side deadlock)
-/// from pinning the per-session actor indefinitely. Tighter than the
-/// local `ToolExecutor::default_timeout` because remote queries
-/// shouldn't take longer than a single HTTP round-trip.
-const SIDECAR_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Hard timeout on sidecar MCP `tools/call` round-trips. Bounds how
+/// long a hung rmcp peer (sidecar process stuck, network partition,
+/// server-side deadlock) can pin the per-session actor.
+///
+/// **Contract with sidecar-hosted MCP tools**: this MUST be strictly
+/// greater than the maximum self-timeout any sidecar tool advertises.
+/// `feishu_ask_user` caps at 600s, so the agent waits 660s here —
+/// the sidecar's own timer always fires first, returns a `timeout`
+/// result, and removes its pending waiter. If the agent timed out
+/// before the sidecar did, a late user reply could be consumed by
+/// an orphan waiter on the sidecar side and silently dropped (Codex
+/// review). The 60s buffer absorbs rmcp round-trip latency + clock
+/// skew so the race is effectively impossible.
+///
+/// Pre-Phase-3.6 this was 30s — too short for interactive sidecar
+/// tools and the source of the lost-reply bug. New tools that need
+/// to wait longer than 600s need to either grow rmcp cancellation
+/// support or bump this constant in lockstep.
+const SIDECAR_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(660);
 
 /// Cap on the byte length of `params_preview` / `result_preview` carried
 /// in `AgentOutput::ToolCall*` telemetry. The agent's own context-side

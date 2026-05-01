@@ -200,10 +200,10 @@ export class LarkMcpServer {
             .number()
             .int()
             .min(5)
-            .max(900)
+            .max(600)
             .optional()
             .describe(
-              "Seconds to wait for a reply before timing out. Defaults to 300 (5 minutes); cap is 900 (15 minutes) so the agent loop doesn't pin a per-session actor for hours.",
+              "Seconds to wait for a reply before timing out. Defaults to 300 (5 minutes); cap is 600 (10 minutes). The cap MUST stay strictly less than the agent's own sidecar-MCP timeout (660s) — if the agent gave up first, this tool's pending waiter would consume the user's late reply as a stale answer and silently drop it from the conversation (Codex review).",
             ),
         },
       },

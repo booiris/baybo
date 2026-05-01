@@ -414,6 +414,52 @@ test("LarkMcpServer: feishu_ask_user routes prompt + auraUserId to askUser handl
   await server.shutdown();
 });
 
+test("LarkMcpServer: feishu_ask_user rejects timeout_seconds above the agent-contract cap", async () => {
+  // Codex regression: the agent's `SIDECAR_MCP_TIMEOUT` is 660s.
+  // If `feishu_ask_user` accepted timeouts above ~600s, the agent
+  // could give up before the sidecar's own timer fires, leaving an
+  // orphan waiter that silently consumes the user's late reply.
+  // The schema cap is 600s; anything above it must be rejected at
+  // tool-call validation, not silently clamped.
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({ kind: "none" }),
+    askUser: async () => ({ kind: "ok", text: "should not run" }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-ask-overcap",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 14,
+      method: "tools/call",
+      params: {
+        name: "feishu_ask_user",
+        arguments: { prompt: "wait forever", timeout_seconds: 700 },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "ask_user over-cap reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 14);
+  assert.equal(last.result.isError, true);
+  // The MCP SDK surfaces zod validation errors as a tool error
+  // result. The exact phrasing isn't load-bearing; we just need
+  // confirmation the call didn't reach the askUser handler.
+  assert.match(
+    last.result.content[0].text,
+    /timeout_seconds|input|invalid|600/i,
+    `expected validation error mentioning timeout/cap, got: ${last.result.content[0].text}`,
+  );
+
+  await server.shutdown();
+});
+
 test("LarkMcpServer: feishu_ask_user timeout surfaces structured tool error", async () => {
   const server = new LarkMcpServer({
     logger: noopLogger,
