@@ -87,6 +87,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         session_id.clone(),
         sink,
         std::sync::Arc::clone(&state.blob_store),
+        super::adapter::SidecarCapabilities::from_negotiated(&negotiated_capabilities),
     );
 
     if let Err(err) = state
@@ -644,6 +645,13 @@ async fn run_inbound_loop(
                                 "sidecar ack: bot failed",
                             );
                         }
+                        // Hand the ack to the reconciler so the
+                        // applied revision advances on success and
+                        // pending clears on failure (so the next
+                        // tick retries instead of the reconciler
+                        // optimistically declaring the rotation
+                        // done).
+                        state.bot_reconciler.record_ack(channel_type, &bot_id, ok);
                     }
                     Frame::SecretRequest {
                         request_id,
