@@ -235,6 +235,28 @@ export interface BotPlatform<BotHandle, ChatId> {
   ): Promise<void>;
 
   /**
+   * Optional tool-use telemetry sink. The channel routes
+   * `Frame::ToolCallStarted` / `Frame::ToolCallCompleted` here after
+   * resolving the route, so platforms can render a mid-turn
+   * indicator (Lark CardKit footer line, Slack thread block, …).
+   * Omit if the platform has no streaming surface — frames drop
+   * silently.
+   */
+  onAgentToolCallStarted?(
+    handle: BotHandle,
+    chat: ChatId,
+    userId: string,
+    ev: import("./channel.js").AgentToolCallStarted,
+  ): Promise<void>;
+
+  onAgentToolCallCompleted?(
+    handle: BotHandle,
+    chat: ChatId,
+    userId: string,
+    ev: import("./channel.js").AgentToolCallCompleted,
+  ): Promise<void>;
+
+  /**
    * Optional slash-command registrar. Implement when the platform has
    * a server-side command list the client UI surfaces (Telegram
    * `setMyCommands`, Discord application commands, Slack
@@ -626,6 +648,40 @@ export class BotChannel<BotHandle, ChatId>
       );
     } catch (err) {
       this.logger.debug("onAgentDelta failed", err);
+    }
+  }
+
+  async onToolCallStarted(
+    ev: import("./channel.js").AgentToolCallStarted,
+  ): Promise<void> {
+    const handler = this.platform.onAgentToolCallStarted;
+    if (!handler) return;
+    const route = this.route(ev.userId);
+    if (!route) {
+      this.logger.debug("tool-call started for unknown user; dropping", ev.userId);
+      return;
+    }
+    try {
+      await handler.call(this.platform, route.handle, route.chat, ev.userId, ev);
+    } catch (err) {
+      this.logger.debug("onAgentToolCallStarted failed", err);
+    }
+  }
+
+  async onToolCallCompleted(
+    ev: import("./channel.js").AgentToolCallCompleted,
+  ): Promise<void> {
+    const handler = this.platform.onAgentToolCallCompleted;
+    if (!handler) return;
+    const route = this.route(ev.userId);
+    if (!route) {
+      this.logger.debug("tool-call completed for unknown user; dropping", ev.userId);
+      return;
+    }
+    try {
+      await handler.call(this.platform, route.handle, route.chat, ev.userId, ev);
+    } catch (err) {
+      this.logger.debug("onAgentToolCallCompleted failed", err);
     }
   }
 

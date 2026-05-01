@@ -178,15 +178,50 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     text: string,
   ): Promise<void> {
     if (text.length === 0) return;
+    const stream = this.ensureStream(handle, chat, userId);
+    if (!stream) return;
+    stream.append(text);
+  }
+
+  async onAgentToolCallStarted(
+    handle: lark.LarkChannel,
+    chat: LarkChat,
+    userId: string,
+    ev: import("@aura/channel-sdk").AgentToolCallStarted,
+  ): Promise<void> {
+    const stream = this.ensureStream(handle, chat, userId);
+    if (!stream) return;
+    stream.setToolCallRunning(ev.callId, ev.tool, ev.paramsPreview);
+  }
+
+  async onAgentToolCallCompleted(
+    handle: lark.LarkChannel,
+    chat: LarkChat,
+    userId: string,
+    ev: import("@aura/channel-sdk").AgentToolCallCompleted,
+  ): Promise<void> {
+    const stream = this.streams.get(userId);
+    // No session means the tool fired before any delta opened a card;
+    // dropping the indicator is fine — onMessage will land the agent's
+    // final reply via `sendText` regardless.
+    if (!stream) return;
+    stream.setToolCallCompleted(ev.callId, ev.error !== undefined);
+  }
+
+  private ensureStream(
+    handle: lark.LarkChannel,
+    chat: LarkChat,
+    userId: string,
+  ): LarkStreamingSession | null {
     const botId = this.botIdFromHandle(handle);
     const config = botId ? this.bots.get(botId)?.config : undefined;
-    if (config && !config.streaming) return;
+    if (config && !config.streaming) return null;
     let stream = this.streams.get(userId);
     if (!stream) {
       stream = new LarkStreamingSession(handle, chat.chatId, this.logger);
       this.streams.set(userId, stream);
     }
-    stream.append(text);
+    return stream;
   }
 
   async startBot(

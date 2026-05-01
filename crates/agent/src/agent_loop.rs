@@ -14,7 +14,7 @@ use crate::memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
-use aura_tools::{ToolOutput, ToolRegistry};
+use aura_tools::{ToolOutput, ToolRegistry, preview_params};
 use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -34,6 +34,28 @@ use crate::tool_executor::ToolExecutor;
 /// closing `}]` arrives within this many bytes, we flush anyway — no real
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
+
+/// Cap on the byte length of `params_preview` / `result_preview` carried
+/// in `AgentOutput::ToolCall*` telemetry. The agent's own context-side
+/// `cap_tool_output` is megabytes — way too much to fan out per-frame
+/// to every connected sidecar. Streaming sidecars only render a one-
+/// line indicator, so a tighter bound is fine.
+const TOOL_TELEMETRY_PREVIEW_LEN: usize = 256;
+
+/// Truncate `text` to at most `max_len` bytes, appending `…` when the
+/// content was clipped. Mirrors `aura_tools::preview_params`'s
+/// behavior on plain strings; we don't go through `preview_params` for
+/// results because they're already strings (not JSON values).
+fn truncate_preview(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    let mut end = max_len;
+    while !text.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
 
 /// Compute the byte index at which it is safe to flush `pending` to the
 /// output stream. Anything after that index is withheld because it might
@@ -373,6 +395,24 @@ impl AgentLoop {
                     "executing tool call"
                 );
 
+                if let Some(tx) = delta_tx.as_ref() {
+                    let _ = tx
+                        .send(AgentOutput::ToolCallStarted {
+                            session_id: session.id.clone(),
+                            user_id: session.user.id.clone(),
+                            channel: session.channel.clone(),
+                            call_id: tool_call.id.clone(),
+                            tool: tool_call.name.clone(),
+                            params_preview: preview_params(
+                                &tool_call.arguments,
+                                TOOL_TELEMETRY_PREVIEW_LEN,
+                            ),
+                            description: None,
+                        })
+                        .await;
+                }
+                let tool_call_started = std::time::Instant::now();
+
                 let tool_result = self
                     .tool_executor
                     .execute(
@@ -385,6 +425,24 @@ impl AgentLoop {
                         parent_job_id,
                     )
                     .await;
+
+                // Classify the outcome for telemetry before consuming
+                // the result for the LLM context. Errors / denials feed
+                // the `error` field on the Completed event so streaming
+                // sidecars can switch the indicator's color/icon.
+                let telemetry_error: Option<String> = match &tool_result {
+                    Ok(ToolOutput::Error(msg)) => Some(msg.clone()),
+                    Err(e) => {
+                        if let Some(aura_tools::ToolError::Denied { .. }) =
+                            e.downcast_ref::<aura_tools::ToolError>()
+                        {
+                            Some("denied by user".to_string())
+                        } else {
+                            Some(e.to_string())
+                        }
+                    }
+                    _ => None,
+                };
 
                 let raw_result_text = match &tool_result {
                     Ok(ToolOutput::Text(s)) => s.clone(),
@@ -411,6 +469,27 @@ impl AgentLoop {
                         }
                     }
                 };
+
+                if let Some(tx) = delta_tx.as_ref() {
+                    let result_preview = if telemetry_error.is_some() {
+                        String::new()
+                    } else {
+                        truncate_preview(&raw_result_text, TOOL_TELEMETRY_PREVIEW_LEN)
+                    };
+                    let _ = tx
+                        .send(AgentOutput::ToolCallCompleted {
+                            session_id: session.id.clone(),
+                            user_id: session.user.id.clone(),
+                            channel: session.channel.clone(),
+                            call_id: tool_call.id.clone(),
+                            tool: tool_call.name.clone(),
+                            result_preview,
+                            error: telemetry_error,
+                            duration_ms: u64::try_from(tool_call_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                        })
+                        .await;
+                }
 
                 // Cap size before wrapping so the truncation notice lands
                 // inside the `<tool_output>` envelope, then wrap so the LLM

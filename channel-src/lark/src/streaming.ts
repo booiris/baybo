@@ -29,6 +29,12 @@ import type * as lark from "@larksuiteoapi/node-sdk";
  * fire-and-forget on the delta path, where logging is more helpful
  * than throwing.
  */
+interface ToolIndicator {
+  tool: string;
+  paramsPreview: string;
+  status: "running" | "ok" | "error";
+}
+
 export class LarkStreamingSession {
   private buf = "";
   private done = false;
@@ -36,6 +42,11 @@ export class LarkStreamingSession {
   private wake: () => void;
   private streamError: unknown = null;
   private readonly streamPromise: Promise<void>;
+  // Tool-use indicators rendered as a header above the agent's prose.
+  // Insertion-ordered so users see the call sequence; entries don't
+  // disappear when a call completes — the icon swaps in place so the
+  // turn's tool history stays visible.
+  private readonly toolCalls = new Map<string, ToolIndicator>();
 
   constructor(
     channel: lark.LarkChannel,
@@ -64,13 +75,15 @@ export class LarkStreamingSession {
           while (true) {
             await this.tick;
             [this.tick, this.wake] = makeTick();
-            if (this.buf !== lastFlushed) {
-              lastFlushed = this.buf;
-              await controller.setContent(lastFlushed);
+            const composed = this.compose();
+            if (composed !== lastFlushed) {
+              lastFlushed = composed;
+              await controller.setContent(composed);
             }
             if (this.done) {
-              if (this.buf !== lastFlushed) {
-                await controller.setContent(this.buf);
+              const final = this.compose();
+              if (final !== lastFlushed) {
+                await controller.setContent(final);
               }
               return;
             }
@@ -99,6 +112,36 @@ export class LarkStreamingSession {
     if (this.done) return;
     this.buf = text;
     this.wake();
+  }
+
+  setToolCallRunning(callId: string, tool: string, paramsPreview: string): void {
+    if (this.done) return;
+    this.toolCalls.set(callId, { tool, paramsPreview, status: "running" });
+    this.wake();
+  }
+
+  setToolCallCompleted(callId: string, errored: boolean): void {
+    if (this.done) return;
+    const existing = this.toolCalls.get(callId);
+    if (!existing) return;
+    existing.status = errored ? "error" : "ok";
+    this.wake();
+  }
+
+  private compose(): string {
+    if (this.toolCalls.size === 0) return this.buf;
+    const lines: string[] = [];
+    for (const ind of this.toolCalls.values()) {
+      const icon =
+        ind.status === "running" ? "🔧" : ind.status === "ok" ? "✓" : "✗";
+      // params preview is already byte-capped upstream; squashing
+      // newlines keeps the indicator on one line so the card stays
+      // tidy even when the LLM passed multi-line JSON.
+      const oneLine = ind.paramsPreview.replace(/\s+/g, " ");
+      lines.push(`${icon} **${ind.tool}**  \`${oneLine}\``);
+    }
+    const header = lines.join("\n");
+    return this.buf.length === 0 ? header : `${header}\n\n${this.buf}`;
   }
 
   /**

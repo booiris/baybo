@@ -268,6 +268,12 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
+        // Tool-use telemetry is rendered by streaming-card sidecars;
+        // the TUI keeps its render simple and ignores both frames.
+        // The agent's text deltas already carry visible "running …"
+        // prose when the model narrates, so dropping these doesn't
+        // strand the user.
+        Frame::ToolCallStarted { .. } | Frame::ToolCallCompleted { .. } => None,
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
         | Frame::ResolveApproval { .. }

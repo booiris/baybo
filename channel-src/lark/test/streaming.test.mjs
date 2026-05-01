@@ -106,3 +106,62 @@ test("LarkStreamingSession: stream() rejection surfaces from finish()", async ()
 
   await assert.rejects(() => session.finish("anything"), /rate_limited/);
 });
+
+test("LarkStreamingSession: tool indicators render above the agent body", async () => {
+  const channel = stubChannel();
+  const session = new LarkStreamingSession(channel, "oc_x", noopLogger);
+
+  await Promise.resolve();
+  session.setToolCallRunning("call-1", "Bash", '{"cmd":"ls -la"}');
+  await Promise.resolve();
+  session.append("Listing the directory…");
+  await Promise.resolve();
+  session.setToolCallCompleted("call-1", false);
+  await session.finish();
+
+  const setContent = channel.calls[0].setContent;
+  // Final flush carries the indicator with a success icon, then the body.
+  const final = setContent.at(-1);
+  assert.match(final, /^✓ \*\*Bash\*\*  `\{"cmd":"ls -la"\}`/);
+  assert.ok(final.endsWith("Listing the directory…"));
+});
+
+test("LarkStreamingSession: errored tool flips icon to ✗", async () => {
+  const channel = stubChannel();
+  const session = new LarkStreamingSession(channel, "oc_x", noopLogger);
+
+  await Promise.resolve();
+  session.setToolCallRunning("call-1", "Bash", '{"cmd":"oops"}');
+  await Promise.resolve();
+  session.setToolCallCompleted("call-1", true);
+  await session.finish();
+
+  const final = channel.calls[0].setContent.at(-1);
+  assert.match(final, /^✗ \*\*Bash\*\*  `\{"cmd":"oops"\}`/);
+});
+
+test("LarkStreamingSession: completing an unknown call_id is a no-op", async () => {
+  const channel = stubChannel();
+  const session = new LarkStreamingSession(channel, "oc_x", noopLogger);
+
+  await Promise.resolve();
+  session.setToolCallCompleted("never-started", false);
+  session.append("hello");
+  await session.finish();
+
+  const final = channel.calls[0].setContent.at(-1);
+  assert.equal(final, "hello");
+});
+
+test("LarkStreamingSession: tool call without any text body still renders the indicator", async () => {
+  const channel = stubChannel();
+  const session = new LarkStreamingSession(channel, "oc_x", noopLogger);
+
+  await Promise.resolve();
+  session.setToolCallRunning("call-1", "Read", '{"path":"/tmp/x"}');
+  await Promise.resolve();
+  await session.finish();
+
+  const final = channel.calls[0].setContent.at(-1);
+  assert.match(final, /^🔧 \*\*Read\*\*  `\{"path":"\/tmp\/x"\}`$/);
+});

@@ -251,6 +251,40 @@ async fn agent_output_to_frame(
                 text,
             }
         }
+        AgentOutput::ToolCallStarted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            params_preview,
+            description,
+            ..
+        } => Frame::ToolCallStarted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            params_preview,
+            description,
+        },
+        AgentOutput::ToolCallCompleted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            result_preview,
+            error,
+            duration_ms,
+            ..
+        } => Frame::ToolCallCompleted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            result_preview,
+            error,
+            duration_ms,
+        },
     }
 }
 

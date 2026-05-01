@@ -604,6 +604,41 @@ function dispatchFrame(
       );
       return;
     }
+    case "tool_call_started": {
+      if (!channel.onToolCallStarted) return;
+      void safeInvoke(
+        () =>
+          channel.onToolCallStarted!({
+            sessionId: frame.session_id,
+            userId: frame.user_id ?? "",
+            callId: frame.call_id,
+            tool: frame.tool,
+            paramsPreview: frame.params_preview,
+            ...(frame.description ? { description: frame.description } : {}),
+          }),
+        "onToolCallStarted",
+        logger,
+      );
+      return;
+    }
+    case "tool_call_completed": {
+      if (!channel.onToolCallCompleted) return;
+      void safeInvoke(
+        () =>
+          channel.onToolCallCompleted!({
+            sessionId: frame.session_id,
+            userId: frame.user_id ?? "",
+            callId: frame.call_id,
+            tool: frame.tool,
+            resultPreview: frame.result_preview,
+            ...(frame.error ? { error: frame.error } : {}),
+            durationMs: Number(frame.duration_ms),
+          }),
+        "onToolCallCompleted",
+        logger,
+      );
+      return;
+    }
     case "approval_requested": {
       void handleApproval(frame, channel, ws, logger);
       return;

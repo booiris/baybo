@@ -222,6 +222,40 @@ pub enum Frame {
         level: String,
         text: String,
     },
+    /// Server -> client: agent is about to invoke a tool on a turn.
+    /// Channels with a streaming surface render an "🔧 running …"
+    /// indicator; the matching [`Frame::ToolCallCompleted`] arrives
+    /// when the tool returns (or errors). Sidecars without a
+    /// streaming surface ignore the frame. Additive — gated by the
+    /// `tool_telemetry` capability so the gateway never pushes it to
+    /// peers that don't claim support.
+    ToolCallStarted {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        call_id: String,
+        tool: String,
+        params_preview: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        description: Option<String>,
+    },
+    /// Server -> client: tool returned (or errored / was denied).
+    /// `error` carries the message when the call failed; `result_preview`
+    /// is empty / a short fallback in that case. Same capability gate
+    /// as `ToolCallStarted`.
+    ToolCallCompleted {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        call_id: String,
+        tool: String,
+        result_preview: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        error: Option<String>,
+        duration_ms: u64,
+    },
     /// Server -> client: a tool call is blocked waiting for the
     /// channel's user to approve or deny. Clients with an approval UX
     /// should echo a [`Frame::ResolveApproval`] back; clients without

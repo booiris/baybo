@@ -76,6 +76,48 @@ pub enum AgentOutput {
         level: NoticeLevel,
         text: String,
     },
+    /// Agent is about to dispatch a tool call. Channels with a
+    /// streaming surface use this to render an "🔧 running …"
+    /// indicator in the in-flight card; everyone else drops it. The
+    /// matching [`AgentOutput::ToolCallCompleted`] arrives once the
+    /// tool returns (success or error). `params_preview` is a
+    /// pre-truncated, vault-redacted snippet — the same shape the
+    /// approval gate already produces — so adapters never see raw
+    /// arguments.
+    ToolCallStarted {
+        session_id: String,
+        /// Aura user id the call is associated with. See
+        /// [`OutgoingMessage::user_id`].
+        user_id: String,
+        channel: ChannelType,
+        /// Stable id mirroring the LLM's `ToolCallInfo.id`. Channels
+        /// pair this with the matching `ToolCallCompleted` so a single
+        /// turn can host several concurrent indicators.
+        call_id: String,
+        tool: String,
+        params_preview: String,
+        /// Optional human-readable label (`Tool::call_label`); same
+        /// field the approval gate carries.
+        description: Option<String>,
+    },
+    /// Tool call returned (or errored). `result_preview` is the same
+    /// pre-truncated, vault-redacted snippet `cap_tool_output` emits
+    /// for the LLM context, capped to the channel-output budget so a
+    /// 1 MB tool reply doesn't pump megabytes of telemetry to every
+    /// connected sidecar. `error` carries the message when the tool
+    /// errored or was denied; `result_preview` is then empty / a
+    /// short fallback.
+    ToolCallCompleted {
+        session_id: String,
+        user_id: String,
+        channel: ChannelType,
+        call_id: String,
+        tool: String,
+        result_preview: String,
+        #[allow(clippy::struct_field_names)]
+        error: Option<String>,
+        duration_ms: u64,
+    },
 }
 
 /// Severity attached to an `AgentOutput::Notice`. Used only for

@@ -70,6 +70,28 @@ function startFixture() {
             );
             ws.send(
               encodeFrame({
+                kind: "tool_call_started",
+                session_id: "sess-1",
+                user_id: "tg_42",
+                call_id: "call-tool-1",
+                tool: "Bash",
+                params_preview: '{"cmd":"ls"}',
+                description: "list files",
+              }),
+            );
+            ws.send(
+              encodeFrame({
+                kind: "tool_call_completed",
+                session_id: "sess-1",
+                user_id: "tg_42",
+                call_id: "call-tool-1",
+                tool: "Bash",
+                result_preview: "a\nb\nc",
+                duration_ms: 12,
+              }),
+            );
+            ws.send(
+              encodeFrame({
                 kind: "approval_requested",
                 call_id: "call-1",
                 session_id: "sess-1",
@@ -140,6 +162,8 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   const gotDelta = { count: 0, last: null };
   const gotNotice = { count: 0, last: null };
   const gotMessage = { count: 0, last: null };
+  const gotToolStarted = { count: 0, last: null };
+  const gotToolCompleted = { count: 0, last: null };
   const gotApprovalResolved = { calls: [] };
   let approvalResolver;
   const approvalSeen = new Promise((r) => (approvalResolver = r));
@@ -158,6 +182,14 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
     async onNotice(notice) {
       gotNotice.count += 1;
       gotNotice.last = notice;
+    },
+    async onToolCallStarted(ev) {
+      gotToolStarted.count += 1;
+      gotToolStarted.last = ev;
+    },
+    async onToolCallCompleted(ev) {
+      gotToolCompleted.count += 1;
+      gotToolCompleted.last = ev;
     },
     async onApprovalRequested(req) {
       approvalResolver(req);
@@ -235,6 +267,21 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
     level: "warn",
     text: "low battery",
   });
+  assert.equal(gotToolStarted.count, 1);
+  assert.deepEqual(gotToolStarted.last, {
+    sessionId: "sess-1",
+    userId: "tg_42",
+    callId: "call-tool-1",
+    tool: "Bash",
+    paramsPreview: '{"cmd":"ls"}',
+    description: "list files",
+  });
+  assert.equal(gotToolCompleted.count, 1);
+  // duration_ms rides as bigint on the wire; the SDK normalises to number.
+  assert.equal(gotToolCompleted.last.callId, "call-tool-1");
+  assert.equal(gotToolCompleted.last.resultPreview, "a\nb\nc");
+  assert.equal(gotToolCompleted.last.error, undefined);
+  assert.equal(gotToolCompleted.last.durationMs, 12);
   assert.equal(gotMessage.count, 1);
   assert.equal(gotMessage.last.content, "pong");
   assert.equal(gotMessage.last.sessionId, "sess-1");

@@ -41,6 +41,39 @@ export interface AgentNotice {
   text: string;
 }
 
+/**
+ * Telemetry surfaced when the agent dispatches a tool call. Streaming
+ * channels render an indicator in the in-flight card; everyone else
+ * drops it. `paramsPreview` is a pre-truncated, vault-redacted JSON
+ * snippet (≤256 chars) — sidecars never see raw tool arguments.
+ * `description` is the tool's optional `call_label` hook (Bash's
+ * `description`, etc.) when present.
+ */
+export interface AgentToolCallStarted {
+  sessionId: string;
+  userId: string;
+  callId: string;
+  tool: string;
+  paramsPreview: string;
+  description?: string;
+}
+
+/**
+ * Pair to {@link AgentToolCallStarted}. `error` is set when the tool
+ * errored or was denied; `resultPreview` is empty / a short fallback
+ * in that case. Match against the `callId` you saw on `onToolCallStarted`
+ * to pair the indicator with its terminal state.
+ */
+export interface AgentToolCallCompleted {
+  sessionId: string;
+  userId: string;
+  callId: string;
+  tool: string;
+  resultPreview: string;
+  error?: string;
+  durationMs: number;
+}
+
 export interface UserInbound {
   sessionId: string;
   userId: string;
@@ -148,6 +181,19 @@ export interface Channel {
   onDelta?(delta: AgentDelta): Promise<void>;
 
   onNotice?(notice: AgentNotice): Promise<void>;
+
+  /**
+   * Optional tool-use telemetry. The gateway emits
+   * `Frame::ToolCallStarted` immediately before invoking each tool
+   * call on the agent's turn and `Frame::ToolCallCompleted` once the
+   * tool returns (or errors / is denied). Streaming sidecars use
+   * these to render mid-turn "🔧 running …" indicators in their
+   * in-flight card; sidecars without a streaming surface omit the
+   * methods and the SDK runner drops the frames silently.
+   */
+  onToolCallStarted?(ev: AgentToolCallStarted): Promise<void>;
+
+  onToolCallCompleted?(ev: AgentToolCallCompleted): Promise<void>;
 
   /**
    * Return value is encoded into a `ResolveApproval` frame by the runner.

@@ -325,6 +325,16 @@ impl Router {
                 session_id,
                 channel,
                 ..
+            }
+            | AgentOutput::ToolCallStarted {
+                session_id,
+                channel,
+                ..
+            }
+            | AgentOutput::ToolCallCompleted {
+                session_id,
+                channel,
+                ..
             } => (session_id.clone(), channel.clone()),
             AgentOutput::Message(outgoing) => {
                 (outgoing.session_id.clone(), outgoing.channel.clone())

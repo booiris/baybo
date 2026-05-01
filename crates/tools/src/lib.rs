@@ -20,6 +20,7 @@ use uuid::Uuid;
 pub use approval::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalQueue, ApprovalRequest,
     ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, ResourceAccess,
+    preview_params,
 };
 pub use error::ToolError;
 

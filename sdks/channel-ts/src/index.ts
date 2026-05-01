@@ -8,6 +8,8 @@ export type {
   AgentDelta,
   AgentMessage,
   AgentNotice,
+  AgentToolCallCompleted,
+  AgentToolCallStarted,
   ApprovalDecision,
   ApprovalRequest,
   BotStatusReport,
