@@ -69,9 +69,11 @@ impl Soul {
 fn build_env_block(workspace: &WorkspaceManager) -> String {
     let paths = WorkspacePaths::new(workspace.root.clone());
     let work_dir = absolutise(&paths.work_dir());
+    let workspace_root = absolutise(paths.root());
     format!(
         "# Environment\n\
          - Working directory: {work_dir}\n\
+         - Workspace root: {workspace_root}\n\
          - Platform: {platform}\n\
          \n\
          Tool calls operate inside the working directory by default — \
@@ -82,6 +84,7 @@ fn build_env_block(workspace: &WorkspaceManager) -> String {
          inside the sandbox; reach outside (e.g. read `/etc/hosts`) \
          only when the task explicitly calls for it.",
         work_dir = work_dir.display(),
+        workspace_root = workspace_root.display(),
         platform = std::env::consts::OS,
     )
 }
