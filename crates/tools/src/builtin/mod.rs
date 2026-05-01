@@ -26,11 +26,9 @@ use std::sync::Arc;
 use aura_model::TrustLevel;
 use aura_storage::BlobStore;
 
-use crate::builtin::browser::BrowserSidecarClient;
 use crate::{Tool, ToolCapability, ToolManifest};
 
 pub mod bash;
-pub mod browser;
 pub mod edit;
 pub mod glob_tool;
 pub mod grep;
@@ -63,14 +61,9 @@ pub use write::WriteTool;
 /// its governance ceiling. `ToolExecutor::validate_trust` compares this
 /// manifest against the runtime trust policy before executing.
 ///
-/// `browser_client`: when `Some`, registers all 12 `browser_*` tools
-/// against the supplied sidecar client. When `None` (default for CLI
-/// commands and any path that doesn't run the gateway), browser tools
-/// are simply absent from the registry and the LLM never sees them.
-pub fn default_tools(
-    blob_store: Arc<dyn BlobStore>,
-    browser_client: Option<Arc<dyn BrowserSidecarClient>>,
-) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
+/// Browser tools are not listed here — they arrive dynamically when
+/// the embedded browser MCP server connects through the reconciler.
+pub fn default_tools(blob_store: Arc<dyn BlobStore>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
         trusted(ReadTool, vec![ToolCapability::ReadFile]),
@@ -89,9 +82,6 @@ pub fn default_tools(
         send_local_file::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
     ];
-    if let Some(client) = browser_client {
-        tools.extend(browser::tools(client, blob_store));
-    }
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));
     tools

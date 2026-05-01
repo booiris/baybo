@@ -1,3 +1,4 @@
+import { type LookupAddress } from "node:dns";
 import { promises as dns } from "node:dns";
 import * as net from "node:net";
 
@@ -214,7 +215,10 @@ export async function resolveAndCheck(
     throw blockedError(`host ${host} blocked`);
   }
 
-  let resolved: dns.LookupAddress[];
+  // The `LookupAddress` type lives on the parent `node:dns` module and
+  // isn't re-exported under `node:dns/promises` in the bundled
+  // `@types/node`; import it directly.
+  let resolved: LookupAddress[];
   try {
     resolved = await dns.lookup(host, { all: true });
   } catch (e) {

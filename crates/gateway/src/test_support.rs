@@ -137,8 +137,6 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         stores,
         channel_control,
         bot_reconciler,
-        tool_ws_client: None,
-        tool_ws_sidecar_label: "tool/browser".to_string(),
     };
 
     TestGateway {

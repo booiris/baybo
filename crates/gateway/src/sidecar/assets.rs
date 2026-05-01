@@ -28,8 +28,16 @@ use generated::{SIDECARS, SidecarAsset, SidecarAuxAsset};
 /// build-time domain string that doesn't appear here is still
 /// accepted, callers just won't have a constant to refer to it by.
 pub mod domains {
+    /// Channel-protocol sidecars (telegram, weixin, …). Each registers
+    /// itself with the channel registry on connect and pumps platform
+    /// messages onto the gateway's WebSocket.
     pub const CHANNEL: &str = "channel";
-    pub const BROWSER: &str = "browser";
+    /// Tool-domain sidecars — embedded MCP servers exposing one or
+    /// more `<server>/<tool>` calls to the agent loop. Today the only
+    /// tool sidecar is `browser`; future families (code_exec,
+    /// db_query, …) sit under the same domain and ship their own
+    /// MCP server name.
+    pub const TOOL: &str = "tool";
 }
 
 #[derive(Debug, Error)]
@@ -62,13 +70,13 @@ struct SidecarEntry {
 /// hold (a small Vec); clone via `Arc` at the call site if shared
 /// across tasks.
 ///
-/// Each sidecar is tagged with its **domain** — the business surface
-/// it participates in (`channel`, `browser`, …) — declared in the
+/// Each sidecar is tagged with its **domain** — the business family
+/// it participates in (`channel`, `tool`, …) — declared in the
 /// sidecar's own `package.json` (`aura.domain`). Callers iterate
-/// per domain so the channel list, the browser supervisor, and any
-/// future tool family stay decoupled. New domains add by appending
-/// to the sidecar's package.json + (optionally) adding a constant
-/// in [`domains`]; no Rust API changes required.
+/// per domain so the channel list, the embedded-MCP profiles, and
+/// any future family stay decoupled. New domains add by appending to
+/// the sidecar's package.json + (optionally) adding a constant in
+/// [`domains`]; no Rust API changes required.
 pub struct SidecarRuntime {
     sidecars: Vec<SidecarEntry>,
 }

@@ -103,7 +103,7 @@ const playwrightCoreDirStub = {
 
 const start = Date.now();
 const result = await build({
-  entryPoints: ["src/index.ts"],
+  entryPoints: ["src/server.ts"],
   bundle: true,
   format: "esm",
   platform: "node",

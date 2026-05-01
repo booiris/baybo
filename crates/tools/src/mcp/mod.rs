@@ -1,14 +1,21 @@
+pub mod access_rule;
 pub mod config;
+pub mod content_adapter;
 pub mod credentials;
+pub mod embedded;
 pub mod error;
 pub mod oauth;
+pub mod profile;
 pub mod reconciler;
 pub mod tool;
 pub mod transport;
 pub mod vault_keys;
 
+pub use access_rule::{AccessRule, AuraToolMeta, CallLabelRule, ResourceKind};
 pub use config::{McpFile, McpServerEntry, McpTransportConfig, OAuthConfig, TrustLevelConfig};
+pub use embedded::EmbeddedMcpServer;
 pub use error::{McpError, McpResult};
+pub use profile::{EmbeddedMcpProfile, browser_mcp_profile, embedded_servers};
 pub use reconciler::McpReconciler;
 pub use tool::McpTool;
 pub use transport::{McpServerSession, connect};

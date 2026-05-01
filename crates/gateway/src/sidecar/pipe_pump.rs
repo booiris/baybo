@@ -8,9 +8,8 @@
 //! `read_capped_line` + `drain_until_newline` pair below uses
 //! `fill_buf` / `consume` so the read buffer never exceeds the cap.
 //!
-//! Used today by `tool_ws::supervisor`. `sidecar::supervisor`
-//! (channel side) still uses the unsafe `BufReader::lines()` shape;
-//! it should migrate here when next touched.
+//! Used by `sidecar::supervisor` (channel-side restart loop) for its
+//! per-line stdout/stderr pump.
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 

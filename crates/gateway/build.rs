@@ -449,9 +449,15 @@ fn embed_sidecars(ws_root: &Path) {
     let mut bundling_failures = 0usize;
     for dir in &sidecar_dirs {
         let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-        let entry_ts = dir.join("src/index.ts");
-        if !entry_ts.exists() {
-            println!("cargo:warning=sidecar '{name}' has no src/index.ts; skipping",);
+        // Channel sidecars name their entry `src/index.ts`; the browser
+        // tool sidecar (an embedded MCP server) uses `src/server.ts`
+        // since it has a different lifecycle. Either is fine.
+        let entry_index = dir.join("src/index.ts");
+        let entry_server = dir.join("src/server.ts");
+        if !entry_index.exists() && !entry_server.exists() {
+            println!(
+                "cargo:warning=sidecar '{name}' has neither src/index.ts nor src/server.ts; skipping",
+            );
             continue;
         }
         let (pkg_name, domain) = match read_package_meta(&dir.join("package.json")) {
@@ -568,10 +574,27 @@ fn embed_sidecars(ws_root: &Path) {
         });
     }
 
-    if emitted.len() == entries.len()
-        && let Err(e) = write_sidecar_cache_manifest(&cache_dir, &emitted)
-    {
-        println!("cargo:warning=write sidecar cache manifest failed: {e}");
+    // Only cache when *every* sidecar bundled + emitted cleanly. A
+    // partial-success cache poisons subsequent builds: the input
+    // fingerprint matches but the cached manifest is missing whichever
+    // sidecars failed (e.g. when a previous `pnpm` invocation hit a
+    // sandbox / network glitch), and the early-return at line ~428
+    // hands out the corrupt cache without ever retrying. Better to
+    // skip the cache write so the next build re-attempts bundling
+    // from scratch.
+    let all_bundled = bundling_failures == 0 && emitted.len() == entries.len();
+    if all_bundled {
+        if let Err(e) = write_sidecar_cache_manifest(&cache_dir, &emitted) {
+            println!("cargo:warning=write sidecar cache manifest failed: {e}");
+        }
+    } else {
+        println!(
+            "cargo:warning=skipping sidecar cache write \
+             ({bundling_failures} bundling failure(s); \
+             {} compressed of {} entries) — next build will retry from scratch",
+            emitted.len(),
+            entries.len(),
+        );
     }
 
     emit_sidecar_assets(&generated, &emitted);

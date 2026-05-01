@@ -30,7 +30,6 @@ pub mod sidecar;
 pub mod spawn;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
-pub mod tool_ws;
 
 pub use crate::auth::{
     AdminToken, CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TUI_CLIENT_LABEL,
@@ -45,5 +44,8 @@ pub use crate::installer::{
 };
 pub use crate::log_buffer::{LogBuffer, LogBufferLayer, LogLevel, LogPage, LogQuery, LogRecord};
 pub use crate::server::{GatewayDeps, GatewayServer};
-pub use crate::sidecar::{BUN_BINARY_ENV, SidecarError, SidecarRuntime, SidecarSupervisor};
+pub use crate::sidecar::{
+    BUN_BINARY_ENV, NODE_BINARY_ENV, SidecarError, SidecarRuntime, SidecarSupervisor,
+    collect_profiles, node_binary,
+};
 pub use crate::spawn::{ChannelSpawner, ChildHandle, SIDECAR_ENV_ALLOWLIST};

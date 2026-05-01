@@ -36,15 +36,16 @@ pub const ENV_CHANNEL_URL: &str = "AURA_CHANNEL_URL";
 /// [`CHANNEL_TOKEN_HEADER`].
 pub const ENV_CHANNEL_TOKEN: &str = "AURA_CHANNEL_TOKEN";
 
-/// Env vars a supervised sidecar (channel or tool) is allowed to
-/// inherit from the gateway. Anything else (`OPENAI_API_KEY`, every
-/// `AURA_*` from the operator's shell, cloud / proxy creds, …) is
-/// scrubbed before `execve` so a compromised JS bundle can't read
-/// the gateway's secret env. Both `ChannelSpawner::spawn` and
-/// `tool_ws::ToolSidecarSupervisor` import this constant so the
-/// scrubbing rules can't drift apart. Also mirrors the
-/// registration-mode allowlist in
-/// `cli::commands::channel::register::scrubbed_env`.
+/// Env vars a supervised channel sidecar is allowed to inherit from
+/// the gateway. Anything else (`OPENAI_API_KEY`, every `AURA_*` from
+/// the operator's shell, cloud / proxy creds, …) is scrubbed before
+/// `execve` so a compromised JS bundle can't read the gateway's
+/// secret env. Mirrors the registration-mode allowlist in
+/// `cli::commands::channel::register::scrubbed_env`. Tool-domain
+/// sidecars (the embedded browser MCP server today) flow through
+/// `aura_tools::mcp::transport::connect_with_extra_env`, which
+/// applies its own scrubbing list — keep these two in mind together
+/// when adding a new env var that needs to reach a child.
 pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",

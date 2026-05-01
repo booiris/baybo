@@ -45,7 +45,7 @@ use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
-use aura_tools::mcp::McpReconciler;
+use aura_tools::mcp::{EmbeddedMcpServer, McpReconciler};
 use aura_workspace::WorkspaceManager;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -185,17 +185,6 @@ pub struct ManagerGraph {
     /// `wire_router` twice panics loudly instead of silently handing
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
-
-    /// Sidecar client that drives the browser tool family. Always
-    /// constructed (cheap — just an `Arc<ClientState>` with no I/O);
-    /// the gateway's `tool_ws` endpoint attaches a live WebSocket via
-    /// [`aura_gateway::tool_ws::WsBrowserSidecarClient::attach`] when
-    /// a sidecar registers, and tools that fire before that get a
-    /// clean `BrowserRpcError::Disconnected`. Held here so
-    /// `gateway_cmd.rs` can plumb the same instance into both
-    /// `GatewayDeps` (for the WS route) and the `ToolRegistry`
-    /// already wrapped in `Arc`.
-    pub tool_ws_client: aura_gateway::tool_ws::WsBrowserSidecarClient,
 }
 
 /// Resolve every domain manager, tying them together with the shared
@@ -232,20 +221,11 @@ pub async fn build_managers(
     // itself stays intact for the graph + downstream consumers.
     let stores = Store::open(boot::storage_db_path(&config.workspace)).await?;
 
-    // Browser-tool plumbing: the WS client is a stateless handle the
-    // tools call into. The gateway's tool_ws server attaches a live
-    // socket when a sidecar registers; until then every browser_*
-    // call fails fast with `Disconnected`. `build_managers` is only
-    // invoked from `gateway_cmd::start` today — direct `aura` argv
-    // paths take the simpler `ToolRegistry::with_defaults` route in
-    // `main.rs` and never see browser tools at all.
-    let tool_ws_client = aura_gateway::tool_ws::WsBrowserSidecarClient::new();
-    let browser_client_for_registry: Arc<dyn aura_tools::builtin::browser::BrowserSidecarClient> =
-        Arc::new(tool_ws_client.clone());
-    let mut tool_registry = Arc::new(ToolRegistry::with_defaults_and_browser(
-        stores.blob.clone(),
-        Some(browser_client_for_registry),
-    ));
+    // Browser tools are not registered as builtins — they arrive
+    // dynamically when the embedded browser MCP server connects via
+    // the reconciler below. Until that connect completes (or if the
+    // child crashes), the LLM does not see `browser/*` tools at all.
+    let mut tool_registry = Arc::new(ToolRegistry::with_defaults(stores.blob.clone()));
 
     // Built after `stores` so `build_llm_client` can wire the blob
     // store in as a `BlobFetcher` — without it, multimodal user
@@ -414,10 +394,34 @@ pub async fn build_managers(
             cancel_on_shutdown.cancel();
         });
     }
+    // Browser MCP server: shipped as a zstd-embedded JS bundle, run
+    // by the gateway as a stdio MCP child. The reconciler spawns it
+    // alongside any user-configured `.mcp.json` entries; if the bundle
+    // failed to materialise (`SidecarRuntime::install` Err), the
+    // embedded list is empty and only user entries get connected.
+    // Embedded MCP servers (browser today; future code_exec / db_query
+    // sit alongside in `aura_gateway::collect_profiles`). When the
+    // bundle table is unavailable or every family is disabled, the
+    // reconciler runs with just the user-configured `.mcp.json`
+    // entries.
+    let embedded_mcp_servers: Vec<EmbeddedMcpServer> = match aura_gateway::SidecarRuntime::install()
+    {
+        Ok(rt) => aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(&rt, &config)),
+        Err(e) => {
+            tracing::info!(
+                error = %e,
+                "embedded sidecar runtime unavailable; no embedded MCP servers will be spawned",
+            );
+            Vec::new()
+        }
+    };
+
     let mcp_reconciler = McpReconciler::new(
         workspace_root.clone(),
         Arc::clone(&tool_registry),
         Arc::clone(&secret_vault),
+        Some(stores.blob.clone()),
+        embedded_mcp_servers,
         mcp_cancel,
     );
     mcp_reconciler.spawn();
@@ -441,7 +445,6 @@ pub async fn build_managers(
         secret_vault,
         stores,
         cron_trigger_rx: Some(cron_trigger_rx),
-        tool_ws_client,
     })
 }
 

@@ -54,7 +54,6 @@ rand = { workspace = true }
 hex = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
-rmp-serde = { workspace = true }
 libc = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

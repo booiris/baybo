@@ -14,6 +14,7 @@
 //! ```
 
 pub mod agent;
+pub mod browser;
 pub mod channels;
 pub mod cost;
 pub mod error;
@@ -31,6 +32,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 pub use crate::agent::{AgentConfig, ContextConfig};
+pub use crate::browser::BrowserConfig;
 pub use crate::channels::{
     ChannelsConfig, CliChannelConfig, DiscordChannelConfig, HttpChannelConfig,
     TelegramChannelConfig,
@@ -62,6 +64,7 @@ pub struct AuraConfig {
     pub cost: CostConfig,
     pub workspace: WorkspaceConfig,
     pub gateway: GatewayConfig,
+    pub browser: BrowserConfig,
 }
 
 impl AuraConfig {

@@ -241,21 +241,15 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // of a "temporary" token: any TUI still holding the previous
     // generation's value must reconnect via the freshly published
     // vault entry.
-    let (token, tui_token, tool_browser_token) = {
+    let (token, tui_token) = {
         let vault = runtime::build_secret_vault(&config).await?;
         let admin_token = AdminToken::new(Arc::clone(&vault)).mint_if_absent().await?;
         let tui_token = aura_gateway::generate_token();
-        // Tool-sidecar token minted up front (rather than later
-        // alongside `channel_tokens.register`) so it can be folded
-        // into the leak detector before tracing fires up — otherwise
-        // any subsequent log line that accidentally echoed it would
-        // sit in `aura.log` until shutdown.
-        let tool_browser_token = aura_gateway::generate_token();
         vault
             .store_secret(TUI_TOKEN_VAULT_KEY, tui_token.as_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("publish TUI token to vault: {e}"))?;
-        (admin_token, tui_token, tool_browser_token)
+        (admin_token, tui_token)
     };
 
     // Build the leak detector (with every gateway-minted token
@@ -269,7 +263,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         &[
             ("gateway.admin_token", token.as_str()),
             (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
-            ("tool.browser.ws_token", tool_browser_token.as_str()),
         ],
     );
     let log_dir = workspace_paths.logs_dir();
@@ -345,21 +338,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
 
-    // Browser-tool sidecar token was generated up front (above, with
-    // tui_token) so the leak detector covers it. Register it in the
-    // channel token table now so `/v1/tool-ws` channel-auth admits
-    // the sidecar connection. Held for the rest of `start` via
-    // `_tool_browser_token_handle`.
-    const TOOL_BROWSER_LABEL: &str = "tool/browser";
-    let _tool_browser_token_handle = channel_tokens.register(
-        tool_browser_token.clone(),
-        ClientIdentity {
-            pid: 0,
-            label: TOOL_BROWSER_LABEL.to_string(),
-            bound_channel_type: None,
-        },
-    );
-
     // CLI-driven bot add/remove writes straight to libsql + vault. The
     // reconciler polls those stores on a short tick and pushes
     // `StartBot` / `StopBot` frames to whichever sidecars are
@@ -399,8 +377,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         stores: graph.stores.clone(),
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
-        tool_ws_client: Some(graph.tool_ws_client.clone()),
-        tool_ws_sidecar_label: TOOL_BROWSER_LABEL.to_string(),
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to
@@ -417,16 +393,15 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let channel_port = channel_server.port();
     let channel_url = format!("ws://127.0.0.1:{channel_port}/v1/channel-ws");
 
-    // Embedded-sidecar supervisor. The channel TCP listener is already
-    // bound above so the kernel's listen queue absorbs child
-    // connection attempts even before `channel_server.run()` starts
-    // accepting inside the select! below. Each channel type gets its
-    // own restart loop driven by the shared shutdown signal.
+    // Channel-sidecar supervisor (telegram / weixin / …). The channel
+    // TCP listener is already bound above so the kernel's listen queue
+    // absorbs child connection attempts even before
+    // `channel_server.run()` starts accepting inside the select! below.
+    // The browser MCP server lives on a separate path: it is spawned
+    // by the MCP reconciler set up inside `runtime::build_managers`,
+    // not by this supervisor.
     match SidecarRuntime::install() {
         Ok(runtime) => {
-            // Per-domain breakdown for the boot log so operators can
-            // see at a glance which families are embedded in this
-            // build (channel: telegram, weixin; browser: browser; …).
             let domains: Vec<&str> = runtime.domains().collect();
             if domains.is_empty() {
                 tracing::info!("no embedded sidecars in this build");
@@ -443,7 +418,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
             }
             let runtime = Arc::new(runtime);
 
-            // Channel sidecars: lazy spawn keyed on registered bots.
             let channel_only: Vec<String> = runtime
                 .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
                 .map(String::from)
@@ -464,41 +438,12 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                 }));
             }
 
-            // Browser tool sidecar: started unconditionally when its
-            // bundle is embedded. The supervisor connects back to the
-            // gateway over `/v1/tool-ws` (using the dedicated channel
-            // token minted earlier as `tool_browser_token`); the
-            // `WsBrowserSidecarClient` already plumbed through the
-            // tool registry receives the live socket on Register.
-            if let Some(bundle_path) = runtime.bundle_for(aura_gateway::sidecar::domains::BROWSER) {
-                let tool_ws_url = format!("ws://127.0.0.1:{channel_port}/v1/tool-ws");
-                let no_sandbox =
-                    parse_bool_env(std::env::var("AURA_BROWSER_NO_SANDBOX").ok().as_deref());
-                if no_sandbox {
-                    tracing::warn!(
-                        "AURA_BROWSER_NO_SANDBOX=1 — Chromium will launch without its \
-                         renderer sandbox. Only safe inside an outer sandbox (rootless \
-                         docker, gVisor, …)."
-                    );
-                }
-                let cfg = aura_gateway::tool_ws::ToolSidecarConfig {
-                    bundle_path: bundle_path.to_path_buf(),
-                    ws_url: tool_ws_url,
-                    ws_token: tool_browser_token.clone(),
-                    chromium_executable: None,
-                    profile_dir: None,
-                    no_sandbox,
-                };
-                let tool_supervisor = aura_gateway::tool_ws::ToolSidecarSupervisor::new(cfg);
-                let sv_shutdown = shutdown.clone();
-                task_tracker.track(tokio::spawn(async move {
-                    tool_supervisor.run(sv_shutdown).await;
-                }));
-                tracing::info!(channel_port, "browser tool sidecar supervisor started");
-            } else {
-                tracing::info!(
-                    "browser tool sidecar bundle not embedded; \
-                     browser_* tools will return Disconnected until a sidecar registers",
+            if graph.config.browser.enable && !graph.config.browser.sandbox {
+                tracing::warn!(
+                    "browser.sandbox=false — Chromium will launch without its renderer \
+                     sandbox. Only safe inside an outer sandbox (rootless docker, gVisor, …). \
+                     Set `browser.sandbox = true` in aura.json once you've verified the host \
+                     supports user-namespace sandboxing."
                 );
             }
         }
@@ -549,11 +494,4 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     task_tracker.shutdown().await;
     tracing::info!("gateway shutdown complete");
     Ok(())
-}
-
-fn parse_bool_env(s: Option<&str>) -> bool {
-    match s.map(|v| v.trim().to_ascii_lowercase()) {
-        Some(v) => matches!(v.as_str(), "1" | "true" | "yes" | "on"),
-        None => false,
-    }
 }

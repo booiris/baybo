@@ -1,38 +1,48 @@
 import type { BrowserManager } from "./manager.js";
 import { assertSafeUrl } from "./network_policy.js";
-import type { RpcHandler } from "./rpc.js";
 import { buildSnapshot } from "./snapshot.js";
 
 /**
  * Cap on `page.goto` / `page.goBack`. Playwright's implicit default is
- * 30 s; we surface it explicitly so an unresponsive target site
- * fails fast instead of hanging until either Playwright's invisible
- * timer fires or the RPC-layer timeout kicks in (whichever the
- * caller set as `ctx.timeout`). 30 s matches Playwright's default
- * and is well below any reasonable per-tool timeout the agent loop
- * configures, so the RPC timeout stays the upper bound and this
- * cap is the lower bound on noticing a stuck navigation.
+ * 30 s; we surface it explicitly so an unresponsive target site fails
+ * fast instead of hanging until either Playwright's invisible timer
+ * fires or the gateway-side per-tool timeout kicks in (whichever the
+ * caller set).
  */
 const NAVIGATION_TIMEOUT_MS = 30_000;
+
+/**
+ * MCP `tools/call` content frame. Mirrors `RawContent` from the Rust
+ * side: text becomes `{type: "text", text}`; an image becomes
+ * `{type: "image", data: <base64>, mimeType}`. We don't import the
+ * SDK's types here to keep this file framework-agnostic.
+ */
+export type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
+
+export type CallResult = {
+  content: ContentBlock[];
+  isError?: boolean;
+};
+
+export type HandlerArgs = Record<string, unknown> & { context_id: string };
+export type ToolHandler = (args: HandlerArgs) => Promise<CallResult>;
 
 /**
  * Resolve a `@eN` ref to a Playwright locator. The `eN` id is minted
  * by `snapshot.ts::walkPageSource` as a per-context nonce-suffixed
  * attribute (`data-aura-ref-<hex>`) on the element itself, so
  * resolution is a plain CSS lookup against Playwright's public
- * `Page.locator` API. No internal Playwright selector engines
- * involved.
+ * `Page.locator` API.
  *
  * Refs are valid only against the **most recent** snapshot for a
  * given context — `walkPageSource` strips `refAttr` from every
- * element before relabeling, so a stale ref from snapshot N is no
- * longer in the DOM after snapshot N+1.
+ * element before relabeling.
  *
  * Uniqueness check: a malicious page may copy our nonce-suffixed
  * attribute onto an attacker-controlled element AFTER the snapshot,
- * producing two matches. We assert exactly one match before acting,
- * so a duplicate-attribute attack fails with a structured error
- * rather than silently mistargeting the click.
+ * producing two matches. We assert exactly one match before acting.
  */
 async function resolveRef(
   state: { page: import("playwright").Page; refAttr: string },
@@ -54,7 +64,7 @@ async function resolveRef(
   if (n > 1) {
     const err = new Error(
       `ref '${ref}' matches ${n} elements; possible page-side ref pollution. ` +
-        `Re-run browser_snapshot to re-mint refs.`,
+        `Re-run browser/snapshot to re-mint refs.`,
     );
     err.name = "REF_AMBIGUOUS";
     throw err;
@@ -62,16 +72,16 @@ async function resolveRef(
   return loc;
 }
 
-export function buildHandlers(manager: BrowserManager): Record<string, RpcHandler> {
+/** JSON-encode an arbitrary handler return value as MCP text content. */
+function asText(value: unknown): CallResult {
+  return { content: [{ type: "text", text: JSON.stringify(value) }] };
+}
+
+export function buildHandlers(manager: BrowserManager): Record<string, ToolHandler> {
   return {
-    async navigate(params) {
-      const url = String((params as { url?: unknown }).url ?? "");
+    async navigate(args) {
+      const url = String(args["url"] ?? "");
       if (!url) throw badParams("navigate: url is required");
-      // Defence in depth: the Rust `browser_navigate` already calls
-      // `validate_url_with`, but the route handler runs in an
-      // entirely separate process so we re-check here too. This also
-      // catches hostnames that resolve only to blocked IP ranges,
-      // which the syntactic Rust check can't see.
       try {
         await assertSafeUrl(url, manager.allowLoopback());
       } catch (e) {
@@ -80,76 +90,76 @@ export function buildHandlers(manager: BrowserManager): Record<string, RpcHandle
         err.name = "BLOCKED_BY_SSRF_POLICY";
         throw err;
       }
-      const state = await manager.acquire(params.context_id);
+      const state = await manager.acquire(args.context_id);
       await state.page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: NAVIGATION_TIMEOUT_MS,
       });
       state.url = state.page.url();
-      const sup = manager.supervisorSnapshot(params.context_id);
+      const sup = manager.supervisorSnapshot(args.context_id);
       const text = await buildSnapshot(state.page, sup, false, state.refAttr);
       const title = await state.page.title().catch(() => "");
-      return { title, url: state.url, snapshot: text };
+      return asText({ title, url: state.url, snapshot: text });
     },
 
-    async snapshot(params) {
-      const full = Boolean((params as { full?: unknown }).full);
-      const state = await manager.acquire(params.context_id);
-      const sup = manager.supervisorSnapshot(params.context_id);
+    async snapshot(args) {
+      const full = Boolean(args["full"]);
+      const state = await manager.acquire(args.context_id);
+      const sup = manager.supervisorSnapshot(args.context_id);
       const text = await buildSnapshot(state.page, sup, full, state.refAttr);
-      return { text };
+      return asText({ text });
     },
 
-    async click(params) {
-      const ref = String((params as { ref?: unknown }).ref ?? "");
+    async click(args) {
+      const ref = String(args["ref"] ?? "");
       if (!ref) throw badParams("click: ref is required");
-      const state = await manager.acquire(params.context_id);
+      const state = await manager.acquire(args.context_id);
       const loc = await resolveRef(state, ref);
       await loc.click();
-      return { ok: true };
+      return asText({ ok: true });
     },
 
-    async type(params) {
-      const ref = String((params as { ref?: unknown }).ref ?? "");
-      const text = String((params as { text?: unknown }).text ?? "");
+    async type(args) {
+      const ref = String(args["ref"] ?? "");
+      const text = String(args["text"] ?? "");
       if (!ref) throw badParams("type: ref is required");
-      const state = await manager.acquire(params.context_id);
+      const state = await manager.acquire(args.context_id);
       const loc = await resolveRef(state, ref);
       await loc.fill("");
       await loc.fill(text);
-      return { ok: true };
+      return asText({ ok: true });
     },
 
-    async scroll(params) {
-      const direction = String((params as { direction?: unknown }).direction ?? "");
+    async scroll(args) {
+      const direction = String(args["direction"] ?? "");
       if (direction !== "up" && direction !== "down") {
         throw badParams("scroll: direction must be 'up' or 'down'");
       }
-      const state = await manager.acquire(params.context_id);
+      const state = await manager.acquire(args.context_id);
       const dy = direction === "down" ? 500 : -500;
       await state.page.evaluate((delta: number) => window.scrollBy(0, delta), dy);
-      return { ok: true };
+      return asText({ ok: true });
     },
 
-    async back(params) {
-      const state = await manager.acquire(params.context_id);
+    async back(args) {
+      const state = await manager.acquire(args.context_id);
       await state.page
         .goBack({ waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS })
         .catch(() => null);
       state.url = state.page.url();
-      return { url: state.url };
+      return asText({ url: state.url });
     },
 
-    async press(params) {
-      const key = String((params as { key?: unknown }).key ?? "");
+    async press(args) {
+      const key = String(args["key"] ?? "");
       if (!key) throw badParams("press: key is required");
-      const state = await manager.acquire(params.context_id);
+      const state = await manager.acquire(args.context_id);
       await state.page.keyboard.press(key);
-      return { ok: true };
+      return asText({ ok: true });
     },
 
-    async get_images(params) {
-      const state = await manager.acquire(params.context_id);
+    async get_images(args) {
+      const state = await manager.acquire(args.context_id);
       const images = await state.page.evaluate(() => {
         const out: Array<{ src: string; alt: string; w: number; h: number }> = [];
         const imgs = document.querySelectorAll("img");
@@ -165,32 +175,41 @@ export function buildHandlers(manager: BrowserManager): Record<string, RpcHandle
         }
         return out;
       });
-      return { images };
+      return asText({ images });
     },
 
-    async screenshot(params) {
-      const fullPage = Boolean((params as { full_page?: unknown }).full_page);
-      const state = await manager.acquire(params.context_id);
+    async screenshot(args) {
+      const fullPage = Boolean(args["full_page"]);
+      const state = await manager.acquire(args.context_id);
       const buf = await state.page.screenshot({ fullPage, type: "png" });
-      return { png_b64: buf.toString("base64"), url: state.page.url() };
+      const url = state.page.url();
+      // Two parts: a JSON text summary so the LLM has the URL +
+      // approximate size in its tool-result, and the inline image bytes
+      // the Aura content adapter pipes into the blob store and surfaces
+      // to a vision-capable LLM via MultiModalText.
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ url, bytes: buf.length }),
+          },
+          {
+            type: "image",
+            data: buf.toString("base64"),
+            mimeType: "image/png",
+          },
+        ],
+      };
     },
 
-    async eval(params) {
-      const expression = (params as { expression?: unknown }).expression;
-      const clear = Boolean((params as { clear?: unknown }).clear);
-      const state = await manager.acquire(params.context_id);
+    async console(args) {
+      const expression = args["expression"];
+      const clear = Boolean(args["clear"]);
+      const state = await manager.acquire(args.context_id);
       const logs = state.supervisor.consoleLog();
       let result: { ok: boolean; value?: unknown; error?: string } | null = null;
       if (typeof expression === "string" && expression.length > 0) {
         try {
-          // Pass the expression string straight through to
-          // `page.evaluate`, which Playwright sends via CDP
-          // `Runtime.evaluate({ expression, awaitPromise: true })`.
-          // That gives us native eval semantics: multi-line works,
-          // promises are awaited, the last expression's value is
-          // returned. Statements (`return 1`, `let x = 1`) are not
-          // valid input — agents that want to mutate without a
-          // return value should wrap in an IIFE themselves.
           const value = await state.page.evaluate(expression);
           result = { ok: true, value };
         } catch (e) {
@@ -199,41 +218,31 @@ export function buildHandlers(manager: BrowserManager): Record<string, RpcHandle
       }
       const errors = logs.filter((l) => l.level === "error");
       if (clear) state.supervisor.clearConsole();
-      return { logs, errors, result };
+      return asText({ logs, errors, result });
     },
 
-    async dialog(params) {
-      const action = (params as { action?: unknown }).action;
+    async dialog(args) {
+      const action = args["action"];
       if (action !== "accept" && action !== "dismiss") {
         throw badParams("dialog: action must be 'accept' or 'dismiss'");
       }
-      const promptText =
-        typeof (params as { prompt_text?: unknown }).prompt_text === "string"
-          ? ((params as { prompt_text: string }).prompt_text)
-          : null;
-      const dialogId =
-        typeof (params as { dialog_id?: unknown }).dialog_id === "string"
-          ? ((params as { dialog_id: string }).dialog_id)
-          : null;
-      const state = await manager.acquire(params.context_id);
-      return await state.supervisor.respond(action, promptText, dialogId);
+      const promptText = typeof args["prompt_text"] === "string" ? args["prompt_text"] : null;
+      const dialogId = typeof args["dialog_id"] === "string" ? args["dialog_id"] : null;
+      const state = await manager.acquire(args.context_id);
+      const out = await state.supervisor.respond(action, promptText, dialogId);
+      return asText(out);
     },
 
-    async cdp(params) {
-      const method = String((params as { method?: unknown }).method ?? "");
+    async cdp(args) {
+      const method = String(args["method"] ?? "");
       if (!method) throw badParams("cdp: method is required");
-      const cdpParams = (params as { params?: unknown }).params;
-      const state = await manager.acquire(params.context_id);
+      const cdpParams = args["params"];
+      const state = await manager.acquire(args.context_id);
       const session = await state.ctx.newCDPSession(state.page);
       try {
-        // Return CDP's raw result directly — every other handler in
-        // this file returns the result un-wrapped, and the Rust
-        // `browser_cdp` consumer just surfaces this as
-        // `ToolOutput::Json` to the agent. A wrapper object would
-        // force the LLM to dereference `.result.<field>` in every
-        // CDP-aware prompt.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return await (session as any).send(method, cdpParams ?? {});
+        const out = await (session as any).send(method, cdpParams ?? {});
+        return asText(out);
       } finally {
         await session.detach().catch(() => null);
       }
