@@ -20,6 +20,7 @@ import {
   parseStartBotCredentials,
   type BotRuntimeConfig,
 } from "./auth/credentials.js";
+import { Semaphore } from "./concurrency.js";
 import { downloadResourceAsAttachment } from "./media/inbound.js";
 import { sendLarkAttachments } from "./media/outbound.js";
 import { cleanInboundContent } from "./messaging/inbound.js";
@@ -46,6 +47,13 @@ interface BotState {
   handle: lark.LarkChannel;
   config: BotRuntimeConfig;
 }
+
+// Two simultaneous download phases per bot. One slot makes everything
+// strictly serial (latency penalty for unrelated peers); raising it
+// past two doesn't help the common case (a single user rarely sends
+// two attachment-heavy messages in flight) and weakens the cap on
+// peak in-flight memory (`permits × MAX_RESOURCE_BYTES`).
+const MEDIA_CONCURRENCY = 2;
 
 export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
   // Per-bot runtime state: streaming/reaction toggles. Keyed on
@@ -205,8 +213,16 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       policy: { requireMention: true, dmMode: "open" },
     });
 
+    const downloadSlots = new Semaphore(MEDIA_CONCURRENCY);
     channel.on("message", (msg) =>
-      this.dispatchInbound(channel, cmd.botId, msg, hooks.emit, config),
+      this.dispatchInbound(
+        channel,
+        cmd.botId,
+        msg,
+        hooks.emit,
+        config,
+        downloadSlots,
+      ),
     );
     channel.on("cardAction", (ev) => this.approvals.handleCardAction(ev));
     // The SDK fires `error` for outbound failures (rate_limited,
@@ -239,6 +255,7 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     msg: lark.NormalizedMessage,
     emit: (ev: BotInboundEvent<LarkChat>) => void,
     config: BotRuntimeConfig,
+    downloadSlots: Semaphore,
   ): Promise<void> {
     const address: LarkChat = { chatId: msg.chatId };
     const platformUserId = msg.senderId;
@@ -265,26 +282,35 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
         `lark inbound message=${platformMsgId} carried ${msg.resources.length} resources; dropping ${dropped} over the per-message cap of ${MAX_ATTACHMENTS_PER_MESSAGE}`,
       );
     }
-    const attachments: WireAttachment[] = [];
     let pairingRequired = false;
-    for (const resource of accepted) {
-      try {
-        const att = await downloadResourceAsAttachment({
-          channel,
-          resource,
-          botId,
-          userId: auraUserId,
-          logger: this.logger,
-        });
-        if (att) attachments.push(att);
-      } catch (err) {
-        if (!(err instanceof BlobPairingRequiredError)) throw err;
-        // Same answer for every resource this turn; stop and let the
-        // Message frame carry the user into the gateway pairing flow.
-        pairingRequired = true;
-        break;
-      }
-    }
+    // Hold the slot for the whole download phase so concurrent
+    // inbounds can't compound their per-resource caps into an
+    // unbounded peak. Skip the gate entirely when there's nothing to
+    // download — text-only messages must not queue behind a
+    // media-heavy peer's downloads.
+    const attachments: WireAttachment[] =
+      accepted.length === 0
+        ? []
+        : await downloadSlots.withPermit(async () => {
+            const out: WireAttachment[] = [];
+            for (const resource of accepted) {
+              try {
+                const att = await downloadResourceAsAttachment({
+                  channel,
+                  resource,
+                  botId,
+                  userId: auraUserId,
+                  logger: this.logger,
+                });
+                if (att) out.push(att);
+              } catch (err) {
+                if (!(err instanceof BlobPairingRequiredError)) throw err;
+                pairingRequired = true;
+                break;
+              }
+            }
+            return out;
+          });
 
     const content = cleanInboundContent(msg.content, msg.mentions);
     if (!content && attachments.length === 0 && !pairingRequired) return;
