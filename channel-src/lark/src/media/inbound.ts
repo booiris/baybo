@@ -1,5 +1,5 @@
 import type { Logger, WireAttachment } from "@aura/channel-sdk";
-import { uploadBlob } from "@aura/channel-sdk";
+import { BlobPairingRequiredError, uploadBlob } from "@aura/channel-sdk";
 import type * as lark from "@larksuiteoapi/node-sdk";
 
 const MIME_BY_KIND: Record<lark.ResourceDescriptor["type"], string> = {
@@ -65,6 +65,10 @@ export async function downloadResourceAsAttachment(args: {
       ...(resource.fileName ? { filename: resource.fileName } : {}),
     };
   } catch (err) {
+    // Pairing prompts must surface to the user; re-throw so the
+    // dispatcher can still emit a Message frame for the gateway's
+    // pairing flow to run.
+    if (err instanceof BlobPairingRequiredError) throw err;
     logger.error(
       `lark inbound media upload failed kind=${resource.type} key=${resource.fileKey}: ${String(err)}`,
     );

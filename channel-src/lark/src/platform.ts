@@ -4,6 +4,7 @@ import type {
   StartBotCommand,
   WireAttachment,
 } from "@aura/channel-sdk";
+import { BlobPairingRequiredError } from "@aura/channel-sdk";
 import { composeAuraUserId } from "@aura/channel-sdk/bot";
 import type {
   BotInboundEvent,
@@ -265,19 +266,28 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       );
     }
     const attachments: WireAttachment[] = [];
+    let pairingRequired = false;
     for (const resource of accepted) {
-      const att = await downloadResourceAsAttachment({
-        channel,
-        resource,
-        botId,
-        userId: auraUserId,
-        logger: this.logger,
-      });
-      if (att) attachments.push(att);
+      try {
+        const att = await downloadResourceAsAttachment({
+          channel,
+          resource,
+          botId,
+          userId: auraUserId,
+          logger: this.logger,
+        });
+        if (att) attachments.push(att);
+      } catch (err) {
+        if (!(err instanceof BlobPairingRequiredError)) throw err;
+        // Same answer for every resource this turn; stop and let the
+        // Message frame carry the user into the gateway pairing flow.
+        pairingRequired = true;
+        break;
+      }
     }
 
     const content = cleanInboundContent(msg.content, msg.mentions);
-    if (!content && attachments.length === 0) return;
+    if (!content && attachments.length === 0 && !pairingRequired) return;
 
     if (config.reactionEcho) {
       // Best-effort acknowledgement; failures are debug-level. We do

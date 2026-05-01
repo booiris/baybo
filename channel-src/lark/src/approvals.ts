@@ -36,8 +36,11 @@ interface PendingEntry {
  *   rejects from anyone else with a toast (security: a group-chat
  *   approval card is clickable by every group member, so without this
  *   filter user B could approve user A's bash call),
- * - Resolves the SDK promise with the chosen decision,
- * - Edits the card to its terminal state on `onResolved`.
+ * - Edits the card to its terminal state immediately so the buttons
+ *   stop being interactive (the gateway-echoed `onResolved` arrives
+ *   later, after `pending` is already gone, so it can't drive the
+ *   terminal edit on the self-resolved path),
+ * - Resolves the SDK promise with the chosen decision.
  *
  * The Lark SDK doesn't ship a per-bot middleware tree like grammy, so
  * `attach(handle)` is a no-op — handler subscription happens in
@@ -111,16 +114,7 @@ export class LarkApprovals
     if (!entry) return;
     this.pending.delete(callId);
     entry.resolve(decision);
-    try {
-      await entry.handle.updateCard(
-        entry.cardMessageId,
-        buildResolvedApprovalCard(entry.request, decision),
-      );
-    } catch (err) {
-      this.logger.debug(
-        `lark approval ${callId}: card edit on resolve failed: ${String(err)}`,
-      );
-    }
+    await this.editCardTerminal(entry, decision);
   }
 
   onStop(): void {
@@ -154,6 +148,26 @@ export class LarkApprovals
 
     this.pending.delete(value.callId);
     entry.resolve(value.decision);
+    // The gateway-echoed `onResolved` will arrive after `pending` is
+    // empty and short-circuit, so the terminal edit can only happen
+    // here on the self-resolved path.
+    void this.editCardTerminal(entry, value.decision);
+  }
+
+  private async editCardTerminal(
+    entry: PendingEntry,
+    decision: ApprovalDecision,
+  ): Promise<void> {
+    try {
+      await entry.handle.updateCard(
+        entry.cardMessageId,
+        buildResolvedApprovalCard(entry.request, decision),
+      );
+    } catch (err) {
+      this.logger.debug(
+        `lark approval ${entry.request.callId}: card terminal update failed: ${String(err)}`,
+      );
+    }
   }
 }
 
