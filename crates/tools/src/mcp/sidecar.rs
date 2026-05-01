@@ -213,6 +213,93 @@ mod tests {
         assert!(transport.receive().await.is_none());
     }
 
+    /// Wire `connect_sidecar` against a fake MCP server running over
+    /// the byte-pipe. The server replies to `initialize` + `tools/list`
+    /// and we verify the resulting `McpServerSession` exposes the
+    /// advertised tools. Belongs alongside the transport tests
+    /// because it covers `connect_sidecar` end-to-end without the
+    /// gateway crate.
+    #[tokio::test]
+    async fn connect_sidecar_round_trips_initialize_and_tools_list() {
+        use crate::mcp::transport::connect_sidecar;
+        use serde_json::Value;
+
+        // Outbound captures everything the rmcp client sends; the
+        // server task reads from it and pushes responses back via
+        // the inbound mpsc.
+        let (server_in_tx, mut server_in_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (server_out_tx, server_out_rx) = mpsc::channel::<Vec<u8>>(16);
+
+        struct PipeSender {
+            tx: mpsc::Sender<Vec<u8>>,
+        }
+        #[async_trait]
+        impl SidecarSender for PipeSender {
+            async fn send(&self, payload: Vec<u8>) -> Result<(), String> {
+                self.tx
+                    .send(payload)
+                    .await
+                    .map_err(|e| format!("pipe closed: {e}"))
+            }
+        }
+
+        // Fake server: read each inbound envelope, dispatch by method.
+        let server = tokio::spawn(async move {
+            while let Some(bytes) = server_in_rx.recv().await {
+                let v: Value = serde_json::from_slice(&bytes).expect("client sends valid json");
+                let method = v["method"].as_str().unwrap_or_default();
+                match method {
+                    "initialize" => {
+                        let id = v["id"].clone();
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": "2024-11-05",
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "stub", "version": "0.0.1"}
+                            }
+                        });
+                        let _ = server_out_tx.send(serde_json::to_vec(&resp).unwrap()).await;
+                    }
+                    "notifications/initialized" => { /* notification; no reply */ }
+                    "tools/list" => {
+                        let id = v["id"].clone();
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "tools": [{
+                                    "name": "stub_tool",
+                                    "description": "test tool",
+                                    "inputSchema": {"type": "object", "properties": {}}
+                                }]
+                            }
+                        });
+                        let _ = server_out_tx.send(serde_json::to_vec(&resp).unwrap()).await;
+                    }
+                    _ => { /* ignore */ }
+                }
+            }
+        });
+
+        let sender: Arc<dyn SidecarSender> = Arc::new(PipeSender { tx: server_in_tx });
+        let session = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_sidecar(sender, server_out_rx),
+        )
+        .await
+        .expect("connect_sidecar within 5s")
+        .expect("session ok");
+
+        let tools = session.tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "stub_tool");
+
+        session.shutdown().await;
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn close_drains_then_ends_inbound() {
         let sender = Arc::new(CapturingSender {

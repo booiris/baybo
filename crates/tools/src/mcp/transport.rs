@@ -14,10 +14,12 @@ use rmcp::transport::streamable_http_client::{
 };
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use crate::mcp::config::{McpServerEntry, McpTransportConfig};
 use crate::mcp::credentials::VaultCredentialStore;
 use crate::mcp::error::{McpError, McpResult};
+use crate::mcp::sidecar::{SidecarSender, SidecarTransport};
 use crate::mcp::vault_keys;
 
 pub struct McpServerSession {
@@ -50,12 +52,40 @@ pub async fn connect(
         McpTransportConfig::Http { url } => connect_http(&entry.name, url, vault).await?,
     };
 
+    finalize_session(running).await
+}
+
+/// Run the rmcp handshake against a sidecar-hosted MCP server.
+///
+/// Callers provide the byte-pipe halves directly — a cloneable
+/// outbound [`SidecarSender`] plus an inbound `mpsc::Receiver`. This
+/// keeps the whole rmcp surface inside `aura-tools` so callers (e.g.
+/// the gateway's channel layer) don't need an rmcp dependency to
+/// stand up a session.
+///
+/// On success: the returned [`McpServerSession`] holds the running
+/// rmcp service and a snapshot of tools advertised at handshake
+/// time. Drop it via `shutdown()` to tear the session down cleanly.
+pub async fn connect_sidecar(
+    sender: Arc<dyn SidecarSender>,
+    inbound: mpsc::Receiver<Vec<u8>>,
+) -> McpResult<McpServerSession> {
+    let transport = SidecarTransport::new(sender, inbound);
+    let running = ()
+        .serve(transport)
+        .await
+        .map_err(|e| McpError::Connection(e.to_string()))?;
+    finalize_session(running).await
+}
+
+async fn finalize_session(
+    running: RunningService<RoleClient, ()>,
+) -> McpResult<McpServerSession> {
     let tools = running
         .peer()
         .list_all_tools()
         .await
         .map_err(|e| McpError::Protocol(format!("list_all_tools: {e}")))?;
-
     Ok(McpServerSession { running, tools })
 }
 
