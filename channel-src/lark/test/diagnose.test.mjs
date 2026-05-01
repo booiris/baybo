@@ -24,7 +24,7 @@ test("onDiagnoseRequested: unknown bot returns single error check", async () => 
   const approvals = new LarkApprovals(noopLogger);
   const platform = new LarkPlatform(noopLogger, approvals);
 
-  const checks = await platform.onDiagnoseRequested({ botId: "missing" });
+  const checks = await platform.onAgentDiagnoseRequested({ botId: "missing" });
   assert.equal(checks.length, 1);
   assert.equal(checks[0].name, "bot_state");
   assert.equal(checks[0].status, "error");
@@ -42,7 +42,7 @@ test("onDiagnoseRequested: known bot returns identity + transport + config rows"
     { streaming: true, reactionEcho: false },
   );
 
-  const checks = await platform.onDiagnoseRequested({ botId: "cli_a1" });
+  const checks = await platform.onAgentDiagnoseRequested({ botId: "cli_a1" });
   const names = checks.map((c) => c.name).sort();
   assert.deepEqual(names, ["bot_identity", "config", "transport"]);
 
@@ -67,7 +67,7 @@ test("onDiagnoseRequested: missing botIdentity downgrades to warn", async () => 
     { streaming: false, reactionEcho: true },
   );
 
-  const checks = await platform.onDiagnoseRequested({ botId: "cli_a1" });
+  const checks = await platform.onAgentDiagnoseRequested({ botId: "cli_a1" });
   const identity = checks.find((c) => c.name === "bot_identity");
   assert.equal(identity.status, "warn");
 });

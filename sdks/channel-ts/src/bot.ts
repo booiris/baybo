@@ -257,6 +257,32 @@ export interface BotPlatform<BotHandle, ChatId> {
   ): Promise<void>;
 
   /**
+   * Optional sidecar-hosted MCP server. The channel forwards each
+   * inbound `Frame::Mcp` envelope here unchanged; the platform owns
+   * the per-tunnel session lifecycle (one McpServer per `tunnelId`).
+   * Implementing this method is what makes BotChannel advertise the
+   * `"mcp_tunnel"` capability — without it the runner never claims
+   * support and the gateway never forwards Mcp frames to this peer.
+   */
+  onAgentMcpEnvelope?(
+    tunnelId: string,
+    payload: Uint8Array,
+    reply: import("./channel.js").McpReplyHandle,
+  ): Promise<void>;
+
+  /**
+   * Optional self-test hook. The channel forwards a
+   * `Frame::DiagnoseRequest` here and ships the returned checks back
+   * over the wire. Implementing this method is what makes
+   * BotChannel advertise the `"diagnose"` capability — without it
+   * the runner never claims support and admin diagnose calls
+   * short-circuit with `not implemented`.
+   */
+  onAgentDiagnoseRequested?(
+    req: import("./channel.js").DiagnoseRequest,
+  ): Promise<import("./channel.js").DiagnoseCheck[]>;
+
+  /**
    * Optional slash-command registrar. Implement when the platform has
    * a server-side command list the client UI surfaces (Telegram
    * `setMyCommands`, Discord application commands, Slack
@@ -541,7 +567,35 @@ export class BotChannel<BotHandle, ChatId>
     this.typingRefreshMs = opts.typingRefreshMs ?? DEFAULT_TYPING_REFRESH_MS;
     this.typingSafetyMs = opts.typingSafetyMs ?? DEFAULT_TYPING_SAFETY_MS;
     this.slashCommands = opts.slashCommands ?? [];
+
+    // Forward MCP / diagnose round-trip hooks only when the platform
+    // implements them. The SDK runner inspects the channel object
+    // for these methods to decide whether to advertise the matching
+    // capability on `Register`; defining them unconditionally would
+    // claim support a no-op handler can't honour, and the gateway-
+    // side caller would time out waiting for a reply.
+    const mcpHook = opts.platform.onAgentMcpEnvelope;
+    if (mcpHook) {
+      this.onMcpEnvelope = (tunnelId, payload, reply) =>
+        mcpHook.call(opts.platform, tunnelId, payload, reply);
+    }
+    const diagHook = opts.platform.onAgentDiagnoseRequested;
+    if (diagHook) {
+      this.onDiagnoseRequested = (req) => diagHook.call(opts.platform, req);
+    }
   }
+
+  // Installed conditionally in the constructor; declared here so the
+  // type system sees the optional Channel hooks even when the
+  // platform doesn't implement the matching `onAgent*` method.
+  onMcpEnvelope?: (
+    tunnelId: string,
+    payload: Uint8Array,
+    reply: import("./channel.js").McpReplyHandle,
+  ) => Promise<void>;
+  onDiagnoseRequested?: (
+    req: import("./channel.js").DiagnoseRequest,
+  ) => Promise<import("./channel.js").DiagnoseCheck[]>;
 
   inbound(signal: AbortSignal): AsyncIterable<UserInbound> {
     const self = this;
@@ -684,6 +738,17 @@ export class BotChannel<BotHandle, ChatId>
       this.logger.debug("onAgentToolCallCompleted failed", err);
     }
   }
+
+  // MCP and diagnose are different from delta/tool-call: the gateway
+  // expects a reply (round-trip semantics) and times out if it
+  // doesn't get one. We therefore can't use the "method always
+  // present, silent no-op when platform doesn't implement" pattern
+  // the streaming hooks use — claiming the capability without an
+  // actual handler would have the agent's MCP client time out.
+  // Instead, the constructor below conditionally installs these
+  // methods only when the platform implements the matching `onAgent*`
+  // hook; the SDK runner's capability auto-advertise then reads them
+  // correctly.
 
   async onNotice(notice: AgentNotice): Promise<void> {
     this.completeTypingTurn(notice.userId);

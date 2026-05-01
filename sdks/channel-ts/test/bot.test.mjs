@@ -722,3 +722,51 @@ test("explicit StopBot clears the user route (contrast with polling exit)", asyn
   });
   assert.equal(fake.calls.sends.length, 0);
 });
+
+test("BotChannel exposes onMcpEnvelope only when platform implements onAgentMcpEnvelope", async () => {
+  // Codex review regression: BotChannel must conditionally surface
+  // round-trip Channel hooks (`onMcpEnvelope`, `onDiagnoseRequested`)
+  // based on platform support. The SDK runner reads method presence
+  // on the channel object to decide whether to advertise the
+  // matching capability — a platform that doesn't implement the
+  // hook must NOT have BotChannel claim the capability, otherwise
+  // the gateway forwards frames the sidecar can't reply to and the
+  // agent times out.
+  const fake = makePlatform();
+  const without = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+  });
+  assert.equal(without.onMcpEnvelope, undefined);
+  assert.equal(without.onDiagnoseRequested, undefined);
+
+  let mcpCalled = false;
+  let diagCalled = false;
+  const platformWithHooks = {
+    ...fake.platform,
+    async onAgentMcpEnvelope(_tunnelId, _payload, _reply) {
+      mcpCalled = true;
+    },
+    async onAgentDiagnoseRequested(_req) {
+      diagCalled = true;
+      return [];
+    },
+  };
+  const withHooks = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: platformWithHooks,
+  });
+  assert.equal(typeof withHooks.onMcpEnvelope, "function");
+  assert.equal(typeof withHooks.onDiagnoseRequested, "function");
+
+  // Forward call confirms the BotChannel methods actually route to
+  // the platform's hooks (not just declared as no-ops).
+  await withHooks.onMcpEnvelope("tunnel-x", new Uint8Array([1]), {
+    async send() {},
+  });
+  assert.equal(mcpCalled, true);
+  await withHooks.onDiagnoseRequested({ botId: "any" });
+  assert.equal(diagCalled, true);
+});

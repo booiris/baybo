@@ -81,16 +81,22 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
   ) {
     this.mcpServer = new LarkMcpServer({
       logger,
-      // Slice 2A picks the first registered bot. Slice 2B routes per
-      // call via `_meta.auraSessionId` from the JSON-RPC envelope.
+      // Slice 2A: single-bot deployments resolve to the only bot.
+      // Multi-bot fails closed with `ambiguous` until slice 2B wires
+      // `_meta.auraSessionId` extraction from the JSON-RPC envelope —
+      // silently routing through the first bot would leak cross-
+      // tenant data (a request from bot B's user executing under bot
+      // A's credentials).
       channelResolver: () => {
-        for (const state of this.bots.values()) return state.handle;
-        return null;
+        const handles = [...this.bots.values()].map((s) => s.handle);
+        if (handles.length === 0) return { kind: "none" };
+        if (handles.length === 1) return { kind: "ok", channel: handles[0]! };
+        return { kind: "ambiguous", bot_count: handles.length };
       },
     });
   }
 
-  async onMcpEnvelope(
+  async onAgentMcpEnvelope(
     tunnelId: string,
     payload: Uint8Array,
     reply: import("@aura/channel-sdk").McpReplyHandle,
@@ -135,7 +141,7 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     await handle.send(chat.chatId, { text: `${prefix} ${notice.text}` });
   }
 
-  async onDiagnoseRequested(req: DiagnoseRequest): Promise<DiagnoseCheck[]> {
+  async onAgentDiagnoseRequested(req: DiagnoseRequest): Promise<DiagnoseCheck[]> {
     const state = this.bots.get(req.botId);
     if (!state) {
       return [
