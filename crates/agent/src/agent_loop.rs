@@ -430,6 +430,14 @@ impl AgentLoop {
                 // the result for the LLM context. Errors / denials feed
                 // the `error` field on the Completed event so streaming
                 // sidecars can switch the indicator's color/icon.
+                //
+                // Telemetry rides the channel wire and lands in the
+                // sidecar's logs / cards — sanitize through the security
+                // gateway before emit so a tool error containing a
+                // bearer token, connection string, or revealed secret
+                // placeholder does not leak. `Ok(ToolOutput::Error)`
+                // already passed `sanitize_tool_output` inside the
+                // executor; the raw `Err(e)` path did not.
                 let telemetry_error: Option<String> = match &tool_result {
                     Ok(ToolOutput::Error(msg)) => Some(msg.clone()),
                     Err(e) => {
@@ -438,7 +446,13 @@ impl AgentLoop {
                         {
                             Some("denied by user".to_string())
                         } else {
-                            Some(e.to_string())
+                            let raw = e.to_string();
+                            Some(
+                                self.security_gateway
+                                    .sanitize_error(&raw)
+                                    .await
+                                    .unwrap_or(raw),
+                            )
                         }
                     }
                     _ => None,
