@@ -105,27 +105,48 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     this.mcpServer = new LarkMcpServer({
       logger,
       // Slice 2A: single-bot deployments resolve to the only bot.
-      // Multi-bot disambiguation:
-      //   1. If the call carries `_meta.auraBotId` and that bot is
-      //      live, route to it directly. This is the slice 2F path;
-      //      the gateway threads `Session::user::bot_id` through.
-      //   2. Otherwise, fall back to slice 2A's three-state behaviour:
-      //      single-bot → `ok`, none → `none`, multi-bot → `ambiguous`
-      //      (fail closed; silently picking a bot would leak cross-
-      //      tenant data).
-      channelResolver: ({ auraBotId }) => {
-        if (auraBotId !== undefined) {
-          const state = this.bots.get(auraBotId);
-          if (state) return { kind: "ok", channel: state.handle };
-          // The supplied bot id isn't connected. Don't silently fall
-          // through to single-bot — the caller specifically asked for
-          // a bot we don't have. Surface as `none` so the tool error
-          // matches "the requested tenant isn't reachable".
-          return { kind: "none" };
+      // Resolve the bot AND the chat the agent is replying in. Per
+      // Codex review #2, chat-bound MCP tools must NOT accept an
+      // arbitrary chat id from LLM-supplied args — that lets a
+      // paired user probe metadata for any chat the bot can see. We
+      // bind to the active conversation by reading
+      // `contextByAuraUser` (populated from each inbound dispatch)
+      // and surfacing chatId + platformUserId in the `ok` variant.
+      //
+      // Resolution order:
+      //   1. With `auraUserId` cached → use that conversation's
+      //      bot+chat+user. If `auraBotId` was also supplied, sanity
+      //      check it matches; mismatch returns `none` (caller
+      //      crossed wires).
+      //   2. Without conversation context → can't safely run a
+      //      chat-bound tool. Return `none` (no active Lark chat
+      //      for this session).
+      //   3. The slice 2A `ambiguous` fallback only kicks in when an
+      //      explicit `auraBotId` resolves to a multi-bot ambiguity
+      //      AND there's no chat context. Today this branch is
+      //      unreachable from any registered tool, but it's kept
+      //      so `LarkChannelResolution` stays a stable surface for
+      //      future bot-only tools.
+      channelResolver: ({ auraBotId, auraUserId }) => {
+        if (auraUserId) {
+          const ctx = this.contextByAuraUser.get(auraUserId);
+          if (!ctx) return { kind: "none" };
+          if (auraBotId && auraBotId !== ctx.botId) return { kind: "none" };
+          const state = this.bots.get(ctx.botId);
+          if (!state) return { kind: "none" };
+          return {
+            kind: "ok",
+            channel: state.handle,
+            chatId: ctx.chatId,
+            platformUserId: ctx.platformUserId,
+          };
         }
+        // No conversation context. Without a chat id we can't run a
+        // chat-bound tool. The bot-count classification is kept for
+        // any future tool that operates without a chat.
         const handles = [...this.bots.values()].map((s) => s.handle);
         if (handles.length === 0) return { kind: "none" };
-        if (handles.length === 1) return { kind: "ok", channel: handles[0]! };
+        if (handles.length === 1) return { kind: "none" };
         return { kind: "ambiguous", bot_count: handles.length };
       },
       askUser: (input, prompt, timeoutMs) =>

@@ -30,13 +30,23 @@ export interface LarkResolverInput {
   auraUserId?: string;
 }
 
-/** Result of resolving which `LarkChannel` an MCP tool call should
- * run against. The `ambiguous` variant is the fail-closed fallback
- * when no `auraBotId` is supplied AND multiple bots are connected;
- * it intentionally rejects the call rather than silently routing
- * through whichever bot we picked first (cross-tenant leak). */
+/** Result of resolving the Lark conversation an MCP tool call should
+ * run against. The `ok` variant carries the full conversation
+ * context — channel (bot) + Feishu chat id + platform user id. Tools
+ * that look up chat-bound resources (e.g. `feishu_get_chat_info`)
+ * MUST use the resolved `chatId` rather than accepting a chat id
+ * from the LLM-supplied tool args; otherwise a paired user could
+ * coax the agent into reading metadata for any chat the bot can
+ * access (Codex review). The `ambiguous` variant remains the
+ * fail-closed fallback for multi-bot deployments where the call
+ * carried no `auraBotId`. */
 export type LarkChannelResolution =
-  | { kind: "ok"; channel: lark.LarkChannel }
+  | {
+      kind: "ok";
+      channel: lark.LarkChannel;
+      chatId: string;
+      platformUserId: string;
+    }
   | { kind: "none" }
   | { kind: "ambiguous"; bot_count: number };
 
@@ -138,22 +148,17 @@ export class LarkMcpServer {
     server.registerTool(
       "feishu_get_chat_info",
       {
-        title: "Get Feishu chat info",
+        title: "Get info on the current Feishu chat",
         description:
-          "Look up basic metadata (name, type, owner, member count) for a Lark / Feishu chat by its `chatId`. The bot must already be a member of the chat — Feishu rejects lookups across the bot's tenant boundary.",
-        inputSchema: {
-          chat_id: z
-            .string()
-            .min(1)
-            .describe("Feishu chat id (e.g. `oc_xxx` for groups, `p2p_xxx` for DMs)"),
-        },
+          "Look up basic metadata (name, type, owner, member count) for the Feishu chat the user is currently messaging the agent in. Useful for grounding the agent in conversation context (e.g. \"this is a 12-person engineering group\" vs a 1:1 DM). Does NOT accept an arbitrary chat id — the lookup is bound to the active conversation so a paired user can't drive the bot to disclose metadata for any chat it happens to belong to.",
+        inputSchema: {},
       },
-      async (args, extra) => {
+      async (_args, extra) => {
         const input = extractResolverInput(extra);
         const resolution = this.opts.channelResolver(input);
         if (resolution.kind === "none") {
           return toolError(
-            "no Lark bot is currently connected; register one with `aura channel add lark` and retry",
+            "no active Lark conversation for this session; the agent must have processed at least one inbound Feishu message before this tool can run",
           );
         }
         if (resolution.kind === "ambiguous") {
@@ -161,9 +166,9 @@ export class LarkMcpServer {
             `multi-bot routing requires an \`auraBotId\` on the call (${resolution.bot_count} bots live); none was provided and we will not silently pick one`,
           );
         }
-        const channel = resolution.channel;
+        const { channel, chatId } = resolution;
         try {
-          const info = await channel.getChatInfo(args.chat_id);
+          const info = await channel.getChatInfo(chatId);
           return {
             content: [
               {
@@ -174,7 +179,7 @@ export class LarkMcpServer {
           };
         } catch (err) {
           this.opts.logger.debug(
-            `feishu_get_chat_info failed for chat=${args.chat_id}: ${String(err)}`,
+            `feishu_get_chat_info failed for chat=${chatId}: ${String(err)}`,
           );
           return toolError(
             err instanceof Error ? err.message : String(err),

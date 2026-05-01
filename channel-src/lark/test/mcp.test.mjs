@@ -113,7 +113,7 @@ test("LarkMcpServer: tools/list advertises feishu_get_chat_info", async () => {
   await server.shutdown();
 });
 
-test("LarkMcpServer: tools/call routes through getChatInfo", async () => {
+test("LarkMcpServer: tools/call routes through getChatInfo using the resolved chat", async () => {
   let receivedChatId = "";
   const channel = stubChannel(async (chatId) => {
     receivedChatId = chatId;
@@ -127,7 +127,16 @@ test("LarkMcpServer: tools/call routes through getChatInfo", async () => {
 
   const server = new LarkMcpServer({
     logger: noopLogger,
-    channelResolver: () => ({ kind: "ok", channel }),
+    // Resolver supplies the chat id from the active conversation.
+    // The tool no longer accepts `chat_id` in its args (Codex #2):
+    // a paired user could otherwise drive the bot to disclose
+    // metadata for any chat the bot can access.
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_demo",
+      platformUserId: "ou_alice",
+    }),
   });
   const reply = captureReply();
   await initialize(server, reply);
@@ -141,22 +150,82 @@ test("LarkMcpServer: tools/call routes through getChatInfo", async () => {
       method: "tools/call",
       params: {
         name: "feishu_get_chat_info",
-        arguments: { chat_id: "oc_demo" },
+        arguments: {},
       },
     }),
     reply.handle,
   );
   await waitFor(() => reply.sent.length > before, "tools/call reply");
 
+  // Resolver provided `oc_demo`; that's what reached `getChatInfo`.
   assert.equal(receivedChatId, "oc_demo");
   const last = decodeJson(reply.sent[reply.sent.length - 1]);
   assert.equal(last.id, 3);
   assert.ok(last.result, `expected result, got ${JSON.stringify(last)}`);
   assert.equal(last.result.isError, undefined);
-  const text = last.result.content[0].text;
-  const parsed = JSON.parse(text);
+  const parsed = JSON.parse(last.result.content[0].text);
   assert.equal(parsed.chatId, "oc_demo");
   assert.equal(parsed.memberCount, 42);
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_get_chat_info ignores LLM-supplied chat_id (cross-chat lookup)", async () => {
+  // Codex #2 regression: even if the LLM hallucinated a `chat_id`
+  // argument referencing a different chat, the tool must run
+  // against the resolver's chat. The MCP SDK's zod schema with
+  // empty `inputSchema: {}` rejects extra fields strictly, so the
+  // call can't smuggle a chat id at all — but we double-check
+  // here by asserting the chat the resolver supplied is the one
+  // `getChatInfo` saw.
+  let receivedChatId = "";
+  const channel = stubChannel(async (chatId) => {
+    receivedChatId = chatId;
+    return { chatId, name: "ActiveChat", chatType: "group", memberCount: 4 };
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_active_chat",
+      platformUserId: "ou_alice",
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-cross-chat",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 15,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_chat_info",
+        // The LLM tries to override with a private chat the bot
+        // happens to see. Either zod rejects (ideal) or the tool
+        // ignores the arg and runs on the resolver's chat.
+        arguments: { chat_id: "oc_private_secrets" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "cross-chat reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 15);
+  // The tool MUST NOT have queried the malicious chat id. Either:
+  //   (a) zod rejected the call → isError true and getChatInfo never ran, or
+  //   (b) the schema allowed the extra field but the tool ignored
+  //       it → getChatInfo ran on the resolver's chat.
+  // Both are safe; we assert the safety invariant directly.
+  assert.notEqual(
+    receivedChatId,
+    "oc_private_secrets",
+    "feishu_get_chat_info must not query an LLM-supplied chat id",
+  );
 
   await server.shutdown();
 });
@@ -167,7 +236,12 @@ test("LarkMcpServer: tools/call surfaces errors as isError replies", async () =>
   });
   const server = new LarkMcpServer({
     logger: noopLogger,
-    channelResolver: () => ({ kind: "ok", channel }),
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_unreachable",
+      platformUserId: "ou_alice",
+    }),
   });
   const reply = captureReply();
   await initialize(server, reply);
@@ -181,7 +255,7 @@ test("LarkMcpServer: tools/call surfaces errors as isError replies", async () =>
       method: "tools/call",
       params: {
         name: "feishu_get_chat_info",
-        arguments: { chat_id: "oc_unreachable" },
+        arguments: {},
       },
     }),
     reply.handle,
@@ -196,7 +270,12 @@ test("LarkMcpServer: tools/call surfaces errors as isError replies", async () =>
   await server.shutdown();
 });
 
-test("LarkMcpServer: tools/call with no live bot returns a tool error", async () => {
+test("LarkMcpServer: tools/call with no active conversation returns a tool error", async () => {
+  // Post Codex #2: the resolver returns `none` not just for "no
+  // bot connected" but also for "no chat context" (e.g. an MCP
+  // call comes in before any inbound Feishu message has populated
+  // `contextByAuraUser`). Both paths surface the same structured
+  // error; the LLM doesn't need to distinguish them.
   const server = new LarkMcpServer({
     logger: noopLogger,
     channelResolver: () => ({ kind: "none" }),
@@ -213,7 +292,7 @@ test("LarkMcpServer: tools/call with no live bot returns a tool error", async ()
       method: "tools/call",
       params: {
         name: "feishu_get_chat_info",
-        arguments: { chat_id: "oc_x" },
+        arguments: {},
       },
     }),
     reply.handle,
@@ -223,7 +302,7 @@ test("LarkMcpServer: tools/call with no live bot returns a tool error", async ()
   const last = decodeJson(reply.sent[reply.sent.length - 1]);
   assert.equal(last.id, 5);
   assert.equal(last.result.isError, true);
-  assert.match(last.result.content[0].text, /no Lark bot is currently connected/);
+  assert.match(last.result.content[0].text, /no active Lark conversation/);
 
   await server.shutdown();
 });
@@ -284,9 +363,16 @@ test("LarkMcpServer: tools/call routes by _meta.auraBotId in multi-bot mode", as
       resolverInput = input;
       // Mimic LarkPlatform's slice-2F resolver: route to the named
       // bot when present, otherwise fall back to the slice-2A
-      // 3-state behaviour.
+      // 3-state behaviour. Per Codex #2, `ok` now carries chatId
+      // + platformUserId so chat-bound tools don't accept an
+      // arbitrary chat id from the LLM.
       if (input.auraBotId === "cli_bot_b") {
-        return { kind: "ok", channel };
+        return {
+          kind: "ok",
+          channel,
+          chatId: "oc_b",
+          platformUserId: "ou_alice",
+        };
       }
       return { kind: "ambiguous", bot_count: 2 };
     },
@@ -497,7 +583,12 @@ test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async
   const channel = stubChannel(async (chatId) => ({ chatId, name: "X" }));
   const server = new LarkMcpServer({
     logger: noopLogger,
-    channelResolver: () => ({ kind: "ok", channel }),
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+    }),
   });
   // Each tunnel gets its own initialize handshake — they're truly
   // independent sessions over the same WS connection.
