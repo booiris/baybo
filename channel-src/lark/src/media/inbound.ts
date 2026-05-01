@@ -1,7 +1,11 @@
 import type { Readable } from "node:stream";
 
 import type { Logger, WireAttachment } from "@aura/channel-sdk";
-import { BlobPairingRequiredError, uploadBlob } from "@aura/channel-sdk";
+import {
+  BlobPairingRequiredError,
+  checkPairing,
+  uploadBlob,
+} from "@aura/channel-sdk";
 import type * as lark from "@larksuiteoapi/node-sdk";
 
 const MIME_BY_KIND: Record<lark.ResourceDescriptor["type"], string> = {
@@ -22,14 +26,13 @@ const MIME_BY_KIND: Record<lark.ResourceDescriptor["type"], string> = {
 // force the sidecar to allocate the full payload before the gateway
 // could reject it.
 //
-// TODO (Phase 3.x — pairing preflight): Codex flagged that an
-// unpaired `(channel_type, bot_id, user_id)` triple can still force
-// up to MAX_RESOURCE_BYTES of bandwidth + memory before
-// `uploadBlob`'s `pairing_required` rejection lands. The proper fix
-// is a lightweight pairing-check call (new gateway endpoint or
-// frame) that runs before the Lark `downloadResource` so we never
-// fetch bytes for an unapproved peer. The byte cap + per-channel
-// concurrency semaphore bound the worst case in the meantime.
+// `downloadResourceAsAttachment` runs a `checkPairing` preflight
+// against the gateway before reaching for the bytes — so an unpaired
+// `(channel_type, bot_id, user_id)` triple can never force a 50 MiB
+// download from Lark's CDN. The byte cap is now defence-in-depth:
+// it bounds the worst case if the preflight is bypassed (network
+// flake mid-download, race with revocation, …) or if a future caller
+// reaches `downloadBounded` directly.
 const MAX_RESOURCE_BYTES = 50 * 1024 * 1024;
 
 // Stickers ride the agent's `image` content block; videos fall back to
@@ -64,6 +67,26 @@ export async function downloadResourceAsAttachment(args: {
   logger: Logger;
 }): Promise<WireAttachment | null> {
   const { channel, resource, botId, userId, logger } = args;
+  // Pairing preflight: skip the Lark CDN download entirely for
+  // unpaired triples. The gateway-side `enforce_pairing` would
+  // reject the resulting `Frame::Message` anyway; downloading first
+  // would waste bandwidth + memory and a per-channel semaphore slot.
+  // Treat preflight failure as "fall through and try" — a flake
+  // shouldn't drop legitimate media; the byte cap + uploadBlob's
+  // `pairing_required` still catch the worst case.
+  try {
+    const paired = await checkPairing({ botId, userId });
+    if (!paired) {
+      logger.debug(
+        `lark inbound media skipped (unpaired): kind=${resource.type} key=${resource.fileKey}`,
+      );
+      return null;
+    }
+  } catch (err) {
+    logger.warn(
+      `lark inbound pairing preflight failed; falling through to download (uploadBlob will gate): ${String(err)}`,
+    );
+  }
   let bytes: Buffer;
   try {
     bytes = await downloadBounded(channel, resource, logger);

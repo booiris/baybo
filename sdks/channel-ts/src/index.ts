@@ -35,6 +35,7 @@ export type {
 export type { AttachmentKind, WireAttachment } from "./wire.js";
 export {
   BlobPairingRequiredError,
+  checkPairing,
   fetchBlob,
   fetchBlobStream,
   uploadBlob,

@@ -125,6 +125,43 @@ export async function uploadBlob(
   return { blobId: json.blob_id };
 }
 
+/**
+ * Read-only pairing preflight against `GET /v1/pairing/check`.
+ *
+ * Returns `true` iff the gateway already has an `Approved` row for
+ * the `(channel_type, botId, userId)` triple. The gateway derives
+ * `channel_type` from the sidecar's bound channel token, so the
+ * caller only supplies the per-message ids.
+ *
+ * Use before downloading inbound media on the platform side. An
+ * unpaired triple's `Frame::Message` will be rejected by the
+ * gateway's `enforce_pairing` anyway, so spending bandwidth /
+ * memory pulling the resource bytes is wasted work. Sidecars that
+ * skip the preflight still get the same security outcome (no
+ * durable persistence for unpaired traffic), just at higher cost.
+ *
+ * Never mints a pending code or upserts a row — calling this on
+ * cold cache is safe.
+ */
+export async function checkPairing(
+  opts: BlobClientOptions & { botId: string; userId: string },
+): Promise<boolean> {
+  const { baseUrl, token } = resolveAuth(opts);
+  const url = `${baseUrl}/v1/pairing/check?bot_id=${encodeURIComponent(opts.botId)}&user_id=${encodeURIComponent(opts.userId)}`;
+  const res = await fetchWithSignal(url, {
+    method: "GET",
+    headers: { "x-aura-channel-token": token },
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  });
+  if (!res.ok) {
+    throw new Error(
+      `checkPairing: ${res.status} ${res.statusText} (${url})`,
+    );
+  }
+  const json = (await res.json()) as { paired?: unknown };
+  return json.paired === true;
+}
+
 /** Fetch a blob's bytes by id. Throws on 404 / any non-2xx. Buffers the
  * entire body in memory — prefer `fetchBlobStream` for large attachments
  * so the bytes can flow straight into the platform SDK's streaming upload. */

@@ -45,6 +45,29 @@ impl PairingService {
         Self { store }
     }
 
+    /// Read-only pairing lookup. Returns `true` iff the triple has an
+    /// `Approved` row. Unlike [`Self::check`], this never mints a
+    /// pending code or upserts a pending row — safe to call from
+    /// preflight paths (e.g. before downloading inbound media on the
+    /// sidecar) where we want to know "is this user authorised to
+    /// send us bytes?" without triggering side effects.
+    pub async fn is_approved(
+        &self,
+        channel_type: &ChannelType,
+        bot_id: &str,
+        user_id: &str,
+    ) -> Result<bool, PairingError> {
+        let row = self
+            .store
+            .get(channel_type, bot_id, user_id)
+            .await
+            .map_err(PairingError::Storage)?;
+        Ok(matches!(
+            row.map(|r| r.status),
+            Some(PairingStatus::Approved)
+        ))
+    }
+
     /// Check whether `(channel_type, bot_id, user_id)` can send
     /// messages. On a miss or on an expired pending row, mint a fresh
     /// code and return [`CheckOutcome::Pending`].

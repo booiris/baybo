@@ -140,6 +140,80 @@ pub(crate) fn routes() -> Router<WsChannelState> {
             post(upload).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
         )
         .route("/blobs/{blob_id}", get(download))
+        .route("/pairing/check", get(pairing_check))
+}
+
+/// Query parameters for the pairing-preflight endpoint. The triple
+/// matches what `Frame::Message` carries on the WS path; the sidecar
+/// uses this endpoint *before* the WS frame so it can avoid spending
+/// bandwidth/memory pulling inbound media for an unpaired user.
+#[derive(Debug, serde::Deserialize)]
+struct PairingCheckQuery {
+    bot_id: String,
+    user_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PairingCheckResponse {
+    paired: bool,
+}
+
+/// `GET /v1/pairing/check?bot_id=…&user_id=…` — read-only preflight.
+///
+/// Returns `{ paired: true|false }`. Never mints a pending code,
+/// never upserts a row — `aura_pairing::PairingService::is_approved`
+/// is side-effect-free. The Lark sidecar uses this before
+/// `downloadResource` so an unpaired triple can't force a 50 MiB
+/// download from Lark's CDN before `Frame::Message`'s pairing gate
+/// rejects the message. Same auth + bound-channel-type contract as
+/// `/v1/blobs`: TUI bypasses, subprocess sidecars must carry a
+/// channel_type-bound token.
+async fn pairing_check(
+    State(state): State<WsChannelState>,
+    Extension(authed): Extension<AuthedClient>,
+    axum::extract::Query(q): axum::extract::Query<PairingCheckQuery>,
+) -> Response {
+    let channel_type = match &authed {
+        AuthedClient::Tui => {
+            // TUI traffic is session-scoped and bypasses pairing the
+            // same way it does in `authorize_upload`. Surface as
+            // `paired: true` so the SDK helper's "skip on false" path
+            // doesn't accidentally drop legitimate TUI media.
+            return axum::Json(PairingCheckResponse { paired: true }).into_response();
+        }
+        AuthedClient::Subprocess {
+            channel_type: None,
+            ..
+        } => {
+            return (
+                StatusCode::FORBIDDEN,
+                "subprocess token has no bound channel_type",
+            )
+                .into_response();
+        }
+        AuthedClient::Subprocess {
+            channel_type: Some(ct),
+            ..
+        } => ChannelType::from(ct.as_str()),
+    };
+    if q.bot_id.is_empty() || q.user_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "bot_id and user_id query parameters are required",
+        )
+            .into_response();
+    }
+    match state
+        .pairing
+        .is_approved(&channel_type, &q.bot_id, &q.user_id)
+        .await
+    {
+        Ok(paired) => axum::Json(PairingCheckResponse { paired }).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, %channel_type, "pairing preflight failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "pairing preflight failed").into_response()
+        }
+    }
 }
 
 async fn upload(
