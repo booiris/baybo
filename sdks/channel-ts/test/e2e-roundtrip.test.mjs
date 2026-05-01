@@ -270,10 +270,16 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   assert.equal(fixture.recorded.register.protocol_version, undefined);
   // The fixture's stub channel implements `onDiagnoseRequested`,
   // `onToolCallStarted`, and `onToolCallCompleted`, so the runner
-  // auto-advertises both gating capabilities.
-  assert.deepEqual(
-    [...fixture.recorded.register.capabilities].sort(),
-    ["diagnose", "tool_telemetry"],
+  // auto-advertises both gating capabilities. Per-cap assertions
+  // (rather than `deepEqual`) so adding a future capability doesn't
+  // churn this test.
+  assert.ok(
+    fixture.recorded.register.capabilities?.includes("diagnose"),
+    "diagnose should be advertised",
+  );
+  assert.ok(
+    fixture.recorded.register.capabilities?.includes("tool_telemetry"),
+    "tool_telemetry should be advertised",
   );
 
   // ---- Server → client -------------------------------------------

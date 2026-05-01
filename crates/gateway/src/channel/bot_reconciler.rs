@@ -47,21 +47,22 @@ pub const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
     /// `StartBot` sent for the given revision. Positive ack moves
-    /// `applied` to that revision; negative ack clears `pending` and
+    /// `applied` to that revision; negative ack clears `pending` so
     /// the next tick retries.
     Start(i64),
-    /// `StopBot` sent because we want to rotate to the given new
-    /// revision — once the sidecar acks the stop, the next tick
-    /// emits `StartBot` with the rotated creds.
-    StopForRotate(i64),
+    /// `StopBot` sent because we want to rotate to a new revision.
+    /// The target revision lives on the libsql row, not here — once
+    /// the stop acks we set `applied = 0` and the next tick
+    /// re-derives the start from `desired`.
+    StopForRotate,
     /// `StopBot` sent because the bot is no longer in the desired
-    /// roster (operator removal). Positive ack drops the tracked
-    /// entry entirely; negative ack clears `pending` so the next
-    /// tick retries the stop.
+    /// roster (operator removal). Positive ack drops the entry
+    /// entirely; negative ack clears `pending` so the next tick
+    /// retries the stop.
     StopForDetach,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct TrackedEntry {
     /// Last revision the sidecar positively acked. `0` means the bot
     /// is not currently running on the sidecar (never started, or
@@ -106,7 +107,7 @@ impl Tracked {
                 // Rotation: stop first, the next tick will see
                 // applied == 0 and emit Start with the new revision.
                 to_stop.push(id.clone());
-                entry.pending = Some(Pending::StopForRotate(*desired_rev));
+                entry.pending = Some(Pending::StopForRotate);
             }
             // applied >= desired_rev: caught up, no-op.
         }
@@ -156,7 +157,7 @@ impl Tracked {
         }
         match pending {
             Pending::Start(rev) => entry.applied = rev,
-            Pending::StopForRotate(_) => entry.applied = 0,
+            Pending::StopForRotate => entry.applied = 0,
             Pending::StopForDetach => {
                 channel_state.remove(bot_id);
             }
@@ -259,11 +260,11 @@ impl ChannelBotReconciler {
     }
 
     /// Apply a `BotStatus` ack from the sidecar. Called from the WS
-    /// inbound loop. `false` returns when the entry was already gone
-    /// (operator removed concurrently with the in-flight op) — safe
-    /// to ignore.
-    pub fn record_ack(&self, channel_type: &ChannelType, bot_id: &str, ok: bool) -> bool {
-        self.tracked.lock().record_ack(channel_type, bot_id, ok)
+    /// inbound loop. Acks for entries the reconciler no longer tracks
+    /// (operator removed concurrently with the in-flight op) are
+    /// dropped silently.
+    pub fn record_ack(&self, channel_type: &ChannelType, bot_id: &str, ok: bool) {
+        self.tracked.lock().record_ack(channel_type, bot_id, ok);
     }
 
     /// Run the loop until `shutdown` fires.

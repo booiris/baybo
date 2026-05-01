@@ -43,7 +43,9 @@ pub(crate) struct SidecarCapabilities {
 impl SidecarCapabilities {
     pub(crate) fn from_negotiated(caps: &[String]) -> Self {
         Self {
-            tool_telemetry: caps.iter().any(|c| c == "tool_telemetry"),
+            tool_telemetry: caps
+                .iter()
+                .any(|c| c == super::handshake::CAP_TOOL_TELEMETRY),
         }
     }
 

@@ -417,7 +417,9 @@ async fn run_inbound_loop(
     connection_session_id: Option<&str>,
     negotiated_capabilities: &[String],
 ) {
-    let secrets_enabled = negotiated_capabilities.iter().any(|c| c == "secrets");
+    let secrets_enabled = negotiated_capabilities
+        .iter()
+        .any(|c| c == super::handshake::CAP_SECRETS);
     while let Some(msg) = source.next().await {
         let msg = match msg {
             Ok(m) => m,

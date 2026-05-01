@@ -98,7 +98,9 @@ async fn diagnose_channel(
     Query(query): Query<DiagnoseQuery>,
 ) -> std::result::Result<Json<DiagnoseResponse>, (StatusCode, Json<ErrorBody>)> {
     let ct = aura_model::ChannelType::from(channel_type.as_str());
-    let cap_advertised = state.channel_capabilities.supports(&ct, "diagnose");
+    let cap_advertised = state
+        .channel_capabilities
+        .supports(&ct, crate::channel::handshake::CAP_DIAGNOSE);
     let report = request_diagnose(
         &state.channel_control,
         &state.diagnose_router,

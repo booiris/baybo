@@ -20,7 +20,15 @@ const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP];
 /// negotiated set as the intersection with their own advertised
 /// capabilities. Forward-compatible: a peer that doesn't know about a
 /// capability simply doesn't claim it.
-pub(crate) const GATEWAY_CAPABILITIES: &[&str] = &["secrets", "diagnose", "tool_telemetry"];
+/// Capability strings shared with sidecars. Each constant is also
+/// listed in [`GATEWAY_CAPABILITIES`]; consumers gate on the const so
+/// a typo at one site is a compile error rather than silent capability
+/// mismatch.
+pub(crate) const CAP_SECRETS: &str = "secrets";
+pub(crate) const CAP_DIAGNOSE: &str = "diagnose";
+pub(crate) const CAP_TOOL_TELEMETRY: &str = "tool_telemetry";
+
+pub(crate) const GATEWAY_CAPABILITIES: &[&str] = &[CAP_SECRETS, CAP_DIAGNOSE, CAP_TOOL_TELEMETRY];
 
 /// Validate the first frame received on a `/v1/channel-ws` upgrade and
 /// produce the `ChannelType` the sidecar is registering as.
