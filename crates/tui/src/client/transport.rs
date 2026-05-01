@@ -278,6 +278,9 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
         // surface and a real sidecar; the TUI is session-scoped and
         // never participates.
         Frame::DiagnoseRequest { .. } | Frame::DiagnoseReply { .. } => None,
+        // MCP tunnel frames flow between Aura's MCP layer and a
+        // sidecar's MCP server; the TUI never participates.
+        Frame::Mcp { .. } => None,
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
         | Frame::ResolveApproval { .. }

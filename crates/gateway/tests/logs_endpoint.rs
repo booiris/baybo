@@ -108,6 +108,7 @@ async fn router_with_seed() -> (axum::Router, Arc<aura_gateway::log_buffer::LogB
         secret_vault: Arc::clone(&tg.deps.secret_vault),
         diagnose_router: Arc::clone(&tg.deps.diagnose_router),
         channel_capabilities: Arc::clone(&tg.deps.channel_capabilities),
+        mcp_tunnel_router: Arc::clone(&tg.deps.mcp_tunnel_router),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
     let (admin_router, _spec) = aura_gateway::api::admin::v1_router_and_spec();

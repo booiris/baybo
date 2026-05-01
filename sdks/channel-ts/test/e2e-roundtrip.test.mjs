@@ -99,6 +99,13 @@ function startFixture() {
             );
             ws.send(
               encodeFrame({
+                kind: "mcp",
+                tunnel_id: "tunnel-7",
+                payload: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+              }),
+            );
+            ws.send(
+              encodeFrame({
                 kind: "approval_requested",
                 call_id: "call-1",
                 session_id: "sess-1",
@@ -138,6 +145,10 @@ function startFixture() {
           }
           case "diagnose_reply": {
             recorded.diagnoseReply = frame;
+            break;
+          }
+          case "mcp": {
+            recorded.mcpReply = frame;
             break;
           }
           case "sidecar_log": {
@@ -215,6 +226,15 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
         { name: "ws", status: "ok", detail: "connected" },
       ];
     },
+    async onMcpEnvelope(tunnelId, payload, reply) {
+      // Echo every byte back with a sentinel prefix so the test can
+      // confirm both directions of the tunnel and the tunnel_id
+      // round-trip.
+      const echoed = new Uint8Array(payload.length + 1);
+      echoed[0] = 0xff;
+      echoed.set(payload, 1);
+      await reply.send(echoed);
+    },
     async *inbound(signal) {
       yield {
         sessionId: "sess-1",
@@ -280,6 +300,20 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   assert.ok(
     fixture.recorded.register.capabilities?.includes("tool_telemetry"),
     "tool_telemetry should be advertised",
+  );
+  assert.ok(
+    fixture.recorded.register.capabilities?.includes("mcp_tunnel"),
+    "mcp_tunnel should be advertised when onMcpEnvelope is implemented",
+  );
+
+  // MCP tunnel echoed back with the sentinel prefix; tunnel_id round-trips.
+  assert.ok(fixture.recorded.mcpReply, "server received an Mcp reply");
+  assert.equal(fixture.recorded.mcpReply.tunnel_id, "tunnel-7");
+  const replyBytes = Uint8Array.from(fixture.recorded.mcpReply.payload);
+  assert.deepEqual(
+    Array.from(replyBytes),
+    [0xff, 0x01, 0x02, 0x03, 0x04],
+    "Mcp reply should be the request bytes prefixed by the stub's sentinel",
   );
 
   // ---- Server → client -------------------------------------------

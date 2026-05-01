@@ -409,6 +409,21 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(optional))]
         error: Option<String>,
     },
+    /// Bidirectional: opaque JSON-RPC envelope tunnelled between
+    /// Aura's MCP client and a sidecar's MCP server. The gateway
+    /// forwards `payload` byte-for-byte without parsing — supporting
+    /// future MCP protocol versions transparent without a wire bump.
+    /// `tunnel_id` is a UUID minted by the agent side when it opens a
+    /// session against the sidecar, and disambiguates concurrent
+    /// JSON-RPC streams from different agent sessions sharing one WS.
+    /// Gated by the `"mcp_tunnel"` capability; sidecars that don't
+    /// claim it never see the frame, and a sidecar emitting one
+    /// without claiming support is dropped server-side.
+    Mcp {
+        tunnel_id: String,
+        #[cfg_attr(feature = "ts-export", ts(type = "Uint8Array"))]
+        payload: Vec<u8>,
+    },
     /// Server -> client: ask the sidecar to assemble a self-test
     /// report for `bot_id`. The sidecar replies with
     /// [`Frame::DiagnoseReply`] using the same `request_id`. The

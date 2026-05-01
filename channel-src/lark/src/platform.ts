@@ -23,6 +23,7 @@ import {
   type BotRuntimeConfig,
 } from "./auth/credentials.js";
 import { Semaphore } from "./concurrency.js";
+import { LarkMcpServer } from "./mcp/server.js";
 import { downloadResourceAsAttachment } from "./media/inbound.js";
 import { sendLarkAttachments } from "./media/outbound.js";
 import { cleanInboundContent } from "./messaging/inbound.js";
@@ -61,6 +62,11 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
   // Per-bot runtime state: streaming/reaction toggles. Keyed on
   // `botId` (StartBot is idempotent at the SDK layer).
   private readonly bots = new Map<string, BotState>();
+  // MCP server stub. Single instance per platform — JSON-RPC envelopes
+  // arrive with their own `id`s so concurrent agent sessions sharing
+  // a single sidecar don't collide. Phase 3.3 slice 2 swaps this for
+  // a real `@modelcontextprotocol/sdk` server hosting the OAPI tools.
+  private readonly mcpServer: LarkMcpServer;
   // Per-userId streaming session: at most one card streams to a given
   // (channelType, botId, chatKey, platformUserId) tuple at a time.
   // Aura's gateway already serialises a session's outbound, so the
@@ -72,7 +78,17 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
   constructor(
     private readonly logger: Logger,
     private readonly approvals: LarkApprovals,
-  ) {}
+  ) {
+    this.mcpServer = new LarkMcpServer({ logger });
+  }
+
+  async onMcpEnvelope(
+    _tunnelId: string,
+    payload: Uint8Array,
+    reply: import("@aura/channel-sdk").McpReplyHandle,
+  ): Promise<void> {
+    await this.mcpServer.handle(payload, reply);
+  }
 
   async sendText(
     handle: lark.LarkChannel,

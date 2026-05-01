@@ -234,6 +234,42 @@ export interface Channel {
   onDiagnoseRequested?(req: DiagnoseRequest): Promise<DiagnoseCheck[]>;
 
   /**
+   * MCP tunnel hook. Per Decision #9 of the Lark report, the
+   * sidecar hosts an MCP server (today: `feishu_*` OAPI tools,
+   * Phase 3.3 work) and JSON-RPC envelopes ride the existing channel
+   * WS as opaque [`Frame::Mcp`] payloads. The runtime delivers each
+   * inbound envelope here with the originating `tunnelId` (a UUID
+   * per agent-side MCP session); the sidecar processes the envelope
+   * and replies via [`McpReplyHandle.send`].
+   *
+   * Implementing this hook auto-claims the `"mcp_tunnel"` capability
+   * on `Register`; the gateway only forwards `Frame::Mcp` to peers
+   * that claimed it.
+   */
+  onMcpEnvelope?(
+    tunnelId: string,
+    payload: Uint8Array,
+    reply: McpReplyHandle,
+  ): Promise<void>;
+}
+
+/**
+ * Lifeline an `onMcpEnvelope` handler uses to ship a JSON-RPC reply
+ * (or notification) back through the gateway tunnel. Decoupled from
+ * the request so a sidecar's MCP server can produce streamed
+ * notifications independent of the request/reply pairing.
+ */
+export interface McpReplyHandle {
+  send(payload: Uint8Array): Promise<void>;
+}
+
+// Re-extend the Channel interface — TS interface declarations merge,
+// so the approval / slash / start-stop / inbound members below all
+// land on the same `Channel` exported above. Keeping them separate
+// from the MCP hook lets the doc strings stay near the interface
+// they describe without nesting `McpReplyHandle` inside `Channel`.
+export interface Channel {
+  /**
    * Return value is encoded into a `ResolveApproval` frame by the runner.
    * The runner invokes this handler in a detached task so concurrent
    * approvals do not serialize behind a slow one.

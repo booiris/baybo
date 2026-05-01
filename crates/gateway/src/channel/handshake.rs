@@ -27,8 +27,14 @@ const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP];
 pub(crate) const CAP_SECRETS: &str = "secrets";
 pub(crate) const CAP_DIAGNOSE: &str = "diagnose";
 pub(crate) const CAP_TOOL_TELEMETRY: &str = "tool_telemetry";
+pub(crate) const CAP_MCP_TUNNEL: &str = "mcp_tunnel";
 
-pub(crate) const GATEWAY_CAPABILITIES: &[&str] = &[CAP_SECRETS, CAP_DIAGNOSE, CAP_TOOL_TELEMETRY];
+pub(crate) const GATEWAY_CAPABILITIES: &[&str] = &[
+    CAP_SECRETS,
+    CAP_DIAGNOSE,
+    CAP_TOOL_TELEMETRY,
+    CAP_MCP_TUNNEL,
+];
 
 /// Validate the first frame received on a `/v1/channel-ws` upgrade and
 /// produce the `ChannelType` the sidecar is registering as.

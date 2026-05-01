@@ -118,6 +118,11 @@ pub struct GatewayDeps {
     /// exists so admin-side callers can introspect without crossing
     /// the WS task boundary.
     pub channel_capabilities: Arc<crate::channel::ChannelCapabilities>,
+    /// Shared MCP tunnel registry. The WS inbound loop uses
+    /// `forward_inbound` to route `Frame::Mcp` payloads to whichever
+    /// caller opened the matching tunnel; the agent-side caller
+    /// (lands in slice 2) holds the open tunnel handles.
+    pub mcp_tunnel_router: Arc<crate::channel::McpTunnelRouter>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -140,6 +145,7 @@ pub struct AdminState {
     pub secret_vault: Arc<SecretVault>,
     pub diagnose_router: Arc<crate::channel::DiagnoseRouter>,
     pub channel_capabilities: Arc<crate::channel::ChannelCapabilities>,
+    pub mcp_tunnel_router: Arc<crate::channel::McpTunnelRouter>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
@@ -178,6 +184,7 @@ impl AdminState {
             secret_vault: Arc::clone(&deps.secret_vault),
             diagnose_router: Arc::clone(&deps.diagnose_router),
             channel_capabilities: Arc::clone(&deps.channel_capabilities),
+            mcp_tunnel_router: Arc::clone(&deps.mcp_tunnel_router),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }
     }
@@ -307,6 +314,7 @@ pub fn build_channel_router(
         inbound_dedup: Arc::new(crate::channel::InboundDedup::new()),
         diagnose_router: Arc::clone(&deps.diagnose_router),
         capabilities: Arc::clone(&deps.channel_capabilities),
+        mcp_tunnel_router: Arc::clone(&deps.mcp_tunnel_router),
     };
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_channel_auth` has stripped `?token=…`.

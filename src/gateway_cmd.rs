@@ -349,6 +349,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     ));
     let diagnose_router = Arc::new(aura_gateway::channel::DiagnoseRouter::new());
     let channel_capabilities = Arc::new(aura_gateway::channel::ChannelCapabilities::new());
+    let mcp_tunnel_router = Arc::new(aura_gateway::channel::McpTunnelRouter::new());
     {
         let reconciler = Arc::clone(&bot_reconciler);
         let shutdown_for_reconciler = shutdown.clone();
@@ -380,6 +381,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         bot_reconciler: Arc::clone(&bot_reconciler),
         diagnose_router,
         channel_capabilities,
+        mcp_tunnel_router,
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to

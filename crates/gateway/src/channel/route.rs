@@ -214,6 +214,10 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         // reply rather than letting them block until the per-call
         // timeout fires.
         state.diagnose_router.drain_for_disconnect();
+        // Drop every MCP tunnel routed through this sidecar so
+        // agent-side awaiters wake immediately with `None` instead
+        // of blocking on a dead pipe.
+        state.mcp_tunnel_router.drain_for_channel(&channel_type);
     }
     unregister_best_effort(&state, &channel_type, session_id.as_deref());
     let _ = sidecar.into_pump().await;
@@ -420,6 +424,9 @@ async fn run_inbound_loop(
     let secrets_enabled = negotiated_capabilities
         .iter()
         .any(|c| c == super::handshake::CAP_SECRETS);
+    let mcp_tunnel_enabled = negotiated_capabilities
+        .iter()
+        .any(|c| c == super::handshake::CAP_MCP_TUNNEL);
     while let Some(msg) = source.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -705,6 +712,32 @@ async fn run_inbound_loop(
                         state
                             .diagnose_router
                             .resolve(&request_id, ok, checks, error);
+                    }
+                    Frame::Mcp { tunnel_id, payload } => {
+                        if !mcp_tunnel_enabled {
+                            // Sidecar sent the frame without claiming
+                            // the capability — drop it loudly so a
+                            // mismatch is visible in operator logs
+                            // rather than silently broken.
+                            tracing::warn!(
+                                %channel_type,
+                                "Frame::Mcp received without `mcp_tunnel` capability; dropping",
+                            );
+                            continue;
+                        }
+                        if !state
+                            .mcp_tunnel_router
+                            .forward_inbound(&tunnel_id, payload)
+                            .await
+                        {
+                            // Late reply for an unregistered tunnel —
+                            // typical when the agent timed out before
+                            // the sidecar's response arrived.
+                            tracing::debug!(
+                                tunnel = %tunnel_id,
+                                "Frame::Mcp dropped: tunnel not registered",
+                            );
+                        }
                     }
                     other => {
                         tracing::warn!(

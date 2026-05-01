@@ -21,6 +21,7 @@ use super::control::ChannelControlRegistry;
 use super::dedup::InboundDedup;
 use super::diagnose::DiagnoseRouter;
 use super::history::TuiHistoryStore;
+use super::mcp_tunnel::McpTunnelRouter;
 use super::session_resolver::ChannelSessionResolver;
 use crate::auth::ChannelTokenTable;
 use crate::log_buffer::LogBuffer;
@@ -91,4 +92,8 @@ pub struct WsChannelState {
     /// requests against sidecars that didn't claim the `"diagnose"`
     /// capability rather than wait for the round-trip to time out.
     pub capabilities: Arc<super::diagnose::ChannelCapabilities>,
+    /// MCP tunnel registry. The inbound loop forwards `Frame::Mcp`
+    /// payloads here; the agent-side MCP client adapter (lands in
+    /// slice 2) opens / closes tunnels as needed.
+    pub mcp_tunnel_router: Arc<McpTunnelRouter>,
 }

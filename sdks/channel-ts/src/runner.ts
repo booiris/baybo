@@ -73,6 +73,7 @@ export async function runChannel(
   if (channel.onToolCallStarted || channel.onToolCallCompleted) {
     derived.push("tool_telemetry");
   }
+  if (channel.onMcpEnvelope) derived.push("mcp_tunnel");
   const capabilities = Array.from(
     new Set([...(opts.capabilities ?? []), ...derived]),
   );
@@ -656,6 +657,33 @@ function dispatchFrame(
       // implemented — the gateway is blocked on a oneshot waiter and
       // would otherwise wait the full timeout.
       void handleDiagnose(frame, channel, ws, logger);
+      return;
+    }
+    case "mcp": {
+      if (!channel.onMcpEnvelope) {
+        logger.debug(
+          `mcp envelope received but channel has no onMcpEnvelope; tunnel=${frame.tunnel_id}`,
+        );
+        return;
+      }
+      const tunnelId = frame.tunnel_id;
+      const reply: import("./channel.js").McpReplyHandle = {
+        async send(payload: Uint8Array): Promise<void> {
+          if (ws.readyState !== WebSocket.OPEN) return;
+          ws.send(
+            encodeFrame({
+              kind: "mcp",
+              tunnel_id: tunnelId,
+              payload,
+            }),
+          );
+        },
+      };
+      void safeInvoke(
+        () => channel.onMcpEnvelope!(tunnelId, frame.payload, reply),
+        "onMcpEnvelope",
+        logger,
+      );
       return;
     }
     case "approval_requested": {

@@ -17,6 +17,7 @@ export type {
   DiagnoseCheck,
   DiagnoseRequest,
   DiagnoseStatus,
+  McpReplyHandle,
   NoticeLevel,
   ReconnectPolicy,
   RunOptions,
