@@ -811,6 +811,196 @@ export class LarkMcpServer {
       },
     );
 
+    server.registerTool(
+      "feishu_calendar_event",
+      {
+        title: "Read Feishu calendar events",
+        description:
+          "Inspect events in a Feishu calendar. `action: \"list\"` paginates events in a time range; `\"get\"` fetches one by id. Read-only — event mutation lives in upcoming calendar_event_create / _update / _delete tools. Returns raw Feishu event shape (start_time/end_time as `{ date | timestamp, timezone }`).",
+        inputSchema: {
+          action: z
+            .enum(["list", "get"])
+            .describe(
+              "`list` paginates events in a calendar (filterable by time range). `get` fetches one event.",
+            ),
+          calendar_id: z
+            .string()
+            .min(1)
+            .describe(
+              "Required. Calendar id from `feishu_calendar`. Use \"primary\" via `feishu_calendar action=primary` first if you don't have a specific id.",
+            ),
+          event_id: z
+            .string()
+            .optional()
+            .describe("Required for `get`. Event id from a prior `list`."),
+          start_time: z
+            .string()
+            .optional()
+            .describe(
+              "Only used by `list`. ISO 8601 lower bound (events overlapping this window are returned).",
+            ),
+          end_time: z
+            .string()
+            .optional()
+            .describe("Only used by `list`. ISO 8601 upper bound."),
+          page_size: z
+            .number()
+            .int()
+            .min(1)
+            .max(1000)
+            .optional()
+            .describe("Only used by `list`. Default 50."),
+          page_token: z.string().optional(),
+          need_attendee: z
+            .boolean()
+            .optional()
+            .describe(
+              "Only used by `get`. If true, the response includes the attendee list (default false — keeps the payload small).",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (args.action === "get" && !args.event_id) {
+          return toolError("feishu_calendar_event action=get requires `event_id`");
+        }
+        return this.runUatTool({
+          active,
+          toolName: "feishu_calendar_event",
+          reason: "read your calendar events",
+          handler: async (uat): Promise<LarkApiResponse> => {
+            const opts = lark.withUserAccessToken(uat);
+            const sdk = active.channel.rawClient.calendar.calendarEvent;
+            if (args.action === "get") {
+              return sdk.get(
+                {
+                  path: { calendar_id: args.calendar_id, event_id: args.event_id! },
+                  params: {
+                    ...(args.need_attendee !== undefined && { need_attendee: args.need_attendee }),
+                  },
+                },
+                opts,
+              );
+            }
+            return sdk.list(
+              {
+                path: { calendar_id: args.calendar_id },
+                params: {
+                  ...(args.start_time !== undefined && { start_time: args.start_time }),
+                  ...(args.end_time !== undefined && { end_time: args.end_time }),
+                  ...(args.page_size !== undefined && { page_size: args.page_size }),
+                  ...(args.page_token !== undefined && { page_token: args.page_token }),
+                },
+              },
+              opts,
+            );
+          },
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_wiki",
+      {
+        title: "Browse Feishu Wiki spaces and nodes",
+        description:
+          "Read the conversing user's Feishu Wiki structure. `action: \"get_space\"` fetches one wiki space by id; `\"list_nodes\"` paginates the children of a node (or the space root). Use to discover doc/sheet/bitable tokens before fetching content with `feishu_fetch_doc`.",
+        inputSchema: {
+          action: z.enum(["get_space", "list_nodes"]).describe("Operation."),
+          space_id: z.string().min(1).describe("Required. Wiki space id."),
+          parent_node_token: z
+            .string()
+            .optional()
+            .describe(
+              "Only used by `list_nodes`. If omitted, lists the space's root nodes; pass a node_token from a prior call to descend.",
+            ),
+          page_size: z.number().int().min(1).max(50).optional().describe("Only used by `list_nodes`. Default 10."),
+          page_token: z.string().optional(),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.runUatTool({
+          active,
+          toolName: "feishu_wiki",
+          reason: "browse your Feishu Wiki",
+          handler: async (uat): Promise<LarkApiResponse> => {
+            const opts = lark.withUserAccessToken(uat);
+            const sdk = active.channel.rawClient.wiki;
+            if (args.action === "get_space") {
+              return sdk.space.get(
+                { path: { space_id: args.space_id } },
+                opts,
+              );
+            }
+            return sdk.spaceNode.list(
+              {
+                path: { space_id: args.space_id },
+                params: {
+                  ...(args.parent_node_token !== undefined && {
+                    parent_node_token: args.parent_node_token,
+                  }),
+                  ...(args.page_size !== undefined && { page_size: args.page_size }),
+                  ...(args.page_token !== undefined && { page_token: args.page_token }),
+                },
+              },
+              opts,
+            );
+          },
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_search_doc",
+      {
+        title: "Search Feishu Docs by keyword",
+        description:
+          "Free-text search across the conversing user's accessible Feishu docs (docx + doc + sheet + bitable). Returns document tokens + titles. Use the returned tokens with `feishu_fetch_doc` (upcoming) to read the content. Goes through the legacy /open-apis/suite/docs-api/search/object endpoint via raw fetch — the SDK doesn't expose this in its typed surface.",
+        inputSchema: {
+          query: z
+            .string()
+            .min(1)
+            .describe("Search keywords. Multilingual; matches title and body."),
+          count: z
+            .number()
+            .int()
+            .min(1)
+            .max(50)
+            .optional()
+            .describe("How many docs to return. Default 10."),
+          offset: z.number().int().min(0).optional().describe("Pagination offset for the next page."),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.runUatTool({
+          active,
+          toolName: "feishu_search_doc",
+          reason: "search your Feishu docs",
+          handler: async (uat) => {
+            const url = `${active.uatAccessor!.baseUrl}/open-apis/suite/docs-api/search/object`;
+            const resp = await fetch(url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${uat}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                search_key: args.query,
+                count: args.count ?? 10,
+                ...(args.offset !== undefined && { offset: args.offset }),
+              }),
+            });
+            return (await resp.json()) as LarkApiResponse;
+          },
+        });
+      },
+    );
+
     this.registerAskUser(server);
   }
 

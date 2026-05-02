@@ -88,12 +88,32 @@ function stubChannel(getChatInfoImpl, rawApi) {
             return rawApi?.calendarGet?.(payload, opts) ?? { code: 0, data: {} };
           },
         },
+        calendarEvent: {
+          async list(payload, opts) {
+            return rawApi?.eventList?.(payload, opts) ?? { code: 0, data: {} };
+          },
+          async get(payload, opts) {
+            return rawApi?.eventGet?.(payload, opts) ?? { code: 0, data: {} };
+          },
+        },
         freebusy: {
           async list(payload, opts) {
             return rawApi?.freebusyList?.(payload, opts) ?? { code: 0, data: {} };
           },
           async batch(payload, opts) {
             return rawApi?.freebusyBatch?.(payload, opts) ?? { code: 0, data: {} };
+          },
+        },
+      },
+      wiki: {
+        space: {
+          async get(payload, opts) {
+            return rawApi?.wikiSpaceGet?.(payload, opts) ?? { code: 0, data: {} };
+          },
+        },
+        spaceNode: {
+          async list(payload, opts) {
+            return rawApi?.wikiSpaceNodeList?.(payload, opts) ?? { code: 0, data: {} };
           },
         },
       },
@@ -187,6 +207,7 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
   assert.deepEqual(toolNames, [
     "feishu_ask_user",
     "feishu_calendar",
+    "feishu_calendar_event",
     "feishu_freebusy",
     "feishu_freebusy_batch",
     "feishu_get_chat_history",
@@ -195,8 +216,10 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_get_user",
     "feishu_list_chat_members",
     "feishu_search_chats",
+    "feishu_search_doc",
     "feishu_search_user",
     "feishu_who_am_i",
+    "feishu_wiki",
   ]);
   // tools/list never resolves a channel — the resolver only fires on
   // tools/call.
@@ -1614,6 +1637,211 @@ test("LarkMcpServer: feishu_freebusy_batch forwards user_ids list to calendar.fr
 
   assert.deepEqual(receivedPayload.data.user_ids, ["ou_x", "ou_y"]);
   assert.equal(receivedPayload.params.user_id_type, "open_id");
+});
+
+test("LarkMcpServer: feishu_calendar_event list/get dispatch with required fields", async () => {
+  const calls = { list: null, get: null };
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async eventList(payload) {
+      calls.list = payload;
+      return { code: 0, data: { items: [], has_more: false } };
+    },
+    async eventGet(payload) {
+      calls.get = payload;
+      return { code: 0, data: { event: { event_id: payload.path.event_id } } };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  async function call(id, args) {
+    const before = reply.sent.length;
+    await server.accept(
+      `tunnel-evt-${id}`,
+      encodeJson({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "feishu_calendar_event", arguments: args },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, `evt ${id}`);
+    return decodeJson(reply.sent[reply.sent.length - 1]);
+  }
+
+  await call(70, {
+    action: "list",
+    calendar_id: "cal_p",
+    start_time: "1700000000",
+    end_time: "1700100000",
+  });
+  await call(71, {
+    action: "get",
+    calendar_id: "cal_p",
+    event_id: "evt_x",
+    need_attendee: true,
+  });
+  const bad = await call(72, { action: "get", calendar_id: "cal_p" });
+
+  assert.equal(calls.list.path.calendar_id, "cal_p");
+  assert.equal(calls.list.params.start_time, "1700000000");
+  assert.equal(calls.get.path.event_id, "evt_x");
+  assert.equal(calls.get.params.need_attendee, true);
+  assert.equal(bad.result.isError, true);
+  assert.match(bad.result.content[0].text, /requires `event_id`/);
+});
+
+test("LarkMcpServer: feishu_wiki dispatches between get_space and list_nodes", async () => {
+  const calls = { space: null, nodes: null };
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async wikiSpaceGet(payload) {
+      calls.space = payload;
+      return { code: 0, data: { space: { space_id: payload.path.space_id } } };
+    },
+    async wikiSpaceNodeList(payload) {
+      calls.nodes = payload;
+      return { code: 0, data: { items: [], has_more: false } };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  await server.accept(
+    "tunnel-wiki-s",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 80,
+      method: "tools/call",
+      params: { name: "feishu_wiki", arguments: { action: "get_space", space_id: "sp_x" } },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => calls.space !== null, "wiki space");
+  await server.accept(
+    "tunnel-wiki-n",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 81,
+      method: "tools/call",
+      params: {
+        name: "feishu_wiki",
+        arguments: {
+          action: "list_nodes",
+          space_id: "sp_x",
+          parent_node_token: "nt_root",
+          page_size: 20,
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => calls.nodes !== null, "wiki nodes");
+
+  assert.equal(calls.space.path.space_id, "sp_x");
+  assert.equal(calls.nodes.params.parent_node_token, "nt_root");
+  assert.equal(calls.nodes.params.page_size, 20);
+});
+
+test("LarkMcpServer: feishu_search_doc POSTs to /open-apis/suite/docs-api/search/object with bearer", async () => {
+  const originalFetch = globalThis.fetch;
+  const fetchCalls = [];
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          code: 0,
+          data: {
+            docs_entities: [{ obj_token: "tok_x", title: "DesignDoc" }],
+            has_more: false,
+          },
+        };
+      },
+    };
+  };
+  try {
+    const fakeAccessor = {
+      baseUrl: "https://open.feishu.cn",
+      async invoke(_req, handler) {
+        return { kind: "ok", result: await handler("uat_alice") };
+      },
+    };
+    const channel = stubChannel(async () => ({}), {});
+    const server = new LarkMcpServer({
+      logger: noopLogger,
+      channelResolver: () => ({
+        kind: "ok",
+        channel,
+        chatId: "oc_x",
+        platformUserId: "ou_alice",
+        uatAccessor: fakeAccessor,
+      }),
+    });
+    const reply = captureReply();
+    await initialize(server, reply);
+
+    const before = reply.sent.length;
+    await server.accept(
+      "tunnel-search-doc",
+      encodeJson({
+        jsonrpc: "2.0",
+        id: 90,
+        method: "tools/call",
+        params: { name: "feishu_search_doc", arguments: { query: "design", count: 5 } },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, "search_doc reply");
+
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(
+      fetchCalls[0].url,
+      "https://open.feishu.cn/open-apis/suite/docs-api/search/object",
+    );
+    assert.equal(fetchCalls[0].init.method, "POST");
+    assert.equal(
+      fetchCalls[0].init.headers.Authorization,
+      "Bearer uat_alice",
+    );
+    const body = JSON.parse(fetchCalls[0].init.body);
+    assert.equal(body.search_key, "design");
+    assert.equal(body.count, 5);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {
