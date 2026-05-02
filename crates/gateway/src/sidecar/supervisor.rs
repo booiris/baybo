@@ -30,6 +30,13 @@
 //! own stdout/stderr so running `aura gateway start` in a terminal
 //! still shows every sidecar line live. Sidecar output never enters
 //! `aura.log`.
+//!
+//! The SDK's default logger emits one NDJSON record per call
+//! (`{"level": "...", "msg": "...", "target"?: "..."}`); [`drain_pipe`]
+//! parses each line back into structured `level`/`target`/`msg` fields
+//! so the dashboard sees the SDK-supplied level instead of "stdout
+//! lines = info". A non-JSON line (third-party logger writing plain
+//! text) falls back to the stream's default level.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -307,7 +314,7 @@ impl SidecarSupervisor {
 }
 
 /// Build the per-channel-type daily-rolling appender and wrap it in
-/// the shared leak-detector's redactor. Pushes the `WorkerGuard` into
+/// the leak-detector's redactor. Pushes the `WorkerGuard` into
 /// `guards` so the caller keeps flushing alive for the supervisor's
 /// lifetime. Returns `None` only if the caller should skip the file
 /// sink entirely (currently never — left as a future opt-out).
@@ -338,15 +345,6 @@ enum Stream {
     Stderr,
 }
 
-impl Stream {
-    fn tag(self) -> &'static str {
-        match self {
-            Stream::Stdout => "stdout",
-            Stream::Stderr => "stderr",
-        }
-    }
-}
-
 async fn drain_pipe<R>(
     reader: R,
     buffer: Arc<LogBuffer>,
@@ -354,7 +352,7 @@ async fn drain_pipe<R>(
     channel_type: String,
     target: String,
     stream: Stream,
-    level: LogLevel,
+    default_level: LogLevel,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -376,7 +374,7 @@ async fn drain_pipe<R>(
             Err(e) => {
                 let msg = format!("[aura] sidecar pipe read error: {e}");
                 if let Some(mw) = file_writer.as_ref() {
-                    write_line_to_file(mw, stream.tag(), &msg);
+                    write_line_to_file(mw, LogLevel::Warn, &msg);
                 }
                 tee_to_terminal(stream, &channel_type, &msg);
                 buffer.push_external(LogLevel::Warn, target.clone(), msg);
@@ -393,29 +391,55 @@ async fn drain_pipe<R>(
         }
         let raw = String::from_utf8_lossy(&buf);
         let cap_hit = outcome == LineOutcome::CapHit;
+
+        // Try-parse the line as NDJSON emitted by the SDK's default
+        // logger (`{"level": "...", "msg": "...", "target"?: "..."}`).
+        // Falls back to plain text on any parse failure or schema
+        // mismatch — third-party loggers writing to stdout/stderr
+        // still surface as records, just without level/target
+        // attribution. Cap-hit lines always go the plain-text path
+        // (a partial JSON object isn't valid).
+        let parsed = if cap_hit {
+            None
+        } else {
+            serde_json::from_str::<SidecarLogLine>(&raw).ok()
+        };
+        let (level, msg_text, line_target) = match parsed {
+            Some(p) => (
+                LogLevel::parse(&p.level).unwrap_or(default_level),
+                p.msg,
+                p.target,
+            ),
+            None => (default_level, raw.into_owned(), None),
+        };
+        let log_target = match line_target.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => format!("sidecar::{channel_type}::{t}"),
+            None => target.clone(),
+        };
+
         let suffix = if cap_hit {
             " [...truncated, line exceeded read cap]"
-        } else if raw.len() > SIDECAR_PIPE_LINE_MAX_BYTES {
+        } else if msg_text.len() > SIDECAR_PIPE_LINE_MAX_BYTES {
             " [...truncated]"
         } else {
             ""
         };
-        let cut_at = if raw.len() > SIDECAR_PIPE_LINE_MAX_BYTES {
+        let cut_at = if msg_text.len() > SIDECAR_PIPE_LINE_MAX_BYTES {
             let mut cut = SIDECAR_PIPE_LINE_MAX_BYTES;
-            while cut > 0 && !raw.is_char_boundary(cut) {
+            while cut > 0 && !msg_text.is_char_boundary(cut) {
                 cut -= 1;
             }
             cut
         } else {
-            raw.len()
+            msg_text.len()
         };
-        let mut trimmed = raw[..cut_at].to_owned();
+        let mut trimmed = msg_text[..cut_at].to_owned();
         trimmed.push_str(suffix);
         if let Some(mw) = file_writer.as_ref() {
-            write_line_to_file(mw, stream.tag(), &trimmed);
+            write_line_to_file(mw, level, &trimmed);
         }
         tee_to_terminal(stream, &channel_type, &trimmed);
-        buffer.push_external(level, target.clone(), trimmed);
+        buffer.push_external(level, log_target, trimmed);
 
         // After a cap-hit flush, resync at the next newline so the
         // remainder of the unbounded line isn't emitted as if it
@@ -426,10 +450,18 @@ async fn drain_pipe<R>(
     }
 }
 
-fn write_line_to_file(mw: &ChannelLogWriter, stream_tag: &str, line: &str) {
+#[derive(serde::Deserialize)]
+struct SidecarLogLine {
+    level: String,
+    msg: String,
+    #[serde(default)]
+    target: Option<String>,
+}
+
+fn write_line_to_file(mw: &ChannelLogWriter, level: LogLevel, line: &str) {
     let mut w = mw.make_writer();
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
-    let _ = writeln!(w, "{ts} [{stream_tag}] {line}");
+    let _ = writeln!(w, "{ts} [{}] {line}", level.as_str());
 }
 
 fn tee_to_terminal(stream: Stream, channel_type: &str, line: &str) {
@@ -495,6 +527,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipe_parses_ndjson_into_structured_record() {
+        // NDJSON-formatted line from the SDK: level + msg should
+        // override the stream-default attribution; target field
+        // should land in the LogBuffer entry's target column.
+        let buf = LogBuffer::new(8);
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let drain = tokio::spawn(drain_pipe(
+            reader,
+            Arc::clone(&buf),
+            None,
+            "telegram".to_string(),
+            "sidecar::telegram::stdout".to_string(),
+            Stream::Stdout,
+            LogLevel::Info,
+        ));
+        writer
+            .write_all(b"{\"level\":\"error\",\"msg\":\"send failed\",\"target\":\"polling\"}\n")
+            .await
+            .unwrap();
+        drop(writer);
+        drain.await.unwrap();
+
+        let page = buf.query(&LogQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(page.total, 1);
+        let rec = &page.items[0];
+        assert_eq!(rec.message, "send failed");
+        assert_eq!(rec.level, LogLevel::Error);
+        assert_eq!(rec.target, "sidecar::telegram::polling");
+    }
+
+    #[tokio::test]
+    async fn pipe_falls_back_to_plain_text_on_non_json() {
+        // A third-party logger writing plain text to stdout still
+        // surfaces — just at the stream's default level and with the
+        // caller-supplied target unchanged.
+        let buf = LogBuffer::new(8);
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let drain = tokio::spawn(drain_pipe(
+            reader,
+            Arc::clone(&buf),
+            None,
+            "telegram".to_string(),
+            "sidecar::telegram::stderr".to_string(),
+            Stream::Stderr,
+            LogLevel::Warn,
+        ));
+        writer
+            .write_all(b"plain console.error output\n")
+            .await
+            .unwrap();
+        drop(writer);
+        drain.await.unwrap();
+
+        let page = buf.query(&LogQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(page.total, 1);
+        let rec = &page.items[0];
+        assert_eq!(rec.message, "plain console.error output");
+        assert_eq!(rec.level, LogLevel::Warn);
+        assert_eq!(rec.target, "sidecar::telegram::stderr");
+    }
+
+    #[tokio::test]
+    async fn pipe_writes_ndjson_level_as_file_tag() {
+        // NDJSON `level` should land as the bracketed file tag,
+        // replacing the old `[stdout]/[stderr]` stream marker.
+        let dir = tempfile::tempdir().unwrap();
+        let leak = Arc::new(LeakDetector::with_default_rules());
+        let mut guards = Vec::new();
+        let mw = build_channel_log_writer(dir.path(), "telegram", leak, &mut guards).unwrap();
+
+        let buf = LogBuffer::new(8);
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let drain = tokio::spawn(drain_pipe(
+            reader,
+            Arc::clone(&buf),
+            Some(mw),
+            "telegram".to_string(),
+            "sidecar::telegram::stdout".to_string(),
+            Stream::Stdout,
+            LogLevel::Info,
+        ));
+        writer
+            .write_all(b"{\"level\":\"error\",\"msg\":\"send failed\"}\n")
+            .await
+            .unwrap();
+        drop(writer);
+        drain.await.unwrap();
+        drop(guards);
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        let contents = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(contents.contains("[error] send failed"), "got: {contents}");
+        assert!(!contents.contains("[stdout]"));
+    }
+
+    #[tokio::test]
     async fn pipe_writes_redacted_lines_to_per_channel_file() {
         let dir = tempfile::tempdir().unwrap();
         let leak = Arc::new(LeakDetector::with_default_rules());
@@ -526,7 +663,8 @@ mod tests {
         let name = entries[0].file_name().into_string().unwrap();
         assert!(name.starts_with("telegram.log."), "got {name}");
         let contents = std::fs::read_to_string(entries[0].path()).unwrap();
-        assert!(contents.contains("[stdout]"));
+        // Stream-default level is the file tag for plain-text input.
+        assert!(contents.contains("[info]"));
         assert!(!contents.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(contents.contains("[{REDACTED_LOG_aws_access_key}]"));
     }

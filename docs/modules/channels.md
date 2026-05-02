@@ -115,11 +115,16 @@ transport, `Register`/`Ack` handshake, loopback-TCP dial, frame
 dispatch, concurrent approval spawning, and auto-reconnect with
 exponential backoff + jitter on transient drops (disable with
 `reconnect: false`).
-The SDK-provided default logger also forwards its own output as
-`Frame::SidecarLog` frames while the WS is open — the gateway pushes
-them into the same `LogBuffer` that backs `/v1/logs`, so sidecar lines
-surface in the dashboard alongside gateway-internal tracing. Custom
-loggers (pino / winston) stay local; attribution uses
+The SDK-provided default logger emits one NDJSON record per call
+(`{"level": "...", "msg": "..."}`) to `process.stdout` (debug/info)
+or `process.stderr` (warn/error). When the sidecar runs under
+[`SidecarSupervisor`] (the in-tree path), the gateway's per-channel
+pipe drain parses each line back into structured records and pushes
+them into the same `LogBuffer` that backs `/v1/logs` plus the
+per-channel file at `<channel_log_dir>/<channel_type>.log.<date>` —
+single write path, no parallel WS sink. A non-JSON line (third-party
+logger, console.log) falls back to a plain text record at info
+(stdout) or warn (stderr). Attribution uses
 `sidecar::<channel_type>[::<target>]`.
 The channel WebSocket URL + token are read from `AURA_CHANNEL_URL`
 / `AURA_CHANNEL_TOKEN` env vars. `ChannelSpawner`
@@ -141,6 +146,31 @@ children are SIGKILLed and awaited. Bringing up a custom sidecar
 out-of-tree is still possible: export the two env vars yourself (or
 pass `wsUrl` / `token` to `runChannel`) and run the process however
 you like.
+
+**Out-of-tree sidecars and observability.** A sidecar started by an
+external process manager (systemd, docker, foreman, …) speaks the
+same `/v1/channel-ws` protocol — the WS frame stream, blob HTTP
+side-channel, and `Register`/`Ack` handshake all work unchanged —
+but the gateway is **not** the parent process and therefore does
+not drain its stdout/stderr. The default logger's NDJSON records
+land wherever that process manager captures them (`journalctl`,
+`docker logs`, the wrapping shell), **not** in `LogBuffer` or the
+per-channel file. The gateway's `/v1/logs` view will show only
+gateway-internal tracing for that channel; the sidecar's runtime
+errors are visible only through whatever sink the operator
+configured for the child process.
+This is an intentional simplification of the previous design — a
+parallel `Frame::SidecarLog` sink mirrored every log line over the
+WS so out-of-tree sidecars also surfaced in `LogBuffer`, but it
+created two write paths that drifted (one bug let the file logger
+silently miss every post-handshake line) and added a synchronisation
+invariant (`if sink != null skip console`) that was easy to
+violate. If you need gateway-side log visibility for an externally
+managed sidecar today, route its stdout/stderr into the gateway by
+adopting one of the supervisor patterns: run it as a child of the
+gateway via [`SidecarSupervisor`], or pipe its stdout into a small
+forwarder that connects to `/v1/logs`'s admin endpoint. There is no
+SDK-level shortcut.
 
 **Embedded sidecar toolchain.** `crates/gateway/build.rs` runs
 `pnpm --filter <pkg> bundle` for each `channel-src/*` package; the

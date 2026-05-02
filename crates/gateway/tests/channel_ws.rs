@@ -295,7 +295,6 @@ async fn recv_message(ws: &mut WsStream) -> Result<WireMessage, ConnectError> {
             | Frame::RegisterAck { .. }
             | Frame::ResolveApproval { .. }
             | Frame::HistoryAppend { .. }
-            | Frame::SidecarLog { .. }
             | Frame::BotStatus { .. } => {
                 return Err(ConnectError::ProtocolViolation(
                     "unexpected frame kind post-handshake",
@@ -328,7 +327,6 @@ async fn recv_notice(ws: &mut WsStream) -> Result<(String, String, String), Conn
             | Frame::RegisterAck { .. }
             | Frame::ResolveApproval { .. }
             | Frame::HistoryAppend { .. }
-            | Frame::SidecarLog { .. }
             | Frame::BotStatus { .. } => {
                 return Err(ConnectError::ProtocolViolation(
                     "unexpected frame kind post-handshake",

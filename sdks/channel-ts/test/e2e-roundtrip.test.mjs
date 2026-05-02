@@ -30,7 +30,6 @@ function startFixture() {
     register: null,
     outboundMessage: null,
     resolveApproval: null,
-    sidecarLogs: [],
   };
   const done = new Promise((resolve) => {
     wss.on("connection", (ws) => {
@@ -98,10 +97,6 @@ function startFixture() {
           }
           case "resolve_approval": {
             recorded.resolveApproval = frame;
-            break;
-          }
-          case "sidecar_log": {
-            recorded.sidecarLogs.push(frame);
             break;
           }
           default: {
@@ -195,11 +190,14 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   // settle before we inspect.
   await new Promise((r) => setTimeout(r, 50));
 
-  // Emit a log line through the SDK's default logger. The runner
-  // should have installed the wire sink, so this becomes a SidecarLog
-  // frame on the server side.
-  logger.info("hello from stub");
-  await new Promise((r) => setTimeout(r, 30));
+  // Emit a log line through the SDK's default logger. The default
+  // logger writes one NDJSON record per call to stdout (info/debug)
+  // or stderr (warn/error); the gateway's pipe drain parses them
+  // back into structured log records. Capture stdout to assert the
+  // line lands there in the expected shape.
+  const stdoutLines = captureStdout(() => {
+    logger.info("hello from stub");
+  });
 
   controller.abort();
   await done;
@@ -258,13 +256,50 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
     "approve_always round-trips back to the server intact",
   );
 
-  // ---- SidecarLog forwarding -------------------------------------
-  const helloLog = fixture.recorded.sidecarLogs.find((l) =>
-    l.text.includes("hello from stub"),
-  );
-  assert.ok(helloLog, "logger.info forwarded as SidecarLog");
+  // ---- Default-logger NDJSON on stdout -------------------------------
+  const helloLog = stdoutLines
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .find((rec) => rec && rec.msg && rec.msg.includes("hello from stub"));
+  assert.ok(helloLog, "logger.info wrote NDJSON to stdout");
   assert.equal(helloLog.level, "info");
 });
+
+/**
+ * Monkey-patch `process.stdout.write` for the duration of `fn`,
+ * collecting every newline-terminated UTF-8 line written through it.
+ * Returns the captured lines in order. Restores the original `write`
+ * before returning even if `fn` throws.
+ */
+function captureStdout(fn) {
+  const original = process.stdout.write.bind(process.stdout);
+  const lines = [];
+  let pending = "";
+  process.stdout.write = (chunk, ...rest) => {
+    const text =
+      typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    pending += text;
+    let nl = pending.indexOf("\n");
+    while (nl >= 0) {
+      lines.push(pending.slice(0, nl));
+      pending = pending.slice(nl + 1);
+      nl = pending.indexOf("\n");
+    }
+    return original(chunk, ...rest);
+  };
+  try {
+    fn();
+  } finally {
+    process.stdout.write = original;
+  }
+  if (pending.length > 0) lines.push(pending);
+  return lines;
+}
 
 test("runChannel register_ack=false is treated as a fatal config failure", async () => {
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });

@@ -19,13 +19,8 @@ export type {
   StopBotCommand,
   UserInbound,
 } from "./channel.js";
-export { defaultLogger, hasWireSink } from "./logger.js";
-export type {
-  Logger,
-  WireCapableLogger,
-  WireLogLevel,
-  WireLogSink,
-} from "./logger.js";
+export { defaultLogger } from "./logger.js";
+export type { Logger, LogLevel } from "./logger.js";
 export type {
   AttachmentKind,
   ResourceAccess,

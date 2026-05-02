@@ -1,3 +1,19 @@
+/**
+ * Per-line byte cap. A sidecar stuck in a hot loop logging huge blobs
+ * could otherwise fill the gateway's log file with noise. Mirrored on
+ * the Rust side; whichever end sees the line first trims it.
+ */
+const MAX_LINE_BYTES = 1024;
+
+/**
+ * Rate-limit window + budget. A sidecar burst above `MAX_LINES_PER_WINDOW`
+ * lines in any `WINDOW_MS` drops the overflow and emits one summary line
+ * per window — the WS pump keeps running and the gateway's log file
+ * stays readable.
+ */
+const WINDOW_MS = 1000;
+const MAX_LINES_PER_WINDOW = 100;
+
 export interface Logger {
   debug(msg: string, ...args: unknown[]): void;
   info(msg: string, ...args: unknown[]): void;
@@ -5,66 +21,43 @@ export interface Logger {
   error(msg: string, ...args: unknown[]): void;
 }
 
-export type WireLogLevel = "debug" | "info" | "warn" | "error";
+export type LogLevel = "debug" | "info" | "warn" | "error";
 
 /**
- * Callback the runner hands to the default logger once a WebSocket is
- * up. Receives one already-formatted log line plus its level; the runner
- * encodes a `SidecarLog` frame and writes it to the wire.
+ * Default sidecar logger. Emits one NDJSON record per call to
+ * `process.stdout` (debug/info) or `process.stderr` (warn/error).
+ * When the sidecar runs as a child of the gateway's `SidecarSupervisor`
+ * (the in-tree path), the gateway's per-channel pipe drain parses each
+ * line back into structured fields (`level`, `target`, `msg`) and
+ * forwards them into `LogBuffer` (admin `/v1/logs`) plus the
+ * per-channel file. A non-JSON line falls back to a plain text record
+ * at info/warn (depending on which stream it came in on).
+ *
+ * **Out-of-tree note.** A sidecar started under a non-gateway parent
+ * (systemd, docker, foreman, …) speaks the same WS protocol but the
+ * gateway never sees its stdout/stderr — the records land wherever
+ * the host process manager captures them (`journalctl`, `docker logs`,
+ * the wrapping shell), not in `/v1/logs`. There is no SDK-level
+ * shortcut to forward them over the WS; see `docs/modules/channels.md`
+ * "Out-of-tree sidecars and observability" for the operator workarounds.
+ *
+ * The `target` field is reserved for future per-component attribution;
+ * the default logger never sets it. A custom logger that wants to tag
+ * sub-components can produce its own NDJSON with `{level, target, msg}`.
  */
-export type WireLogSink = (level: WireLogLevel, text: string) => void;
-
-/**
- * Default-logger extension point used by {@link runChannel}. Third-party
- * loggers (pino / winston / etc.) don't implement this method, and the
- * runner leaves them alone — they remain stdout-only.
- */
-export interface WireCapableLogger extends Logger {
-  setWireSink(send: WireLogSink | null): void;
-}
-
-export function hasWireSink(logger: Logger): logger is WireCapableLogger {
-  return (
-    typeof (logger as Partial<WireCapableLogger>).setWireSink === "function"
-  );
-}
-
-/**
- * Per-line byte cap. A sidecar stuck in a hot loop logging huge blobs
- * could otherwise fill the admin LogBuffer with noise. Mirrored on the
- * Rust side; whichever end sees the line first trims it.
- */
-const MAX_LINE_BYTES = 1024;
-
-/**
- * Rate-limit window + budget. A sidecar burst above `MAX_LINES_PER_WINDOW`
- * lines in any `WINDOW_MS` drops the overflow and emits one summary line
- * per window — the WS pump keeps running and the dashboard stays
- * readable.
- */
-const WINDOW_MS = 1000;
-const MAX_LINES_PER_WINDOW = 100;
-
-export function defaultLogger(_channelType: string): WireCapableLogger {
-  let sink: WireLogSink | null = null;
+export function defaultLogger(_channelType: string): Logger {
   let windowStart = 0;
   let windowCount = 0;
   let droppedInWindow = 0;
 
-  const forward = (level: WireLogLevel, text: string): void => {
-    if (!sink) return;
+  const emit = (level: LogLevel, msg: string): void => {
     const now = Date.now();
     if (now - windowStart > WINDOW_MS) {
       if (droppedInWindow > 0) {
-        try {
-          sink(
-            "warn",
-            `[aura-sdk] dropped ${droppedInWindow} log lines (rate cap ${MAX_LINES_PER_WINDOW}/${WINDOW_MS}ms)`,
-          );
-        } catch {
-          // sink failures are transient; swallow so the logger itself
-          // never throws into the caller's code path
-        }
+        writeNdjson(
+          "warn",
+          `[aura-sdk] dropped ${droppedInWindow} log lines (rate cap ${MAX_LINES_PER_WINDOW}/${WINDOW_MS}ms)`,
+        );
         droppedInWindow = 0;
       }
       windowStart = now;
@@ -75,57 +68,45 @@ export function defaultLogger(_channelType: string): WireCapableLogger {
       return;
     }
     windowCount += 1;
-    const line = truncate(text, MAX_LINE_BYTES);
-    try {
-      sink(level, line);
-    } catch {
-      // swallow — runner loop will surface real transport errors
-    }
+    writeNdjson(level, truncate(msg, MAX_LINE_BYTES));
   };
 
-  // With a wire sink attached, the gateway also pipes the child's
-  // stdout/stderr into the same LogBuffer — console writes here would
-  // double-log. Fall back to console only when no sink is set.
   return {
     debug(msg, ...args) {
-      const text = formatLine(msg, args);
-      if (sink) {
-        forward("debug", text);
-      }
+      emit("debug", formatLine(msg, args));
     },
     info(msg, ...args) {
-      const text = formatLine(msg, args);
-      if (sink) {
-        forward("info", text);
-      } else {
-        console.log(text);
-      }
+      emit("info", formatLine(msg, args));
     },
     warn(msg, ...args) {
-      const text = formatLine(msg, args);
-      if (sink) {
-        forward("warn", text);
-      } else {
-        console.warn(text);
-      }
+      emit("warn", formatLine(msg, args));
     },
     error(msg, ...args) {
-      const text = formatLine(msg, args);
-      if (sink) {
-        forward("error", text);
-      } else {
-        console.error(text);
-      }
-    },
-    setWireSink(next) {
-      sink = next;
-      // reset the rate-limit window so a reconnect doesn't inherit a
-      // partially-spent budget from the prior connection
-      windowStart = 0;
-      windowCount = 0;
-      droppedInWindow = 0;
+      emit("error", formatLine(msg, args));
     },
   };
+}
+
+/**
+ * Write one NDJSON record. warn/error go to stderr so they preserve
+ * unix conventions — a plain `node bundle.mjs 2>err.log` still pulls
+ * out only the loud lines. Falls back to no-op on serialise failure
+ * so the logger itself never throws into the caller.
+ */
+function writeNdjson(level: LogLevel, msg: string): void {
+  let line: string;
+  try {
+    line = `${JSON.stringify({ level, msg })}\n`;
+  } catch {
+    return;
+  }
+  const stream =
+    level === "warn" || level === "error" ? process.stderr : process.stdout;
+  try {
+    stream.write(line);
+  } catch {
+    // EPIPE / closed stream — nothing useful to do from inside a logger
+  }
 }
 
 function formatLine(msg: string, args: unknown[]): string {
