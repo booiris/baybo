@@ -339,7 +339,35 @@ export function defaultChatKey(chat: unknown): string {
   }
   const obj = chat as Record<string, unknown>;
   const keys = Object.keys(obj).sort();
-  return keys.map((k) => `${k}=${String(obj[k])}`).join("&");
+  return keys.map((k) => `${k}=${chatValueToString(obj[k])}`).join("&");
+}
+
+// `String(v)` on a nested object yields `[object Object]`, which would
+// silently collide every chat into one routing bucket. The contract
+// (see BotPlatform docs) is "primitives or plain objects of
+// primitives" — but no runtime check enforces it, so a future
+// platform passing a nested object would otherwise produce a
+// platform-wide session collision before anyone noticed. Fall back
+// to JSON.stringify so each distinct nested value at least gets a
+// distinct key. Note: JSON.stringify isn't key-order-stable for
+// nested objects, so off-contract shapes still risk discriminating
+// `{a:{x:1,y:2}}` vs `{a:{y:2,x:1}}` — that's strictly better than
+// silent total collision and the contract still says "don't do that."
+function chatValueToString(v: unknown): string {
+  if (v === null || typeof v !== "object") return String(v);
+  return JSON.stringify(v);
+}
+
+/** Render an attachment list as `count=N size=B mime=X` (singular when
+ * `count==1`) / `mimes=X,Y` (plural with dedup) — the SDK's per-event
+ * inbound/outbound logs use this so the operator sees the high-level
+ * shape without each attachment getting its own line. */
+function formatAttachments(atts: ReadonlyArray<WireAttachment>): string {
+  const totalSize = atts.reduce((s, a) => s + a.size, 0);
+  const mimes = [...new Set(atts.map((a) => a.mime_type))];
+  const mimeStr =
+    mimes.length === 1 ? `mime=${mimes[0]}` : `mimes=${mimes.join(",")}`;
+  return `count=${atts.length} size=${totalSize} ${mimeStr}`;
 }
 
 /**
@@ -529,26 +557,33 @@ export class BotChannel<BotHandle, ChatId>
       );
       return;
     }
-    const hasMedia = msg.attachments !== undefined && msg.attachments.length > 0;
+    const sendMediaPath =
+      msg.attachments !== undefined
+      && msg.attachments.length > 0
+      && this.platform.sendMedia !== undefined;
+    this.logOutbound(route.botId, route.chat, msg, sendMediaPath);
     try {
-      if (hasMedia && this.platform.sendMedia) {
-        await this.platform.sendMedia(route.handle, route.chat, {
+      if (sendMediaPath) {
+        await this.platform.sendMedia!(route.handle, route.chat, {
           text: msg.content,
           attachments: msg.attachments!,
         });
       } else {
-        if (hasMedia) {
+        if (msg.attachments !== undefined && msg.attachments.length > 0) {
           // Platform doesn't implement sendMedia — surface this loudly
           // because the user's reply just lost its non-text payload.
           // The text part still ships so the conversation isn't broken.
           this.logger.warn(
-            `dropping ${msg.attachments!.length} attachment(s) — platform does not implement sendMedia`,
+            `dropping ${msg.attachments.length} attachment(s) — platform does not implement sendMedia`,
           );
         }
         await this.platform.sendText(route.handle, route.chat, msg.content);
       }
     } catch (err) {
-      this.logger.error(hasMedia ? "sendMedia failed" : "sendText failed", err);
+      this.logger.error(
+        sendMediaPath ? "sendMedia failed" : "sendText failed",
+        err,
+      );
     }
   }
 
@@ -640,6 +675,10 @@ export class BotChannel<BotHandle, ChatId>
       );
     }
     await this.publishSlashCommands(cmd.botId, out.handle);
+    this.logger.info(
+      `bot started channel=${this.channelType} bot=${cmd.botId}` +
+        (out.username ? ` username=${out.username}` : ""),
+    );
     return {
       botId: cmd.botId,
       ok: true,
@@ -706,6 +745,9 @@ export class BotChannel<BotHandle, ChatId>
         message: `stop failed: ${message}`,
       };
     }
+    this.logger.info(
+      `bot stopped channel=${this.channelType} bot=${cmd.botId}`,
+    );
     return { botId: cmd.botId, ok: true };
   }
 
@@ -767,6 +809,7 @@ export class BotChannel<BotHandle, ChatId>
     );
     this.chatByUser.set(userId, ev.chat);
     this.botByUser.set(userId, botId);
+    this.logInbound(botId, ev);
     this.startOrRefreshTyping(userId, botId, ev.chat);
     this.pushInbound({
       sessionId: "",
@@ -778,6 +821,49 @@ export class BotChannel<BotHandle, ChatId>
         ? { attachments: ev.attachments }
         : {}),
     });
+  }
+
+  /** Render a chat using the platform's `chatKey` if defined,
+   * otherwise fall through to {@link defaultChatKey}. Same identity
+   * `composeAuraUserId` keys on, so a log line's `chat=` token matches
+   * the chat-portion of the `user=` (Aura user id) it appears with. */
+  private renderChat(chat: ChatId): string {
+    return this.platform.chatKey
+      ? this.platform.chatKey.call(this.platform, chat)
+      : defaultChatKey(chat);
+  }
+
+  private logInbound(botId: string, ev: BotInboundEvent<ChatId>): void {
+    const base =
+      `channel=${this.channelType} bot=${botId}` +
+      ` chat=${this.renderChat(ev.chat)} user=${ev.platformUserId}`;
+    if (ev.attachments && ev.attachments.length > 0) {
+      const textPart = ev.content ? ` text_len=${ev.content.length}` : "";
+      this.logger.info(
+        `inbound media ${base} ${formatAttachments(ev.attachments)}${textPart}`,
+      );
+    } else {
+      this.logger.info(`inbound text ${base} len=${ev.content.length}`);
+    }
+  }
+
+  private logOutbound(
+    botId: string,
+    chat: ChatId,
+    msg: AgentMessage,
+    sendMediaPath: boolean,
+  ): void {
+    const base =
+      `channel=${this.channelType} bot=${botId}` +
+      ` chat=${this.renderChat(chat)}`;
+    if (sendMediaPath && msg.attachments) {
+      const textPart = msg.content ? ` text_len=${msg.content.length}` : "";
+      this.logger.info(
+        `outbound media ${base} ${formatAttachments(msg.attachments)}${textPart}`,
+      );
+    } else {
+      this.logger.info(`outbound text ${base} len=${msg.content.length}`);
+    }
   }
 
   private startOrRefreshTyping(

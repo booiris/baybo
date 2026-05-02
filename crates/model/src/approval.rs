@@ -14,11 +14,26 @@ use serde::{Deserialize, Serialize};
 /// Concrete resource a single tool call touches, derived from its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
 pub enum ResourceAccess {
-    ReadFile { path: PathBuf },
-    WriteFile { path: PathBuf },
-    Http { host: String },
-    ExecCommand { command: String },
+    ReadFile {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        path: PathBuf,
+    },
+    WriteFile {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        path: PathBuf,
+    },
+    Http {
+        host: String,
+    },
+    ExecCommand {
+        command: String,
+    },
 }
 
 impl ResourceAccess {

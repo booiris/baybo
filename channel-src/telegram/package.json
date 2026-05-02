@@ -7,6 +7,9 @@
   "bin": {
     "aura-channel-telegram": "./dist/index.js"
   },
+  "aura": {
+    "domain": "channel"
+  },
   "scripts": {
     "build": "tsc",
     "bundle": "bun build src/index.ts --target=bun --minify --outfile=dist/bundle.mjs",

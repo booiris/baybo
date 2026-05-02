@@ -339,8 +339,19 @@ fn list_dir_entries(dir: &Path) -> Vec<PathBuf> {
 /// output is cached for unchanged sidecar inputs and the binary ships
 /// to every user, paying the build-time cost is the right tradeoff.
 const ZSTD_LEVEL: i32 = 19;
-const SIDECAR_CACHE_SCHEMA_VERSION: &str = "3";
+const SIDECAR_CACHE_SCHEMA_VERSION: &str = "5";
 
+/// Each sidecar self-declares its **domain** — the business surface
+/// it belongs to (`channel` for Telegram/WeChat/TUI, `browser` for
+/// the Playwright tool, future domains for code-exec, db, …) — via
+/// its `package.json`'s `aura.domain` field. The runtime exposes
+/// per-domain iteration so `aura channel list/add` only sees the
+/// `channel` domain, the browser supervisor only sees `browser`,
+/// and adding a future domain doesn't touch any of those code
+/// paths.
+///
+/// Domain is a free string at the build/runtime layer; constants
+/// for the known ones live in `aura_gateway::sidecar::domains`.
 struct AuxAsset {
     name: String,
     src: PathBuf,
@@ -348,6 +359,7 @@ struct AuxAsset {
 
 struct BuiltSidecar {
     name: String,
+    domain: String,
     bundle_path: PathBuf,
     content_hash: String,
     aux_assets: Vec<AuxAsset>,
@@ -360,6 +372,7 @@ struct EmittedAuxAsset {
 
 struct EmittedSidecar {
     name: String,
+    domain: String,
     bundle_zst: PathBuf,
     content_hash: String,
     aux_assets: Vec<EmittedAuxAsset>,
@@ -372,9 +385,29 @@ fn embed_sidecars(ws_root: &Path) {
 
     println!("cargo:rerun-if-env-changed={STRICT_SIDECARS_ENV}");
 
-    // `channel-src/` holds one directory per in-tree sidecar.
-    let sidecars_dir = ws_root.join("channel-src");
-    let sidecar_dirs = list_sidecar_dirs(&sidecars_dir);
+    // `channel-src/` holds channel sidecars, `tool-src/` holds tool
+    // sidecars (browser, …). Both are bundled the same way and emit
+    // into the same asset table; the `name` field (= directory name)
+    // is the unique identifier used by `SidecarRuntime::bundle_for`.
+    // Collisions across pools are a build-time error.
+    // Discovery is now agnostic about which top-level directory a
+    // sidecar lives in. Each `package.json` self-declares its
+    // domain via `aura.domain`; the directory layout is just file-
+    // system organisation. Adding a third `<x>-src/` is one line
+    // here.
+    let mut sidecar_dirs: Vec<PathBuf> = Vec::new();
+    sidecar_dirs.extend(list_sidecar_dirs(&ws_root.join("channel-src")));
+    sidecar_dirs.extend(list_sidecar_dirs(&ws_root.join("tool-src")));
+    sidecar_dirs.sort();
+    if let Some(dup) = first_duplicate_dir_name(&sidecar_dirs) {
+        let msg = format!(
+            "duplicate sidecar directory name `{dup}` across sidecar source dirs; \
+             names must be unique because they key the embedded asset table"
+        );
+        sidecar_failure(strict, &msg);
+        write_empty_sidecar_assets(&generated);
+        return;
+    }
     let cache_root = ws_root.join("target").join("sidecar-cache");
     let input_fingerprint = match sidecar_input_fingerprint(ws_root, &sidecar_dirs) {
         Ok(fingerprint) => fingerprint,
@@ -416,13 +449,19 @@ fn embed_sidecars(ws_root: &Path) {
     let mut bundling_failures = 0usize;
     for dir in &sidecar_dirs {
         let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-        let entry_ts = dir.join("src/index.ts");
-        if !entry_ts.exists() {
-            println!("cargo:warning=sidecar '{name}' has no src/index.ts; skipping",);
+        // Channel sidecars name their entry `src/index.ts`; the browser
+        // tool sidecar (an embedded MCP server) uses `src/server.ts`
+        // since it has a different lifecycle. Either is fine.
+        let entry_index = dir.join("src/index.ts");
+        let entry_server = dir.join("src/server.ts");
+        if !entry_index.exists() && !entry_server.exists() {
+            println!(
+                "cargo:warning=sidecar '{name}' has neither src/index.ts nor src/server.ts; skipping",
+            );
             continue;
         }
-        let pkg_name = match read_package_name(&dir.join("package.json")) {
-            Ok(n) => n,
+        let (pkg_name, domain) = match read_package_meta(&dir.join("package.json")) {
+            Ok(m) => m,
             Err(e) => {
                 bundling_failures += 1;
                 let msg = format!("read sidecar '{name}' package.json failed: {e}");
@@ -479,6 +518,7 @@ fn embed_sidecars(ws_root: &Path) {
         };
         entries.push(BuiltSidecar {
             name: name.to_string(),
+            domain: domain.clone(),
             bundle_path,
             content_hash: hash,
             aux_assets,
@@ -527,16 +567,34 @@ fn embed_sidecars(ws_root: &Path) {
         }
         emitted.push(EmittedSidecar {
             name: entry.name.clone(),
+            domain: entry.domain.clone(),
             bundle_zst: zst_path,
             content_hash: entry.content_hash.clone(),
             aux_assets,
         });
     }
 
-    if emitted.len() == entries.len()
-        && let Err(e) = write_sidecar_cache_manifest(&cache_dir, &emitted)
-    {
-        println!("cargo:warning=write sidecar cache manifest failed: {e}");
+    // Only cache when *every* sidecar bundled + emitted cleanly. A
+    // partial-success cache poisons subsequent builds: the input
+    // fingerprint matches but the cached manifest is missing whichever
+    // sidecars failed (e.g. when a previous `pnpm` invocation hit a
+    // sandbox / network glitch), and the early-return at line ~428
+    // hands out the corrupt cache without ever retrying. Better to
+    // skip the cache write so the next build re-attempts bundling
+    // from scratch.
+    let all_bundled = bundling_failures == 0 && emitted.len() == entries.len();
+    if all_bundled {
+        if let Err(e) = write_sidecar_cache_manifest(&cache_dir, &emitted) {
+            println!("cargo:warning=write sidecar cache manifest failed: {e}");
+        }
+    } else {
+        println!(
+            "cargo:warning=skipping sidecar cache write \
+             ({bundling_failures} bundling failure(s); \
+             {} compressed of {} entries) — next build will retry from scratch",
+            emitted.len(),
+            entries.len(),
+        );
     }
 
     emit_sidecar_assets(&generated, &emitted);
@@ -578,11 +636,32 @@ fn list_sidecar_dirs(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Detect the first directory name that appears in more than one sidecar
+/// pool (`channel-src/` + `tool-src/`). Returns `None` when names are
+/// unique. The asset table keys on the directory name, so collisions
+/// would silently shadow each other at materialise time.
+fn first_duplicate_dir_name(dirs: &[PathBuf]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    for dir in dirs {
+        let Some(name) = dir.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !seen.insert(name.to_string()) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 fn sidecar_input_fingerprint(ws_root: &Path, sidecar_dirs: &[PathBuf]) -> Result<String, String> {
     let input_roots = sidecar_input_roots(ws_root, sidecar_dirs);
     println!(
         "cargo:rerun-if-changed={}",
         ws_root.join("channel-src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        ws_root.join("tool-src").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -684,16 +763,44 @@ fn hash_path_state(hasher: &mut sha2::Sha256, ws_root: &Path, path: &Path) -> Re
     Ok(())
 }
 
-fn read_package_name(package_json: &Path) -> Result<String, String> {
+/// Read both the npm package name and the Aura `domain` field from
+/// a sidecar's `package.json`. Domain is mandatory — a missing
+/// `aura.domain` is a build-time error so a new sidecar can't
+/// silently default into the wrong family.
+fn read_package_meta(package_json: &Path) -> Result<(String, String), String> {
     let raw = fs::read_to_string(package_json)
         .map_err(|e| format!("read {}: {e}", package_json.display()))?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", package_json.display()))?;
-    value
+    let name = value
         .get("name")
         .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| format!("{} has no string `name`", package_json.display()))
+        .ok_or_else(|| format!("{} has no string `name`", package_json.display()))?
+        .to_owned();
+    let domain = value
+        .get("aura")
+        .and_then(|v| v.get("domain"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "{} has no string `aura.domain` (sidecars must declare a domain like \
+                 `\"aura\": {{ \"domain\": \"channel\" }}` so the runtime can iterate \
+                 them per-family)",
+                package_json.display()
+            )
+        })?
+        .to_owned();
+    if domain.is_empty()
+        || !domain
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+    {
+        return Err(format!(
+            "{} has invalid `aura.domain` `{domain}` — must match [a-z0-9_]+",
+            package_json.display()
+        ));
+    }
+    Ok((name, domain))
 }
 
 /// Run `pnpm --filter <pkg> bundle` inside the workspace. The script
@@ -772,7 +879,10 @@ fn sidecar_aux_assets(dir: &Path) -> Result<Vec<AuxAsset>, String> {
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "aura.auxAssets entries require string `name`".to_string())?;
-        validate_aux_name(name)?;
+        let recursive = asset
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let src_path = dir.join(src);
         if !src_path.exists() {
             return Err(format!(
@@ -780,12 +890,63 @@ fn sidecar_aux_assets(dir: &Path) -> Result<Vec<AuxAsset>, String> {
                 src_path.display()
             ));
         }
-        out.push(AuxAsset {
-            name: name.to_string(),
-            src: src_path,
-        });
+        if recursive {
+            // Directory-tree variant: walk every file under `src` and
+            // emit one AuxAsset per file named `<name>/<relative path>`.
+            // Used by the browser sidecar to ship chrome-devtools-mcp's
+            // 280+ pre-bundled JS files without enumerating each one
+            // by hand in package.json.
+            if !src_path.is_dir() {
+                return Err(format!(
+                    "aux asset '{name}' has recursive=true but src '{}' is not a directory",
+                    src_path.display()
+                ));
+            }
+            collect_recursive_aux(&src_path, &src_path, name, &mut out)?;
+        } else {
+            validate_aux_name(name)?;
+            out.push(AuxAsset {
+                name: name.to_string(),
+                src: src_path,
+            });
+        }
     }
     Ok(out)
+}
+
+fn collect_recursive_aux(
+    root: &Path,
+    cur: &Path,
+    name_prefix: &str,
+    out: &mut Vec<AuxAsset>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(cur).map_err(|e| format!("read aux dir {}: {e}", cur.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("read aux dir entry under {}: {e}", cur.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("stat aux dir entry {}: {e}", path.display()))?;
+        if file_type.is_dir() {
+            collect_recursive_aux(root, &path, name_prefix, out)?;
+        } else if file_type.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| format!("aux dir relative path for {}: {e}", path.display()))?;
+            let rel_str = rel
+                .to_str()
+                .ok_or_else(|| format!("aux dir entry {} has non-UTF-8 path", path.display()))?
+                .replace('\\', "/");
+            let aux_name = format!("{name_prefix}/{rel_str}");
+            validate_aux_name(&aux_name)?;
+            out.push(AuxAsset {
+                name: aux_name,
+                src: path,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_aux_name(name: &str) -> Result<(), String> {
@@ -856,7 +1017,8 @@ fn emit_sidecar_assets(generated: &Path, sidecars: &[EmittedSidecar]) {
     writeln!(
         out,
         "pub(crate) struct SidecarAsset {{ \
-         pub channel_type: &'static str, \
+         pub name: &'static str, \
+         pub domain: &'static str, \
          pub bundle_zst: &'static [u8], \
          pub content_hash: &'static str, \
          pub aux_assets: &'static [SidecarAuxAsset] \
@@ -867,8 +1029,8 @@ fn emit_sidecar_assets(generated: &Path, sidecars: &[EmittedSidecar]) {
     for sidecar in sidecars {
         writeln!(
             out,
-            "    SidecarAsset {{ channel_type: {:?}, bundle_zst: include_bytes!({:?}), content_hash: {:?}, aux_assets: &[",
-            sidecar.name, sidecar.bundle_zst, sidecar.content_hash,
+            "    SidecarAsset {{ name: {:?}, domain: {:?}, bundle_zst: include_bytes!({:?}), content_hash: {:?}, aux_assets: &[",
+            sidecar.name, sidecar.domain, sidecar.bundle_zst, sidecar.content_hash,
         )
         .unwrap();
         for aux in &sidecar.aux_assets {
@@ -903,8 +1065,9 @@ fn load_sidecar_cache(cache_dir: &Path) -> Result<Option<Vec<EmittedSidecar>>, S
         match kind {
             "sidecar" => {
                 let name = parts.next().unwrap_or_default();
+                let domain = parts.next().unwrap_or_default();
                 let hash = parts.next().unwrap_or_default();
-                if name.is_empty() || hash.is_empty() {
+                if name.is_empty() || domain.is_empty() || hash.is_empty() {
                     return Err(format!(
                         "invalid sidecar cache manifest entry in {}",
                         manifest.display()
@@ -918,6 +1081,7 @@ fn load_sidecar_cache(cache_dir: &Path) -> Result<Option<Vec<EmittedSidecar>>, S
                     name.to_string(),
                     EmittedSidecar {
                         name: name.to_string(),
+                        domain: domain.to_string(),
                         bundle_zst: zst_path,
                         content_hash: hash.to_string(),
                         aux_assets: Vec::new(),
@@ -965,8 +1129,8 @@ fn write_sidecar_cache_manifest(
     let mut out = String::new();
     for sidecar in sidecars {
         out.push_str(&format!(
-            "sidecar\t{}\t{}\n",
-            sidecar.name, sidecar.content_hash
+            "sidecar\t{}\t{}\t{}\n",
+            sidecar.name, sidecar.domain, sidecar.content_hash
         ));
         for aux in &sidecar.aux_assets {
             let zst_name = aux

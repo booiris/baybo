@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
 
-import type { ApprovalDecision, ApprovalRequest, Logger } from "@aura/channel-sdk";
+import type {
+  ApprovalDecision,
+  ApprovalRequest,
+  Logger,
+  ResourceAccess,
+} from "@aura/channel-sdk";
 import type {
   BotRoute,
   PlatformApprovals,
@@ -67,6 +72,19 @@ function formatParamsPreview(raw: string): string {
     return JSON.stringify(parsed, null, 2);
   } catch {
     return trimmed;
+  }
+}
+
+function formatAccess(acc: ResourceAccess): string {
+  switch (acc.kind) {
+    case "read_file":
+      return `read ${acc.path}`;
+    case "write_file":
+      return `write ${acc.path}`;
+    case "http":
+      return acc.host === "*" ? "use the network" : `reach ${acc.host}`;
+    case "exec_command":
+      return `run: ${acc.command}`;
   }
 }
 
@@ -216,14 +234,28 @@ export class WeixinApprovals
     chat: WeixinChat,
     req: ApprovalRequest,
   ): Promise<void> {
-    const args = formatParamsPreview(req.paramsPreview);
     const lines: string[] = [
       "🔐 Tool approval required",
       "",
       `Tool: \`${req.tool}\``,
     ];
-    if (args) {
-      lines.push("", "Arguments:", args);
+    const accessLines = req.accesses.map((acc) => `  • ${formatAccess(acc)}`);
+    if (accessLines.length > 0) {
+      lines.push("", "Will:", ...accessLines);
+    }
+    const desc = req.description?.trim();
+    if (desc !== undefined && desc.length > 0) {
+      lines.push("", `Note: ${desc}`);
+    }
+    // Fall back to the JSON args only when neither accesses nor a
+    // description gave the user a useful summary — many tools declare
+    // no controlled resources and no label, in which case the param
+    // shape is the only thing left to render.
+    if (accessLines.length === 0 && (desc === undefined || desc.length === 0)) {
+      const args = formatParamsPreview(req.paramsPreview);
+      if (args) {
+        lines.push("", "Arguments:", args);
+      }
     }
     lines.push("", "Reply: yes / always / no");
     const text = lines.join("\n");

@@ -297,9 +297,9 @@ pub fn build_channel_router(
     // Outer-to-inner layer application means "outer" = "first to
     // observe the request", so an outer TraceLayer would log the
     // raw token-bearing URI before auth rewrites it.
-    let v1_inner = crate::channel::routes()
-        .with_state(ws_state)
-        .layer(TraceLayer::new_for_http());
+    let channel_router: Router<()> = crate::channel::routes().with_state(ws_state);
+
+    let v1_inner = channel_router.layer(TraceLayer::new_for_http());
     let v1 = channel_auth::attach(v1_inner, auth_state);
     Router::new()
         .merge(api::health::routes().layer(TraceLayer::new_for_http()))

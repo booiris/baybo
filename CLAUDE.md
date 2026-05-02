@@ -75,14 +75,59 @@ The admin TCP listener serves an embedded React dashboard baked into the gateway
 - Admin API types are generated: `docs/openapi.json` is produced by `aura-gateway` (utoipa) and kept in sync by `crates/gateway/tests/openapi_spec_sync.rs` (regen with `UPDATE_OPENAPI=1 cargo test -p aura-gateway --test openapi_spec_sync`). The web build runs `openapi-typescript` over that file (`pnpm --filter aura-web gen:api`, wired into `pnpm --filter aura-web build`) to emit `web/src/api/schema.d.ts`; the runtime client lives in `web/src/api/client.ts` (`openapi-fetch` with Bearer auth pre-applied). `utoipa` itself is only a dependency of `aura-gateway` — domain crates stay framework-agnostic, and new HTTP-visible fields are added by editing the mirror DTOs in `crates/gateway/src/api/dto.rs`.
 - Design tokens (`--color-brand`, `--shadow-brutal*`, `--font-mono`, …) live in `web/src/index.css` under Tailwind v4's `@theme` block. Keep the heavy-border + offset-shadow aesthetic consistent when adding new components.
 
-## Channel Sidecars (embedded)
+## Embedded Sidecars
 
-Every in-tree channel sidecar under `channel-src/*` ships inside the aura binary as a zstd-compressed JS bundle. `crates/gateway/build.rs` runs `pnpm --filter <pkg> bundle` (which invokes `bun build --target=bun --minify` to emit a single self-contained file at `dist/bundle.mjs`), zstd-compresses each bundle plus any aux assets, and emits `$OUT_DIR/sidecar_assets.rs`. At boot, `SidecarRuntime::install` materialises everything to `$XDG_CACHE_HOME/aura/sidecars/<channel>-<hash>/{bundle.mjs, <aux...>}` (hash-keyed so upgrades never overwrite the old files — a downgraded install can still find its bundle). `SidecarSupervisor` then runs one restart loop per embedded channel type and spawns each via the host's `bun` (resolved from `PATH`, override with `AURA_BUN_BIN`).
+In-tree sidecars under `channel-src/*` and `tool-src/*` ship inside the aura binary as zstd-compressed JS bundles. `crates/gateway/build.rs` invokes the package's `bundle` script (channels: `bun build --target=bun --minify`; tools: `esbuild`), zstd-compresses the result + any aux files, and emits `$OUT_DIR/sidecar_assets.rs`. At boot, `SidecarRuntime::install` materialises everything to `$XDG_CACHE_HOME/aura/sidecars/<name>-<hash>/{bundle.mjs, <aux...>}` — hash-keyed so an upgrade never overwrites an old bundle, and the janitor sweeps stale `<hash>/` dirs once a day (live-set allowlist + 7d mtime guard).
 
-- Pre-reqs before `cargo build`: `pnpm install` must have populated `channel-src/*/node_modules` and `sdks/channel-ts/dist`, and `bun` must be on `PATH` (used both at build time by the `bundle` script and at runtime to execute the bundle). Missing the install degrades to `cargo:warning=…` and empty embedded assets — the build still succeeds, the supervisor logs "embedded sidecar runtime unavailable".
-- Adding a new sidecar: create `channel-src/<name>/` with `src/index.ts` calling `runSidecar`, add it to `pnpm-workspace.yaml`, copy the `"bundle": "bun build …"` script from one of the existing sidecars, and run `pnpm install`. `build.rs` picks it up automatically via the `channel-src/*` enumeration — no Rust changes needed.
-- Why bun (not node + esbuild): with `--target=bun`, bun's bundler substitutes its own polyfills for the npm packages our sidecars pull in transitively (`ws` → bun's WHATWG WebSocket, `node-fetch@2` → bun's native fetch, etc.). That sidesteps several traps the node + esbuild combo hits: `node-fetch@2` + `whatwg-url@5` emit `DEP0040`/`DEP0169` warnings on every Bot API call; esbuild's minifier mangles `node-fetch@2`'s async stack badly enough that `bot.init()` deadlocks; `silk-wasm`'s dual-package `main: lib/index.cjs` references `__filename` which doesn't exist in ESM scope. bun ducks all three by replacing the offending packages outright at bundle time.
-- Forcing a strict release build: set `AURA_REQUIRE_SIDECARS=1` to turn any sidecar packaging failure into a hard `cargo build` error (the gateway boots fine without sidecars during local backend hacking, but a release build with no embedded channels is almost always a packaging mistake).
+- **Build prereqs**: `pnpm install` populates `node_modules`, and `bun` must be on `PATH` (channel sidecars; override with `AURA_BUN_BIN`). Tool sidecars run under `node` (override with `AURA_NODE_BIN`). Missing the install degrades to `cargo:warning=…` with empty embedded assets — the build still succeeds, the supervisor logs "embedded sidecar runtime unavailable". Set `AURA_REQUIRE_SIDECARS=1` for release builds to hard-fail on packaging failures.
+- **Why bun for channels**: with `--target=bun`, bun substitutes its own polyfills for `ws` / `node-fetch@2` / `silk-wasm`, dodging three node + esbuild traps (DEP warnings, esbuild minifier deadlocking `bot.init()`, and `silk-wasm`'s `__filename` reference in ESM). Tool sidecars don't ship those packages and run under node directly.
+
+Every sidecar self-declares an `aura.domain` in its `package.json` (`channel`, `tool`, …). Domain identifies the family; the per-package name identifies an individual sidecar inside it. Constants live in `aura_gateway::sidecar::domains`. **Build-time enforcement**: a missing or invalid domain (must match `[a-z0-9_]+`) is a hard `cargo build` error — new sidecars can't silently default into the wrong family.
+
+Adding a new sidecar:
+1. Pick a directory (`channel-src/<name>/` or `tool-src/<name>/`), add it to `pnpm-workspace.yaml`.
+2. `package.json` declares `"aura": { "domain": "channel" | "tool" | ..., "kind": "mcp_server"? }`.
+3. For a new family, add a `domains::YOUR_DOMAIN` constant in `crates/gateway/src/sidecar/assets.rs` and iterate it from whichever supervisor / route / CLI dispatches that family.
+4. For a new tool-domain MCP server: also add an `*_mcp_profile(...)` builder in `crates/tools/src/mcp/profile/<name>.rs` (primitive args so `aura-tools` stays free of an `aura-config` dep) and append an entry in `runtime::build_managers`.
+
+Existing dispatch:
+- `aura channel list/add` filters `runtime.names_in_domain(domains::CHANNEL)`.
+- `SidecarSupervisor` (channel restart loop) iterates `domains::CHANNEL`.
+- `aura_tools::mcp::embedded_servers(&profiles)` consumes the `EmbeddedMcpProfile` list from `runtime::build_managers` (today: just browser when `browser.enable=true`).
+
+## Browser tool sidecar (`tool-src/browser`)
+
+Thin wrapper around Google's [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) (CDDM, version-pinned in `tool-src/browser/package.json`). Spawned by `McpReconciler` over stdio MCP; the ~30 CDDM tools (`navigate_page`, `click`, `take_screenshot`, `evaluate_script`, `lighthouse_audit`, `take_snapshot`, perf-trace family, …) surface as `browser/<tool>` to the LLM. The `extensions` category is force-disabled in our wrapper (mutates the persistent profile). One additional in-process tool — `browser/read_page` — wraps Mozilla Readability + Turndown for clean Markdown extraction.
+
+**Opt-in**: `aura.json:browser.enable=false` by default — when off, the bundle stays inert in the binary and `browser/*` tools never appear. All operator-facing knobs live on the `BrowserConfig` struct (`crates/config/src/browser.rs`); the wrapper itself reads `AURA_BROWSER_*` env vars only as internal gateway↔child plumbing.
+
+**Chrome binary**: auto-downloads Google Chrome for Testing 'stable' to `$XDG_CACHE_HOME/aura/browser/chrome/` on first boot via `@puppeteer/browsers` — non-blocking (the MCP server connects immediately so the LLM sees the full tool list; calls during install get a synthetic "preparing, N% complete, retry" response via `GuardingTransport`). Pin a specific Chrome via `browser.chrome_path`. Pre-warm air-gapped: `pnpm --filter @aura/tool-browser run install-chrome`.
+
+**Auto-fontconfig**: `<workspace>/work/.fonts/` is always pinned as a Chrome fontconfig `<dir>` (synthesised temp `fonts.conf` + `FONTCONFIG_FILE` env). Drop a CJK / icon font there and Chrome picks it up next restart. macOS no-op (Chrome uses Core Text).
+
+### Security trade-offs (deliberate)
+
+Shape what the agent can be safely told to do — not bugs but load-bearing:
+
+- **No per-Aura-session isolation**. All sessions in one Aura process share one Chrome profile (CDDM has no `BrowserContext` primitive). Concurrent sessions see each other's cookies. Docker mode does not restore isolation.
+- **No in-sidecar SSRF guard**. CDDM doesn't gate navigation to RFC1918 / loopback / cloud-metadata. With approvals also off, the LLM can navigate to `http://169.254.169.254/...` un-prompted. Treat `browser/navigate_page` to a non-vetted hostname the way you'd treat a `WebFetch` to that host.
+- **No per-call approval gate**. The browser MCP profile declares `capabilities = []` (`crates/tools/src/mcp/profile/browser.rs`) and CDDM emits no `_meta.aura` annotations, so the agent loop's pre-execute approval prompt never fires for `browser/*`. Add HITL gateway-side, not in the MCP layer.
+- **Wide tool surface**. `evaluate_script` runs arbitrary JS in the page; `lighthouse_audit` / perf-trace / memory-snapshot are all live and ungated.
+- **DNS-rebinding window**. CDDM runs no sidecar-owned resolver — the agent has no checkpoint between resolution and CDP commands.
+
+### Docker mode (`browser.docker.*`)
+
+Opt-in via `browser.docker.enable=true`. Spawns a debian-slim container running consumer Chrome behind Xvfb and connects via CDP. Headed Chrome (no `HeadlessChrome` UA) is the point — many anti-bot stacks reject the headless profile. Any docker failure (daemon down, perms, …) transparently falls back to host-headless; boot never breaks on a missing daemon. **macOS exception**: force-disabled on darwin (Docker Desktop's hidden Linux VM defeats the "real native Chrome" point — wrapper logs an explicit "ignored on macOS" line).
+
+- `docker.cdp_url`: escape hatch — when set, skips every docker interaction and connects directly to a pre-existing Chrome (k8s, docker-compose, remote host).
+- `docker.web_vnc_port`: opt-in noVNC observability (`x11vnc` + `websockify` on the configured port). Open `http://127.0.0.1:<port>/vnc.html` in any browser. **No password, loopback-only by design** — for remote access use `ssh -L`. Don't publish on a public interface.
+- `docker.image_tag`: override the deterministic `aura-browser:<sha256(Dockerfile+entrypoint)[..12]>` tag and skip the on-first-boot build (air-gapped registries).
+
+**Sandbox in docker mode**: `browser.sandbox` is ignored — the container is the trust boundary; Chrome runs `--no-sandbox` because the slim base ships no SUID `chrome-sandbox`. Tightening would require a custom seccomp profile + a base image with the helper installed.
+
+**Container lifecycle**: one container per Aura process, named `aura-browser-<pid>-<rand6>`, labelled `aura.role=browser-sidecar` + `aura.pid=<pid>`. `docker run` is **not** invoked with `--rm` (so a startup crash leaves logs fetchable via `docker logs`). Cleanup: success-path `stop()` (`docker stop -t 5` + `docker rm -f`), failure-path force-remove, and the next-boot `sweepStaleContainers()` for `kill -9` cases. Inside the container Chrome listens on loopback only (Chrome 134+ silently ignores `--remote-debugging-address=0.0.0.0` for DNS-rebinding protection); a `socat 0.0.0.0:9223 → 127.0.0.1:9222` relay forwards the published port. CDP publishes on `127.0.0.1::9223` (ephemeral host port).
+
+**Profile portability**: `browser.profile_dir` is bind-mounted at `/data/profile`; container runs `--user $(id -u):$(id -g)` so files round-trip cleanly between host-headless and docker modes under the same operator UID.
 
 ## Dependency Management
 

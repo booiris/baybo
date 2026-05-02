@@ -1,34 +1,47 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use aura_storage::BlobStore;
 use rmcp::RoleClient;
-use rmcp::model::{CallToolRequestParams, RawContent, Tool as RmcpTool};
+use rmcp::model::{CallToolRequestParams, Tool as RmcpTool};
 use rmcp::service::Peer;
 use serde_json::Value;
 
 use crate::approval::ResourceAccess;
+use crate::mcp::content_adapter::adapt_call_result;
 use crate::{Tool, ToolContext, ToolError, ToolOutput};
 
 /// Wrapper that exposes one rmcp-discovered tool to Aura's agent loop.
 ///
-/// Names are namespaced as `<server>/<tool>` so that an MCP server's tool
-/// list cannot collide with a builtin. The peer is `Arc`-cloned per tool;
+/// Names are namespaced as `<server>/<tool>` so an MCP server's tool list
+/// cannot collide with a builtin. The peer is `Arc`-cloned per tool;
 /// `Peer<RoleClient>` is internally `Arc`-based, so the cost is a refcount
 /// bump per tool, not per call.
+///
+/// `default_resource_access` is the per-server resource list the approval
+/// gate consults — every tool from the same server inherits the same
+/// access shape (stdio → one `ExecCommand`, http → one `Http`, embedded
+/// servers with `capabilities=[]` → none). MCP tools have no per-call
+/// override path: a future embedded server that needs finer per-tool
+/// approvals adds a typed mechanism for that case at the time it ships.
 pub struct McpTool {
     server_name: String,
     tool_name: String,
     namespaced_name: String,
     description: String,
     parameters_schema: Value,
-    resource_access: Vec<ResourceAccess>,
+    default_resource_access: Vec<ResourceAccess>,
     peer: Peer<RoleClient>,
+    blob_store: Option<Arc<dyn BlobStore>>,
 }
 
 impl McpTool {
     pub fn new(
         server_name: String,
         descriptor: RmcpTool,
-        resource_access: Vec<ResourceAccess>,
+        default_resource_access: Vec<ResourceAccess>,
         peer: Peer<RoleClient>,
+        blob_store: Option<Arc<dyn BlobStore>>,
     ) -> Self {
         let namespaced_name = format!("{server_name}/{}", descriptor.name);
         let parameters_schema = serde_json::Value::Object((*descriptor.input_schema).clone());
@@ -43,8 +56,9 @@ impl McpTool {
             namespaced_name,
             description,
             parameters_schema,
-            resource_access,
+            default_resource_access,
             peer,
+            blob_store,
         }
     }
 
@@ -72,7 +86,7 @@ impl Tool for McpTool {
     }
 
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
-        self.resource_access.clone()
+        self.default_resource_access.clone()
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
@@ -94,29 +108,9 @@ impl Tool for McpTool {
                 ToolError::Mcp(format!("{}/{}: {e}", self.server_name, self.tool_name))
             })?;
 
-        if result.is_error.unwrap_or(false) {
-            return Ok(ToolOutput::Error(format_content(&result.content)));
-        }
-
-        Ok(ToolOutput::Text(format_content(&result.content)))
+        let is_error = result.is_error.unwrap_or(false);
+        adapt_call_result(&result.content, is_error, self.blob_store.as_ref()).await
     }
-}
-
-fn format_content(parts: &[rmcp::model::Annotated<RawContent>]) -> String {
-    let mut out = String::new();
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        match &part.raw {
-            RawContent::Text(text) => out.push_str(&text.text),
-            RawContent::Image(_) => out.push_str("[image content elided]"),
-            RawContent::Audio(_) => out.push_str("[audio content elided]"),
-            RawContent::Resource(_) => out.push_str("[resource content elided]"),
-            RawContent::ResourceLink(_) => out.push_str("[resource link elided]"),
-        }
-    }
-    out
 }
 
 /// Synthesize a ToolManifest for an MCP-sourced tool given the server's
