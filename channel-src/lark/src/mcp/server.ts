@@ -640,6 +640,177 @@ export class LarkMcpServer {
       },
     );
 
+    server.registerTool(
+      "feishu_calendar",
+      {
+        title: "Read Feishu calendar metadata",
+        description:
+          "Inspect the conversing user's Feishu calendars. `action: \"primary\"` returns their primary calendar; `\"list\"` paginates all visible calendars (own + shared); `\"get\"` fetches one by id. Read-only — calendar mutation lives in `feishu_calendar_event`.",
+        inputSchema: {
+          action: z
+            .enum(["primary", "list", "get"])
+            .describe(
+              "`primary` returns the user's main calendar (no other args). `list` paginates everything they can see (page_size up to 1000, default 50; pass `page_token` for the next page). `get` fetches a single calendar by `calendar_id`.",
+            ),
+          calendar_id: z
+            .string()
+            .optional()
+            .describe("Required for `get`. Calendar id from a prior `list`/`primary` response."),
+          page_size: z
+            .number()
+            .int()
+            .min(1)
+            .max(1000)
+            .optional()
+            .describe("Only used by `list`. Default 50, hard cap 1000."),
+          page_token: z
+            .string()
+            .optional()
+            .describe("Only used by `list`. Cursor from a prior call."),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (args.action === "get" && !args.calendar_id) {
+          return toolError("feishu_calendar action=get requires `calendar_id`");
+        }
+        return this.runUatTool({
+          active,
+          toolName: "feishu_calendar",
+          reason: "read your Feishu calendar metadata",
+          handler: async (uat): Promise<LarkApiResponse> => {
+            const opts = lark.withUserAccessToken(uat);
+            const sdk = active.channel.rawClient.calendar;
+            if (args.action === "primary") return sdk.calendar.primary({}, opts);
+            if (args.action === "get") {
+              return sdk.calendar.get(
+                { path: { calendar_id: args.calendar_id! } },
+                opts,
+              );
+            }
+            return sdk.calendar.list(
+              {
+                params: {
+                  ...(args.page_size !== undefined && { page_size: args.page_size }),
+                  ...(args.page_token !== undefined && { page_token: args.page_token }),
+                },
+              },
+              opts,
+            );
+          },
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_freebusy",
+      {
+        title: "Query Feishu calendar free/busy",
+        description:
+          "Look up free/busy windows in a time range for one user (or one room). When `user_id` is omitted, queries the conversing user's primary calendar. Use `feishu_freebusy_batch` for multi-user scheduling questions. Returns `freebusy_items` (`{ start_time, end_time }`); empty list means the window is free.",
+        inputSchema: {
+          time_min: z
+            .string()
+            .describe("ISO 8601 lower bound, inclusive (e.g. `2026-05-02T09:00:00+08:00`)."),
+          time_max: z
+            .string()
+            .describe("ISO 8601 upper bound, exclusive."),
+          user_id: z
+            .string()
+            .optional()
+            .describe("Target user. Omit to query the conversing user. Mutually exclusive with `room_id`."),
+          room_id: z
+            .string()
+            .optional()
+            .describe("Room id to query a meeting room's busy windows. Mutually exclusive with `user_id`."),
+          user_id_type: z
+            .enum(["open_id", "union_id", "user_id"])
+            .optional()
+            .describe("Default open_id."),
+          only_busy: z
+            .boolean()
+            .optional()
+            .describe("If true, omit calendar entry titles — only return time ranges. Default false (titles included if you have read access)."),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (args.user_id && args.room_id) {
+          return toolError("feishu_freebusy: user_id and room_id are mutually exclusive");
+        }
+        return this.runUatTool({
+          active,
+          toolName: "feishu_freebusy",
+          reason: "check calendar free/busy",
+          handler: (uat) =>
+            active.channel.rawClient.calendar.freebusy.list(
+              {
+                data: {
+                  time_min: args.time_min,
+                  time_max: args.time_max,
+                  ...(args.user_id !== undefined && { user_id: args.user_id }),
+                  ...(args.room_id !== undefined && { room_id: args.room_id }),
+                  ...(args.only_busy !== undefined && { only_busy: args.only_busy }),
+                },
+                params: {
+                  user_id_type: args.user_id_type ?? "open_id",
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_freebusy_batch",
+      {
+        title: "Query Feishu calendar free/busy for multiple users",
+        description:
+          "Multi-user variant of `feishu_freebusy`. Useful for finding common free time across a group. Returns one `freebusy_lists` entry per `user_id`.",
+        inputSchema: {
+          time_min: z.string().describe("ISO 8601 lower bound, inclusive."),
+          time_max: z.string().describe("ISO 8601 upper bound, exclusive."),
+          user_ids: z
+            .array(z.string().min(1))
+            .min(1)
+            .max(50)
+            .describe("List of user ids to query (1-50)."),
+          user_id_type: z
+            .enum(["open_id", "union_id", "user_id"])
+            .optional()
+            .describe("Default open_id."),
+          only_busy: z.boolean().optional(),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.runUatTool({
+          active,
+          toolName: "feishu_freebusy_batch",
+          reason: "check group calendar free/busy",
+          handler: (uat) =>
+            active.channel.rawClient.calendar.freebusy.batch(
+              {
+                data: {
+                  time_min: args.time_min,
+                  time_max: args.time_max,
+                  user_ids: args.user_ids,
+                  ...(args.only_busy !== undefined && { only_busy: args.only_busy }),
+                },
+                params: {
+                  user_id_type: args.user_id_type ?? "open_id",
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
     this.registerAskUser(server);
   }
 
@@ -704,6 +875,16 @@ function extractResolverInput(extra: unknown): LarkResolverInput {
   if (typeof m?.auraUserId === "string") input.auraUserId = m.auraUserId;
   return input;
 }
+
+/** Common Lark OAPI response shape. Tools whose handler unions
+ * multiple SDK calls (different `data` shapes per branch) declare the
+ * handler return as `Promise<LarkApiResponse>` so TypeScript can pick
+ * a single type for the union without forcing each tool to assert. */
+type LarkApiResponse = {
+  code?: number | undefined;
+  msg?: string | undefined;
+  data?: unknown;
+};
 
 function toolError(message: string): {
   content: { type: "text"; text: string }[];

@@ -76,6 +76,27 @@ function stubChannel(getChatInfoImpl, rawApi) {
           },
         },
       },
+      calendar: {
+        calendar: {
+          async primary(payload, opts) {
+            return rawApi?.calendarPrimary?.(payload, opts) ?? { code: 0, data: {} };
+          },
+          async list(payload, opts) {
+            return rawApi?.calendarList?.(payload, opts) ?? { code: 0, data: {} };
+          },
+          async get(payload, opts) {
+            return rawApi?.calendarGet?.(payload, opts) ?? { code: 0, data: {} };
+          },
+        },
+        freebusy: {
+          async list(payload, opts) {
+            return rawApi?.freebusyList?.(payload, opts) ?? { code: 0, data: {} };
+          },
+          async batch(payload, opts) {
+            return rawApi?.freebusyBatch?.(payload, opts) ?? { code: 0, data: {} };
+          },
+        },
+      },
       im: {
         v1: {
           chat: {
@@ -165,6 +186,9 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
   const toolNames = last.result.tools.map((t) => t.name).sort();
   assert.deepEqual(toolNames, [
     "feishu_ask_user",
+    "feishu_calendar",
+    "feishu_freebusy",
+    "feishu_freebusy_batch",
     "feishu_get_chat_history",
     "feishu_get_chat_info",
     "feishu_get_message",
@@ -1425,6 +1449,171 @@ test("LarkMcpServer: feishu_search_user calls /open-apis/search/v1/user with bea
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("LarkMcpServer: feishu_calendar dispatches to primary/list/get based on action", async () => {
+  const calls = { primary: 0, list: null, get: null };
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async calendarPrimary() {
+      calls.primary++;
+      return { code: 0, data: { calendars: [{ calendar: { calendar_id: "cal_p" } }] } };
+    },
+    async calendarList(payload) {
+      calls.list = payload;
+      return { code: 0, data: { calendar_list: [], has_more: false } };
+    },
+    async calendarGet(payload) {
+      calls.get = payload;
+      return { code: 0, data: { calendar_id: payload.path.calendar_id } };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  async function call(id, args) {
+    const before = reply.sent.length;
+    await server.accept(
+      `tunnel-cal-${id}`,
+      encodeJson({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "feishu_calendar", arguments: args },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, `calendar id=${id}`);
+    return decodeJson(reply.sent[reply.sent.length - 1]);
+  }
+
+  await call(60, { action: "primary" });
+  await call(61, { action: "list", page_size: 100, page_token: "pt_x" });
+  await call(62, { action: "get", calendar_id: "cal_target" });
+  const badGet = await call(63, { action: "get" });
+
+  assert.equal(calls.primary, 1);
+  assert.equal(calls.list.params.page_size, 100);
+  assert.equal(calls.list.params.page_token, "pt_x");
+  assert.equal(calls.get.path.calendar_id, "cal_target");
+
+  assert.equal(badGet.id, 63);
+  assert.equal(badGet.result.isError, true);
+  assert.match(badGet.result.content[0].text, /requires `calendar_id`/);
+});
+
+test("LarkMcpServer: feishu_freebusy rejects mutually-exclusive user_id + room_id", async () => {
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {});
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-fb-bad",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 64,
+      method: "tools/call",
+      params: {
+        name: "feishu_freebusy",
+        arguments: {
+          time_min: "2026-05-02T09:00:00+08:00",
+          time_max: "2026-05-02T18:00:00+08:00",
+          user_id: "ou_x",
+          room_id: "room_y",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "freebusy bad reply");
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /mutually exclusive/);
+});
+
+test("LarkMcpServer: feishu_freebusy_batch forwards user_ids list to calendar.freebusy.batch", async () => {
+  let receivedPayload = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async freebusyBatch(payload) {
+      receivedPayload = payload;
+      return {
+        code: 0,
+        data: {
+          freebusy_lists: [{ user_id: "ou_x", freebusy_items: [] }],
+        },
+      };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-fb-batch",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 65,
+      method: "tools/call",
+      params: {
+        name: "feishu_freebusy_batch",
+        arguments: {
+          time_min: "2026-05-02T09:00:00+08:00",
+          time_max: "2026-05-02T18:00:00+08:00",
+          user_ids: ["ou_x", "ou_y"],
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "freebusy batch reply");
+
+  assert.deepEqual(receivedPayload.data.user_ids, ["ou_x", "ou_y"]);
+  assert.equal(receivedPayload.params.user_id_type, "open_id");
 });
 
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {
