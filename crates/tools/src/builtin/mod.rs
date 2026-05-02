@@ -37,7 +37,6 @@ pub(crate) mod paths;
 pub mod read;
 pub mod send_local_file;
 pub mod todo;
-pub(crate) mod url_policy;
 pub mod web_fetch;
 pub mod write;
 
