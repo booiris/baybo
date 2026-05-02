@@ -133,14 +133,6 @@ pub struct AuraToolMeta {
     #[serde(default)]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub call_label: Option<CallLabelRule>,
-    /// When set, the executor injects `ctx.session_id` into the params
-    /// object under this key before calling the server. Used by the
-    /// embedded browser MCP server, whose handlers route per-Aura-session
-    /// `BrowserContext`s by `context_id`. Vanilla MCP servers leave this
-    /// `None` and never see session ids.
-    #[serde(default)]
-    #[cfg_attr(feature = "ts-export", ts(optional))]
-    pub inject_session_id_as: Option<String>,
 }
 
 impl AuraToolMeta {

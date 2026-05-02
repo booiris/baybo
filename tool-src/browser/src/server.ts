@@ -146,7 +146,14 @@ function defaultProfileDir(): string {
 }
 
 function defaultChromeCacheDir(): string {
-  return process.env["AURA_BROWSER_CACHE_DIR"] ?? join(xdgCacheHome(), "aura", "browser", "chrome");
+  // The gateway's connect_stdio strips inherited env (env_clear), so an
+  // operator-set AURA_BROWSER_CACHE_DIR does NOT reach the runtime
+  // sidecar — only the standalone `pnpm install-chrome` script (which
+  // runs in the operator's shell, not via the gateway) honours it. Read
+  // is intentionally absent here so the runtime path always uses the
+  // canonical `$XDG_CACHE_HOME/aura/browser/chrome/` and stays in sync
+  // with the install script's default branch.
+  return join(xdgCacheHome(), "aura", "browser", "chrome");
 }
 
 const log = (msg: string): void => {
@@ -247,7 +254,6 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
   const userDataDir = process.env["AURA_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
   mkdirSync(userDataDir, { recursive: true });
 
-  const proxyServer = process.env["AURA_BROWSER_PROXY"] || undefined;
   const viewport = parseViewport(process.env["AURA_BROWSER_VIEWPORT"]);
 
   // Chrome's renderer sandbox is on by default. The Rust profile
@@ -267,7 +273,6 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
     performanceCrux: false,
     userDataDir,
     executablePath,
-    proxyServer,
     viewport,
     chromeArg: chromeArg.length > 0 ? chromeArg : undefined,
     redactNetworkHeaders: true,
@@ -753,15 +758,36 @@ async function main(): Promise<void> {
       `telemetry=off install_state=${state.phase} extra_tools=read_page`,
   );
 
+  // Cap shutdown at the docker stop timeout (5s graceful + slack for
+  // `docker rm`) so a hung container can't pin the gateway's reload
+  // forever, but give the in-flight `docker stop` a real chance to
+  // complete — the previous 50ms hard cutoff routinely exited before
+  // `docker stop` even sent SIGTERM, leaving the container running and
+  // the next-boot sweep responsible for cleanup.
+  const SHUTDOWN_TIMEOUT_MS = 25_000;
+  let shuttingDown = false;
   const shutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     log("shutting down");
+    const closes: Array<Promise<unknown>> = [
+      proxy.close().catch(() => undefined),
+      cddmClient.close().catch(() => undefined),
+      cddmServer.close().catch(() => undefined),
+    ];
     if (dockerHandle) {
-      void dockerHandle.stop().catch(() => undefined);
+      // dockerHandle.stop already swallows its own errors.
+      closes.push(dockerHandle.stop());
     }
-    void proxy.close().catch(() => undefined);
-    void cddmClient.close().catch(() => undefined);
-    void cddmServer.close().catch(() => undefined);
-    setTimeout(() => process.exit(0), 50).unref();
+    const watchdog = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        log(`shutdown watchdog fired after ${SHUTDOWN_TIMEOUT_MS}ms; forcing exit`);
+        resolve();
+      }, SHUTDOWN_TIMEOUT_MS).unref();
+    });
+    void Promise.race([Promise.allSettled(closes).then(() => undefined), watchdog]).then(() => {
+      process.exit(0);
+    });
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

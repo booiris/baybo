@@ -199,7 +199,9 @@ impl McpReconciler {
         }
 
         for name in desired_keys {
-            let target = desired.get(&name).expect("present").clone();
+            let Some(target) = desired.get(&name).cloned() else {
+                continue;
+            };
             let needs_reconnect = self
                 .state
                 .lock()

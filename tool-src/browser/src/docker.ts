@@ -109,7 +109,10 @@ export async function sweepStaleContainers(): Promise<void> {
     for (const line of lines) {
         const [name, pidStr] = line.split("\t");
         if (!name) continue;
-        const pid = pidStr ? parseInt(pidStr, 10) : NaN;
+        // `Number(pidStr)` returns NaN on partial parse; `parseInt("12abc",10)`
+        // would silently truncate to 12 and falsely treat the container's
+        // owner as still-alive when the label is corrupted.
+        const pid = pidStr ? Number(pidStr) : NaN;
         if (Number.isFinite(pid) && pid > 0 && isPidAlive(pid)) {
             continue;
         }

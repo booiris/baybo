@@ -40,7 +40,6 @@ pub struct McpTool {
     default_resource_access: Vec<ResourceAccess>,
     access_rule: Option<AccessRule>,
     call_label: Option<CallLabelRule>,
-    inject_session_id_as: Option<String>,
     peer: Peer<RoleClient>,
     blob_store: Option<Arc<dyn BlobStore>>,
 }
@@ -80,7 +79,6 @@ impl McpTool {
             default_resource_access,
             access_rule: meta.access_rule,
             call_label: meta.call_label,
-            inject_session_id_as: meta.inject_session_id_as,
             peer,
             blob_store,
         }
@@ -124,22 +122,13 @@ impl Tool for McpTool {
         Some(label)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let mut request = CallToolRequestParams::new(self.tool_name.clone());
         match params {
-            Value::Object(mut map) => {
-                if let Some(key) = &self.inject_session_id_as {
-                    map.insert(key.clone(), Value::String(ctx.session_id.clone()));
-                }
+            Value::Object(map) => {
                 request = request.with_arguments(map);
             }
-            Value::Null => {
-                if let Some(key) = &self.inject_session_id_as {
-                    let mut map = serde_json::Map::new();
-                    map.insert(key.clone(), Value::String(ctx.session_id.clone()));
-                    request = request.with_arguments(map);
-                }
-            }
+            Value::Null => {}
             other => {
                 return Err(ToolError::InvalidParams(format!(
                     "MCP tools require an object of arguments; got {other:?}"
