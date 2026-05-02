@@ -5,6 +5,7 @@
 //! Sidecars are spawned at runtime with the local `node` resolved
 //! from `PATH` — no JS runtime is shipped inside the gateway binary.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -145,6 +146,35 @@ impl SidecarRuntime {
             .iter()
             .find(|s| s.name == name)
             .map(|s| s.bundle_path.as_path())
+    }
+
+    /// Cache root that holds every materialised `<name>-<hash>/` dir
+    /// (`$XDG_CACHE_HOME/aura/sidecars/`). Returned only when the
+    /// runtime contains at least one sidecar — an empty runtime has no
+    /// path to point at. Consumed by the janitor's sidecar-cache sweep
+    /// to know which root directory to walk.
+    pub fn sidecars_cache_root(&self) -> Option<PathBuf> {
+        self.sidecars
+            .first()
+            .and_then(|s| s.bundle_path.parent()?.parent().map(Path::to_path_buf))
+    }
+
+    /// `<name>-<hash>` directory names for every currently-live
+    /// sidecar in this build. Consumed by the janitor's sidecar-cache
+    /// sweep as the "do not delete" allowlist — anything else under
+    /// `sidecars_cache_root()` whose mtime is older than the TTL is
+    /// stale cruft from a prior Aura version.
+    pub fn live_dir_names(&self) -> HashSet<String> {
+        self.sidecars
+            .iter()
+            .filter_map(|s| {
+                s.bundle_path
+                    .parent()?
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_owned)
+            })
+            .collect()
     }
 }
 

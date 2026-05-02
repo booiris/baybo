@@ -26,7 +26,7 @@ pub struct EmbeddedMcpServer {
 }
 
 impl EmbeddedMcpServer {
-    pub fn new(entry: McpServerEntry, extra_env: HashMap<String, String>) -> Self {
+    pub(crate) fn new(entry: McpServerEntry, extra_env: HashMap<String, String>) -> Self {
         Self { entry, extra_env }
     }
 }

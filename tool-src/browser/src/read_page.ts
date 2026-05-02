@@ -74,26 +74,35 @@ turndown.remove(["style", "script", "noscript"]);
 export async function handleReadPage(client: Client): Promise<CallToolResult> {
     // Inject Readability into the page (idempotent across calls thanks
     // to the `window.__auraReadability` cache), parse the live DOM, and
-    // return the article object. We send the source as a string literal
-    // inside the script so CDDM's evaluate_script doesn't have to
-    // resolve a network URL.
+    // return the article object.
     //
-    // `JSON.stringify` the source twice: once to embed it as a JS
-    // string literal in the function body, then CDDM's evaluator
-    // serialises the whole function as JSON-RPC params.
-    // Readability.js ends with `if (typeof module === "object") module.exports = Readability`.
-    // We pass `module` as an actual parameter to an IIFE so that check
-    // passes and the export assignment runs. `.call({ module })` doesn't
-    // work — Readability references `module` as a bare identifier, not
-    // `this.module`.
+    // SECURITY: the only interpolation into this script is the
+    // bundle-time-fixed Readability source, and it goes through
+    // `JSON.stringify` so it lands as a quoted string literal — the
+    // in-page side then `new Function('module', src)` to execute it.
+    // This means *any future interpolation* using the same shape would
+    // also get escape-quoted by JSON.stringify, so accidentally piping
+    // page or user data through here can no longer become a code-
+    // injection vector. **Do not change this template literal to embed
+    // anything via bare `${...}` interpolation** — always JSON.stringify
+    // the value first, even if the source is "obviously trusted" today.
+    //
+    // Why `new Function('module', src)` (and not `eval`):
+    // `new Function` creates a fresh global-scope closure, so the
+    // injected code can't see surrounding `try`/`return` and can't
+    // accidentally reference our locals. Readability.js ends with
+    // `if (typeof module === "object") module.exports = Readability`,
+    // so passing `moduleShim` as the `module` parameter triggers the
+    // commonjs export branch and we recover the constructor via
+    // `moduleShim.exports`.
+    const readabilitySrcLiteral = JSON.stringify(__READABILITY_SOURCE__);
     const inPageScript = `
 async () => {
   try {
     if (typeof window.__auraReadability === "undefined") {
       const moduleShim = { exports: undefined };
-      ((module) => {
-        ${__READABILITY_SOURCE__}
-      })(moduleShim);
+      const src = ${readabilitySrcLiteral};
+      (new Function("module", src))(moduleShim);
       window.__auraReadability = moduleShim.exports;
       if (typeof window.__auraReadability !== "function") {
         return { __error: "Readability injection failed: module.exports is " + typeof moduleShim.exports };

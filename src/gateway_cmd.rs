@@ -354,8 +354,16 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     }));
 
     {
-        let janitor =
+        let mut janitor =
             aura_janitor::Janitor::new(workspace_paths.clone(), graph.stores.blob.clone());
+        if let Some(runtime) = sidecar_runtime.as_ref()
+            && let Some(cache_root) = runtime.sidecars_cache_root()
+        {
+            janitor = janitor.with_sidecar_cache(aura_janitor::SidecarCache {
+                cache_root,
+                live_dirs: runtime.live_dir_names(),
+            });
+        }
         let janitor_shutdown = shutdown.clone();
         task_tracker.track(tokio::spawn(async move {
             janitor

@@ -296,6 +296,14 @@ fn truncate_label(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
+    // Codepoint slice — avoids splitting a UTF-16 surrogate pair or a
+    // multi-byte UTF-8 sequence at the cut. Won't preserve emoji ZWJ
+    // cluster integrity (an emoji like 👨‍👩‍👧‍👦 may render as the leading
+    // 👨 followed by an ellipsis); the alternative would be a
+    // grapheme-aware crate dep, which is out of scope for an approval-
+    // prompt label that's already best-effort. Mirrors the codepoint
+    // slice in `channel-src/telegram/src/media/outbound.ts` which
+    // truncates Telegram captions the same way.
     let mut out: String = s.chars().take(max).collect();
     out.push('…');
     out

@@ -339,7 +339,23 @@ export function defaultChatKey(chat: unknown): string {
   }
   const obj = chat as Record<string, unknown>;
   const keys = Object.keys(obj).sort();
-  return keys.map((k) => `${k}=${String(obj[k])}`).join("&");
+  return keys.map((k) => `${k}=${chatValueToString(obj[k])}`).join("&");
+}
+
+// `String(v)` on a nested object yields `[object Object]`, which would
+// silently collide every chat into one routing bucket. The contract
+// (see BotPlatform docs) is "primitives or plain objects of
+// primitives" — but no runtime check enforces it, so a future
+// platform passing a nested object would otherwise produce a
+// platform-wide session collision before anyone noticed. Fall back
+// to JSON.stringify so each distinct nested value at least gets a
+// distinct key. Note: JSON.stringify isn't key-order-stable for
+// nested objects, so off-contract shapes still risk discriminating
+// `{a:{x:1,y:2}}` vs `{a:{y:2,x:1}}` — that's strictly better than
+// silent total collision and the contract still says "don't do that."
+function chatValueToString(v: unknown): string {
+  if (v === null || typeof v !== "object") return String(v);
+  return JSON.stringify(v);
 }
 
 /** Render an attachment list as `count=N size=B mime=X` (singular when
