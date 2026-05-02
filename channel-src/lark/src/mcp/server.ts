@@ -5,6 +5,7 @@ import type { Logger, McpReplyHandle } from "@aura/channel-sdk";
 import * as lark from "@larksuiteoapi/node-sdk";
 
 import type { UATAccessor } from "../auth/auto-auth.js";
+import { scopesFor } from "../auth/scopes.js";
 import { TunnelMcpTransport } from "./transport.js";
 
 /** Aura-internal `_meta` keys forwarded on every `tools/call`.
@@ -258,6 +259,7 @@ export class LarkMcpServer {
           userOpenId: active.platformUserId,
           chatId: active.chatId,
           reason,
+          scopes: scopesFor(toolName),
         },
         handler,
       );
@@ -1292,7 +1294,7 @@ export class LarkMcpServer {
       {
         title: "Create a Feishu calendar event",
         description:
-          "Create a new event on a Feishu calendar (the user's primary, or a shared calendar they have writer/owner role on). REQUIRES IN-CHAT APPROVAL — the user sees a card with the event summary + time and must click Approve before the event is created. Use ISO 8601 timestamps as Unix-millis-strings (Lark's quirk). Skip the `attendees` field unless you specifically want notifications sent — most clarification flows are easier in chat than via calendar invite.",
+          "Create a new event on a Feishu calendar (the user's primary, or a shared calendar they have writer/owner role on). REQUIRES IN-CHAT APPROVAL — the user sees a card with the event summary + time and must click Approve before the event is created. Use Unix-seconds-or-millis timestamps as strings (Lark's quirk). \n\nLIMITATION: this tool creates a personal event without attendees. Inviting attendees requires a separate Feishu API call (`calendar.calendarEventAttendee.create`) which isn't yet plumbed — for multi-person scheduling, ask the user to add attendees themselves in the Lark UI after the event lands.",
         inputSchema: {
           calendar_id: z
             .string()
@@ -1322,13 +1324,6 @@ export class LarkMcpServer {
             .describe(
               "IANA timezone (e.g. `Asia/Shanghai`, `America/Los_Angeles`). Default: Lark's user-account timezone.",
             ),
-          attendees: z
-            .array(z.string().min(1))
-            .max(20)
-            .optional()
-            .describe(
-              "List of user open_ids to invite. Leave empty for personal events — the user can add attendees in Lark UI faster than the agent can. Max 20 to bound notification fan-out.",
-            ),
           visibility: z
             .enum(["default", "public", "private"])
             .optional()
@@ -1337,7 +1332,7 @@ export class LarkMcpServer {
             .boolean()
             .optional()
             .describe(
-              "Whether attendees receive notifications. Default true. Set false for batch-imports or test events.",
+              "Whether change-tracking notifications are sent for the event. Default true. Set false for batch-imports or test events.",
             ),
         },
       },
@@ -1349,15 +1344,10 @@ export class LarkMcpServer {
             "feishu_calendar_event_create requires UAT but the bot's OAuth pipeline isn't configured for this session",
           );
         }
-        const summary = `Create event "${args.summary}" from ts=${args.start_timestamp} to ts=${args.end_timestamp}${args.timezone ? ` (${args.timezone})` : ""} on calendar ${args.calendar_id}`;
-        const detail = [
-          args.description ? `description: ${args.description.slice(0, 400)}` : null,
-          args.attendees && args.attendees.length > 0
-            ? `attendees: ${args.attendees.length} users (${args.attendees.slice(0, 5).join(", ")}${args.attendees.length > 5 ? ", ..." : ""})`
-            : null,
-        ]
-          .filter((v) => v !== null)
-          .join("\n");
+        const summary = `Create event "${args.summary}" from ts=${args.start_timestamp} to ts=${args.end_timestamp}${args.timezone ? ` (${args.timezone})` : ""} on calendar ${args.calendar_id} (no attendees — use Lark UI to invite people)`;
+        const detail = args.description
+          ? `description: ${args.description.slice(0, 400)}`
+          : "";
         const blocked = await this.gateWrite(extra, {
           toolName: "feishu_calendar_event_create",
           summary,
@@ -1957,6 +1947,7 @@ export class LarkMcpServer {
           userOpenId: active.platformUserId,
           chatId: active.chatId,
           reason,
+          scopes: scopesFor(toolName),
         },
         async (uat) => {
           const resp = await fetch(mcpUrl, {

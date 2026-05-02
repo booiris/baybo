@@ -310,11 +310,95 @@ export async function refreshUAT(
       },
     };
   }
+  // Codex review #4: classify the OAuth error so the caller can
+  // distinguish terminal-grant errors (drop the UAT) from transient
+  // server-side errors (keep the UAT, retry next sweep). The
+  // previous unconditional `expired_token` mapping turned a Lark
+  // outage into mass UAT deletion + reauth storm.
   const message =
     typeof data.error_description === "string"
       ? data.error_description
       : (error ?? "refresh failed");
+  if (isTransientOAuthError(error)) {
+    return { ok: false, error: "network_error", message };
+  }
   return { ok: false, error: "expired_token", message };
+}
+
+/** Per RFC 6749 §5.2 + RFC 6750 §3.1, terminal grant errors mean
+ * "this refresh token will never work again" — drop the UAT.
+ * Everything else (server_error, temporarily_unavailable, unknown
+ * codes, malformed payloads) is treated as transient: keep the UAT
+ * around so the next sweep retries instead of forcing the user to
+ * reauth because Lark's OAuth tier hiccupped. */
+const TERMINAL_GRANT_ERRORS = new Set<string>([
+  "invalid_grant",
+  "invalid_client",
+  "unauthorized_client",
+  "unsupported_grant_type",
+  "invalid_scope",
+  "access_denied",
+]);
+
+function isTransientOAuthError(error: string | undefined): boolean {
+  if (!error) return true; // missing error code → can't tell, treat conservatively
+  return !TERMINAL_GRANT_ERRORS.has(error);
+}
+
+/** Look up the OAuth subject (the actual `open_id` Lark issued the
+ * token to) by calling `/authen/v1/user_info` with the freshly-minted
+ * UAT. Used by the auth flow to verify the token belongs to the user
+ * we asked to authorise — without this check, a group-chat member who
+ * isn't the original requester could click the auth link and end up
+ * with their UAT silently stored under the requester's user id. */
+export interface UATSubject {
+  openId: string;
+  unionId?: string;
+  userId?: string;
+  name?: string;
+}
+
+export type UATSubjectResult =
+  | { ok: true; subject: UATSubject }
+  | { ok: false; reason: string };
+
+export async function fetchUATSubject(opts: {
+  accessToken: string;
+  baseUrl: string;
+  logger: Logger;
+  fetchImpl?: typeof fetch;
+}): Promise<UATSubjectResult> {
+  const f = opts.fetchImpl ?? fetch;
+  const url = `${opts.baseUrl.replace(/\/+$/, "")}/open-apis/authen/v1/user_info`;
+  let resp: Response;
+  try {
+    resp = await f(url, {
+      headers: { Authorization: `Bearer ${opts.accessToken}` },
+    });
+  } catch (err) {
+    return { ok: false, reason: `userInfo network error: ${String(err)}` };
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = (await resp.json()) as Record<string, unknown>;
+  } catch {
+    return { ok: false, reason: `userInfo returned non-JSON HTTP ${resp.status}` };
+  }
+  const code = typeof data.code === "number" ? data.code : -1;
+  if (!resp.ok || (code !== 0 && code !== -1)) {
+    const msg = typeof data.msg === "string" ? data.msg : `HTTP ${resp.status}`;
+    return { ok: false, reason: `userInfo rejected: ${msg}` };
+  }
+  const inner = (data.data ?? data) as Record<string, unknown>;
+  const openId = typeof inner.open_id === "string" ? inner.open_id : undefined;
+  if (!openId) {
+    return { ok: false, reason: "userInfo response missing open_id" };
+  }
+  const subject: UATSubject = { openId };
+  if (typeof inner.union_id === "string") subject.unionId = inner.union_id;
+  if (typeof inner.user_id === "string") subject.userId = inner.user_id;
+  if (typeof inner.name === "string") subject.name = inner.name;
+  return { ok: true, subject };
 }
 
 function ensureOfflineAccess(scope: string | undefined): string {

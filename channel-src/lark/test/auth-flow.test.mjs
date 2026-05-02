@@ -81,12 +81,41 @@ const DEVICE_AUTH_BODY = {
   interval: 0, // poll immediately for tests
 };
 
-function buildController(handler) {
+/**
+ * Wrap the test's fetch handler so:
+ *   - `/authen/v1/user_info` calls (subject verification, Codex review #1)
+ *     auto-resolve to a stub matching the most-recently-requested
+ *     user_open_id by default. Tests that want to simulate a
+ *     subject mismatch pass `userInfoOverride` to inject a different
+ *     open_id (or a network error).
+ *   - The numeric counter passed to `handler` only increments on
+ *     non-userInfo URLs so existing tests keep their device-auth /
+ *     poll arms numbered 1, 2, 3, ...
+ */
+function buildController(handler, opts = {}) {
   const scope = new MemoryScope();
   const store = new UATStore(scope);
   const channel = fakeChannel();
-  const f = fakeFetch(handler);
-  const controller = new AuthFlowController({
+  let nonUserInfoCount = 0;
+  let lastRequestedUserOpenId = "ou_alice"; // default for tests that don't set explicitly
+  const fetchHandler = async (url, init, _ignored) => {
+    if (url.includes("/authen/v1/user_info")) {
+      if (opts.userInfoOverride) {
+        return opts.userInfoOverride(url, init);
+      }
+      return jsonResponse({
+        code: 0,
+        data: {
+          open_id: lastRequestedUserOpenId,
+          name: "Test User",
+        },
+      });
+    }
+    nonUserInfoCount++;
+    return handler(url, init, nonUserInfoCount);
+  };
+  const f = fakeFetch(fetchHandler);
+  const baseController = new AuthFlowController({
     channel,
     store,
     appId: "cli_x",
@@ -95,6 +124,16 @@ function buildController(handler) {
     logger: noopLogger,
     fetchImpl: f.fetch,
   });
+  // Wrap requestUAT to track the user we're authenticating, so the
+  // userInfo stub returns the matching open_id by default.
+  const controller = {
+    requestUAT(req) {
+      lastRequestedUserOpenId = req.userOpenId;
+      return baseController.requestUAT(req);
+    },
+    cancelAll: () => baseController.cancelAll(),
+    isInflight: (id) => baseController.isInflight(id),
+  };
   return { controller, store, channel, fakeFetch: f };
 }
 
@@ -329,4 +368,113 @@ test("AuthFlowController: send-card failure surfaces as error and doesn't try to
   assert.equal(r.kind, "error");
   assert.match(r.message, /failed to send auth card/);
   assert.match(r.message, /invalid_chat_id/);
+});
+
+test("AuthFlowController: rejects UAT when /authen/v1/user_info open_id doesn't match the requesting user (Codex review #1)", async () => {
+  // Group-chat impersonation guard: poll succeeded with someone
+  // else's UAT (a coworker who clicked the auth link first), but
+  // userInfo says the token belongs to ou_eve, not ou_alice. The
+  // controller MUST refuse to store and return error.
+  const { controller, store, channel } = buildController(
+    (_url, _init, n) => {
+      if (n === 1) return jsonResponse(DEVICE_AUTH_BODY);
+      return jsonResponse({
+        access_token: "uat_eve",
+        refresh_token: "ur_eve",
+        expires_in: 7200,
+        scope: "im:message offline_access",
+      });
+    },
+    {
+      userInfoOverride: () =>
+        jsonResponse({
+          code: 0,
+          data: { open_id: "ou_eve", name: "Eve" },
+        }),
+    },
+  );
+
+  const r = await controller.requestUAT({
+    userOpenId: "ou_alice",
+    chatId: "oc_group",
+    reason: "read your bitable",
+  });
+
+  assert.equal(r.kind, "error");
+  assert.match(r.message, /does not match the requesting user/);
+
+  // No UAT stored — would have been a data-isolation break.
+  assert.equal(await store.get("ou_alice"), null);
+  assert.equal(await store.get("ou_eve"), null);
+
+  // The card was edited to a red error state explaining what
+  // happened (so the user can re-trigger the flow).
+  assert.equal(channel.updated.length, 1);
+  assert.equal(channel.updated[0].card.header.template, "red");
+});
+
+test("AuthFlowController: rejects UAT when /authen/v1/user_info itself fails (transient or hostile)", async () => {
+  // If we can't verify the subject we can't safely store — fail
+  // closed. A network blip means the user retries; a Lark-side
+  // 5xx during userInfo means the same.
+  const { controller, store } = buildController(
+    (_url, _init, n) => {
+      if (n === 1) return jsonResponse(DEVICE_AUTH_BODY);
+      return jsonResponse({
+        access_token: "uat_x",
+        refresh_token: "ur_x",
+        expires_in: 7200,
+      });
+    },
+    {
+      userInfoOverride: async () => {
+        throw new Error("ECONNRESET");
+      },
+    },
+  );
+
+  const r = await controller.requestUAT({
+    userOpenId: "ou_alice",
+    chatId: "oc_x",
+    reason: "read",
+  });
+  assert.equal(r.kind, "error");
+  assert.match(r.message, /subject verification failed/);
+  assert.match(r.message, /ECONNRESET/);
+  // No UAT stored.
+  assert.equal(await store.get("ou_alice"), null);
+});
+
+test("AuthFlowController: authorized card uses the verified user's name from userInfo", async () => {
+  // Subject verification gives us the real display name — surface
+  // it on the success card so the user knows which account got
+  // wired up.
+  const { controller, channel } = buildController(
+    (_url, _init, n) => {
+      if (n === 1) return jsonResponse(DEVICE_AUTH_BODY);
+      return jsonResponse({
+        access_token: "uat_alice",
+        refresh_token: "ur_alice",
+        expires_in: 7200,
+      });
+    },
+    {
+      userInfoOverride: () =>
+        jsonResponse({
+          code: 0,
+          data: { open_id: "ou_alice", name: "Alice Anderson" },
+        }),
+    },
+  );
+
+  const r = await controller.requestUAT({
+    userOpenId: "ou_alice",
+    chatId: "oc_x",
+    reason: "read",
+  });
+  assert.equal(r.kind, "ok");
+  // Success card surfaces the verified name.
+  const updated = channel.updated[channel.updated.length - 1];
+  assert.equal(updated.card.header.template, "green");
+  assert.match(updated.card.elements[0].text.content, /Alice Anderson/);
 });

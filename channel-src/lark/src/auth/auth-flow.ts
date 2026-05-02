@@ -8,9 +8,11 @@ import {
   type AuthFailureKind,
 } from "./auth-cards.js";
 import {
+  fetchUATSubject,
   pollDeviceToken,
   requestDeviceAuthorization,
 } from "./device-flow.js";
+import { joinScopes } from "./scopes.js";
 import type { StoredUAToken, UATStore } from "./uat-store.js";
 
 export type AuthFlowOutcome =
@@ -48,12 +50,22 @@ export interface AuthRequest {
    * the pending card. Keep it short — "read your Feishu calendar",
    * "search your Bitable apps", etc. */
   reason: string;
-  /** OAuth scope override. Defaults to none ⇒ the device-flow client
-   * appends just `offline_access`, which is enough for the basic
-   * `/authen/v1/user_info` lookup but not for any per-API scope. The
-   * caller (typically the auto-auth interceptor) is expected to pass
-   * the scope the failing tool needs. */
-  scope?: string;
+  /** OAuth scopes the underlying tool needs — passed verbatim into
+   * the device-flow scope parameter. The accessor's `UATInvokeRequest.scopes`
+   * forwards here, so the OAuth grant always asks for what the tool
+   * actually needs (Codex review #2). Empty array means "just
+   * `offline_access`", which works only for tools like
+   * `feishu_who_am_i` that hit `/authen/v1/user_info`. */
+  scopes: readonly string[];
+}
+
+/** Mask an open_id for log/error surfaces — Lark `ou_` ids look
+ * uniform enough that a leaked one in an LLM-readable error can
+ * make follow-up spear-phishing easier. Keep just enough to let an
+ * operator cross-check against the audit trail. */
+function maskOpenId(id: string): string {
+  if (id.length <= 8) return id;
+  return `${id.slice(0, 4)}…${id.slice(-3)}`;
 }
 
 interface InflightFlow {
@@ -140,11 +152,53 @@ export class AuthFlowController {
     });
 
     if (poll.ok) {
+      // Subject check (Codex review #1): Lark issues the UAT to
+      // whoever clicked the auth link, NOT necessarily the user we
+      // asked. In a group chat any member who can see the card can
+      // beat the original requester to the click — without this
+      // check we'd silently store the wrong person's UAT under
+      // `req.userOpenId` and every subsequent tool call would
+      // operate on the impersonator's Feishu data. Verify the token
+      // actually belongs to who we expected before persisting.
+      const subjectResult = await fetchUATSubject({
+        accessToken: poll.token.accessToken,
+        baseUrl: this.opts.baseUrl,
+        logger: this.opts.logger,
+        ...(this.opts.fetchImpl !== undefined && {
+          fetchImpl: this.opts.fetchImpl,
+        }),
+      });
+      if (!subjectResult.ok) {
+        const detail = `subject verification failed: ${subjectResult.reason}`;
+        void this.terminalCard(
+          cardMessageId,
+          buildAuthFailedCard({ kind: "error", detail }),
+        );
+        return { kind: "error", message: detail };
+      }
+      if (subjectResult.subject.openId !== req.userOpenId) {
+        const detail = `the authorized user (${maskOpenId(subjectResult.subject.openId)}) does not match the requesting user (${maskOpenId(req.userOpenId)}); the auth link was clicked by someone else in the chat — restart the flow yourself`;
+        this.opts.logger.warn(
+          `lark auth subject mismatch: expected=${req.userOpenId} got=${subjectResult.subject.openId}`,
+        );
+        void this.terminalCard(
+          cardMessageId,
+          buildAuthFailedCard({ kind: "error", detail }),
+        );
+        return { kind: "error", message: detail };
+      }
       const stored = await this.opts.store.storeGrant(
         req.userOpenId,
         poll.token,
       );
-      void this.terminalCard(cardMessageId, buildAuthorizedCard({}));
+      void this.terminalCard(
+        cardMessageId,
+        buildAuthorizedCard(
+          subjectResult.subject.name !== undefined
+            ? { userName: subjectResult.subject.name }
+            : {},
+        ),
+      );
       return { kind: "ok", uat: stored };
     }
 
@@ -185,6 +239,7 @@ export class AuthFlowController {
   private async requestDeviceCode(
     req: AuthRequest,
   ): ReturnType<typeof requestDeviceAuthorization> {
+    const scope = joinScopes(req.scopes ?? []);
     return requestDeviceAuthorization({
       appId: this.opts.appId,
       appSecret: this.opts.appSecret,
@@ -193,7 +248,7 @@ export class AuthFlowController {
       ...(this.opts.fetchImpl !== undefined && {
         fetchImpl: this.opts.fetchImpl,
       }),
-      ...(req.scope !== undefined && { scope: req.scope }),
+      ...(scope.length > 0 && { scope }),
     });
   }
 

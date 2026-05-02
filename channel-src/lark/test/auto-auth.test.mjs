@@ -86,7 +86,30 @@ function buildAccessor(handler) {
   const scope = new MemoryScope();
   const store = new UATStore(scope);
   const channel = fakeChannel();
-  const f = fakeFetch(handler);
+  // Wrap so userInfo subject-verification calls (Codex review #1)
+  // auto-resolve to ou_alice — every test that exercises the auth
+  // flow uses ou_alice as the conversing user. Tests for subject
+  // mismatch live in auth-flow.test.mjs; here we just need the
+  // verification to succeed so the auto-auth interceptor logic
+  // under test is what the assertions cover.
+  let nonUserInfoCount = 0;
+  const fetchHandler = async (url, init, _ignored) => {
+    if (url.includes("/authen/v1/user_info")) {
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({ code: 0, data: { open_id: "ou_alice" } });
+        },
+        async json() {
+          return { code: 0, data: { open_id: "ou_alice" } };
+        },
+      };
+    }
+    nonUserInfoCount++;
+    return handler(url, init, nonUserInfoCount);
+  };
+  const f = fakeFetch(fetchHandler);
   const mutex = new UATMutex();
   const authFlow = new AuthFlowController({
     channel,
@@ -421,6 +444,107 @@ test("UATAccessor.invoke: non-UAT errors propagate untouched", async () => {
     ),
     /network down/,
   );
+});
+
+test("UATAccessor.invoke: drops + reauths a UAT whose scope doesn't cover the tool's required scopes (Codex review #2)", async () => {
+  // Stored UAT was minted with only `offline_access` (the regression
+  // condition Codex flagged: tools never passed scopes, so OAuth grant
+  // only got offline_access, then every privileged tool reauth-looped).
+  // Now the tool says it needs `calendar:calendar.event:create`; the
+  // accessor MUST drop the stale-scope token and run a fresh flow with
+  // the wider scope, NOT silently use the insufficient one and let
+  // Lark return 99991663.
+  let deviceAuthScope = null;
+  const { accessor, store, channel } = buildAccessor((_url, init, n) => {
+    if (n === 1) {
+      // Capture the scope param the device authorization request
+      // sends — it must include the new wider scope, not just
+      // offline_access.
+      const body = new URLSearchParams(init.body);
+      deviceAuthScope = body.get("scope");
+      return jsonResponse(DEVICE_AUTH_BODY);
+    }
+    return jsonResponse({
+      access_token: "uat_with_scope",
+      refresh_token: "ur_x",
+      expires_in: 7200,
+      scope: "offline_access calendar:calendar.event:create",
+    });
+  });
+
+  await store.set("ou_alice", {
+    accessToken: "uat_offline_only",
+    refreshToken: "ur_old",
+    expiresAt: Date.now() + 7200_000,
+    refreshExpiresAt: Date.now() + 604800_000,
+    scope: "offline_access", // narrow scope — wouldn't pass the new check
+    grantedAt: Date.now() - 60_000,
+  });
+
+  let handlerSawUat;
+  const r = await accessor.invoke(
+    {
+      userOpenId: "ou_alice",
+      chatId: "oc_x",
+      reason: "create event",
+      scopes: ["calendar:calendar.event:create"],
+    },
+    async (uat) => {
+      handlerSawUat = uat;
+      return { code: 0, data: "OK" };
+    },
+  );
+
+  assert.equal(r.kind, "ok");
+  // Handler ran with the FRESH UAT, not the stale-scope one.
+  assert.equal(handlerSawUat, "uat_with_scope");
+  // Auth card was sent — proves a fresh device flow ran.
+  assert.equal(channel.sent.length, 1);
+  // Device authorization scope param included offline_access (auto-
+  // appended) AND the per-tool scope.
+  assert.match(deviceAuthScope, /calendar:calendar\.event:create/);
+  assert.match(deviceAuthScope, /offline_access/);
+  // Stored UAT was replaced with the new one carrying the wider scope.
+  const storedAfter = await store.get("ou_alice");
+  assert.equal(storedAfter.accessToken, "uat_with_scope");
+});
+
+test("UATAccessor.invoke: keeps the stored UAT when scope is sufficient", async () => {
+  // Counterpart to the above: a stored UAT whose scope covers
+  // the request must NOT trigger reauth (would be a UX regression).
+  const { accessor, store, channel, fakeFetch: f } = buildAccessor(() =>
+    jsonResponse({}),
+  );
+
+  await store.set("ou_alice", {
+    accessToken: "uat_wide",
+    refreshToken: "ur_x",
+    expiresAt: Date.now() + 7200_000,
+    refreshExpiresAt: Date.now() + 604800_000,
+    scope: "offline_access calendar:calendar.event:read calendar:calendar.event:create",
+    grantedAt: Date.now() - 60_000,
+  });
+
+  let handlerSawUat;
+  const r = await accessor.invoke(
+    {
+      userOpenId: "ou_alice",
+      chatId: "oc_x",
+      reason: "create event",
+      scopes: ["calendar:calendar.event:create"],
+    },
+    async (uat) => {
+      handlerSawUat = uat;
+      return { code: 0, data: "OK" };
+    },
+  );
+
+  assert.equal(r.kind, "ok");
+  assert.equal(handlerSawUat, "uat_wide");
+  // No fresh auth flow.
+  assert.equal(channel.sent.length, 0);
+  // No HTTP at all (no refresh either, UAT not near expiry).
+  assert.equal(f.calls.length, 0);
 });
 
 test("UAT_DEAD_CODES carries the documented Lark codes", () => {

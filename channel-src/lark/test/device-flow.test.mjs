@@ -287,3 +287,65 @@ test("refreshUAT surfaces invalid_grant as terminal expired_token", async () => 
   assert.equal(r.error, "expired_token");
   assert.match(r.message, /expired/);
 });
+
+test("refreshUAT classifies transient OAuth errors as network_error so the UAT survives Lark hiccups (Codex review #4)", async () => {
+  // Critical regression: previously every non-success OAuth error
+  // got classified as expired_token, and the scheduler/accessor
+  // delete UATs on expired_token. So a Feishu OAuth tier outage
+  // (server_error, temporarily_unavailable) wiped every refresh-due
+  // UAT and forced mass reauth. Verify the new classification keeps
+  // these classified as network_error so the caller retains the UAT.
+  const transientCodes = [
+    "server_error",
+    "temporarily_unavailable",
+    "rate_limited",
+    "unknown_garbage_code", // unknown codes treated as transient
+  ];
+  for (const code of transientCodes) {
+    const f = fakeFetch(() => jsonResponse({ error: code }));
+    const r = await refreshUAT({
+      appId: "x",
+      appSecret: "y",
+      baseUrl: "https://open.feishu.cn",
+      logger: noopLogger,
+      fetchImpl: f.fetch,
+      refreshToken: "ur_alive",
+    });
+    assert.equal(r.ok, false);
+    assert.equal(
+      r.error,
+      "network_error",
+      `${code}: must classify as network_error, not expired_token`,
+    );
+  }
+});
+
+test("refreshUAT keeps the full set of terminal grant errors mapped to expired_token", async () => {
+  // Per RFC 6749 §5.2, these all mean "this refresh token is dead,
+  // get a new grant" — drop the UAT.
+  const terminalCodes = [
+    "invalid_grant",
+    "invalid_client",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "invalid_scope",
+    "access_denied",
+  ];
+  for (const code of terminalCodes) {
+    const f = fakeFetch(() => jsonResponse({ error: code }));
+    const r = await refreshUAT({
+      appId: "x",
+      appSecret: "y",
+      baseUrl: "https://open.feishu.cn",
+      logger: noopLogger,
+      fetchImpl: f.fetch,
+      refreshToken: "ur",
+    });
+    assert.equal(r.ok, false);
+    assert.equal(
+      r.error,
+      "expired_token",
+      `${code}: must classify as expired_token (terminal grant error)`,
+    );
+  }
+});

@@ -2,6 +2,7 @@ import type { Logger } from "@aura/channel-sdk";
 
 import type { AuthFlowController, AuthFlowOutcome } from "./auth-flow.js";
 import { refreshUAT } from "./device-flow.js";
+import { grantedCovers, joinScopes } from "./scopes.js";
 import type { StoredUAToken, UATStore } from "./uat-store.js";
 
 /** Lark API error codes that mean "your user_access_token is no longer
@@ -81,7 +82,19 @@ export interface UATInvokeRequest {
   userOpenId: string;
   chatId: string;
   reason: string;
-  scope?: string;
+  /** OAuth scopes the underlying API call needs. The accessor:
+   *
+   *   1. Drops + reauths a stored UAT whose `scope` doesn't cover
+   *      every entry here (otherwise we'd hit 99991663 on every
+   *      call and reauth-loop without ever asking for the right
+   *      scope).
+   *   2. Forwards them as the device-flow scope string when a
+   *      fresh auth flow is needed.
+   *
+   * Required (not optional) — passing `[]` is a deliberate choice
+   * meaning "this tool needs only `offline_access`", which is rare
+   * in practice. Use {@link scopesFor} to look up by tool name. */
+  scopes: readonly string[];
 }
 
 export type UATInvokeResult<T> =
@@ -169,6 +182,20 @@ export class UATAccessor {
     return await this.opts.mutex.withLock(req.userOpenId, async () => {
       const stored = await this.opts.store.get(req.userOpenId);
       const now = Date.now();
+      // Scope coverage check (Codex review #2): a stored UAT issued
+      // for a narrower scope set CAN'T satisfy a tool that needs a
+      // wider one — Lark would just return 99991663, and the auto-
+      // retry interceptor would reauth-loop without ever asking for
+      // the right scope. Drop the stale-scope token + force a fresh
+      // device flow with the wider scope before doing anything else.
+      const requiredScopes = req.scopes ?? [];
+      if (stored && !grantedCovers(stored.scope, requiredScopes)) {
+        this.opts.logger.info(
+          `lark UAT scope insufficient for tool — granted="${stored.scope}" needed="${joinScopes(requiredScopes)}"; reauthing`,
+        );
+        await this.opts.store.delete(req.userOpenId);
+        return await this.runAuthFlow(req);
+      }
       if (
         stored &&
         stored.expiresAt - now > PROACTIVE_REFRESH_MS

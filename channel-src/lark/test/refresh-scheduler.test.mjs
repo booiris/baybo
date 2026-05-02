@@ -186,6 +186,41 @@ test("UATRefreshScheduler treats a transient network error as a non-terminal err
   assert.equal(after.refreshToken, "ur_alive");
 });
 
+test("UATRefreshScheduler keeps the UAT when Lark returns a transient OAuth server_error (Codex review #4)", async () => {
+  // The dangerous regression Codex flagged: previously every non-
+  // success OAuth response (server_error, temporarily_unavailable,
+  // unknown codes) was classified as expired_token, and the
+  // scheduler deleted UATs on expired_token. So a Lark OAuth tier
+  // outage caused a mass UAT wipe — every refresh-due UAT got
+  // deleted across all users at once. After the fix the OAuth
+  // server_error must classify as transient and leave the UAT in
+  // place for the next sweep.
+  const f = fakeFetch(() =>
+    jsonResponse({
+      error: "server_error",
+      error_description: "internal error",
+    }),
+  );
+  const { store, scheduler } = buildScheduler({ fetch: f });
+  await store.set("ou_alice", {
+    accessToken: "uat_x",
+    refreshToken: "ur_alive",
+    expiresAt: Date.now() + 30_000,
+    refreshExpiresAt: Date.now() + 604800_000,
+    scope: "",
+    grantedAt: Date.now(),
+  });
+
+  const r = await scheduler.sweepOnce();
+  // Classified as a transient error (kept in store), NOT expired.
+  assert.deepEqual(r.expired, []);
+  assert.equal(r.errors.length, 1);
+  assert.equal(r.errors[0].userOpenId, "ou_alice");
+  // UAT survives — would have been mass-wiped under the old behavior.
+  const after = await store.get("ou_alice");
+  assert.equal(after.refreshToken, "ur_alive");
+});
+
 test("UATRefreshScheduler.sweepOnce is reentrant-safe", async () => {
   const f = fakeFetch(() =>
     jsonResponse({
