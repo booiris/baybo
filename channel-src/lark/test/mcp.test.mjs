@@ -2818,6 +2818,150 @@ test("LarkMcpServer: feishu_calendar_event_update refuses no-op calls (no fields
   assert.match(last.result.content[0].text, /no fields to update/);
 });
 
+test("LarkMcpServer: feishu_update_doc gates destructive overwrite behind approval", async () => {
+  const originalFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = async () => {
+    upstreamCalls++;
+    return {
+      ok: true,
+      status: 200,
+      async text() { return "{}"; },
+      async json() {
+        return { jsonrpc: "2.0", id: "x", result: { content: [] } };
+      },
+    };
+  };
+  try {
+    let approvalRequest = null;
+    const fakeAccessor = {
+      baseUrl: "https://open.feishu.cn",
+      async invoke(_req, handler) {
+        return { kind: "ok", result: await handler("uat") };
+      },
+    };
+    const channel = stubChannel(async () => ({}), {});
+    const server = new LarkMcpServer({
+      logger: noopLogger,
+      channelResolver: () => ({
+        kind: "ok",
+        channel,
+        chatId: "oc_x",
+        platformUserId: "ou_alice",
+        uatAccessor: fakeAccessor,
+      }),
+      approveWrite: async (_input, request) => {
+        approvalRequest = request;
+        return { kind: "denied" };
+      },
+    });
+    const reply = captureReply();
+    await initialize(server, reply);
+
+    // overwrite mode → approval card → denied → no upstream call
+    const before = reply.sent.length;
+    await server.accept(
+      "tunnel-update-doc-deny",
+      encodeJson({
+        jsonrpc: "2.0",
+        id: 230,
+        method: "tools/call",
+        params: {
+          name: "feishu_update_doc",
+          arguments: {
+            doc_id: "doxcn_x",
+            mode: "overwrite",
+            markdown: "# replacement\n\nbody",
+          },
+        },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, "update doc denied");
+
+    assert.equal(upstreamCalls, 0);
+    assert.match(approvalRequest.summary, /OVERWRITE/);
+    assert.match(approvalRequest.summary, /doxcn_x/);
+    // Markdown preview included.
+    assert.match(approvalRequest.detail, /# replacement/);
+    const last = decodeJson(reply.sent[reply.sent.length - 1]);
+    assert.equal(last.result.isError, true);
+    assert.match(last.result.content[0].text, /denied the write/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("LarkMcpServer: feishu_update_doc skips approval for additive append mode", async () => {
+  const originalFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = async () => {
+    upstreamCalls++;
+    return {
+      ok: true,
+      status: 200,
+      async text() { return "{}"; },
+      async json() {
+        return { jsonrpc: "2.0", id: "x", result: { content: [] } };
+      },
+    };
+  };
+  try {
+    let approvalRequested = false;
+    const fakeAccessor = {
+      baseUrl: "https://open.feishu.cn",
+      async invoke(_req, handler) {
+        return { kind: "ok", result: await handler("uat") };
+      },
+    };
+    const channel = stubChannel(async () => ({}), {});
+    const server = new LarkMcpServer({
+      logger: noopLogger,
+      channelResolver: () => ({
+        kind: "ok",
+        channel,
+        chatId: "oc_x",
+        platformUserId: "ou_alice",
+        uatAccessor: fakeAccessor,
+      }),
+      approveWrite: async () => {
+        approvalRequested = true;
+        return { kind: "denied" };
+      },
+    });
+    const reply = captureReply();
+    await initialize(server, reply);
+
+    // append mode → no approval → upstream called.
+    const before = reply.sent.length;
+    await server.accept(
+      "tunnel-update-doc-append",
+      encodeJson({
+        jsonrpc: "2.0",
+        id: 231,
+        method: "tools/call",
+        params: {
+          name: "feishu_update_doc",
+          arguments: {
+            doc_id: "doxcn_x",
+            mode: "append",
+            markdown: "## addendum\n",
+          },
+        },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, "update doc append");
+
+    // No approval card requested for additive ops.
+    assert.equal(approvalRequested, false);
+    // Upstream call went through.
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {
   const channel = stubChannel(async (chatId) => ({ chatId, name: "X" }));
   const server = new LarkMcpServer({

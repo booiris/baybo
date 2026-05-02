@@ -1898,6 +1898,29 @@ export class LarkMcpServer {
             );
           }
         }
+        // Destructive modes (overwrite, replace_*, delete_range) gate
+        // behind in-chat approval — they can erase content the user
+        // didn't ask to lose. Additive modes (append, insert_*) skip
+        // the gate, since they only ADD content (still under the user's
+        // OAuth grant). task_id mode is async polling, not a write,
+        // so it skips too.
+        const isDestructive =
+          !args.task_id &&
+          (args.mode === "overwrite" ||
+            args.mode === "replace_all" ||
+            args.mode === "replace_range" ||
+            args.mode === "delete_range");
+        if (isDestructive) {
+          const summary = describeUpdateDoc(args);
+          const blocked = await this.gateWrite(extra, {
+            toolName: "feishu_update_doc",
+            summary,
+            ...(args.markdown !== undefined && {
+              detail: args.markdown.slice(0, 1500),
+            }),
+          });
+          if (blocked) return blocked;
+        }
         return this.callDocProxyTool(active, "update-doc", "feishu_update_doc", "update your Feishu doc", args);
       },
     );
@@ -2051,6 +2074,34 @@ function extractResolverInput(extra: unknown): LarkResolverInput {
   if (typeof m?.auraSessionId === "string") input.auraSessionId = m.auraSessionId;
   if (typeof m?.auraUserId === "string") input.auraUserId = m.auraUserId;
   return input;
+}
+
+/** One-line description for the `feishu_update_doc` approval card.
+ * Spells out which destructive mode the agent picked + the doc id +
+ * (for selection-based modes) the selection target so the user can
+ * sanity-check before approving. */
+function describeUpdateDoc(args: {
+  doc_id?: string | undefined;
+  mode: string;
+  selection_with_ellipsis?: string | undefined;
+  selection_by_title?: string | undefined;
+  new_title?: string | undefined;
+}): string {
+  const mode = args.mode;
+  let where = "";
+  if (args.selection_with_ellipsis !== undefined) {
+    where = ` at "${args.selection_with_ellipsis.slice(0, 80)}"`;
+  } else if (args.selection_by_title !== undefined) {
+    where = ` at heading "${args.selection_by_title.slice(0, 80)}"`;
+  }
+  const titleSuffix = args.new_title !== undefined ? ` (rename → "${args.new_title}")` : "";
+  if (mode === "overwrite" || mode === "replace_all") {
+    return `⚠️ ${mode.toUpperCase()} doc ${args.doc_id} — replaces the entire current contents${titleSuffix}.`;
+  }
+  if (mode === "delete_range") {
+    return `⚠️ DELETE_RANGE in doc ${args.doc_id}${where} — irreversible.`;
+  }
+  return `⚠️ ${mode.toUpperCase()} in doc ${args.doc_id}${where}${titleSuffix}.`;
 }
 
 /** Common Lark OAPI response shape. Tools whose handler unions
