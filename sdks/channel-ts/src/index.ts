@@ -26,7 +26,11 @@ export type {
   WireLogLevel,
   WireLogSink,
 } from "./logger.js";
-export type { AttachmentKind, WireAttachment } from "./wire.js";
+export type {
+  AttachmentKind,
+  ResourceAccess,
+  WireAttachment,
+} from "./wire.js";
 export {
   BlobPairingRequiredError,
   fetchBlob,

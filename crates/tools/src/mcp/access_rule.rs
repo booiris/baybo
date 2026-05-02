@@ -100,7 +100,21 @@ impl ResourceKind {
 )]
 pub enum CallLabelRule {
     None,
-    FromParam { param: String, max_chars: usize },
+    /// Take a string-typed `param` directly, truncate to `max_chars`.
+    /// Use for tools whose primary input is itself the user-meaningful
+    /// label (URL, expression, CDP method name, …).
+    FromParam {
+        param: String,
+        max_chars: usize,
+    },
+    /// Render `template` against the params via the same `{name}` /
+    /// `{name?then:else}` substitution the access-rule label uses.
+    /// Use for tools whose label needs ternary branching on a flag
+    /// (e.g. screenshot's "viewport" vs "full page") or static text
+    /// the params don't carry verbatim.
+    Template {
+        template: String,
+    },
 }
 
 /// Aura-specific block we look for inside the tool descriptor's
@@ -202,15 +216,31 @@ impl CallLabelRule {
                 .get(param)
                 .and_then(Value::as_str)
                 .map(|s| truncate_label(s, *max_chars)),
+            Self::Template { template } => {
+                let rendered = render_template(template, params);
+                if rendered.trim().is_empty() {
+                    None
+                } else {
+                    Some(rendered)
+                }
+            }
         }
     }
 }
 
-/// Plain `{name}` substitution against the params object. A missing
-/// key renders as empty string (callers that depended on an exact
-/// param value should have used `IfParamPresent` to gate the rule
-/// itself). No braces inside keys, no escaping — every existing
-/// browser-tool template is one-or-two flat substitutions.
+/// Substitution against the params object. Two forms inside `{ … }`:
+///
+/// * `{name}` — render the value at `params.name`. Missing or null
+///   renders empty. No nested braces, no escaping.
+/// * `{name?then:else}` — ternary on truthiness of `params.name`:
+///   `then` when truthy, `else` when falsy. Truthy = bool true,
+///   non-empty string, non-zero number, any object/array. Falsy =
+///   missing, null, bool false, empty string, zero. Used by tools
+///   whose label hinges on a boolean flag (e.g. screenshot's
+///   "viewport" vs "full page"). The `then` / `else` branches are
+///   plain literals — no nested substitution.
+///
+/// Bytes outside `{ … }` pass through unchanged.
 fn render_template(template: &str, params: &Value) -> String {
     let mut out = String::with_capacity(template.len());
     let bytes = template.as_bytes();
@@ -219,23 +249,45 @@ fn render_template(template: &str, params: &Value) -> String {
         if bytes[i] == b'{'
             && let Some(end_rel) = bytes[i + 1..].iter().position(|&b| b == b'}')
         {
-            let key = &template[i + 1..i + 1 + end_rel];
-            if let Some(v) = params.get(key) {
-                match v {
-                    Value::String(s) => out.push_str(s),
-                    Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-                    Value::Number(n) => out.push_str(&n.to_string()),
-                    Value::Null => {}
-                    other => out.push_str(&other.to_string()),
-                }
-            }
+            let inner = &template[i + 1..i + 1 + end_rel];
+            render_placeholder(inner, params, &mut out);
             i += 1 + end_rel + 1;
             continue;
         }
-        out.push(template[i..].chars().next().unwrap());
-        i += template[i..].chars().next().unwrap().len_utf8();
+        let ch = template[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
+}
+
+fn render_placeholder(inner: &str, params: &Value, out: &mut String) {
+    if let Some((name, rest)) = inner.split_once('?')
+        && let Some((then_branch, else_branch)) = rest.split_once(':')
+    {
+        let truthy = params.get(name).is_some_and(is_truthy);
+        out.push_str(if truthy { then_branch } else { else_branch });
+        return;
+    }
+    if let Some(v) = params.get(inner) {
+        match v {
+            Value::String(s) => out.push_str(s),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Number(n) => out.push_str(&n.to_string()),
+            Value::Null => {}
+            other => out.push_str(&other.to_string()),
+        }
+    }
+}
+
+fn is_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
 }
 
 fn truncate_label(s: &str, max: usize) -> String {
@@ -367,6 +419,56 @@ mod tests {
             rule.evaluate(&json!({ "expr": "abc" })),
             Some("abc".to_string())
         );
+    }
+
+    #[test]
+    fn template_ternary_branches_on_truthiness() {
+        let rule = AccessRule::Always {
+            resource: ResourceKind::ExecCommand,
+            label_template: "screenshot ({full_page?full page:viewport})".into(),
+        };
+        let r = rule.evaluate(&json!({ "full_page": true }));
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            ResourceAccess::ExecCommand { command } => {
+                assert_eq!(command, "screenshot (full page)");
+            }
+            other => panic!("expected ExecCommand, got {other:?}"),
+        }
+        let r = rule.evaluate(&json!({ "full_page": false }));
+        match &r[0] {
+            ResourceAccess::ExecCommand { command } => {
+                assert_eq!(command, "screenshot (viewport)");
+            }
+            other => panic!("expected ExecCommand, got {other:?}"),
+        }
+        let r = rule.evaluate(&json!({}));
+        match &r[0] {
+            ResourceAccess::ExecCommand { command } => {
+                assert_eq!(command, "screenshot (viewport)");
+            }
+            other => panic!("expected ExecCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_label_template_renders() {
+        let rule = CallLabelRule::Template {
+            template: "{full_page?full page:viewport}".into(),
+        };
+        assert_eq!(
+            rule.evaluate(&json!({ "full_page": true })),
+            Some("full page".to_string())
+        );
+        assert_eq!(rule.evaluate(&json!({})), Some("viewport".to_string()));
+    }
+
+    #[test]
+    fn call_label_template_empty_yields_none() {
+        let rule = CallLabelRule::Template {
+            template: "{missing}".into(),
+        };
+        assert_eq!(rule.evaluate(&json!({})), None);
     }
 
     #[test]

@@ -681,6 +681,7 @@ async function handleApproval(
       sessionId: frame.session_id,
       userId: frame.user_id ?? "",
       tool: frame.tool,
+      accesses: frame.accesses,
       paramsPreview: frame.params_preview,
       ...(frame.description != null ? { description: frame.description } : {}),
     });

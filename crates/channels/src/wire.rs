@@ -218,7 +218,6 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         user_id: String,
         tool: String,
-        #[cfg_attr(feature = "ts-export", ts(type = "unknown[]"))]
         accesses: Vec<ResourceAccess>,
         params_preview: String,
         /// Optional human-readable label the tool produced via

@@ -556,6 +556,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "ts-rs",
  "uuid",
 ]
 

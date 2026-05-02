@@ -3,8 +3,17 @@ name = "aura-model"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Emit ts-rs-generated TypeScript definitions for the wire-visible
+# subset of approval / message types into
+# `sdks/channel-ts/src/generated/`. Kept behind a feature so CI /
+# release builds don't depend on ts-rs.
+ts-export = ["dep:ts-rs"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+
+ts-rs = { workspace = true, optional = true }

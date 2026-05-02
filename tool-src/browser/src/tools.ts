@@ -216,7 +216,11 @@ export const TOOLS: BrowserToolDescriptor[] = [
       access_rule: {
         kind: "always",
         resource: "exec_command",
-        label_template: "browser_screenshot: {full_page}",
+        label_template: "browser_screenshot ({full_page?full page:viewport})",
+      },
+      call_label: {
+        kind: "template",
+        template: "{full_page?full page:viewport}",
       },
     }),
   },
