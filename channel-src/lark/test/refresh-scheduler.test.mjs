@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { UATStore } from "../dist/auth/uat-store.js";
 import { UATRefreshScheduler } from "../dist/auth/refresh-scheduler.js";
+import { UATMutex } from "../dist/auth/auto-auth.js";
 
 const noopLogger = {
   debug() {},
@@ -59,6 +60,7 @@ function buildScheduler(opts = {}) {
   const f = opts.fetch ?? fakeFetch(() => jsonResponse({}));
   const scheduler = new UATRefreshScheduler({
     store,
+    mutex: new UATMutex(),
     appId: "cli_xxx",
     appSecret: "sec_yyy",
     baseUrl: "https://open.feishu.cn",

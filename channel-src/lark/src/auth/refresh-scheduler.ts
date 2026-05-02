@@ -1,10 +1,16 @@
 import type { Logger } from "@aura/channel-sdk";
 
+import type { UATMutex } from "./auto-auth.js";
 import { refreshUAT } from "./device-flow.js";
 import type { StoredUAToken, UATStore } from "./uat-store.js";
 
 export interface UATRefreshSchedulerOptions {
   store: UATStore;
+  /** Per-user mutex shared with the auto-auth interceptor. Required
+   * even when no interceptor is wired (e.g. tests) — OAuth 2.1's
+   * one-time-use refresh tokens make a missing mutex a footgun the
+   * moment any other code path also refreshes. */
+  mutex: UATMutex;
   appId: string;
   appSecret: string;
   baseUrl: string;
@@ -128,29 +134,48 @@ export class UATRefreshScheduler {
     const errors: { userOpenId: string; error: string }[] = [];
 
     for (const userOpenId of users) {
-      const stored = await this.opts.store.get(userOpenId);
-      if (!stored) continue;
-
-      // Refresh-token already dead — drop the UAT so the next tool
-      // call triggers a fresh device-flow auth.
-      if (stored.refreshExpiresAt <= now) {
-        await this.opts.store.delete(userOpenId);
-        expired.push(userOpenId);
-        continue;
-      }
-      // No refresh_token at all (Lark sometimes omits one) — leave it
-      // be; it'll be cleaned up when the access_token finally expires
-      // and a tool call reports 99991664.
-      if (stored.refreshToken.length === 0) continue;
-      // Not yet inside the refresh window.
-      if (stored.expiresAt - now > this.refreshAheadMs) continue;
-
-      const outcome = await this.refreshOne(userOpenId, stored);
+      // Hold the per-user mutex while we look + refresh + write so
+      // an on-demand auto-auth interceptor on the same user can't
+      // race us into invalid_grant.
+      const outcome = await this.opts.mutex.withLock(userOpenId, () =>
+        this.refreshOneIfDue(userOpenId, now),
+      );
+      if (outcome.kind === "skipped") continue;
       if (outcome.kind === "refreshed") refreshed.push(userOpenId);
       else if (outcome.kind === "expired") expired.push(userOpenId);
       else errors.push({ userOpenId, error: outcome.error });
     }
     return { scanned: users.length, refreshed, expired, errors };
+  }
+
+  private async refreshOneIfDue(
+    userOpenId: string,
+    now: number,
+  ): Promise<
+    | { kind: "skipped" }
+    | { kind: "refreshed" }
+    | { kind: "expired" }
+    | { kind: "error"; error: string }
+  > {
+    const stored = await this.opts.store.get(userOpenId);
+    if (!stored) return { kind: "skipped" };
+
+    // Refresh-token already dead — drop the UAT so the next tool
+    // call triggers a fresh device-flow auth.
+    if (stored.refreshExpiresAt <= now) {
+      await this.opts.store.delete(userOpenId);
+      return { kind: "expired" };
+    }
+    // No refresh_token at all (Lark sometimes omits one) — leave it
+    // be; it'll be cleaned up when the access_token finally expires
+    // and a tool call reports 99991664.
+    if (stored.refreshToken.length === 0) return { kind: "skipped" };
+    // Not yet inside the refresh window — interceptor refreshed
+    // proactively, or the timer fired before expiry; either way
+    // we have nothing to do this sweep.
+    if (stored.expiresAt - now > this.refreshAheadMs) return { kind: "skipped" };
+
+    return await this.refreshOne(userOpenId, stored);
   }
 
   private async refreshOne(
