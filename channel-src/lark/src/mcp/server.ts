@@ -133,6 +133,43 @@ export class LarkMcpServer {
     }
   }
 
+  private resolveActive(extra: unknown):
+    | {
+        ok: true;
+        channel: lark.LarkChannel;
+        chatId: string;
+        platformUserId: string;
+      }
+    | {
+        ok: false;
+        reply: { content: { type: "text"; text: string }[]; isError: true };
+      } {
+    const input = extractResolverInput(extra);
+    const resolution = this.opts.channelResolver(input);
+    if (resolution.kind === "none") {
+      return {
+        ok: false,
+        reply: toolError(
+          "no active Lark conversation for this session; the agent must have processed at least one inbound Feishu message before this tool can run",
+        ),
+      };
+    }
+    if (resolution.kind === "ambiguous") {
+      return {
+        ok: false,
+        reply: toolError(
+          `multi-bot routing requires an \`auraBotId\` on the call (${resolution.bot_count} bots live); none was provided and we will not silently pick one`,
+        ),
+      };
+    }
+    return {
+      ok: true,
+      channel: resolution.channel,
+      chatId: resolution.chatId,
+      platformUserId: resolution.platformUserId,
+    };
+  }
+
   private async openSession(reply: McpReplyHandle): Promise<TunnelSession> {
     const transport = new TunnelMcpTransport(reply);
     const server = new McpServer(
@@ -154,40 +191,154 @@ export class LarkMcpServer {
         inputSchema: {},
       },
       async (_args, extra) => {
-        const input = extractResolverInput(extra);
-        const resolution = this.opts.channelResolver(input);
-        if (resolution.kind === "none") {
-          return toolError(
-            "no active Lark conversation for this session; the agent must have processed at least one inbound Feishu message before this tool can run",
-          );
-        }
-        if (resolution.kind === "ambiguous") {
-          return toolError(
-            `multi-bot routing requires an \`auraBotId\` on the call (${resolution.bot_count} bots live); none was provided and we will not silently pick one`,
-          );
-        }
-        const { channel, chatId } = resolution;
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        const { channel, chatId } = active;
         try {
           const info = await channel.getChatInfo(chatId);
           return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(info, null, 2),
-              },
-            ],
+            content: [{ type: "text", text: JSON.stringify(info, null, 2) }],
           };
         } catch (err) {
           this.opts.logger.debug(
             `feishu_get_chat_info failed for chat=${chatId}: ${String(err)}`,
           );
-          return toolError(
-            err instanceof Error ? err.message : String(err),
-          );
+          return toolError(err instanceof Error ? err.message : String(err));
         }
       },
     );
 
+    server.registerTool(
+      "feishu_list_chat_members",
+      {
+        title: "List members of the current Feishu chat",
+        description:
+          "Return members of the Feishu chat the user is currently messaging the agent in: name + user id per member, plus a cursor for pagination. Useful for grounding the agent in who's in the room (group composition, attribution). The Feishu API excludes bots from the result by contract. Bound to the active conversation — does NOT accept an arbitrary chat id (Codex review).",
+        inputSchema: {
+          member_id_type: z
+            .enum(["open_id", "union_id", "user_id"])
+            .optional()
+            .describe(
+              "Which user-id flavour to return per member. Defaults to open_id, matching the suffix in `_meta.auraUserId`.",
+            ),
+          page_size: z
+            .number()
+            .int()
+            .min(1)
+            .max(100)
+            .optional()
+            .describe("Page size, default 20, hard cap 100."),
+          page_token: z
+            .string()
+            .optional()
+            .describe(
+              "Cursor from a prior call's `page_token`. Omit on the first call; `has_more=false` means you've drained the list.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        const { channel, chatId } = active;
+        try {
+          const res = await channel.rawClient.im.v1.chatMembers.get({
+            path: { chat_id: chatId },
+            params: {
+              member_id_type: args.member_id_type ?? "open_id",
+              ...(args.page_size !== undefined && { page_size: args.page_size }),
+              ...(args.page_token !== undefined && {
+                page_token: args.page_token,
+              }),
+            },
+          });
+          if (typeof res.code === "number" && res.code !== 0) {
+            return toolError(
+              `Feishu API error ${res.code}: ${res.msg ?? "unknown"}`,
+            );
+          }
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(res.data ?? {}, null, 2) },
+            ],
+          };
+        } catch (err) {
+          this.opts.logger.debug(
+            `feishu_list_chat_members failed for chat=${chatId}: ${String(err)}`,
+          );
+          return toolError(err instanceof Error ? err.message : String(err));
+        }
+      },
+    );
+
+    server.registerTool(
+      "feishu_get_chat_history",
+      {
+        title: "Read recent messages from the current Feishu chat",
+        description:
+          "Return up to `limit` recent messages from the Feishu chat the user is currently messaging the agent in. The bot must already be a member of the chat. Bound to the active conversation — does NOT accept an arbitrary chat id, so a paired user can't coax the agent to read history from another chat the bot happens to be in. Returns messages in raw Feishu shape (msg_type + body.content as a JSON string per type); the agent should parse content based on msg_type. For long histories, drive pagination via `page_token` from the previous response.",
+        inputSchema: {
+          limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(50)
+            .optional()
+            .describe(
+              "Cap on messages returned this call. Default 20, hard cap 50 to keep payload bounded — paginate via `page_token` for more.",
+            ),
+          sort_type: z
+            .enum(["ByCreateTimeAsc", "ByCreateTimeDesc"])
+            .optional()
+            .describe(
+              "Order. Defaults to `ByCreateTimeDesc` (newest first) — usually what you want for context grounding.",
+            ),
+          page_token: z
+            .string()
+            .optional()
+            .describe(
+              "Cursor from a prior call's `page_token`. Omit on first call.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        const { channel, chatId } = active;
+        try {
+          const res = await channel.rawClient.im.v1.message.list({
+            params: {
+              container_id_type: "chat",
+              container_id: chatId,
+              sort_type: args.sort_type ?? "ByCreateTimeDesc",
+              page_size: args.limit ?? 20,
+              ...(args.page_token !== undefined && {
+                page_token: args.page_token,
+              }),
+            },
+          });
+          if (typeof res.code === "number" && res.code !== 0) {
+            return toolError(
+              `Feishu API error ${res.code}: ${res.msg ?? "unknown"}`,
+            );
+          }
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(res.data ?? {}, null, 2) },
+            ],
+          };
+        } catch (err) {
+          this.opts.logger.debug(
+            `feishu_get_chat_history failed for chat=${chatId}: ${String(err)}`,
+          );
+          return toolError(err instanceof Error ? err.message : String(err));
+        }
+      },
+    );
+
+    this.registerAskUser(server);
+  }
+
+  private registerAskUser(server: McpServer): void {
     server.registerTool(
       "feishu_ask_user",
       {

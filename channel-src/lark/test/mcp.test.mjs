@@ -47,11 +47,33 @@ async function waitFor(predicate, label, ticks = 50) {
   throw new Error(`waitFor: ${label} did not become true within ${ticks} ticks`);
 }
 
-function stubChannel(getChatInfoImpl) {
+function stubChannel(getChatInfoImpl, rawApi) {
   return {
     botIdentity: { name: "AuraBot", openId: "ou_bot" },
     async getChatInfo(chatId) {
       return getChatInfoImpl(chatId);
+    },
+    rawClient: {
+      im: {
+        v1: {
+          chatMembers: {
+            async get(payload) {
+              if (!rawApi?.chatMembersGet) {
+                throw new Error("chatMembers.get stub not configured");
+              }
+              return rawApi.chatMembersGet(payload);
+            },
+          },
+          message: {
+            async list(payload) {
+              if (!rawApi?.messageList) {
+                throw new Error("message.list stub not configured");
+              }
+              return rawApi.messageList(payload);
+            },
+          },
+        },
+      },
     },
   };
 }
@@ -81,7 +103,7 @@ async function initialize(server, reply, tunnelId = "tunnel-init") {
   );
 }
 
-test("LarkMcpServer: tools/list advertises feishu_get_chat_info", async () => {
+test("LarkMcpServer: tools/list advertises the registered tool surface", async () => {
   let resolverCalls = 0;
   const server = new LarkMcpServer({
     logger: noopLogger,
@@ -105,7 +127,12 @@ test("LarkMcpServer: tools/list advertises feishu_get_chat_info", async () => {
   assert.equal(last.id, 2);
   assert.ok(last.result, `expected result, got ${JSON.stringify(last)}`);
   const toolNames = last.result.tools.map((t) => t.name).sort();
-  assert.deepEqual(toolNames, ["feishu_ask_user", "feishu_get_chat_info"]);
+  assert.deepEqual(toolNames, [
+    "feishu_ask_user",
+    "feishu_get_chat_history",
+    "feishu_get_chat_info",
+    "feishu_list_chat_members",
+  ]);
   // tools/list never resolves a channel — the resolver only fires on
   // tools/call.
   assert.equal(resolverCalls, 0);
@@ -575,6 +602,199 @@ test("LarkMcpServer: feishu_ask_user timeout surfaces structured tool error", as
   assert.equal(last.id, 13);
   assert.equal(last.result.isError, true);
   assert.match(last.result.content[0].text, /timed out after 30s/);
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_list_chat_members routes through rawClient with the resolved chat", async () => {
+  let receivedPayload = null;
+  const channel = stubChannel(
+    async () => ({}),
+    {
+      async chatMembersGet(payload) {
+        receivedPayload = payload;
+        return {
+          code: 0,
+          msg: "ok",
+          data: {
+            items: [
+              { member_id_type: "open_id", member_id: "ou_a", name: "Alice" },
+              { member_id_type: "open_id", member_id: "ou_b", name: "Bob" },
+            ],
+            has_more: false,
+            member_total: 2,
+          },
+        };
+      },
+    },
+  );
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_resolved",
+      platformUserId: "ou_alice",
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-members",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: {
+        name: "feishu_list_chat_members",
+        // The LLM hallucinates an unrelated chat id — the tool must
+        // ignore it and bind to the resolver's `oc_resolved`.
+        arguments: { chat_id: "oc_other", page_size: 50 },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "list_chat_members reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 21);
+  assert.equal(last.result.isError, undefined);
+  // Tool ignored the LLM-supplied chat id — bound to the resolved chat.
+  assert.equal(receivedPayload.path.chat_id, "oc_resolved");
+  assert.equal(receivedPayload.params.member_id_type, "open_id");
+  // page_size came through; page_token absent stayed absent (omitted).
+  assert.equal(receivedPayload.params.page_size, 50);
+  assert.equal("page_token" in receivedPayload.params, false);
+
+  const parsed = JSON.parse(last.result.content[0].text);
+  assert.equal(parsed.member_total, 2);
+  assert.equal(parsed.items[0].name, "Alice");
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_list_chat_members surfaces non-zero Feishu API codes as tool errors", async () => {
+  const channel = stubChannel(
+    async () => ({}),
+    {
+      async chatMembersGet() {
+        return { code: 230002, msg: "bot is not in the chat", data: {} };
+      },
+    },
+  );
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_no_bot",
+      platformUserId: "ou_alice",
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-members-err",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: { name: "feishu_list_chat_members", arguments: {} },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "list_chat_members err reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 22);
+  assert.equal(last.result.isError, true);
+  assert.match(
+    last.result.content[0].text,
+    /Feishu API error 230002.*bot is not in the chat/,
+  );
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_get_chat_history binds container_id to the resolved chat", async () => {
+  let receivedPayload = null;
+  const channel = stubChannel(
+    async () => ({}),
+    {
+      async messageList(payload) {
+        receivedPayload = payload;
+        return {
+          code: 0,
+          data: {
+            has_more: true,
+            page_token: "pt_next",
+            items: [
+              {
+                message_id: "om_1",
+                msg_type: "text",
+                body: { content: "{\"text\":\"hi\"}" },
+                sender: {
+                  id: "ou_alice",
+                  id_type: "open_id",
+                  sender_type: "user",
+                },
+                create_time: "1700000000000",
+              },
+            ],
+          },
+        };
+      },
+    },
+  );
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_history",
+      platformUserId: "ou_alice",
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-history",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 23,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_chat_history",
+        arguments: {
+          // LLM tries to override container — must be ignored.
+          container_id: "oc_other",
+          limit: 5,
+          sort_type: "ByCreateTimeAsc",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "get_chat_history reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 23);
+  assert.equal(last.result.isError, undefined);
+  // Bound to resolver's chat, not the LLM's `container_id` arg.
+  assert.equal(receivedPayload.params.container_id, "oc_history");
+  assert.equal(receivedPayload.params.container_id_type, "chat");
+  assert.equal(receivedPayload.params.page_size, 5);
+  assert.equal(receivedPayload.params.sort_type, "ByCreateTimeAsc");
+
+  const parsed = JSON.parse(last.result.content[0].text);
+  assert.equal(parsed.page_token, "pt_next");
+  assert.equal(parsed.items[0].message_id, "om_1");
 
   await server.shutdown();
 });
