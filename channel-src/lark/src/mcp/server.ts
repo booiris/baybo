@@ -73,6 +73,29 @@ export type LarkAskUserHandler = (
   timeoutMs: number,
 ) => Promise<LarkAskUserResult>;
 
+export interface LarkWriteApprovalRequest {
+  toolName: string;
+  /** Plain-English one-liner of what the tool wants to do — feeds
+   * the approval card body. Build at the call site, the platform
+   * doesn't synthesise it. */
+  summary: string;
+  /** Optional richer block (e.g. listing the records that will be
+   * created). The card builder fences it as code. */
+  detail?: string;
+}
+
+export type LarkWriteApprovalResult =
+  | { kind: "approved" }
+  | { kind: "denied" }
+  | { kind: "timeout" }
+  | { kind: "no_context" };
+
+export type LarkWriteApprovalHandler = (
+  input: LarkResolverInput,
+  request: LarkWriteApprovalRequest,
+  timeoutMs: number,
+) => Promise<LarkWriteApprovalResult>;
+
 export interface LarkMcpServerOpts {
   logger: Logger;
   channelResolver: LarkChannelResolver;
@@ -85,6 +108,22 @@ export interface LarkMcpServerOpts {
    * surfaces `no_context` so the tool still returns a clean error.
    */
   askUser?: LarkAskUserHandler;
+  /**
+   * Per-call write-approval gate for destructive MCP write tools.
+   * Sends an interactive [Approve] [Deny] card into the active
+   * Lark conversation, waits for the user's click (or timeout).
+   *
+   * Tools that mutate state (delete event, overwrite doc, batch
+   * create records) MUST gate behind this — without it, the OAuth
+   * grant lets the agent execute any write the user has scope for,
+   * which violates the user's intent (they authorised "use my Lark
+   * surfaces", not "every write the LLM hallucinates is fine").
+   *
+   * Optional: tests can omit it; tools that hit `approveWrite`
+   * without a configured handler treat it as `no_context` and
+   * refuse to execute (fail closed — never silently bypass).
+   */
+  approveWrite?: LarkWriteApprovalHandler;
 }
 
 interface TunnelSession {
@@ -139,6 +178,44 @@ export class LarkMcpServer {
       await s.server.close().catch(() => undefined);
       await s.transport.close().catch(() => undefined);
     }
+  }
+
+  /** Gate a destructive MCP write tool behind an in-chat approval
+   * card. Returns `null` when the user approved (caller proceeds);
+   * otherwise returns a rendered tool error explaining the outcome.
+   *
+   * Default timeout 5 minutes — wider than `feishu_ask_user`'s 5min
+   * default because approving a write is a heavier decision than
+   * answering a clarification.
+   *
+   * If the platform didn't wire `approveWrite`, this fails closed
+   * with a clear message — the tool MUST NOT proceed. */
+  private async gateWrite(
+    extra: unknown,
+    request: LarkWriteApprovalRequest,
+    timeoutMs = 300_000,
+  ): Promise<{ content: { type: "text"; text: string }[]; isError: true } | null> {
+    if (!this.opts.approveWrite) {
+      return toolError(
+        `${request.toolName} requires an in-chat approval gate but the platform didn't configure one — refusing to write blind`,
+      );
+    }
+    const input = extractResolverInput(extra);
+    const result = await this.opts.approveWrite(input, request, timeoutMs);
+    if (result.kind === "approved") return null;
+    if (result.kind === "denied") {
+      return toolError(
+        `${request.toolName}: the user denied the write — do NOT retry; ask them to clarify what they want differently before trying anything else`,
+      );
+    }
+    if (result.kind === "timeout") {
+      return toolError(
+        `${request.toolName}: approval card timed out after ${Math.round(timeoutMs / 1000)}s with no response — fall back to a non-destructive alternative or ask the user again with a clearer summary`,
+      );
+    }
+    return toolError(
+      `${request.toolName}: no Lark conversation context for the approval card; the agent must have processed at least one inbound Feishu message before a write tool can run`,
+    );
   }
 
   /** Run a UAT-requiring Lark API call through the accessor + render

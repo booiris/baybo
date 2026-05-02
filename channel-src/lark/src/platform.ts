@@ -28,6 +28,13 @@ import {
 } from "./auth/credentials.js";
 import { UATRefreshScheduler } from "./auth/refresh-scheduler.js";
 import { UATStore } from "./auth/uat-store.js";
+import {
+  buildResolvedWriteApprovalCard,
+  buildWriteApprovalCard,
+  parseWriteApprovalCardValue,
+  type WriteApprovalCardOpts,
+  type WriteApprovalDecision,
+} from "./messaging/write-approval.js";
 import { Semaphore } from "./concurrency.js";
 import { LarkMcpServer } from "./mcp/server.js";
 import { downloadResourceAsAttachment } from "./media/inbound.js";
@@ -114,6 +121,23 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  // Per-call write-approval waiters keyed by `call_id` (UUID minted
+  // per `approveWrite`). Card actions tagged `aura: "mcp_write"` route
+  // here from `handleCardAction`. Only the originating user's clicks
+  // count — cross-user taps in a group chat are silently ignored, so
+  // a coworker can't approve someone else's destructive write.
+  private readonly pendingApprovals = new Map<
+    string,
+    {
+      botId: string;
+      triggererOpenId: string;
+      cardMessageId: string;
+      handle: lark.LarkChannel;
+      request: WriteApprovalCardOpts;
+      resolve: (decision: WriteApprovalDecision) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
 
   constructor(
     private readonly logger: Logger,
@@ -169,6 +193,8 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       },
       askUser: (input, prompt, timeoutMs) =>
         this.askUser(input, prompt, timeoutMs),
+      approveWrite: (input, request, timeoutMs) =>
+        this.approveWrite(input, request, timeoutMs),
     });
   }
 
@@ -240,6 +266,129 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
         timer,
       });
     });
+  }
+
+  /** Send an interactive [Approve] [Deny] card into the active
+   * conversation and wait up to `timeoutMs` for the originating
+   * user's click. Per-call (not per-session) so the user can refuse
+   * specific destructive ops even after granting OAuth.
+   *
+   * Only the user who started the conversation can resolve the card
+   * — taps from other users in a group chat are silently ignored
+   * (mirrors `LarkApprovals` operator-filter for bash approvals,
+   * stops a coworker from rubber-stamping someone else's writes). */
+  async approveWrite(
+    input: { auraUserId?: string; auraBotId?: string },
+    request: {
+      toolName: string;
+      summary: string;
+      detail?: string;
+    },
+    timeoutMs: number,
+  ): Promise<
+    | { kind: "approved" }
+    | { kind: "denied" }
+    | { kind: "timeout" }
+    | { kind: "no_context" }
+  > {
+    if (!input.auraUserId) return { kind: "no_context" };
+    const ctx = this.contextByAuraUser.get(input.auraUserId);
+    if (!ctx) return { kind: "no_context" };
+    if (input.auraBotId && input.auraBotId !== ctx.botId) {
+      return { kind: "no_context" };
+    }
+    const state = this.bots.get(ctx.botId);
+    if (!state) return { kind: "no_context" };
+
+    const callId = `mcpw_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const cardOpts: WriteApprovalCardOpts = {
+      callId,
+      toolName: request.toolName,
+      summary: request.summary,
+      ...(request.detail !== undefined && { detail: request.detail }),
+    };
+    let cardMessageId: string;
+    try {
+      const result = await state.handle.send(ctx.chatId, {
+        card: buildWriteApprovalCard(cardOpts),
+      });
+      cardMessageId = result.messageId;
+    } catch (err) {
+      this.logger.warn(
+        `lark approveWrite: card send failed bot=${ctx.botId} chat=${ctx.chatId} tool=${request.toolName}: ${String(err)}`,
+      );
+      return { kind: "timeout" };
+    }
+
+    return await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const entry = this.pendingApprovals.get(callId);
+        if (!entry) return;
+        this.pendingApprovals.delete(callId);
+        // Best-effort terminal edit so the card doesn't dangle as a
+        // pending prompt forever — mark it as expired.
+        void state.handle
+          .updateCard(
+            entry.cardMessageId,
+            buildResolvedWriteApprovalCard(entry.request, "deny"),
+          )
+          .catch(() => undefined);
+        resolve({ kind: "timeout" });
+      }, timeoutMs);
+
+      this.pendingApprovals.set(callId, {
+        botId: ctx.botId,
+        triggererOpenId: ctx.platformUserId,
+        cardMessageId,
+        handle: state.handle,
+        request: cardOpts,
+        resolve: (decision) =>
+          resolve(decision === "approve" ? { kind: "approved" } : { kind: "denied" }),
+        timer,
+      });
+    });
+  }
+
+  /** Try to resolve `ev` as an MCP write-approval click. Returns
+   * true if the event was an MCP-write tap (so the caller skips the
+   * bash-approval pipeline) — false otherwise.
+   *
+   * Only the originating user's clicks count; cross-user taps in a
+   * group chat are ignored so a coworker can't approve someone
+   * else's destructive write.
+   *
+   * Tagged `aura: "mcp_write"` ≠ bash's `aura: "approval"`, so the
+   * bash-approval handler can stay narrow without being aware of
+   * MCP writes. */
+  private dispatchWriteApproval(ev: lark.CardActionEvent): boolean {
+    const value = parseWriteApprovalCardValue(ev.action.value);
+    if (!value) return false;
+    const entry = this.pendingApprovals.get(value.callId);
+    if (!entry) {
+      // Card already resolved or expired. Surface as handled so the
+      // bash-approval handler doesn't try to route it.
+      return true;
+    }
+    if (ev.operator.openId !== entry.triggererOpenId) {
+      this.logger.debug(
+        `lark approveWrite: tap from ${ev.operator.openId} ignored — only ${entry.triggererOpenId} may resolve call=${value.callId}`,
+      );
+      return true;
+    }
+    clearTimeout(entry.timer);
+    this.pendingApprovals.delete(value.callId);
+    entry.resolve(value.decision);
+    void entry.handle
+      .updateCard(
+        entry.cardMessageId,
+        buildResolvedWriteApprovalCard(entry.request, value.decision),
+      )
+      .catch((err) => {
+        this.logger.debug(
+          `lark approveWrite: terminal card update failed call=${value.callId}: ${String(err)}`,
+        );
+      });
+    return true;
   }
 
   async onAgentMcpEnvelope(
@@ -345,6 +494,15 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
         // flow so the sidecar can exit cleanly.
         await state.uat.scheduler.stop();
         state.uat.authFlow.cancelAll();
+      }
+      // Resolve any pending write-approval cards for this bot as
+      // `denied` so the in-flight tool calls unwind cleanly instead
+      // of hanging on a timer that survives bot teardown.
+      for (const [callId, entry] of this.pendingApprovals) {
+        if (entry.botId !== botId) continue;
+        clearTimeout(entry.timer);
+        this.pendingApprovals.delete(callId);
+        entry.resolve("deny");
       }
       this.purgeBotStreams(botId);
       this.bots.delete(botId);
@@ -493,7 +651,15 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
         downloadSlots,
       ),
     );
-    channel.on("cardAction", (ev) => this.approvals.handleCardAction(ev));
+    channel.on("cardAction", (ev) => {
+      // MCP write-approval cards carry `aura: "mcp_write"`; route those
+      // here. Bash approval cards carry `aura: "approval"` and continue
+      // to the existing approvals pipeline. Other action shapes fall
+      // through (silent — Lark dispatches every cardAction event to
+      // every handler).
+      if (this.dispatchWriteApproval(ev)) return;
+      this.approvals.handleCardAction(ev);
+    });
     // The SDK fires `error` for outbound failures (rate_limited,
     // format_error, ssrf_blocked, …) and reconnect exhaustion. None of
     // them mean "the bot is dead" — the WSClient handles transient WS

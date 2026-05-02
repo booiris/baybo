@@ -34,6 +34,8 @@ export function buildAuthPendingCard(opts: AuthPendingCardOpts): object {
   const lines = [
     `Aura needs your authorization to ${opts.reason}.`,
     "",
+    `Granting will let Aura **read and write** the Feishu surfaces it has scope for (calendar, docs, bitable, etc.) on your behalf for the lifetime of the token. Destructive writes (delete, overwrite) require an extra in-chat confirmation per call.`,
+    "",
     `Tap **Authorize** to open the Feishu sign-in page (or visit ${opts.verificationUri} and enter the code below). This page expires in ~${minutesLeft} minute${minutesLeft === 1 ? "" : "s"}.`,
     "",
     `**Code:** \`${opts.userCode}\``,
