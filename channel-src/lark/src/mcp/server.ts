@@ -1277,7 +1277,187 @@ export class LarkMcpServer {
     );
 
     this.registerDocProxyTools(server);
+    this.registerWriteTools(server);
     this.registerAskUser(server);
+  }
+
+  /** Destructive write tools — every one of these gates behind
+   * `gateWrite` (in-chat [Approve] [Deny] card) before touching
+   * Lark. The OAuth grant lets the UAT execute any write the user
+   * has scope for; the approval card is the per-call veto so the
+   * agent can't act blind on its broad authorisation. */
+  private registerWriteTools(server: McpServer): void {
+    server.registerTool(
+      "feishu_calendar_event_create",
+      {
+        title: "Create a Feishu calendar event",
+        description:
+          "Create a new event on a Feishu calendar (the user's primary, or a shared calendar they have writer/owner role on). REQUIRES IN-CHAT APPROVAL — the user sees a card with the event summary + time and must click Approve before the event is created. Use ISO 8601 timestamps as Unix-millis-strings (Lark's quirk). Skip the `attendees` field unless you specifically want notifications sent — most clarification flows are easier in chat than via calendar invite.",
+        inputSchema: {
+          calendar_id: z
+            .string()
+            .min(1)
+            .describe(
+              "Calendar id from `feishu_calendar action=primary` or `action=list`. Must be a calendar the user has writer/owner role on.",
+            ),
+          summary: z.string().min(1).max(200).describe("Event title (visible in the calendar grid)."),
+          description: z
+            .string()
+            .max(10_000)
+            .optional()
+            .describe("Optional event body / agenda. Plain text or basic Markdown."),
+          start_timestamp: z
+            .string()
+            .min(1)
+            .describe(
+              "Start time as a Unix-seconds-or-milliseconds string (Lark accepts both as the `timestamp` field). Use the user's local timezone unless they specify otherwise.",
+            ),
+          end_timestamp: z
+            .string()
+            .min(1)
+            .describe("End time, same format as start_timestamp."),
+          timezone: z
+            .string()
+            .optional()
+            .describe(
+              "IANA timezone (e.g. `Asia/Shanghai`, `America/Los_Angeles`). Default: Lark's user-account timezone.",
+            ),
+          attendees: z
+            .array(z.string().min(1))
+            .max(20)
+            .optional()
+            .describe(
+              "List of user open_ids to invite. Leave empty for personal events — the user can add attendees in Lark UI faster than the agent can. Max 20 to bound notification fan-out.",
+            ),
+          visibility: z
+            .enum(["default", "public", "private"])
+            .optional()
+            .describe("Event visibility on the calendar. Default uses the calendar's default."),
+          need_notification: z
+            .boolean()
+            .optional()
+            .describe(
+              "Whether attendees receive notifications. Default true. Set false for batch-imports or test events.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (!active.uatAccessor) {
+          return toolError(
+            "feishu_calendar_event_create requires UAT but the bot's OAuth pipeline isn't configured for this session",
+          );
+        }
+        const summary = `Create event "${args.summary}" from ts=${args.start_timestamp} to ts=${args.end_timestamp}${args.timezone ? ` (${args.timezone})` : ""} on calendar ${args.calendar_id}`;
+        const detail = [
+          args.description ? `description: ${args.description.slice(0, 400)}` : null,
+          args.attendees && args.attendees.length > 0
+            ? `attendees: ${args.attendees.length} users (${args.attendees.slice(0, 5).join(", ")}${args.attendees.length > 5 ? ", ..." : ""})`
+            : null,
+        ]
+          .filter((v) => v !== null)
+          .join("\n");
+        const blocked = await this.gateWrite(extra, {
+          toolName: "feishu_calendar_event_create",
+          summary,
+          ...(detail.length > 0 && { detail }),
+        });
+        if (blocked) return blocked;
+
+        return this.runUatTool({
+          active,
+          toolName: "feishu_calendar_event_create",
+          reason: "create the calendar event you approved",
+          handler: (uat) =>
+            active.channel.rawClient.calendar.calendarEvent.create(
+              {
+                path: { calendar_id: args.calendar_id },
+                data: {
+                  summary: args.summary,
+                  ...(args.description !== undefined && { description: args.description }),
+                  start_time: {
+                    timestamp: args.start_timestamp,
+                    ...(args.timezone !== undefined && { timezone: args.timezone }),
+                  },
+                  end_time: {
+                    timestamp: args.end_timestamp,
+                    ...(args.timezone !== undefined && { timezone: args.timezone }),
+                  },
+                  ...(args.visibility !== undefined && { visibility: args.visibility }),
+                  ...(args.need_notification !== undefined && {
+                    need_notification: args.need_notification,
+                  }),
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_calendar_event_delete",
+      {
+        title: "Delete a Feishu calendar event",
+        description:
+          "Delete an event from the user's calendar. REQUIRES IN-CHAT APPROVAL — the user sees the event id + summary on a card and must click Approve. Irreversible; recurring events are deleted in their entirety (use a different mechanism for single-occurrence cancellation if Lark exposes one). Use `feishu_calendar_event action=get` first to fetch the event details for the approval card.",
+        inputSchema: {
+          calendar_id: z.string().min(1).describe("Calendar id."),
+          event_id: z.string().min(1).describe("Event id to delete."),
+          summary: z
+            .string()
+            .max(200)
+            .optional()
+            .describe(
+              "Optional event title — included in the approval card so the user can sanity-check what's being deleted. Highly recommended to fetch via `feishu_calendar_event action=get` first.",
+            ),
+          need_notification: z
+            .boolean()
+            .optional()
+            .describe(
+              "Whether attendees receive a deletion notification. Default true.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (!active.uatAccessor) {
+          return toolError(
+            "feishu_calendar_event_delete requires UAT but the bot's OAuth pipeline isn't configured for this session",
+          );
+        }
+        const labelled = args.summary ? `"${args.summary}"` : "event";
+        const summary = `⚠️ DELETE ${labelled} (event_id=${args.event_id}) from calendar ${args.calendar_id}. This is irreversible.`;
+        const blocked = await this.gateWrite(extra, {
+          toolName: "feishu_calendar_event_delete",
+          summary,
+        });
+        if (blocked) return blocked;
+
+        return this.runUatTool({
+          active,
+          toolName: "feishu_calendar_event_delete",
+          reason: "delete the calendar event you approved",
+          handler: (uat) =>
+            active.channel.rawClient.calendar.calendarEvent.delete(
+              {
+                path: {
+                  calendar_id: args.calendar_id,
+                  event_id: args.event_id,
+                },
+                params: {
+                  ...(args.need_notification !== undefined && {
+                    need_notification: args.need_notification ? "true" : "false",
+                  }),
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
   }
 
   /** Three doc tools that proxy through Feishu's hosted MCP gateway

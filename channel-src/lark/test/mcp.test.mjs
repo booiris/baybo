@@ -95,6 +95,12 @@ function stubChannel(getChatInfoImpl, rawApi) {
           async get(payload, opts) {
             return rawApi?.eventGet?.(payload, opts) ?? { code: 0, data: {} };
           },
+          async create(payload, opts) {
+            return rawApi?.eventCreate?.(payload, opts) ?? { code: 0, data: {} };
+          },
+          async delete(payload, opts) {
+            return rawApi?.eventDelete?.(payload, opts) ?? { code: 0, data: {} };
+          },
         },
         freebusy: {
           async list(payload, opts) {
@@ -223,6 +229,8 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_bitable_records",
     "feishu_calendar",
     "feishu_calendar_event",
+    "feishu_calendar_event_create",
+    "feishu_calendar_event_delete",
     "feishu_create_doc",
     "feishu_doc_comments",
     "feishu_fetch_doc",
@@ -2222,6 +2230,241 @@ test("LarkMcpServer: feishu_update_doc enforces selection requirement for range 
     last.result.content[0].text,
     /requires exactly one of.*selection_with_ellipsis.*selection_by_title/,
   );
+});
+
+test("LarkMcpServer: feishu_calendar_event_create proceeds only when approveWrite returns approved", async () => {
+  let createCalls = 0;
+  let approvalRequest = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async eventCreate(payload) {
+      createCalls++;
+      return {
+        code: 0,
+        data: { event: { event_id: "evt_new", summary: payload.data.summary } },
+      };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    approveWrite: async (_input, request) => {
+      approvalRequest = request;
+      return { kind: "approved" };
+    },
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-evtc",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 200,
+      method: "tools/call",
+      params: {
+        name: "feishu_calendar_event_create",
+        arguments: {
+          calendar_id: "cal_p",
+          summary: "Q3 review",
+          start_timestamp: "1700000000",
+          end_timestamp: "1700003600",
+          timezone: "Asia/Shanghai",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "event_create reply");
+
+  // Approval card got the right summary text.
+  assert.equal(approvalRequest.toolName, "feishu_calendar_event_create");
+  assert.match(approvalRequest.summary, /Q3 review/);
+  assert.match(approvalRequest.summary, /Asia\/Shanghai/);
+
+  // Write went through after approval.
+  assert.equal(createCalls, 1);
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.result.isError, undefined);
+  const parsed = JSON.parse(last.result.content[0].text);
+  assert.equal(parsed.event.summary, "Q3 review");
+});
+
+test("LarkMcpServer: feishu_calendar_event_create refuses when approveWrite returns denied", async () => {
+  let createCalls = 0;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async eventCreate() {
+      createCalls++;
+      return { code: 0, data: {} };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    approveWrite: async () => ({ kind: "denied" }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-evtc-deny",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 201,
+      method: "tools/call",
+      params: {
+        name: "feishu_calendar_event_create",
+        arguments: {
+          calendar_id: "cal_p",
+          summary: "Bad event",
+          start_timestamp: "1700000000",
+          end_timestamp: "1700003600",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "event_create deny reply");
+
+  // Write must NOT have happened.
+  assert.equal(createCalls, 0);
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /denied the write/);
+  assert.match(last.result.content[0].text, /do NOT retry/);
+});
+
+test("LarkMcpServer: feishu_calendar_event_delete fails closed when no approveWrite is wired", async () => {
+  // Defense in depth: if the platform forgot to wire approveWrite,
+  // the destructive tool refuses to run rather than silently
+  // bypassing approval.
+  let deleteCalls = 0;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async eventDelete() {
+      deleteCalls++;
+      return { code: 0, data: {} };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    // approveWrite intentionally omitted.
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-evtd-noapprove",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 202,
+      method: "tools/call",
+      params: {
+        name: "feishu_calendar_event_delete",
+        arguments: { calendar_id: "cal_p", event_id: "evt_x" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "delete no-approve reply");
+
+  assert.equal(deleteCalls, 0);
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /requires an in-chat approval gate/);
+  assert.match(last.result.content[0].text, /refusing to write blind/);
+});
+
+test("LarkMcpServer: feishu_calendar_event_delete includes summary in approval card when provided", async () => {
+  let approvalRequest = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async eventDelete() {
+      return { code: 0, data: {} };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    approveWrite: async (_input, request) => {
+      approvalRequest = request;
+      return { kind: "approved" };
+    },
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-evtd-summary",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 203,
+      method: "tools/call",
+      params: {
+        name: "feishu_calendar_event_delete",
+        arguments: {
+          calendar_id: "cal_p",
+          event_id: "evt_target",
+          summary: "Q3 review",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "delete summary reply");
+
+  // Approval card carries enough info for the user to sanity-check
+  // — title shown explicitly, irreversible flag spelled out.
+  assert.match(approvalRequest.summary, /Q3 review/);
+  assert.match(approvalRequest.summary, /irreversible/);
+  assert.match(approvalRequest.summary, /evt_target/);
 });
 
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {
