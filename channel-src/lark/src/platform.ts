@@ -73,6 +73,11 @@ interface UatPipeline {
   accessor: UATAccessor;
   scheduler: UATRefreshScheduler;
   authFlow: AuthFlowController;
+  /** Direct handle to the UAT store. Held alongside the scheduler so
+   * the diagnose hook (and any future operator-facing surface) can
+   * inspect the stored grants without reaching into private fields
+   * on the scheduler / accessor. */
+  store: UATStore;
 }
 
 // Two simultaneous download phases per bot. One slot makes everything
@@ -482,7 +487,100 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       detail: `streaming=${state.config.streaming} reaction_echo=${state.config.reactionEcho}`,
     });
 
+    // UAT pipeline status: how many users have authorized, plus a
+    // probe that the secrets capability is actually wired (see
+    // helper). Cheap — just inspects in-memory state + counts
+    // entries in the secret store.
+    checks.push(await this.summariseUatPipeline(state));
+
+    // MCP tool surface: count of registered tools so an operator
+    // can confirm the sidecar started clean (a tool registration
+    // throw would surface as a smaller-than-expected count).
+    checks.push({
+      name: "mcp_tools",
+      status: "ok",
+      detail: `${this.mcpServer.toolNames().length} MCP tools registered`,
+    });
+
+    // OAuth endpoint reachability — separate from the WS host,
+    // catches DNS / TCP issues that `transport` (which is WS to
+    // open.X) wouldn't surface for the device-flow path
+    // (accounts.X / open.X HTTP).
+    checks.push(await this.probeOAuthEndpoint(state));
+
     return checks;
+  }
+
+  private async probeOAuthEndpoint(state: BotState): Promise<DiagnoseCheck> {
+    const PROBE_TIMEOUT_MS = 5_000;
+    if (!state.uat) {
+      // No UAT pipeline = no OAuth host configured for this bot.
+      // Use `warn` since skipping is informational, not a hard
+      // error — the SDK's DiagnoseStatus enum doesn't have a
+      // dedicated `skipped` variant.
+      return {
+        name: "oauth_endpoint",
+        status: "warn",
+        detail: "OAuth pipeline disabled — skipping endpoint reachability probe",
+      };
+    }
+    const baseUrl = state.uat.accessor.baseUrl;
+    const url = `${baseUrl.replace(/\/+$/, "")}/open-apis/authen/v1/user_info`;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+      try {
+        // Hitting the OAuth endpoint without a UAT returns 401 / a
+        // structured error — that's still a successful round-trip
+        // (the host is reachable + responding); we just want to know
+        // we COULD talk to it. A connection error / DNS failure
+        // would throw.
+        const resp = await fetch(url, {
+          headers: { Authorization: "Bearer probe" },
+          signal: ctrl.signal,
+        });
+        return {
+          name: "oauth_endpoint",
+          status: "ok",
+          detail: `${baseUrl} reachable (HTTP ${resp.status})`,
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err) {
+      return {
+        name: "oauth_endpoint",
+        status: "error",
+        detail: `failed to reach ${baseUrl}: ${String(err)}`,
+      };
+    }
+  }
+
+  private async summariseUatPipeline(state: BotState): Promise<DiagnoseCheck> {
+    if (!state.uat) {
+      return {
+        name: "uat_pipeline",
+        status: "warn",
+        detail: "OAuth pipeline disabled (gateway didn't negotiate `secrets` capability)",
+      };
+    }
+    try {
+      // store.listUsers requires the `secrets` capability; if the
+      // gateway negotiated it but the bot row doesn't exist server-
+      // side, this throws SecretBotUnknownError — surface as error.
+      const users = await state.uat.store.listUsers();
+      return {
+        name: "uat_pipeline",
+        status: "ok",
+        detail: `${users.length} authorized user${users.length === 1 ? "" : "s"} stored, refresh scheduler running`,
+      };
+    } catch (err) {
+      return {
+        name: "uat_pipeline",
+        status: "error",
+        detail: `UAT store query failed: ${String(err)}`,
+      };
+    }
   }
 
   async stopBot(handle: lark.LarkChannel): Promise<void> {
@@ -727,7 +825,7 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
       baseUrl,
       logger: this.logger,
     });
-    return { accessor, authFlow, scheduler };
+    return { accessor, authFlow, scheduler, store };
   }
 
   private async dispatchInbound(

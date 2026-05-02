@@ -147,8 +147,20 @@ interface TunnelSession {
  */
 export class LarkMcpServer {
   private readonly tunnels = new Map<string, TunnelSession>();
+  /** Names of every tool the server registers per session. Populated
+   * lazily on the first `openSession` (since tools register on the
+   * fresh `McpServer` per session) and reused for diagnose hooks
+   * without spinning up another session just to count. */
+  private cachedToolNames: readonly string[] | null = null;
 
   constructor(private readonly opts: LarkMcpServerOpts) {}
+
+  /** Names of every MCP tool the server exposes. Cheap (cached after
+   * the first session) — used by `LarkPlatform.onAgentDiagnoseRequested`
+   * to surface the registered count to operators. */
+  toolNames(): readonly string[] {
+    return this.cachedToolNames ?? [];
+  }
 
   /**
    * Route one inbound envelope to its tunnel session. First envelope
@@ -330,7 +342,27 @@ export class LarkMcpServer {
       { name: "aura-lark", version: "0.1.0" },
       { capabilities: { tools: {} } },
     );
+    // Intercept registerTool to harvest the tool name list as a
+    // side-effect — the McpServer SDK doesn't expose the registered
+    // set publicly, so the diagnose hook would otherwise have no
+    // way to count tools without spinning up a tools/list round-trip.
+    const collectedNames: string[] = [];
+    const shouldHarvest = this.cachedToolNames === null;
+    if (shouldHarvest) {
+      const originalRegister = server.registerTool.bind(server);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (server as { registerTool: (...args: unknown[]) => unknown }).registerTool = (
+        ...args: unknown[]
+      ): unknown => {
+        if (typeof args[0] === "string") collectedNames.push(args[0]);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (originalRegister as any)(...args);
+      };
+    }
     this.registerTools(server);
+    if (shouldHarvest) {
+      this.cachedToolNames = Object.freeze(collectedNames.slice());
+    }
     await server.connect(transport);
     return { server, transport };
   }
