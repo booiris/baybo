@@ -141,6 +141,69 @@ export class LarkMcpServer {
     }
   }
 
+  /** Run a UAT-requiring Lark API call through the accessor + render
+   * the result as an MCP tool reply.
+   *
+   * Compresses the boilerplate that every UAT tool needs: resolve
+   * accessor → invoke → distinguish auth_failed from API errors →
+   * render data as JSON. The handler returns the raw Lark response
+   * `{ code, msg, data }`; this method pulls `data` and serialises
+   * it, surfacing a non-zero `code` as a structured tool error. */
+  private async runUatTool<
+    T extends {
+      code?: number | undefined;
+      msg?: string | undefined;
+      data?: unknown;
+    },
+  >(args: {
+    active: {
+      channel: lark.LarkChannel;
+      chatId: string;
+      platformUserId: string;
+      uatAccessor?: UATAccessor;
+    };
+    toolName: string;
+    reason: string;
+    handler: (uat: string) => Promise<T>;
+  }): Promise<{
+    content: { type: "text"; text: string }[];
+    isError?: true;
+  }> {
+    const { active, toolName, reason, handler } = args;
+    if (!active.uatAccessor) {
+      return toolError(
+        `${toolName} requires UAT but the bot's OAuth pipeline isn't configured for this session`,
+      );
+    }
+    try {
+      const result = await active.uatAccessor.invoke(
+        {
+          userOpenId: active.platformUserId,
+          chatId: active.chatId,
+          reason,
+        },
+        handler,
+      );
+      if (result.kind !== "ok") {
+        return toolError(authFailedMessage(toolName, result.outcome));
+      }
+      const res = result.result;
+      if (typeof res.code === "number" && res.code !== 0) {
+        return toolError(
+          `Feishu API error ${res.code}: ${res.msg ?? "unknown"}`,
+        );
+      }
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(res.data ?? {}, null, 2) },
+        ],
+      };
+    } catch (err) {
+      this.opts.logger.debug(`${toolName} failed: ${String(err)}`);
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   private resolveActive(extra: unknown):
     | {
         ok: true;
@@ -467,45 +530,113 @@ export class LarkMcpServer {
       async (_args, extra) => {
         const active = this.resolveActive(extra);
         if (!active.ok) return active.reply;
-        const { channel, chatId, platformUserId, uatAccessor } = active;
-        if (!uatAccessor) {
-          return toolError(
-            "feishu_who_am_i requires UAT but the bot's OAuth pipeline isn't configured for this session",
-          );
-        }
-        try {
-          const result = await uatAccessor.invoke(
-            {
-              userOpenId: platformUserId,
-              chatId,
-              reason: "look up your Feishu profile",
-            },
-            (uat) =>
-              channel.rawClient.authen.userInfo.get(
-                {},
-                lark.withUserAccessToken(uat),
-              ),
-          );
-          if (result.kind !== "ok") {
-            return toolError(
-              authFailedMessage("feishu_who_am_i", result.outcome),
-            );
-          }
-          const res = result.result;
-          if (typeof res.code === "number" && res.code !== 0) {
-            return toolError(
-              `Feishu API error ${res.code}: ${res.msg ?? "unknown"}`,
-            );
-          }
-          return {
-            content: [
-              { type: "text", text: JSON.stringify(res.data ?? {}, null, 2) },
-            ],
-          };
-        } catch (err) {
-          this.opts.logger.debug(`feishu_who_am_i failed: ${String(err)}`);
-          return toolError(err instanceof Error ? err.message : String(err));
-        }
+        return this.runUatTool({
+          active,
+          toolName: "feishu_who_am_i",
+          reason: "look up your Feishu profile",
+          handler: (uat) =>
+            active.channel.rawClient.authen.userInfo.get(
+              {},
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_get_user",
+      {
+        title: "Get a Feishu user by id",
+        description:
+          "Look up a Feishu user by `user_id`. Returns name, email, mobile, department, status, etc. Acts under the conversing user's UAT (so visibility respects their org-chart scope, not the bot's app-level permissions). For the user themselves, prefer `feishu_who_am_i` — it doesn't require knowing the id.",
+        inputSchema: {
+          user_id: z
+            .string()
+            .min(1)
+            .describe(
+              "The target user id. Format depends on `user_id_type` (default open_id, e.g. `ou_…`).",
+            ),
+          user_id_type: z
+            .enum(["open_id", "union_id", "user_id"])
+            .optional()
+            .describe(
+              "Which id flavour `user_id` is. Defaults to `open_id`, matching what shows up everywhere else (chat members, message senders, _meta.auraUserId suffix).",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.runUatTool({
+          active,
+          toolName: "feishu_get_user",
+          reason: "look up that Feishu user's profile",
+          handler: (uat) =>
+            active.channel.rawClient.contact.v3.user.get(
+              {
+                path: { user_id: args.user_id },
+                params: { user_id_type: args.user_id_type ?? "open_id" },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_search_user",
+      {
+        title: "Search Feishu users by keyword",
+        description:
+          "Search Feishu users (employees) by free-text query against name, with results ranked by org-chart proximity to the conversing user. Useful when the agent has a person's name but needs their `open_id` to mention them, send a card, or query their calendar/profile. Acts under the conversing user's UAT — visibility respects their org-chart scope. The Feishu open API for this endpoint isn't exposed in the SDK's typed surface, so the call goes via raw fetch against `${baseUrl}/open-apis/search/v1/user`.",
+        inputSchema: {
+          query: z
+            .string()
+            .min(1)
+            .describe(
+              "Required. Matched against name (multilingual, fuzzy, supports pinyin / prefix).",
+            ),
+          page_size: z
+            .number()
+            .int()
+            .min(1)
+            .max(200)
+            .optional()
+            .describe("Default 20, hard cap 200."),
+          page_token: z
+            .string()
+            .optional()
+            .describe(
+              "Cursor from a prior call's `page_token`. Omit on the first call.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.runUatTool({
+          active,
+          toolName: "feishu_search_user",
+          reason: "search for that Feishu user",
+          handler: async (uat) => {
+            const params = new URLSearchParams({
+              query: args.query,
+              page_size: String(args.page_size ?? 20),
+            });
+            if (args.page_token !== undefined) {
+              params.set("page_token", args.page_token);
+            }
+            const url = `${active.uatAccessor!.baseUrl}/open-apis/search/v1/user?${params}`;
+            const resp = await fetch(url, {
+              headers: { Authorization: `Bearer ${uat}` },
+            });
+            return (await resp.json()) as {
+              code?: number;
+              msg?: string;
+              data?: unknown;
+            };
+          },
+        });
       },
     );
 

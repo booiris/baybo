@@ -64,6 +64,18 @@ function stubChannel(getChatInfoImpl, rawApi) {
           },
         },
       },
+      contact: {
+        v3: {
+          user: {
+            async get(payload, opts) {
+              if (!rawApi?.contactUserGet) {
+                throw new Error("contact.v3.user.get stub not configured");
+              }
+              return rawApi.contactUserGet(payload, opts);
+            },
+          },
+        },
+      },
       im: {
         v1: {
           chat: {
@@ -156,8 +168,10 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_get_chat_history",
     "feishu_get_chat_info",
     "feishu_get_message",
+    "feishu_get_user",
     "feishu_list_chat_members",
     "feishu_search_chats",
+    "feishu_search_user",
     "feishu_who_am_i",
   ]);
   // tools/list never resolves a channel — the resolver only fires on
@@ -1219,6 +1233,198 @@ test("LarkMcpServer: feishu_who_am_i surfaces auth-failed outcomes as readable t
   const last = decodeJson(reply.sent[reply.sent.length - 1]);
   assert.equal(last.result.isError, true);
   assert.match(last.result.content[0].text, /declined the authorization/);
+});
+
+test("LarkMcpServer: feishu_get_user routes through contact.v3.user.get with UAT", async () => {
+  let receivedPayload = null;
+  let receivedOpts = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      const result = await handler("uat_for_alice");
+      return { kind: "ok", result };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async contactUserGet(payload, opts) {
+      receivedPayload = payload;
+      receivedOpts = opts;
+      return {
+        code: 0,
+        data: {
+          user: {
+            open_id: "ou_bob",
+            name: "Bob",
+            email: "bob@example.com",
+          },
+        },
+      };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_active",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-get-user",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 51,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_user",
+        arguments: { user_id: "ou_bob", user_id_type: "open_id" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "get_user reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 51);
+  assert.equal(last.result.isError, undefined);
+  assert.equal(receivedPayload.path.user_id, "ou_bob");
+  assert.equal(receivedPayload.params.user_id_type, "open_id");
+  // UAT was attached.
+  assert.ok(receivedOpts);
+  const parsed = JSON.parse(last.result.content[0].text);
+  assert.equal(parsed.user.name, "Bob");
+});
+
+test("LarkMcpServer: feishu_get_user defaults user_id_type to open_id", async () => {
+  let receivedParams = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async contactUserGet(payload) {
+      receivedParams = payload.params;
+      return { code: 0, data: { user: {} } };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  await server.accept(
+    "tunnel-get-user-default",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 52,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_user",
+        // No user_id_type — must default to open_id, not flow as
+        // undefined into the API call (Feishu rejects undefined).
+        arguments: { user_id: "ou_x" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => receivedParams !== null, "get_user default reply");
+  assert.equal(receivedParams.user_id_type, "open_id");
+});
+
+test("LarkMcpServer: feishu_search_user calls /open-apis/search/v1/user with bearer UAT", async () => {
+  // Stub global fetch since feishu_search_user goes through raw
+  // fetch (the SDK doesn't expose this endpoint typed).
+  const originalFetch = globalThis.fetch;
+  const fetchCalls = [];
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          code: 0,
+          data: {
+            users: [{ open_id: "ou_match", name: "Carol" }],
+            has_more: false,
+          },
+        };
+      },
+    };
+  };
+  try {
+    const fakeAccessor = {
+      baseUrl: "https://open.feishu.cn",
+      async invoke(_req, handler) {
+        const result = await handler("uat_for_alice");
+        return { kind: "ok", result };
+      },
+    };
+    const channel = stubChannel(async () => ({}), {});
+    const server = new LarkMcpServer({
+      logger: noopLogger,
+      channelResolver: () => ({
+        kind: "ok",
+        channel,
+        chatId: "oc_active",
+        platformUserId: "ou_alice",
+        uatAccessor: fakeAccessor,
+      }),
+    });
+    const reply = captureReply();
+    await initialize(server, reply);
+
+    const before = reply.sent.length;
+    await server.accept(
+      "tunnel-search-user",
+      encodeJson({
+        jsonrpc: "2.0",
+        id: 53,
+        method: "tools/call",
+        params: {
+          name: "feishu_search_user",
+          arguments: { query: "Carol", page_size: 5 },
+        },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, "search_user reply");
+
+    assert.equal(fetchCalls.length, 1);
+    const url = fetchCalls[0].url;
+    assert.match(
+      url,
+      /^https:\/\/open\.feishu\.cn\/open-apis\/search\/v1\/user\?/,
+    );
+    assert.match(url, /query=Carol/);
+    assert.match(url, /page_size=5/);
+    assert.equal(
+      fetchCalls[0].init.headers.Authorization,
+      "Bearer uat_for_alice",
+    );
+
+    const last = decodeJson(reply.sent[reply.sent.length - 1]);
+    assert.equal(last.id, 53);
+    assert.equal(last.result.isError, undefined);
+    const parsed = JSON.parse(last.result.content[0].text);
+    assert.equal(parsed.users[0].name, "Carol");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {

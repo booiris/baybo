@@ -97,7 +97,16 @@ export type UATInvokeResult<T> =
  *      response, the UAT became invalid mid-flight (revoked server-
  *      side, etc.). Drop it, run the auth flow, retry once. */
 export class UATAccessor {
-  constructor(private readonly opts: UATAccessorOptions) {}
+  /** Public for tools that need to construct ad-hoc Lark API URLs
+   * — the SDK only types ~70% of Feishu's surface, so a handful of
+   * tools (search/v1/user, drive/v2/comment, etc.) call `fetch`
+   * directly against `${baseUrl}/open-apis/...` with the UAT in the
+   * Authorization header. */
+  readonly baseUrl: string;
+
+  constructor(private readonly opts: UATAccessorOptions) {
+    this.baseUrl = opts.baseUrl;
+  }
 
   async invoke<T>(
     req: UATInvokeRequest,
