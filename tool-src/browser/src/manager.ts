@@ -70,13 +70,6 @@ export interface ManagerOptions {
    */
   noSandbox?: boolean | undefined;
   /**
-   * Run Chromium in headless mode. Default true. Flip to false for
-   * local debugging when you want to see the agent's browsing —
-   * only useful with a desktop session ($DISPLAY / Wayland);
-   * headed mode in a server / CI env fails with `Missing X server`.
-   */
-  headless?: boolean | undefined;
-  /**
    * Extra Chromium command-line arguments, appended verbatim to the
    * launch flags. Each entry must include the leading `-` / `--`
    * (e.g. `"--lang=en-US"`). Empty by default.
@@ -158,10 +151,15 @@ export class BrowserManager {
     if (this.opts.extraArgs && this.opts.extraArgs.length > 0) {
       args.push(...this.opts.extraArgs);
     }
-    // headless defaults true; only the operator opting out of
-    // headless via `browser.headless = false` flips it.
-    const headless = this.opts.headless !== false;
-    const launchOptions: LaunchOptions = { headless, args };
+    // Headless is hardcoded — headed mode requires a display server
+    // (X / Wayland) so it can't run on the typical SSH / container
+    // host the gateway is deployed on, and stealth-detection-wise
+    // it doesn't buy anything against modern anti-bot stacks (the
+    // bigger tells are `navigator.webdriver` + `--enable-automation`,
+    // which Playwright sets in both modes). If you need to
+    // anti-detect, reach for `rebrowser-playwright` or
+    // `playwright-extra-plugin-stealth`, not headed mode.
+    const launchOptions: LaunchOptions = { headless: true, args };
     if (this.opts.chromiumExecutable) {
       launchOptions.executablePath = this.opts.chromiumExecutable;
     }

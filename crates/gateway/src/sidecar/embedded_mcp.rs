@@ -50,7 +50,6 @@ pub fn collect_profiles(
         browser_mcp_profile(
             config.browser.enable,
             config.browser.sandbox,
-            config.browser.headless,
             config.browser.chrome_path.as_deref(),
             config.browser.profile_dir.as_deref(),
             &config.browser.args,

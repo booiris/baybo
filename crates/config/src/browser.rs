@@ -37,15 +37,6 @@ pub struct BrowserConfig {
     /// code and the gateway user. Has no effect when `enable=false`.
     pub sandbox: bool,
 
-    /// Run Chromium in headless mode (no visible window).
-    ///
-    /// **Default: `true`**. Flip to `false` for local debugging when
-    /// you want to see what the agent's browsing — only useful when
-    /// running the gateway from a desktop session with a display
-    /// server (`$DISPLAY` / Wayland). Headed mode in a server / CI
-    /// environment will fail with `Missing X server or $DISPLAY`.
-    pub headless: bool,
-
     /// Override the Chromium binary the sidecar drives.
     ///
     /// Default: Playwright's bundled Chromium under
@@ -91,9 +82,6 @@ impl Default for BrowserConfig {
         Self {
             enable: false,
             sandbox: false,
-            // Match the historical hardcoded behaviour. Headed mode
-            // is opt-in for desktop debugging.
-            headless: true,
             chrome_path: None,
             profile_dir: None,
             args: Vec::new(),
@@ -114,10 +102,6 @@ mod tests {
             "enable defaults off (opt-in like gateway.enabled)"
         );
         assert!(!c.sandbox, "sandbox defaults off");
-        assert!(
-            c.headless,
-            "headless defaults on (matches historical behaviour)"
-        );
         assert!(c.chrome_path.is_none());
         assert!(c.profile_dir.is_none());
         assert!(c.args.is_empty(), "no extra Chromium args by default");
@@ -135,7 +119,6 @@ mod tests {
         let c = BrowserConfig {
             enable: true,
             sandbox: true,
-            headless: false,
             chrome_path: Some(PathBuf::from("/usr/bin/chromium")),
             profile_dir: Some(PathBuf::from("/tmp/aura-profile")),
             args: vec!["--lang=en-US".into(), "--ignore-certificate-errors".into()],

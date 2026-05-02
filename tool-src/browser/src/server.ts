@@ -21,7 +21,6 @@ interface Env {
   profileDir: string;
   chromiumExecutable: string | undefined;
   noSandbox: boolean;
-  headless: boolean;
   extraArgs: readonly string[];
   allowLoopback: boolean;
 }
@@ -33,11 +32,6 @@ function readEnv(): Env {
     defaultProfileDir();
   const chromiumExecutable = process.env["AURA_CHROMIUM_BIN"];
   const noSandbox = parseBoolEnv(process.env["AURA_BROWSER_NO_SANDBOX"]);
-  // headless defaults true. The gateway only sets the env when the
-  // operator opted out (`browser.headless = false`), so an absent var
-  // means stay-headless and an explicit value uses normal bool parsing.
-  const rawHeadless = process.env["AURA_BROWSER_HEADLESS"];
-  const headless = rawHeadless === undefined ? true : parseBoolEnv(rawHeadless);
   const extraArgs = parseArgsEnv(process.env["AURA_BROWSER_ARGS"]);
   // Test-only escape hatch: admits 127.0.0.0/8 + ::1 so smoke tests
   // can drive a real Chromium against a local HTTP server. Production
@@ -47,7 +41,6 @@ function readEnv(): Env {
     profileDir,
     chromiumExecutable,
     noSandbox,
-    headless,
     extraArgs,
     allowLoopback,
   };
@@ -102,7 +95,6 @@ async function main(): Promise<void> {
     profileDir: env.profileDir,
     chromiumExecutable: env.chromiumExecutable,
     noSandbox: env.noSandbox,
-    headless: env.headless,
     extraArgs: env.extraArgs,
     allowLoopback: env.allowLoopback,
     // Without the WS transport's outbound channel, embedded MCP servers

@@ -61,7 +61,6 @@
   "browser": {
     "enable": false,
     "sandbox": false,
-    "headless": true,
     "allow_loopback": false
   }
 }

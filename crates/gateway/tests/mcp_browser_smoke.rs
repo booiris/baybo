@@ -95,7 +95,6 @@ async fn boot_reconciler(
         browser_mcp_profile(
             browser_cfg.enable,
             browser_cfg.sandbox,
-            browser_cfg.headless,
             browser_cfg.chrome_path.as_deref(),
             browser_cfg.profile_dir.as_deref(),
             &browser_cfg.args,

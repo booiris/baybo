@@ -25,9 +25,6 @@ use crate::ToolCapability;
 /// - `enable`: master switch — `false` returns `None`.
 /// - `sandbox`: when `false`, sets `AURA_BROWSER_NO_SANDBOX=1` so the
 ///   TS sidecar launches Chromium with `--no-sandbox`.
-/// - `headless`: when `false`, sets `AURA_BROWSER_HEADLESS=0` so the
-///   TS sidecar launches Chromium with a visible window. Default is
-///   headless (env var skipped) to match historical behaviour.
 /// - `chrome_path`, `profile_dir`: optional overrides; when set, land
 ///   in `AURA_CHROMIUM_BIN` / `AURA_BROWSER_PROFILE_DIR` env vars.
 /// - `extra_args`: passed through verbatim to `chromium.launch.args`
@@ -56,7 +53,6 @@ use crate::ToolCapability;
 pub fn browser_mcp_profile(
     enable: bool,
     sandbox: bool,
-    headless: bool,
     chrome_path: Option<&Path>,
     profile_dir: Option<&Path>,
     extra_args: &[String],
@@ -81,12 +77,6 @@ pub fn browser_mcp_profile(
     // explicitly enabled it, the child default (sandbox on) takes effect.
     if !sandbox {
         extra_env.insert("AURA_BROWSER_NO_SANDBOX".into(), "1".into());
-    }
-    // `headless: true` is the default on the TS side; only emit the
-    // env when the operator opted out, so the var stays absent in
-    // typical operation.
-    if !headless {
-        extra_env.insert("AURA_BROWSER_HEADLESS".into(), "0".into());
     }
     if !extra_args.is_empty() {
         // JSON-encode so an arg containing whitespace, `=`, or any
@@ -135,14 +125,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// Common args used by tests below. headless=true (default) keeps
-    /// AURA_BROWSER_HEADLESS out of extra_env; sandbox=false keeps
+    /// Common args used by tests below. sandbox=false keeps
     /// AURA_BROWSER_NO_SANDBOX=1 in extra_env per default behaviour.
     fn defaults_call(enable: bool) -> Option<EmbeddedMcpProfile> {
         browser_mcp_profile(
             enable,
             false, // sandbox
-            true,  // headless
             None,  // chrome_path
             None,  // profile_dir
             &[],   // extra_args
@@ -166,8 +154,6 @@ mod tests {
         assert_eq!(p.args, vec!["/x.mjs".to_string()]);
         // sandbox=false default → AURA_BROWSER_NO_SANDBOX=1 in extra_env
         assert_eq!(p.extra_env.get("AURA_BROWSER_NO_SANDBOX").unwrap(), "1");
-        // headless=true default → AURA_BROWSER_HEADLESS absent
-        assert!(!p.extra_env.contains_key("AURA_BROWSER_HEADLESS"));
         // empty extra_args → AURA_BROWSER_ARGS absent
         assert!(!p.extra_env.contains_key("AURA_BROWSER_ARGS"));
     }
@@ -175,7 +161,6 @@ mod tests {
     #[test]
     fn sandbox_on_clears_no_sandbox_env() {
         let p = browser_mcp_profile(
-            true,
             true,
             true,
             None,
@@ -191,29 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn headless_off_emits_env() {
-        let p = browser_mcp_profile(
-            true,
-            false,
-            false,
-            None,
-            None,
-            &[],
-            false,
-            None,
-            "node".into(),
-            Path::new("/x.mjs"),
-        )
-        .expect("profile when enabled");
-        assert_eq!(p.extra_env.get("AURA_BROWSER_HEADLESS").unwrap(), "0");
-    }
-
-    #[test]
     fn chrome_path_lands_in_env() {
         let p = browser_mcp_profile(
             true,
             false,
-            true,
             Some(&PathBuf::from("/opt/chrome")),
             None,
             &[],
@@ -235,7 +201,6 @@ mod tests {
         let p = browser_mcp_profile(
             true,
             false,
-            true,
             None,
             None,
             &args,
@@ -260,7 +225,6 @@ mod tests {
         let p = browser_mcp_profile(
             true,
             false,
-            true,
             None,
             None,
             &[],
