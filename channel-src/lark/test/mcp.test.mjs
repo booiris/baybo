@@ -56,6 +56,14 @@ function stubChannel(getChatInfoImpl, rawApi) {
     rawClient: {
       im: {
         v1: {
+          chat: {
+            async search(payload) {
+              if (!rawApi?.chatSearch) {
+                throw new Error("chat.search stub not configured");
+              }
+              return rawApi.chatSearch(payload);
+            },
+          },
           chatMembers: {
             async get(payload) {
               if (!rawApi?.chatMembersGet) {
@@ -70,6 +78,12 @@ function stubChannel(getChatInfoImpl, rawApi) {
                 throw new Error("message.list stub not configured");
               }
               return rawApi.messageList(payload);
+            },
+            async get(payload) {
+              if (!rawApi?.messageGet) {
+                throw new Error("message.get stub not configured");
+              }
+              return rawApi.messageGet(payload);
             },
           },
         },
@@ -131,7 +145,9 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_ask_user",
     "feishu_get_chat_history",
     "feishu_get_chat_info",
+    "feishu_get_message",
     "feishu_list_chat_members",
+    "feishu_search_chats",
   ]);
   // tools/list never resolves a channel — the resolver only fires on
   // tools/call.
@@ -795,6 +811,247 @@ test("LarkMcpServer: feishu_get_chat_history binds container_id to the resolved 
   const parsed = JSON.parse(last.result.content[0].text);
   assert.equal(parsed.page_token, "pt_next");
   assert.equal(parsed.items[0].message_id, "om_1");
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_search_chats forwards query + pagination to chat.search", async () => {
+  let receivedPayload = null;
+  const channel = stubChannel(
+    async () => ({}),
+    {
+      async chatSearch(payload) {
+        receivedPayload = payload;
+        return {
+          code: 0,
+          data: {
+            items: [
+              { chat_id: "oc_one", name: "Engineering", chat_status: "normal" },
+              { chat_id: "oc_two", name: "Engineering Alumni", chat_status: "normal" },
+            ],
+            has_more: true,
+            page_token: "pt_next",
+          },
+        };
+      },
+    },
+  );
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_active",
+      platformUserId: "ou_alice",
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-search-chats",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: {
+        name: "feishu_search_chats",
+        arguments: { query: "engineering", page_size: 50 },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "search_chats reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 31);
+  assert.equal(last.result.isError, undefined);
+  assert.equal(receivedPayload.params.query, "engineering");
+  assert.equal(receivedPayload.params.page_size, 50);
+  assert.equal("page_token" in receivedPayload.params, false);
+  const parsed = JSON.parse(last.result.content[0].text);
+  assert.equal(parsed.items.length, 2);
+  assert.equal(parsed.page_token, "pt_next");
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_get_message returns the message when chat_id matches the active chat", async () => {
+  let receivedPayload = null;
+  const channel = stubChannel(
+    async () => ({}),
+    {
+      async messageGet(payload) {
+        receivedPayload = payload;
+        return {
+          code: 0,
+          data: {
+            items: [
+              {
+                message_id: "om_target",
+                chat_id: "oc_active",
+                msg_type: "text",
+                body: { content: "{\"text\":\"hello\"}" },
+                sender: {
+                  id: "ou_alice",
+                  id_type: "open_id",
+                  sender_type: "user",
+                },
+                create_time: "1700000001000",
+              },
+            ],
+          },
+        };
+      },
+    },
+  );
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_active",
+      platformUserId: "ou_alice",
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-msg-ok",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 32,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_message",
+        arguments: { message_id: "om_target" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "get_message ok reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 32);
+  assert.equal(last.result.isError, undefined);
+  assert.equal(receivedPayload.path.message_id, "om_target");
+  const parsed = JSON.parse(last.result.content[0].text);
+  assert.equal(parsed.message_id, "om_target");
+  assert.equal(parsed.chat_id, "oc_active");
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_get_message refuses cross-chat lookups", async () => {
+  // Even though the bot can technically read messages from any chat
+  // it belongs to, the tool must refuse to return a message whose
+  // chat_id != the resolver's chat — otherwise a paired user could
+  // coax the agent into leaking content from sibling chats. Same
+  // invariant as feishu_get_chat_info post-Codex #2.
+  const channel = stubChannel(
+    async () => ({}),
+    {
+      async messageGet() {
+        return {
+          code: 0,
+          data: {
+            items: [
+              {
+                message_id: "om_other_chat",
+                chat_id: "oc_secret",
+                msg_type: "text",
+                body: { content: "{\"text\":\"private\"}" },
+              },
+            ],
+          },
+        };
+      },
+    },
+  );
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_active",
+      platformUserId: "ou_alice",
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-msg-cross",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 33,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_message",
+        arguments: { message_id: "om_other_chat" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "get_message cross-chat reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 33);
+  assert.equal(last.result.isError, true);
+  assert.match(
+    last.result.content[0].text,
+    /belongs to a different chat than the active conversation/,
+  );
+  assert.doesNotMatch(last.result.content[0].text, /private/);
+
+  await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_get_message reports not-found cleanly when API returns no items", async () => {
+  const channel = stubChannel(
+    async () => ({}),
+    {
+      async messageGet() {
+        return { code: 0, data: { items: [] } };
+      },
+    },
+  );
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_active",
+      platformUserId: "ou_alice",
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-msg-empty",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 34,
+      method: "tools/call",
+      params: {
+        name: "feishu_get_message",
+        arguments: { message_id: "om_missing" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "get_message not-found reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 34);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /no message found for id om_missing/);
 
   await server.shutdown();
 });

@@ -335,6 +335,115 @@ export class LarkMcpServer {
       },
     );
 
+    server.registerTool(
+      "feishu_search_chats",
+      {
+        title: "Search chats the bot is a member of",
+        description:
+          "Search the chats this bot can see (chats it's joined plus any public chats explicitly visible to it) by free-text query against chat name. Useful for the agent to discover its own surface — e.g. \"is there an existing #incidents chat I should post to?\". Returns chat_id, name, description, owner. Bot-scoped, NOT chat-scoped: routes to the bot inferred from `_meta.auraBotId` (or the only one in single-bot mode). Empty `query` lists all visible chats.",
+        inputSchema: {
+          query: z
+            .string()
+            .optional()
+            .describe(
+              "Free-text query matched against chat name (fuzzy, multilingual). Omit to list every visible chat.",
+            ),
+          page_size: z
+            .number()
+            .int()
+            .min(1)
+            .max(100)
+            .optional()
+            .describe("Page size, default 20, hard cap 100."),
+          page_token: z
+            .string()
+            .optional()
+            .describe("Cursor from a prior call's `page_token`. Omit on first call."),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        const { channel } = active;
+        try {
+          const res = await channel.rawClient.im.v1.chat.search({
+            params: {
+              ...(args.query !== undefined && { query: args.query }),
+              page_size: args.page_size ?? 20,
+              ...(args.page_token !== undefined && {
+                page_token: args.page_token,
+              }),
+            },
+          });
+          if (typeof res.code === "number" && res.code !== 0) {
+            return toolError(
+              `Feishu API error ${res.code}: ${res.msg ?? "unknown"}`,
+            );
+          }
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(res.data ?? {}, null, 2) },
+            ],
+          };
+        } catch (err) {
+          this.opts.logger.debug(`feishu_search_chats failed: ${String(err)}`);
+          return toolError(err instanceof Error ? err.message : String(err));
+        }
+      },
+    );
+
+    server.registerTool(
+      "feishu_get_message",
+      {
+        title: "Fetch a single Feishu message by id",
+        description:
+          "Look up one Feishu message by `message_id`. Useful for resolving message references the agent sees in chat history (\"see om_xxx above\"). Bound to the active conversation: even though Feishu's API would let the bot read any message in any chat it belongs to, this tool rejects messages whose `chat_id` doesn't match the resolver's chat — otherwise a paired user could coax the agent into reading messages from other chats the bot happens to be in (mirrors the `feishu_get_chat_info` Codex #2 invariant).",
+        inputSchema: {
+          message_id: z
+            .string()
+            .min(1)
+            .describe(
+              "The Feishu message id (e.g. `om_xxx`). Usually pulled from a `[message_id=om_xxx]` marker in chat history.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        const { channel, chatId } = active;
+        try {
+          const res = await channel.rawClient.im.v1.message.get({
+            path: { message_id: args.message_id },
+          });
+          if (typeof res.code === "number" && res.code !== 0) {
+            return toolError(
+              `Feishu API error ${res.code}: ${res.msg ?? "unknown"}`,
+            );
+          }
+          const items = res.data?.items ?? [];
+          const msg = items[0];
+          if (!msg) {
+            return toolError(
+              `feishu_get_message: no message found for id ${args.message_id}`,
+            );
+          }
+          if (msg.chat_id && msg.chat_id !== chatId) {
+            return toolError(
+              `feishu_get_message: message ${args.message_id} belongs to a different chat than the active conversation; refusing to leak cross-chat content`,
+            );
+          }
+          return {
+            content: [{ type: "text", text: JSON.stringify(msg, null, 2) }],
+          };
+        } catch (err) {
+          this.opts.logger.debug(
+            `feishu_get_message failed for id=${args.message_id}: ${String(err)}`,
+          );
+          return toolError(err instanceof Error ? err.message : String(err));
+        }
+      },
+    );
+
     this.registerAskUser(server);
   }
 
