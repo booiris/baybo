@@ -1001,6 +1001,204 @@ export class LarkMcpServer {
       },
     );
 
+    server.registerTool(
+      "feishu_bitable_records",
+      {
+        title: "List records in a Feishu Bitable table",
+        description:
+          "Read records from a Feishu Bitable (multi-dimensional table). Useful for querying structured data the user has set up — e.g. \"what's in my project tracker?\", \"how many open bugs in the dashboard?\". Pass `app_token` (the bitable's URL token) and `table_id`; optional `filter` / `sort` follow Feishu's bitable expression syntax (see API docs). Returns rows as `{ fields: { <name>: <value> } }` plus pagination cursors. Read-only — record CRUD is a separate tool family (deferred).",
+        inputSchema: {
+          app_token: z
+            .string()
+            .min(1)
+            .describe("Bitable app token from the URL (e.g. `bascn…`)."),
+          table_id: z
+            .string()
+            .min(1)
+            .describe("Table id within the bitable (e.g. `tblxxx`)."),
+          view_id: z
+            .string()
+            .optional()
+            .describe(
+              "Optional view id to inherit a view's filter/sort/field-visibility config.",
+            ),
+          filter: z
+            .string()
+            .optional()
+            .describe(
+              "Optional Feishu bitable filter expression (e.g. `CurrentValue.[Status]=\"Open\"`). When set, overrides the view's filter.",
+            ),
+          sort: z
+            .string()
+            .optional()
+            .describe(
+              "Optional sort expression (e.g. `[\"field_x ASC\", \"field_y DESC\"]` as a JSON string per Feishu spec).",
+            ),
+          field_names: z
+            .string()
+            .optional()
+            .describe(
+              "Optional JSON-encoded array of field names to return (e.g. `[\"Title\",\"Status\"]`). Default: all fields.",
+            ),
+          page_size: z
+            .number()
+            .int()
+            .min(1)
+            .max(500)
+            .optional()
+            .describe("Default 20, hard cap 500."),
+          page_token: z.string().optional(),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.runUatTool({
+          active,
+          toolName: "feishu_bitable_records",
+          reason: "read records from your Bitable",
+          handler: (uat) =>
+            active.channel.rawClient.bitable.appTableRecord.list(
+              {
+                path: {
+                  app_token: args.app_token,
+                  table_id: args.table_id,
+                },
+                params: {
+                  ...(args.view_id !== undefined && { view_id: args.view_id }),
+                  ...(args.filter !== undefined && { filter: args.filter }),
+                  ...(args.sort !== undefined && { sort: args.sort }),
+                  ...(args.field_names !== undefined && {
+                    field_names: args.field_names,
+                  }),
+                  ...(args.page_size !== undefined && { page_size: args.page_size }),
+                  ...(args.page_token !== undefined && {
+                    page_token: args.page_token,
+                  }),
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_doc_comments",
+      {
+        title: "List comments on a Feishu doc / sheet / file",
+        description:
+          "Read collaboration comments left on a Feishu document, sheet, slide deck, or attached file. Useful when the agent's been asked to summarise feedback or follow up on a thread of unresolved comments. Returns top-level comments + their replies, plus solved/unsolved flags.",
+        inputSchema: {
+          file_token: z
+            .string()
+            .min(1)
+            .describe("File token from the doc/sheet URL."),
+          file_type: z
+            .enum(["doc", "docx", "sheet", "file", "slides"])
+            .describe(
+              "File flavour. `docx` is the modern doc format; `doc` is the legacy one. `sheet` for spreadsheets. `slides` for decks. `file` for plain files in Drive.",
+            ),
+          is_solved: z
+            .boolean()
+            .optional()
+            .describe(
+              "Filter by resolved state. Omit to include both. Useful for \"any open comments still need addressing?\".",
+            ),
+          is_whole: z
+            .boolean()
+            .optional()
+            .describe(
+              "If true, return whole-document comments only (those not anchored to a specific selection). If false, only inline ones. Omit for both.",
+            ),
+          page_size: z.number().int().min(1).max(100).optional().describe("Default 20."),
+          page_token: z.string().optional(),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.runUatTool({
+          active,
+          toolName: "feishu_doc_comments",
+          reason: "read comments on your Feishu doc",
+          handler: (uat) =>
+            active.channel.rawClient.drive.fileComment.list(
+              {
+                path: { file_token: args.file_token },
+                params: {
+                  file_type: args.file_type,
+                  ...(args.is_solved !== undefined && { is_solved: args.is_solved }),
+                  ...(args.is_whole !== undefined && { is_whole: args.is_whole }),
+                  ...(args.page_size !== undefined && { page_size: args.page_size }),
+                  ...(args.page_token !== undefined && {
+                    page_token: args.page_token,
+                  }),
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_sheet_read_range",
+      {
+        title: "Read a cell range from a Feishu spreadsheet",
+        description:
+          "Read raw cell values from a range in a Feishu spreadsheet. Returns the raw 2D `values` array (and optionally formula representations). Useful for the agent to inspect or summarise tabular data the user has set up. Goes through the legacy /sheets/v2/spreadsheets/{token}/values/{range} endpoint via raw fetch — the SDK's typed v3 surface doesn't expose value reads.",
+        inputSchema: {
+          spreadsheet_token: z
+            .string()
+            .min(1)
+            .describe("Spreadsheet token from the URL (e.g. `shtcn…`)."),
+          range: z
+            .string()
+            .min(1)
+            .describe(
+              "A1 notation range, e.g. `<sheet_id>!A1:D10`. The sheet_id prefix is required even for the first sheet — get it from `feishu_wiki list_nodes` or the URL.",
+            ),
+          value_render_option: z
+            .enum(["ToString", "Formula", "FormattedValue", "UnformattedValue"])
+            .optional()
+            .describe(
+              "How to render values. `ToString` (default) returns plain strings; `Formula` returns formulas as text; the others control number formatting.",
+            ),
+          date_time_render_option: z
+            .enum(["FormattedString"])
+            .optional()
+            .describe(
+              "Render dates/times as `FormattedString` instead of serial numbers. Defaults to serial numbers.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.runUatTool({
+          active,
+          toolName: "feishu_sheet_read_range",
+          reason: "read cells from your Feishu spreadsheet",
+          handler: async (uat) => {
+            const params = new URLSearchParams();
+            if (args.value_render_option !== undefined) {
+              params.set("valueRenderOption", args.value_render_option);
+            }
+            if (args.date_time_render_option !== undefined) {
+              params.set("dateTimeRenderOption", args.date_time_render_option);
+            }
+            const qs = params.toString() ? `?${params}` : "";
+            const url = `${active.uatAccessor!.baseUrl}/open-apis/sheets/v2/spreadsheets/${encodeURIComponent(args.spreadsheet_token)}/values/${encodeURIComponent(args.range)}${qs}`;
+            const resp = await fetch(url, {
+              headers: { Authorization: `Bearer ${uat}` },
+            });
+            return (await resp.json()) as LarkApiResponse;
+          },
+        });
+      },
+    );
+
     this.registerAskUser(server);
   }
 

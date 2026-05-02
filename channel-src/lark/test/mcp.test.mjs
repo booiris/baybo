@@ -117,6 +117,20 @@ function stubChannel(getChatInfoImpl, rawApi) {
           },
         },
       },
+      bitable: {
+        appTableRecord: {
+          async list(payload, opts) {
+            return rawApi?.bitableRecordList?.(payload, opts) ?? { code: 0, data: {} };
+          },
+        },
+      },
+      drive: {
+        fileComment: {
+          async list(payload, opts) {
+            return rawApi?.driveCommentList?.(payload, opts) ?? { code: 0, data: {} };
+          },
+        },
+      },
       im: {
         v1: {
           chat: {
@@ -206,8 +220,10 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
   const toolNames = last.result.tools.map((t) => t.name).sort();
   assert.deepEqual(toolNames, [
     "feishu_ask_user",
+    "feishu_bitable_records",
     "feishu_calendar",
     "feishu_calendar_event",
+    "feishu_doc_comments",
     "feishu_freebusy",
     "feishu_freebusy_batch",
     "feishu_get_chat_history",
@@ -218,6 +234,7 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_search_chats",
     "feishu_search_doc",
     "feishu_search_user",
+    "feishu_sheet_read_range",
     "feishu_who_am_i",
     "feishu_wiki",
   ]);
@@ -1839,6 +1856,185 @@ test("LarkMcpServer: feishu_search_doc POSTs to /open-apis/suite/docs-api/search
     const body = JSON.parse(fetchCalls[0].init.body);
     assert.equal(body.search_key, "design");
     assert.equal(body.count, 5);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("LarkMcpServer: feishu_bitable_records routes through appTableRecord.list", async () => {
+  let receivedPayload = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async bitableRecordList(payload) {
+      receivedPayload = payload;
+      return {
+        code: 0,
+        data: { items: [{ fields: { Title: "Hello" } }], has_more: false, total: 1 },
+      };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-bt",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 100,
+      method: "tools/call",
+      params: {
+        name: "feishu_bitable_records",
+        arguments: {
+          app_token: "bascn123",
+          table_id: "tblXYZ",
+          filter: 'CurrentValue.[Status]="Open"',
+          page_size: 50,
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "bitable reply");
+
+  assert.equal(receivedPayload.path.app_token, "bascn123");
+  assert.equal(receivedPayload.path.table_id, "tblXYZ");
+  assert.equal(receivedPayload.params.filter, 'CurrentValue.[Status]="Open"');
+  assert.equal(receivedPayload.params.page_size, 50);
+});
+
+test("LarkMcpServer: feishu_doc_comments forwards file_type filter to drive.fileComment.list", async () => {
+  let receivedPayload = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async driveCommentList(payload) {
+      receivedPayload = payload;
+      return { code: 0, data: { items: [], has_more: false } };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-cmt",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 101,
+      method: "tools/call",
+      params: {
+        name: "feishu_doc_comments",
+        arguments: {
+          file_token: "doxcn_abc",
+          file_type: "docx",
+          is_solved: false,
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "comments reply");
+
+  assert.equal(receivedPayload.path.file_token, "doxcn_abc");
+  assert.equal(receivedPayload.params.file_type, "docx");
+  assert.equal(receivedPayload.params.is_solved, false);
+});
+
+test("LarkMcpServer: feishu_sheet_read_range builds the v2 URL with token + range", async () => {
+  const originalFetch = globalThis.fetch;
+  const fetchCalls = [];
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          code: 0,
+          data: { valueRange: { range: "Sheet1!A1:D10", values: [[1, 2, 3, 4]] } },
+        };
+      },
+    };
+  };
+  try {
+    const fakeAccessor = {
+      baseUrl: "https://open.feishu.cn",
+      async invoke(_req, handler) {
+        return { kind: "ok", result: await handler("uat_alice") };
+      },
+    };
+    const channel = stubChannel(async () => ({}), {});
+    const server = new LarkMcpServer({
+      logger: noopLogger,
+      channelResolver: () => ({
+        kind: "ok",
+        channel,
+        chatId: "oc_x",
+        platformUserId: "ou_alice",
+        uatAccessor: fakeAccessor,
+      }),
+    });
+    const reply = captureReply();
+    await initialize(server, reply);
+
+    const before = reply.sent.length;
+    await server.accept(
+      "tunnel-sheet",
+      encodeJson({
+        jsonrpc: "2.0",
+        id: 102,
+        method: "tools/call",
+        params: {
+          name: "feishu_sheet_read_range",
+          arguments: {
+            spreadsheet_token: "shtcn_xyz",
+            range: "shet1!A1:D10",
+            value_render_option: "FormattedValue",
+          },
+        },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, "sheet reply");
+
+    assert.equal(fetchCalls.length, 1);
+    assert.match(
+      fetchCalls[0].url,
+      /https:\/\/open\.feishu\.cn\/open-apis\/sheets\/v2\/spreadsheets\/shtcn_xyz\/values\/shet1!A1%3AD10/,
+    );
+    assert.match(fetchCalls[0].url, /valueRenderOption=FormattedValue/);
+    assert.equal(
+      fetchCalls[0].init.headers.Authorization,
+      "Bearer uat_alice",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
