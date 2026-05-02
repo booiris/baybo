@@ -12,7 +12,7 @@
 //! `config.browser.sandbox`, …).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::EmbeddedMcpProfile;
 use crate::ToolCapability;
@@ -61,7 +61,7 @@ pub fn browser_mcp_profile(
     profile_dir: Option<&Path>,
     extra_args: &[String],
     allow_loopback: bool,
-    blob_upload: Option<BlobUploadEnv<'_>>,
+    blob_upload: Option<&BlobUploadEnv>,
     command: String,
     bundle_path: &Path,
 ) -> Option<EmbeddedMcpProfile> {
@@ -106,7 +106,7 @@ pub fn browser_mcp_profile(
             "AURA_CHANNEL_PORT_FILE".into(),
             up.port_file.display().to_string(),
         );
-        extra_env.insert("AURA_BLOB_UPLOAD_TOKEN".into(), up.token.into());
+        extra_env.insert("AURA_BLOB_UPLOAD_TOKEN".into(), up.token.clone());
     }
     Some(EmbeddedMcpProfile {
         server_name: "browser".into(),
@@ -124,14 +124,10 @@ pub fn browser_mcp_profile(
 /// screenshots, and the token to authenticate with. The port itself
 /// isn't passed — the child reads `port_file` lazily on first
 /// upload, sidestepping the boot-order race.
-#[derive(Debug, Clone, Copy)]
-pub struct BlobUploadEnv<'a> {
-    /// Path the channel TCP listener writes its bound port to (e.g.
-    /// `<workspace>/state/channel.port`).
-    pub port_file: &'a Path,
-    /// Channel-token registered against a `tool/<sidecar>` label —
-    /// `AuthedClient::Tool` bypasses pairing on `/v1/blobs`.
-    pub token: &'a str,
+#[derive(Debug, Clone)]
+pub struct BlobUploadEnv {
+    pub port_file: PathBuf,
+    pub token: String,
 }
 
 #[cfg(test)]
@@ -257,7 +253,10 @@ mod tests {
 
     #[test]
     fn blob_upload_env_lands_in_env() {
-        let port_file = PathBuf::from("/var/aura/state/channel.port");
+        let blob_upload = BlobUploadEnv {
+            port_file: PathBuf::from("/var/aura/state/channel.port"),
+            token: "secret123".into(),
+        };
         let p = browser_mcp_profile(
             true,
             false,
@@ -266,10 +265,7 @@ mod tests {
             None,
             &[],
             false,
-            Some(BlobUploadEnv {
-                port_file: &port_file,
-                token: "secret123",
-            }),
+            Some(&blob_upload),
             "node".into(),
             Path::new("/x.mjs"),
         )

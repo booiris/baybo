@@ -195,12 +195,12 @@ pub async fn build_managers(
     config: Arc<AuraConfig>,
     shutdown: ShutdownSignal,
     leak_detector: Arc<LeakDetector>,
-    // Optional blob-upload context for the embedded browser MCP
-    // child. Built by the gateway boot path from the workspace's
-    // channel port-file path + the minted `tool/browser` token.
-    // `None` for non-gateway boot paths (no `/v1/blobs` endpoint
-    // exists, so the child stays inline-only).
-    browser_blob_upload: Option<aura_gateway::sidecar::BootBlobUpload>,
+    // Pre-assembled embedded MCP server entries the reconciler should
+    // spawn alongside any user-configured `.mcp.json` entries. Built
+    // by the boot-path caller (`gateway_cmd::start` for the gateway,
+    // empty `Vec` for non-gateway paths) so the manager-graph layer
+    // stays free of per-tool-domain wiring (browser blob upload, etc).
+    embedded_mcp_servers: Vec<EmbeddedMcpServer>,
 ) -> anyhow::Result<ManagerGraph> {
     // --- minimal services shared by every mode
     let workspace_paths =
@@ -405,28 +405,6 @@ pub async fn build_managers(
     // alongside any user-configured `.mcp.json` entries; if the bundle
     // failed to materialise (`SidecarRuntime::install` Err), the
     // embedded list is empty and only user entries get connected.
-    // Embedded MCP servers (browser today; future code_exec / db_query
-    // sit alongside in `aura_gateway::collect_profiles`). When the
-    // bundle table is unavailable or every family is disabled, the
-    // reconciler runs with just the user-configured `.mcp.json`
-    // entries.
-    let blob_upload_env = browser_blob_upload.as_ref().map(|b| b.as_env());
-    let embedded_mcp_servers: Vec<EmbeddedMcpServer> = match aura_gateway::SidecarRuntime::install()
-    {
-        Ok(rt) => aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(
-            &rt,
-            &config,
-            blob_upload_env,
-        )),
-        Err(e) => {
-            tracing::info!(
-                error = %e,
-                "embedded sidecar runtime unavailable; no embedded MCP servers will be spawned",
-            );
-            Vec::new()
-        }
-    };
-
     let mcp_reconciler = McpReconciler::new(
         workspace_root.clone(),
         Arc::clone(&tool_registry),

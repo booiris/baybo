@@ -30,7 +30,5 @@ pub(crate) mod pipe_pump;
 mod supervisor;
 
 pub use assets::{SidecarError, SidecarRuntime, domains};
-pub use embedded_mcp::{
-    BootBlobUpload, NODE_BINARY_ENV, blob_upload_env, collect_profiles, node_binary,
-};
+pub use embedded_mcp::{NODE_BINARY_ENV, collect_profiles, node_binary};
 pub use supervisor::{BUN_BINARY_ENV, SidecarSupervisor};

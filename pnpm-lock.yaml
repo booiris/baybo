@@ -65,6 +65,9 @@ importers:
 
   tool-src/browser:
     dependencies:
+      '@aura/channel-sdk':
+        specifier: workspace:*
+        version: link:../../sdks/channel-ts
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(zod@4.4.1)

@@ -5,7 +5,7 @@
 use aura_channels::wire::{Frame, PROTOCOL_VERSION};
 use aura_model::ChannelType;
 
-use crate::auth::{AuthedClient, ChannelTokenTable};
+use crate::auth::{AuthedClient, ChannelTokenTable, TOOL_CLIENT_LABEL_PREFIX};
 
 /// Channel type strings reserved for in-process adapters. Sidecars may
 /// not claim these — they would shadow the real adapter. `tui` is not
@@ -80,26 +80,20 @@ pub(crate) fn validate_register(
                 );
             }
         }
+        // Tool sidecars (browser MCP server today; future code_exec,
+        // db_query, …) live in the same `ChannelTokenTable` for
+        // `/v1/blobs` auth, but must never register on `/v1/channel-ws`
+        // — a leaked tool token would otherwise impersonate a channel.
+        // Both arms reject by label prefix; the duplication is
+        // intentional defence in depth (a future refactor that
+        // constructs `Subprocess` directly bypasses `from_identity`).
         AuthedClient::Tool { label } => {
-            // Tool sidecars (browser MCP server today; future
-            // code_exec, db_query, …) live in the same
-            // `ChannelTokenTable` so the channel-auth middleware
-            // accepts them for `/v1/blobs` uploads. They MUST NOT be
-            // admitted here — a leaked tool token presented at
-            // /v1/channel-ws would otherwise impersonate a channel.
             return Err(format!(
                 "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
             ));
         }
         AuthedClient::Subprocess { pid, label, .. } => {
-            // Defence in depth: `AuthedClient::from_identity` already
-            // routes any `tool/*` label into the `Tool` arm above, so
-            // we shouldn't see one here in production. But a future
-            // refactor (or a test that constructs `Subprocess`
-            // directly) could bypass `from_identity` — keep the
-            // prefix rejection so a leaked tool token can never
-            // register a channel by sneaking in via this arm.
-            if label.starts_with("tool/") {
+            if label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
                 return Err(format!(
                     "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
                 ));

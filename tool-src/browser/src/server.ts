@@ -33,11 +33,11 @@ function readEnv(): Env {
     defaultProfileDir();
   const chromiumExecutable = process.env["AURA_CHROMIUM_BIN"];
   const noSandbox = parseBoolEnv(process.env["AURA_BROWSER_NO_SANDBOX"]);
-  // headless defaults true. Gateway only sets the env when the
-  // operator opted out (`browser.headless = false`), so the
-  // historical headless behaviour stays the default when the var
-  // is absent.
-  const headless = !parseBoolFalseyEnv(process.env["AURA_BROWSER_HEADLESS"]);
+  // headless defaults true. The gateway only sets the env when the
+  // operator opted out (`browser.headless = false`), so an absent var
+  // means stay-headless and an explicit value uses normal bool parsing.
+  const rawHeadless = process.env["AURA_BROWSER_HEADLESS"];
+  const headless = rawHeadless === undefined ? true : parseBoolEnv(rawHeadless);
   const extraArgs = parseArgsEnv(process.env["AURA_BROWSER_ARGS"]);
   // Test-only escape hatch: admits 127.0.0.0/8 + ::1 so smoke tests
   // can drive a real Chromium against a local HTTP server. Production
@@ -57,16 +57,6 @@ function parseBoolEnv(s: string | undefined): boolean {
   if (!s) return false;
   const v = s.trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes" || v === "on";
-}
-
-/** Read a "falsey" env var: returns true iff the value is explicitly
- *  one of `0|false|no|off`. Used for opt-out flags whose absent state
- *  means "stay enabled" (i.e. headless stays on unless the operator
- *  set the var to a falsey value). */
-function parseBoolFalseyEnv(s: string | undefined): boolean {
-  if (!s) return false;
-  const v = s.trim().toLowerCase();
-  return v === "0" || v === "false" || v === "no" || v === "off";
 }
 
 function parseArgsEnv(raw: string | undefined): readonly string[] {

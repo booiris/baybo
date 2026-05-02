@@ -25,8 +25,7 @@ use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
 use aura_gateway::{
     AdminToken, ChannelServer, ChannelSpawner, ChannelTokenTable, ClientIdentity, GatewayDeps,
-    GatewayServer, RuntimeGatewayConfig, SidecarRuntime, SidecarSupervisor, TUI_CLIENT_LABEL,
-    TUI_TOKEN_VAULT_KEY,
+    GatewayServer, RuntimeGatewayConfig, SidecarSupervisor, TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY,
 };
 
 use crate::boot;
@@ -326,17 +325,43 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // lazily on first upload, so we can compute the path before the
     // listener actually binds and ship it via env to the child.
     let port_file = workspace_paths.channel_port();
-    let browser_blob_upload = aura_gateway::sidecar::BootBlobUpload {
+    let browser_blob_upload = aura_tools::mcp::BlobUploadEnv {
         port_file: port_file.clone(),
         token: browser_tool_token.clone(),
     };
+
+    // Install the embedded sidecar runtime once and reuse it for both
+    // the MCP-profile collection (browser MCP server) below and the
+    // channel-sidecar supervisor further down. Idempotent install but
+    // keeping a single Arc avoids the second filesystem walk.
+    let sidecar_runtime: Option<Arc<aura_gateway::SidecarRuntime>> =
+        match aura_gateway::SidecarRuntime::install() {
+            Ok(rt) => Some(Arc::new(rt)),
+            Err(e) => {
+                tracing::info!(
+                    error = %e,
+                    "embedded sidecar runtime unavailable; no embedded sidecars will be spawned",
+                );
+                None
+            }
+        };
+    let embedded_mcp_servers: Vec<aura_tools::mcp::EmbeddedMcpServer> = sidecar_runtime
+        .as_deref()
+        .map(|rt| {
+            aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(
+                rt,
+                &config,
+                Some(&browser_blob_upload),
+            ))
+        })
+        .unwrap_or_default();
 
     let shutdown = ShutdownSignal::new();
     let mut graph = runtime::build_managers(
         Arc::clone(&config),
         shutdown.clone(),
         Arc::clone(&leak_detector),
-        Some(browser_blob_upload),
+        embedded_mcp_servers,
     )
     .await?;
     let run_handle = runtime::wire_router(&mut graph).await;
@@ -425,57 +450,48 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // The browser MCP server lives on a separate path: it is spawned
     // by the MCP reconciler set up inside `runtime::build_managers`,
     // not by this supervisor.
-    match SidecarRuntime::install() {
-        Ok(runtime) => {
-            let domains: Vec<&str> = runtime.domains().collect();
-            if domains.is_empty() {
-                tracing::info!("no embedded sidecars in this build");
-            } else {
-                for domain in &domains {
-                    let names: Vec<&str> = runtime.names_in_domain(domain).collect();
-                    tracing::info!(
-                        domain = %domain,
-                        sidecars = ?names,
-                        channel_port,
-                        "sidecar runtime materialised",
-                    );
-                }
-            }
-            let runtime = Arc::new(runtime);
-
-            let channel_only: Vec<String> = runtime
-                .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
-                .map(String::from)
-                .collect();
-            if !channel_only.is_empty() {
-                let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
-                let supervisor = SidecarSupervisor::new(
-                    Arc::clone(&runtime),
-                    spawner,
-                    Arc::clone(&log_buffer),
-                    workspace_paths.channel_logs_dir(),
-                    Arc::clone(&leak_detector),
-                    graph.stores.channel_bot.clone(),
-                );
-                let sv_shutdown = shutdown.clone();
-                task_tracker.track(tokio::spawn(async move {
-                    supervisor.run(sv_shutdown).await;
-                }));
-            }
-
-            if graph.config.browser.enable && !graph.config.browser.sandbox {
-                tracing::warn!(
-                    "browser.sandbox=false — Chromium will launch without its renderer \
-                     sandbox. Only safe inside an outer sandbox (rootless docker, gVisor, …). \
-                     Set `browser.sandbox = true` in aura.json once you've verified the host \
-                     supports user-namespace sandboxing."
+    if let Some(runtime) = sidecar_runtime.as_ref() {
+        let domains: Vec<&str> = runtime.domains().collect();
+        if domains.is_empty() {
+            tracing::info!("no embedded sidecars in this build");
+        } else {
+            for domain in &domains {
+                let names: Vec<&str> = runtime.names_in_domain(domain).collect();
+                tracing::info!(
+                    domain = %domain,
+                    sidecars = ?names,
+                    channel_port,
+                    "sidecar runtime materialised",
                 );
             }
         }
-        Err(e) => {
+
+        let channel_only: Vec<String> = runtime
+            .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
+            .map(String::from)
+            .collect();
+        if !channel_only.is_empty() {
+            let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
+            let supervisor = SidecarSupervisor::new(
+                Arc::clone(runtime),
+                spawner,
+                Arc::clone(&log_buffer),
+                workspace_paths.channel_logs_dir(),
+                Arc::clone(&leak_detector),
+                graph.stores.channel_bot.clone(),
+            );
+            let sv_shutdown = shutdown.clone();
+            task_tracker.track(tokio::spawn(async move {
+                supervisor.run(sv_shutdown).await;
+            }));
+        }
+
+        if graph.config.browser.enable && !graph.config.browser.sandbox {
             tracing::warn!(
-                error = %e,
-                "embedded sidecar runtime unavailable; no sidecars will be spawned",
+                "browser.sandbox=false — Chromium will launch without its renderer \
+                 sandbox. Only safe inside an outer sandbox (rootless docker, gVisor, …). \
+                 Set `browser.sandbox = true` in aura.json once you've verified the host \
+                 supports user-namespace sandboxing."
             );
         }
     }

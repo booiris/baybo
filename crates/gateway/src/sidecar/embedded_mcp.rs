@@ -7,7 +7,7 @@
 //! and the per-domain composition that turns the operator's
 //! [`AuraConfig`] into the profile list the reconciler consumes.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use aura_config::AuraConfig;
 use aura_tools::mcp::{BlobUploadEnv, EmbeddedMcpProfile, browser_mcp_profile};
@@ -43,7 +43,7 @@ pub fn node_binary() -> PathBuf {
 pub fn collect_profiles(
     runtime: &SidecarRuntime,
     config: &AuraConfig,
-    blob_upload: Option<BlobUploadEnv<'_>>,
+    blob_upload: Option<&BlobUploadEnv>,
 ) -> Vec<EmbeddedMcpProfile> {
     let node_cmd = node_binary().display().to_string();
     [runtime.bundle_for("browser").and_then(|bundle| {
@@ -63,33 +63,6 @@ pub fn collect_profiles(
     .into_iter()
     .flatten()
     .collect()
-}
-
-/// Convenience: build a [`BlobUploadEnv`] from the workspace channel
-/// port-file path and a registered tool-sidecar token. The token must
-/// be live in the gateway's `ChannelTokenTable` under a `tool/<name>`
-/// label before the first upload could fire.
-pub fn blob_upload_env<'a>(port_file: &'a Path, token: &'a str) -> BlobUploadEnv<'a> {
-    BlobUploadEnv { port_file, token }
-}
-
-/// Owned counterpart to [`BlobUploadEnv`] — passes through
-/// [`crate::server`] / `runtime::build_managers` boundaries that the
-/// borrow can't cross. Built once in `gateway_cmd::start` from the
-/// minted browser-tool token + workspace's channel port-file path.
-#[derive(Debug, Clone)]
-pub struct BootBlobUpload {
-    pub port_file: PathBuf,
-    pub token: String,
-}
-
-impl BootBlobUpload {
-    pub fn as_env(&self) -> BlobUploadEnv<'_> {
-        BlobUploadEnv {
-            port_file: &self.port_file,
-            token: &self.token,
-        }
-    }
 }
 
 #[cfg(test)]
