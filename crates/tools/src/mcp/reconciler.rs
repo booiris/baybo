@@ -319,7 +319,7 @@ impl McpReconciler {
         // `installed`-trust stdio command and run it at boot.
         entry.validate()?;
         let session = connect_with_extra_env(entry, &self.vault, extra_env).await?;
-        let resources = resource_access_for(entry);
+        let resources = resource_access_for(entry, is_embedded);
         let trust_level: aura_model::TrustLevel = entry.trust_level.into();
 
         for descriptor in session.tools().to_vec() {
@@ -397,7 +397,31 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
     hasher.finish()
 }
 
-fn resource_access_for(entry: &McpServerEntry) -> Vec<ResourceAccess> {
+/// Default per-call resource accesses for tools provided by the given MCP
+/// server. Becomes the McpTool's `default_resource_access` fallback when
+/// the tool descriptor carries no `_meta.aura.access_rule`.
+///
+/// For **user-configured** `.mcp.json` servers the answer is
+/// transport-derived: every stdio tool counts as an `ExecCommand{command}`,
+/// every HTTP tool as `Http{host}`. The agent loop's pre-execute approval
+/// gate prompts on these uniformly.
+///
+/// For **embedded** Aura-owned servers (browser today, future code_exec /
+/// db_query) the embedded profile builder declares the capability
+/// ceiling explicitly via `EmbeddedMcpProfile::capabilities`. An *empty*
+/// `capabilities` is the embedded profile's way of saying "Aura controls
+/// the spawn and trusts the vendor; do not gate per-call approval on the
+/// transport command" — the user already authorised the spawn by setting
+/// `enable=true` in aura.json. The browser sidecar relies on this:
+/// chrome-devtools-mcp's tool surface is too broad and too high-frequency
+/// for a per-call "will run: node" prompt to make sense.
+///
+/// User servers can't reach this branch — `is_embedded=false` keeps the
+/// existing behaviour even if `.mcp.json` declares `capabilities: []`.
+fn resource_access_for(entry: &McpServerEntry, is_embedded: bool) -> Vec<ResourceAccess> {
+    if is_embedded && entry.capabilities.is_empty() {
+        return Vec::new();
+    }
     match &entry.transport {
         McpTransportConfig::Stdio { command, .. } => {
             vec![ResourceAccess::ExecCommand {
@@ -455,5 +479,72 @@ mod tests {
         // Load failed → can't tell whether the user removed it →
         // preserve the live connection.
         assert!(!should_disconnect("github-mcp", false, &embedded));
+    }
+
+    /// Regression: `aura.json:browser` declares `capabilities: []` to
+    /// opt the embedded browser sidecar out of per-call approval (the
+    /// operator's `enable=true` is the gate). Before the fix, the
+    /// reconciler derived approval resources from the **transport**
+    /// (stdio → `ExecCommand{command="node"}`) regardless of capabilities,
+    /// so every browser tool call prompted "will run: node". This test
+    /// pins the contract: an embedded server with empty capabilities
+    /// gets an empty default access list, which short-circuits the
+    /// agent loop's pre-execute approval gate.
+    #[test]
+    fn embedded_with_empty_capabilities_skips_approval() {
+        use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
+
+        let entry = McpServerEntry {
+            name: "browser".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "node".into(),
+                args: vec!["/path/to/bundle.mjs".into()],
+            },
+            trust_level: TrustLevelConfig::Trusted,
+            capabilities: vec![],
+            oauth: None,
+        };
+        let embedded = resource_access_for(&entry, true);
+        assert!(
+            embedded.is_empty(),
+            "embedded server with capabilities=[] must yield empty default \
+             accesses; got {embedded:?}",
+        );
+        // User servers with the same shape MUST still get the
+        // transport-derived ExecCommand prompt — `is_embedded=false` is
+        // the only difference.
+        let user = resource_access_for(&entry, false);
+        assert_eq!(
+            user.len(),
+            1,
+            "user .mcp.json server falls back to transport-derived ExecCommand",
+        );
+    }
+
+    /// Embedded servers that DO declare capabilities still get the
+    /// transport-derived approval — opting out via empty capabilities is
+    /// explicit. A future `code_exec` tool sidecar declaring
+    /// `[ExecCommand]` should still trigger the approval gate.
+    #[test]
+    fn embedded_with_capabilities_still_gets_approval() {
+        use crate::ToolCapability;
+        use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
+
+        let entry = McpServerEntry {
+            name: "code_exec".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "node".into(),
+                args: vec!["/path/to/exec_bundle.mjs".into()],
+            },
+            trust_level: TrustLevelConfig::Trusted,
+            capabilities: vec![ToolCapability::ExecCommand],
+            oauth: None,
+        };
+        let access = resource_access_for(&entry, true);
+        assert_eq!(
+            access.len(),
+            1,
+            "embedded server with declared capabilities still gets approval gate",
+        );
     }
 }

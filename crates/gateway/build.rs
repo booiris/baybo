@@ -879,7 +879,10 @@ fn sidecar_aux_assets(dir: &Path) -> Result<Vec<AuxAsset>, String> {
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "aura.auxAssets entries require string `name`".to_string())?;
-        validate_aux_name(name)?;
+        let recursive = asset
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let src_path = dir.join(src);
         if !src_path.exists() {
             return Err(format!(
@@ -887,12 +890,63 @@ fn sidecar_aux_assets(dir: &Path) -> Result<Vec<AuxAsset>, String> {
                 src_path.display()
             ));
         }
-        out.push(AuxAsset {
-            name: name.to_string(),
-            src: src_path,
-        });
+        if recursive {
+            // Directory-tree variant: walk every file under `src` and
+            // emit one AuxAsset per file named `<name>/<relative path>`.
+            // Used by the browser sidecar to ship chrome-devtools-mcp's
+            // 280+ pre-bundled JS files without enumerating each one
+            // by hand in package.json.
+            if !src_path.is_dir() {
+                return Err(format!(
+                    "aux asset '{name}' has recursive=true but src '{}' is not a directory",
+                    src_path.display()
+                ));
+            }
+            collect_recursive_aux(&src_path, &src_path, name, &mut out)?;
+        } else {
+            validate_aux_name(name)?;
+            out.push(AuxAsset {
+                name: name.to_string(),
+                src: src_path,
+            });
+        }
     }
     Ok(out)
+}
+
+fn collect_recursive_aux(
+    root: &Path,
+    cur: &Path,
+    name_prefix: &str,
+    out: &mut Vec<AuxAsset>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(cur).map_err(|e| format!("read aux dir {}: {e}", cur.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("read aux dir entry under {}: {e}", cur.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("stat aux dir entry {}: {e}", path.display()))?;
+        if file_type.is_dir() {
+            collect_recursive_aux(root, &path, name_prefix, out)?;
+        } else if file_type.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| format!("aux dir relative path for {}: {e}", path.display()))?;
+            let rel_str = rel
+                .to_str()
+                .ok_or_else(|| format!("aux dir entry {} has non-UTF-8 path", path.display()))?
+                .replace('\\', "/");
+            let aux_name = format!("{name_prefix}/{rel_str}");
+            validate_aux_name(&aux_name)?;
+            out.push(AuxAsset {
+                name: aux_name,
+                src: path,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_aux_name(name: &str) -> Result<(), String> {

@@ -240,21 +240,15 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // of a "temporary" token: any TUI still holding the previous
     // generation's value must reconnect via the freshly published
     // vault entry.
-    let (token, tui_token, browser_tool_token) = {
+    let (token, tui_token) = {
         let vault = runtime::build_secret_vault(&config).await?;
         let admin_token = AdminToken::new(Arc::clone(&vault)).mint_if_absent().await?;
         let tui_token = aura_gateway::generate_token();
-        // Browser tool sidecar token: minted up front so the leak
-        // detector can mask it before tracing starts. Lives in the
-        // ChannelTokenTable under the `tool/browser` label, which the
-        // auth middleware classifies as `AuthedClient::Tool` (bypasses
-        // pairing on /v1/blobs, rejected from /v1/channel-ws).
-        let browser_tool_token = aura_gateway::generate_token();
         vault
             .store_secret(TUI_TOKEN_VAULT_KEY, tui_token.as_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("publish TUI token to vault: {e}"))?;
-        (admin_token, tui_token, browser_tool_token)
+        (admin_token, tui_token)
     };
 
     // Build the leak detector (with every gateway-minted token
@@ -268,7 +262,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         &[
             ("gateway.admin_token", token.as_str()),
             (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
-            ("tool.browser.upload_token", browser_tool_token.as_str()),
         ],
     );
     let log_dir = workspace_paths.logs_dir();
@@ -288,12 +281,12 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let runtime_cfg = RuntimeGatewayConfig::from_config(&config.gateway)
         .map_err(|e| anyhow::anyhow!("invalid gateway config: {e}"))?;
 
-    // Channel-token table needs to exist BEFORE `build_managers`
-    // spawns the embedded browser MCP child — the child env carries
-    // the token, and the first /v1/blobs POST will look it up here.
-    // Register both the TUI token and the browser tool token; both
-    // handles are held for the lifetime of `start` (drop revokes the
-    // in-memory entry on shutdown).
+    // Channel-token table for the TUI handshake. The browser MCP
+    // sidecar (chrome-devtools-mcp wrapper) does not use the blob
+    // upload backchannel — its screenshots flow through the standard
+    // MCP `attachImage` content type and are decoded by Aura's
+    // gateway-side `content_adapter`. So no tool/* token registration
+    // is needed here.
     let channel_tokens = ChannelTokenTable::new();
     let _tui_token_handle = channel_tokens.register(
         tui_token.clone(),
@@ -307,28 +300,10 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
             bound_channel_type: None,
         },
     );
-    let _browser_tool_handle = channel_tokens.register(
-        browser_tool_token.clone(),
-        ClientIdentity {
-            pid: std::process::id(),
-            label: format!("{}browser", aura_gateway::TOOL_CLIENT_LABEL_PREFIX),
-            // None: tool sidecars are session-scoped (like TUI), not
-            // bound to a channel type. The handshake gate rejects
-            // tool/* labels from /v1/channel-ws; only the blob
-            // upload path uses this token.
-            bound_channel_type: None,
-        },
-    );
 
-    // Workspace channel-port file — the channel listener will write
-    // its bound port here at start. The browser MCP child reads it
-    // lazily on first upload, so we can compute the path before the
-    // listener actually binds and ship it via env to the child.
+    // Workspace channel-port file — the channel listener writes its
+    // bound port here at start.
     let port_file = workspace_paths.channel_port();
-    let browser_blob_upload = aura_tools::mcp::BlobUploadEnv {
-        port_file: port_file.clone(),
-        token: browser_tool_token.clone(),
-    };
 
     // Install the embedded sidecar runtime once and reuse it for both
     // the MCP-profile collection (browser MCP server) below and the
@@ -347,13 +322,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         };
     let embedded_mcp_servers: Vec<aura_tools::mcp::EmbeddedMcpServer> = sidecar_runtime
         .as_deref()
-        .map(|rt| {
-            aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(
-                rt,
-                &config,
-                Some(&browser_blob_upload),
-            ))
-        })
+        .map(|rt| aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(rt, &config)))
         .unwrap_or_default();
 
     let shutdown = ShutdownSignal::new();
@@ -435,9 +404,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Channel loopback-TCP listener — publishes its ephemeral port to
     // `<workspace>/channel.port` (same workspace identity dir as the
     // singleton lockfile) so TUI and sidecars can discover it without
-    // a config roundtrip. `port_file` was computed above and shipped
-    // into the browser MCP child's env so it can resolve the upload
-    // URL lazily.
+    // a config roundtrip.
     let channel_server = ChannelServer::bind(&deps, port_file, channel_tokens.clone())
         .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();
@@ -484,15 +451,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
             task_tracker.track(tokio::spawn(async move {
                 supervisor.run(sv_shutdown).await;
             }));
-        }
-
-        if graph.config.browser.enable && !graph.config.browser.sandbox {
-            tracing::warn!(
-                "browser.sandbox=false — Chromium will launch without its renderer \
-                 sandbox. Only safe inside an outer sandbox (rootless docker, gVisor, …). \
-                 Set `browser.sandbox = true` in aura.json once you've verified the host \
-                 supports user-namespace sandboxing."
-            );
         }
     }
 

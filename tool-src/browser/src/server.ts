@@ -1,174 +1,385 @@
 #!/usr/bin/env node
+// Aura's browser MCP sidecar is a thin wrapper around chrome-devtools-mcp:
+// we call its `createMcpServer` programmatically with hardened args
+// (telemetry off, isolation/persistence both via a dedicated userDataDir
+// + a dedicated Chrome binary) and connect a StdioServerTransport.
+//
+// What we install: **Google Chrome for Testing** — Google's own Chrome
+// stable build, packaged for automation. Same Blink/V8/Skia source
+// as the Chrome end users install from chrome.google.com, identical
+// proprietary codec stack (FFmpeg with H.264/AAC), Widevine CDM
+// included. The "for Testing" distribution differs from the consumer
+// Chrome only in: not auto-updating, no Google sign-in/sync, no
+// installer-level code-signing for general user use. Not Chromium
+// (the upstream open-source build, which lacks Google branding,
+// Widevine, and proprietary codecs).
+//
+// We deliberately do not pass through `--isolated`: that flag creates
+// a temp userDataDir auto-deleted on close, which conflicts with the
+// "persistent across Aura restarts" property the operator gets by
+// default. We achieve "isolated from the user's real Chrome profile"
+// via `userDataDir` pointed at an Aura-managed cache path + an
+// `executablePath` pointing at a Chrome under Aura's cache (not the
+// user's system browser).
+//
+// Chrome auto-install + non-blocking ready: on first boot, if no
+// Chrome is found under Aura's cache, we kick off a download of
+// Chrome for Testing 'stable' into `$XDG_CACHE_HOME/aura/browser/chrome/`
+// via @puppeteer/browsers in the background. The MCP server connects
+// immediately so the gateway sees the full tool list and the LLM can
+// reason about browser availability. Any `tools/call` arriving while
+// the download is in progress is intercepted by `GuardingTransport`
+// and answered with a synthetic "Chrome installing, X%" response —
+// the LLM gets actionable progress and can retry. Once the download
+// completes, the `args.executablePath` field is mutated in place, and
+// CDDM's `getContext()` (which re-reads `serverArgs.executablePath`
+// on every tool call) picks up the new path on the next attempt.
+//
+// Operator-facing knobs all live in `aura.json:browser.*`:
+// - `enable`, `chrome_path`, `sandbox`, `profile_dir` flow through
+//   `aura_tools::mcp::profile::browser_mcp_profile` into the child's
+//   env as internal IPC vars (`AURA_BROWSER_CHROME_PATH`,
+//   `AURA_BROWSER_NO_SANDBOX`, `AURA_BROWSER_PROFILE_DIR`).
+// - The env vars themselves are NOT a public interface; setting them
+//   directly works in development but isn't documented or supported.
+
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { createMcpServer } from "chrome-devtools-mcp";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequestSchema,
-  type CallToolResult,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+  Browser,
+  computeExecutablePath,
+  detectBrowserPlatform,
+  getInstalledBrowsers,
+  install,
+  resolveBuildId,
+} from "@puppeteer/browsers";
 
-import { BrowserManager } from "./manager.js";
-import { buildHandlers } from "./handlers.js";
-import { TOOLS } from "./tools.js";
+import type { CreateMcpServerArgs } from "chrome-devtools-mcp";
 
-const SERVER_NAME = "browser";
-const SERVER_VERSION = "0.1.0";
+type ServerArgs = CreateMcpServerArgs;
 
-interface Env {
-  profileDir: string;
-  chromiumExecutable: string | undefined;
-  noSandbox: boolean;
-  extraArgs: readonly string[];
-  allowLoopback: boolean;
+interface InstallState {
+  phase: "installing" | "ready" | "failed";
+  percent: number;
+  error?: string;
+  buildId?: string;
 }
 
-function readEnv(): Env {
-  const profileDir =
-    process.env["AURA_BROWSER_PROFILE_DIR"] ??
-    process.env["AURA_PROFILE_DIR"] ??
-    defaultProfileDir();
-  const chromiumExecutable = process.env["AURA_CHROMIUM_BIN"];
-  const noSandbox = parseBoolEnv(process.env["AURA_BROWSER_NO_SANDBOX"]);
-  const extraArgs = parseArgsEnv(process.env["AURA_BROWSER_ARGS"]);
-  // Test-only escape hatch: admits 127.0.0.0/8 + ::1 so smoke tests
-  // can drive a real Chromium against a local HTTP server. Production
-  // never sets this.
-  const allowLoopback = parseBoolEnv(process.env["AURA_BROWSER_ALLOW_LOOPBACK"]);
-  return {
-    profileDir,
-    chromiumExecutable,
-    noSandbox,
-    extraArgs,
-    allowLoopback,
-  };
-}
-
-function parseBoolEnv(s: string | undefined): boolean {
-  if (!s) return false;
-  const v = s.trim().toLowerCase();
-  return v === "1" || v === "true" || v === "yes" || v === "on";
-}
-
-function parseArgsEnv(raw: string | undefined): readonly string[] {
-  if (!raw) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    process.stderr.write(
-      `[browser-mcp] AURA_BROWSER_ARGS is not valid JSON, ignoring: ${
-        e instanceof Error ? e.message : String(e)
-      }\n`,
-    );
-    return [];
+function parseViewport(raw: string | undefined): { width: number; height: number } | undefined {
+  if (!raw) return undefined;
+  const m = raw.match(/^(\d+)x(\d+)$/);
+  if (!m) {
+    process.stderr.write(`[browser-mcp] AURA_BROWSER_VIEWPORT '${raw}' is not WxH; ignoring\n`);
+    return undefined;
   }
-  if (!Array.isArray(parsed) || !parsed.every((v) => typeof v === "string")) {
-    process.stderr.write(
-      `[browser-mcp] AURA_BROWSER_ARGS must be a JSON array of strings, ignoring\n`,
-    );
-    return [];
-  }
-  return parsed as readonly string[];
+  return { width: Number(m[1]), height: Number(m[2]) };
+}
+
+function xdgCacheHome(): string {
+  const xdg = process.env["XDG_CACHE_HOME"];
+  return xdg && xdg.length > 0 ? xdg : join(homedir(), ".cache");
 }
 
 function defaultProfileDir(): string {
-  const xdg = process.env["XDG_CACHE_HOME"];
-  const root = xdg && xdg.length > 0 ? xdg : join(homedir(), ".cache");
-  return join(root, "aura", "browser", "profile");
+  return join(xdgCacheHome(), "aura", "browser", "profile");
+}
+
+function defaultChromeCacheDir(): string {
+  return process.env["AURA_BROWSER_CACHE_DIR"] ?? join(xdgCacheHome(), "aura", "browser", "chrome");
+}
+
+const log = (msg: string): void => {
+  process.stderr.write(`[browser-mcp] ${msg}\n`);
+};
+
+/**
+ * Synchronous fast path: if a Chrome is already on disk (operator
+ * pinned via `aura.json:browser.chrome_path`, plumbed to us as
+ * `AURA_BROWSER_CHROME_PATH` by the Rust profile builder; or cached
+ * from a previous run), return its path. Returns `null` if nothing
+ * is available — the caller then kicks off the background download
+ * via {@link installChromeInBackground}.
+ *
+ * `AURA_BROWSER_CHROME_PATH` is an internal IPC channel between the
+ * gateway and the sidecar; operators configure the path through
+ * `aura.json:browser.chrome_path` only.
+ */
+async function findExistingChrome(): Promise<string | null> {
+  const pinned = process.env["AURA_BROWSER_CHROME_PATH"];
+  if (pinned && pinned.length > 0) {
+    if (existsSync(pinned)) {
+      log(`using configured Chrome: ${pinned}`);
+      return pinned;
+    }
+    log(
+      `aura.json:browser.chrome_path=${pinned} does not exist on disk; ` +
+        `falling through to cache lookup`,
+    );
+  }
+
+  const cacheDir = defaultChromeCacheDir();
+  mkdirSync(cacheDir, { recursive: true });
+
+  const platform = detectBrowserPlatform();
+  if (!platform) {
+    throw new Error(
+      "@puppeteer/browsers detectBrowserPlatform returned null — unsupported OS/arch combo. " +
+        "Set aura.json:browser.chrome_path to a Chrome binary you have available.",
+    );
+  }
+
+  const installed = await getInstalledBrowsers({ cacheDir });
+  const cached = installed.find((b) => b.browser === Browser.CHROME);
+  if (cached) {
+    log(`using cached Chrome: buildId=${cached.buildId} path=${cached.executablePath}`);
+    return cached.executablePath;
+  }
+
+  return null;
+}
+
+/**
+ * Long-running async path: download Google Chrome for Testing 'stable'
+ * into Aura's cache and update `state` in place so the
+ * {@link GuardingTransport} can surface progress. Resolves to the
+ * installed executable path on success; throws on failure.
+ */
+async function installChromeInBackground(state: InstallState): Promise<string> {
+  const cacheDir = defaultChromeCacheDir();
+  const platform = detectBrowserPlatform();
+  if (!platform) {
+    throw new Error("@puppeteer/browsers: unsupported platform for auto-install");
+  }
+  log(`no Chrome in ${cacheDir}; resolving Chrome for Testing 'stable' buildId for ${platform}`);
+  const buildId = await resolveBuildId(Browser.CHROME, platform, "stable");
+  state.buildId = buildId;
+  log(`downloading Chrome for Testing buildId=${buildId} platform=${platform} -> ${cacheDir}`);
+
+  let lastReport = -1;
+  await install({
+    cacheDir,
+    browser: Browser.CHROME,
+    buildId,
+    downloadProgressCallback: (downloaded: number, total: number): void => {
+      if (total <= 0) return;
+      const percent = Math.floor((downloaded / total) * 100);
+      state.percent = percent;
+      if (percent >= lastReport + 10) {
+        const mb = (n: number): string => (n / (1024 * 1024)).toFixed(1);
+        log(`download ${percent}% (${mb(downloaded)}/${mb(total)} MiB)`);
+        lastReport = percent;
+      }
+    },
+  });
+
+  const exe = computeExecutablePath({
+    cacheDir,
+    browser: Browser.CHROME,
+    buildId,
+    platform,
+  });
+  log(`Chrome installed at ${exe}`);
+  return exe;
+}
+
+function buildArgs(executablePath: string | undefined): ServerArgs {
+  const userDataDir = process.env["AURA_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
+  mkdirSync(userDataDir, { recursive: true });
+
+  const proxyServer = process.env["AURA_BROWSER_PROXY"] || undefined;
+  const viewport = parseViewport(process.env["AURA_BROWSER_VIEWPORT"]);
+
+  // Chrome's renderer sandbox is on by default. The Rust profile
+  // builder sets AURA_BROWSER_NO_SANDBOX=1 when `aura.json:browser.sandbox`
+  // is false (the default — most container/CI hosts can't satisfy
+  // Chrome's user-namespace prerequisites). Append `--no-sandbox` to
+  // chromeArg so it reaches Chrome at launch.
+  const chromeArg: string[] = [];
+  if (process.env["AURA_BROWSER_NO_SANDBOX"] === "1") {
+    chromeArg.push("--no-sandbox");
+  }
+
+  return {
+    headless: true,
+    isolated: false,
+    usageStatistics: false,
+    performanceCrux: false,
+    userDataDir,
+    executablePath,
+    proxyServer,
+    viewport,
+    chromeArg: chromeArg.length > 0 ? chromeArg : undefined,
+    redactNetworkHeaders: true,
+    categoryNavigationAutomation: true,
+    categoryDebugging: true,
+    categoryEmulation: true,
+    categoryPerformance: true,
+    categoryNetwork: true,
+    categoryExtensions: false,
+    slim: false,
+  };
+}
+
+// ---------------------------------------------------------------------
+// GuardingTransport
+// ---------------------------------------------------------------------
+//
+// Wraps a real `StdioServerTransport` with one job: while Chrome is
+// downloading, intercept `tools/call` requests and reply with a
+// synthetic "still installing" message. Everything else (initialize,
+// notifications/initialized, tools/list, ping, etc.) flows through
+// unchanged so the gateway sees a fully-functional MCP server from
+// the moment we connect.
+
+interface JsonRpcRequest {
+  jsonrpc: "2.0";
+  id: number | string;
+  method: string;
+  params?: unknown;
+}
+
+interface JsonRpcMessage {
+  jsonrpc?: "2.0";
+  id?: number | string;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: unknown;
+}
+
+function isToolCallRequest(msg: unknown): msg is JsonRpcRequest {
+  if (typeof msg !== "object" || msg === null) return false;
+  const m = msg as JsonRpcMessage;
+  return (
+    m.method === "tools/call" &&
+    (typeof m.id === "number" || typeof m.id === "string")
+  );
+}
+
+class GuardingTransport {
+  private real: StdioServerTransport;
+  private state: InstallState;
+  public onmessage?: (msg: unknown) => void;
+  public onerror?: (err: Error) => void;
+  public onclose?: () => void;
+
+  constructor(real: StdioServerTransport, state: InstallState) {
+    this.real = real;
+    this.state = state;
+    this.real.onmessage = (msg: unknown): void => {
+      if (this.state.phase !== "ready" && isToolCallRequest(msg)) {
+        void this.sendSyntheticReply(msg);
+        return;
+      }
+      this.onmessage?.(msg);
+    };
+    this.real.onerror = (err: Error): void => {
+      this.onerror?.(err);
+    };
+    this.real.onclose = (): void => {
+      this.onclose?.();
+    };
+  }
+
+  private async sendSyntheticReply(req: JsonRpcRequest): Promise<void> {
+    let text: string;
+    if (this.state.phase === "installing") {
+      const buildSuffix = this.state.buildId ? ` (Chrome for Testing buildId=${this.state.buildId})` : "";
+      text =
+        `Browser is still being prepared for first-time setup: downloading Chrome${buildSuffix}, ` +
+        `${this.state.percent}% complete. The download is ~175 MiB and runs in the background. ` +
+        `Please retry this tool call in a few seconds.`;
+    } else {
+      text =
+        `Browser is unavailable: Chrome auto-install failed (${this.state.error}). ` +
+        `Set aura.json:browser.chrome_path to an existing Chrome binary, or fix ` +
+        `the network and restart the gateway.`;
+    }
+    await this.real.send({
+      jsonrpc: "2.0",
+      id: req.id,
+      result: {
+        content: [{ type: "text", text }],
+        isError: true,
+      },
+    });
+  }
+
+  async start(): Promise<void> {
+    return this.real.start();
+  }
+  async close(): Promise<void> {
+    return this.real.close();
+  }
+  async send(msg: unknown): Promise<void> {
+    return this.real.send(msg as Parameters<StdioServerTransport["send"]>[0]);
+  }
 }
 
 async function main(): Promise<void> {
-  const env = readEnv();
+  const state: InstallState = { phase: "installing", percent: 0 };
 
-  // Stderr-only logging: the gateway pipes stderr into its tracing
-  // log_buffer, while stdout carries the MCP framed protocol — any
-  // stray println on stdout corrupts a JSON-RPC frame and kills the
-  // session.
-  const log = (msg: string): void => {
-    process.stderr.write(`[browser-mcp] ${msg}\n`);
-  };
+  // Sync-ish fast path: if Chrome is already available, skip the
+  // dance entirely and start in 'ready' state.
+  let initialPath: string | null = null;
+  try {
+    initialPath = await findExistingChrome();
+  } catch (e) {
+    state.phase = "failed";
+    state.error = e instanceof Error ? e.message : String(e);
+  }
 
-  const manager = new BrowserManager({
-    profileDir: env.profileDir,
-    chromiumExecutable: env.chromiumExecutable,
-    noSandbox: env.noSandbox,
-    extraArgs: env.extraArgs,
-    allowLoopback: env.allowLoopback,
-    // Without the WS transport's outbound channel, embedded MCP servers
-    // have no clean way to push unsolicited "context_closed" events
-    // back to the gateway. The downstream Rust side only logged them
-    // anyway, so we drop the upcall: idle GC still reaps Playwright
-    // contexts on the sidecar side; the gateway just doesn't get an
-    // explicit notification.
-    emitEvent: () => {},
-  });
+  if (initialPath) {
+    state.phase = "ready";
+  }
 
-  const handlers = buildHandlers(manager);
+  const args = buildArgs(initialPath ?? undefined);
 
-  const server = new Server(
-    { name: SERVER_NAME, version: SERVER_VERSION },
-    { capabilities: { tools: {} } },
+  // Kick off the install in background if we don't have Chrome yet
+  // and the platform check above didn't already fail.
+  if (state.phase === "installing") {
+    void installChromeInBackground(state).then(
+      (exe) => {
+        args.executablePath = exe;
+        state.phase = "ready";
+        state.percent = 100;
+        log("Chrome ready; browser tools are live");
+      },
+      (err: unknown) => {
+        state.phase = "failed";
+        state.error = err instanceof Error ? err.message : String(err);
+        log(`Chrome install failed: ${state.error}`);
+      },
+    );
+  }
+
+  const { server } = await createMcpServer(args, {});
+
+  const realTransport = new StdioServerTransport();
+  const transport = new GuardingTransport(realTransport, state);
+  await server.connect(transport as unknown as StdioServerTransport);
+
+  const chromeArgList = args.chromeArg && args.chromeArg.length > 0 ? args.chromeArg.join(",") : "";
+  const viewportStr = args.viewport ? `${args.viewport.width}x${args.viewport.height}` : "<chrome default>";
+  log(
+    `chrome-devtools-mcp ready: userDataDir=${args.userDataDir} ` +
+      `executable=${args.executablePath ?? "<pending install>"} ` +
+      `viewport=${viewportStr} headless=${args.headless} ` +
+      `sandbox=${chromeArgList.includes("--no-sandbox") ? "off" : "on"} ` +
+      `telemetry=off install_state=${state.phase}`,
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: TOOLS.map((t) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
-      _meta: t._meta,
-    })),
-  }));
-
-  server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
-    const handler = handlers[req.params.name];
-    if (!handler) {
-      return {
-        content: [{ type: "text", text: `unknown tool '${req.params.name}'` }],
-        isError: true,
-      };
-    }
-    const args = (req.params.arguments ?? {}) as Record<string, unknown>;
-    if (typeof args["context_id"] !== "string" || args["context_id"].length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "missing context_id — Aura's MCP client should auto-inject this; non-Aura clients must pass it explicitly",
-          },
-        ],
-        isError: true,
-      };
-    }
-    try {
-      const out = await handler(args as Record<string, unknown> & { context_id: string });
-      // The MCP SDK's `CallToolResult` is a structural superset of our
-      // internal `CallResult`; the cast is a no-op at runtime.
-      return out as CallToolResult;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      const code = e instanceof Error && e.name ? e.name : "EXECUTION_ERROR";
-      return {
-        content: [{ type: "text", text: `${code}: ${msg}` }],
-        isError: true,
-      };
-    }
-  });
-
-  const shutdown = async (): Promise<void> => {
+  const shutdown = (): void => {
     log("shutting down");
-    await manager.shutdown();
-    await server.close().catch(() => undefined);
-    process.exit(0);
+    void server.close().catch(() => undefined);
+    setTimeout(() => process.exit(0), 50).unref();
   };
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  log(`mcp server '${SERVER_NAME}' v${SERVER_VERSION} ready (${TOOLS.length} tools)`);
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 main().catch((e: unknown) => {

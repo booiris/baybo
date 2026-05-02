@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use aura_config::AuraConfig;
-use aura_tools::mcp::{BlobUploadEnv, EmbeddedMcpProfile, browser_mcp_profile};
+use aura_tools::mcp::{EmbeddedMcpProfile, browser_mcp_profile};
 
 use crate::sidecar::SidecarRuntime;
 
@@ -40,21 +40,16 @@ pub fn node_binary() -> PathBuf {
 /// Adding a future tool-domain MCP server (code_exec, db_query, …) is
 /// one more entry in the array literal — `runtime::build_managers`
 /// stays unchanged.
-pub fn collect_profiles(
-    runtime: &SidecarRuntime,
-    config: &AuraConfig,
-    blob_upload: Option<&BlobUploadEnv>,
-) -> Vec<EmbeddedMcpProfile> {
+pub fn collect_profiles(runtime: &SidecarRuntime, config: &AuraConfig) -> Vec<EmbeddedMcpProfile> {
     let node_cmd = node_binary().display().to_string();
     [runtime.bundle_for("browser").and_then(|bundle| {
         browser_mcp_profile(
             config.browser.enable,
-            config.browser.sandbox,
             config.browser.chrome_path.as_deref(),
             config.browser.profile_dir.as_deref(),
-            &config.browser.args,
-            config.browser.allow_loopback,
-            blob_upload,
+            config.browser.sandbox,
+            config.browser.width,
+            config.browser.height,
             node_cmd.clone(),
             bundle,
         )
@@ -72,8 +67,8 @@ mod tests {
     /// Disabled-by-default browser config produces zero embedded
     /// profiles even when the bundle is materialised. This is the
     /// boot-path equivalent of the `browser_mcp_profile` unit test —
-    /// catches a typo like `config.browser.sandbox` instead of
-    /// `config.browser.enable` that would silently bypass the gate.
+    /// catches a typo on `config.browser.enable` that would silently
+    /// bypass the gate.
     #[test]
     fn default_config_produces_no_profiles() {
         let Ok(rt) = SidecarRuntime::install() else {
@@ -85,7 +80,7 @@ mod tests {
         let cfg = AuraConfig::default();
         assert!(!cfg.browser.enable, "default browser config is opt-in");
         assert!(
-            collect_profiles(&rt, &cfg, None).is_empty(),
+            collect_profiles(&rt, &cfg).is_empty(),
             "browser.enable=false must keep the profile list empty even when the bundle is embedded",
         );
     }
@@ -100,12 +95,11 @@ mod tests {
             return;
         };
         if rt.bundle_for("browser").is_none() {
-            // No browser bundle in this build; nothing to enable.
             return;
         }
         let mut cfg = AuraConfig::default();
         cfg.browser.enable = true;
-        let profiles = collect_profiles(&rt, &cfg, None);
+        let profiles = collect_profiles(&rt, &cfg);
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].server_name, "browser");
     }
