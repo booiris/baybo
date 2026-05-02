@@ -25,8 +25,14 @@ use crate::ToolCapability;
 /// - `enable`: master switch — `false` returns `None`.
 /// - `sandbox`: when `false`, sets `AURA_BROWSER_NO_SANDBOX=1` so the
 ///   TS sidecar launches Chromium with `--no-sandbox`.
+/// - `headless`: when `false`, sets `AURA_BROWSER_HEADLESS=0` so the
+///   TS sidecar launches Chromium with a visible window. Default is
+///   headless (env var skipped) to match historical behaviour.
 /// - `chrome_path`, `profile_dir`: optional overrides; when set, land
 ///   in `AURA_CHROMIUM_BIN` / `AURA_BROWSER_PROFILE_DIR` env vars.
+/// - `extra_args`: passed through verbatim to `chromium.launch.args`
+///   via `AURA_BROWSER_ARGS` (JSON-array encoded). Each entry must
+///   already include the leading `-` / `--`.
 /// - `allow_loopback`: test-only escape hatch — admits 127.0.0.0/8 +
 ///   `::1` via `AURA_BROWSER_ALLOW_LOOPBACK=1`.
 /// - `command`: typically the resolved host `node` binary
@@ -50,8 +56,10 @@ use crate::ToolCapability;
 pub fn browser_mcp_profile(
     enable: bool,
     sandbox: bool,
+    headless: bool,
     chrome_path: Option<&Path>,
     profile_dir: Option<&Path>,
+    extra_args: &[String],
     allow_loopback: bool,
     blob_upload: Option<BlobUploadEnv<'_>>,
     command: String,
@@ -73,6 +81,22 @@ pub fn browser_mcp_profile(
     // explicitly enabled it, the child default (sandbox on) takes effect.
     if !sandbox {
         extra_env.insert("AURA_BROWSER_NO_SANDBOX".into(), "1".into());
+    }
+    // `headless: true` is the default on the TS side; only emit the
+    // env when the operator opted out, so the var stays absent in
+    // typical operation.
+    if !headless {
+        extra_env.insert("AURA_BROWSER_HEADLESS".into(), "0".into());
+    }
+    if !extra_args.is_empty() {
+        // JSON-encode so an arg containing whitespace, `=`, or any
+        // shell-special char survives intact across the env-var hop.
+        // The TS side `JSON.parse`s and forwards verbatim to
+        // `chromium.launch({ args: [...] })`. Encode failure here is
+        // unreachable (Vec<String> always serializes), but `unwrap_or`
+        // keeps the function infallible.
+        let encoded = serde_json::to_string(extra_args).unwrap_or_else(|_| "[]".into());
+        extra_env.insert("AURA_BROWSER_ARGS".into(), encoded);
     }
     if allow_loopback {
         extra_env.insert("AURA_BROWSER_ALLOW_LOOPBACK".into(), "1".into());
@@ -115,41 +139,41 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Common args used by tests below. headless=true (default) keeps
+    /// AURA_BROWSER_HEADLESS out of extra_env; sandbox=false keeps
+    /// AURA_BROWSER_NO_SANDBOX=1 in extra_env per default behaviour.
+    fn defaults_call(enable: bool) -> Option<EmbeddedMcpProfile> {
+        browser_mcp_profile(
+            enable,
+            false, // sandbox
+            true,  // headless
+            None,  // chrome_path
+            None,  // profile_dir
+            &[],   // extra_args
+            false, // allow_loopback
+            None,  // blob_upload
+            "node".into(),
+            Path::new("/x.mjs"),
+        )
+    }
+
     #[test]
     fn disabled_yields_no_profile() {
-        assert!(
-            browser_mcp_profile(
-                false,
-                false,
-                None,
-                None,
-                false,
-                None,
-                "node".into(),
-                Path::new("/x.mjs"),
-            )
-            .is_none()
-        );
+        assert!(defaults_call(false).is_none());
     }
 
     #[test]
     fn enabled_synthesises_a_profile_with_no_sandbox_env() {
-        let p = browser_mcp_profile(
-            true,
-            false,
-            None,
-            None,
-            false,
-            None,
-            "node".into(),
-            Path::new("/x.mjs"),
-        )
-        .expect("profile when enabled");
+        let p = defaults_call(true).expect("profile when enabled");
         assert_eq!(p.server_name, "browser");
         assert_eq!(p.command, "node");
         assert_eq!(p.args, vec!["/x.mjs".to_string()]);
         // sandbox=false default → AURA_BROWSER_NO_SANDBOX=1 in extra_env
         assert_eq!(p.extra_env.get("AURA_BROWSER_NO_SANDBOX").unwrap(), "1");
+        // headless=true default → AURA_BROWSER_HEADLESS absent
+        assert!(!p.extra_env.contains_key("AURA_BROWSER_HEADLESS"));
+        // empty extra_args → AURA_BROWSER_ARGS absent
+        assert!(!p.extra_env.contains_key("AURA_BROWSER_ARGS"));
     }
 
     #[test]
@@ -157,8 +181,10 @@ mod tests {
         let p = browser_mcp_profile(
             true,
             true,
+            true,
             None,
             None,
+            &[],
             false,
             None,
             "node".into(),
@@ -169,12 +195,32 @@ mod tests {
     }
 
     #[test]
+    fn headless_off_emits_env() {
+        let p = browser_mcp_profile(
+            true,
+            false,
+            false,
+            None,
+            None,
+            &[],
+            false,
+            None,
+            "node".into(),
+            Path::new("/x.mjs"),
+        )
+        .expect("profile when enabled");
+        assert_eq!(p.extra_env.get("AURA_BROWSER_HEADLESS").unwrap(), "0");
+    }
+
+    #[test]
     fn chrome_path_lands_in_env() {
         let p = browser_mcp_profile(
             true,
             false,
+            true,
             Some(&PathBuf::from("/opt/chrome")),
             None,
+            &[],
             false,
             None,
             "node".into(),
@@ -185,13 +231,40 @@ mod tests {
     }
 
     #[test]
+    fn extra_args_json_encoded_in_env() {
+        let args = vec![
+            "--lang=en-US".to_string(),
+            "--ignore-certificate-errors".to_string(),
+        ];
+        let p = browser_mcp_profile(
+            true,
+            false,
+            true,
+            None,
+            None,
+            &args,
+            false,
+            None,
+            "node".into(),
+            Path::new("/x.mjs"),
+        )
+        .expect("profile when enabled");
+        let raw = p.extra_env.get("AURA_BROWSER_ARGS").unwrap();
+        // JSON-encoded so the TS side can parse without a delimiter
+        // collision worry.
+        assert_eq!(raw, r#"["--lang=en-US","--ignore-certificate-errors"]"#);
+    }
+
+    #[test]
     fn blob_upload_env_lands_in_env() {
         let port_file = PathBuf::from("/var/aura/state/channel.port");
         let p = browser_mcp_profile(
             true,
             false,
+            true,
             None,
             None,
+            &[],
             false,
             Some(BlobUploadEnv {
                 port_file: &port_file,

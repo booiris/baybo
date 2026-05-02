@@ -95,8 +95,10 @@ async fn boot_reconciler(
         browser_mcp_profile(
             browser_cfg.enable,
             browser_cfg.sandbox,
+            browser_cfg.headless,
             browser_cfg.chrome_path.as_deref(),
             browser_cfg.profile_dir.as_deref(),
+            &browser_cfg.args,
             browser_cfg.allow_loopback,
             // Smoke tests don't exercise the >2 MiB upload path —
             // the served pages are tiny. Leaving blob_upload at None

@@ -21,6 +21,8 @@ interface Env {
   profileDir: string;
   chromiumExecutable: string | undefined;
   noSandbox: boolean;
+  headless: boolean;
+  extraArgs: readonly string[];
   allowLoopback: boolean;
 }
 
@@ -31,17 +33,62 @@ function readEnv(): Env {
     defaultProfileDir();
   const chromiumExecutable = process.env["AURA_CHROMIUM_BIN"];
   const noSandbox = parseBoolEnv(process.env["AURA_BROWSER_NO_SANDBOX"]);
+  // headless defaults true. Gateway only sets the env when the
+  // operator opted out (`browser.headless = false`), so the
+  // historical headless behaviour stays the default when the var
+  // is absent.
+  const headless = !parseBoolFalseyEnv(process.env["AURA_BROWSER_HEADLESS"]);
+  const extraArgs = parseArgsEnv(process.env["AURA_BROWSER_ARGS"]);
   // Test-only escape hatch: admits 127.0.0.0/8 + ::1 so smoke tests
   // can drive a real Chromium against a local HTTP server. Production
   // never sets this.
   const allowLoopback = parseBoolEnv(process.env["AURA_BROWSER_ALLOW_LOOPBACK"]);
-  return { profileDir, chromiumExecutable, noSandbox, allowLoopback };
+  return {
+    profileDir,
+    chromiumExecutable,
+    noSandbox,
+    headless,
+    extraArgs,
+    allowLoopback,
+  };
 }
 
 function parseBoolEnv(s: string | undefined): boolean {
   if (!s) return false;
   const v = s.trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+/** Read a "falsey" env var: returns true iff the value is explicitly
+ *  one of `0|false|no|off`. Used for opt-out flags whose absent state
+ *  means "stay enabled" (i.e. headless stays on unless the operator
+ *  set the var to a falsey value). */
+function parseBoolFalseyEnv(s: string | undefined): boolean {
+  if (!s) return false;
+  const v = s.trim().toLowerCase();
+  return v === "0" || v === "false" || v === "no" || v === "off";
+}
+
+function parseArgsEnv(raw: string | undefined): readonly string[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    process.stderr.write(
+      `[browser-mcp] AURA_BROWSER_ARGS is not valid JSON, ignoring: ${
+        e instanceof Error ? e.message : String(e)
+      }\n`,
+    );
+    return [];
+  }
+  if (!Array.isArray(parsed) || !parsed.every((v) => typeof v === "string")) {
+    process.stderr.write(
+      `[browser-mcp] AURA_BROWSER_ARGS must be a JSON array of strings, ignoring\n`,
+    );
+    return [];
+  }
+  return parsed as readonly string[];
 }
 
 function defaultProfileDir(): string {
@@ -65,6 +112,8 @@ async function main(): Promise<void> {
     profileDir: env.profileDir,
     chromiumExecutable: env.chromiumExecutable,
     noSandbox: env.noSandbox,
+    headless: env.headless,
+    extraArgs: env.extraArgs,
     allowLoopback: env.allowLoopback,
     // Without the WS transport's outbound channel, embedded MCP servers
     // have no clean way to push unsolicited "context_closed" events

@@ -70,6 +70,19 @@ export interface ManagerOptions {
    */
   noSandbox?: boolean | undefined;
   /**
+   * Run Chromium in headless mode. Default true. Flip to false for
+   * local debugging when you want to see the agent's browsing —
+   * only useful with a desktop session ($DISPLAY / Wayland);
+   * headed mode in a server / CI env fails with `Missing X server`.
+   */
+  headless?: boolean | undefined;
+  /**
+   * Extra Chromium command-line arguments, appended verbatim to the
+   * launch flags. Each entry must include the leading `-` / `--`
+   * (e.g. `"--lang=en-US"`). Empty by default.
+   */
+  extraArgs?: readonly string[] | undefined;
+  /**
    * Test-only: allow navigations / subresources to 127.0.0.0/8 and
    * ::1. Mirrors `aura_security::is_blocked_ip(allow_loopback)` so
    * smoke tests can bind a local HTTP server and drive a real
@@ -139,7 +152,16 @@ export class BrowserManager {
           "an outer sandbox (rootless docker / gVisor / etc.).\n",
       );
     }
-    const launchOptions: LaunchOptions = { headless: true, args };
+    // Operator-supplied extras go LAST so they can override any
+    // defaults the gateway inserted above (e.g. an explicit
+    // `--enable-gpu` reverses our `--disable-gpu`).
+    if (this.opts.extraArgs && this.opts.extraArgs.length > 0) {
+      args.push(...this.opts.extraArgs);
+    }
+    // headless defaults true; only the operator opting out of
+    // headless via `browser.headless = false` flips it.
+    const headless = this.opts.headless !== false;
+    const launchOptions: LaunchOptions = { headless, args };
     if (this.opts.chromiumExecutable) {
       launchOptions.executablePath = this.opts.chromiumExecutable;
     }

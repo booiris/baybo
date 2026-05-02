@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BrowserConfig {
     /// Master switch for the embedded browser MCP server.
@@ -37,6 +37,15 @@ pub struct BrowserConfig {
     /// code and the gateway user. Has no effect when `enable=false`.
     pub sandbox: bool,
 
+    /// Run Chromium in headless mode (no visible window).
+    ///
+    /// **Default: `true`**. Flip to `false` for local debugging when
+    /// you want to see what the agent's browsing — only useful when
+    /// running the gateway from a desktop session with a display
+    /// server (`$DISPLAY` / Wayland). Headed mode in a server / CI
+    /// environment will fail with `Missing X server or $DISPLAY`.
+    pub headless: bool,
+
     /// Override the Chromium binary the sidecar drives.
     ///
     /// Default: Playwright's bundled Chromium under
@@ -55,12 +64,42 @@ pub struct BrowserConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_dir: Option<PathBuf>,
 
+    /// Extra Chromium command-line arguments, appended verbatim to
+    /// the launch flags. **Each entry must include the leading `-` /
+    /// `--`** — Aura passes them through without mangling, so write
+    /// `"--disable-features=BlockInsecurePrivateNetworkRequests"`,
+    /// not `"disable-features=..."`.
+    ///
+    /// Default: empty. The sidecar always passes `--disable-gpu` (and,
+    /// when `sandbox = false`, `--no-sandbox`); these don't need to
+    /// be repeated here. Use this for site-specific workarounds
+    /// (e.g. `"--lang=en-US"`, `"--ignore-certificate-errors"` —
+    /// the latter at your own risk).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+
     /// Test-only escape hatch: admit navigations to 127.0.0.0/8 and
     /// `::1`. Mirrors `aura_security::is_blocked_ip(allow_loopback)`
     /// so smoke tests can bind a local HTTP server and drive a real
     /// Chromium against it. **Production must leave this off** — the
     /// SSRF floor depends on it.
     pub allow_loopback: bool,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            sandbox: false,
+            // Match the historical hardcoded behaviour. Headed mode
+            // is opt-in for desktop debugging.
+            headless: true,
+            chrome_path: None,
+            profile_dir: None,
+            args: Vec::new(),
+            allow_loopback: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -75,8 +114,13 @@ mod tests {
             "enable defaults off (opt-in like gateway.enabled)"
         );
         assert!(!c.sandbox, "sandbox defaults off");
+        assert!(
+            c.headless,
+            "headless defaults on (matches historical behaviour)"
+        );
         assert!(c.chrome_path.is_none());
         assert!(c.profile_dir.is_none());
+        assert!(c.args.is_empty(), "no extra Chromium args by default");
         assert!(!c.allow_loopback, "allow_loopback defaults off");
     }
 
@@ -91,8 +135,10 @@ mod tests {
         let c = BrowserConfig {
             enable: true,
             sandbox: true,
+            headless: false,
             chrome_path: Some(PathBuf::from("/usr/bin/chromium")),
             profile_dir: Some(PathBuf::from("/tmp/aura-profile")),
+            args: vec!["--lang=en-US".into(), "--ignore-certificate-errors".into()],
             allow_loopback: true,
         };
         let json = serde_json::to_string(&c).unwrap();
@@ -106,5 +152,6 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         assert!(!json.contains("chrome_path"), "None chrome_path elided");
         assert!(!json.contains("profile_dir"), "None profile_dir elided");
+        assert!(!json.contains("args"), "empty args elided");
     }
 }
