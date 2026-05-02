@@ -24,7 +24,7 @@
 // path via the `auraResolveCddm` plugin below.
 
 import { build } from "esbuild";
-import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -39,6 +39,21 @@ if (!existsSync(cddmSrc)) {
   );
   process.exit(1);
 }
+
+// Inline Mozilla's Readability.js source so `read_page.ts` can inject
+// it into Chrome via `evaluate_script` without a network round-trip.
+// See `src/read_page.ts` for the injection wrapper.
+const readabilityPath = resolve(
+  here,
+  "node_modules/@mozilla/readability/Readability.js",
+);
+if (!existsSync(readabilityPath)) {
+  console.error(
+    "@mozilla/readability/Readability.js missing — run `pnpm install --filter @aura/tool-browser` first",
+  );
+  process.exit(1);
+}
+const readabilitySource = readFileSync(readabilityPath, "utf8");
 
 mkdirSync(distDir, { recursive: true });
 rmSync(resolve(distDir, "cddm"), { recursive: true, force: true });
@@ -69,6 +84,12 @@ const result = await build({
   // is materialised next to the bundle as a separate dir tree, hence
   // the resolver plugin above.
   external: [],
+  define: {
+    // Build-time constant referenced by `src/read_page.ts`. Wrapped in
+    // a string-literal so the source becomes a JS expression at bundle
+    // time, then ends up as a string runtime value.
+    __READABILITY_SOURCE__: JSON.stringify(readabilitySource),
+  },
   banner: {
     js: [
       `import { createRequire as __auraCreateRequire } from "node:module";`,

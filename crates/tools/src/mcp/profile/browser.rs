@@ -52,7 +52,26 @@ use super::EmbeddedMcpProfile;
 ///   `AURA_BROWSER_EXTRA_FONT_DIRS`. The TS wrapper writes a fontconfig
 ///   include file and sets `FONTCONFIG_FILE` before loading CDDM, so
 ///   Chrome (which is spawned in-process by CDDM/puppeteer) inherits
-///   the augmented font search path. Empty slice = no override.
+///   the augmented font search path. In docker mode the wrapper
+///   bind-mounts the *first existing* dir at `/data/fonts` instead.
+///   Empty slice = no override.
+/// - `docker_enable`: master switch for docker mode. When true and
+///   docker is available on the host, the TS wrapper spawns a Chrome-
+///   in-Xvfb container and connects via CDP (`browserUrl`); when
+///   docker is *not* available, the wrapper falls back to the host-
+///   headless path so boot still succeeds. Plumbed as
+///   `AURA_BROWSER_DOCKER_ENABLE=1`.
+/// - `docker_cdp_url`: when set, take precedence over `docker_enable`
+///   and connect to a pre-existing Chrome (operator-managed
+///   container, k8s pod, …) — sidecar performs zero docker
+///   interaction. Plumbed as `AURA_BROWSER_DOCKER_CDP_URL`.
+/// - `docker_web_vnc_port`: when set, the spawned container runs
+///   `x11vnc` + `websockify` + the bundled noVNC HTML client on this
+///   port for browser-based observability. Plumbed as
+///   `AURA_BROWSER_DOCKER_WEB_VNC_PORT`.
+/// - `docker_image_tag`: when set, skip the deterministic-tag computation
+///   + image build and trust this tag exists. Plumbed as
+///     `AURA_BROWSER_DOCKER_IMAGE_TAG`.
 ///
 /// `capabilities` is intentionally empty: dropping the
 /// `[Http, ExecCommand]` ceiling means `accessed_resources()` returns
@@ -75,6 +94,10 @@ pub fn browser_mcp_profile(
     command: String,
     bundle_path: &Path,
     extra_font_dirs: &[&Path],
+    docker_enable: bool,
+    docker_cdp_url: Option<&str>,
+    docker_web_vnc_port: Option<u16>,
+    docker_image_tag: Option<&str>,
 ) -> Option<EmbeddedMcpProfile> {
     if !enable {
         return None;
@@ -129,6 +152,22 @@ pub fn browser_mcp_profile(
             .join(":");
         extra_env.insert("AURA_BROWSER_EXTRA_FONT_DIRS".into(), joined);
     }
+    // Docker mode plumbing. All four are presence-only / value-bearing
+    // env vars the TS wrapper reads at startup. `cdp_url` takes
+    // precedence: when set, the wrapper skips docker entirely and
+    // connects to the operator's Chrome.
+    if docker_enable {
+        extra_env.insert("AURA_BROWSER_DOCKER_ENABLE".into(), "1".into());
+    }
+    if let Some(url) = docker_cdp_url {
+        extra_env.insert("AURA_BROWSER_DOCKER_CDP_URL".into(), url.into());
+    }
+    if let Some(port) = docker_web_vnc_port {
+        extra_env.insert("AURA_BROWSER_DOCKER_WEB_VNC_PORT".into(), port.to_string());
+    }
+    if let Some(tag) = docker_image_tag {
+        extra_env.insert("AURA_BROWSER_DOCKER_IMAGE_TAG".into(), tag.into());
+    }
     Some(EmbeddedMcpProfile {
         server_name: "browser".into(),
         command,
@@ -162,6 +201,10 @@ mod tests {
             "node".into(),
             Path::new("/x.mjs"),
             &[],
+            false, // docker_enable
+            None,  // docker_cdp_url
+            None,  // docker_web_vnc_port
+            None,  // docker_image_tag
         )
     }
 
@@ -233,6 +276,10 @@ mod tests {
             "node".into(),
             Path::new("/x.mjs"),
             &[],
+            false,
+            None,
+            None,
+            None,
         )
         .expect("profile when enabled");
         assert!(
@@ -253,6 +300,10 @@ mod tests {
             "node".into(),
             Path::new("/x.mjs"),
             &[],
+            false,
+            None,
+            None,
+            None,
         )
         .expect("profile when enabled");
         assert_eq!(
@@ -273,6 +324,10 @@ mod tests {
             "node".into(),
             Path::new("/x.mjs"),
             &[],
+            false,
+            None,
+            None,
+            None,
         )
         .expect("profile when enabled");
         assert_eq!(
@@ -293,6 +348,10 @@ mod tests {
             "node".into(),
             Path::new("/x.mjs"),
             &[],
+            false,
+            None,
+            None,
+            None,
         )
         .expect("profile when enabled");
         assert_eq!(
@@ -334,12 +393,131 @@ mod tests {
             "node".into(),
             Path::new("/x.mjs"),
             &[a.as_path(), b.as_path()],
+            false,
+            None,
+            None,
+            None,
         )
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env.get("AURA_BROWSER_EXTRA_FONT_DIRS").unwrap(),
             "/work/.fonts:/usr/share/extra-fonts",
             "multiple font dirs encoded as colon-joined path list (PATH-style) for the TS wrapper",
+        );
+    }
+
+    #[test]
+    fn docker_disabled_omits_all_docker_env() {
+        let p = defaults_call(true).expect("profile when enabled");
+        for key in [
+            "AURA_BROWSER_DOCKER_ENABLE",
+            "AURA_BROWSER_DOCKER_CDP_URL",
+            "AURA_BROWSER_DOCKER_WEB_VNC_PORT",
+            "AURA_BROWSER_DOCKER_IMAGE_TAG",
+        ] {
+            assert!(
+                !p.extra_env.contains_key(key),
+                "docker mode off must omit {key} so the TS wrapper takes the host-headless path",
+            );
+        }
+    }
+
+    #[test]
+    fn docker_enable_lands_in_env() {
+        let p = browser_mcp_profile(
+            true,
+            None,
+            None,
+            false,
+            1920,
+            1080,
+            "node".into(),
+            Path::new("/x.mjs"),
+            &[],
+            true,
+            None,
+            None,
+            None,
+        )
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env.get("AURA_BROWSER_DOCKER_ENABLE"),
+            Some(&"1".to_string()),
+            "docker_enable=true → AURA_BROWSER_DOCKER_ENABLE=1 (presence-only flag)",
+        );
+    }
+
+    #[test]
+    fn docker_cdp_url_lands_in_env() {
+        let p = browser_mcp_profile(
+            true,
+            None,
+            None,
+            false,
+            1920,
+            1080,
+            "node".into(),
+            Path::new("/x.mjs"),
+            &[],
+            false,
+            Some("http://10.0.0.5:9222"),
+            None,
+            None,
+        )
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env.get("AURA_BROWSER_DOCKER_CDP_URL").unwrap(),
+            "http://10.0.0.5:9222",
+        );
+    }
+
+    #[test]
+    fn docker_image_tag_override_lands_in_env() {
+        let p = browser_mcp_profile(
+            true,
+            None,
+            None,
+            false,
+            1920,
+            1080,
+            "node".into(),
+            Path::new("/x.mjs"),
+            &[],
+            true,
+            None,
+            None,
+            Some("my-registry/aura-browser:pinned"),
+        )
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env.get("AURA_BROWSER_DOCKER_IMAGE_TAG").unwrap(),
+            "my-registry/aura-browser:pinned",
+            "operator-supplied tag short-circuits the deterministic tag computation in the wrapper",
+        );
+    }
+
+    #[test]
+    fn docker_web_vnc_port_lands_in_env_as_string() {
+        let p = browser_mcp_profile(
+            true,
+            None,
+            None,
+            false,
+            1920,
+            1080,
+            "node".into(),
+            Path::new("/x.mjs"),
+            &[],
+            true,
+            None,
+            Some(6080),
+            None,
+        )
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env.get("AURA_BROWSER_DOCKER_WEB_VNC_PORT").unwrap(),
+            "6080",
+            "web_vnc_port serialised to a decimal string for the TS wrapper to parse",
         );
     }
 }

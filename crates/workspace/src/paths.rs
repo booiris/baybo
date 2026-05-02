@@ -100,6 +100,13 @@ pub const CODE_BUILDER_SUBDIR: &str = "code-builder";
 /// gateway restart picks it up without touching system fontconfig.
 pub const BROWSER_FONTS_SUBDIR: &str = ".fonts";
 
+/// Browser sidecar Chrome user-data-dir inside [`WORK_DIR`]. Persistent
+/// across Aura restarts (cookies / localStorage retained); in docker
+/// mode this gets bind-mounted at `/data/profile` inside the container.
+/// Lives under `work/` so it sits next to other workspace-scoped state
+/// (and inherits the same gitignore + lifecycle as the rest of `work/`).
+pub const BROWSER_PROFILE_SUBDIR: &str = "browser/profile";
+
 // ---------------------------------------------------------------------------
 // Files inside `logs/` (gitignored)
 // ---------------------------------------------------------------------------
@@ -299,6 +306,10 @@ impl WorkspacePaths {
     pub fn browser_fonts_dir(&self) -> PathBuf {
         self.work_dir().join(BROWSER_FONTS_SUBDIR)
     }
+
+    pub fn browser_profile_dir(&self) -> PathBuf {
+        self.work_dir().join(BROWSER_PROFILE_SUBDIR)
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +350,14 @@ mod tests {
         assert_eq!(
             p.code_builder_dir(),
             PathBuf::from("/var/aura/work/code-builder"),
+        );
+        assert_eq!(
+            p.browser_fonts_dir(),
+            PathBuf::from("/var/aura/work/.fonts"),
+        );
+        assert_eq!(
+            p.browser_profile_dir(),
+            PathBuf::from("/var/aura/work/browser/profile"),
         );
         assert_eq!(p.gitignore_file(), PathBuf::from("/var/aura/.gitignore"));
     }

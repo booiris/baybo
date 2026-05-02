@@ -32,7 +32,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 pub use crate::agent::{AgentConfig, ContextConfig};
-pub use crate::browser::BrowserConfig;
+pub use crate::browser::{BrowserConfig, BrowserDockerConfig};
 pub use crate::channels::{
     ChannelsConfig, CliChannelConfig, DiscordChannelConfig, HttpChannelConfig,
     TelegramChannelConfig,
