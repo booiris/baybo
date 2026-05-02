@@ -117,7 +117,11 @@ impl Tool for McpTool {
     }
 
     fn call_label(&self, params: &Value) -> Option<String> {
-        self.call_label.as_ref().and_then(|r| r.evaluate(params))
+        let label = self.call_label.as_ref().and_then(|r| r.evaluate(params))?;
+        if label_dedupes_against(&label, &self.accessed_resources(params)) {
+            return None;
+        }
+        Some(label)
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
@@ -151,6 +155,34 @@ impl Tool for McpTool {
         let is_error = result.is_error.unwrap_or(false);
         adapt_call_result(&result.content, is_error, self.blob_store.as_ref()).await
     }
+}
+
+fn access_label_text(access: &ResourceAccess) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match access {
+        ResourceAccess::Http { host } => Cow::Borrowed(host),
+        ResourceAccess::ExecCommand { command } => Cow::Borrowed(command),
+        ResourceAccess::ReadFile { path } | ResourceAccess::WriteFile { path } => {
+            path.to_string_lossy()
+        }
+    }
+}
+
+/// True when `label` is already conveyed by some entry in `accesses`
+/// — the renderer would otherwise show the same string twice (once
+/// as the bullet, once as the trailing description).
+///
+/// `…` truncation on `from_param` / `template` labels is stripped
+/// before comparing so a clipped description still dedupes against
+/// the un-clipped access string.
+fn label_dedupes_against(label: &str, accesses: &[ResourceAccess]) -> bool {
+    let needle = label.trim_end_matches('…').trim();
+    if needle.is_empty() {
+        return false;
+    }
+    accesses
+        .iter()
+        .any(|a| access_label_text(a).contains(needle))
 }
 
 /// Synthesize a ToolManifest for an MCP-sourced tool given the server's
@@ -249,6 +281,63 @@ mod tests {
             evaluated_blocked, server_default,
             "user server: must fall back to default_resource_access (server-level ExecCommand)",
         );
+    }
+
+    /// `screenshot` (viewport): access label "screenshot (viewport)"
+    /// already contains the description "viewport" — the call_label
+    /// would render as a duplicate trailing line and gets dropped.
+    #[test]
+    fn dedupe_drops_label_already_in_access() {
+        let accesses = vec![ResourceAccess::ExecCommand {
+            command: "browser_screenshot (viewport)".into(),
+        }];
+        assert!(label_dedupes_against("viewport", &accesses));
+    }
+
+    /// `console("document.cookie")`: access label
+    /// "browser_console: document.cookie" contains the call_label
+    /// "document.cookie".
+    #[test]
+    fn dedupe_drops_label_inside_prefixed_access() {
+        let accesses = vec![ResourceAccess::ExecCommand {
+            command: "browser_console: document.cookie".into(),
+        }];
+        assert!(label_dedupes_against("document.cookie", &accesses));
+    }
+
+    /// `console("<long expr…>")`: the description is truncated with `…`
+    /// at 80 chars, but the access label has the full untruncated
+    /// expression. Strip the truncation marker before comparing so
+    /// the dedup still fires.
+    #[test]
+    fn dedupe_strips_truncation_marker_before_compare() {
+        let accesses = vec![ResourceAccess::ExecCommand {
+            command: "browser_console: window.fetch('/api/users').then(r => r.json())".into(),
+        }];
+        assert!(label_dedupes_against(
+            "window.fetch('/api/users').then(r => r.json…",
+            &accesses,
+        ));
+    }
+
+    /// `navigate("https://example.com/login")`: hostname → access list
+    /// is empty (PublicIpInUrlParam doesn't fire for hostnames). The
+    /// description is the only signal we have, must NOT be dropped.
+    #[test]
+    fn dedupe_keeps_label_when_no_accesses() {
+        assert!(!label_dedupes_against("https://example.com/login", &[]));
+    }
+
+    /// `navigate("http://8.8.8.8/foo")`: access label is just the host
+    /// "8.8.8.8"; the call_label has the full URL "http://8.8.8.8/foo"
+    /// — the access is a substring of the description, not the other
+    /// way around. Description has more info (path) and stays.
+    #[test]
+    fn dedupe_keeps_label_when_access_is_substring_of_label() {
+        let accesses = vec![ResourceAccess::Http {
+            host: "8.8.8.8".into(),
+        }];
+        assert!(!label_dedupes_against("http://8.8.8.8/foo", &accesses));
     }
 
     /// Embedded servers (the Aura-shipped browser MCP today) keep
