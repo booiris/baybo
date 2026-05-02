@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use aura_config::AuraConfig;
 use aura_tools::mcp::{EmbeddedMcpProfile, browser_mcp_profile};
+use aura_workspace::WorkspacePaths;
 
 use crate::sidecar::SidecarRuntime;
 
@@ -37,11 +38,21 @@ pub fn node_binary() -> PathBuf {
 /// When no families fire, the returned vec is empty and the reconciler
 /// just runs with the user-configured `.mcp.json` entries.
 ///
+/// `workspace_paths` lets per-domain composition reach into the
+/// workspace layout — currently used to pin `<work>/.fonts` as a Chrome
+/// fontconfig search dir so user-dropped fonts (notably CJK) render in
+/// screenshots without operator intervention.
+///
 /// Adding a future tool-domain MCP server (code_exec, db_query, …) is
 /// one more entry in the array literal — `runtime::build_managers`
 /// stays unchanged.
-pub fn collect_profiles(runtime: &SidecarRuntime, config: &AuraConfig) -> Vec<EmbeddedMcpProfile> {
+pub fn collect_profiles(
+    runtime: &SidecarRuntime,
+    config: &AuraConfig,
+    workspace_paths: &WorkspacePaths,
+) -> Vec<EmbeddedMcpProfile> {
     let node_cmd = node_binary().display().to_string();
+    let browser_font_dir = workspace_paths.browser_fonts_dir();
     [runtime.bundle_for("browser").and_then(|bundle| {
         browser_mcp_profile(
             config.browser.enable,
@@ -52,6 +63,7 @@ pub fn collect_profiles(runtime: &SidecarRuntime, config: &AuraConfig) -> Vec<Em
             config.browser.height,
             node_cmd.clone(),
             bundle,
+            &[browser_font_dir.as_path()],
         )
     })]
     .into_iter()
@@ -63,6 +75,10 @@ pub fn collect_profiles(runtime: &SidecarRuntime, config: &AuraConfig) -> Vec<Em
 mod tests {
     use super::*;
     use aura_config::AuraConfig;
+
+    fn ws() -> WorkspacePaths {
+        WorkspacePaths::new(PathBuf::from("/tmp/aura-test-workspace"))
+    }
 
     /// Disabled-by-default browser config produces zero embedded
     /// profiles even when the bundle is materialised. This is the
@@ -80,7 +96,7 @@ mod tests {
         let cfg = AuraConfig::default();
         assert!(!cfg.browser.enable, "default browser config is opt-in");
         assert!(
-            collect_profiles(&rt, &cfg).is_empty(),
+            collect_profiles(&rt, &cfg, &ws()).is_empty(),
             "browser.enable=false must keep the profile list empty even when the bundle is embedded",
         );
     }
@@ -99,8 +115,13 @@ mod tests {
         }
         let mut cfg = AuraConfig::default();
         cfg.browser.enable = true;
-        let profiles = collect_profiles(&rt, &cfg);
+        let profiles = collect_profiles(&rt, &cfg, &ws());
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].server_name, "browser");
+        let font_dirs = profiles[0]
+            .extra_env
+            .get("AURA_BROWSER_EXTRA_FONT_DIRS")
+            .expect("collect_profiles must pin <work>/.fonts as a Chrome fontconfig dir");
+        assert_eq!(font_dirs, "/tmp/aura-test-workspace/work/.fonts");
     }
 }

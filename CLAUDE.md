@@ -147,6 +147,8 @@ The browser sidecar is a **thin wrapper around `chrome-devtools-mcp`** (Google's
 
   These flow through `aura_gateway::collect_profiles(runtime, &config)` into the reconciler's `extra_env` map (vault entries under `mcp.browser.env` still take precedence on collision). Inside the TS sidecar, the corresponding `AURA_BROWSER_CHROME_PATH` / `AURA_BROWSER_NO_SANDBOX` / `AURA_BROWSER_VIEWPORT` (`<W>x<H>`) / `AURA_BROWSER_PROFILE_DIR` env vars are read at startup as the parent→child plumbing detail.
 
+  **Auto-fontconfig** (no operator knob, hardcoded): `collect_profiles` always pins `<workspace_root>/work/.fonts/` as an extra Chrome fontconfig `<dir>`. Drop a CJK / icon font into that directory and the next Aura restart picks it up — no `fc-cache`, no system-level install. Chrome itself takes no font-dir flag; the plumbing is `AURA_BROWSER_EXTRA_FONT_DIRS=<work>/.fonts` → TS sidecar synthesises a temp `fonts.conf` (`<include ignore_missing>` `/etc/fonts/fonts.conf` + `<dir><work>/.fonts</dir>`) → `FONTCONFIG_FILE` env → puppeteer-spawned Chrome inherits it. macOS Chrome uses Core Text and ignores fontconfig, so the override is a no-op there (not a bug — there's nothing to fix; macOS Chrome just reads system fonts directly).
+
 ### What the replacement removed (vs. the old Playwright-based sidecar)
 
 We previously shipped a hand-written Playwright wrapper with a curated 12-tool surface, in-sidecar SSRF guard, per-Aura-session `BrowserContext` isolation, and `_meta.aura.access_rule` per-call approval annotations. The chrome-devtools-mcp swap is intentionally a thinner trust layer — operators get the upstream tool surface and depend on Aura's outer trust boundaries:

@@ -43,8 +43,8 @@
 // - The env vars themselves are NOT a public interface; setting them
 //   directly works in development but isn't documented or supported.
 
-import { existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createMcpServer } from "chrome-devtools-mcp";
@@ -67,6 +67,43 @@ interface InstallState {
   percent: number;
   error?: string;
   buildId?: string;
+}
+
+// Chrome takes no font-dir flag; the only way to add a font dir is via
+// fontconfig's FONTCONFIG_FILE. macOS Chrome uses Core Text and ignores
+// fontconfig — the override is a no-op there.
+function applyFontconfigOverride(): void {
+  const raw = process.env["AURA_BROWSER_EXTRA_FONT_DIRS"];
+  if (!raw) return;
+  const dirs = raw.split(":").filter((d) => d.length > 0);
+  if (dirs.length === 0) return;
+
+  for (const d of dirs) {
+    try {
+      mkdirSync(d, { recursive: true });
+    } catch (e) {
+      log(`mkdir ${d} failed: ${(e as Error).message}`);
+    }
+  }
+
+  const systemIncludes = [
+    "/etc/fonts/fonts.conf",
+    "/usr/local/etc/fonts/fonts.conf",
+    "/opt/homebrew/etc/fonts/fonts.conf",
+  ];
+  const xml =
+    `<?xml version="1.0"?>\n` +
+    `<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n` +
+    `<fontconfig>\n` +
+    systemIncludes.map((p) => `  <include ignore_missing="yes">${p}</include>`).join("\n") +
+    "\n" +
+    dirs.map((d) => `  <dir>${d}</dir>`).join("\n") +
+    `\n</fontconfig>\n`;
+
+  const confPath = join(tmpdir(), `aura-browser-fonts-${process.pid}.conf`);
+  writeFileSync(confPath, xml);
+  process.env["FONTCONFIG_FILE"] = confPath;
+  log(`fontconfig override: FONTCONFIG_FILE=${confPath} extra_dirs=${dirs.join(",")}`);
 }
 
 function parseViewport(raw: string | undefined): { width: number; height: number } | undefined {
@@ -321,6 +358,11 @@ class GuardingTransport {
 }
 
 async function main(): Promise<void> {
+  // Inject FONTCONFIG_FILE before any Chrome spawn. Puppeteer reads
+  // process.env at spawn time, not at import time, so this can run
+  // here in main() rather than ahead of the CDDM import.
+  applyFontconfigOverride();
+
   const state: InstallState = { phase: "installing", percent: 0 };
 
   // Sync-ish fast path: if Chrome is already available, skip the

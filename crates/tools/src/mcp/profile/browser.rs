@@ -47,6 +47,12 @@ use super::EmbeddedMcpProfile;
 ///   (`aura_gateway::node_binary().display().to_string()`).
 /// - `bundle_path`: the materialised `dist/bundle.mjs` path
 ///   (`runtime.bundle_for("browser")`).
+/// - `extra_font_dirs`: directories to add to the Chrome's fontconfig
+///   search path. Joined with `:` and plumbed via
+///   `AURA_BROWSER_EXTRA_FONT_DIRS`. The TS wrapper writes a fontconfig
+///   include file and sets `FONTCONFIG_FILE` before loading CDDM, so
+///   Chrome (which is spawned in-process by CDDM/puppeteer) inherits
+///   the augmented font search path. Empty slice = no override.
 ///
 /// `capabilities` is intentionally empty: dropping the
 /// `[Http, ExecCommand]` ceiling means `accessed_resources()` returns
@@ -68,6 +74,7 @@ pub fn browser_mcp_profile(
     height: u32,
     command: String,
     bundle_path: &Path,
+    extra_font_dirs: &[&Path],
 ) -> Option<EmbeddedMcpProfile> {
     if !enable {
         return None;
@@ -114,6 +121,14 @@ pub fn browser_mcp_profile(
     // Puppeteer); future Node deprecations on those transitive deps
     // are not actionable for Aura operators anyway.
     extra_env.insert("NODE_OPTIONS".into(), "--no-warnings".into());
+    if !extra_font_dirs.is_empty() {
+        let joined = extra_font_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        extra_env.insert("AURA_BROWSER_EXTRA_FONT_DIRS".into(), joined);
+    }
     Some(EmbeddedMcpProfile {
         server_name: "browser".into(),
         command,
@@ -146,6 +161,7 @@ mod tests {
             1080,
             "node".into(),
             Path::new("/x.mjs"),
+            &[],
         )
     }
 
@@ -216,6 +232,7 @@ mod tests {
             1080,
             "node".into(),
             Path::new("/x.mjs"),
+            &[],
         )
         .expect("profile when enabled");
         assert!(
@@ -235,6 +252,7 @@ mod tests {
             1080,
             "node".into(),
             Path::new("/x.mjs"),
+            &[],
         )
         .expect("profile when enabled");
         assert_eq!(
@@ -254,6 +272,7 @@ mod tests {
             1080,
             "node".into(),
             Path::new("/x.mjs"),
+            &[],
         )
         .expect("profile when enabled");
         assert_eq!(
@@ -273,6 +292,7 @@ mod tests {
             720,
             "node".into(),
             Path::new("/x.mjs"),
+            &[],
         )
         .expect("profile when enabled");
         assert_eq!(
@@ -288,6 +308,38 @@ mod tests {
         assert_eq!(
             p.extra_env.get("AURA_BROWSER_VIEWPORT").unwrap(),
             "1920x1080",
+        );
+    }
+
+    #[test]
+    fn empty_font_dirs_omits_env() {
+        let p = defaults_call(true).expect("profile when enabled");
+        assert!(
+            !p.extra_env.contains_key("AURA_BROWSER_EXTRA_FONT_DIRS"),
+            "empty extra_font_dirs must NOT set the env var so the TS sidecar skips fontconfig override entirely",
+        );
+    }
+
+    #[test]
+    fn font_dirs_join_with_colon() {
+        let a = PathBuf::from("/work/.fonts");
+        let b = PathBuf::from("/usr/share/extra-fonts");
+        let p = browser_mcp_profile(
+            true,
+            None,
+            None,
+            false,
+            1920,
+            1080,
+            "node".into(),
+            Path::new("/x.mjs"),
+            &[a.as_path(), b.as_path()],
+        )
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env.get("AURA_BROWSER_EXTRA_FONT_DIRS").unwrap(),
+            "/work/.fonts:/usr/share/extra-fonts",
+            "multiple font dirs encoded as colon-joined path list (PATH-style) for the TS wrapper",
         );
     }
 }

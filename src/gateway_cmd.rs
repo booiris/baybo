@@ -322,7 +322,13 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         };
     let embedded_mcp_servers: Vec<aura_tools::mcp::EmbeddedMcpServer> = sidecar_runtime
         .as_deref()
-        .map(|rt| aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(rt, &config)))
+        .map(|rt| {
+            aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(
+                rt,
+                &config,
+                &workspace_paths,
+            ))
+        })
         .unwrap_or_default();
 
     let shutdown = ShutdownSignal::new();

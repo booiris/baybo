@@ -95,6 +95,11 @@ pub const SESSIONS_LOG_SUBDIR: &str = "sessions";
 /// sit directly under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`.
 pub const CODE_BUILDER_SUBDIR: &str = "code-builder";
 
+/// Browser sidecar font drop-in dir inside [`WORK_DIR`]. Pinned as a
+/// Chrome fontconfig `<dir>` at boot — drop a font here and the next
+/// gateway restart picks it up without touching system fontconfig.
+pub const BROWSER_FONTS_SUBDIR: &str = ".fonts";
+
 // ---------------------------------------------------------------------------
 // Files inside `logs/` (gitignored)
 // ---------------------------------------------------------------------------
@@ -289,6 +294,10 @@ impl WorkspacePaths {
 
     pub fn code_builder_dir(&self) -> PathBuf {
         self.work_dir().join(CODE_BUILDER_SUBDIR)
+    }
+
+    pub fn browser_fonts_dir(&self) -> PathBuf {
+        self.work_dir().join(BROWSER_FONTS_SUBDIR)
     }
 }
 
