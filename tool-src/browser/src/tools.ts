@@ -208,20 +208,13 @@ export const TOOLS: BrowserToolDescriptor[] = [
       },
     }),
     _meta: auraMeta({
-      // Always prompt: a screenshot can capture PII the user opened in
-      // a previous step (an email tab, a banking dashboard, …) that
-      // they did not intend the LLM to see. The cache key splits
-      // viewport vs full-page so the user can grant the cheaper
-      // variant without auto-approving the heavier exfil surface.
-      access_rule: {
-        kind: "always",
-        resource: "exec_command",
-        label_template: "browser_screenshot ({full_page?full page:viewport})",
-      },
-      call_label: {
-        kind: "template",
-        template: "{full_page?full page:viewport}",
-      },
+      // No approval. Screenshots are read-only against the page Aura
+      // is already driving; the SSRF gate on `navigate` is what keeps
+      // the agent from pointing the browser at sensitive surfaces in
+      // the first place. Prompting on every screenshot was high-noise
+      // for low signal — the user's already approved (or implicitly
+      // accepted, for hostnames) the navigate that loaded the page.
+      access_rule: { kind: "none" },
     }),
   },
 
@@ -235,8 +228,9 @@ export const TOOLS: BrowserToolDescriptor[] = [
       "alongside any logs produced. With `clear=true`, drops the buffered " +
       "logs after returning the current state.\n\n" +
       "JS evaluation is privileged (can read cookies, mutate the DOM, " +
-      "exfiltrate page content) and prompts for explicit approval before " +
-      "each call.",
+      "exfiltrate page content) and prompts for explicit user approval " +
+      "the first time per session — \"approve always\" then covers " +
+      "subsequent expressions in the same session.",
     inputSchema: obj({
       expression: {
         type: "string",
@@ -250,11 +244,18 @@ export const TOOLS: BrowserToolDescriptor[] = [
       },
     }),
     _meta: auraMeta({
+      // Static label_template (no `{expression}` substitution): the
+      // ApprovedResource cache key is exact-string; embedding the
+      // expression would mean each new JS snippet re-prompts. The
+      // user's intent in clicking "approve always" is "trust this
+      // session to run JS in the page", not "trust this exact
+      // string". The per-call expression still surfaces in the prompt
+      // via `call_label` below.
       access_rule: {
         kind: "if_param_present",
         param: "expression",
         resource: "exec_command",
-        label_template: "browser_console: {expression}",
+        label_template: "browser_console",
       },
       call_label: { kind: "from_param", param: "expression", max_chars: 80 },
     }),
@@ -306,10 +307,15 @@ export const TOOLS: BrowserToolDescriptor[] = [
       ["method"],
     ),
     _meta: auraMeta({
+      // Static label_template (no `{method}` substitution): same
+      // rationale as `console` — "approve always" should grant
+      // session-wide trust for raw CDP, not per-method, since the
+      // user can't reasonably audit the CDP method surface call by
+      // call. Per-call method still surfaces via `call_label`.
       access_rule: {
         kind: "always",
         resource: "exec_command",
-        label_template: "browser_cdp: {method}",
+        label_template: "browser_cdp",
       },
       call_label: { kind: "from_param", param: "method", max_chars: 80 },
     }),
