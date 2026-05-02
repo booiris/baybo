@@ -42,7 +42,11 @@ export type DeviceFlowError =
   | "authorization_pending"
   | "slow_down"
   | "access_denied"
-  | "expired_token";
+  | "expired_token"
+  /** Transient — caller should retry. Distinguished from `expired_token`
+   * so refresh callers don't delete a perfectly valid UAT just because
+   * the network blipped. */
+  | "network_error";
 
 export type DeviceFlowResult =
   | { ok: true; token: DeviceFlowToken }
@@ -279,7 +283,7 @@ export async function refreshUAT(
   } catch (err) {
     return {
       ok: false,
-      error: "expired_token",
+      error: "network_error",
       message: `refresh network error: ${String(err)}`,
     };
   }
