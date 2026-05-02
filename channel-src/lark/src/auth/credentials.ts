@@ -11,6 +11,11 @@ export interface AppCredentials {
   // mainstream hosts get an enum mapping for nicer logging; everything
   // else flows through verbatim.
   domain: lark.Domain | string;
+  /** The raw base URL string (`https://open.feishu.cn` etc.) preserved
+   * separately from `domain` because OAuth endpoint resolution
+   * (`accounts.X` derivation) needs the URL form even when `domain`
+   * collapsed to the enum for the SDK. */
+  baseUrl: string;
 }
 
 export interface BotRuntimeConfig {
@@ -39,7 +44,7 @@ export function parseStartBotCredentials(cmd: StartBotCommand): AppCredentials {
     );
   }
   const baseUrl = (cmd.metadata["base_url"] ?? DEFAULT_BASE_URL).trim();
-  return { appId, appSecret, domain: domainFromBaseUrl(baseUrl) };
+  return { appId, appSecret, domain: domainFromBaseUrl(baseUrl), baseUrl };
 }
 
 /**

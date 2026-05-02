@@ -2,8 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { Logger, McpReplyHandle } from "@aura/channel-sdk";
-import type * as lark from "@larksuiteoapi/node-sdk";
+import * as lark from "@larksuiteoapi/node-sdk";
 
+import type { UATAccessor } from "../auth/auto-auth.js";
 import { TunnelMcpTransport } from "./transport.js";
 
 /** Aura-internal `_meta` keys forwarded on every `tools/call`.
@@ -46,6 +47,13 @@ export type LarkChannelResolution =
       channel: lark.LarkChannel;
       chatId: string;
       platformUserId: string;
+      /** Per-bot UAT accessor. Optional because tenant-token tools
+       * (chat info, members, message history) don't need it; UAT
+       * tools (calendar, bitable, …) refuse to run when it's absent
+       * and surface a configuration error to the agent. Wired by
+       * `LarkPlatform` once the SDK's `secrets()` capability has
+       * been negotiated. */
+      uatAccessor?: UATAccessor;
     }
   | { kind: "none" }
   | { kind: "ambiguous"; bot_count: number };
@@ -139,6 +147,7 @@ export class LarkMcpServer {
         channel: lark.LarkChannel;
         chatId: string;
         platformUserId: string;
+        uatAccessor?: UATAccessor;
       }
     | {
         ok: false;
@@ -167,6 +176,9 @@ export class LarkMcpServer {
       channel: resolution.channel,
       chatId: resolution.chatId,
       platformUserId: resolution.platformUserId,
+      ...(resolution.uatAccessor !== undefined && {
+        uatAccessor: resolution.uatAccessor,
+      }),
     };
   }
 
@@ -444,6 +456,59 @@ export class LarkMcpServer {
       },
     );
 
+    server.registerTool(
+      "feishu_who_am_i",
+      {
+        title: "Identify the current user via OAuth",
+        description:
+          "Return the Feishu profile (name, avatar, email, open_id) of the user the agent is currently messaging. The first call in a fresh session prompts the user to authorize Aura via a chat card; later calls reuse the stored token. Useful for grounding the agent in the user's identity before generating personalised replies. Bound to the user driving the conversation — does NOT accept a target user_id, so the LLM can't probe other users' profiles.",
+        inputSchema: {},
+      },
+      async (_args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        const { channel, chatId, platformUserId, uatAccessor } = active;
+        if (!uatAccessor) {
+          return toolError(
+            "feishu_who_am_i requires UAT but the bot's OAuth pipeline isn't configured for this session",
+          );
+        }
+        try {
+          const result = await uatAccessor.invoke(
+            {
+              userOpenId: platformUserId,
+              chatId,
+              reason: "look up your Feishu profile",
+            },
+            (uat) =>
+              channel.rawClient.authen.userInfo.get(
+                {},
+                lark.withUserAccessToken(uat),
+              ),
+          );
+          if (result.kind !== "ok") {
+            return toolError(
+              authFailedMessage("feishu_who_am_i", result.outcome),
+            );
+          }
+          const res = result.result;
+          if (typeof res.code === "number" && res.code !== 0) {
+            return toolError(
+              `Feishu API error ${res.code}: ${res.msg ?? "unknown"}`,
+            );
+          }
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(res.data ?? {}, null, 2) },
+            ],
+          };
+        } catch (err) {
+          this.opts.logger.debug(`feishu_who_am_i failed: ${String(err)}`);
+          return toolError(err instanceof Error ? err.message : String(err));
+        }
+      },
+    );
+
     this.registerAskUser(server);
   }
 
@@ -517,4 +582,25 @@ function toolError(message: string): {
     content: [{ type: "text", text: message }],
     isError: true,
   };
+}
+
+/** Translate an `AuthFlowOutcome` non-`ok` variant into an LLM-readable
+ * error string. Spelled out so each failure mode tells the agent what
+ * to do next (retry, give up, ask the user differently). */
+function authFailedMessage(
+  toolName: string,
+  outcome: import("../auth/auth-flow.js").AuthFlowOutcome,
+): string {
+  switch (outcome.kind) {
+    case "denied":
+      return `${toolName}: the user declined the authorization request — fall back to a tool that doesn't require their OAuth, or ask them to reconsider`;
+    case "expired":
+      return `${toolName}: the authorization page timed out before the user approved — ask the user again to retry, which will start a fresh sign-in`;
+    case "cancelled":
+      return `${toolName}: authorization was cancelled (the bot is shutting down) — try again later`;
+    case "error":
+      return `${toolName}: authorization flow failed: ${outcome.message}`;
+    case "ok":
+      return `${toolName}: authorization succeeded but tool dispatch returned an unexpected ok branch`;
+  }
 }

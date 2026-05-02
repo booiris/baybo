@@ -54,6 +54,16 @@ function stubChannel(getChatInfoImpl, rawApi) {
       return getChatInfoImpl(chatId);
     },
     rawClient: {
+      authen: {
+        userInfo: {
+          async get(payload, opts) {
+            if (!rawApi?.authenUserInfoGet) {
+              throw new Error("authen.userInfo.get stub not configured");
+            }
+            return rawApi.authenUserInfoGet(payload, opts);
+          },
+        },
+      },
       im: {
         v1: {
           chat: {
@@ -148,6 +158,7 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_get_message",
     "feishu_list_chat_members",
     "feishu_search_chats",
+    "feishu_who_am_i",
   ]);
   // tools/list never resolves a channel — the resolver only fires on
   // tools/call.
@@ -1054,6 +1065,160 @@ test("LarkMcpServer: feishu_get_message reports not-found cleanly when API retur
   assert.match(last.result.content[0].text, /no message found for id om_missing/);
 
   await server.shutdown();
+});
+
+test("LarkMcpServer: feishu_who_am_i returns toolError when UAT pipeline isn't wired", async () => {
+  // The accessor is optional on LarkChannelResolution.ok — a bot
+  // without the `secrets` capability negotiated still responds
+  // cleanly instead of throwing inside the tool.
+  const channel = stubChannel(async () => ({}), {});
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_active",
+      platformUserId: "ou_alice",
+      // uatAccessor intentionally omitted.
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-no-uat",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 41,
+      method: "tools/call",
+      params: { name: "feishu_who_am_i", arguments: {} },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "no-uat reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 41);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /UAT.*pipeline isn't configured/);
+});
+
+test("LarkMcpServer: feishu_who_am_i routes through UATAccessor with platformUserId", async () => {
+  let receivedRequest = null;
+  const fakeAccessor = {
+    async invoke(req, handler) {
+      receivedRequest = req;
+      // Pretend we already have a UAT — call the handler directly
+      // and return its result wrapped in `ok`.
+      const result = await handler("uat_for_alice");
+      return { kind: "ok", result };
+    },
+  };
+  let receivedAuthOpts = null;
+  const channel = stubChannel(async () => ({}), {
+    async authenUserInfoGet(_payload, opts) {
+      receivedAuthOpts = opts;
+      return {
+        code: 0,
+        data: {
+          name: "Alice",
+          en_name: "Alice",
+          open_id: "ou_alice",
+          email: "alice@example.com",
+        },
+      };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_active",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-who",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 42,
+      method: "tools/call",
+      params: { name: "feishu_who_am_i", arguments: {} },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "who_am_i reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.id, 42);
+  assert.equal(last.result.isError, undefined);
+
+  // Accessor was called with the resolver's platformUserId — proves
+  // the LLM can't smuggle a different user id since the tool's
+  // inputSchema is empty.
+  assert.equal(receivedRequest.userOpenId, "ou_alice");
+  assert.equal(receivedRequest.chatId, "oc_active");
+  assert.match(receivedRequest.reason, /Feishu profile/);
+
+  // The handler called channel.rawClient.authen.userInfo.get with
+  // the user-access-token option set by lark.withUserAccessToken.
+  assert.ok(receivedAuthOpts);
+  // The opts shape is the SDK's IRequestOption — opaque to us, but
+  // it MUST be present (without it the call would use tenant token).
+  // Sanity: at minimum the opts is an object.
+  assert.equal(typeof receivedAuthOpts, "object");
+
+  const parsed = JSON.parse(last.result.content[0].text);
+  assert.equal(parsed.name, "Alice");
+  assert.equal(parsed.open_id, "ou_alice");
+});
+
+test("LarkMcpServer: feishu_who_am_i surfaces auth-failed outcomes as readable tool errors", async () => {
+  const fakeAccessor = {
+    async invoke() {
+      return {
+        kind: "auth_failed",
+        outcome: { kind: "denied" },
+      };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {});
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-denied",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 43,
+      method: "tools/call",
+      params: { name: "feishu_who_am_i", arguments: {} },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "denied reply");
+
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /declined the authorization/);
 });
 
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {

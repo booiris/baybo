@@ -16,12 +16,18 @@ import type {
 } from "@aura/channel-sdk/bot";
 import * as lark from "@larksuiteoapi/node-sdk";
 
+import { secrets } from "@aura/channel-sdk";
+
 import type { LarkApprovals } from "./approvals.js";
+import { AuthFlowController } from "./auth/auth-flow.js";
+import { UATAccessor, UATMutex } from "./auth/auto-auth.js";
 import {
   parseBotRuntimeConfig,
   parseStartBotCredentials,
   type BotRuntimeConfig,
 } from "./auth/credentials.js";
+import { UATRefreshScheduler } from "./auth/refresh-scheduler.js";
+import { UATStore } from "./auth/uat-store.js";
 import { Semaphore } from "./concurrency.js";
 import { LarkMcpServer } from "./mcp/server.js";
 import { downloadResourceAsAttachment } from "./media/inbound.js";
@@ -49,6 +55,17 @@ export interface LarkChat {
 interface BotState {
   handle: lark.LarkChannel;
   config: BotRuntimeConfig;
+  /** UAT pipeline. Created at startBot — see {@link buildUatPipeline}.
+   * `null` when the SDK didn't negotiate the `secrets` capability,
+   * which makes UAT-requiring tools fail closed with a clean
+   * configuration error rather than throwing at the call site. */
+  uat: UatPipeline | null;
+}
+
+interface UatPipeline {
+  accessor: UATAccessor;
+  scheduler: UATRefreshScheduler;
+  authFlow: AuthFlowController;
 }
 
 // Two simultaneous download phases per bot. One slot makes everything
@@ -139,6 +156,7 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
             channel: state.handle,
             chatId: ctx.chatId,
             platformUserId: ctx.platformUserId,
+            ...(state.uat !== null && { uatAccessor: state.uat.accessor }),
           };
         }
         // No conversation context. Without a chat id we can't run a
@@ -321,6 +339,13 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
   async stopBot(handle: lark.LarkChannel): Promise<void> {
     const botId = this.botIdFromHandle(handle);
     if (botId !== null) {
+      const state = this.bots.get(botId);
+      if (state?.uat) {
+        // Stop the refresh sweep timer + abort any in-flight device
+        // flow so the sidecar can exit cleanly.
+        await state.uat.scheduler.stop();
+        state.uat.authFlow.cancelAll();
+      }
       this.purgeBotStreams(botId);
       this.bots.delete(botId);
     }
@@ -488,9 +513,55 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
     // entered live state, so leaving the map untouched keeps the
     // soft-error path clean. The handle is the same instance that
     // BotChannel will pass back to `stopBot` later.
-    this.bots.set(cmd.botId, { handle: channel, config });
+    const uat = this.buildUatPipeline(channel, creds.appId, creds.appSecret, creds.baseUrl);
+    if (uat !== null) uat.scheduler.start();
+    this.bots.set(cmd.botId, { handle: channel, config, uat });
 
     return username ? { handle: channel, username } : { handle: channel };
+  }
+
+  /** Build the UAT pipeline for one bot (store + scheduler + auth flow
+   * + auto-auth interceptor + per-user mutex). The SDK's `secrets()`
+   * factory doesn't probe the capability at construction — the error
+   * surfaces only on the first WS-mediated op — so this can't usefully
+   * fail-fast here. If the gateway didn't negotiate `secrets`, the
+   * accessor's first invoke will throw `CapabilityMissingError`, which
+   * the MCP tool wrapper translates to a clean tool error. */
+  private buildUatPipeline(
+    channel: lark.LarkChannel,
+    appId: string,
+    appSecret: string,
+    baseUrl: string,
+  ): UatPipeline | null {
+    const scope = secrets().scope(appId);
+    const store = new UATStore(scope);
+    const mutex = new UATMutex();
+    const authFlow = new AuthFlowController({
+      channel,
+      store,
+      appId,
+      appSecret,
+      baseUrl,
+      logger: this.logger,
+    });
+    const accessor = new UATAccessor({
+      store,
+      authFlow,
+      mutex,
+      appId,
+      appSecret,
+      baseUrl,
+      logger: this.logger,
+    });
+    const scheduler = new UATRefreshScheduler({
+      store,
+      mutex,
+      appId,
+      appSecret,
+      baseUrl,
+      logger: this.logger,
+    });
+    return { accessor, authFlow, scheduler };
   }
 
   private async dispatchInbound(
@@ -610,3 +681,4 @@ export class LarkPlatform implements BotPlatform<lark.LarkChannel, LarkChat> {
 // past it as a defense against memory-exhaustion attacks (each
 // resource is fully buffered before upload).
 const MAX_ATTACHMENTS_PER_MESSAGE = 9;
+
