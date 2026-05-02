@@ -289,11 +289,54 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let runtime_cfg = RuntimeGatewayConfig::from_config(&config.gateway)
         .map_err(|e| anyhow::anyhow!("invalid gateway config: {e}"))?;
 
+    // Channel-token table needs to exist BEFORE `build_managers`
+    // spawns the embedded browser MCP child — the child env carries
+    // the token, and the first /v1/blobs POST will look it up here.
+    // Register both the TUI token and the browser tool token; both
+    // handles are held for the lifetime of `start` (drop revokes the
+    // in-memory entry on shutdown).
+    let channel_tokens = ChannelTokenTable::new();
+    let _tui_token_handle = channel_tokens.register(
+        tui_token.clone(),
+        ClientIdentity {
+            pid: std::process::id(),
+            label: TUI_CLIENT_LABEL.to_string(),
+            // None: TUI's channel-type binding is enforced via
+            // `TUI_CLIENT_LABEL` in the handshake, not via this
+            // field. Subprocess sidecars get `Some(channel_type)`
+            // from `ChannelSpawner::spawn`.
+            bound_channel_type: None,
+        },
+    );
+    let _browser_tool_handle = channel_tokens.register(
+        browser_tool_token.clone(),
+        ClientIdentity {
+            pid: std::process::id(),
+            label: format!("{}browser", aura_gateway::TOOL_CLIENT_LABEL_PREFIX),
+            // None: tool sidecars are session-scoped (like TUI), not
+            // bound to a channel type. The handshake gate rejects
+            // tool/* labels from /v1/channel-ws; only the blob
+            // upload path uses this token.
+            bound_channel_type: None,
+        },
+    );
+
+    // Workspace channel-port file — the channel listener will write
+    // its bound port here at start. The browser MCP child reads it
+    // lazily on first upload, so we can compute the path before the
+    // listener actually binds and ship it via env to the child.
+    let port_file = workspace_paths.channel_port();
+    let browser_blob_upload = aura_gateway::sidecar::BootBlobUpload {
+        port_file: port_file.clone(),
+        token: browser_tool_token.clone(),
+    };
+
     let shutdown = ShutdownSignal::new();
     let mut graph = runtime::build_managers(
         Arc::clone(&config),
         shutdown.clone(),
         Arc::clone(&leak_detector),
+        Some(browser_blob_upload),
     )
     .await?;
     let run_handle = runtime::wire_router(&mut graph).await;
@@ -320,47 +363,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                 .await;
         }));
     }
-
-    // Shared capability table — the channel TCP listener consumes it
-    // for auth, and the WS channel server re-reads it in the
-    // Register-frame handshake via `GatewayDeps`.
-    let channel_tokens = ChannelTokenTable::new();
-
-    // Register the TUI token with the freshly-published value. The
-    // returned handle is held for the rest of `start`, so the TUI
-    // entry stays live until shutdown drops it (which revokes the
-    // in-memory entry — the vault row is overwritten on next start).
-    let _tui_token_handle = channel_tokens.register(
-        tui_token.clone(),
-        ClientIdentity {
-            pid: std::process::id(),
-            label: TUI_CLIENT_LABEL.to_string(),
-            // None: TUI's channel-type binding is enforced via
-            // `TUI_CLIENT_LABEL` in the handshake, not via this
-            // field. Subprocess sidecars get `Some(channel_type)`
-            // from `ChannelSpawner::spawn`.
-            bound_channel_type: None,
-        },
-    );
-
-    // Browser tool sidecar token — registered NOW (before
-    // `mcp_reconciler.set_embedded` re-spawns the browser MCP child
-    // with the upload token in its env) so the first POST to
-    // /v1/blobs from the child finds a live entry. The handle is
-    // held for the lifetime of `start`; on shutdown it drops and
-    // revokes the in-memory entry.
-    let _browser_tool_handle = channel_tokens.register(
-        browser_tool_token.clone(),
-        ClientIdentity {
-            pid: std::process::id(),
-            label: format!("{}browser", aura_gateway::TOOL_CLIENT_LABEL_PREFIX),
-            // None: tool sidecars are session-scoped (like TUI), not
-            // bound to a channel type. The handshake gate rejects
-            // tool/* labels from /v1/channel-ws; only the blob
-            // upload path uses this token.
-            bound_channel_type: None,
-        },
-    );
 
     let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
 
@@ -408,38 +410,13 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Channel loopback-TCP listener — publishes its ephemeral port to
     // `<workspace>/channel.port` (same workspace identity dir as the
     // singleton lockfile) so TUI and sidecars can discover it without
-    // a config roundtrip. The TUI authenticates with the per-start
-    // token published above; sidecars use the per-spawn capability
-    // tokens minted by `ChannelSpawner`. Both arrive through the same
-    // `ChannelTokenTable`, so the listener doesn't need any extra
-    // auth material at bind time.
-    let port_file = workspace_paths.channel_port();
-    let channel_server = ChannelServer::bind(&deps, port_file.clone(), channel_tokens.clone())
+    // a config roundtrip. `port_file` was computed above and shipped
+    // into the browser MCP child's env so it can resolve the upload
+    // URL lazily.
+    let channel_server = ChannelServer::bind(&deps, port_file, channel_tokens.clone())
         .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();
     let channel_url = format!("ws://127.0.0.1:{channel_port}/v1/channel-ws");
-
-    // Now that the channel listener is bound and the port file will be
-    // written by `channel_server.run()`, refresh the embedded MCP
-    // profiles with the blob-upload env wired in. The browser MCP
-    // child reads `AURA_CHANNEL_PORT_FILE` lazily on its first big
-    // screenshot upload — by that time the file exists on disk.
-    {
-        let blob_upload = aura_gateway::sidecar::blob_upload_env(&port_file, &browser_tool_token);
-        let profiles = match aura_gateway::SidecarRuntime::install() {
-            Ok(rt) => aura_gateway::collect_profiles(&rt, &graph.config, Some(blob_upload)),
-            Err(e) => {
-                tracing::info!(
-                    error = %e,
-                    "embedded sidecar runtime unavailable; skipping post-bind MCP profile refresh",
-                );
-                Vec::new()
-            }
-        };
-        graph
-            .mcp_reconciler
-            .set_embedded(aura_tools::mcp::embedded_servers(&profiles));
-    }
 
     // Channel-sidecar supervisor (telegram / weixin / …). The channel
     // TCP listener is already bound above so the kernel's listen queue

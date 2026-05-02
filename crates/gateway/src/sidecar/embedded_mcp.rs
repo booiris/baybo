@@ -73,6 +73,25 @@ pub fn blob_upload_env<'a>(port_file: &'a Path, token: &'a str) -> BlobUploadEnv
     BlobUploadEnv { port_file, token }
 }
 
+/// Owned counterpart to [`BlobUploadEnv`] — passes through
+/// [`crate::server`] / `runtime::build_managers` boundaries that the
+/// borrow can't cross. Built once in `gateway_cmd::start` from the
+/// minted browser-tool token + workspace's channel port-file path.
+#[derive(Debug, Clone)]
+pub struct BootBlobUpload {
+    pub port_file: PathBuf,
+    pub token: String,
+}
+
+impl BootBlobUpload {
+    pub fn as_env(&self) -> BlobUploadEnv<'_> {
+        BlobUploadEnv {
+            port_file: &self.port_file,
+            token: &self.token,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

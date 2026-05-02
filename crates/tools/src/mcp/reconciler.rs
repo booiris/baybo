@@ -57,13 +57,7 @@ pub struct McpReconciler {
     registry: Arc<ToolRegistry>,
     vault: Arc<SecretVault>,
     blob_store: Option<Arc<dyn BlobStore>>,
-    /// Mutex (rather than `Vec<...>` directly) so the boot path can
-    /// late-bind embedded entries — the channel TCP listener gives
-    /// out its port only after `build_managers` returns, but the
-    /// browser MCP profile needs that port-file path + a registered
-    /// tool token to enable streaming blob uploads. Initially empty;
-    /// `set_embedded` swaps + pokes.
-    embedded: Mutex<Vec<EmbeddedMcpServer>>,
+    embedded: Vec<EmbeddedMcpServer>,
     cancel: CancellationToken,
     notify: Arc<Notify>,
     state: Mutex<HashMap<String, Connected>>,
@@ -84,22 +78,12 @@ impl McpReconciler {
             registry,
             vault,
             blob_store,
-            embedded: Mutex::new(embedded),
+            embedded,
             cancel,
             notify: Arc::new(Notify::new()),
             state: Mutex::new(HashMap::new()),
             backoff: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// Atomically replace the embedded server list and wake the
-    /// reconciler so the new entries land on the next tick (which
-    /// fires immediately due to [`Self::poke`]). Used by the boot
-    /// path after the channel TCP listener has bound — the wired-up
-    /// embedded profiles can now reach `/v1/blobs`.
-    pub fn set_embedded(self: &Arc<Self>, embedded: Vec<EmbeddedMcpServer>) {
-        *self.embedded.lock() = embedded;
-        self.poke();
     }
 
     /// Wake the reconciler immediately. CLI commands call this after a
@@ -149,15 +133,9 @@ impl McpReconciler {
                 },
             );
         }
-        // Snapshot the embedded list once per tick — `set_embedded`
-        // can swap it concurrently and we want a consistent view
-        // through the rest of the pass.
-        let embedded_snapshot: Vec<EmbeddedMcpServer> = self.embedded.lock().clone();
-        let embedded_names: HashSet<String> = embedded_snapshot
-            .iter()
-            .map(|e| e.entry.name.clone())
-            .collect();
-        for emb in &embedded_snapshot {
+        let embedded_names: HashSet<String> =
+            self.embedded.iter().map(|e| e.entry.name.clone()).collect();
+        for emb in &self.embedded {
             if desired.contains_key(&emb.entry.name) {
                 tracing::warn!(
                     server = %emb.entry.name,
@@ -196,7 +174,7 @@ impl McpReconciler {
         // triggers reconciliation).
         let probe_targets: Vec<String> = {
             let state = self.state.lock();
-            embedded_snapshot
+            self.embedded
                 .iter()
                 .filter(|e| state.contains_key(&e.entry.name))
                 .map(|e| e.entry.name.clone())

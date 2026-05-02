@@ -172,12 +172,6 @@ pub struct ManagerGraph {
     pub cost_tracker: Arc<CostTracker>,
     pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
-    /// Live reconciler handle. `gateway_cmd::start` reaches into this
-    /// to call `set_embedded` after the channel TCP listener has bound
-    /// — that's when the browser MCP profile can finally include a
-    /// blob-upload env (port-file path + tool token) without racing
-    /// the bind. TUI / direct-CLI paths never touch it.
-    pub mcp_reconciler: Arc<McpReconciler>,
     /// Cloneable bundle of every libsql-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
@@ -201,6 +195,12 @@ pub async fn build_managers(
     config: Arc<AuraConfig>,
     shutdown: ShutdownSignal,
     leak_detector: Arc<LeakDetector>,
+    // Optional blob-upload context for the embedded browser MCP
+    // child. Built by the gateway boot path from the workspace's
+    // channel port-file path + the minted `tool/browser` token.
+    // `None` for non-gateway boot paths (no `/v1/blobs` endpoint
+    // exists, so the child stays inline-only).
+    browser_blob_upload: Option<aura_gateway::sidecar::BootBlobUpload>,
 ) -> anyhow::Result<ManagerGraph> {
     // --- minimal services shared by every mode
     let workspace_paths =
@@ -410,17 +410,14 @@ pub async fn build_managers(
     // bundle table is unavailable or every family is disabled, the
     // reconciler runs with just the user-configured `.mcp.json`
     // entries.
+    let blob_upload_env = browser_blob_upload.as_ref().map(|b| b.as_env());
     let embedded_mcp_servers: Vec<EmbeddedMcpServer> = match aura_gateway::SidecarRuntime::install()
     {
-        // `blob_upload: None` here. The reconciler is set up before
-        // the channel TCP listener is bound and the tool token is
-        // registered in `ChannelTokenTable`, so the upload path stays
-        // disabled until `gateway_cmd::start` calls
-        // `mcp_reconciler.set_embedded(...)` post-bind with the wired
-        // [`BlobUploadEnv`]. Until then every screenshot inlines.
-        Ok(rt) => {
-            aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(&rt, &config, None))
-        }
+        Ok(rt) => aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(
+            &rt,
+            &config,
+            blob_upload_env,
+        )),
         Err(e) => {
             tracing::info!(
                 error = %e,
@@ -439,7 +436,6 @@ pub async fn build_managers(
         mcp_cancel,
     );
     mcp_reconciler.spawn();
-    let mcp_reconciler_for_graph = Arc::clone(&mcp_reconciler);
 
     Ok(ManagerGraph {
         config,
@@ -458,7 +454,6 @@ pub async fn build_managers(
         cost_tracker,
         hook_manager,
         secret_vault,
-        mcp_reconciler: mcp_reconciler_for_graph,
         stores,
         cron_trigger_rx: Some(cron_trigger_rx),
     })
