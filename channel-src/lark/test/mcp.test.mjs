@@ -128,6 +128,15 @@ function stubChannel(getChatInfoImpl, rawApi) {
           async list(payload, opts) {
             return rawApi?.bitableRecordList?.(payload, opts) ?? { code: 0, data: {} };
           },
+          async create(payload, opts) {
+            return rawApi?.bitableRecordCreate?.(payload, opts) ?? { code: 0, data: {} };
+          },
+          async update(payload, opts) {
+            return rawApi?.bitableRecordUpdate?.(payload, opts) ?? { code: 0, data: {} };
+          },
+          async delete(payload, opts) {
+            return rawApi?.bitableRecordDelete?.(payload, opts) ?? { code: 0, data: {} };
+          },
         },
       },
       drive: {
@@ -226,6 +235,9 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
   const toolNames = last.result.tools.map((t) => t.name).sort();
   assert.deepEqual(toolNames, [
     "feishu_ask_user",
+    "feishu_bitable_record_create",
+    "feishu_bitable_record_delete",
+    "feishu_bitable_record_update",
     "feishu_bitable_records",
     "feishu_calendar",
     "feishu_calendar_event",
@@ -2465,6 +2477,227 @@ test("LarkMcpServer: feishu_calendar_event_delete includes summary in approval c
   assert.match(approvalRequest.summary, /Q3 review/);
   assert.match(approvalRequest.summary, /irreversible/);
   assert.match(approvalRequest.summary, /evt_target/);
+});
+
+test("LarkMcpServer: feishu_bitable_record_create flows fields through after approval", async () => {
+  let createPayload = null;
+  let approvalRequest = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async bitableRecordCreate(payload) {
+      createPayload = payload;
+      return { code: 0, data: { record: { record_id: "rec_new" } } };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    approveWrite: async (_input, request) => {
+      approvalRequest = request;
+      return { kind: "approved" };
+    },
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-bt-create",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 210,
+      method: "tools/call",
+      params: {
+        name: "feishu_bitable_record_create",
+        arguments: {
+          app_token: "bascn_app",
+          table_id: "tblXYZ",
+          fields: { Title: "Hello", Status: "Open" },
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "bitable create reply");
+
+  // Approval card detail block carried the field map for sanity-check.
+  assert.match(approvalRequest.summary, /2 fields/);
+  assert.match(approvalRequest.detail, /Hello/);
+  assert.match(approvalRequest.detail, /Open/);
+  // Write happened after approval.
+  assert.equal(createPayload.path.app_token, "bascn_app");
+  assert.deepEqual(createPayload.data.fields, { Title: "Hello", Status: "Open" });
+});
+
+test("LarkMcpServer: feishu_bitable_record_update only writes the listed fields after approval", async () => {
+  let updatePayload = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async bitableRecordUpdate(payload) {
+      updatePayload = payload;
+      return { code: 0, data: { record: { record_id: payload.path.record_id } } };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    approveWrite: async () => ({ kind: "approved" }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-bt-update",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 211,
+      method: "tools/call",
+      params: {
+        name: "feishu_bitable_record_update",
+        arguments: {
+          app_token: "bascn_app",
+          table_id: "tblXYZ",
+          record_id: "rec_target",
+          fields: { Status: "Closed" },
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "bitable update reply");
+
+  assert.equal(updatePayload.path.record_id, "rec_target");
+  // Only the listed field — partial update semantics preserved.
+  assert.deepEqual(updatePayload.data.fields, { Status: "Closed" });
+});
+
+test("LarkMcpServer: feishu_bitable_record_delete refuses without approval (defense in depth)", async () => {
+  let deleteCalls = 0;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async bitableRecordDelete() {
+      deleteCalls++;
+      return { code: 0, data: {} };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    // approveWrite intentionally omitted.
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-bt-delete-nogate",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 212,
+      method: "tools/call",
+      params: {
+        name: "feishu_bitable_record_delete",
+        arguments: {
+          app_token: "bascn_app",
+          table_id: "tblXYZ",
+          record_id: "rec_x",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "bitable delete refused");
+
+  assert.equal(deleteCalls, 0);
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /requires an in-chat approval gate/);
+});
+
+test("LarkMcpServer: feishu_bitable_record_delete propagates the preview into the approval card", async () => {
+  let approvalRequest = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async bitableRecordDelete() {
+      return { code: 0, data: {} };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    approveWrite: async (_input, request) => {
+      approvalRequest = request;
+      return { kind: "approved" };
+    },
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-bt-delete-preview",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 213,
+      method: "tools/call",
+      params: {
+        name: "feishu_bitable_record_delete",
+        arguments: {
+          app_token: "bascn_app",
+          table_id: "tblXYZ",
+          record_id: "rec_x",
+          preview: 'Title="Q3 review", Status="Open"',
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "bitable delete preview");
+
+  assert.match(approvalRequest.summary, /Q3 review/);
+  assert.match(approvalRequest.summary, /irreversible/);
+  assert.match(approvalRequest.summary, /rec_x/);
 });
 
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {

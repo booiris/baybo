@@ -1397,6 +1397,179 @@ export class LarkMcpServer {
     );
 
     server.registerTool(
+      "feishu_bitable_record_create",
+      {
+        title: "Create a record in a Feishu Bitable table",
+        description:
+          "Insert one record. REQUIRES IN-CHAT APPROVAL. `fields` is a flat object keyed by field name (NOT field id) — values match Feishu's per-type encoding: strings/numbers for text/number cells, `{ text, link }` for hyperlink, arrays of `{ id }` for user-link, etc. For batch-creating many rows, do NOT loop — ask the user instead, since a per-row approval each makes for a terrible UX (a real batch tool with a single approval is upcoming, deferred until field-validation lands).",
+        inputSchema: {
+          app_token: z.string().min(1),
+          table_id: z.string().min(1),
+          fields: z
+            .record(z.string(), z.unknown())
+            .describe(
+              "Field name → value map. Field names are the human-readable column names from the Bitable UI, not the internal `fld...` ids. Use `feishu_bitable_records` first if you don't know the schema.",
+            ),
+          user_id_type: z.enum(["open_id", "union_id", "user_id"]).optional(),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (!active.uatAccessor) {
+          return toolError(
+            "feishu_bitable_record_create requires UAT but the bot's OAuth pipeline isn't configured for this session",
+          );
+        }
+        const fieldNames = Object.keys(args.fields);
+        const summary = `Create record in bitable ${args.app_token} table ${args.table_id} with ${fieldNames.length} field${fieldNames.length === 1 ? "" : "s"}`;
+        const detail = JSON.stringify(args.fields, null, 2);
+        const blocked = await this.gateWrite(extra, {
+          toolName: "feishu_bitable_record_create",
+          summary,
+          detail,
+        });
+        if (blocked) return blocked;
+
+        return this.runUatTool({
+          active,
+          toolName: "feishu_bitable_record_create",
+          reason: "create the bitable record you approved",
+          handler: (uat) =>
+            active.channel.rawClient.bitable.appTableRecord.create(
+              {
+                path: { app_token: args.app_token, table_id: args.table_id },
+                data: {
+                  // The SDK types this `fields` Record with the giant
+                  // value-shape union; an as-cast is the only path
+                  // that matches without a 100-line type assertion.
+                  fields: args.fields as Record<string, never>,
+                },
+                params: {
+                  user_id_type: args.user_id_type ?? "open_id",
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_bitable_record_update",
+      {
+        title: "Update a Feishu Bitable record",
+        description:
+          "Update one record's fields by `record_id`. REQUIRES IN-CHAT APPROVAL. Only the fields in `fields` are written; unspecified fields keep their current values. Use `feishu_bitable_records` to find the record_id first if the agent only has a row content match.",
+        inputSchema: {
+          app_token: z.string().min(1),
+          table_id: z.string().min(1),
+          record_id: z.string().min(1).describe("Record id (e.g. `rec...`) — get from a prior `feishu_bitable_records` call."),
+          fields: z
+            .record(z.string(), z.unknown())
+            .describe(
+              "Partial field update map. Only listed fields change; others keep their values.",
+            ),
+          user_id_type: z.enum(["open_id", "union_id", "user_id"]).optional(),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (!active.uatAccessor) {
+          return toolError(
+            "feishu_bitable_record_update requires UAT but the bot's OAuth pipeline isn't configured for this session",
+          );
+        }
+        const fieldNames = Object.keys(args.fields);
+        const summary = `Update record ${args.record_id} in bitable ${args.app_token} table ${args.table_id} — touches ${fieldNames.length} field${fieldNames.length === 1 ? "" : "s"}: ${fieldNames.join(", ")}`;
+        const blocked = await this.gateWrite(extra, {
+          toolName: "feishu_bitable_record_update",
+          summary,
+          detail: JSON.stringify(args.fields, null, 2),
+        });
+        if (blocked) return blocked;
+
+        return this.runUatTool({
+          active,
+          toolName: "feishu_bitable_record_update",
+          reason: "update the bitable record you approved",
+          handler: (uat) =>
+            active.channel.rawClient.bitable.appTableRecord.update(
+              {
+                path: {
+                  app_token: args.app_token,
+                  table_id: args.table_id,
+                  record_id: args.record_id,
+                },
+                data: {
+                  fields: args.fields as Record<string, never>,
+                },
+                params: {
+                  user_id_type: args.user_id_type ?? "open_id",
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
+      "feishu_bitable_record_delete",
+      {
+        title: "Delete a Feishu Bitable record",
+        description:
+          "Delete one record by `record_id`. REQUIRES IN-CHAT APPROVAL. Irreversible (Bitable doesn't expose undo for record-level deletes via OAPI). Use `feishu_bitable_records` to verify the record content first; the agent should pass an optional `preview` so the user can sanity-check what's being deleted on the approval card.",
+        inputSchema: {
+          app_token: z.string().min(1),
+          table_id: z.string().min(1),
+          record_id: z.string().min(1),
+          preview: z
+            .string()
+            .max(500)
+            .optional()
+            .describe(
+              "Short human-readable description of the record being deleted (e.g. `Title=\"Q3 review\", Status=\"Open\"`). Highly recommended — without it the user only sees the opaque record_id on the approval card.",
+            ),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (!active.uatAccessor) {
+          return toolError(
+            "feishu_bitable_record_delete requires UAT but the bot's OAuth pipeline isn't configured for this session",
+          );
+        }
+        const labelled = args.preview ? `record (${args.preview})` : "record";
+        const summary = `⚠️ DELETE ${labelled} (record_id=${args.record_id}) from bitable ${args.app_token} table ${args.table_id}. This is irreversible.`;
+        const blocked = await this.gateWrite(extra, {
+          toolName: "feishu_bitable_record_delete",
+          summary,
+        });
+        if (blocked) return blocked;
+
+        return this.runUatTool({
+          active,
+          toolName: "feishu_bitable_record_delete",
+          reason: "delete the bitable record you approved",
+          handler: (uat) =>
+            active.channel.rawClient.bitable.appTableRecord.delete(
+              {
+                path: {
+                  app_token: args.app_token,
+                  table_id: args.table_id,
+                  record_id: args.record_id,
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
       "feishu_calendar_event_delete",
       {
         title: "Delete a Feishu calendar event",
