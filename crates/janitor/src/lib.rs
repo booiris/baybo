@@ -282,8 +282,16 @@ mod tests {
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(stale.join("script.py"), b"print(1)\n").unwrap();
-        std::fs::write(fresh.join("script.py"), b"print(2)\n").unwrap();
+        std::fs::write(
+            stale.join(aura_workspace::paths::CODE_BUILDER_SCRIPT_FILE),
+            b"print(1)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fresh.join(aura_workspace::paths::CODE_BUILDER_SCRIPT_FILE),
+            b"print(2)\n",
+        )
+        .unwrap();
         // Make stale dir mtime old by setting on its inner file then
         // re-stating: tokio::fs uses the dir entry's mtime, which on
         // Linux is set when the dir is last modified (e.g., when we
@@ -386,19 +394,26 @@ mod tests {
         std::fs::write(recent.join("bundle.mjs"), b"x").unwrap();
         std::fs::write(&stray, b"keep").unwrap();
         back_date_dir(&live, Duration::from_secs(SIDECAR_CACHE_TTL.as_secs() + 60));
-        back_date_dir(&stale, Duration::from_secs(SIDECAR_CACHE_TTL.as_secs() + 60));
+        back_date_dir(
+            &stale,
+            Duration::from_secs(SIDECAR_CACHE_TTL.as_secs() + 60),
+        );
 
         let paths = workspace_paths(tmp.path());
         let live_dirs: HashSet<String> = ["browser-livehash".to_string()].into_iter().collect();
-        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
-            .with_sidecar_cache(SidecarCache {
+        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new())).with_sidecar_cache(
+            SidecarCache {
                 cache_root: cache.clone(),
                 live_dirs,
-            });
+            },
+        );
 
         let removed = janitor.sweep_sidecar_cache().await;
         assert_eq!(removed, 1, "only the stale non-live dir is removed");
-        assert!(live.exists(), "live dir survives even when its mtime is old");
+        assert!(
+            live.exists(),
+            "live dir survives even when its mtime is old"
+        );
         assert!(!stale.exists(), "stale non-live dir removed");
         assert!(recent.exists(), "fresh non-live dir survives the TTL guard");
         assert!(stray.exists(), "non-directory entries are left alone");
@@ -419,11 +434,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("does-not-exist");
         let paths = workspace_paths(tmp.path());
-        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
-            .with_sidecar_cache(SidecarCache {
+        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new())).with_sidecar_cache(
+            SidecarCache {
                 cache_root: cache,
                 live_dirs: HashSet::new(),
-            });
+            },
+        );
         assert_eq!(janitor.sweep_sidecar_cache().await, 0);
     }
 

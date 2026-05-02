@@ -454,7 +454,7 @@ impl AgentLoop {
                 // Cap size before wrapping so the truncation notice lands
                 // inside the `<tool_output>` envelope, then wrap so the LLM
                 // sees a clear boundary around untrusted tool output.
-                let capped = self.security_gateway.cap_tool_output(raw_result_text);
+                let capped = self.security_gateway.cap_tool_output(raw_result_text).await;
                 let wrapped = self
                     .security_gateway
                     .wrap_tool_output_for_llm(&tool_call.name, &capped);

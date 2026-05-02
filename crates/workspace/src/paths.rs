@@ -87,13 +87,28 @@ pub const CHANNEL_PORT_FILE: &str = "channel.port";
 /// parameters, and the response (or error) plus latency / model metadata.
 pub const SESSIONS_LOG_SUBDIR: &str = "sessions";
 
+/// Per-session JSONL files inside [`SESSIONS_LOG_SUBDIR`] are named
+/// `<session_id>.<SESSION_LOG_EXTENSION>`.
+pub const SESSION_LOG_EXTENSION: &str = "jsonl";
+
 // ---------------------------------------------------------------------------
 // Files inside `work/` (gitignored)
 // ---------------------------------------------------------------------------
 
 /// Code-builder scratch parent inside [`WORK_DIR`]. Per-call scratch dirs
-/// sit directly under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`.
-pub const CODE_BUILDER_SUBDIR: &str = "code-builder";
+/// sit directly under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`. Hidden
+/// (leading dot) so the agent's working directory stays uncluttered.
+pub const CODE_BUILDER_SUBDIR: &str = ".code-builder";
+
+/// Per-call code-builder run dir layout, all relative to
+/// `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`. The `*.txt` overflow
+/// files are only written when stdout/stderr exceed the inline cap.
+pub const CODE_BUILDER_SCRIPT_FILE: &str = "script.py";
+pub const CODE_BUILDER_STDOUT_FILE: &str = "stdout.txt";
+pub const CODE_BUILDER_STDERR_FILE: &str = "stderr.txt";
+pub const CODE_BUILDER_TOOL_CALL_FILE: &str = "tool_call.json";
+pub const CODE_BUILDER_UV_CACHE_SUBDIR: &str = "uv-cache";
+pub const CODE_BUILDER_WORKDIR_SUBDIR: &str = "workdir";
 
 /// Browser sidecar font drop-in dir inside [`WORK_DIR`]. Pinned as a
 /// Chrome fontconfig `<dir>` at boot — drop a font here and the next
@@ -105,7 +120,15 @@ pub const BROWSER_FONTS_SUBDIR: &str = ".fonts";
 /// mode this gets bind-mounted at `/data/profile` inside the container.
 /// Lives under `work/` so it sits next to other workspace-scoped state
 /// (and inherits the same gitignore + lifecycle as the rest of `work/`).
-pub const BROWSER_PROFILE_SUBDIR: &str = "browser/profile";
+/// Hidden (leading dot) so the agent's working directory stays
+/// uncluttered.
+pub const BROWSER_PROFILE_SUBDIR: &str = ".browser/profile";
+
+/// Tool-output spill dir inside [`WORK_DIR`]. The security gateway
+/// drops oversize tool results here as content-addressed `.txt` files
+/// so the LLM can `Read` the rest. Hidden (leading dot) to keep
+/// glob/grep noise down on the agent's working directory.
+pub const TOOL_SPILLS_SUBDIR: &str = ".aura-tool-spills";
 
 // ---------------------------------------------------------------------------
 // Files inside `logs/` (gitignored)
@@ -310,6 +333,10 @@ impl WorkspacePaths {
     pub fn browser_profile_dir(&self) -> PathBuf {
         self.work_dir().join(BROWSER_PROFILE_SUBDIR)
     }
+
+    pub fn tool_spills_dir(&self) -> PathBuf {
+        self.work_dir().join(TOOL_SPILLS_SUBDIR)
+    }
 }
 
 #[cfg(test)]
@@ -349,7 +376,7 @@ mod tests {
         assert_eq!(p.skills_dir(), PathBuf::from("/var/aura/skills"));
         assert_eq!(
             p.code_builder_dir(),
-            PathBuf::from("/var/aura/work/code-builder"),
+            PathBuf::from("/var/aura/work/.code-builder"),
         );
         assert_eq!(
             p.browser_fonts_dir(),
@@ -357,7 +384,11 @@ mod tests {
         );
         assert_eq!(
             p.browser_profile_dir(),
-            PathBuf::from("/var/aura/work/browser/profile"),
+            PathBuf::from("/var/aura/work/.browser/profile"),
+        );
+        assert_eq!(
+            p.tool_spills_dir(),
+            PathBuf::from("/var/aura/work/.aura-tool-spills"),
         );
         assert_eq!(p.gitignore_file(), PathBuf::from("/var/aura/.gitignore"));
     }

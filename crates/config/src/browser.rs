@@ -68,7 +68,7 @@ pub struct BrowserConfig {
 
     /// Override the per-sidecar Chrome profile directory.
     ///
-    /// Default: `<workspace_root>/work/browser/profile` (computed by
+    /// Default: `<workspace_root>/work/.browser/profile` (computed by
     /// `aura_gateway::collect_profiles` from `workspace.path`). The
     /// profile is **persistent across Aura restarts** (cookies /
     /// localStorage retained) and lives under the workspace so it

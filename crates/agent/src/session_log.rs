@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::ChatMessage;
+use aura_workspace::paths::SESSION_LOG_EXTENSION;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -11,8 +12,6 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
-
-const FILE_EXTENSION: &str = "jsonl";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -157,7 +156,9 @@ impl SessionLlmLogger {
 
     async fn write_line(&self, session_id: &str, line: &mut Vec<u8>) -> io::Result<()> {
         let safe_id = sanitize_session_id(session_id);
-        let path = self.base_dir.join(format!("{safe_id}.{FILE_EXTENSION}"));
+        let path = self
+            .base_dir
+            .join(format!("{safe_id}.{SESSION_LOG_EXTENSION}"));
         line.push(b'\n');
 
         fs::create_dir_all(&self.base_dir).await?;

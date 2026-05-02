@@ -1,13 +1,18 @@
 use std::path::{Path, PathBuf};
 
-use aura_workspace::paths::CODE_BUILDER_SUBDIR;
+use aura_workspace::paths::{
+    CODE_BUILDER_SCRIPT_FILE, CODE_BUILDER_STDERR_FILE, CODE_BUILDER_STDOUT_FILE,
+    CODE_BUILDER_SUBDIR, CODE_BUILDER_TOOL_CALL_FILE, CODE_BUILDER_UV_CACHE_SUBDIR,
+    CODE_BUILDER_WORKDIR_SUBDIR,
+};
 use uuid::Uuid;
 
 use crate::error::CodeBuilderError;
 
-/// Per-call run directory under `<sandbox_root>/code-builder/<uuid>/`.
-/// In production `sandbox_root` is `<workspace>/work`, so the full
-/// path is `<workspace>/work/code-builder/<uuid>/`.
+/// Per-call run directory under
+/// `<sandbox_root>/<CODE_BUILDER_SUBDIR>/<uuid>/`. In production
+/// `sandbox_root` is `<workspace>/work`, so the full path is
+/// `<workspace>/work/.code-builder/<uuid>/`.
 ///
 /// Holds:
 /// - `script.py` — persisted; the agent's outer LLM sees this path in
@@ -36,9 +41,9 @@ impl RunDir {
         let base = sandbox_root.join(CODE_BUILDER_SUBDIR);
         let id = Uuid::new_v4();
         let root = base.join(id.to_string());
-        let uv_cache_dir = root.join("uv-cache");
-        let workdir = root.join("workdir");
-        let script_path = root.join("script.py");
+        let uv_cache_dir = root.join(CODE_BUILDER_UV_CACHE_SUBDIR);
+        let workdir = root.join(CODE_BUILDER_WORKDIR_SUBDIR);
+        let script_path = root.join(CODE_BUILDER_SCRIPT_FILE);
 
         std::fs::create_dir_all(&uv_cache_dir).map_err(scratch_err)?;
         std::fs::create_dir_all(&workdir).map_err(scratch_err)?;
@@ -57,15 +62,15 @@ impl RunDir {
     }
 
     pub fn stdout_path(&self) -> PathBuf {
-        self.root.join("stdout.txt")
+        self.root.join(CODE_BUILDER_STDOUT_FILE)
     }
 
     pub fn stderr_path(&self) -> PathBuf {
-        self.root.join("stderr.txt")
+        self.root.join(CODE_BUILDER_STDERR_FILE)
     }
 
     pub fn tool_call_path(&self) -> PathBuf {
-        self.root.join("tool_call.json")
+        self.root.join(CODE_BUILDER_TOOL_CALL_FILE)
     }
 
     /// Write a long stdout/stderr body to disk with mode 0600. The body

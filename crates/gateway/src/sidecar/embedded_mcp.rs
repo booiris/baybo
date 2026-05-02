@@ -141,8 +141,11 @@ mod tests {
         let profile_dir = profiles[0]
             .extra_env
             .get("AURA_BROWSER_PROFILE_DIR")
-            .expect("collect_profiles must default the Chrome profile to <work>/browser/profile");
-        assert_eq!(profile_dir, "/tmp/aura-test-workspace/work/browser/profile");
+            .expect("collect_profiles must default the Chrome profile to <work>/.browser/profile");
+        assert_eq!(
+            profile_dir,
+            "/tmp/aura-test-workspace/work/.browser/profile"
+        );
         assert!(
             !profiles[0]
                 .extra_env
