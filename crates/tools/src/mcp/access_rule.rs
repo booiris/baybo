@@ -254,7 +254,9 @@ fn render_template(template: &str, params: &Value) -> String {
             i += 1 + end_rel + 1;
             continue;
         }
-        let ch = template[i..].chars().next().unwrap();
+        let Some(ch) = template[i..].chars().next() else {
+            break;
+        };
         out.push(ch);
         i += ch.len_utf8();
     }

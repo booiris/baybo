@@ -406,11 +406,11 @@ async fn drain_pipe<R>(
         };
         let (level, msg_text, line_target) = match parsed {
             Some(p) => (
-                LogLevel::parse(&p.level).unwrap_or(default_level),
-                p.msg,
-                p.target,
+                LogLevel::parse(&sanitize_log_field(&p.level)).unwrap_or(default_level),
+                sanitize_log_field(&p.msg),
+                p.target.map(|t| sanitize_log_field(&t)),
             ),
-            None => (default_level, raw.into_owned(), None),
+            None => (default_level, sanitize_log_field(&raw), None),
         };
         let log_target = match line_target.as_deref().filter(|t| !t.is_empty()) {
             Some(t) => format!("sidecar::{channel_type}::{t}"),
@@ -456,6 +456,22 @@ struct SidecarLogLine {
     msg: String,
     #[serde(default)]
     target: Option<String>,
+}
+
+/// Replace ASCII control bytes (0x00-0x1F except `\t`, plus 0x7F) with
+/// `?`. Keeps the supervisor TTY + tail output safe from a sidecar that
+/// emits ANSI escapes (`\x1b[2J` would clear the operator's screen) or
+/// other terminal-state mutations inside its log strings. Tabs are
+/// preserved so structured log strings keep formatting; everything else
+/// in that range has no business in a one-line log payload.
+fn sanitize_log_field(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\t' => '\t',
+            c if c.is_control() => '?',
+            c => c,
+        })
+        .collect()
 }
 
 fn write_line_to_file(mw: &ChannelLogWriter, level: LogLevel, line: &str) {
@@ -558,6 +574,40 @@ mod tests {
         assert_eq!(rec.message, "send failed");
         assert_eq!(rec.level, LogLevel::Error);
         assert_eq!(rec.target, "sidecar::telegram::polling");
+    }
+
+    #[tokio::test]
+    async fn pipe_strips_ansi_escapes_from_ndjson_payload() {
+        // A sidecar that emits a CSI escape inside its NDJSON `msg`
+        // would otherwise see the raw escape land in the LogBuffer +
+        // tee'd terminal — the supervisor must replace it so the
+        // operator's TTY can't be hijacked by sidecar output.
+        let buf = LogBuffer::new(8);
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let drain = tokio::spawn(drain_pipe(
+            reader,
+            Arc::clone(&buf),
+            None,
+            "telegram".to_string(),
+            "sidecar::telegram::stdout".to_string(),
+            Stream::Stdout,
+            LogLevel::Info,
+        ));
+        writer
+            .write_all(b"{\"level\":\"info\",\"msg\":\"hello\\u001b[2Jworld\"}\n")
+            .await
+            .unwrap();
+        drop(writer);
+        drain.await.unwrap();
+
+        let page = buf.query(&LogQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(page.total, 1);
+        let rec = &page.items[0];
+        assert_eq!(rec.message, "hello?[2Jworld", "ESC sanitized to ?");
+        assert!(!rec.message.contains('\u{001b}'));
     }
 
     #[tokio::test]

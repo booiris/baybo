@@ -43,7 +43,7 @@
 // - The env vars themselves are NOT a public interface; setting them
 //   directly works in development but isn't documented or supported.
 
-import { existsSync, mkdirSync, readlinkSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readlinkSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, hostname as osHostname, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -488,6 +488,27 @@ async function runHostFallback(state: InstallState): Promise<ServerArgs> {
  * lock with a live PID is the only case we leave alone (it'd be a real
  * concurrent-instance conflict that Chrome should fail loudly on).
  */
+/**
+ * Cross-check that a live PID actually belongs to a Chrome family
+ * process before respecting its `Singleton*` lock. Linux PIDs are
+ * recycled, so a previous Chrome PID that died, then got reissued to
+ * an unrelated process (sleep, sshd worker, …), would otherwise pass
+ * `isPidAlive` and block Chrome from ever starting on this profile.
+ *
+ * Linux: read `/proc/<pid>/comm`. macOS: `/proc` doesn't exist; fall
+ * back to "assume Chrome" so behaviour matches today's conservative
+ * default. Docker entrypoint runs the same dance inside the container
+ * (Linux), so the check is effective in both modes.
+ */
+function isLikelyChromeProcess(pid: number): boolean {
+  try {
+    const comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    return /^(chrome|chromium|google-chrome)/i.test(comm);
+  } catch {
+    return true;
+  }
+}
+
 function clearStaleChromeLocks(profileDir: string): void {
   const myHostname = osHostname();
   for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
@@ -506,14 +527,17 @@ function clearStaleChromeLocks(profileDir: string): void {
     const lockHostname = m[1] ?? "";
     const lockPid = Number(m[2]);
     if (lockHostname === myHostname && Number.isInteger(lockPid)) {
-      if (isPidAlive(lockPid)) {
+      if (isPidAlive(lockPid) && isLikelyChromeProcess(lockPid)) {
         log(
           `Chrome lock ${lockPath} points at live PID ${lockPid} on this host; leaving alone ` +
             `(would race a real running instance — close it first or use a different profile_dir)`,
         );
         continue;
       }
-      log(`clearing stale Chrome lock ${lockPath} (PID ${lockPid} is dead on ${myHostname})`);
+      const reason = isPidAlive(lockPid)
+        ? `PID ${lockPid} is alive but is not a Chrome process (likely PID reuse on a busy host)`
+        : `PID ${lockPid} is dead on ${myHostname}`;
+      log(`clearing stale Chrome lock ${lockPath} (${reason})`);
     } else {
       log(
         `clearing stale Chrome lock ${lockPath} (target ${target} from a different host or container)`,

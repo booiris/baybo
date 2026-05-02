@@ -170,15 +170,29 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
     log(`image ${tag} built`);
 }
 
+// Hard ceiling on how stale a cached aura-browser:* image we'll silently
+// fall back to. Past this, the Chrome inside is likely missing a quarter
+// of security fixes; refusing the fallback forces the operator to either
+// fix the build (network/disk/apt) or explicitly opt into the old image
+// via browser.docker.image_tag.
+const STALE_IMAGE_MAX_AGE_DAYS = 30;
+
 /**
  * Find the most recently created `aura-browser:*` image present locally.
  * Used as a fallback when the deterministic-tag image isn't built and the
  * Chrome stable resolver couldn't reach the network — better to run a
  * slightly-stale cached image than to fall back to host-headless.
+ *
+ * Returns the tag along with its age in days so the caller can refuse
+ * silently-old images and surface a loud warning when an image is on
+ * the older end of the acceptable window.
  */
-async function findCachedAuraBrowserImage(): Promise<string | undefined> {
+async function findCachedAuraBrowserImage(): Promise<
+    { tag: string; ageDays: number } | undefined
+> {
+    let stdout: string;
     try {
-        const { stdout } = await exec(
+        const r = await exec(
             "docker",
             [
                 "images",
@@ -188,19 +202,39 @@ async function findCachedAuraBrowserImage(): Promise<string | undefined> {
             ],
             { timeout: 5000 },
         );
-        const lines = stdout
-            .split("\n")
-            .map((l) => l.trim())
-            .filter((l) => l.length > 0 && !l.startsWith("aura-browser:<none>"));
-        if (lines.length === 0) return undefined;
-        // `docker images` already returns rows ordered most-recent first.
-        const first = lines[0];
-        if (!first) return undefined;
-        const tag = first.split("\t")[0];
-        return tag || undefined;
+        stdout = r.stdout;
     } catch {
         return undefined;
     }
+    const lines = stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0 && !l.startsWith("aura-browser:<none>"));
+    // `docker images` already returns rows ordered most-recent first.
+    const first = lines[0];
+    if (!first) return undefined;
+    const [tag, createdAt] = first.split("\t");
+    if (!tag || !createdAt) return undefined;
+    const ageDays = parseDockerCreatedAtAgeDays(createdAt);
+    if (ageDays === undefined) {
+        log(`cached image ${tag} CreatedAt='${createdAt}' unparseable; assuming stale`);
+        return undefined;
+    }
+    return { tag, ageDays };
+}
+
+/**
+ * `docker images --format {{.CreatedAt}}` returns strings like
+ * `2026-04-15 14:20:45 +0800 CST`. Date.parse can't handle the trailing
+ * timezone abbreviation, so strip it before parsing.
+ */
+function parseDockerCreatedAtAgeDays(createdAt: string): number | undefined {
+    const trimmed = createdAt.replace(/\s+[A-Z]{2,5}$/, "").trim();
+    const ts = Date.parse(trimmed);
+    if (Number.isNaN(ts)) return undefined;
+    const ageMs = Date.now() - ts;
+    if (ageMs < 0) return 0;
+    return ageMs / (1000 * 60 * 60 * 24);
 }
 
 async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
@@ -222,9 +256,25 @@ async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
         const reason = e instanceof Error ? e.message : String(e);
         log(`build of ${tag} failed (${reason}); looking for a cached aura-browser image`);
         const cached = await findCachedAuraBrowserImage();
+        if (cached && cached.ageDays <= STALE_IMAGE_MAX_AGE_DAYS) {
+            const ageStr = cached.ageDays.toFixed(1);
+            log(
+                `WARNING: build failed; falling back to cached image ${cached.tag} ` +
+                    `(${ageStr} days old, contains a Chrome that may be missing recent ` +
+                    `security fixes). Fix the build (network/apt/disk) or pin a known image ` +
+                    `via aura.json:browser.docker.image_tag.`,
+            );
+            return cached.tag;
+        }
         if (cached) {
-            log(`falling back to cached image ${cached} (older Chrome but works offline)`);
-            return cached;
+            const ageStr = cached.ageDays.toFixed(1);
+            throw new Error(
+                `image build failed and the only cached aura-browser:* image (${cached.tag}) is ` +
+                    `${ageStr} days old (cap is ${STALE_IMAGE_MAX_AGE_DAYS}d). Refusing the silent ` +
+                    `fallback to a likely-vulnerable Chrome — fix the build, or set ` +
+                    `aura.json:browser.docker.image_tag to opt into the old image explicitly. ` +
+                    `Build error: ${reason}`,
+            );
         }
         throw new Error(
             `image build failed and no cached aura-browser:* image found locally: ${reason}`,
@@ -233,6 +283,16 @@ async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
 }
 
 export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHandle> {
+    // `:` is the field separator in `docker -v src:dst[:opts]`; a path
+    // containing it would either silently re-interpret the suffix as a
+    // mount option or break parsing entirely. Validate before we get
+    // anywhere near the docker CLI so the operator gets a clear message
+    // instead of a `Mounts denied` / `invalid mode` error from docker.
+    rejectColonInBindPath(opts.profileDir, "browser.profile_dir");
+    if (opts.fontDir) {
+        rejectColonInBindPath(opts.fontDir, "<workspace>/work/.fonts (font bind-mount source)");
+    }
+
     const tag = await resolveImageTag(opts);
 
     opts.onPhase("docker-starting-container");
@@ -435,6 +495,15 @@ async function containerExitInfo(containerName: string): Promise<string> {
         return r.stdout.trim() || "(no inspect output)";
     } catch (e) {
         return `inspect failed: ${(e as Error).message}`;
+    }
+}
+
+function rejectColonInBindPath(path: string, label: string): void {
+    if (path.includes(":")) {
+        throw new Error(
+            `${label} contains ':' (${path}); docker -v parses 'src:dst[:opts]' so the colon would ` +
+                `corrupt the bind-mount. Move the directory to a path without ':' before enabling docker mode.`,
+        );
     }
 }
 

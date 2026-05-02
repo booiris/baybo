@@ -15,8 +15,11 @@
 #      fixed internal :5900 (loopback only); websockify proxies the
 #      operator's WEB_VNC_PORT to it. Native-VNC clients are not
 #      supported by design — browser-only access via noVNC.
-#   6. exec chrome with CDP exposed on 0.0.0.0:9222 inside the container.
-#      The host wrapper resolves the published port via `docker port` and
+#   5. exec chrome (loopback CDP on 9222) + socat relay (0.0.0.0:9223 ->
+#      127.0.0.1:9222). Chrome 134+ silently ignores
+#      `--remote-debugging-address=0.0.0.0` (DNS-rebind protection), so the
+#      relay is what makes the host-published port reachable. The host
+#      wrapper resolves the published 9223 port via `docker port` and
 #      connects via `args.browserUrl = http://127.0.0.1:<published>`.
 #
 # Env vars (set by `docker run -e ...` from the TS wrapper):
@@ -146,7 +149,7 @@ if [ -n "${WEB_VNC_PORT:-}" ]; then
                "127.0.0.1:$INTERNAL_VNC_PORT" >&2 &
 fi
 
-# Step 6 — launch chrome + socat relay.
+# Step 5 — launch chrome + socat relay.
 #
 # Chrome 134+ silently ignores `--remote-debugging-address=0.0.0.0` for
 # DNS-rebinding protection: Chrome's CDP server now refuses any TCP
@@ -170,6 +173,13 @@ fi
 #
 # `--enable-logging=stderr` surfaces Chrome's own stderr in `docker logs`
 # (default is to write to a logfile inside the user-data-dir).
+#
+# `--disable-dev-shm-usage` is belt-and-braces: docker.ts passes
+# `--shm-size=2g` so /dev/shm is large enough for Chrome by default, but
+# older docker engines silently ignore that flag and Chrome OOMs on
+# memory-heavy pages with no obvious signal. Setting this flag makes
+# Chrome back its shared-memory regions with /tmp regardless, so the
+# /dev/shm size is no longer a hidden cliff.
 log "launching chrome (loopback CDP on 9222) + socat relay (0.0.0.0:9223 -> 127.0.0.1:9222)"
 /usr/local/bin/chrome \
     --remote-debugging-port=9222 \
@@ -180,6 +190,7 @@ log "launching chrome (loopback CDP on 9222) + socat relay (0.0.0.0:9223 -> 127.
     --disable-default-apps \
     --no-sandbox \
     --disable-gpu \
+    --disable-dev-shm-usage \
     --enable-logging=stderr \
     --window-position=0,0 \
     --window-size="${VIEWPORT%x*},${VIEWPORT#*x}" \
