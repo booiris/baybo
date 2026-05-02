@@ -3,7 +3,7 @@ import type {
   StartBotCommand,
   WireAttachment,
 } from "@aura/channel-sdk";
-import { fetchBlobStream, uploadBlob } from "@aura/channel-sdk";
+import { fetchBlob, uploadBlob } from "@aura/channel-sdk";
 import type {
   BotInboundEvent,
   BotMediaPayload,
@@ -12,7 +12,7 @@ import type {
   SlashCommandSpec,
 } from "@aura/channel-sdk/bot";
 import { composeAuraUserId } from "@aura/channel-sdk/bot";
-import { Bot, type Context } from "grammy";
+import { Bot, type Context, GrammyError, HttpError } from "grammy";
 
 import {
   downloadTelegramFile,
@@ -80,7 +80,12 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
     cmd: StartBotCommand,
     hooks: BotStartHooks<Bot, TelegramChat>,
   ): Promise<{ handle: Bot; username?: string; waitForExit: Promise<void> }> {
-    const bot = new Bot(cmd.token);
+    // sensitiveLogs makes grammy fold the underlying fetch error's
+    // message into HttpError.message instead of dropping it. Bot tokens
+    // never appear in those messages, so the "sensitive" name is
+    // misleading here — the real win is that "sendPhoto failed!"
+    // becomes "sendPhoto failed! ConnectTimeoutError: ...".
+    const bot = new Bot(cmd.token, { client: { sensitiveLogs: true } });
     bot.on("message", (ctx) =>
       this.handleInboundMessage(bot, cmd.botId, ctx, hooks.emit),
     );
@@ -113,18 +118,15 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
     // doesn't see it duplicated across a multi-photo reply.
     let captionRemaining = payload.text;
     for (const att of payload.attachments) {
-      const stream = await this.openAttachmentStream(att);
-      if (!stream) continue;
+      const bytes = await this.openAttachmentBytes(att);
+      if (!bytes) continue;
       try {
-        await sendTelegramAttachment(bot, chat, att, stream, captionRemaining);
+        await sendTelegramAttachment(bot, chat, att, bytes, captionRemaining);
         captionRemaining = "";
       } catch (err) {
         this.logger.error(
-          `telegram sendMedia failed for kind=${att.kind} blob_id=${att.blob_id}: ${String(err)}`,
+          `telegram sendMedia failed for kind=${att.kind} blob_id=${att.blob_id}: ${describeError(err)}`,
         );
-        // grammy may have only partially consumed the stream on error.
-        // Cancel so the underlying connection doesn't dangle.
-        stream.cancel().catch(() => {});
       }
     }
     // If every attachment failed to fetch but a caption remains, fall
@@ -134,21 +136,27 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
         await this.sendText(bot, chat, captionRemaining);
       } catch (err) {
         this.logger.error(
-          `telegram sendMedia text fallback failed: ${String(err)}`,
+          `telegram sendMedia text fallback failed: ${describeError(err)}`,
         );
       }
     }
   }
 
-  private async openAttachmentStream(
+  // Buffer the whole blob before handing it to grammy. The streaming
+  // path (fetchBlobStream → grammy InputFile around a web ReadableStream)
+  // tripped over `yield* stream` inside grammy's multipart generator on
+  // bun — grammy expects the stream to expose `[Symbol.asyncIterator]`
+  // and got `undefined is not a function` instead. Bot API caps photos
+  // at 10 MB and documents at 50 MB anyway, so peak memory is bounded.
+  private async openAttachmentBytes(
     att: WireAttachment,
-  ): Promise<ReadableStream<Uint8Array> | null> {
+  ): Promise<Uint8Array | null> {
     try {
-      const { stream } = await fetchBlobStream(att.blob_id);
-      return stream;
+      const { bytes } = await fetchBlob(att.blob_id);
+      return bytes;
     } catch (err) {
       this.logger.error(
-        `telegram sendMedia: fetchBlobStream failed blob_id=${att.blob_id} err=${String(err)}`,
+        `telegram sendMedia: fetchBlob failed blob_id=${att.blob_id} err=${describeError(err)}`,
       );
       return null;
     }
@@ -204,7 +212,10 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
       if (!attachment) {
         // Surface a stub so the user's intent isn't silently lost.
         // This lands as a regular text inbound — not perfect, but
-        // strictly better than dropping the turn entirely.
+        // strictly better than dropping the turn entirely. The SDK
+        // logs the resulting inbound event; the warn we emit inside
+        // downloadAndUpload's "skipped" path tells the operator why
+        // the agent saw text instead of media.
         const stub = mediaFallbackText(media);
         emit({
           chat: address,
@@ -244,16 +255,31 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
     try {
       bytes = await downloadTelegramFile(bot, media.fileId, media.size);
     } catch (err) {
-      this.logger.error(`telegram inbound media download failed: ${String(err)}`);
+      this.logger.error(`telegram inbound media download failed: ${describeError(err)}`);
       return null;
     }
-    if (!bytes) return null;
+    if (!bytes) {
+      // Hit the 20 MB getFile ceiling; the platform layer falls back
+      // to a text stub. Log so the operator can correlate with the
+      // missing-attachment turn the user sees in chat.
+      this.logger.warn(
+        `telegram inbound media skipped (over getFile limit): kind=${media.kind} mime=${media.mimeType}` +
+          (media.size !== undefined ? ` size=${media.size}` : ""),
+      );
+      return null;
+    }
+    this.logger.info(
+      `telegram inbound media downloaded kind=${media.kind} mime=${media.mimeType} size=${bytes.length}`,
+    );
 
     try {
       const { blobId } = await uploadBlob(bytes, media.mimeType, {
         botId,
         userId,
       });
+      this.logger.info(
+        `telegram inbound media uploaded blob_id=${blobId} bytes=${bytes.length}`,
+      );
       return {
         kind: media.kind,
         blob_id: blobId,
@@ -262,7 +288,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
         ...(media.filename ? { filename: media.filename } : {}),
       };
     } catch (err) {
-      this.logger.error(`telegram inbound media upload failed: ${String(err)}`);
+      this.logger.error(`telegram inbound media upload failed: ${describeError(err)}`);
       return null;
     }
   }
@@ -277,4 +303,32 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
 function mediaFallbackText(media: TelegramInboundMedia): string {
   const name = media.filename ? ` ${media.filename}` : "";
   return `[${media.kind}: ${media.mimeType}${name}]`;
+}
+
+/**
+ * Render an error in a form that's actually useful for diagnosing a
+ * sidecar failure. `String(err)` on grammy's errors only yields
+ * `HttpError: Network request for 'sendPhoto' failed!` — the real
+ * cause (`fetch failed`, `ConnectTimeoutError`, certificate problem,
+ * …) is hidden under `err.error` (grammy) or `err.cause` (standard).
+ * Walk both chains so we surface every link.
+ */
+function describeError(err: unknown): string {
+  if (err instanceof GrammyError) {
+    return `GrammyError ${err.error_code} on ${err.method}: ${err.description}`;
+  }
+  const parts: string[] = [];
+  let cur: unknown = err;
+  for (let depth = 0; cur != null && depth < 4; depth++) {
+    if (cur instanceof Error) {
+      parts.push(`${cur.name}: ${cur.message}`);
+      const next: unknown =
+        cur instanceof HttpError ? cur.error : (cur as { cause?: unknown }).cause;
+      cur = next === cur ? null : next;
+    } else {
+      parts.push(String(cur));
+      cur = null;
+    }
+  }
+  return parts.length > 0 ? parts.join(" <- ") : String(err);
 }
