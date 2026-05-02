@@ -46,8 +46,11 @@ pub struct EmbeddedMcpProfile {
     /// Args appended to `command` (typically the materialised bundle
     /// path).
     pub args: Vec<String>,
-    /// Capability ceiling for the synthesised manifest. The per-tool
-    /// `_meta.aura.access_rule` annotations refine this per call.
+    /// Capability ceiling for the synthesised manifest, surfaced as
+    /// the per-server resource list every tool from this server
+    /// inherits. An empty list means "Aura controls the spawn and
+    /// trusts the vendor; do not gate per-call approval on the
+    /// transport command" (browser today).
     pub capabilities: Vec<ToolCapability>,
     /// Boot-config env vars merged onto the child's env after the
     /// secret-vault load (so `mcp.<server_name>.env` vault entries

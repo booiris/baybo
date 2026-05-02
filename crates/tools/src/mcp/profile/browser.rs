@@ -172,11 +172,10 @@ pub fn browser_mcp_profile(
         server_name: "browser".into(),
         command,
         args: vec![bundle_path.display().to_string()],
-        // Empty by design — see the doc comment above. With no
-        // capability ceiling and no per-tool `_meta.aura.access_rule`
-        // (CDDM doesn't emit any), the McpTool wrapper's
-        // `accessed_resources()` returns `[]` and the agent loop
-        // never prompts on browser tool calls.
+        // Empty by design — see the doc comment above. The McpTool
+        // wrapper's `accessed_resources()` returns this list verbatim,
+        // so an empty capability ceiling means the agent loop's
+        // pre-execute approval gate never fires for browser tool calls.
         capabilities: Vec::new(),
         extra_env,
     })
@@ -244,14 +243,13 @@ mod tests {
     }
 
     /// Pinned guarantee: browser tools must never trigger the agent
-    /// loop's pre-execute approval prompt. This is enforced by
-    /// `capabilities: vec![]` here (no default ResourceAccess) plus
-    /// CDDM emitting no `_meta.aura.access_rule` annotations. If a
-    /// future refactor sneaks Http or ExecCommand into the browser
-    /// profile's capability list, the McpTool wrapper's
-    /// `accessed_resources()` would return non-empty and every
-    /// `browser/*` tool call would start prompting — silently
-    /// degrading UX. This test fails loud if that happens.
+    /// loop's pre-execute approval prompt. Enforced by
+    /// `capabilities: vec![]` here — McpTool's `accessed_resources()`
+    /// returns the per-server list verbatim, so empty capabilities =
+    /// no prompt. If a future refactor sneaks Http or ExecCommand into
+    /// the browser profile's capability list, every `browser/*` tool
+    /// call would start prompting and silently degrade UX. This test
+    /// fails loud if that happens.
     #[test]
     fn capabilities_stay_empty_to_skip_approval_gate() {
         let p = defaults_call(true).expect("profile when enabled");

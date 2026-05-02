@@ -329,10 +329,6 @@ impl McpReconciler {
                 entry.name.clone(),
                 descriptor.clone(),
                 resources.clone(),
-                // Only honor `_meta.aura` for Aura-owned embedded
-                // servers. A user `.mcp.json` server can't suppress its
-                // own approval gate via per-tool annotations.
-                is_embedded,
                 session.peer(),
                 self.blob_store.clone(),
             );
@@ -399,9 +395,9 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
     hasher.finish()
 }
 
-/// Default per-call resource accesses for tools provided by the given MCP
-/// server. Becomes the McpTool's `default_resource_access` fallback when
-/// the tool descriptor carries no `_meta.aura.access_rule`.
+/// Per-server resource accesses for every tool the MCP server provides.
+/// Becomes the McpTool's `default_resource_access` — the agent loop's
+/// pre-execute approval gate consults this list per call.
 ///
 /// For **user-configured** `.mcp.json` servers the answer is
 /// transport-derived: every stdio tool counts as an `ExecCommand{command}`,

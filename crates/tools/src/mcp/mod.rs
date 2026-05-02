@@ -1,4 +1,3 @@
-pub mod access_rule;
 pub mod config;
 pub mod content_adapter;
 pub mod credentials;
@@ -11,7 +10,6 @@ pub mod tool;
 pub mod transport;
 pub mod vault_keys;
 
-pub use access_rule::{AccessRule, AuraToolMeta, CallLabelRule, ResourceKind};
 pub use config::{McpFile, McpServerEntry, McpTransportConfig, OAuthConfig, TrustLevelConfig};
 pub use embedded::EmbeddedMcpServer;
 pub use error::{McpError, McpResult};
