@@ -2,6 +2,14 @@
 name = "aura-gateway"
 version.workspace = true
 edition.workspace = true
+# See `crates/integration-tests/Cargo.toml` for the rationale: aggregating
+# tests/*.rs into one binary saves the per-binary link of the gateway
+# graph (200s+ each on debug).
+autotests = false
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 [features]
 default = ["linux", "macos"]

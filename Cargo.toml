@@ -201,3 +201,14 @@ lto = true
 codegen-units = 1
 strip = "debuginfo"
 panic = "abort"
+
+# Each test target re-links the whole upper dep graph; full DWARF dominates
+# link time. `line-tables-only` keeps usable backtraces, `unpacked` skips
+# bundling `.dwo`s back into the executable after link.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
