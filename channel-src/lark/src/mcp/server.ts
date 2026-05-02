@@ -1570,6 +1570,105 @@ export class LarkMcpServer {
     );
 
     server.registerTool(
+      "feishu_calendar_event_update",
+      {
+        title: "Update an existing Feishu calendar event",
+        description:
+          "Patch one event's fields by `event_id`. REQUIRES IN-CHAT APPROVAL. Only the fields you pass are written; unspecified fields keep their values. Common uses: reschedule (`start_timestamp`+`end_timestamp`), retitle (`summary`), edit description. For complex changes (attendee add/remove, recurrence rules), use Lark UI — those have nuanced semantics worth a human touch.",
+        inputSchema: {
+          calendar_id: z.string().min(1),
+          event_id: z.string().min(1),
+          summary: z
+            .string()
+            .max(200)
+            .optional()
+            .describe("New event title. Pass undefined to keep the current title."),
+          description: z.string().max(10_000).optional(),
+          start_timestamp: z
+            .string()
+            .optional()
+            .describe(
+              "New start as Unix-seconds-or-millis string. If you change start, almost always change end too — Feishu doesn't auto-shift the duration.",
+            ),
+          end_timestamp: z.string().optional(),
+          timezone: z
+            .string()
+            .optional()
+            .describe(
+              "IANA timezone for the new times. Required if you set start/end and the original timezone was unusual.",
+            ),
+          need_notification: z
+            .boolean()
+            .optional()
+            .describe("Whether attendees get a change notification. Default true."),
+        },
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (!active.uatAccessor) {
+          return toolError(
+            "feishu_calendar_event_update requires UAT but the bot's OAuth pipeline isn't configured for this session",
+          );
+        }
+        const changes: string[] = [];
+        if (args.summary !== undefined) changes.push(`summary="${args.summary}"`);
+        if (args.description !== undefined) changes.push("description");
+        if (args.start_timestamp !== undefined) changes.push(`start=${args.start_timestamp}`);
+        if (args.end_timestamp !== undefined) changes.push(`end=${args.end_timestamp}`);
+        if (args.timezone !== undefined) changes.push(`tz=${args.timezone}`);
+        if (changes.length === 0) {
+          return toolError(
+            "feishu_calendar_event_update: no fields to update — pass at least one of summary/description/start_timestamp/end_timestamp/timezone/need_notification",
+          );
+        }
+        const summary = `Update event ${args.event_id} on calendar ${args.calendar_id}: ${changes.join(", ")}`;
+        const blocked = await this.gateWrite(extra, {
+          toolName: "feishu_calendar_event_update",
+          summary,
+        });
+        if (blocked) return blocked;
+
+        return this.runUatTool({
+          active,
+          toolName: "feishu_calendar_event_update",
+          reason: "update the calendar event you approved",
+          handler: (uat) =>
+            active.channel.rawClient.calendar.calendarEvent.patch(
+              {
+                path: {
+                  calendar_id: args.calendar_id,
+                  event_id: args.event_id,
+                },
+                data: {
+                  ...(args.summary !== undefined && { summary: args.summary }),
+                  ...(args.description !== undefined && {
+                    description: args.description,
+                  }),
+                  ...(args.start_timestamp !== undefined && {
+                    start_time: {
+                      timestamp: args.start_timestamp,
+                      ...(args.timezone !== undefined && { timezone: args.timezone }),
+                    },
+                  }),
+                  ...(args.end_timestamp !== undefined && {
+                    end_time: {
+                      timestamp: args.end_timestamp,
+                      ...(args.timezone !== undefined && { timezone: args.timezone }),
+                    },
+                  }),
+                  ...(args.need_notification !== undefined && {
+                    need_notification: args.need_notification,
+                  }),
+                },
+              },
+              lark.withUserAccessToken(uat),
+            ),
+        });
+      },
+    );
+
+    server.registerTool(
       "feishu_calendar_event_delete",
       {
         title: "Delete a Feishu calendar event",

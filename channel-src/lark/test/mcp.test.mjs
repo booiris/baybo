@@ -98,6 +98,9 @@ function stubChannel(getChatInfoImpl, rawApi) {
           async create(payload, opts) {
             return rawApi?.eventCreate?.(payload, opts) ?? { code: 0, data: {} };
           },
+          async patch(payload, opts) {
+            return rawApi?.eventPatch?.(payload, opts) ?? { code: 0, data: {} };
+          },
           async delete(payload, opts) {
             return rawApi?.eventDelete?.(payload, opts) ?? { code: 0, data: {} };
           },
@@ -243,6 +246,7 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_calendar_event",
     "feishu_calendar_event_create",
     "feishu_calendar_event_delete",
+    "feishu_calendar_event_update",
     "feishu_create_doc",
     "feishu_doc_comments",
     "feishu_fetch_doc",
@@ -2698,6 +2702,120 @@ test("LarkMcpServer: feishu_bitable_record_delete propagates the preview into th
   assert.match(approvalRequest.summary, /Q3 review/);
   assert.match(approvalRequest.summary, /irreversible/);
   assert.match(approvalRequest.summary, /rec_x/);
+});
+
+test("LarkMcpServer: feishu_calendar_event_update partial-patches only listed fields after approval", async () => {
+  let patchPayload = null;
+  let approvalRequest = null;
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async eventPatch(payload) {
+      patchPayload = payload;
+      return { code: 0, data: { event: { event_id: payload.path.event_id } } };
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    approveWrite: async (_input, request) => {
+      approvalRequest = request;
+      return { kind: "approved" };
+    },
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-evt-update",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 220,
+      method: "tools/call",
+      params: {
+        name: "feishu_calendar_event_update",
+        arguments: {
+          calendar_id: "cal_p",
+          event_id: "evt_x",
+          summary: "Q3 review (rescheduled)",
+          start_timestamp: "1700100000",
+          end_timestamp: "1700103600",
+        },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "evt update reply");
+
+  // Approval card lists exactly which fields change.
+  assert.match(approvalRequest.summary, /summary="Q3 review/);
+  assert.match(approvalRequest.summary, /start=1700100000/);
+  assert.match(approvalRequest.summary, /end=1700103600/);
+  // Description not touched.
+  assert.equal(patchPayload.data.description, undefined);
+  // Listed fields written.
+  assert.equal(patchPayload.data.summary, "Q3 review (rescheduled)");
+  assert.equal(patchPayload.data.start_time.timestamp, "1700100000");
+  assert.equal(patchPayload.data.end_time.timestamp, "1700103600");
+});
+
+test("LarkMcpServer: feishu_calendar_event_update refuses no-op calls (no fields to patch)", async () => {
+  // Defense against the agent firing an empty patch and confusing
+  // the user with an approval card that says nothing changes.
+  const fakeAccessor = {
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {
+    async eventPatch() {
+      throw new Error("should not be called");
+    },
+  });
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+    approveWrite: async () => {
+      throw new Error("approval should not be requested for a no-op");
+    },
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-evt-update-noop",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 221,
+      method: "tools/call",
+      params: {
+        name: "feishu_calendar_event_update",
+        arguments: { calendar_id: "cal_p", event_id: "evt_x" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "evt update noop");
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.result.isError, true);
+  assert.match(last.result.content[0].text, /no fields to update/);
 });
 
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {
