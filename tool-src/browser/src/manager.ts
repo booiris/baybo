@@ -255,7 +255,9 @@ export class BrowserManager {
       await state.ctx.close();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`browser ctx close failed: ${msg}\n`);
+      if (!isExpectedShutdownError(msg)) {
+        process.stderr.write(`browser ctx close failed: ${msg}\n`);
+      }
     }
     this.opts.emitEvent("context_closed", { context_id: contextId });
   }
@@ -279,7 +281,9 @@ export class BrowserManager {
         await this.browser.close();
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        process.stderr.write(`browser close failed: ${msg}\n`);
+        if (!isExpectedShutdownError(msg)) {
+          process.stderr.write(`browser close failed: ${msg}\n`);
+        }
       }
       this.browser = null;
     }
@@ -332,6 +336,20 @@ export class BrowserManager {
       }
     }
   }
+}
+
+/**
+ * Recognize the "peer is gone" errors Playwright surfaces when the
+ * Chromium subprocess died out from under us. The common path is a
+ * terminal Ctrl+C: SIGINT broadcasts to every child of the process
+ * group, so by the time the SIGINT handler runs `manager.shutdown()`
+ * the Chromium peer is already tearing itself down and `ctx.close()`
+ * / `browser.close()` correctly report the connection is gone. Treat
+ * the message as benign during teardown so a clean exit looks clean
+ * — but keep it noisy for any other failure mode.
+ */
+function isExpectedShutdownError(msg: string): boolean {
+  return /has been closed|Target closed/i.test(msg);
 }
 
 /**
