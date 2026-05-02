@@ -223,7 +223,9 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_bitable_records",
     "feishu_calendar",
     "feishu_calendar_event",
+    "feishu_create_doc",
     "feishu_doc_comments",
+    "feishu_fetch_doc",
     "feishu_freebusy",
     "feishu_freebusy_batch",
     "feishu_get_chat_history",
@@ -235,6 +237,7 @@ test("LarkMcpServer: tools/list advertises the registered tool surface", async (
     "feishu_search_doc",
     "feishu_search_user",
     "feishu_sheet_read_range",
+    "feishu_update_doc",
     "feishu_who_am_i",
     "feishu_wiki",
   ]);
@@ -2038,6 +2041,187 @@ test("LarkMcpServer: feishu_sheet_read_range builds the v2 URL with token + rang
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("LarkMcpServer: feishu_fetch_doc proxies through mcp.feishu.cn with UAT header + allowed-tools scope", async () => {
+  const originalFetch = globalThis.fetch;
+  const fetchCalls = [];
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      async text() { return "{}"; },
+      async json() {
+        return {
+          jsonrpc: "2.0",
+          id: "feishu_fetch_doc-x",
+          result: {
+            content: [{ type: "text", text: "# Title\n\nBody" }],
+          },
+        };
+      },
+    };
+  };
+  try {
+    const fakeAccessor = {
+      baseUrl: "https://open.feishu.cn",
+      async invoke(_req, handler) {
+        return { kind: "ok", result: await handler("uat_alice") };
+      },
+    };
+    const channel = stubChannel(async () => ({}), {});
+    const server = new LarkMcpServer({
+      logger: noopLogger,
+      channelResolver: () => ({
+        kind: "ok",
+        channel,
+        chatId: "oc_x",
+        platformUserId: "ou_alice",
+        uatAccessor: fakeAccessor,
+      }),
+    });
+    const reply = captureReply();
+    await initialize(server, reply);
+
+    const before = reply.sent.length;
+    await server.accept(
+      "tunnel-fetch-doc",
+      encodeJson({
+        jsonrpc: "2.0",
+        id: 110,
+        method: "tools/call",
+        params: {
+          name: "feishu_fetch_doc",
+          arguments: { doc_id: "doxcn_abc" },
+        },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, "fetch_doc reply");
+
+    assert.equal(fetchCalls.length, 1);
+    // open.feishu.cn → mcp.feishu.cn host substitution.
+    assert.equal(fetchCalls[0].url, "https://mcp.feishu.cn/mcp");
+    assert.equal(fetchCalls[0].init.method, "POST");
+    assert.equal(fetchCalls[0].init.headers["X-Lark-MCP-UAT"], "uat_alice");
+    // Allowed-tools scoping: this header should pin the call to one
+    // upstream tool, defense in depth against the gateway being asked
+    // to dispatch something other than what we sent.
+    assert.equal(
+      fetchCalls[0].init.headers["X-Lark-MCP-Allowed-Tools"],
+      "fetch-doc",
+    );
+    const body = JSON.parse(fetchCalls[0].init.body);
+    assert.equal(body.method, "tools/call");
+    assert.equal(body.params.name, "fetch-doc");
+    assert.equal(body.params.arguments.doc_id, "doxcn_abc");
+
+    // Reply forwards the upstream's `result` payload.
+    const last = decodeJson(reply.sent[reply.sent.length - 1]);
+    const parsed = JSON.parse(last.result.content[0].text);
+    assert.equal(parsed.content[0].text, "# Title\n\nBody");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("LarkMcpServer: feishu_create_doc validates mutual exclusion + required args", async () => {
+  const fakeAccessor = {
+    baseUrl: "https://open.feishu.cn",
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {});
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  async function call(id, args) {
+    const before = reply.sent.length;
+    await server.accept(
+      `tunnel-cr-${id}`,
+      encodeJson({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "feishu_create_doc", arguments: args },
+      }),
+      reply.handle,
+    );
+    await waitFor(() => reply.sent.length > before, `create_doc ${id}`);
+    return decodeJson(reply.sent[reply.sent.length - 1]);
+  }
+
+  // No task_id, no markdown/title.
+  const r1 = await call(120, {});
+  assert.equal(r1.result.isError, true);
+  assert.match(r1.result.content[0].text, /both `markdown` and `title` are required/);
+
+  // Two destinations.
+  const r2 = await call(121, {
+    markdown: "x",
+    title: "T",
+    folder_token: "f1",
+    wiki_node: "w1",
+  });
+  assert.equal(r2.result.isError, true);
+  assert.match(r2.result.content[0].text, /mutually exclusive/);
+});
+
+test("LarkMcpServer: feishu_update_doc enforces selection requirement for range modes", async () => {
+  const fakeAccessor = {
+    baseUrl: "https://open.feishu.cn",
+    async invoke(_req, handler) {
+      return { kind: "ok", result: await handler("uat") };
+    },
+  };
+  const channel = stubChannel(async () => ({}), {});
+  const server = new LarkMcpServer({
+    logger: noopLogger,
+    channelResolver: () => ({
+      kind: "ok",
+      channel,
+      chatId: "oc_x",
+      platformUserId: "ou_alice",
+      uatAccessor: fakeAccessor,
+    }),
+  });
+  const reply = captureReply();
+  await initialize(server, reply);
+
+  // replace_range without selection → error
+  const before = reply.sent.length;
+  await server.accept(
+    "tunnel-up-noseg",
+    encodeJson({
+      jsonrpc: "2.0",
+      id: 130,
+      method: "tools/call",
+      params: {
+        name: "feishu_update_doc",
+        arguments: { doc_id: "doxcn", mode: "replace_range", markdown: "x" },
+      },
+    }),
+    reply.handle,
+  );
+  await waitFor(() => reply.sent.length > before, "update_doc no-sel");
+  const last = decodeJson(reply.sent[reply.sent.length - 1]);
+  assert.equal(last.result.isError, true);
+  assert.match(
+    last.result.content[0].text,
+    /requires exactly one of.*selection_with_ellipsis.*selection_by_title/,
+  );
 });
 
 test("LarkMcpServer: distinct tunnel_ids get independent server sessions", async () => {

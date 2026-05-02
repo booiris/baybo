@@ -1199,7 +1199,267 @@ export class LarkMcpServer {
       },
     );
 
+    this.registerDocProxyTools(server);
     this.registerAskUser(server);
+  }
+
+  /** Three doc tools that proxy through Feishu's hosted MCP gateway
+   * (`mcp.feishu.cn`) — the canonical OAPI for fetching/creating/
+   * updating cloud docs as Markdown isn't exposed in the regular
+   * `/open-apis/...` surface, so openclaw uses the hosted MCP and we
+   * follow suit. JSON-RPC envelope ride is wired up here once and
+   * each tool just stamps its own arguments. */
+  private registerDocProxyTools(server: McpServer): void {
+    const fetchDoc = z.object({
+      doc_id: z
+        .string()
+        .min(1)
+        .describe(
+          "Doc id or full URL — the gateway parses both. For wiki-hosted docs, pass the wiki node URL.",
+        ),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Character offset for paginating large docs."),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          "Max characters this call. Use only when the doc is large enough that a single fetch would blow the agent's context.",
+        ),
+    });
+    server.registerTool(
+      "feishu_fetch_doc",
+      {
+        title: "Fetch a Feishu cloud doc as Markdown",
+        description:
+          "Read a Feishu cloud doc (docx / doc) and return its title + body as Markdown. Goes through Feishu's hosted MCP gateway (`mcp.feishu.cn` / `mcp.larksuite.com`) — the gateway has the doc-to-Markdown conversion logic. Supports offset/limit pagination for large docs.",
+        inputSchema: fetchDoc.shape,
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        return this.callDocProxyTool(active, "fetch-doc", "feishu_fetch_doc", "fetch your Feishu doc", args);
+      },
+    );
+
+    const createDoc = z.object({
+      markdown: z.string().optional().describe("Doc body as Markdown."),
+      title: z.string().optional().describe("Doc title."),
+      folder_token: z
+        .string()
+        .optional()
+        .describe(
+          "Parent folder token (mutually exclusive with `wiki_node` / `wiki_space`).",
+        ),
+      wiki_node: z
+        .string()
+        .optional()
+        .describe("Parent wiki node token or URL (mutually exclusive)."),
+      wiki_space: z
+        .string()
+        .optional()
+        .describe("Wiki space id (mutually exclusive). Special value `my_library`."),
+      task_id: z
+        .string()
+        .optional()
+        .describe(
+          "If a previous create returned async — pass its task_id to poll status instead of starting a new doc.",
+        ),
+    });
+    server.registerTool(
+      "feishu_create_doc",
+      {
+        title: "Create a Feishu doc from Markdown",
+        description:
+          "Create a Feishu cloud doc from Markdown content. Requires `markdown` + `title` unless `task_id` is set (which polls a previous async create). Destination is `folder_token` OR `wiki_node` OR `wiki_space` — at most one. Goes through Feishu's hosted MCP gateway.",
+        inputSchema: createDoc.shape,
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (!args.task_id) {
+          if (!args.markdown || !args.title) {
+            return toolError(
+              "feishu_create_doc: without `task_id`, both `markdown` and `title` are required",
+            );
+          }
+          const dests = [args.folder_token, args.wiki_node, args.wiki_space].filter(
+            (v) => v !== undefined,
+          );
+          if (dests.length > 1) {
+            return toolError(
+              "feishu_create_doc: `folder_token`, `wiki_node`, and `wiki_space` are mutually exclusive — pass at most one",
+            );
+          }
+        }
+        return this.callDocProxyTool(active, "create-doc", "feishu_create_doc", "create your Feishu doc", args);
+      },
+    );
+
+    const updateDoc = z.object({
+      doc_id: z.string().optional().describe("Doc id or URL — required unless `task_id` is set."),
+      markdown: z.string().optional().describe("New Markdown content (required for every mode except `delete_range`)."),
+      mode: z
+        .enum([
+          "overwrite",
+          "append",
+          "replace_range",
+          "replace_all",
+          "insert_before",
+          "insert_after",
+          "delete_range",
+        ])
+        .describe(
+          "Update mode. `overwrite` replaces the whole doc; `append` adds to the end; the `*_range` / `insert_*` / `delete_range` modes need a selection (see below).",
+        ),
+      selection_with_ellipsis: z
+        .string()
+        .optional()
+        .describe(
+          "Locate selection by `start...end` text snippets. Required for replace_range / insert_before / insert_after / delete_range when not using selection_by_title.",
+        ),
+      selection_by_title: z
+        .string()
+        .optional()
+        .describe(
+          "Locate selection by heading (e.g. `## My Section`). Mutually exclusive with selection_with_ellipsis.",
+        ),
+      new_title: z.string().optional().describe("Optionally rename the doc."),
+      task_id: z.string().optional().describe("Poll previous async update."),
+    });
+    server.registerTool(
+      "feishu_update_doc",
+      {
+        title: "Update a Feishu doc with Markdown",
+        description:
+          "Mutate an existing Feishu cloud doc. Modes: `overwrite` / `append` / `replace_range` / `replace_all` / `insert_before` / `insert_after` / `delete_range`. The selection-based modes need either `selection_with_ellipsis` (start...end snippet) or `selection_by_title` (heading text). Use `task_id` to poll a previous async update.",
+        inputSchema: updateDoc.shape,
+      },
+      async (args, extra) => {
+        const active = this.resolveActive(extra);
+        if (!active.ok) return active.reply;
+        if (!args.task_id) {
+          if (!args.doc_id) {
+            return toolError(
+              "feishu_update_doc: without `task_id`, `doc_id` is required",
+            );
+          }
+          const needsSelection =
+            args.mode === "replace_range" ||
+            args.mode === "insert_before" ||
+            args.mode === "insert_after" ||
+            args.mode === "delete_range";
+          if (needsSelection) {
+            const hasEllipsis = args.selection_with_ellipsis !== undefined;
+            const hasTitle = args.selection_by_title !== undefined;
+            if ((hasEllipsis && hasTitle) || (!hasEllipsis && !hasTitle)) {
+              return toolError(
+                `feishu_update_doc: mode=${args.mode} requires exactly one of \`selection_with_ellipsis\` or \`selection_by_title\``,
+              );
+            }
+          }
+          if (args.mode !== "delete_range" && !args.markdown) {
+            return toolError(
+              `feishu_update_doc: mode=${args.mode} requires \`markdown\``,
+            );
+          }
+        }
+        return this.callDocProxyTool(active, "update-doc", "feishu_update_doc", "update your Feishu doc", args);
+      },
+    );
+  }
+
+  /** POST a `tools/call` JSON-RPC envelope to Feishu's hosted MCP
+   * gateway. The gateway URL derives from the bot's baseUrl by
+   * substituting the `open.` host prefix with `mcp.` (open.feishu.cn
+   * → mcp.feishu.cn). The UAT rides in the `X-Lark-MCP-UAT` header
+   * (gateway-specific, not Bearer); `X-Lark-MCP-Allowed-Tools` scopes
+   * the call to a single tool name as defense in depth. */
+  private async callDocProxyTool(
+    active: {
+      channel: lark.LarkChannel;
+      chatId: string;
+      platformUserId: string;
+      uatAccessor?: UATAccessor;
+    },
+    upstreamName: string,
+    toolName: string,
+    reason: string,
+    args: Record<string, unknown>,
+  ): Promise<{ content: { type: "text"; text: string }[]; isError?: true }> {
+    if (!active.uatAccessor) {
+      return toolError(
+        `${toolName} requires UAT but the bot's OAuth pipeline isn't configured for this session`,
+      );
+    }
+    const baseUrl = active.uatAccessor.baseUrl;
+    const mcpUrl = `${deriveMcpHost(baseUrl)}/mcp`;
+    try {
+      const result = await active.uatAccessor.invoke(
+        {
+          userOpenId: active.platformUserId,
+          chatId: active.chatId,
+          reason,
+        },
+        async (uat) => {
+          const resp = await fetch(mcpUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Lark-MCP-UAT": uat,
+              "X-Lark-MCP-Allowed-Tools": upstreamName,
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: `${toolName}-${Date.now()}`,
+              method: "tools/call",
+              params: { name: upstreamName, arguments: args },
+            }),
+          });
+          if (!resp.ok) {
+            const text = await resp.text();
+            throw new Error(
+              `MCP gateway HTTP ${resp.status}: ${text.slice(0, 500)}`,
+            );
+          }
+          const body = (await resp.json()) as McpJsonRpcResponse;
+          if ("error" in body && body.error) {
+            return {
+              code: body.error.code,
+              msg: body.error.message,
+              data: body.error.data ?? null,
+            } satisfies LarkApiResponse;
+          }
+          // Upstream `result` is itself an MCP tool reply
+          // `{ content: [{ type, text }, ...] }`. Pass through to the
+          // agent as-is (we just stash it in `data` for runUatTool's
+          // JSON serialiser).
+          return { code: 0, data: body.result ?? null } satisfies LarkApiResponse;
+        },
+      );
+      if (result.kind !== "ok") {
+        return toolError(authFailedMessage(toolName, result.outcome));
+      }
+      const res = result.result;
+      if (typeof res.code === "number" && res.code !== 0) {
+        return toolError(
+          `Feishu MCP gateway error ${res.code}: ${res.msg ?? "unknown"}`,
+        );
+      }
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(res.data ?? {}, null, 2) },
+        ],
+      };
+    } catch (err) {
+      this.opts.logger.debug(`${toolName} failed: ${String(err)}`);
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   private registerAskUser(server: McpServer): void {
@@ -1273,6 +1533,34 @@ type LarkApiResponse = {
   msg?: string | undefined;
   data?: unknown;
 };
+
+/** JSON-RPC response from Feishu's hosted MCP gateway
+ * (`mcp.feishu.cn` / `mcp.larksuite.com`). `result` carries the
+ * upstream tool's `{ content: [...] }` payload on success; `error`
+ * carries `{ code, message, data? }` on failure. */
+interface McpJsonRpcResponse {
+  jsonrpc: "2.0";
+  id?: string | number | null;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+}
+
+/** Derive Feishu's hosted MCP gateway base URL from the bot's
+ * `baseUrl`: `https://open.feishu.cn` → `https://mcp.feishu.cn`,
+ * `https://open.larksuite.com` → `https://mcp.larksuite.com`, and
+ * by-convention `open.X` → `mcp.X` for private-cloud / regional
+ * hosts. Falls back to the input on URL parse error. */
+function deriveMcpHost(baseUrl: string): string {
+  try {
+    const u = new URL(baseUrl);
+    if (u.hostname.startsWith("open.")) {
+      return `${u.protocol}//${u.hostname.replace(/^open\./, "mcp.")}`;
+    }
+    return baseUrl;
+  } catch {
+    return baseUrl;
+  }
+}
 
 function toolError(message: string): {
   content: { type: "text"; text: string }[];
