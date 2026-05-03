@@ -9,12 +9,7 @@ import {
   type ApprovalDecision,
   type NoticeLevel,
 } from "./channel.js";
-import {
-  defaultLogger,
-  hasWireSink,
-  type Logger,
-  type WireLogLevel,
-} from "./logger.js";
+import { defaultLogger, type Logger } from "./logger.js";
 import {
   installSecretsClient,
   resetSecretsClient,
@@ -180,10 +175,6 @@ async function runOnce(
       once: true,
     });
 
-    if (hasWireSink(logger)) {
-      logger.setWireSink(makeWireSink(ws));
-    }
-
     const secretRouter = new SecretRouter(ws, negotiated, logger);
     installSecretsClient(secretRouter);
 
@@ -199,7 +190,6 @@ async function runOnce(
       );
       await Promise.all([outbound, inbound]);
     } finally {
-      if (hasWireSink(logger)) logger.setWireSink(null);
       secretRouter.close();
       resetSecretsClient(secretRouter);
     }
@@ -208,25 +198,6 @@ async function runOnce(
     safeClose(ws);
     rootSignal.removeEventListener("abort", onRootAbort);
   }
-}
-
-function makeWireSink(ws: WebSocket) {
-  return (level: WireLogLevel, text: string): void => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    try {
-      ws.send(
-        encodeFrame({
-          kind: "sidecar_log",
-          level,
-          text,
-        }),
-      );
-    } catch {
-      // A WS send failure here is surfaced through the main inbound /
-      // outbound pumps — no need to double-report it from the logger
-      // path (and throwing would make the logger unsafe to call).
-    }
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -754,7 +725,6 @@ function dispatchFrame(
     case "register":
     case "register_ack":
     case "resolve_approval":
-    case "sidecar_log":
     case "bot_status":
     case "secret_request":
       logger.warn("unexpected server->client frame", frame.kind);
@@ -825,6 +795,7 @@ async function handleApproval(
       sessionId: frame.session_id,
       userId: frame.user_id ?? "",
       tool: frame.tool,
+      accesses: frame.accesses,
       paramsPreview: frame.params_preview,
       ...(frame.description != null ? { description: frame.description } : {}),
     });

@@ -10,7 +10,7 @@ edition.workspace = true
 # `aura_model::ChannelType` is emitted as plain `string` via a
 # field-level `#[ts(type = "string")]` override so ts-rs doesn't
 # chase the domain crate.
-ts-export = ["dep:ts-rs"]
+ts-export = ["dep:ts-rs", "aura-model/ts-export"]
 
 [dependencies]
 aura-model = { workspace = true }

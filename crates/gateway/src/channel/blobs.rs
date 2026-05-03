@@ -87,7 +87,9 @@ async fn authorize_upload(
     headers: &HeaderMap,
 ) -> UploadAuth {
     match authed {
-        AuthedClient::Tui => UploadAuth::Bypass,
+        // TUI and tool-sidecar uploads are session-scoped (not
+        // per-bot/per-user) — pairing doesn't apply.
+        AuthedClient::Tui | AuthedClient::Tool { .. } => UploadAuth::Bypass,
         AuthedClient::Subprocess {
             channel_type: None, ..
         } => UploadAuth::Reject(
@@ -174,16 +176,15 @@ async fn pairing_check(
     axum::extract::Query(q): axum::extract::Query<PairingCheckQuery>,
 ) -> Response {
     let channel_type = match &authed {
-        AuthedClient::Tui => {
-            // TUI traffic is session-scoped and bypasses pairing the
-            // same way it does in `authorize_upload`. Surface as
+        AuthedClient::Tui | AuthedClient::Tool { .. } => {
+            // TUI + tool sidecars are session-scoped and bypass pairing
+            // the same way they do in `authorize_upload`. Surface as
             // `paired: true` so the SDK helper's "skip on false" path
             // doesn't accidentally drop legitimate TUI media.
             return axum::Json(PairingCheckResponse { paired: true }).into_response();
         }
         AuthedClient::Subprocess {
-            channel_type: None,
-            ..
+            channel_type: None, ..
         } => {
             return (
                 StatusCode::FORBIDDEN,
@@ -211,7 +212,11 @@ async fn pairing_check(
         Ok(paired) => axum::Json(PairingCheckResponse { paired }).into_response(),
         Err(e) => {
             tracing::error!(error = %e, %channel_type, "pairing preflight failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "pairing preflight failed").into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pairing preflight failed",
+            )
+                .into_response()
         }
     }
 }
@@ -371,6 +376,19 @@ mod tests {
     async fn tui_bypasses_pairing() {
         let (_store, svc) = fresh_pairing().await;
         let out = authorize_upload(&svc, &AuthedClient::Tui, &HeaderMap::new()).await;
+        assert!(matches!(out, UploadAuth::Bypass));
+    }
+
+    /// Tool sidecars (browser MCP server today) are session-scoped
+    /// like the TUI, not per-bot/per-user. They must bypass pairing
+    /// so screenshot blobs can land before any user has paired.
+    #[tokio::test]
+    async fn tool_sidecar_bypasses_pairing() {
+        let (_store, svc) = fresh_pairing().await;
+        let authed = AuthedClient::Tool {
+            label: "tool/browser".into(),
+        };
+        let out = authorize_upload(&svc, &authed, &HeaderMap::new()).await;
         assert!(matches!(out, UploadAuth::Bypass));
     }
 

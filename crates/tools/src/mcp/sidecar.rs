@@ -72,7 +72,8 @@ impl Transport<RoleClient> for SidecarTransport {
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
         let sender = Arc::clone(&self.sender);
-        let encoded = serde_json::to_vec(&item).map_err(|e| SidecarTransportError::Encode(e.to_string()));
+        let encoded =
+            serde_json::to_vec(&item).map_err(|e| SidecarTransportError::Encode(e.to_string()));
         async move {
             let bytes = encoded?;
             sender
@@ -251,10 +252,7 @@ mod tests {
         struct Stub;
         #[async_trait]
         impl SidecarMcpProvider for Stub {
-            async fn tool_definitions_for_session(
-                &self,
-                session: &Session,
-            ) -> Vec<ToolDefinition> {
+            async fn tool_definitions_for_session(&self, session: &Session) -> Vec<ToolDefinition> {
                 vec![ToolDefinition {
                     name: format!("{}/feishu_get_chat_info", session.user.channel),
                     description: "stub".into(),
@@ -569,11 +567,17 @@ mod tests {
         .unwrap();
 
         transport.close().await.expect("close ok");
-        assert!(transport.receive().await.is_some(), "buffered envelope drains after close");
+        assert!(
+            transport.receive().await.is_some(),
+            "buffered envelope drains after close"
+        );
 
         // After the buffered item, the next send is rejected and the
         // receiver ends.
         assert!(tx.send(b"x".to_vec()).await.is_err());
-        assert!(transport.receive().await.is_none(), "closed inbound returns None");
+        assert!(
+            transport.receive().await.is_none(),
+            "closed inbound returns None"
+        );
     }
 }

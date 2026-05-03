@@ -9,6 +9,14 @@ edition.workspace = true
 #   aura-tools = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
 test-support = []
+# Emits ts-rs-generated TypeScript definitions for the Aura-specific
+# `_meta.aura.*` annotations the embedded MCP servers carry on each
+# tool descriptor. Kept behind a feature so release builds don't pull
+# in ts-rs. Generated files land under
+# `tool-src/browser/src/generated/` so the browser sidecar imports the
+# same types the Rust client deserializes — wire drift is a compile
+# error on the TS side.
+ts-export = ["dep:ts-rs"]
 
 [dependencies]
 aura-model = { workspace = true }
@@ -45,9 +53,14 @@ oauth2 = { workspace = true }
 open = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 rand = { workspace = true }
 axum = { workspace = true }
 uuid = { workspace = true }
+
+# Optional — only pulled in for the `ts-export` feature so that
+# release builds don't have to compile ts-rs.
+ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 aura-storage = { workspace = true, features = ["test-support"] }

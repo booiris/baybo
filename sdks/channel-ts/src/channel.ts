@@ -1,5 +1,5 @@
 import type { Logger } from "./logger.js";
-import type { WireAttachment } from "./wire.js";
+import type { ResourceAccess, WireAttachment } from "./wire.js";
 
 export interface AgentMessage {
   sessionId: string;
@@ -139,13 +139,21 @@ export interface ApprovalRequest {
    */
   userId: string;
   tool: string;
+  /**
+   * Resources the tool will touch on this call (filesystem paths,
+   * hosts, shell commands). Sidecars should render these to the user
+   * as the primary "what is being approved?" surface — they describe
+   * the security-relevant action, not the JSON shape of the call.
+   * Empty array when the tool declares no controlled resources
+   * (auto-approve path, no prompt would have fired).
+   */
+  accesses: ResourceAccess[];
   paramsPreview: string;
   /**
    * Optional human-readable label produced by the tool's
    * `Tool::call_label` hook (e.g. Bash's `description` parameter).
-   * Sidecars should prefer this in the approval UI when present and
-   * fall back to `paramsPreview` otherwise. `undefined` when the tool
-   * did not supply one.
+   * Sidecars may show this alongside `accesses`. `undefined` when the
+   * tool did not supply one.
    */
   description?: string;
 }

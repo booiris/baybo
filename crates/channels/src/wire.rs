@@ -269,7 +269,6 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         user_id: String,
         tool: String,
-        #[cfg_attr(feature = "ts-export", ts(type = "unknown[]"))]
         accesses: Vec<ResourceAccess>,
         params_preview: String,
         /// Optional human-readable label the tool produced via
@@ -308,23 +307,6 @@ pub enum Frame {
     HistorySnapshot {
         session_id: String,
         entries: Vec<String>,
-    },
-    /// Client -> server: a log line emitted by the sidecar itself,
-    /// forwarded so aura operators see sidecar output in the dashboard
-    /// alongside gateway-internal tracing. The server attributes the
-    /// record to the sidecar's `ChannelType` before handing it to the
-    /// `LogBuffer`.
-    ///
-    /// `level` mirrors lower-cased tracing levels (`"error"`, `"warn"`,
-    /// `"info"`, `"debug"`). Unknown values degrade to `info`. `target`
-    /// is an optional module/category the sidecar tags. Additive frame —
-    /// no `PROTOCOL_VERSION` bump.
-    SidecarLog {
-        level: String,
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        target: Option<String>,
     },
     /// Server -> client: attach a new bot (or other per-tenant
     /// credential) to a sidecar that multiplexes many tenants over
@@ -829,16 +811,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_sidecar_log_with_target() {
-        let frame = Frame::SidecarLog {
-            level: "warn".into(),
-            text: "retry exhausted".into(),
-            target: Some("telegram::poll".into()),
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
     fn round_trip_start_bot() {
         let frame = Frame::StartBot {
             bot_id: "prod-bot".into(),
@@ -951,18 +923,5 @@ mod tests {
             message: Some("401 Unauthorized".into()),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_sidecar_log_without_target() {
-        let frame = Frame::SidecarLog {
-            level: "info".into(),
-            text: "startup".into(),
-            target: None,
-        };
-        let bytes = encode(&frame).unwrap();
-        // `target: None` is omitted on the wire — old peers that don't
-        // send the field must still decode into the None variant.
-        assert_eq!(frame, decode(&bytes).unwrap());
     }
 }

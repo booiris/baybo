@@ -30,6 +30,14 @@ pub const CHANNEL_TOKEN_HEADER: &str = "x-aura-channel-token";
 /// this label.
 pub const TUI_CLIENT_LABEL: &str = "tui";
 
+/// Prefix for tokens minted to embedded tool sidecars (the browser
+/// MCP server today). The auth middleware recognises any label
+/// starting with this prefix as [`crate::AuthedClient::Tool`], which
+/// bypasses pairing on `/v1/blobs` (tool sidecars are session-scoped
+/// like the TUI, not per-bot/per-user) and is rejected from the
+/// channel-WS handshake (tool sidecars don't register channels).
+pub const TOOL_CLIENT_LABEL_PREFIX: &str = "tool/";
+
 /// Secret-vault key under which the gateway publishes the current
 /// generation of the TUI channel token. Rotated on every `aura
 /// gateway start`; the bundled `aura tui` reads it back from the vault

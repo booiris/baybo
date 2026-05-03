@@ -45,7 +45,7 @@ use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
-use aura_tools::mcp::McpReconciler;
+use aura_tools::mcp::{EmbeddedMcpServer, McpReconciler};
 use aura_workspace::WorkspaceManager;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -195,6 +195,12 @@ pub async fn build_managers(
     config: Arc<AuraConfig>,
     shutdown: ShutdownSignal,
     leak_detector: Arc<LeakDetector>,
+    // Pre-assembled embedded MCP server entries the reconciler should
+    // spawn alongside any user-configured `.mcp.json` entries. Built
+    // by the boot-path caller (`gateway_cmd::start` for the gateway,
+    // empty `Vec` for non-gateway paths) so the manager-graph layer
+    // stays free of per-tool-domain wiring (browser blob upload, etc).
+    embedded_mcp_servers: Vec<EmbeddedMcpServer>,
 ) -> anyhow::Result<ManagerGraph> {
     // --- minimal services shared by every mode
     let workspace_paths =
@@ -220,6 +226,11 @@ pub async fn build_managers(
     // handed to a manager is a cheap `stores.xxx.clone()` so the bundle
     // itself stays intact for the graph + downstream consumers.
     let stores = Store::open(boot::storage_db_path(&config.workspace)).await?;
+
+    // Browser tools are not registered as builtins — they arrive
+    // dynamically when the embedded browser MCP server connects via
+    // the reconciler below. Until that connect completes (or if the
+    // child crashes), the LLM does not see `browser/*` tools at all.
     let mut tool_registry = Arc::new(ToolRegistry::with_defaults(stores.blob.clone()));
 
     // Built after `stores` so `build_llm_client` can wire the blob
@@ -295,10 +306,12 @@ pub async fn build_managers(
     }
 
     // --- security gateway + tool executor
-    let security_gateway = Arc::new(SecurityGateway::new(
-        Arc::clone(&leak_detector),
-        Arc::clone(&secret_vault),
-    ));
+    let tool_spill_dir =
+        aura_workspace::WorkspacePaths::new(workspace_root.clone()).tool_spills_dir();
+    let security_gateway = Arc::new(
+        SecurityGateway::new(Arc::clone(&leak_detector), Arc::clone(&secret_vault))
+            .with_spill_dir(tool_spill_dir),
+    );
     let gate_map = channels_registry.approval_gates();
     let sandbox_runner = match aura_sandbox::current_platform_runner() {
         Ok(r) => match r.warm().await {
@@ -389,10 +402,17 @@ pub async fn build_managers(
             cancel_on_shutdown.cancel();
         });
     }
+    // Browser MCP server: shipped as a zstd-embedded JS bundle, run
+    // by the gateway as a stdio MCP child. The reconciler spawns it
+    // alongside any user-configured `.mcp.json` entries; if the bundle
+    // failed to materialise (`SidecarRuntime::install` Err), the
+    // embedded list is empty and only user entries get connected.
     let mcp_reconciler = McpReconciler::new(
         workspace_root.clone(),
         Arc::clone(&tool_registry),
         Arc::clone(&secret_vault),
+        Some(stores.blob.clone()),
+        embedded_mcp_servers,
         mcp_cancel,
     );
     mcp_reconciler.spawn();

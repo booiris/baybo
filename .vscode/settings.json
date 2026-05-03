@@ -49,6 +49,7 @@
         "cloudflared",
         "Corasick",
         "coreutils",
+        "creds",
         "Crossterm",
         "CTYPE",
         "daemonised",

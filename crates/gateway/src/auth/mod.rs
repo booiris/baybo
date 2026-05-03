@@ -27,6 +27,6 @@ pub mod token;
 pub use admin::{AdminAuthState, AdminToken, require_admin_token};
 pub use channel::{AuthedClient, ChannelAuthState, attach as attach_channel_auth};
 pub use token::{
-    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY,
-    TokenHandle, constant_time_eq, generate_token,
+    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
+    TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY, TokenHandle, constant_time_eq, generate_token,
 };

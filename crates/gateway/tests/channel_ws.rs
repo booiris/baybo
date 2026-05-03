@@ -303,7 +303,6 @@ async fn recv_message(ws: &mut WsStream) -> Result<WireMessage, ConnectError> {
             | Frame::RegisterAck { .. }
             | Frame::ResolveApproval { .. }
             | Frame::HistoryAppend { .. }
-            | Frame::SidecarLog { .. }
             | Frame::BotStatus { .. }
             | Frame::SecretRequest { .. } => {
                 return Err(ConnectError::ProtocolViolation(
@@ -344,7 +343,6 @@ async fn recv_notice(ws: &mut WsStream) -> Result<(String, String, String), Conn
             | Frame::RegisterAck { .. }
             | Frame::ResolveApproval { .. }
             | Frame::HistoryAppend { .. }
-            | Frame::SidecarLog { .. }
             | Frame::BotStatus { .. }
             | Frame::SecretRequest { .. } => {
                 return Err(ConnectError::ProtocolViolation(

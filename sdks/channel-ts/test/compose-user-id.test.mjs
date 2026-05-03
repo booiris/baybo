@@ -117,3 +117,14 @@ test("defaultChatKey is exported and matches the `<key>=<value>&…` shape", () 
   assert.equal(defaultChatKey({ chatId: 1, threadId: 2 }), "chatId=1&threadId=2");
   assert.equal(defaultChatKey(42), "42");
 });
+
+test("defaultChatKey discriminates nested object values instead of collapsing to [object Object]", () => {
+  // Off-contract input (BotPlatform.chatKey docs say primitives /
+  // plain-object-of-primitives) used to collide every chat into one
+  // bucket via String({...}) -> "[object Object]". Now JSON-stringifies
+  // the nested value so distinct shapes still get distinct keys.
+  const a = defaultChatKey({ chat: { x: 1 } });
+  const b = defaultChatKey({ chat: { x: 2 } });
+  assert.notEqual(a, b, "distinct nested values must produce distinct keys");
+  assert.ok(!a.includes("[object Object]"), "no [object Object] collision marker");
+});

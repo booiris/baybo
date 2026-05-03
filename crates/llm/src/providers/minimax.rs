@@ -1,17 +1,17 @@
 use rig::client::CompletionClient;
-use rig::providers::openai;
+use rig::providers::anthropic;
 
 use crate::registry::{LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
 
-const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/v1";
+const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 
 /// Factory that creates `LlmClient` instances configured for MiniMax models.
 ///
-/// MiniMax exposes an OpenAI-compatible chat completions API, so we route
-/// through rig's OpenAI client with the MiniMax base URL pinned by default.
-/// Operators can override `base_url` (e.g. `https://api.minimaxi.com/v1` for
-/// the China endpoint) via `LlmConfig.base_url`.
+/// MiniMax exposes an Anthropic-compatible Messages API, so we route
+/// through rig's Anthropic client with the MiniMax base URL pinned by
+/// default. Operators can override `base_url` (e.g. the international
+/// `https://api.minimax.io/anthropic` endpoint) via `LlmConfig.base_url`.
 pub struct MiniMaxProviderFactory;
 
 impl LlmProviderFactory for MiniMaxProviderFactory {
@@ -40,7 +40,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
             .as_deref()
             .unwrap_or(MINIMAX_DEFAULT_BASE_URL);
 
-        let client = openai::Client::builder()
+        let client = anthropic::Client::builder()
             .api_key(api_key)
             .base_url(base_url)
             .build()
@@ -48,7 +48,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
                 crate::LlmError::Config(format!("failed to create MiniMax client: {e}"))
             })?;
 
-        let model = client.completions_api().completion_model(&config.model);
+        let model = client.completion_model(&config.model);
 
         let model_info = ModelInfo {
             id: config.model.clone(),
@@ -62,10 +62,10 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
             },
         };
 
-        Ok(
-            LlmClient::new(model_info, AnyCompletionModel::OpenAI(model))
-                .with_parse_inline_think_tags(true),
-        )
+        Ok(LlmClient::new(
+            model_info,
+            AnyCompletionModel::Anthropic(model),
+        ))
     }
 }
 

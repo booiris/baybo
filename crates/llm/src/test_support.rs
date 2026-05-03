@@ -25,6 +25,12 @@ pub struct StubLlm {
     /// emission. Used to stress `safe_flush_boundary` by forcing
     /// placeholder delimiters across chunk boundaries.
     text_chunk_size: Mutex<Option<usize>>,
+    /// Captured `ChatRequest` snapshots, one per `chat`/`chat_stream`
+    /// call. Lets tests assert on what the agent loop ended up
+    /// sending to the model — particularly useful when the actor's
+    /// mutations on its private `Session` aren't reachable through
+    /// the harness's shadow copy.
+    captured_requests: Mutex<Vec<ChatRequest>>,
 }
 
 impl Default for StubLlm {
@@ -44,6 +50,7 @@ impl Default for StubLlm {
             chat_queue: Mutex::new(std::collections::VecDeque::new()),
             stream_queue: Mutex::new(std::collections::VecDeque::new()),
             text_chunk_size: Mutex::new(None),
+            captured_requests: Mutex::new(Vec::new()),
         }
     }
 }
@@ -84,6 +91,13 @@ impl StubLlm {
     pub fn push_stream_results(&self, events: Vec<crate::Result<StreamEvent>>) {
         self.stream_queue.lock().push_back(events);
     }
+
+    /// Snapshot of every `ChatRequest` the agent loop sent so far,
+    /// in arrival order. Cloned on read so callers can keep iterating
+    /// without holding the mutex.
+    pub fn captured_requests(&self) -> Vec<ChatRequest> {
+        self.captured_requests.lock().clone()
+    }
 }
 
 fn split_text_chunks(text: &str, n: usize) -> Vec<String> {
@@ -109,14 +123,16 @@ fn split_text_chunks(text: &str, n: usize) -> Vec<String> {
 
 #[async_trait]
 impl LlmCompletion for StubLlm {
-    async fn chat(&self, _request: &ChatRequest) -> crate::Result<LlmResponse> {
+    async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {
+        self.captured_requests.lock().push(request.clone());
         self.chat_queue
             .lock()
             .pop_front()
             .ok_or_else(|| LlmError::Provider("StubLlm: chat queue empty".into()))?
     }
 
-    async fn chat_stream(&self, _request: &ChatRequest) -> crate::Result<LlmStream> {
+    async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
+        self.captured_requests.lock().push(request.clone());
         let raw = self
             .stream_queue
             .lock()

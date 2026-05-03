@@ -11,21 +11,18 @@ import type { TelegramChat } from "../platform.js";
 export const TELEGRAM_CAPTION_MAX = 1024;
 
 /** Anything grammy's `InputFile` constructor accepts as the file source.
- * Streaming is the production path (`ReadableStream` from `fetchBlobStream`);
- * `Buffer`/`Uint8Array` is kept for tests and small inline payloads. */
-export type AttachmentSource =
-  | Uint8Array
-  | ReadableStream<Uint8Array>
-  | AsyncIterable<Uint8Array>;
+ * We hand it a `Uint8Array` in production: grammy's bundled multipart
+ * code runs on bun via `--target=bun`, and `yield* webReadableStream`
+ * inside grammy throws `TypeError: undefined is not a function` there.
+ * Buffering through `fetchBlob` (Bot API caps at 50 MB anyway) is the
+ * stable path. */
+export type AttachmentSource = Uint8Array;
 
 /**
  * Dispatch a single attachment to the right `bot.api.sendXxx` method
  * based on the wire-level `kind` and the underlying MIME type. `caption`
  * is applied to this attachment only — the platform layer rotates it
- * onto the first attachment in a multi-attachment payload. Pass a
- * `ReadableStream` from `fetchBlobStream` to keep peak memory at one
- * chunk regardless of file size; grammy pipes the async iterable
- * straight into the multipart upload.
+ * onto the first attachment in a multi-attachment payload.
  */
 export async function sendTelegramAttachment(
   bot: Bot,

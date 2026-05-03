@@ -23,13 +23,6 @@ use super::handshake::{GATEWAY_CAPABILITIES, validate_register};
 use super::secrets;
 use super::state::WsChannelState;
 use crate::auth::AuthedClient;
-use crate::log_buffer::LogLevel;
-
-/// Defensive cap on the size of a forwarded sidecar log line. The SDK
-/// enforces the same limit on the sender side; this is the belt-and-
-/// braces so a malicious sidecar can't flood the LogBuffer with
-/// arbitrarily large lines.
-const SIDECAR_LOG_MAX_BYTES: usize = 1024;
 
 /// Maximum time to wait for the client's `Register` frame after the WS
 /// upgrade completes. Keeps idle connections that never speak from
@@ -393,43 +386,6 @@ pub(crate) fn bot_secret_name(channel_type: &ChannelType, bot_id: &str) -> Strin
     aura_channels::vault_keys::primary_token(channel_type, bot_id)
 }
 
-/// Push one forwarded sidecar log line into the shared `LogBuffer`.
-///
-/// Attribution is scoped to the sidecar's `ChannelType`, with an
-/// optional sidecar-supplied `target` suffix. Unknown level strings
-/// degrade to `info` so a typo on the sidecar side never drops the
-/// record. The caller has already accepted the frame past the WS
-/// decode; any truncation we do here is purely a size safety net —
-/// the TS SDK enforces the same 1 KB cap on the sender side.
-fn push_sidecar_log(
-    state: &WsChannelState,
-    channel_type: &ChannelType,
-    level: &str,
-    text: String,
-    target: Option<&str>,
-) {
-    let level = LogLevel::parse(level).unwrap_or(LogLevel::Info);
-    let message = if text.len() > SIDECAR_LOG_MAX_BYTES {
-        // `String::truncate` panics on a non-char-boundary cut; scan
-        // back to the nearest boundary at or below the cap.
-        let mut cut = SIDECAR_LOG_MAX_BYTES;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let mut truncated = text;
-        truncated.truncate(cut);
-        truncated.push_str(" [...truncated]");
-        truncated
-    } else {
-        text
-    };
-    let attributed = match target {
-        Some(t) if !t.is_empty() => format!("sidecar::{channel_type}::{t}"),
-        _ => format!("sidecar::{channel_type}"),
-    };
-    state.log_buffer.push_external(level, attributed, message);
-}
-
 async fn run_inbound_loop(
     mut source: SplitStream<WebSocket>,
     state: &WsChannelState,
@@ -652,13 +608,6 @@ async fn run_inbound_loop(
                                 "append tui input history"
                             );
                         }
-                    }
-                    Frame::SidecarLog {
-                        level,
-                        text,
-                        target,
-                    } => {
-                        push_sidecar_log(state, channel_type, &level, text, target.as_deref());
                     }
                     Frame::BotStatus {
                         bot_id,

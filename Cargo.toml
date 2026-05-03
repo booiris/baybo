@@ -89,7 +89,10 @@ hmac = "0.12"
 hkdf = "0.12"
 aes-gcm = "0.10"
 rand = "0.10"
-libsql = "0.9"
+# Local-only — never connects to a remote turso/libsql server, so we
+# drop default features (`replication`, `remote`, `sync`, `tls`) that
+# would pull in hyper-rustls + an old rustls/webpki tree.
+libsql = { version = "0.9", default-features = false, features = ["core"] }
 axum = "0.8"
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = [
@@ -201,3 +204,14 @@ lto = true
 codegen-units = 1
 strip = "debuginfo"
 panic = "abort"
+
+# Each test target re-links the whole upper dep graph; full DWARF dominates
+# link time. `line-tables-only` keeps usable backtraces, `unpacked` skips
+# bundling `.dwo`s back into the executable after link.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"

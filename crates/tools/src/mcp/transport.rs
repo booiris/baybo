@@ -5,9 +5,7 @@ use std::sync::Arc;
 use aura_security::SecretVault;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
-use rmcp::model::{
-    Annotated, CallToolRequestParams, Meta, RawContent, Tool as RmcpTool,
-};
+use rmcp::model::{Annotated, CallToolRequestParams, Meta, RawContent, Tool as RmcpTool};
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::auth::{AuthClient, AuthorizationManager, CredentialStore, OAuthClientConfig};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -118,10 +116,7 @@ pub async fn call_tool_via_peer(
     if let Some(args) = arguments {
         request = request.with_arguments(args);
     }
-    if meta.aura_session_id.is_some()
-        || meta.aura_bot_id.is_some()
-        || meta.aura_user_id.is_some()
-    {
+    if meta.aura_session_id.is_some() || meta.aura_bot_id.is_some() || meta.aura_user_id.is_some() {
         let mut rmcp_meta = Meta::new();
         if let Some(id) = meta.aura_session_id {
             rmcp_meta
@@ -184,9 +179,24 @@ pub async fn connect(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
 ) -> McpResult<McpServerSession> {
+    connect_with_extra_env(entry, vault, &HashMap::new()).await
+}
+
+/// Like [`connect`] but merges `extra_env` onto the stdio child's env
+/// after the vault load. Used by the reconciler for embedded servers
+/// to inject boot-config env vars (`AURA_BROWSER_PROFILE_DIR`, …)
+/// without polluting the user's secret vault. Vault entries retain
+/// precedence — `extra_env` is applied first, then vault entries, so
+/// an operator who really wants to override a boot value can stash
+/// it under `mcp.<name>.env`.
+pub async fn connect_with_extra_env(
+    entry: &McpServerEntry,
+    vault: &Arc<SecretVault>,
+    extra_env: &HashMap<String, String>,
+) -> McpResult<McpServerSession> {
     let running = match &entry.transport {
         McpTransportConfig::Stdio { command, args } => {
-            connect_stdio(&entry.name, command, args, vault).await?
+            connect_stdio(&entry.name, command, args, vault, extra_env).await?
         }
         McpTransportConfig::Http { url } => connect_http(&entry.name, url, vault).await?,
     };
@@ -210,16 +220,11 @@ pub async fn connect_sidecar(
     inbound: mpsc::Receiver<Vec<u8>>,
 ) -> McpResult<McpServerSession> {
     let transport = SidecarTransport::new(sender, inbound);
-    let running = ()
-        .serve(transport)
-        .await
-        .map_err(|e| McpError::Connection(e.to_string()))?;
+    let running = ().serve(transport).await.map_err(|e| McpError::Connection(e.to_string()))?;
     finalize_session(running).await
 }
 
-async fn finalize_session(
-    running: RunningService<RoleClient, ()>,
-) -> McpResult<McpServerSession> {
+async fn finalize_session(running: RunningService<RoleClient, ()>) -> McpResult<McpServerSession> {
     let tools = running
         .peer()
         .list_all_tools()
@@ -233,6 +238,7 @@ async fn connect_stdio(
     command: &str,
     args: &[String],
     vault: &Arc<SecretVault>,
+    extra_env: &HashMap<String, String>,
 ) -> McpResult<RunningService<RoleClient, ()>> {
     let env = load_string_map(vault, &vault_keys::env_bag(server_name)).await?;
 
@@ -252,6 +258,10 @@ async fn connect_stdio(
         if k.starts_with("LC_") {
             tokio_cmd.env(k, v);
         }
+    }
+    // Embedded boot-config env first; vault overrides if both present.
+    for (k, v) in extra_env {
+        tokio_cmd.env(k, v);
     }
     for (k, v) in env {
         tokio_cmd.env(k, v);

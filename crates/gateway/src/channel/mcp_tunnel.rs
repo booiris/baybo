@@ -185,7 +185,11 @@ impl McpTunnel {
     /// [`Transport`]: rmcp::transport::Transport
     pub fn into_transport_parts(
         mut self,
-    ) -> (Arc<dyn SidecarSender>, mpsc::Receiver<Vec<u8>>, McpTunnelGuard) {
+    ) -> (
+        Arc<dyn SidecarSender>,
+        mpsc::Receiver<Vec<u8>>,
+        McpTunnelGuard,
+    ) {
         let guard = self.guard.take().expect("tunnel guard set in open()");
         let sender: Arc<dyn SidecarSender> = self.sender.clone();
         let rx = std::mem::replace(&mut self.rx, mpsc::channel(1).1);
@@ -412,7 +416,10 @@ mod tests {
 
         let frame = pump_rx.recv().await.expect("pump receives frame");
         match frame {
-            Frame::Mcp { tunnel_id: id, payload } => {
+            Frame::Mcp {
+                tunnel_id: id,
+                payload,
+            } => {
                 assert_eq!(id, tunnel_id);
                 let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
                 assert_eq!(v["id"], 42);
@@ -434,6 +441,9 @@ mod tests {
             .await
             .expect("receive resolves")
             .expect("got message");
-        assert!(matches!(received, RxJsonRpcMessage::<RoleClient>::Response(_)));
+        assert!(matches!(
+            received,
+            RxJsonRpcMessage::<RoleClient>::Response(_)
+        ));
     }
 }

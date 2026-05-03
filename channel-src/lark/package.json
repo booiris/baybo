@@ -4,6 +4,9 @@
   "private": true,
   "description": "Lark / Feishu channel sidecar for the Aura gateway",
   "type": "module",
+  "aura": {
+    "domain": "channel"
+  },
   "bin": {
     "aura-channel-lark": "./dist/index.js"
   },

@@ -137,7 +137,7 @@ mod tests {
                 id: "u1".to_string(),
                 name: Some("Test".to_string()),
                 channel: ChannelType::tui(),
-            bot_id: None,
+                bot_id: None,
             },
             channel: ChannelType::tui(),
             messages: vec![],

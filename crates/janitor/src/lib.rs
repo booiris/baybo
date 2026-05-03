@@ -1,12 +1,15 @@
 mod blob_sweep;
 mod error;
 mod fs_sweep;
+mod sidecar_sweep;
 
 pub use error::JanitorError;
 
+use std::collections::HashSet;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aura_storage::BlobStore;
 use aura_workspace::WorkspacePaths;
@@ -20,7 +23,21 @@ const LOG_FILE_TTL: Duration = Duration::from_secs(14 * 86_400);
 // blob whose `last_accessed_at` falls behind this window is reaped on
 // the next sweep.
 const BLOB_TTL: Duration = Duration::from_secs(7 * 86_400);
-const TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+// Stale-sidecar-bundle window. The cache root is shared across every
+// Aura process running under the same UID, so the TTL also doubles as
+// a safety margin: a concurrent older-version Aura that's actively
+// using one of the dirs touches it (spawn child reads bundle.mjs, the
+// browser sidecar opens the docker/ aux dir on every `docker build`)
+// and will look fresh enough to skip. Operators running multiple Aura
+// versions side-by-side for >7 days without restarting either is well
+// outside the realistic case.
+const SIDECAR_CACHE_TTL: Duration = Duration::from_secs(7 * 86_400);
+const TICK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+// Sidecar-cache cleanup is much rarer than the other sweeps — it only
+// reclaims after a binary upgrade lands a fresh content hash, and the
+// total cruft per upgrade is single-digit MB. Daily cadence keeps the
+// walk off the hot path while still bounding the eventual size.
+const SIDECAR_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JanitorReport {
@@ -28,16 +45,43 @@ pub struct JanitorReport {
     pub python_dirs_removed: usize,
     pub log_files_removed: usize,
     pub blobs_purged: u64,
+    pub sidecar_dirs_removed: usize,
+}
+
+/// Live-set view consumed by the sidecar-cache sweep. `cache_root` is
+/// `$XDG_CACHE_HOME/aura/sidecars/`; `live_dirs` is the
+/// `<name>-<hash>` set the running Aura currently has materialised.
+/// Anything else under `cache_root` whose mtime is older than the TTL
+/// is left over from a previous Aura version and gets removed.
+#[derive(Debug, Clone)]
+pub struct SidecarCache {
+    pub cache_root: PathBuf,
+    pub live_dirs: HashSet<String>,
 }
 
 pub struct Janitor {
     paths: WorkspacePaths,
     blobs: Arc<dyn BlobStore>,
+    sidecar_cache: Option<SidecarCache>,
 }
 
 impl Janitor {
     pub fn new(paths: WorkspacePaths, blobs: Arc<dyn BlobStore>) -> Self {
-        Self { paths, blobs }
+        Self {
+            paths,
+            blobs,
+            sidecar_cache: None,
+        }
+    }
+
+    /// Enable the sidecar-cache sweep. Call before [`Self::run`]; the
+    /// constructor leaves it disabled so unit tests / integration
+    /// callers that don't have a `SidecarRuntime` can still build a
+    /// Janitor.
+    #[must_use]
+    pub fn with_sidecar_cache(mut self, cache: SidecarCache) -> Self {
+        self.sidecar_cache = Some(cache);
+        self
     }
 
     /// Run all four sweeps once. Failures in one sweep are logged and
@@ -103,9 +147,11 @@ impl Janitor {
         report
     }
 
-    /// Background loop: sweep at boot, then every [`TICK_INTERVAL`].
-    /// Returns when `shutdown` resolves. Designed to be wrapped in a
-    /// `tokio::spawn` next to the cron tick loop.
+    /// Background loop: sweep at boot, then every [`TICK_INTERVAL`]
+    /// (12h). The sidecar-cache sweep is gated separately at
+    /// [`SIDECAR_SWEEP_INTERVAL`] (24h) so it runs every other tick
+    /// rather than on the same cadence as the day-scoped sweeps.
+    /// Returns when `shutdown` resolves.
     pub async fn run<S>(self, shutdown: S)
     where
         S: Future<Output = ()>,
@@ -116,15 +162,45 @@ impl Janitor {
         // than burst-catch-up so a slow sweep can't stack.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tracing::info!(tick_secs = TICK_INTERVAL.as_secs(), "janitor started",);
+        // First-tick sentinel: sweep immediately on boot, then space
+        // subsequent runs by `SIDECAR_SWEEP_INTERVAL`.
+        let mut last_sidecar_sweep: Option<Instant> = None;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     let _ = self.sweep_once().await;
+                    let due = last_sidecar_sweep
+                        .map(|t| t.elapsed() >= SIDECAR_SWEEP_INTERVAL)
+                        .unwrap_or(true);
+                    if due {
+                        let _ = self.sweep_sidecar_cache().await;
+                        last_sidecar_sweep = Some(Instant::now());
+                    }
                 }
                 _ = &mut shutdown => {
                     tracing::info!("janitor shutting down");
                     break;
                 }
+            }
+        }
+    }
+
+    /// One pass of the sidecar-cache sweep. Public for tests; the run
+    /// loop calls this on its own daily cadence.
+    pub async fn sweep_sidecar_cache(&self) -> usize {
+        let Some(cache) = self.sidecar_cache.as_ref() else {
+            return 0;
+        };
+        match sidecar_sweep::sweep(cache, SIDECAR_CACHE_TTL).await {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!(removed = n, "sidecar-cache sweep complete");
+                }
+                n
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sidecar-cache sweep failed");
+                0
             }
         }
     }
@@ -206,8 +282,16 @@ mod tests {
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(stale.join("script.py"), b"print(1)\n").unwrap();
-        std::fs::write(fresh.join("script.py"), b"print(2)\n").unwrap();
+        std::fs::write(
+            stale.join(aura_workspace::paths::CODE_BUILDER_SCRIPT_FILE),
+            b"print(1)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fresh.join(aura_workspace::paths::CODE_BUILDER_SCRIPT_FILE),
+            b"print(2)\n",
+        )
+        .unwrap();
         // Make stale dir mtime old by setting on its inner file then
         // re-stating: tokio::fs uses the dir entry's mtime, which on
         // Linux is set when the dir is last modified (e.g., when we
@@ -286,6 +370,77 @@ mod tests {
         // A second run is idempotent.
         let report2 = Janitor::new(paths, Arc::clone(&store)).sweep_once().await;
         assert_eq!(report2.blobs_purged, 0);
+    }
+
+    #[tokio::test]
+    async fn sidecar_cache_sweep_removes_only_stale_non_live_dirs() {
+        // Three subdirs under the simulated $XDG_CACHE_HOME/aura/sidecars/:
+        //   browser-livehash : current build, must survive even when stale
+        //   browser-oldhash  : prior build, age > TTL, must be removed
+        //   browser-recent   : prior build, fresh mtime, must survive
+        // Plus a stray non-dir entry (a leftover lockfile) — must survive.
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("sidecars");
+        std::fs::create_dir_all(&cache).unwrap();
+        let live = cache.join("browser-livehash");
+        let stale = cache.join("browser-oldhash");
+        let recent = cache.join("browser-recent");
+        let stray = cache.join("README");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&recent).unwrap();
+        std::fs::write(live.join("bundle.mjs"), b"x").unwrap();
+        std::fs::write(stale.join("bundle.mjs"), b"x").unwrap();
+        std::fs::write(recent.join("bundle.mjs"), b"x").unwrap();
+        std::fs::write(&stray, b"keep").unwrap();
+        back_date_dir(&live, Duration::from_secs(SIDECAR_CACHE_TTL.as_secs() + 60));
+        back_date_dir(
+            &stale,
+            Duration::from_secs(SIDECAR_CACHE_TTL.as_secs() + 60),
+        );
+
+        let paths = workspace_paths(tmp.path());
+        let live_dirs: HashSet<String> = ["browser-livehash".to_string()].into_iter().collect();
+        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new())).with_sidecar_cache(
+            SidecarCache {
+                cache_root: cache.clone(),
+                live_dirs,
+            },
+        );
+
+        let removed = janitor.sweep_sidecar_cache().await;
+        assert_eq!(removed, 1, "only the stale non-live dir is removed");
+        assert!(
+            live.exists(),
+            "live dir survives even when its mtime is old"
+        );
+        assert!(!stale.exists(), "stale non-live dir removed");
+        assert!(recent.exists(), "fresh non-live dir survives the TTL guard");
+        assert!(stray.exists(), "non-directory entries are left alone");
+    }
+
+    #[tokio::test]
+    async fn sidecar_cache_sweep_is_noop_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let paths = workspace_paths(tmp.path());
+        let n = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
+            .sweep_sidecar_cache()
+            .await;
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn sidecar_cache_sweep_short_circuits_on_missing_root() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("does-not-exist");
+        let paths = workspace_paths(tmp.path());
+        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new())).with_sidecar_cache(
+            SidecarCache {
+                cache_root: cache,
+                live_dirs: HashSet::new(),
+            },
+        );
+        assert_eq!(janitor.sweep_sidecar_cache().await, 0);
     }
 
     #[tokio::test]

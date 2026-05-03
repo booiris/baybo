@@ -228,6 +228,36 @@ pub enum ToolOutput {
         text: String,
         attachments: Vec<aura_model::ContentBlock>,
     },
+    /// Tool result that includes images the *LLM itself* should see on
+    /// the next turn (e.g. `browser_screenshot`). The agent loop
+    /// appends `text` as the normal text-only `ToolResult`, then emits
+    /// a follow-up `Role::User` message carrying `llm_images` so a
+    /// vision-capable provider receives them through the standard
+    /// multimodal user-content path. The same images are also mirrored
+    /// into the final `OutgoingMessage` so the user channel sees them.
+    ///
+    /// Invariant (asserted by [`MultiModalText::new`]): every entry of
+    /// `llm_images` is `ContentBlock::Image`. Other variants are
+    /// silently dropped at construction.
+    MultiModalText {
+        text: String,
+        llm_images: Vec<aura_model::ContentBlock>,
+    },
+}
+
+impl ToolOutput {
+    /// Construct a [`ToolOutput::MultiModalText`], filtering
+    /// `llm_images` to only `ContentBlock::Image` entries. Other
+    /// variants are silently dropped — the variant is documented as
+    /// images-only and accidental misuse from a tool author should
+    /// not surprise the agent loop.
+    pub fn multi_modal_text(text: String, llm_images: Vec<aura_model::ContentBlock>) -> Self {
+        let llm_images = llm_images
+            .into_iter()
+            .filter(|b| matches!(b, aura_model::ContentBlock::Image { .. }))
+            .collect();
+        Self::MultiModalText { text, llm_images }
+    }
 }
 
 /// Definition visible to the LLM for function calling.
@@ -273,3 +303,83 @@ pub fn resource_path(p: impl Into<PathBuf>) -> PathBuf {
 }
 
 pub use registry::ToolRegistry;
+
+#[cfg(test)]
+mod multi_modal_text_tests {
+    use super::ToolOutput;
+    use aura_model::{BlobRef, ContentBlock};
+
+    fn img() -> ContentBlock {
+        ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: format!("sha256:{}", "ab".repeat(32)),
+            },
+            mime_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn keeps_image_blocks() {
+        let out = ToolOutput::multi_modal_text("text".into(), vec![img(), img()]);
+        match out {
+            ToolOutput::MultiModalText { llm_images, .. } => {
+                assert_eq!(llm_images.len(), 2);
+                assert!(
+                    llm_images
+                        .iter()
+                        .all(|b| matches!(b, ContentBlock::Image { .. }))
+                );
+            }
+            _ => panic!("expected MultiModalText variant"),
+        }
+    }
+
+    #[test]
+    fn filters_non_image_variants() {
+        // Documents the invariant: only `Image` survives. A regression
+        // here means a refactor accidentally let other content-block
+        // kinds reach the agent_loop's user-message forwarding path.
+        let blocks = vec![
+            img(),
+            ContentBlock::Text("hi".into()),
+            ContentBlock::Audio {
+                blob: BlobRef {
+                    blob_id: "sha256:0".into(),
+                },
+                mime_type: "audio/wav".into(),
+            },
+            ContentBlock::File {
+                blob: BlobRef {
+                    blob_id: "sha256:0".into(),
+                },
+                filename: "x".into(),
+                mime_type: "application/pdf".into(),
+            },
+            img(),
+        ];
+        let out = ToolOutput::multi_modal_text("text".into(), blocks);
+        match out {
+            ToolOutput::MultiModalText { llm_images, .. } => {
+                assert_eq!(llm_images.len(), 2, "only the two Image blocks survive");
+                assert!(
+                    llm_images
+                        .iter()
+                        .all(|b| matches!(b, ContentBlock::Image { .. }))
+                );
+            }
+            _ => panic!("expected MultiModalText variant"),
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_empty_images() {
+        let out = ToolOutput::multi_modal_text("just text".into(), vec![]);
+        match out {
+            ToolOutput::MultiModalText { text, llm_images } => {
+                assert_eq!(text, "just text");
+                assert!(llm_images.is_empty());
+            }
+            _ => panic!("expected MultiModalText variant"),
+        }
+    }
+}

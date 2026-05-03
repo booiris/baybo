@@ -735,7 +735,7 @@ mod tests {
                 id: "u".into(),
                 name: None,
                 channel: aura_model::ChannelType::tui(),
-            bot_id: None,
+                bot_id: None,
             },
             timeout: Duration::from_secs(30),
             cancellation_token: CancellationToken::new(),
@@ -1051,8 +1051,16 @@ mod tests {
 
         // Ephemeral subdirs trimmed.
         let run_root = script_path.parent().unwrap();
-        assert!(!run_root.join("uv-cache").exists());
-        assert!(!run_root.join("workdir").exists());
+        assert!(
+            !run_root
+                .join(aura_workspace::paths::CODE_BUILDER_UV_CACHE_SUBDIR)
+                .exists()
+        );
+        assert!(
+            !run_root
+                .join(aura_workspace::paths::CODE_BUILDER_WORKDIR_SUBDIR)
+                .exists()
+        );
         assert!(!run_root.join("inputs.json").exists());
     }
 
@@ -1177,7 +1185,7 @@ mod tests {
         let ctx = make_ctx(tmp.path().to_path_buf());
         let _ = tool.execute(json!({"task": "x"}), &ctx).await.unwrap_err();
 
-        let runs_root = tmp.path().join("code-builder");
+        let runs_root = tmp.path().join(aura_workspace::paths::CODE_BUILDER_SUBDIR);
         if runs_root.exists() {
             let count = std::fs::read_dir(&runs_root).unwrap().count();
             assert_eq!(count, 0, "failed run must be cleaned up");
@@ -1292,7 +1300,7 @@ mod tests {
                 id: "u".into(),
                 name: None,
                 channel: aura_model::ChannelType::tui(),
-            bot_id: None,
+                bot_id: None,
             },
             timeout: Duration::from_secs(30),
             cancellation_token: CancellationToken::new(),
@@ -1400,7 +1408,7 @@ mod tests {
         );
         // Run dir is cleaned up by Drop on early return; nothing left
         // under code-builder/.
-        let runs_root = tmp.path().join("code-builder");
+        let runs_root = tmp.path().join(aura_workspace::paths::CODE_BUILDER_SUBDIR);
         if runs_root.exists() {
             let count = std::fs::read_dir(&runs_root).unwrap().count();
             assert_eq!(count, 0, "denied run must be cleaned up by Drop");
@@ -1559,7 +1567,10 @@ mod tests {
     fn build_accesses_strips_writes_inside_scratch() {
         // A real run: the path must exist for canonicalize() to succeed.
         let tmp = tempfile::tempdir().unwrap();
-        let scratch = tmp.path().join("code-builder").join("uuid");
+        let scratch = tmp
+            .path()
+            .join(aura_workspace::paths::CODE_BUILDER_SUBDIR)
+            .join("uuid");
         std::fs::create_dir_all(&scratch).unwrap();
         let inside = scratch.join("workdir");
         std::fs::create_dir_all(&inside).unwrap();
@@ -1576,7 +1587,10 @@ mod tests {
     #[test]
     fn build_accesses_includes_writes_outside_scratch() {
         let tmp = tempfile::tempdir().unwrap();
-        let scratch = tmp.path().join("code-builder").join("uuid");
+        let scratch = tmp
+            .path()
+            .join(aura_workspace::paths::CODE_BUILDER_SUBDIR)
+            .join("uuid");
         std::fs::create_dir_all(&scratch).unwrap();
         let outside = tmp.path().join("project").join("output");
         std::fs::create_dir_all(&outside).unwrap();
@@ -1607,7 +1621,9 @@ mod tests {
         // else must surface a WriteFile prompt.
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
-        let scratch = workspace.join("code-builder").join("uuid");
+        let scratch = workspace
+            .join(aura_workspace::paths::CODE_BUILDER_SUBDIR)
+            .join("uuid");
         std::fs::create_dir_all(&scratch).unwrap();
         // Path that is under the workspace root but **not** under
         // the scratch root, and **does not exist** on the host.

@@ -227,7 +227,7 @@ mod tests {
                 id: "u1".into(),
                 name: Some("tester".into()),
                 channel: ChannelType::tui(),
-            bot_id: None,
+                bot_id: None,
             },
             timeout: Duration::from_secs(5),
             cancellation_token: tokio_util::sync::CancellationToken::new(),

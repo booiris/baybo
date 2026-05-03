@@ -98,9 +98,7 @@ impl SidecarMcpManager {
                                 .as_ref()
                                 .map(|c| c.to_string())
                                 .unwrap_or_default(),
-                            parameters_schema: serde_json::Value::Object(
-                                (*t.input_schema).clone(),
-                            ),
+                            parameters_schema: serde_json::Value::Object((*t.input_schema).clone()),
                         })
                         .collect();
                     info!(
@@ -156,10 +154,7 @@ impl SidecarMcpProvider for SidecarMcpManager {
         };
         let slot = slot.value().clone();
         let guard = slot.lock().await;
-        guard
-            .as_ref()
-            .map(|c| c.tools.clone())
-            .unwrap_or_default()
+        guard.as_ref().map(|c| c.tools.clone()).unwrap_or_default()
     }
 
     async fn claims_tool(&self, session: &Session, name: &str) -> bool {
@@ -336,7 +331,11 @@ mod tests {
 
         let session = dummy_session(ChannelType::from("lark"));
         // Not attached: claims_tool false, execute None.
-        assert!(!manager.claims_tool(&session, "lark/feishu_get_chat_info").await);
+        assert!(
+            !manager
+                .claims_tool(&session, "lark/feishu_get_chat_info")
+                .await
+        );
         assert!(
             manager
                 .execute_for_session(&session, "lark/feishu_get_chat_info", serde_json::json!({}))

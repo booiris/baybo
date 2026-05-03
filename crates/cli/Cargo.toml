@@ -2,6 +2,13 @@
 name = "aura-cli"
 version.workspace = true
 edition.workspace = true
+# See `crates/integration-tests/Cargo.toml` for the rationale: aggregating
+# tests/*.rs into one binary saves the per-binary link of the CLI graph.
+autotests = false
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 [dependencies]
 aura-model = { workspace = true }

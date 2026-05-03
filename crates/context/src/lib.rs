@@ -225,7 +225,7 @@ mod tests {
                 id: "user-1".to_string(),
                 name: None,
                 channel: aura_model::ChannelType::tui(),
-            bot_id: None,
+                bot_id: None,
             },
             channel: aura_model::ChannelType::tui(),
             messages,

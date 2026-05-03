@@ -59,6 +59,9 @@ pub use write::WriteTool;
 /// Each entry pairs an [`Arc<dyn Tool>`] with the [`ToolManifest`] describing
 /// its governance ceiling. `ToolExecutor::validate_trust` compares this
 /// manifest against the runtime trust policy before executing.
+///
+/// Browser tools are not listed here — they arrive dynamically when
+/// the embedded browser MCP server connects through the reconciler.
 pub fn default_tools(blob_store: Arc<dyn BlobStore>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
@@ -75,7 +78,7 @@ pub fn default_tools(blob_store: Arc<dyn BlobStore>) -> Vec<(Arc<dyn Tool>, Tool
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
         trusted(WebFetchTool::default(), vec![ToolCapability::Http]),
-        send_local_file::tool(blob_store),
+        send_local_file::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
     ];
     #[cfg(debug_assertions)]

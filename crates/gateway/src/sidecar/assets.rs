@@ -5,6 +5,7 @@
 //! Sidecars are spawned at runtime with the local `node` resolved
 //! from `PATH` — no JS runtime is shipped inside the gateway binary.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +22,24 @@ mod generated {
 }
 
 use generated::{SIDECARS, SidecarAsset, SidecarAuxAsset};
+
+/// Well-known domain identifiers. New domains are added by appending
+/// here AND by setting `"aura": { "domain": "<name>" }` in the new
+/// sidecar's `package.json`. The runtime is otherwise agnostic — a
+/// build-time domain string that doesn't appear here is still
+/// accepted, callers just won't have a constant to refer to it by.
+pub mod domains {
+    /// Channel-protocol sidecars (telegram, weixin, …). Each registers
+    /// itself with the channel registry on connect and pumps platform
+    /// messages onto the gateway's WebSocket.
+    pub const CHANNEL: &str = "channel";
+    /// Tool-domain sidecars — embedded MCP servers exposing one or
+    /// more `<server>/<tool>` calls to the agent loop. Today the only
+    /// tool sidecar is `browser`; future families (code_exec,
+    /// db_query, …) sit under the same domain and ship their own
+    /// MCP server name.
+    pub const TOOL: &str = "tool";
+}
 
 #[derive(Debug, Error)]
 pub enum SidecarError {
@@ -42,11 +61,25 @@ pub enum SidecarError {
     },
 }
 
+struct SidecarEntry {
+    name: String,
+    domain: String,
+    bundle_path: PathBuf,
+}
+
 /// Materialised runtime: one JS path per embedded sidecar. Cheap to
 /// hold (a small Vec); clone via `Arc` at the call site if shared
 /// across tasks.
+///
+/// Each sidecar is tagged with its **domain** — the business family
+/// it participates in (`channel`, `tool`, …) — declared in the
+/// sidecar's own `package.json` (`aura.domain`). Callers iterate
+/// per domain so the channel list, the embedded-MCP profiles, and
+/// any future family stay decoupled. New domains add by appending to
+/// the sidecar's package.json + (optionally) adding a constant in
+/// [`domains`]; no Rust API changes required.
 pub struct SidecarRuntime {
-    sidecars: Vec<(String, PathBuf)>,
+    sidecars: Vec<SidecarEntry>,
 }
 
 impl SidecarRuntime {
@@ -63,22 +96,85 @@ impl SidecarRuntime {
         let mut sidecars = Vec::with_capacity(SIDECARS.len());
         for asset in SIDECARS {
             let js_path = install_sidecar(&cache_root, asset)?;
-            sidecars.push((asset.channel_type.to_string(), js_path));
+            sidecars.push(SidecarEntry {
+                name: asset.name.to_string(),
+                domain: asset.domain.to_string(),
+                bundle_path: js_path,
+            });
         }
         Ok(Self { sidecars })
     }
 
-    pub fn channel_types(&self) -> impl Iterator<Item = &str> {
-        self.sidecars.iter().map(|(c, _)| c.as_str())
-    }
-
-    /// Path to the JS bundle for `channel_type`, or `None` if this
-    /// build doesn't ship a sidecar for it.
-    pub fn bundle_for(&self, channel_type: &str) -> Option<&Path> {
+    /// Names of every embedded sidecar in `domain`. Empty iter when
+    /// no sidecar declares that domain. Use the constants in
+    /// [`domains`] to avoid typos for the well-known ones; the
+    /// argument is a free string so a new domain works without
+    /// touching this file.
+    pub fn names_in_domain<'a>(&'a self, domain: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.sidecars
             .iter()
-            .find(|(c, _)| c == channel_type)
-            .map(|(_, p)| p.as_path())
+            .filter(move |s| s.domain == domain)
+            .map(|s| s.name.as_str())
+    }
+
+    /// Every distinct domain present in the embedded asset table,
+    /// alphabetically sorted. Sorted (rather than iteration-order
+    /// of the asset table) so the boot log lines stay deterministic
+    /// build-to-build even when a new sidecar's name shifts the
+    /// underlying table order.
+    pub fn domains(&self) -> impl Iterator<Item = &str> {
+        let mut domains: Vec<&str> = self.sidecars.iter().map(|s| s.domain.as_str()).collect();
+        domains.sort_unstable();
+        domains.dedup();
+        domains.into_iter()
+    }
+
+    /// Domain of the sidecar named `name`. `None` if no sidecar by
+    /// that name is in this build.
+    pub fn domain_of(&self, name: &str) -> Option<&str> {
+        self.sidecars
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.domain.as_str())
+    }
+
+    /// Path to the JS bundle for `name`, or `None` if this build
+    /// doesn't ship a sidecar by that name. Names are globally
+    /// unique across all domains (asserted at build time).
+    pub fn bundle_for(&self, name: &str) -> Option<&Path> {
+        self.sidecars
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.bundle_path.as_path())
+    }
+
+    /// Cache root that holds every materialised `<name>-<hash>/` dir
+    /// (`$XDG_CACHE_HOME/aura/sidecars/`). Returned only when the
+    /// runtime contains at least one sidecar — an empty runtime has no
+    /// path to point at. Consumed by the janitor's sidecar-cache sweep
+    /// to know which root directory to walk.
+    pub fn sidecars_cache_root(&self) -> Option<PathBuf> {
+        self.sidecars
+            .first()
+            .and_then(|s| s.bundle_path.parent()?.parent().map(Path::to_path_buf))
+    }
+
+    /// `<name>-<hash>` directory names for every currently-live
+    /// sidecar in this build. Consumed by the janitor's sidecar-cache
+    /// sweep as the "do not delete" allowlist — anything else under
+    /// `sidecars_cache_root()` whose mtime is older than the TTL is
+    /// stale cruft from a prior Aura version.
+    pub fn live_dir_names(&self) -> HashSet<String> {
+        self.sidecars
+            .iter()
+            .filter_map(|s| {
+                s.bundle_path
+                    .parent()?
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_owned)
+            })
+            .collect()
     }
 }
 
@@ -89,7 +185,7 @@ fn cache_root() -> Result<PathBuf, SidecarError> {
 fn install_sidecar(cache_root: &Path, asset: &SidecarAsset) -> Result<PathBuf, SidecarError> {
     let dir = cache_root
         .join("sidecars")
-        .join(format!("{}-{}", asset.channel_type, asset.content_hash));
+        .join(format!("{}-{}", asset.name, asset.content_hash));
     mkdir_all(&dir)?;
     // Hash-keyed: a bundle content change lands at a fresh filename
     // without ever rewriting a live one. Auxiliary files live next to
@@ -201,7 +297,8 @@ mod tests {
             .into_boxed_slice(),
         );
         let asset = SidecarAsset {
-            channel_type: "weixin",
+            name: "weixin",
+            domain: "channel",
             bundle_zst: zst(b"console.log('weixin');"),
             content_hash: "fixture",
             aux_assets,

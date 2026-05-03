@@ -1,5 +1,5 @@
 import { RunnerError, type Channel, type RunOptions } from "./channel.js";
-import { defaultLogger, type WireCapableLogger } from "./logger.js";
+import { defaultLogger, type Logger } from "./logger.js";
 import {
   runRegistration,
   type RegistrationContext,
@@ -25,12 +25,13 @@ export interface SidecarOptions {
 
   /**
    * Construct the channel. Invoked after the default logger is ready
-   * so the channel can consume it (and its log lines ride the SDK's
-   * wire-forwarder once the WS handshake completes). May be async for
-   * config loading, network probes, etc. Any thrown error — including
-   * a missing env var — is reported as fatal and exits 1.
+   * so the channel can consume it (lines emit as NDJSON on stdout/
+   * stderr, where the gateway's pipe drain parses them back into
+   * structured log records). May be async for config loading, network
+   * probes, etc. Any thrown error — including a missing env var — is
+   * reported as fatal and exits 1.
    */
-  build(logger: WireCapableLogger): Channel | Promise<Channel>;
+  build(logger: Logger): Channel | Promise<Channel>;
 
   /** Override the default shutdown-signal list. */
   signals?: NodeJS.Signals[];
@@ -57,7 +58,7 @@ export interface SidecarOptions {
  * Boilerplate wrapper for a sidecar's entry point.
  *
  * Handles everything every sidecar would otherwise write by hand:
- * constructs the SDK's wire-forwarding default logger, installs
+ * constructs the SDK's NDJSON-on-stdout default logger, installs
  * `SIGINT`/`SIGTERM` handlers that route through a shared
  * `AbortController`, invokes `runChannel`, and translates the
  * runner's outcomes into deterministic process exit codes:

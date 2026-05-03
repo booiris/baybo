@@ -173,6 +173,9 @@ impl AgentActor {
                     ToolOutput::WithAttachments { text, attachments } => {
                         (text.clone(), attachments.clone())
                     }
+                    ToolOutput::MultiModalText { text, llm_images } => {
+                        (text.clone(), llm_images.clone())
+                    }
                     ToolOutput::Error(e) => {
                         // Tool returned an error output — fall back to LLM
                         let diagnostic = format!(

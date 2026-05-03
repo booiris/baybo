@@ -78,6 +78,18 @@ fn truncate_preview(text: &str, max_len: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+/// Cap on attachments carried into the final `OutgoingMessage`. Tools
+/// like `browser_screenshot` and `send_local_file` push into a
+/// per-turn `accumulated_attachments` vec; without a cap a chatty
+/// agent (multi-iteration browse, page-each screenshot, …) would
+/// dump every blob produced over the loop into one channel message.
+/// 16 is well above any plausible "user asked for N artifacts" case
+/// and small enough that a runaway loop doesn't drown the channel.
+/// FIFO eviction: keep the newest, drop the oldest — older
+/// screenshots from earlier iterations are typically stale anyway
+/// (page state has moved on).
+const MAX_ATTACHMENTS_PER_TURN: usize = 16;
+
 /// Compute the byte index at which it is safe to flush `pending` to the
 /// output stream. Anything after that index is withheld because it might
 /// be the beginning of a `[{REDACTED_SECRET_...}]` placeholder split
@@ -105,6 +117,22 @@ fn safe_flush_boundary(pending: &str) -> usize {
         return pending.len() - 1;
     }
     pending.len()
+}
+
+/// Append `items` into `dst` while keeping `dst.len() <=
+/// MAX_ATTACHMENTS_PER_TURN` via FIFO eviction. Used for the
+/// per-turn `accumulated_attachments` vec so a runaway loop can't
+/// drown the final `OutgoingMessage` in stale screenshots.
+fn push_bounded<I: IntoIterator<Item = ContentBlock>>(dst: &mut Vec<ContentBlock>, items: I) {
+    for item in items {
+        if dst.len() >= MAX_ATTACHMENTS_PER_TURN {
+            // Stable order: channels render attachments in arrival
+            // order, so FIFO eviction keeps the surviving set
+            // chronologically coherent.
+            dst.remove(0);
+        }
+        dst.push(item);
+    }
 }
 
 /// Outcome of the skill risk assessor for a single candidate. `run()`
@@ -463,10 +491,7 @@ impl AgentLoop {
                 //     or session log,
                 //   * an observability span so the call shows up in
                 //     traces alongside local tool executions.
-                let claims = self
-                    .sidecar_mcp
-                    .claims_tool(session, &tool_call.name)
-                    .await;
+                let claims = self.sidecar_mcp.claims_tool(session, &tool_call.name).await;
                 let tool_result: anyhow::Result<ToolOutput> = if claims {
                     self.dispatch_sidecar_tool(
                         session,
@@ -522,13 +547,24 @@ impl AgentLoop {
                     _ => None,
                 };
 
+                let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
                 let raw_result_text = match &tool_result {
                     Ok(ToolOutput::Text(s)) => s.clone(),
                     Ok(ToolOutput::Json(v)) => {
                         serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
                     }
                     Ok(ToolOutput::WithAttachments { text, attachments }) => {
-                        accumulated_attachments.extend(attachments.iter().cloned());
+                        push_bounded(&mut accumulated_attachments, attachments.iter().cloned());
+                        text.clone()
+                    }
+                    Ok(ToolOutput::MultiModalText { text, llm_images }) => {
+                        // LLM-visible images go in BOTH directions: a
+                        // follow-up User-role message (so the next turn
+                        // sees them through the standard multimodal user
+                        // path) AND the final OutgoingMessage (so the
+                        // user channel renders them too).
+                        push_bounded(&mut accumulated_attachments, llm_images.iter().cloned());
+                        llm_visible_images.extend(llm_images.iter().cloned());
                         text.clone()
                     }
                     Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
@@ -572,7 +608,7 @@ impl AgentLoop {
                 // Cap size before wrapping so the truncation notice lands
                 // inside the `<tool_output>` envelope, then wrap so the LLM
                 // sees a clear boundary around untrusted tool output.
-                let capped = self.security_gateway.cap_tool_output(raw_result_text);
+                let capped = self.security_gateway.cap_tool_output(raw_result_text).await;
                 let wrapped = self
                     .security_gateway
                     .wrap_tool_output_for_llm(&tool_call.name, &capped);
@@ -587,6 +623,28 @@ impl AgentLoop {
                     }],
                 };
                 self.append_context_message(session, &tool_msg).await?;
+
+                // ToolResult.content is text-only; provider adapters
+                // serialize it as plain text. To get images back into
+                // the LLM's view, follow with a User-role message that
+                // carries the same images plus a marker tying them to
+                // this tool call. Vision-capable providers fetch the
+                // blob bytes via the existing user_content_for_block
+                // path; non-vision providers fall back to a text stub.
+                if !llm_visible_images.is_empty() {
+                    let mut content: Vec<ContentBlock> =
+                        Vec::with_capacity(llm_visible_images.len() + 1);
+                    content.push(ContentBlock::Text(format!(
+                        "[image attachment(s) returned by tool `{}` (tool_use_id={})]",
+                        tool_call.name, tool_call.id
+                    )));
+                    content.extend(llm_visible_images);
+                    let image_msg = ChatMessage {
+                        role: Role::User,
+                        content,
+                    };
+                    self.append_context_message(session, &image_msg).await?;
+                }
             }
 
             // Flush accumulated approvals back into session state.
@@ -661,23 +719,21 @@ impl AgentLoop {
             .reveal_in_value(&mut params_revealed)
             .await
         {
-            recorder.fail(handle, &format!("reveal_in_value: {e}")).await?;
+            recorder
+                .fail(handle, &format!("reveal_in_value: {e}"))
+                .await?;
             return Err(e.into());
         }
 
-        let dispatch_fut = self.sidecar_mcp.execute_for_session(
-            session,
-            tool_name,
-            params_revealed,
-        );
+        let dispatch_fut =
+            self.sidecar_mcp
+                .execute_for_session(session, tool_name, params_revealed);
 
         let started = std::time::Instant::now();
         let dispatch_result = match tokio::time::timeout(SIDECAR_MCP_TIMEOUT, dispatch_fut).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => {
-                let msg = format!(
-                    "sidecar mcp call timed out after {SIDECAR_MCP_TIMEOUT:?}"
-                );
+                let msg = format!("sidecar mcp call timed out after {SIDECAR_MCP_TIMEOUT:?}");
                 recorder.fail(handle, &msg).await?;
                 return Ok(ToolOutput::Error(msg));
             }
@@ -698,7 +754,11 @@ impl AgentLoop {
             ),
         };
 
-        if let Err(e) = self.security_gateway.sanitize_tool_output(&mut output).await {
+        if let Err(e) = self
+            .security_gateway
+            .sanitize_tool_output(&mut output)
+            .await
+        {
             warn!(error = %e, tool = tool_name, "sidecar mcp: sanitize_tool_output failed");
         }
 
@@ -789,10 +849,7 @@ impl AgentLoop {
         // for the current session so multi-bot deployments don't leak
         // tool surfaces between tenants. Most builds run the no-op
         // provider and pay no cost.
-        let sidecar_tools = self
-            .sidecar_mcp
-            .tool_definitions_for_session(session)
-            .await;
+        let sidecar_tools = self.sidecar_mcp.tool_definitions_for_session(session).await;
         tool_defs.extend(sidecar_tools.into_iter().map(|td| ToolDefinitionForLlm {
             name: td.name,
             description: td.description,
@@ -1225,5 +1282,59 @@ mod stream_buffer_tests {
     fn high_water_forces_flush() {
         let s: String = "a".repeat(200) + "[";
         assert_eq!(safe_flush_boundary(&s), s.len());
+    }
+}
+
+#[cfg(test)]
+mod attachment_bound_tests {
+    use super::{MAX_ATTACHMENTS_PER_TURN, push_bounded};
+    use aura_model::{BlobRef, ContentBlock};
+
+    fn img(tag: &str) -> ContentBlock {
+        ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: format!("sha256:{tag}"),
+            },
+            mime_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn under_cap_keeps_everything() {
+        let mut v: Vec<ContentBlock> = Vec::new();
+        push_bounded(&mut v, vec![img("a"), img("b"), img("c")]);
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn over_cap_evicts_oldest_first() {
+        let mut v: Vec<ContentBlock> = Vec::new();
+        let pushed: Vec<ContentBlock> = (0..MAX_ATTACHMENTS_PER_TURN + 5)
+            .map(|i| img(&format!("{i:0>2}")))
+            .collect();
+        push_bounded(&mut v, pushed);
+        assert_eq!(v.len(), MAX_ATTACHMENTS_PER_TURN);
+        // Newest 16 survive; the first 5 (00..04) evicted.
+        match &v[0] {
+            ContentBlock::Image { blob, .. } => {
+                assert!(
+                    blob.blob_id.ends_with("05"),
+                    "oldest survivor should be 05, got {}",
+                    blob.blob_id
+                );
+            }
+            _ => panic!("expected image"),
+        }
+        match v.last().unwrap() {
+            ContentBlock::Image { blob, .. } => {
+                let last = format!("{:0>2}", MAX_ATTACHMENTS_PER_TURN + 4);
+                assert!(
+                    blob.blob_id.ends_with(&last),
+                    "newest should be {last}, got {}",
+                    blob.blob_id
+                );
+            }
+            _ => panic!("expected image"),
+        }
     }
 }

@@ -5,7 +5,7 @@
 use aura_channels::wire::Frame;
 use aura_model::ChannelType;
 
-use crate::auth::{AuthedClient, ChannelTokenTable};
+use crate::auth::{AuthedClient, ChannelTokenTable, TOOL_CLIENT_LABEL_PREFIX};
 
 /// Channel type strings reserved for in-process adapters. Sidecars may
 /// not claim these — they would shadow the real adapter. `tui` is not
@@ -102,7 +102,24 @@ pub(crate) fn validate_register(
                 );
             }
         }
+        // Tool sidecars (browser MCP server today; future code_exec,
+        // db_query, …) live in the same `ChannelTokenTable` for
+        // `/v1/blobs` auth, but must never register on `/v1/channel-ws`
+        // — a leaked tool token would otherwise impersonate a channel.
+        // Both arms reject by label prefix; the duplication is
+        // intentional defence in depth (a future refactor that
+        // constructs `Subprocess` directly bypasses `from_identity`).
+        AuthedClient::Tool { label } => {
+            return Err(format!(
+                "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
+            ));
+        }
         AuthedClient::Subprocess { pid, label, .. } => {
+            if label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
+                return Err(format!(
+                    "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
+                ));
+            }
             let identity = tokens
                 .lookup(&token)
                 .ok_or_else(|| "token not registered".to_string())?;
@@ -359,6 +376,31 @@ mod tests {
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(
             err.contains("bound to channel_type 'slack'") && err.contains("'discord'"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn rejects_subprocess_with_tool_label_on_channel_ws() {
+        // The browser tool sidecar mints a token under label
+        // "tool/browser" (see gateway_cmd::start). That token lives in
+        // the same ChannelTokenTable so /v1/tool-ws can accept it via
+        // the channel-auth middleware. If the sidecar (or anyone who
+        // leaked the token) presented it at /v1/channel-ws, the
+        // identity check would pass and `bound_channel_type=None`
+        // would let it through the binding gate too. The label
+        // prefix rule fences this off.
+        let tokens = ChannelTokenTable::new();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 0,
+            label: "tool/browser".into(),
+            bound_channel_type: None,
+        });
+        let frame = register(handle.token(), "telegram");
+        let authed = subprocess(0, "tool/browser");
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(
+            err.contains("tool/browser") && err.contains("reserved for tool sidecars"),
             "got: {err}",
         );
     }
