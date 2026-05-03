@@ -11,11 +11,32 @@ The two hosts are very different. OpenClaw is an in-process plugin model: a Lark
 
 Three shippable phases. Some gateway/SDK extensions land alongside Phase 1 because the user has explicitly OK'd extending Aura's wire surface where it pays off across channels.
 
-| Phase | Scope | Effort |
+| Phase | Scope | Status |
 |---|---|---|
-| **MVP** | `StartBot.metadata` wire field + SDK secret-vault helpers (gateway+SDK extensions, generic to all sidecars). Then: one bot, app-token only, text in/out, image+file attachments, typing indicator, approval inline-card, `/new` echoed via SlashManifest | ~1.5 weeks |
-| **Pretty** | Streaming card replies (CardKit v2), reaction echo, mention/@-all parsing, group policy gate, message dedup, multi-account via `StartBot`/`StopBot` | ~2-3 weeks |
-| **Power-user parity** | Skills bundle (doc/wiki/bitable/calendar/task/IM read), OAuth UAT device flow over the SDK secret API, ask-user-question card, comment-thread routing, VC-meeting-invite handling | ~1-2 months and 2-3 gateway PRs |
+| **MVP** | `StartBot.metadata` wire field + SDK secret-vault helpers (gateway+SDK extensions, generic to all sidecars). Then: one bot, app-token only, text in/out, image+file attachments, typing indicator, approval inline-card, `/new` echoed via SlashManifest | ✅ shipped |
+| **Pretty** | Streaming card replies (CardKit v2), reaction echo, mention/@-all parsing, group policy gate, message dedup, multi-account via `StartBot`/`StopBot` | ✅ shipped |
+| **Power-user parity** | Skills bundle (doc/wiki/bitable/calendar/task/IM read), OAuth UAT device flow over the SDK secret API, ask-user-question card, comment-thread routing, VC-meeting-invite handling | 🟡 mostly shipped — see §1.1 |
+
+### 1.1 Shipped status (as of 2026-05)
+
+What landed across all three phases:
+
+- **MCP tool surface (27 total)**:
+  - Tenant-token reads (5): `feishu_get_chat_info`, `feishu_list_chat_members`, `feishu_get_chat_history`, `feishu_search_chats`, `feishu_get_message`.
+  - UAT reads (12): `feishu_who_am_i`, `feishu_get_user`, `feishu_search_user`, `feishu_calendar` (3 actions), `feishu_calendar_event` (2 actions), `feishu_freebusy`, `feishu_freebusy_batch`, `feishu_wiki` (2 actions), `feishu_search_doc`, `feishu_doc_comments`, `feishu_bitable_records`, `feishu_sheet_read_range`, `feishu_fetch_doc`.
+  - UAT writes with in-chat approval gates (8): `feishu_calendar_event_create` / `_update` / `_delete`, `feishu_bitable_record_create` / `_update` / `_delete`, `feishu_create_doc`, `feishu_update_doc` (mode-aware: destructive modes prompt, additive modes don't).
+  - Interactive (1): `feishu_ask_user`.
+- **OAuth UAT pipeline**: RFC 8628 device flow + chat-card UX, per-bot UAT store backed by the SDK secret vault, background refresh scheduler with per-user mutex, auto-auth interceptor with retry-on-99991663/99991664, mandatory subject verification (Codex review #1), per-tool scope plumbing with insufficient-scope reauth (Codex #2), terminal-vs-transient OAuth error classification (Codex #4).
+- **Write safety framework**: `LarkPlatform.approveWrite` sends interactive [Approve] [Deny] cards into the active conversation, gates destructive MCP writes per call, fails closed if the platform didn't wire the handler. Operator filter prevents cross-user approval.
+- **Workspace skills (5)**: `feishu-channel-rules`, `feishu-calendar`, `feishu-bitable`, `feishu-docs`, `feishu-people`, `feishu-troubleshoot`.
+- **Diagnostics**: `/v1/admin/channels/lark/diagnose` round-trip with 6 checks (`bot_identity`, `transport`, `config`, `mcp_tools`, `uat_pipeline`, `oauth_endpoint`).
+
+What did **not** ship:
+
+- **VC meeting-invited handler** — deferred indefinitely on an SDK dependency. Re-evaluate if `@larksuiteoapi/node-sdk` exposes VC events on `LarkChannel.on(...)` in a future release. See Phase 3 item 7 for the analysis.
+- **Bulk OAPI tool ports** — deferred to "Wave C deferred" (calendar attendees, bitable app/table/field/view CRUD, drive file/doc-media, sheets writes, task family, IM read with UAT). Each item documents why it wasn't worth it for v0; pull in by user demand.
+- **`bin/lark-diagnose` CLI binary** — admin endpoint covers the operational case; standalone offline binary is convenience to add later.
+- **`Frame::AbortSession`** (Phase 0.4 in §4) — no Lark-specific consumer landed; deferred until a real abort UX surfaces.
 
 **Guiding principles** (from explicit user direction):
 1. **SDK-first.** If a capability could be useful to a second channel, it goes into `sdks/channel-ts/` and not into the Lark sidecar. The Lark sidecar consumes; it doesn't carry generic plumbing.
@@ -787,15 +808,23 @@ No gateway changes needed yet.
 
 This is where Aura's runtime needs to grow:
 
-1. **Tool-use telemetry frames** (gateway change) — `Frame::ToolCallStarted { call_id, tool, params_preview }` and `Frame::ToolCallCompleted { call_id, result_preview, error?, duration_ms }`. Channels can render mid-agent tool runs in the streaming card. ~200 LOC in `crates/gateway/src/channel/adapter.rs` + `crates/channels/src/wire.rs` + ts-rs export. **SDK-first:** the SDK adds `Channel.onToolCallStarted` / `onToolCallCompleted` hooks so any channel can render tool-use UI without re-decoding the wire.
-2. **Channel-flavoured slash commands** (gateway change) — extend `crates/gateway/src/channel/slash.rs::manifest()` to be per-channel-type, and add a `Frame::SlashInvoke { command, args }` push to the sidecar with `Frame::SlashReply` back. Or: keep slash purely client-rendered and have the sidecar special-case command-shaped inbounds before yielding (the cheap path).
+1. **Tool-use telemetry frames** (gateway change) ✅ shipped — `Frame::ToolCallStarted { call_id, tool, params_preview }` and `Frame::ToolCallCompleted { call_id, result_preview, error?, duration_ms }`. Channels can render mid-agent tool runs in the streaming card. ~200 LOC in `crates/gateway/src/channel/adapter.rs` + `crates/channels/src/wire.rs` + ts-rs export. **SDK-first:** the SDK adds `Channel.onToolCallStarted` / `onToolCallCompleted` hooks so any channel can render tool-use UI without re-decoding the wire.
+2. **Channel-flavoured slash commands** (gateway change) ✅ shipped (`crates/gateway/src/channel/slash.rs` per-channel-type manifest; lark `/help`).
 3. **Tool exposure** (sidecar work, no gateway change). Two parallel surfaces:
-   - **MCP-as-server in the sidecar** for the 28 OAPI tools — the sidecar runs an MCP stdio (or unix socket) endpoint alongside its WS connection; Aura's existing MCP client wires it in. 1:1 ports of openclaw's `src/tools/oapi/**` TS handlers, reusing `@larksuiteoapi/node-sdk` and the TypeBox schemas. **OAuth UAT storage uses the SDK secret-vault helper from §4.0.2** — same primitive any future channel reuses for its own per-user OAuth.
-   - **HTTP proxy to Feishu's hosted MCP gateway** for the 3 doc tools (`feishu_fetch_doc`, `feishu_create_doc`, `feishu_update_doc`) — openclaw itself uses `mcp.larksuite.com` here because Feishu OAPI doesn't expose those operations. Port `src/tools/mcp/shared.ts:callMcpTool` as another tool the MCP-server in the sidecar exposes; it's just a typed wrapper around an outbound HTTP call.
-4. **Skill bundle** — copy `skills/feishu-*` markdown into the workspace `skills/` directory.
-5. **Diagnostics CLI + admin endpoint** — `bin/lark-diagnose` plus `/v1/admin/channels/lark/diagnose` for the WebUI. **Stays Lark-local** (under `channel-src/lark/src/diagnostic/`). Lark is the only channel with a config × permission × OAuth × network matrix that warrants a dedicated doctor; Telegram's health is `bot.getMe()` and doesn't need a framework. Promote into the SDK only when there's a second consumer.
-6. **Ask-user-question tool** — implement as an MCP tool in the sidecar that posts a card and blocks on the callback.
-7. **VC meeting-invited handler** — port; emits a synthetic inbound. Sidecar drops outbound on synthetic targets (mirrors `outbound.ts:175-178`).
+   - **MCP-as-server in the sidecar** ✅ shipped — the sidecar runs an MCP stdio (or unix socket) endpoint alongside its WS connection; Aura's existing MCP client wires it in. 28 of the 28 openclaw OAPI tool slots were considered; we landed **20 MCP tools** (5 tenant-token reads + 12 UAT reads + 3 UAT writes with approval gates) and explicitly deferred the rest (calendar attendee CRUD, bitable app/table/field/view CRUD, drive file/doc-media, sheets writes, task family) — see "Wave C deferred" below.
+   - **HTTP proxy to Feishu's hosted MCP gateway** ✅ shipped — `feishu_fetch_doc` / `feishu_create_doc` / `feishu_update_doc` route through `mcp.feishu.cn` (or `mcp.larksuite.com`) via JSON-RPC over fetch with `X-Lark-MCP-UAT` header. `feishu_update_doc` has mode-aware approval gating (destructive modes prompt; additive modes don't).
+4. **Skill bundle** ✅ shipped — 5 workspace skills under `skills/feishu-*` (channel-rules, calendar, bitable, docs, people, troubleshoot). **Adapted not copied** — openclaw's skill corpus references several tools we deliberately didn't port (event search/reply, attendee CRUD, IM read with UAT, task family), so a 1:1 copy would mislead the agent into calling non-existent tools.
+5. **Diagnostics admin endpoint** ✅ shipped — `/v1/admin/channels/lark/diagnose` round-trip checks: `bot_identity`, `transport`, `config`, `mcp_tools`, `uat_pipeline` (stored UAT count + secrets-capability probe), `oauth_endpoint` (HTTPS reachability to `open.X` separate from the WS `wss://open.X` host). The `bin/lark-diagnose` CLI is **not** built — the admin endpoint covers the operational need; a standalone CLI binary is a future convenience for offline debugging.
+6. **Ask-user-question tool** ✅ shipped (`feishu_ask_user`).
+7. **VC meeting-invited handler** ❌ **deferred — SDK dependency**. `@larksuiteoapi/node-sdk`'s `LarkChannel.on(...)` only surfaces 9 events (`message`, `cardAction`, `reaction`, `botAdded`, `comment`, `error`, `reconnecting`, `reconnected`, `reject`) — VC meeting events (`vc.meeting.meeting_started_v1`, `meeting_ended_v1`, `meeting_recording_*`) flow through the lower-level `EventDispatcher` which `LarkChannel` keeps private. Implementing this would require either forking the wrapper to expose the dispatcher, or opening a second `WSClient` ourselves with duplicated auth/encrypt-key handling — both ~1 day of work for an unclear use case (no concrete user demand for "agent receives VC invite then..."). Re-evaluate if the SDK exposes VC events in a future release, or if a real user workflow surfaces.
+
+**Wave C deferred (in scope of #3 but not landed)**:
+- Calendar event attendees (CRUD via `calendar.calendarEventAttendee.create/list/delete` — needs its own approval-card design since it cascades notifications).
+- Bitable beyond record CRUD: app / table / field / view (admin-leaning, low frequency).
+- Drive file/doc-media upload+download (involves streaming through the blob channel).
+- Sheets beyond range read (batch update, append, find-and-replace — partial-success semantics need careful surfacing).
+- Task family (`feishu_task_*`, `feishu_tasklist_*`, sections / subtasks / comments / attachments — separate workflow stack, ~7 tools).
+- IM read with UAT (`feishu_im_user_get_messages` etc. — redundant with the existing tenant-token `feishu_get_chat_history`).
 
 ## 5. What we deliberately won't port
 
