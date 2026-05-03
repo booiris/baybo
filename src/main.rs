@@ -138,7 +138,11 @@ async fn main() -> anyhow::Result<()> {
         // `llm` / `doctor` / `status` never send multimodal content,
         // so it's fine to skip the BlobStore wiring here — opening
         // libsql for a status probe would be wasteful.
-        match boot::build_llm_client(&config.llm, None) {
+        // No vault here either: argv-mode `llm` / `doctor` / `status` are
+        // probes that don't need OAuth tokens; the openai-subscription
+        // provider's create() returns a clear error if it's selected
+        // without a vault.
+        match boot::build_llm_client(&config.llm, None, None) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 tracing::warn!(error = %e, "LLM client unavailable for this command");

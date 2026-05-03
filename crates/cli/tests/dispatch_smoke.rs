@@ -1920,7 +1920,10 @@ async fn llm_models_lists_default_providers() {
     let out = dispatch::run(
         &ctx,
         Commands::Llm {
-            cmd: LlmCmd::Models,
+            cmd: LlmCmd::Models {
+                live: false,
+                provider: None,
+            },
         },
     )
     .await

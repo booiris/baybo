@@ -1,6 +1,6 @@
 mod error;
 pub mod multimodal;
-mod providers;
+pub mod providers;
 pub mod registry;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 pub use crate::error::LlmError;
-pub use crate::registry::{LlmProviderConfig, LlmProviderRegistry, ProviderModels};
+pub use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, ProviderModels};
 
 /// Strip `; charset=…` and lowercase, then map common MIME strings to
 /// rig's `ImageMediaType` enum. `None` means the model can't natively
@@ -263,6 +263,10 @@ pub(crate) enum AnyCompletionModel {
     OpenAI(openai::completion::CompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
+    /// ChatGPT/Codex OAuth subscription path. Doesn't go through rig — the
+    /// Codex Responses API uses a different request shape and needs custom
+    /// auth + 401-refresh handling. See `providers::openai_subscription`.
+    OpenAiSubscription(crate::providers::openai_subscription::OpenAiSubscriptionCompletionModel),
 }
 
 impl AnyCompletionModel {
@@ -298,6 +302,7 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
+            Self::OpenAiSubscription(m) => m.completion(request).await,
         }
     }
 
@@ -318,6 +323,7 @@ impl AnyCompletionModel {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_rig_stream(stream))
             }
+            Self::OpenAiSubscription(m) => m.stream(request).await,
         }
     }
 }
@@ -927,6 +933,7 @@ mod multimodal_dispatch_tests {
                 base_url: None,
                 model: "MiniMax-VL-01".into(),
                 supports_vision: Some(true),
+                vault: None,
             })
             .unwrap()
     }
@@ -1017,6 +1024,7 @@ mod multimodal_dispatch_tests {
                 base_url: None,
                 model: "gpt-3.5-turbo".into(),
                 supports_vision: None,
+                vault: None,
             })
             .unwrap();
         // OpenAI factory may set vision=true on some models; force

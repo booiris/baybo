@@ -135,7 +135,10 @@ fn llm_models_and_probe_parse() {
     assert!(matches!(
         cli.command,
         Some(Commands::Llm {
-            cmd: LlmCmd::Models
+            cmd: LlmCmd::Models {
+                live: false,
+                provider: None,
+            }
         })
     ));
     let cli = parse(&["llm", "probe"]);

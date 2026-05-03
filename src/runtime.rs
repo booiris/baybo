@@ -233,6 +233,14 @@ pub async fn build_managers(
     // child crashes), the LLM does not see `browser/*` tools at all.
     let mut tool_registry = Arc::new(ToolRegistry::with_defaults(stores.blob.clone()));
 
+    // Vault is constructed up here (before `build_llm_client`) so the
+    // openai-subscription provider can read its OAuth bundle straight away.
+    // Other providers ignore the vault. Comment from the original site:
+    // can't route through `build_secret_vault` (it would re-open libsql);
+    // share the master-key policy via `load_master_key`.
+    let master_key = load_master_key(&config.security)?;
+    let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
+
     // Built after `stores` so `build_llm_client` can wire the blob
     // store in as a `BlobFetcher` — without it, multimodal user
     // content would degrade to a `[image: …]` text stub even on
@@ -241,6 +249,7 @@ pub async fn build_managers(
         let client = Arc::new(boot::build_llm_client(
             &config.llm,
             Some(stores.blob.clone()),
+            Some(Arc::clone(&secret_vault)),
         )?);
         info!(
             provider = %client.model_info().provider,
@@ -281,13 +290,6 @@ pub async fn build_managers(
     let job_manager = Arc::new(job_manager);
 
     let cost_tracker = Arc::new(CostTracker::new(stores.cost.clone()));
-
-    // --- secret vault (master key optionally substituted with a dev key).
-    // The store is already open here, so we can't route through
-    // `build_secret_vault` (it would re-open libsql); share the
-    // master-key policy via `load_master_key`.
-    let master_key = load_master_key(&config.security)?;
-    let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
 
     // --- cron scheduler (built before ToolExecutor so its tools register
     // while `tool_registry` still has a single Arc owner)

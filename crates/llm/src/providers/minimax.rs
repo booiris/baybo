@@ -88,6 +88,7 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            vault: None,
         };
         assert!(factory.create(&config).is_err());
     }
@@ -101,6 +102,7 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            vault: None,
         };
         let client = factory.create(&config).expect("client builds with api key");
         assert_eq!(client.model_info().provider, "minimax");
@@ -126,6 +128,7 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            vault: None,
         };
         let client = factory.create(&config).unwrap();
         assert!(!client.model_info().supports_vision);
@@ -144,6 +147,7 @@ mod tests {
                 base_url: None,
                 model: "MiniMax-VL-01".into(),
                 supports_vision: Some(true),
+                vault: None,
             })
             .unwrap();
         assert!(client.model_info().supports_vision);
@@ -162,6 +166,7 @@ mod tests {
                 base_url: None,
                 model: "claude-sonnet-4-6".into(),
                 supports_vision: Some(false),
+                vault: None,
             })
             .unwrap();
         assert!(!client.model_info().supports_vision);

@@ -1,0 +1,1760 @@
+//! Codex Responses API client driven by an OAuth bearer.
+//! Endpoint: `<base_url>/codex/responses`. See
+//! `docs/modules/llm-openai-subscription.md` for design rationale.
+
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use futures::stream::{self, Stream, StreamExt};
+use rig::OneOrMany;
+use rig::completion::message::{
+    AssistantContent, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction, UserContent,
+};
+use rig::completion::{self, CompletionError, CompletionRequest};
+use rig::message::Message;
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
+
+use super::oauth::{ORIGINATOR, RefreshError, refresh};
+use super::token_bundle::OAuthTokenBundle;
+use super::token_store::VaultTokenStore;
+use crate::{LlmError, LlmStream, StreamEvent, TokenUsage, ToolCallInfo};
+
+pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const RESPONSES_PATH: &str = "/codex/responses";
+
+/// Just-in-time refresh skew. Safety net for the window where the
+/// background loop hasn't ticked yet.
+const REFRESH_SKEW_SECS: i64 = 60;
+/// Background refresh cadence — long enough to avoid spinning the
+/// refresh-token rotation counter, short enough to keep the cache warm.
+const BACKGROUND_REFRESH_INTERVAL_SECS: u64 = 3600;
+/// Wider margin for the background loop so it acts before the JIT path
+/// has to.
+const BACKGROUND_REFRESH_MARGIN_SECS: i64 = 300;
+
+/// A rotated refresh_token must hit the disk; if it doesn't, a process
+/// restart reads the burned old token and forces re-login. Retry hard
+/// before falling back to the in-memory dirty state.
+const VAULT_SAVE_RETRY_ATTEMPTS: usize = 3;
+const VAULT_SAVE_RETRY_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
+
+/// Cache-hit path re-validates the vault every N seconds so a
+/// cross-process logout is honoured within that window. Within the
+/// window, hot-path requests skip the vault read entirely.
+const CACHE_VAULT_REVALIDATE_INTERVAL_SECS: i64 = 60;
+
+/// Whether to spawn the periodic background-refresh task on construction.
+/// Production wiring uses `Enabled`; unit tests use `Disabled` so the
+/// suite doesn't leak spawned tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundRefresh {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Debug)]
+struct CachedBundle {
+    /// Wrapped in Arc so the hot-path read returns a refcount bump
+    /// instead of cloning ~2 KiB of JWT material per chat request.
+    bundle: Arc<OAuthTokenBundle>,
+    /// `false` = a prior vault save failed; the next refresh-path entry
+    /// retries the save before doing anything else.
+    persisted: bool,
+    /// Last time we re-read the vault. `0` = never. Folded in here (not
+    /// a separate atomic) so cache state and revalidation timestamp
+    /// can't disagree.
+    last_vault_check: i64,
+}
+
+#[derive(Clone)]
+pub struct OpenAiSubscriptionCompletionModel {
+    model: String,
+    base_url: String,
+    http: reqwest::Client,
+    token_store: VaultTokenStore,
+    cache: Arc<Mutex<Option<CachedBundle>>>,
+    /// Single-flight gate for refresh ops. Without it, two concurrent
+    /// callers would both call `refresh()` with the same refresh_token
+    /// and one would hit `refresh_token_reused` → vault cleared → user
+    /// logged out under nothing but normal load.
+    refresh_flight: Arc<Mutex<()>>,
+}
+
+impl OpenAiSubscriptionCompletionModel {
+    pub fn new(
+        model: String,
+        base_url: Option<String>,
+        token_store: VaultTokenStore,
+        background: BackgroundRefresh,
+    ) -> Self {
+        let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let model = Self {
+            model,
+            base_url,
+            http: reqwest::Client::new(),
+            token_store: token_store.clone(),
+            cache: Arc::new(Mutex::new(None)),
+            refresh_flight: Arc::new(Mutex::new(())),
+        };
+        if background == BackgroundRefresh::Enabled {
+            spawn_background_refresh_loop(
+                token_store,
+                Arc::clone(&model.cache),
+                Arc::clone(&model.refresh_flight),
+            );
+        }
+        model
+    }
+
+    pub fn base_url_is_default(&self) -> bool {
+        self.base_url == DEFAULT_BASE_URL
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// rig-shape completion: drives the stream internally and assembles a
+    /// non-streaming response. Single network call regardless.
+    pub async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<()>, CompletionError> {
+        let stream = self.stream(request).await?;
+        let mut text_buf = String::new();
+        let mut reasoning_buf = String::new();
+        let mut thinking_blocks: Vec<aura_model::ContentBlock> = Vec::new();
+        let mut tool_calls: Vec<ToolCallInfo> = Vec::new();
+        let mut usage = TokenUsage::default();
+        let mut stream = stream;
+        while let Some(event) = stream.next().await {
+            match event.map_err(|e| CompletionError::ProviderError(e.to_string()))? {
+                StreamEvent::Text(chunk) => text_buf.push_str(&chunk),
+                StreamEvent::Reasoning(delta) => reasoning_buf.push_str(&delta),
+                StreamEvent::ThinkingBlock(block) => thinking_blocks.push(block),
+                StreamEvent::ToolCall(call) => tool_calls.push(call),
+                StreamEvent::Usage(u) => usage = u,
+            }
+        }
+
+        // Choice order: reasoning first, then text, then tool calls — matches
+        // the agent loop's expectation when it reads `AssistantContent` and
+        // converts to `LlmResponse.thinking` + content.
+        let mut choice_parts: Vec<AssistantContent> = Vec::new();
+        if let Some(reasoning) = build_reasoning_block(reasoning_buf, thinking_blocks) {
+            choice_parts.push(AssistantContent::Reasoning(reasoning));
+        }
+        if !text_buf.is_empty() {
+            choice_parts.push(AssistantContent::Text(Text { text: text_buf }));
+        }
+        for tc in tool_calls {
+            choice_parts.push(AssistantContent::ToolCall(ToolCall {
+                id: tc.id,
+                call_id: None,
+                function: ToolFunction {
+                    name: tc.name,
+                    arguments: tc.arguments,
+                },
+                signature: tc.signature,
+                additional_params: None,
+            }));
+        }
+        if choice_parts.is_empty() {
+            choice_parts.push(AssistantContent::Text(Text {
+                text: String::new(),
+            }));
+        }
+        let first = choice_parts.remove(0);
+        let mut choice = OneOrMany::one(first);
+        for part in choice_parts {
+            choice.push(part);
+        }
+
+        Ok(completion::CompletionResponse {
+            choice,
+            usage: completion::Usage {
+                input_tokens: usage.input_tokens as u64,
+                output_tokens: usage.output_tokens as u64,
+                total_tokens: (usage.input_tokens + usage.output_tokens) as u64,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+            raw_response: (),
+            message_id: None,
+        })
+    }
+
+    /// Open a streaming connection to `<base_url>/codex/responses` with
+    /// pre-flight + reactive (401-once) refresh handling.
+    pub async fn stream(&self, request: CompletionRequest) -> Result<LlmStream, CompletionError> {
+        let body = build_responses_body(&self.model, &request).map_err(|msg| {
+            let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+            CompletionError::RequestError(err)
+        })?;
+        let bundle = self
+            .ensure_fresh_bundle()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+        let response = self
+            .send(&bundle, &body)
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            warn!(
+                event = "openai_subscription_unauthorized",
+                "Codex returned 401 — refreshing token and retrying once"
+            );
+            let refreshed = self
+                .force_refresh(&bundle)
+                .await
+                .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+            let retried = self
+                .send(&refreshed, &body)
+                .await
+                .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+            if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(CompletionError::ProviderError(
+                    "openai-subscription: unauthorized after refresh — run `aura llm auth login \
+                     --provider openai-subscription`"
+                        .into(),
+                ));
+            }
+            retried
+        } else {
+            response
+        };
+        Ok(self.adapt_response(response))
+    }
+
+    async fn ensure_fresh_bundle(&self) -> crate::Result<Arc<OAuthTokenBundle>> {
+        let now = chrono::Utc::now().timestamp();
+        // Hot path: cache hit, fresh, and we read the vault recently.
+        if let Some(cached) = self.cache.lock().await.as_ref()
+            && !cached.bundle.is_near_expiry(REFRESH_SKEW_SECS)
+            && now - cached.last_vault_check < CACHE_VAULT_REVALIDATE_INTERVAL_SECS
+        {
+            return Ok(Arc::clone(&cached.bundle));
+        }
+
+        // Past the revalidate window OR cache miss OR near-expiry: read
+        // the vault. Covers cross-process logout, cross-process refresh,
+        // and fresh process startup uniformly.
+        let from_vault = self.token_store.load().await?;
+        let candidate = match from_vault {
+            Some(b) => b,
+            None => {
+                let had_cache = self.cache.lock().await.take().is_some();
+                if had_cache {
+                    tracing::info!(
+                        event = "openai_subscription_cache_invalidated",
+                        outcome = "vault_empty",
+                        "vault entry disappeared (cross-process logout?); dropped in-memory bundle"
+                    );
+                }
+                return Err(LlmError::Config(
+                    "openai-subscription: not signed in — run \
+                     `aura llm auth login --provider openai-subscription`"
+                        .into(),
+                ));
+            }
+        };
+        if !candidate.is_near_expiry(REFRESH_SKEW_SECS) {
+            let bundle = Arc::new(candidate);
+            *self.cache.lock().await = Some(CachedBundle {
+                bundle: Arc::clone(&bundle),
+                persisted: true,
+                last_vault_check: now,
+            });
+            return Ok(bundle);
+        }
+        do_single_flight_refresh(
+            &self.refresh_flight,
+            &self.cache,
+            &self.token_store,
+            &candidate.refresh_token,
+        )
+        .await
+    }
+
+    /// Live model discovery against `<base>/codex/models`.
+    pub async fn list_remote_models(&self) -> crate::Result<Vec<crate::LiveModelInfo>> {
+        let url = format!(
+            "{}/codex/models?client_version={}",
+            self.base_url,
+            env!("CARGO_PKG_VERSION")
+        );
+        let bundle = self.ensure_fresh_bundle().await?;
+        let resp = self.send_models_get(&url, &bundle).await?;
+        let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let refreshed = self.force_refresh(&bundle).await?;
+            self.send_models_get(&url, &refreshed).await?
+        } else {
+            resp
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LlmError::Provider(format!(
+                "openai-subscription: GET /codex/models returned {status}: {body}"
+            )));
+        }
+        parse_models_response(resp).await
+    }
+
+    async fn send_models_get(
+        &self,
+        url: &str,
+        bundle: &OAuthTokenBundle,
+    ) -> crate::Result<reqwest::Response> {
+        self.authed_request(reqwest::Method::GET, url, bundle)
+            .send()
+            .await
+            .map_err(|e| {
+                LlmError::Provider(format!(
+                    "openai-subscription: GET /codex/models transport: {e}"
+                ))
+            })
+    }
+
+    async fn force_refresh(
+        &self,
+        current: &OAuthTokenBundle,
+    ) -> crate::Result<Arc<OAuthTokenBundle>> {
+        do_single_flight_refresh(
+            &self.refresh_flight,
+            &self.cache,
+            &self.token_store,
+            &current.refresh_token,
+        )
+        .await
+    }
+
+    /// Apply the bearer + originator + (optional) account-id headers
+    /// shared by every authenticated request. Returns a `RequestBuilder`
+    /// the caller chains `.json()` / `.send()` onto.
+    fn authed_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        bundle: &OAuthTokenBundle,
+    ) -> reqwest::RequestBuilder {
+        let mut req = self
+            .http
+            .request(method, url)
+            .bearer_auth(&bundle.access_token)
+            .header("originator", ORIGINATOR);
+        if let Some(account_id) = &bundle.account_id {
+            req = req.header("ChatGPT-Account-Id", account_id);
+        }
+        req
+    }
+
+    async fn send(
+        &self,
+        bundle: &OAuthTokenBundle,
+        body: &Value,
+    ) -> crate::Result<reqwest::Response> {
+        let url = format!("{}{}", self.base_url, RESPONSES_PATH);
+        debug!(url = %url, "POST openai-subscription Responses");
+        self.authed_request(reqwest::Method::POST, &url, bundle)
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("Accept", "text/event-stream")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| LlmError::Provider(format!("openai-subscription: HTTP transport: {e}")))
+    }
+
+    fn adapt_response(&self, response: reqwest::Response) -> LlmStream {
+        let status = response.status();
+        if !status.is_success() {
+            // Surface as a single-element error stream so callers see the
+            // provider message rather than an empty stream.
+            let stream = stream::once(async move {
+                let body = response.text().await.unwrap_or_default();
+                Err(LlmError::Provider(format!(
+                    "openai-subscription: Codex Responses returned {status}: {body}"
+                )))
+            });
+            return LlmStream::from_inner(Box::pin(stream));
+        }
+        LlmStream::from_inner(Box::pin(parse_sse_stream(response)))
+    }
+}
+
+/// rig `CompletionRequest` → Codex Responses API JSON body. Returns
+/// `Value` so tests can inspect the shape without mocking HTTP.
+pub(crate) fn build_responses_body(
+    model: &str,
+    request: &CompletionRequest,
+) -> Result<Value, String> {
+    let mut input: Vec<Value> = Vec::new();
+    for message in request.chat_history.iter() {
+        for item in convert_message(message)? {
+            input.push(item);
+        }
+    }
+
+    let tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            })
+        })
+        .collect();
+
+    // store=false: we manage conversation state ourselves; don't ask
+    // the server to retain it (matches the Codex CLI posture).
+    let mut body = json!({
+        "model": model,
+        "input": input,
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "stream": true,
+        "store": false,
+    });
+    if let Some(preamble) = &request.preamble {
+        body["instructions"] = Value::String(preamble.clone());
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+    if let Some(temp) = request.temperature {
+        body["temperature"] = json!(temp);
+    }
+    Ok(body)
+}
+
+async fn parse_models_response(
+    resp: reqwest::Response,
+) -> crate::Result<Vec<crate::LiveModelInfo>> {
+    let body: Value = resp.json().await.map_err(|e| {
+        LlmError::Provider(format!(
+            "openai-subscription: /codex/models response parse: {e}"
+        ))
+    })?;
+    project_models_body(body)
+}
+
+/// Project Codex's `{ "models": [...] }` into `Vec<LiveModelInfo>`. Each
+/// raw entry is stashed verbatim into `extras` so operators with --json
+/// can see fields aura doesn't surface.
+fn project_models_body(mut body: Value) -> crate::Result<Vec<crate::LiveModelInfo>> {
+    let raw = match body.get_mut("models").map(Value::take) {
+        Some(Value::Array(arr)) => arr,
+        _ => {
+            return Err(LlmError::Provider(format!(
+                "openai-subscription: /codex/models missing `models` array; body: {body}"
+            )));
+        }
+    };
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let id = entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                LlmError::Provider(format!(
+                    "openai-subscription: model entry missing `slug`: {entry}"
+                ))
+            })?;
+        let display_name = entry
+            .get("display_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let description = entry
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .filter(|s| !s.is_empty());
+        let context_window = entry
+            .get("context_window")
+            .and_then(Value::as_u64)
+            .or_else(|| entry.get("max_context_window").and_then(Value::as_u64))
+            .map(|v| v as usize);
+        let supports_vision = entry
+            .get("input_modalities")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .any(|m| m.as_str() == Some("image") || m.as_str() == Some("Image"))
+            });
+        // All Codex-served models are tool-capable; `supports_parallel_tool_calls`
+        // is a different question and shouldn't be conflated.
+        let supports_tools = Some(true);
+        out.push(crate::LiveModelInfo {
+            id,
+            display_name,
+            description,
+            context_window,
+            supports_vision,
+            supports_tools,
+            extras: entry,
+        });
+    }
+    Ok(out)
+}
+
+fn convert_message(message: &Message) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new();
+    match message {
+        Message::User { content } => {
+            // Split into one Responses API item per tool result (function_call_output)
+            // plus one combined message item for text/image parts.
+            let mut text_parts: Vec<Value> = Vec::new();
+            for item in content.iter() {
+                match item {
+                    UserContent::Text(t) => {
+                        text_parts.push(json!({
+                            "type": "input_text",
+                            "text": t.text,
+                        }));
+                    }
+                    UserContent::ToolResult(tr) => {
+                        let text_output = tool_result_to_text(tr);
+                        out.push(json!({
+                            "type": "function_call_output",
+                            "call_id": tr.id,
+                            "output": text_output,
+                        }));
+                    }
+                    UserContent::Image(_)
+                    | UserContent::Audio(_)
+                    | UserContent::Document(_)
+                    | UserContent::Video(_) => {
+                        // Multimodal not wired for the OAuth path yet — degrade
+                        // to a placeholder so the call doesn't fail outright.
+                        text_parts.push(json!({
+                            "type": "input_text",
+                            "text": "[non-text user content elided — openai-subscription does not yet pass binary blobs]",
+                        }));
+                    }
+                }
+            }
+            if !text_parts.is_empty() {
+                out.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": text_parts,
+                }));
+            }
+        }
+        Message::Assistant { content, .. } => {
+            let mut text_parts: Vec<Value> = Vec::new();
+            for item in content.iter() {
+                match item {
+                    AssistantContent::Text(t) => {
+                        text_parts.push(json!({
+                            "type": "output_text",
+                            "text": t.text,
+                        }));
+                    }
+                    AssistantContent::ToolCall(call) => {
+                        out.push(json!({
+                            "type": "function_call",
+                            "call_id": call.id,
+                            "name": call.function.name,
+                            "arguments": call.function.arguments.to_string(),
+                        }));
+                    }
+                    AssistantContent::Reasoning(_) => {
+                        // Server reconstructs reasoning from
+                        // `include: ["reasoning.encrypted_content"]`; nothing to send.
+                    }
+                    AssistantContent::Image(_) => {
+                        text_parts.push(json!({
+                            "type": "output_text",
+                            "text": "[assistant-generated image elided]",
+                        }));
+                    }
+                }
+            }
+            if !text_parts.is_empty() {
+                out.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": text_parts,
+                }));
+            }
+        }
+        // System messages normally flow through `preamble` -> `instructions`.
+        // Codex Responses API has no system-role item; emit as user text so
+        // a stray System variant isn't silently dropped.
+        Message::System { content } => {
+            out.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": content }],
+            }));
+        }
+    }
+    Ok(out)
+}
+
+/// Combine streamed reasoning deltas + any complete `Thinking` blocks
+/// into one `Reasoning` block for `AssistantContent`. Returns `None`
+/// when there's nothing to surface.
+fn build_reasoning_block(
+    reasoning_buf: String,
+    thinking_blocks: Vec<aura_model::ContentBlock>,
+) -> Option<Reasoning> {
+    let mut content: Vec<ReasoningContent> = Vec::new();
+    if !reasoning_buf.is_empty() {
+        // Codex reasoning deltas are summary-style (no signature payload).
+        content.push(ReasoningContent::Summary(reasoning_buf));
+    }
+    for block in thinking_blocks {
+        if let aura_model::ContentBlock::Thinking { content: tc, .. } = block {
+            for piece in tc {
+                content.push(match piece {
+                    aura_model::ThinkingContent::Text { text, signature } => {
+                        ReasoningContent::Text { text, signature }
+                    }
+                    aura_model::ThinkingContent::Summary { text } => {
+                        ReasoningContent::Summary(text)
+                    }
+                    aura_model::ThinkingContent::Redacted { data } => {
+                        ReasoningContent::Redacted { data }
+                    }
+                });
+            }
+        }
+    }
+    if content.is_empty() {
+        return None;
+    }
+    let mut reasoning = Reasoning::new("");
+    reasoning.content = content;
+    Some(reasoning)
+}
+
+fn tool_result_to_text(tr: &completion::message::ToolResult) -> String {
+    use completion::message::ToolResultContent;
+    let mut buf = String::new();
+    for piece in tr.content.iter() {
+        match piece {
+            ToolResultContent::Text(t) => buf.push_str(&t.text),
+            _ => buf.push_str("[non-text tool result content elided]"),
+        }
+    }
+    buf
+}
+
+/// SSE → flat `Stream<Result<StreamEvent>>`. Drops unknown event types;
+/// Codex frequently adds new ones and we'd rather skip them than fail.
+fn parse_sse_stream(
+    response: reqwest::Response,
+) -> impl Stream<Item = crate::Result<StreamEvent>> + Send {
+    use bytes::BytesMut;
+    let mut buffer = BytesMut::new();
+    let mut function_calls: HashMap<String, FunctionCallAccumulator> = HashMap::new();
+    let mut byte_stream = response.bytes_stream();
+
+    async_stream::stream! {
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    yield Err(LlmError::Provider(format!(
+                        "openai-subscription: SSE transport: {e}"
+                    )));
+                    return;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            // SSE events are separated by blank lines (\n\n). Pull all
+            // complete events out of the buffer.
+            while let Some(idx) = find_event_boundary(&buffer) {
+                let raw = buffer.split_to(idx + 2);
+                let raw_str = match std::str::from_utf8(&raw) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield Err(LlmError::Provider(format!(
+                            "openai-subscription: SSE non-UTF-8: {e}"
+                        )));
+                        return;
+                    }
+                };
+                let Some(event) = parse_sse_event(raw_str) else { continue };
+                match translate_event(&mut function_calls, event) {
+                    Some(events) => {
+                        for ev in events {
+                            yield ev;
+                        }
+                    }
+                    None => continue,
+                }
+            }
+        }
+    }
+}
+
+fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SseEvent {
+    event_type: String,
+    data: String,
+}
+
+fn parse_sse_event(raw: &str) -> Option<SseEvent> {
+    let mut event_type = String::new();
+    let mut data_lines: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_type = rest.trim().to_owned();
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.trim_start());
+        } else if line.starts_with(':') {
+            // Comment / heartbeat — ignore.
+            continue;
+        }
+    }
+    if event_type.is_empty() && data_lines.is_empty() {
+        return None;
+    }
+    Some(SseEvent {
+        event_type,
+        data: data_lines.join("\n"),
+    })
+}
+
+#[derive(Default)]
+struct FunctionCallAccumulator {
+    name: String,
+    arguments: String,
+}
+
+fn translate_event(
+    function_calls: &mut HashMap<String, FunctionCallAccumulator>,
+    event: SseEvent,
+) -> Option<Vec<crate::Result<StreamEvent>>> {
+    let payload: Value = serde_json::from_str(&event.data).ok()?;
+    let mut out: Vec<crate::Result<StreamEvent>> = Vec::new();
+    match event.event_type.as_str() {
+        // Plain text chunks coming back from the model.
+        "response.output_text.delta" => {
+            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                out.push(Ok(StreamEvent::Text(delta.to_owned())));
+            }
+        }
+        // Reasoning summary deltas (gpt-5 family).
+        "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
+            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                out.push(Ok(StreamEvent::Reasoning(delta.to_owned())));
+            }
+        }
+        // Tool / function call assembly. Codex emits an `added` event with
+        // the call's name + id, then a stream of `arguments.delta`s, then a
+        // `done`/`completed` event.
+        "response.output_item.added" => {
+            if let Some(item) = payload.get("item")
+                && item.get("type").and_then(Value::as_str) == Some("function_call")
+            {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("id").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_owned();
+                if !call_id.is_empty() {
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    function_calls
+                        .entry(call_id)
+                        .or_insert_with(|| FunctionCallAccumulator {
+                            name,
+                            arguments: String::new(),
+                        });
+                }
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let call_id = payload
+                .get("call_id")
+                .or_else(|| payload.get("item_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let delta = payload.get("delta").and_then(Value::as_str).unwrap_or("");
+            if !call_id.is_empty() {
+                let entry = function_calls.entry(call_id.to_owned()).or_default();
+                entry.arguments.push_str(delta);
+            }
+        }
+        "response.function_call_arguments.done" | "response.output_item.done" => {
+            // Pull the matching accumulator out and emit the assembled call.
+            // `output_item.done` carries the full item; if `function_calls`
+            // already has a richer view (because we saw the deltas) prefer
+            // that, otherwise reconstruct from the payload.
+            let call_id = payload
+                .get("call_id")
+                .or_else(|| payload.get("item").and_then(|i| i.get("call_id")))
+                .or_else(|| payload.get("item").and_then(|i| i.get("id")))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let call_id = call_id?;
+            let acc = function_calls.remove(&call_id).unwrap_or_default();
+            // For output_item.done we can also pull a fully-formed
+            // `arguments` field from the item itself — fall back to it if
+            // we never accumulated deltas (server-rendered final).
+            let arguments_str = if acc.arguments.is_empty() {
+                payload
+                    .get("item")
+                    .and_then(|i| i.get("arguments"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                acc.arguments
+            };
+            let name = if acc.name.is_empty() {
+                payload
+                    .get("item")
+                    .and_then(|i| i.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                acc.name
+            };
+            if name.is_empty() {
+                return None;
+            }
+            let arguments_value: Value =
+                serde_json::from_str(&arguments_str).unwrap_or(Value::String(arguments_str));
+            out.push(Ok(StreamEvent::ToolCall(ToolCallInfo {
+                id: call_id,
+                name,
+                arguments: arguments_value,
+                signature: None,
+            })));
+        }
+        // Final event with usage totals.
+        "response.completed" => {
+            if let Some(usage) = payload.get("response").and_then(|r| r.get("usage")) {
+                let input = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let output = usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                out.push(Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                })));
+            }
+        }
+        "response.error" | "error" => {
+            let message = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .or_else(|| payload.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("openai-subscription: server-side stream error");
+            out.push(Err(LlmError::Provider(message.to_owned())));
+        }
+        _ => {
+            // Unknown event type — drop silently. Codex frequently introduces
+            // new event types; we don't want to fail the call on each one.
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Pure refresh-policy function — unit-testable without a tokio runtime.
+/// `Refresh(bundle)` carries the bundle so callers don't need a separate
+/// `.expect("decision implies Some")` after matching.
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshDecision {
+    Skip,
+    Refresh(OAuthTokenBundle),
+    NotSignedIn,
+}
+
+fn decide_refresh(bundle: Option<OAuthTokenBundle>, margin_secs: i64) -> RefreshDecision {
+    match bundle {
+        None => RefreshDecision::NotSignedIn,
+        Some(b) if b.is_near_expiry(margin_secs) => RefreshDecision::Refresh(b),
+        Some(_) => RefreshDecision::Skip,
+    }
+}
+
+/// Single-flight refresh. Every refresh path (JIT, reactive 401,
+/// background) funnels through here.
+///
+/// 1. Take the flight mutex (serialises refreshes).
+/// 2. Self-heal a previously-dirty vault save. If we can't, refuse to
+///    rotate again — chained unsaved bundles all evaporate on restart.
+/// 3. Dedup: if the cache has rotated under us, reuse it.
+/// 4. `refresh()` the token, persist with retries; on persist failure
+///    keep usable in-memory but flag dirty for self-heal next time.
+/// 5. Permanent refresh failures clear the vault entry and surface as
+///    `LlmError::Config` so the caller's error reads "re-login required".
+async fn do_single_flight_refresh(
+    refresh_flight: &Mutex<()>,
+    cache: &Mutex<Option<CachedBundle>>,
+    token_store: &VaultTokenStore,
+    expected_refresh_token: &str,
+) -> crate::Result<Arc<OAuthTokenBundle>> {
+    let _flight_guard = refresh_flight.lock().await;
+    let now = chrono::Utc::now().timestamp();
+
+    // Self-heal pass.
+    {
+        let mut guard = cache.lock().await;
+        if let Some(cached) = guard.as_mut()
+            && !cached.persisted
+        {
+            match save_with_retries(token_store, &cached.bundle).await {
+                Ok(()) => {
+                    cached.persisted = true;
+                    tracing::info!(
+                        event = "openai_subscription_refresh",
+                        outcome = "dirty_save_recovered",
+                        "previously-failed vault save succeeded on retry"
+                    );
+                }
+                Err(e) => {
+                    return Err(LlmError::Provider(format!(
+                        "openai-subscription: vault save still failing for previously \
+                         rotated token; refusing to rotate again until disk recovers ({e})"
+                    )));
+                }
+            }
+        }
+    }
+
+    // Dedup re-check.
+    if let Some(cached) = cache.lock().await.as_ref()
+        && cached.bundle.refresh_token != expected_refresh_token
+    {
+        tracing::debug!(
+            event = "openai_subscription_refresh",
+            outcome = "deduped",
+            "refresh: another caller already rotated the token; reusing"
+        );
+        return Ok(Arc::clone(&cached.bundle));
+    }
+
+    let refreshed = match refresh(expected_refresh_token).await {
+        Ok(b) => b,
+        Err(RefreshError::Permanent(msg)) => {
+            token_store.clear().await.ok();
+            *cache.lock().await = None;
+            return Err(LlmError::Config(format!(
+                "openai-subscription: refresh token expired/revoked — re-login required ({msg})"
+            )));
+        }
+        Err(RefreshError::Transient(msg)) => {
+            return Err(LlmError::Provider(format!(
+                "openai-subscription: token refresh transient: {msg}"
+            )));
+        }
+    };
+    let persisted = match save_with_retries(token_store, &refreshed).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                event = "openai_subscription_refresh",
+                outcome = "persistence_degraded",
+                error = %e,
+                "rotated token couldn't be persisted after {VAULT_SAVE_RETRY_ATTEMPTS} retries; \
+                 in-memory cache is the only copy. Process restart before recovery forces re-login."
+            );
+            false
+        }
+    };
+    let bundle = Arc::new(refreshed);
+    *cache.lock().await = Some(CachedBundle {
+        bundle: Arc::clone(&bundle),
+        persisted,
+        last_vault_check: now,
+    });
+    Ok(bundle)
+}
+
+/// Retry vault save with bounded exponential backoff. The backoff
+/// schedule is small ({100ms, 500ms, 2s}) — vault writes hit local
+/// libsql, so any failure is either "disk is genuinely broken" (retry
+/// won't help much) or "transient FS glitch" (retry will succeed
+/// quickly). Three attempts is the sweet spot.
+async fn save_with_retries(
+    token_store: &VaultTokenStore,
+    bundle: &OAuthTokenBundle,
+) -> crate::Result<()> {
+    let mut last_err = None;
+    for (attempt, backoff_ms) in VAULT_SAVE_RETRY_BACKOFF_MS
+        .iter()
+        .copied()
+        .enumerate()
+        .take(VAULT_SAVE_RETRY_ATTEMPTS)
+    {
+        match token_store.save(bundle).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    event = "openai_subscription_vault_save",
+                    outcome = "retry",
+                    attempt = attempt + 1,
+                    of = VAULT_SAVE_RETRY_ATTEMPTS,
+                    error = %e,
+                    "vault save failed; will retry in {backoff_ms}ms"
+                );
+                last_err = Some(e);
+                if attempt + 1 < VAULT_SAVE_RETRY_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| LlmError::Provider("vault save: no attempt was made".into())))
+}
+
+/// One task per provider instance — clones share the same cache. Exits
+/// quietly on logout or permanent refresh failure; transient errors
+/// just log and retry next tick.
+fn spawn_background_refresh_loop(
+    token_store: VaultTokenStore,
+    cache: Arc<Mutex<Option<CachedBundle>>>,
+    refresh_flight: Arc<Mutex<()>>,
+) {
+    use std::time::Duration;
+
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(BACKGROUND_REFRESH_INTERVAL_SECS);
+        loop {
+            // Snapshot bundle from cache, falling back to vault when the
+            // cache is empty (covers the case where CLI login populated
+            // vault after we spawned but no chat request has run yet).
+            let snapshot = { cache.lock().await.as_ref().map(|c| (*c.bundle).clone()) };
+            let bundle = match snapshot {
+                Some(b) => Some(b),
+                None => match token_store.load().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "openai_subscription_background_refresh",
+                            outcome = "vault_load_error",
+                            error = %e,
+                            "background refresh: vault load failed; will retry next interval"
+                        );
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                },
+            };
+
+            match decide_refresh(bundle, BACKGROUND_REFRESH_MARGIN_SECS) {
+                RefreshDecision::Skip => {}
+                RefreshDecision::NotSignedIn => {
+                    tracing::info!(
+                        event = "openai_subscription_background_refresh",
+                        outcome = "exit_not_signed_in",
+                        "background refresh: no token in vault; exiting loop"
+                    );
+                    return;
+                }
+                RefreshDecision::Refresh(b) => {
+                    match do_single_flight_refresh(
+                        &refresh_flight,
+                        &cache,
+                        &token_store,
+                        &b.refresh_token,
+                    )
+                    .await
+                    {
+                        Ok(_) => tracing::debug!(
+                            event = "openai_subscription_background_refresh",
+                            outcome = "success",
+                            "background refresh: token rotated (or reused after concurrent \
+                             refresh)"
+                        ),
+                        Err(LlmError::Config(msg)) => {
+                            // Permanent: single_flight_refresh already cleared the
+                            // vault and surfaced as Config. Exit; next sign-in
+                            // spawns a fresh loop.
+                            tracing::warn!(
+                                event = "openai_subscription_background_refresh",
+                                outcome = "permanent_failure_exit",
+                                error = %msg,
+                                "background refresh: permanently failed; exiting loop"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                event = "openai_subscription_background_refresh",
+                                outcome = "transient_failure",
+                                error = %e,
+                                "background refresh: transient failure; will retry next interval"
+                            );
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+impl LlmStream {
+    pub(crate) fn from_inner(
+        inner: Pin<Box<dyn Stream<Item = crate::Result<StreamEvent>> + Send>>,
+    ) -> Self {
+        Self { inner }
+    }
+}
+
+// Compile-time bound check: shared via Arc, so must stay Send+Sync+Clone.
+#[allow(dead_code)]
+fn _assert_bounds() {
+    fn assert_send_sync<T: Send + Sync + Clone>() {}
+    assert_send_sync::<OpenAiSubscriptionCompletionModel>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::completion::ToolDefinition;
+    use serde_json::json;
+
+    fn empty_request() -> CompletionRequest {
+        CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::one(Message::User {
+                content: OneOrMany::one(UserContent::Text(Text { text: "hi".into() })),
+            }),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        }
+    }
+
+    #[test]
+    fn body_carries_model_and_text_user_input() {
+        let body = build_responses_body("gpt-5", &empty_request()).unwrap();
+        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn body_lifts_preamble_into_instructions() {
+        let mut req = empty_request();
+        req.preamble = Some("be terse".into());
+        let body = build_responses_body("gpt-5", &req).unwrap();
+        assert_eq!(body["instructions"], "be terse");
+    }
+
+    #[test]
+    fn body_translates_tools_to_function_shape() {
+        let mut req = empty_request();
+        req.tools.push(ToolDefinition {
+            name: "search".into(),
+            description: "look stuff up".into(),
+            parameters: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        });
+        let body = build_responses_body("gpt-5", &req).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "search");
+        assert_eq!(tools[0]["parameters"]["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
+    fn body_translates_assistant_tool_call_history() {
+        let mut req = empty_request();
+        req.chat_history.push(Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "call_1".into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "search".into(),
+                    arguments: json!({"q": "rust"}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        });
+        let body = build_responses_body("gpt-5", &req).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let call_item = input
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("expected a function_call item");
+        assert_eq!(call_item["call_id"], "call_1");
+        assert_eq!(call_item["name"], "search");
+        // arguments is a JSON-encoded string per Responses API contract.
+        assert_eq!(call_item["arguments"], "{\"q\":\"rust\"}");
+    }
+
+    #[test]
+    fn body_translates_tool_result_user_message() {
+        let mut req = empty_request();
+        req.chat_history.push(Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(completion::message::ToolResult {
+                id: "call_1".into(),
+                call_id: None,
+                content: OneOrMany::one(completion::message::ToolResultContent::Text(Text {
+                    text: "rust is a programming language".into(),
+                })),
+            })),
+        });
+        let body = build_responses_body("gpt-5", &req).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let result_item = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .expect("expected a function_call_output item");
+        assert_eq!(result_item["call_id"], "call_1");
+        assert_eq!(result_item["output"], "rust is a programming language");
+    }
+
+    #[test]
+    fn parse_sse_event_handles_event_and_data() {
+        let raw = "event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n";
+        let event = parse_sse_event(raw).unwrap();
+        assert_eq!(event.event_type, "response.output_text.delta");
+        assert_eq!(event.data, "{\"delta\":\"hi\"}");
+    }
+
+    #[test]
+    fn parse_sse_event_ignores_comment_lines() {
+        let raw = ":heartbeat\nevent: response.output_text.delta\ndata: {\"delta\":\"x\"}\n\n";
+        let event = parse_sse_event(raw).unwrap();
+        assert_eq!(event.event_type, "response.output_text.delta");
+    }
+
+    #[test]
+    fn translate_event_emits_text_delta() {
+        let mut calls = HashMap::new();
+        let event = SseEvent {
+            event_type: "response.output_text.delta".into(),
+            data: r#"{"delta":"hello"}"#.into(),
+        };
+        let out = translate_event(&mut calls, event).unwrap();
+        assert_eq!(out.len(), 1);
+        match out.into_iter().next().unwrap().unwrap() {
+            StreamEvent::Text(s) => assert_eq!(s, "hello"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_event_assembles_function_call_from_deltas() {
+        let mut calls = HashMap::new();
+        // 1: added — registers id + name
+        translate_event(
+            &mut calls,
+            SseEvent {
+                event_type: "response.output_item.added".into(),
+                data: r#"{"item":{"type":"function_call","call_id":"call_1","name":"search"}}"#
+                    .into(),
+            },
+        );
+        // 2 + 3: argument deltas
+        translate_event(
+            &mut calls,
+            SseEvent {
+                event_type: "response.function_call_arguments.delta".into(),
+                data: r#"{"call_id":"call_1","delta":"{\"q\":"}"#.into(),
+            },
+        );
+        translate_event(
+            &mut calls,
+            SseEvent {
+                event_type: "response.function_call_arguments.delta".into(),
+                data: r#"{"call_id":"call_1","delta":"\"rust\"}"}"#.into(),
+            },
+        );
+        // 4: done — emits the assembled ToolCall
+        let final_events = translate_event(
+            &mut calls,
+            SseEvent {
+                event_type: "response.function_call_arguments.done".into(),
+                data: r#"{"call_id":"call_1"}"#.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(final_events.len(), 1);
+        match final_events.into_iter().next().unwrap().unwrap() {
+            StreamEvent::ToolCall(tc) => {
+                assert_eq!(tc.id, "call_1");
+                assert_eq!(tc.name, "search");
+                assert_eq!(tc.arguments, json!({"q": "rust"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_event_emits_usage_from_completed() {
+        let mut calls = HashMap::new();
+        let out = translate_event(
+            &mut calls,
+            SseEvent {
+                event_type: "response.completed".into(),
+                data: r#"{"response":{"usage":{"input_tokens":42,"output_tokens":7}}}"#.into(),
+            },
+        )
+        .unwrap();
+        match out.into_iter().next().unwrap().unwrap() {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 42);
+                assert_eq!(u.output_tokens, 7);
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    fn sample_bundle(now: i64, expires_at: i64) -> OAuthTokenBundle {
+        OAuthTokenBundle {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            id_token: "i".into(),
+            account_id: None,
+            expires_at,
+            obtained_at: now,
+        }
+    }
+
+    #[test]
+    fn decide_refresh_skips_when_bundle_is_fresh() {
+        let now = chrono::Utc::now().timestamp();
+        let bundle = sample_bundle(now, now + 7200); // 2h out
+        assert_eq!(
+            decide_refresh(Some(bundle), BACKGROUND_REFRESH_MARGIN_SECS),
+            RefreshDecision::Skip
+        );
+    }
+
+    #[test]
+    fn decide_refresh_triggers_inside_margin() {
+        let now = chrono::Utc::now().timestamp();
+        let bundle = sample_bundle(now, now + 120); // 2 min out, inside 5 min margin
+        let expected = bundle.clone();
+        assert_eq!(
+            decide_refresh(Some(bundle), BACKGROUND_REFRESH_MARGIN_SECS),
+            RefreshDecision::Refresh(expected)
+        );
+    }
+
+    #[test]
+    fn decide_refresh_treats_missing_bundle_as_not_signed_in() {
+        assert_eq!(
+            decide_refresh(None, BACKGROUND_REFRESH_MARGIN_SECS),
+            RefreshDecision::NotSignedIn
+        );
+    }
+
+    /// SecretStore adapter that fails the first N stores, then succeeds.
+    /// Drives the "vault is broken right now" branch of the durable-save path.
+    struct FailingStoreNTimes {
+        inner: aura_storage::test_support::MemorySecretStore,
+        fails_remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl aura_storage::SecretStore for FailingStoreNTimes {
+        async fn store(
+            &self,
+            name: &str,
+            encrypted_value: &[u8],
+        ) -> std::result::Result<(), aura_storage::StorageError> {
+            if self
+                .fails_remaining
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                return Err(aura_storage::StorageError::Storage(
+                    "simulated vault failure".into(),
+                ));
+            }
+            self.inner.store(name, encrypted_value).await
+        }
+        async fn retrieve(
+            &self,
+            name: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, aura_storage::StorageError> {
+            self.inner.retrieve(name).await
+        }
+        async fn delete(&self, name: &str) -> std::result::Result<(), aura_storage::StorageError> {
+            self.inner.delete(name).await
+        }
+        async fn list(&self) -> std::result::Result<Vec<String>, aura_storage::StorageError> {
+            self.inner.list().await
+        }
+    }
+
+    fn vault_with_failing_store(
+        initial_fails: usize,
+    ) -> (VaultTokenStore, std::sync::Arc<FailingStoreNTimes>) {
+        use aura_security::{EncryptionKey, SecretVault};
+        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+        let store = std::sync::Arc::new(FailingStoreNTimes {
+            inner: aura_storage::test_support::MemorySecretStore::new(),
+            fails_remaining: std::sync::atomic::AtomicUsize::new(initial_fails),
+        });
+        let vault = std::sync::Arc::new(SecretVault::new(key, store.clone()));
+        (VaultTokenStore::new(vault), store)
+    }
+
+    /// Test helper: build a CachedBundle wrapping the given OAuth bundle.
+    fn cached(bundle: OAuthTokenBundle, persisted: bool) -> CachedBundle {
+        CachedBundle {
+            bundle: Arc::new(bundle),
+            persisted,
+            last_vault_check: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_with_retries_recovers_within_budget() {
+        let (store, _) = vault_with_failing_store(2); // first 2 fail, 3rd succeeds
+        let bundle = sample_bundle(0, 0);
+        save_with_retries(&store, &bundle)
+            .await
+            .expect("3rd attempt should succeed");
+        assert_eq!(store.load().await.unwrap(), Some(bundle));
+    }
+
+    #[tokio::test]
+    async fn save_with_retries_gives_up_after_budget() {
+        let (store, _) = vault_with_failing_store(usize::MAX); // never succeeds
+        let bundle = sample_bundle(0, 0);
+        let err = save_with_retries(&store, &bundle).await.unwrap_err();
+        assert!(format!("{err}").contains("simulated vault failure"));
+        assert!(store.load().await.unwrap().is_none());
+    }
+
+    /// Pre-fill cache with a dirty bundle whose refresh_token differs
+    /// from what the caller will request — the gate's dedup re-check
+    /// then bails out without touching the network, but only after the
+    /// self-heal step has run. That lets us assert `persisted` flips
+    /// back to true without an HTTP mock.
+    #[tokio::test]
+    async fn single_flight_refresh_self_heals_dirty_save() {
+        let (store, _) = vault_with_failing_store(VAULT_SAVE_RETRY_ATTEMPTS - 1);
+        let now = chrono::Utc::now().timestamp();
+        let bundle = OAuthTokenBundle {
+            access_token: "stale-at".into(),
+            refresh_token: "rotated-rt".into(),
+            id_token: "id".into(),
+            account_id: None,
+            expires_at: now + 7200,
+            obtained_at: now,
+        };
+        let cache: Mutex<Option<CachedBundle>> = Mutex::new(Some(cached(bundle.clone(), false)));
+        let refresh_flight: Mutex<()> = Mutex::new(());
+        let result =
+            do_single_flight_refresh(&refresh_flight, &cache, &store, "different-rt-from-caller")
+                .await
+                .expect("self-heal then dedup must succeed");
+        assert_eq!(result.refresh_token, "rotated-rt");
+        let final_state = cache.lock().await.clone().unwrap();
+        assert!(final_state.persisted);
+        assert_eq!(store.load().await.unwrap(), Some(bundle));
+    }
+
+    /// Cache-hit path revalidates the vault every CACHE_VAULT_REVALIDATE_INTERVAL_SECS.
+    /// Past the window, a missing vault entry invalidates the cached bundle
+    /// so a cross-process `aura llm auth logout` is honoured.
+    #[tokio::test]
+    async fn ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied() {
+        use aura_security::{EncryptionKey, SecretVault};
+        use aura_storage::test_support::MemorySecretStore;
+
+        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+        let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
+        let token_store = VaultTokenStore::new(vault);
+
+        let now = chrono::Utc::now().timestamp();
+        let bundle = OAuthTokenBundle {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            id_token: "it".into(),
+            account_id: None,
+            expires_at: now + 7200,
+            obtained_at: now,
+        };
+        token_store.save(&bundle).await.unwrap();
+        let model = OpenAiSubscriptionCompletionModel::new(
+            "gpt-5".into(),
+            None,
+            token_store.clone(),
+            BackgroundRefresh::Disabled,
+        );
+
+        // Warm cache, then backdate last_vault_check so the next call
+        // crosses the revalidation boundary.
+        let first = model.ensure_fresh_bundle().await.unwrap();
+        assert_eq!(*first, bundle);
+        token_store.clear().await.unwrap();
+        if let Some(c) = model.cache.lock().await.as_mut() {
+            c.last_vault_check = 0;
+        }
+
+        let err = model
+            .ensure_fresh_bundle()
+            .await
+            .expect_err("vault is empty — must surface not-signed-in");
+        match err {
+            LlmError::Config(msg) => assert!(msg.contains("not signed in")),
+            other => panic!("expected Config, got {other:?}"),
+        }
+        assert!(model.cache.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_bundle_skips_vault_within_revalidate_interval() {
+        use aura_security::{EncryptionKey, SecretVault};
+        use aura_storage::test_support::MemorySecretStore;
+
+        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+        let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
+        let token_store = VaultTokenStore::new(vault);
+
+        let now = chrono::Utc::now().timestamp();
+        let bundle = OAuthTokenBundle {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            id_token: "it".into(),
+            account_id: None,
+            expires_at: now + 7200,
+            obtained_at: now,
+        };
+        token_store.save(&bundle).await.unwrap();
+        let model = OpenAiSubscriptionCompletionModel::new(
+            "gpt-5".into(),
+            None,
+            token_store.clone(),
+            BackgroundRefresh::Disabled,
+        );
+        let _ = model.ensure_fresh_bundle().await.unwrap();
+        // Within the window the cache wins; an emptied vault does not
+        // immediately invalidate.
+        token_store.clear().await.unwrap();
+        let second = model.ensure_fresh_bundle().await.unwrap();
+        assert_eq!(*second, bundle);
+    }
+
+    /// Two consecutive dirty-save failures must NOT chain rotations —
+    /// chained unsaved bundles all evaporate on process restart, much
+    /// worse than waiting for the disk to recover.
+    #[tokio::test]
+    async fn single_flight_refresh_refuses_to_rotate_when_dirty_save_keeps_failing() {
+        let (store, _) = vault_with_failing_store(usize::MAX);
+        let now = chrono::Utc::now().timestamp();
+        let bundle = OAuthTokenBundle {
+            access_token: "stale-at".into(),
+            refresh_token: "rotated-rt".into(),
+            id_token: "id".into(),
+            account_id: None,
+            expires_at: now + 7200,
+            obtained_at: now,
+        };
+        let cache: Mutex<Option<CachedBundle>> = Mutex::new(Some(cached(bundle, false)));
+        let refresh_flight: Mutex<()> = Mutex::new(());
+        let err =
+            do_single_flight_refresh(&refresh_flight, &cache, &store, "different-rt-from-caller")
+                .await
+                .expect_err("should refuse to rotate while disk is broken");
+        match err {
+            LlmError::Provider(msg) => assert!(msg.contains("vault save still failing")),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    /// Concurrent rotation race: two callers reach the gate with the
+    /// same refresh_token, server rotates it for the first arriver, the
+    /// second would hit `refresh_token_reused` if it called `refresh()`.
+    /// The dedup re-check makes the second caller a no-op instead.
+    /// Tested by pre-filling the cache with the "already-rotated" state
+    /// — the re-check fires before any network call.
+    #[tokio::test]
+    async fn single_flight_refresh_dedups_after_concurrent_rotation() {
+        use aura_security::{EncryptionKey, SecretVault};
+        use aura_storage::test_support::MemorySecretStore;
+
+        let now = chrono::Utc::now().timestamp();
+        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+        let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
+        let token_store = VaultTokenStore::new(vault);
+
+        let refresh_flight: Mutex<()> = Mutex::new(());
+        let already_rotated = OAuthTokenBundle {
+            access_token: "new-at".into(),
+            refresh_token: "new-rt".into(),
+            id_token: "new-id".into(),
+            account_id: None,
+            expires_at: now + 7200,
+            obtained_at: now,
+        };
+        let cache: Mutex<Option<CachedBundle>> =
+            Mutex::new(Some(cached(already_rotated.clone(), true)));
+
+        let result = do_single_flight_refresh(&refresh_flight, &cache, &token_store, "old-rt")
+            .await
+            .expect("dedup path must succeed without a network call");
+        assert_eq!(result.refresh_token, "new-rt");
+        assert_eq!(result.access_token, "new-at");
+        let still_cached = cache.lock().await.clone().unwrap();
+        assert_eq!(*still_cached.bundle, already_rotated);
+        assert!(still_cached.persisted);
+    }
+
+    #[test]
+    fn translate_event_surfaces_error() {
+        let mut calls = HashMap::new();
+        let out = translate_event(
+            &mut calls,
+            SseEvent {
+                event_type: "response.error".into(),
+                data: r#"{"error":{"message":"rate limited"}}"#.into(),
+            },
+        )
+        .unwrap();
+        let err = out.into_iter().next().unwrap();
+        assert!(matches!(err, Err(LlmError::Provider(ref m)) if m == "rate limited"));
+    }
+
+    #[test]
+    fn build_reasoning_block_combines_deltas_and_thinking_blocks() {
+        // No content -> None.
+        assert!(build_reasoning_block(String::new(), Vec::new()).is_none());
+
+        // Reasoning deltas alone -> single Summary entry.
+        let r = build_reasoning_block("step 1\nstep 2".into(), Vec::new()).unwrap();
+        assert_eq!(r.content.len(), 1);
+        assert!(matches!(
+            &r.content[0],
+            ReasoningContent::Summary(s) if s == "step 1\nstep 2"
+        ));
+
+        // Reasoning deltas + structured thinking block -> Summary + the
+        // block's pieces appended in order. Verifies neither path drops
+        // content (the bug this regression test guards against).
+        let block = aura_model::ContentBlock::Thinking {
+            id: Some("t1".into()),
+            content: vec![
+                aura_model::ThinkingContent::Text {
+                    text: "signed thought".into(),
+                    signature: Some("sig".into()),
+                },
+                aura_model::ThinkingContent::Redacted {
+                    data: "secret".into(),
+                },
+            ],
+        };
+        let r = build_reasoning_block("delta".into(), vec![block]).unwrap();
+        assert_eq!(r.content.len(), 3);
+        assert!(matches!(&r.content[0], ReasoningContent::Summary(s) if s == "delta"));
+        assert!(matches!(
+            &r.content[1],
+            ReasoningContent::Text { text, signature: Some(sig) }
+                if text == "signed thought" && sig == "sig"
+        ));
+        assert!(matches!(&r.content[2], ReasoningContent::Redacted { data } if data == "secret"));
+    }
+
+    #[test]
+    fn project_models_body_lifts_codex_fields_into_live_model_info() {
+        let body = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5",
+                    "display_name": "GPT-5",
+                    "description": "flagship",
+                    "context_window": 272_000,
+                    "supports_parallel_tool_calls": true,
+                    "input_modalities": ["text", "image"],
+                },
+                {
+                    "slug": "gpt-5-mini",
+                    "display_name": "GPT-5 mini",
+                    "description": "",
+                    "max_context_window": 128_000,
+                    "supports_parallel_tool_calls": false,
+                    "supports_search_tool": true,
+                    "input_modalities": ["text"],
+                }
+            ]
+        });
+        let entries = project_models_body(body).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].id, "gpt-5");
+        assert_eq!(entries[0].display_name.as_deref(), Some("GPT-5"));
+        assert_eq!(entries[0].description.as_deref(), Some("flagship"));
+        assert_eq!(entries[0].context_window, Some(272_000));
+        assert_eq!(entries[0].supports_vision, Some(true));
+        assert_eq!(entries[0].supports_tools, Some(true));
+        assert_eq!(
+            entries[0].extras.get("slug").and_then(Value::as_str),
+            Some("gpt-5")
+        );
+
+        assert_eq!(entries[1].id, "gpt-5-mini");
+        assert!(entries[1].description.is_none());
+        // max_context_window fallback when context_window is absent.
+        assert_eq!(entries[1].context_window, Some(128_000));
+        assert_eq!(entries[1].supports_vision, Some(false));
+        // Tool-capability is constant for Codex-served models.
+        assert_eq!(entries[1].supports_tools, Some(true));
+    }
+
+    #[test]
+    fn project_models_body_errors_loudly_on_missing_models_array() {
+        let body = serde_json::json!({"oops": "no models field"});
+        let err = project_models_body(body).unwrap_err();
+        match err {
+            LlmError::Provider(msg) => assert!(msg.contains("missing `models` array")),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_models_body_errors_loudly_on_missing_slug() {
+        let body = serde_json::json!({
+            "models": [{ "display_name": "no slug here" }]
+        });
+        let err = project_models_body(body).unwrap_err();
+        match err {
+            LlmError::Provider(msg) => assert!(msg.contains("missing `slug`")),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+}

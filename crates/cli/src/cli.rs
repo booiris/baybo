@@ -425,11 +425,63 @@ pub enum PairCmd {
 pub enum LlmCmd {
     /// Show the configured LLM provider, model id, and capabilities.
     Status,
-    /// List the model catalog each registered provider advertises.
-    Models,
+    /// List the model catalog each registered provider advertises. By
+    /// default this is the static `known_models()` set baked into each
+    /// factory. Pass `--live --provider <id>` to instead query the
+    /// provider's catalog endpoint at runtime — useful for
+    /// subscription-style providers (`openai-subscription`) where the
+    /// model set depends on what the user's account currently has access
+    /// to. Live discovery requires the provider's credentials to be
+    /// configured (e.g. `aura llm auth login --provider openai-subscription`
+    /// for openai-subscription).
+    Models {
+        /// Hit the provider's catalog endpoint instead of returning the
+        /// static known_models() list. Requires --provider.
+        #[arg(long)]
+        live: bool,
+        /// Which provider to ask. Required when --live is set; ignored
+        /// otherwise (the static listing covers all providers at once).
+        #[arg(long, required_if_eq("live", "true"))]
+        provider: Option<String>,
+    },
     /// Send a one-token chat request to the configured provider to verify
     /// connectivity and auth. Feeds `aura doctor`.
     Probe,
+    /// OAuth-style authentication for subscription providers (currently only
+    /// `openai-subscription`). API-key providers don't use this surface —
+    /// they read `OPENAI_API_KEY` etc. from the environment.
+    #[command(subcommand)]
+    Auth(LlmAuthCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LlmAuthCmd {
+    /// Sign in via PKCE OAuth. Opens a browser to `https://auth.openai.com`
+    /// (or with `--device-code`, prints a code to enter on a separate
+    /// device). Persists the resulting bundle to the vault under
+    /// `llm.<provider>.tokens`.
+    Login {
+        /// Provider id, e.g. `openai-subscription`.
+        #[arg(long)]
+        provider: String,
+        /// Use the device-code flow instead of the localhost browser
+        /// callback. Pick this on headless / SSH boxes where 127.0.0.1
+        /// can't be reached from a browser.
+        #[arg(long)]
+        device_code: bool,
+    },
+    /// Show whether a token is stored, the account email + plan type,
+    /// the access-token expiry, and the endpoint the token is sent to
+    /// (with a NON-DEFAULT warning when `base_url` is overridden).
+    Status {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Revoke (best-effort) and delete the stored token bundle.
+    Logout {
+        #[arg(long)]
+        provider: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

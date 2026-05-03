@@ -84,6 +84,7 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 pub fn build_llm_client(
     cfg: &LlmConfig,
     blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
+    vault: Option<std::sync::Arc<aura_security::SecretVault>>,
 ) -> anyhow::Result<LlmClient> {
     let registry = LlmProviderRegistry::with_default_providers();
     let client = registry
@@ -93,6 +94,7 @@ pub fn build_llm_client(
             base_url: cfg.base_url.clone(),
             model: cfg.model.clone(),
             supports_vision: cfg.supports_vision,
+            vault,
         })
         .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))?;
     Ok(match blob_store {
