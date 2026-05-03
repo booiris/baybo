@@ -68,6 +68,17 @@ Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) a
 
 Use transactions for: `TraceStore.save_trace()` writing trace root and nodes atomically.
 
+### Soft delete (libsql)
+
+All libsql-backed tables that support deletion use **soft delete**, never a hard `DELETE`. This preserves history for audit, replay, and compliance.
+
+- Every deletable table carries a nullable `deleted_at INTEGER` column (Unix seconds; `NULL` = live row).
+- Deletion = `UPDATE ... SET deleted_at = ?now WHERE ... AND deleted_at IS NULL`. Do not emit `DELETE FROM` against these tables.
+- Every read (`SELECT`) MUST include `AND deleted_at IS NULL` so soft-deleted rows stay hidden. Every mutation (`UPDATE`) on a live row MUST include the same guard so you never write through a deleted row.
+- Re-insertion semantics: `INSERT OR REPLACE` and `ON CONFLICT ... DO UPDATE` must reset `deleted_at` back to `NULL` so recreating a soft-deleted id revives it (see `skill_risk.rs::upsert_job` for the pattern).
+- Schema changes: add the column to the `CREATE TABLE IF NOT EXISTS` in `crates/storage/src/libsql/mod.rs`.
+- Tables currently covered: `sessions`, `memories`, `session_traces`, `trace_nodes`, `trace_forks`, `secrets`, `jobs`, `job_transitions`, `cron_jobs`, `cron_executions`, `skill_risk_assessments`, `skill_risk_assessment_jobs`. The only append-only table without `deleted_at` is `cost_records` (billing audit trail).
+
 ## Constraints
 
 - Depends on domain crates for types only (`model`, `trace`, `security`, `job`) — not on `aura-session`, to keep `aura-session → aura-storage` acyclic
