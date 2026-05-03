@@ -20,6 +20,7 @@ declare module "chrome-devtools-mcp" {
     categoryNetwork: boolean;
     categoryExtensions: boolean;
     slim: boolean;
+    experimentalPageIdRouting?: boolean | undefined;
     [extra: string]: unknown;
   }
 

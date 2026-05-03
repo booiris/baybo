@@ -283,6 +283,33 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
     categoryNetwork: true,
     categoryExtensions: false,
     slim: false,
+    // Adds an optional `pageId` parameter to every page-scoped CDDM
+    // tool. When the agent passes it, the call routes to that exact
+    // page instead of CDDM's process-global "selected page" — which
+    // is the only thing that lets multiple Aura agents share one
+    // browser sidecar without their navigations / clicks / snapshots
+    // tripping over each other (a select_page+act sequence is no
+    // longer racy because CDDM's own toolMutex serialises every call,
+    // but routing per-call by id removes the need for select_page in
+    // the first place).
+    //
+    // Caveat — CDDM 0.23.0 inconsistency: page-scoped tools fall back
+    // to the selected page when `pageId` is omitted (build/src/index.js
+    // pre-resolves with `params.pageId && getPageById(...) :
+    // getSelectedMcpPage()`), but `evaluate_script` is registered as
+    // non-page-scoped and re-resolves inside its own handler without
+    // that fallback (build/src/tools/script.js: `experimentalPageIdRouting
+    // ? getPageById(pageId) : getSelectedMcpPage()` — `getPageById(undefined)`
+    // throws "No page found"). So once routing is on, **`evaluate_script`
+    // requires `pageId`**. Our injected `browser/read_page` tool
+    // surfaces this in its schema + threads `pageId` through to the
+    // underlying `evaluate_script` call.
+    //
+    // For per-agent cookie/storage isolation (not just per-call page
+    // targeting), agents should additionally pass `isolatedContext:
+    // "<agent-id>"` to `new_page` — CDDM creates a Puppeteer
+    // BrowserContext per name, giving each agent its own cookie jar.
+    experimentalPageIdRouting: true,
   };
 }
 
@@ -734,7 +761,10 @@ async function main(): Promise<void> {
   });
   proxy.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (req.params.name === READ_PAGE_TOOL.name) {
-      return await handleReadPage(cddmClient);
+      const raw = req.params.arguments ?? {};
+      const pageIdRaw = (raw as { pageId?: unknown }).pageId;
+      const pageId = typeof pageIdRaw === "number" ? pageIdRaw : undefined;
+      return await handleReadPage(cddmClient, { pageId });
     }
     return await cddmClient.callTool({
       name: req.params.name,
@@ -755,7 +785,8 @@ async function main(): Promise<void> {
     `chrome-devtools-mcp ready: mode=${mode} userDataDir=${args.userDataDir} ${target} ` +
       `viewport=${viewportStr} headless=${args.headless} ` +
       `sandbox=${chromeArgList.includes("--no-sandbox") ? "off" : "on"} ` +
-      `telemetry=off install_state=${state.phase} extra_tools=read_page`,
+      `telemetry=off page_id_routing=${args.experimentalPageIdRouting ? "on" : "off"} ` +
+      `install_state=${state.phase} extra_tools=read_page`,
   );
 
   // Cap shutdown at the docker stop timeout (5s graceful + slack for

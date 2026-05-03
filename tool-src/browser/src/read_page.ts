@@ -35,19 +35,34 @@ declare const __READABILITY_SOURCE__: string;
 export const READ_PAGE_TOOL = {
     name: "read_page",
     description:
-        "Extract the main article content from the currently selected page as clean " +
-        "Markdown (Mozilla Readability + Turndown). Returns title, byline, excerpt, and " +
-        "the article body with headings/lists/links preserved. Strips navigation, ads, " +
-        "sidebars, and footers. Use this instead of `take_snapshot` when you want the " +
-        "page's prose content for reading or summarisation; use `take_snapshot` when you " +
-        "need the full DOM/accessibility tree for interaction. The page must already be " +
-        "navigated to and rendered (call `navigate_page` and `wait_for` first).",
+        "Extract the main article content from a page as clean Markdown (Mozilla " +
+        "Readability + Turndown). Returns title, byline, excerpt, and the article body " +
+        "with headings/lists/links preserved. Strips navigation, ads, sidebars, and " +
+        "footers. Use this instead of `take_snapshot` when you want the page's prose " +
+        "content for reading or summarisation; use `take_snapshot` when you need the " +
+        "full DOM/accessibility tree for interaction. The page must already be navigated " +
+        "to and rendered (call `navigate_page` and `wait_for` first). " +
+        "`pageId` targets a specific tab — required when multiple agents share one " +
+        "browser sidecar so calls don't race each other's navigations. Get a `pageId` " +
+        "from `new_page` or `list_pages`.",
     inputSchema: {
         type: "object",
-        properties: {},
+        properties: {
+            pageId: {
+                type: "number",
+                description:
+                    "ID of the tab to read. Required when running with multi-page routing " +
+                    "(every browser/* tool accepts a pageId after sidecar start). Get the " +
+                    "id from new_page or list_pages.",
+            },
+        },
         additionalProperties: false,
     },
 } as const;
+
+interface ReadPageArgs {
+    pageId?: number;
+}
 
 interface ArticleFromPage {
     title: string | null;
@@ -71,7 +86,10 @@ const turndown = new TurndownService({
 // but Readability sometimes leaves inline `<noscript>` boilerplate).
 turndown.remove(["style", "script", "noscript"]);
 
-export async function handleReadPage(client: Client): Promise<CallToolResult> {
+export async function handleReadPage(
+    client: Client,
+    args: ReadPageArgs,
+): Promise<CallToolResult> {
     // Inject Readability into the page (idempotent across calls thanks
     // to the `window.__auraReadability` cache), parse the live DOM, and
     // return the article object.
@@ -127,9 +145,18 @@ async () => {
   }
 }`;
 
+    // CDDM 0.23.0 quirk: when experimentalPageIdRouting is on, the
+    // `evaluate_script` tool requires a pageId — its own handler does
+    // `getPageById(pageId)` without falling back to the selected page
+    // (build/src/tools/script.js). Forward whatever the caller gave us;
+    // if they omitted it, CDDM's "No page found" surfaces back.
+    const evaluateArgs: Record<string, unknown> = { function: inPageScript };
+    if (args.pageId !== undefined) {
+        evaluateArgs.pageId = args.pageId;
+    }
     const cddmResult = await client.callTool({
         name: "evaluate_script",
-        arguments: { function: inPageScript },
+        arguments: evaluateArgs,
     });
 
     const article = extractArticleFromCddmResult(cddmResult);
