@@ -154,13 +154,16 @@ mod tests {
         // Debug-build default is `./.aura` — a relative path. The
         // prompt must absolutise it before the agent ever sees it,
         // otherwise the agent has no way to know which cwd the runtime
-        // started from when constructing tool-call paths.
+        // started from when constructing tool-call paths. The current env
+        // block only prints `- Working directory:` (a subpath of the
+        // workspace root, so absolutising it implicitly absolutises the
+        // root) — the older `- Workspace root:` line was dropped in
+        // commit 046c664 ("update env prompt").
         let workspace = WorkspaceManager::new(PathBuf::from("./relative-soul-test/.aura"));
         let soul = Soul::from_workspace(&workspace).await.expect("soul");
         let prompt = soul.system_prompt();
 
         let mut saw_work_dir = false;
-        let mut saw_workspace_root = false;
         for line in prompt.lines() {
             if let Some(value) = line.strip_prefix("- Working directory: ") {
                 assert!(
@@ -173,23 +176,8 @@ mod tests {
                 );
                 saw_work_dir = true;
             }
-            if let Some(value) = line.strip_prefix("- Workspace root: ") {
-                assert!(
-                    value.starts_with('/'),
-                    "Workspace root must be absolute: {line}"
-                );
-                assert!(
-                    !value.contains("/./"),
-                    "Workspace root must not carry `.` segments: {line}"
-                );
-                saw_workspace_root = true;
-            }
         }
         assert!(saw_work_dir, "no `- Working directory:` line in: {prompt}");
-        assert!(
-            saw_workspace_root,
-            "no `- Workspace root:` line in: {prompt}"
-        );
     }
 
     #[tokio::test]
