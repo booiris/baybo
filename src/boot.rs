@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 
 use aura_agent::policy::ExecutionPolicy;
 use aura_config::{
-    AgentConfig, AuraConfig, LlmConfig, RiskCheckConfig, SecurityConfig, SessionConfig,
-    ToolsConfig, WorkspaceConfig,
+    AgentConfig, AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, SessionConfig, ToolsConfig,
+    WorkspaceConfig,
 };
 use aura_context::TokenBudget;
+use aura_llm::credentials::resolve_api_key;
 use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
 use aura_skills_assessor::AssessmentMode;
@@ -73,7 +74,8 @@ pub fn resolve_config_path() -> Option<PathBuf> {
     default.exists().then_some(default)
 }
 
-/// Build an `LlmClient` from `LlmConfig`, resolving the api key through env.
+/// Build an `LlmClient` from the `default-llm` entry of an `AuraConfig`,
+/// resolving the api key through env then vault.
 ///
 /// `blob_store` is optional. When `Some`, the client is wired with a
 /// `BlobFetcher` so vision-capable models actually receive image
@@ -81,19 +83,55 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 /// on a model that claims `supports_vision: true`. Pass `None` only
 /// for one-shot tooling (e.g. a `probe` subcommand) that never sends
 /// multimodal content.
-pub fn build_llm_client(
-    cfg: &LlmConfig,
+pub async fn build_llm_client(
+    cfg: &AuraConfig,
     blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
 ) -> anyhow::Result<LlmClient> {
+    let entry = cfg.default_llm_entry().ok_or_else(|| {
+        if cfg.llm.is_empty() {
+            anyhow::anyhow!(
+                "no LLM entries configured in aura.json — run `aura llm add` to register one"
+            )
+        } else {
+            anyhow::anyhow!(
+                "default-llm = {:?} does not match any entry in `llm` (existing: [{}])",
+                cfg.default_llm,
+                cfg.llm
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }
+    })?;
+    build_llm_client_for_entry(entry, blob_store, vault).await
+}
+
+/// Build an `LlmClient` from a specific entry. Same wiring as
+/// `build_llm_client` but lets callers (CLI tooling: probe, live model
+/// listing) pin a non-default entry.
+pub async fn build_llm_client_for_entry(
+    entry: &LlmEntry,
+    blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
+    vault: Option<std::sync::Arc<aura_security::SecretVault>>,
+) -> anyhow::Result<LlmClient> {
+    let api_key = resolve_api_key(
+        &entry.name,
+        &entry.provider,
+        entry.api_key_env.as_deref(),
+        vault.as_deref(),
+    )
+    .await;
     let registry = LlmProviderRegistry::with_default_providers();
     let client = registry
         .create_client(&LlmProviderConfig {
-            provider: cfg.provider.clone(),
-            api_key: resolve_llm_api_key(cfg),
-            base_url: cfg.base_url.clone(),
-            model: cfg.model.clone(),
-            supports_vision: cfg.supports_vision,
+            provider: entry.provider.clone(),
+            api_key,
+            base_url: entry.base_url.clone(),
+            model: entry.model.clone(),
+            supports_vision: entry.supports_vision,
+            reasoning_effort: entry.reasoning_effort.clone(),
             vault,
         })
         .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))?;
@@ -120,25 +158,6 @@ impl aura_llm::BlobFetcher for BlobStoreFetcher {
             .get(blob_id)
             .await
             .map_err(|e| aura_llm::LlmError::Provider(format!("blob fetch: {e}")))
-    }
-}
-
-/// Resolve the LLM API key from the env var named by `api_key_env`, falling
-/// back to provider-specific defaults (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-/// `GEMINI_API_KEY`, `MINIMAX_API_KEY`). Returns `None` if nothing is set —
-/// the provider may still accept it (e.g. local models) or error later.
-pub fn resolve_llm_api_key(cfg: &LlmConfig) -> Option<String> {
-    if let Some(env) = &cfg.api_key_env
-        && let Ok(v) = std::env::var(env)
-    {
-        return Some(v);
-    }
-    match cfg.provider.as_str() {
-        "openai" => std::env::var("OPENAI_API_KEY").ok(),
-        "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
-        "gemini" => std::env::var("GEMINI_API_KEY").ok(),
-        "minimax" => std::env::var("MINIMAX_API_KEY").ok(),
-        _ => None,
     }
 }
 

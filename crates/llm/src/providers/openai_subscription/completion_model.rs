@@ -73,6 +73,10 @@ struct CachedBundle {
 pub struct OpenAiSubscriptionCompletionModel {
     model: String,
     base_url: String,
+    /// Reasoning effort the operator picked, clamped to whatever the
+    /// model accepts. `None` = reasoning off. Resolved once at
+    /// construction time so every request body shares the same value.
+    reasoning_effort: Option<&'static str>,
     http: reqwest::Client,
     token_store: VaultTokenStore,
     cache: Arc<Mutex<Option<CachedBundle>>>,
@@ -87,13 +91,16 @@ impl OpenAiSubscriptionCompletionModel {
     pub fn new(
         model: String,
         base_url: Option<String>,
+        reasoning_effort: Option<&str>,
         token_store: VaultTokenStore,
         background: BackgroundRefresh,
     ) -> Self {
         let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let reasoning_effort = super::reasoning::resolve_effort(&model, reasoning_effort);
         let model = Self {
             model,
             base_url,
+            reasoning_effort,
             http: reqwest::Client::new(),
             token_store: token_store.clone(),
             cache: Arc::new(Mutex::new(None)),
@@ -190,10 +197,11 @@ impl OpenAiSubscriptionCompletionModel {
     /// Open a streaming connection to `<base_url>/codex/responses` with
     /// pre-flight + reactive (401-once) refresh handling.
     pub async fn stream(&self, request: CompletionRequest) -> Result<LlmStream, CompletionError> {
-        let body = build_responses_body(&self.model, &request).map_err(|msg| {
-            let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
-            CompletionError::RequestError(err)
-        })?;
+        let body =
+            build_responses_body(&self.model, self.reasoning_effort, &request).map_err(|msg| {
+                let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+                CompletionError::RequestError(err)
+            })?;
         let bundle = self
             .ensure_fresh_bundle()
             .await
@@ -385,10 +393,44 @@ impl OpenAiSubscriptionCompletionModel {
     }
 }
 
+/// Codex Responses requires `tools[].name` to match
+/// `^[a-zA-Z0-9_-]+$`. Aura's MCP-prefixed tools use `<server>/<tool>`
+/// (e.g. `browser/navigate_page`), so we encode `/` → `__` on the
+/// way out and reverse the substitution on the way back. Any other
+/// forbidden char (rare in practice) is replaced with `_`, which is
+/// lossy but at least produces a valid request — the model's tool
+/// call will round-trip back to a name we don't recognise, surfacing
+/// a clean ToolNotFound rather than a 400 from the server.
+pub(crate) fn sanitize_tool_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    for ch in name.chars() {
+        match ch {
+            '/' => out.push_str("__"),
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => out.push(c),
+            _ => out.push('_'),
+        }
+    }
+    out
+}
+
+/// Reverse of [`sanitize_tool_name`] for echoes coming back from the
+/// server. Only the `/` encoding is reversible — single-`_`
+/// replacements for other forbidden chars are not.
+pub(crate) fn unsanitize_tool_name(name: &str) -> String {
+    name.replace("__", "/")
+}
+
 /// rig `CompletionRequest` → Codex Responses API JSON body. Returns
 /// `Value` so tests can inspect the shape without mocking HTTP.
+///
+/// `reasoning_effort` is the operator's already-resolved effort
+/// level (clamped to whatever the model supports). When `Some`, the
+/// body includes `reasoning: { effort, summary: "auto" }` and
+/// `include: ["reasoning.encrypted_content"]` so the server emits +
+/// retains thinking state. `None` disables reasoning entirely.
 pub(crate) fn build_responses_body(
     model: &str,
+    reasoning_effort: Option<&str>,
     request: &CompletionRequest,
 ) -> Result<Value, String> {
     let mut input: Vec<Value> = Vec::new();
@@ -404,32 +446,59 @@ pub(crate) fn build_responses_body(
         .map(|t| {
             json!({
                 "type": "function",
-                "name": t.name,
+                "name": sanitize_tool_name(&t.name),
                 "description": t.description,
                 "parameters": t.parameters,
             })
         })
         .collect();
 
+    // The Codex Responses API rejects requests without `instructions`
+    // ("400: Instructions are required") even when the caller hasn't
+    // set a system message — `aura llm probe` is the canonical example.
+    // Always supply at least a minimal placeholder.
+    let instructions = request
+        .preamble
+        .clone()
+        .unwrap_or_else(|| "You are a helpful assistant.".to_string());
     // store=false: we manage conversation state ourselves; don't ask
     // the server to retain it (matches the Codex CLI posture).
     let mut body = json!({
         "model": model,
         "input": input,
+        "instructions": instructions,
         "tool_choice": "auto",
         "parallel_tool_calls": true,
         "stream": true,
         "store": false,
     });
-    if let Some(preamble) = &request.preamble {
-        body["instructions"] = Value::String(preamble.clone());
-    }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    if let Some(temp) = request.temperature {
-        body["temperature"] = json!(temp);
+    if let Some(effort) = reasoning_effort {
+        body["reasoning"] = json!({
+            "effort": effort,
+            "summary": "auto",
+        });
+        // Tell the server to emit and retain encrypted reasoning
+        // state across turns. Without `include`, multi-turn calls
+        // can't echo prior thinking back, defeating the cache.
+        body["include"] = json!(["reasoning.encrypted_content"]);
+        debug!(
+            model = %model,
+            effort = %effort,
+            "openai-subscription: reasoning enabled in request body"
+        );
+    } else {
+        debug!(
+            model = %model,
+            "openai-subscription: reasoning disabled (effort = None)"
+        );
     }
+    // `temperature` is not part of the Codex Responses parameter set —
+    // server returns 400 "Unsupported parameter: temperature" if we
+    // forward it. Reasoning models pin sampling internally; the
+    // request shape simply doesn't expose a knob.
     Ok(body)
 }
 
@@ -562,13 +631,26 @@ fn convert_message(message: &Message) -> Result<Vec<Value>, String> {
                         out.push(json!({
                             "type": "function_call",
                             "call_id": call.id,
-                            "name": call.function.name,
+                            "name": sanitize_tool_name(&call.function.name),
                             "arguments": call.function.arguments.to_string(),
                         }));
                     }
-                    AssistantContent::Reasoning(_) => {
-                        // Server reconstructs reasoning from
-                        // `include: ["reasoning.encrypted_content"]`; nothing to send.
+                    AssistantContent::Reasoning(reasoning) => {
+                        // Echo the redacted reasoning item we captured
+                        // last turn straight back into `input` so the
+                        // server can decode `encrypted_content` and
+                        // resume the thinking state. The stored bytes
+                        // are an opaque server-side blob; we don't
+                        // synthesise a new shape, just round-trip the
+                        // exact item we received.
+                        for content in reasoning.content.iter() {
+                            if let rig::completion::message::ReasoningContent::Redacted { data } =
+                                content
+                                && let Ok(item) = serde_json::from_str::<Value>(data)
+                            {
+                                out.push(item);
+                            }
+                        }
                     }
                     AssistantContent::Image(_) => {
                         text_parts.push(json!({
@@ -754,8 +836,15 @@ fn translate_event(
             }
         }
         // Reasoning summary deltas (gpt-5 family).
-        "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
+        "response.reasoning.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_text.delta" => {
             if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                debug!(
+                    event_type = %event.event_type,
+                    bytes = delta.len(),
+                    "openai-subscription: reasoning delta"
+                );
                 out.push(Ok(StreamEvent::Reasoning(delta.to_owned())));
             }
         }
@@ -799,53 +888,57 @@ fn translate_event(
                 entry.arguments.push_str(delta);
             }
         }
-        "response.function_call_arguments.done" | "response.output_item.done" => {
-            // Pull the matching accumulator out and emit the assembled call.
-            // `output_item.done` carries the full item; if `function_calls`
-            // already has a richer view (because we saw the deltas) prefer
-            // that, otherwise reconstruct from the payload.
-            let call_id = payload
-                .get("call_id")
-                .or_else(|| payload.get("item").and_then(|i| i.get("call_id")))
-                .or_else(|| payload.get("item").and_then(|i| i.get("id")))
+        "response.function_call_arguments.done" => {
+            emit_function_call(&payload, function_calls, &mut out);
+        }
+        "response.output_item.done" => {
+            // Dispatch on the carried item type — `output_item.done`
+            // is a generic "this item is finalised" marker; the
+            // item's `type` field tells us what shape it is.
+            let item_type = payload
+                .get("item")
+                .and_then(|i| i.get("type"))
                 .and_then(Value::as_str)
-                .map(str::to_owned);
-            let call_id = call_id?;
-            let acc = function_calls.remove(&call_id).unwrap_or_default();
-            // For output_item.done we can also pull a fully-formed
-            // `arguments` field from the item itself — fall back to it if
-            // we never accumulated deltas (server-rendered final).
-            let arguments_str = if acc.arguments.is_empty() {
-                payload
-                    .get("item")
-                    .and_then(|i| i.get("arguments"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned()
-            } else {
-                acc.arguments
-            };
-            let name = if acc.name.is_empty() {
-                payload
-                    .get("item")
-                    .and_then(|i| i.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned()
-            } else {
-                acc.name
-            };
-            if name.is_empty() {
-                return None;
+                .unwrap_or("");
+            match item_type {
+                "function_call" => emit_function_call(&payload, function_calls, &mut out),
+                "reasoning" => {
+                    debug!("openai-subscription: reasoning output_item.done received");
+                    // The whole `item` is what we need to echo back next
+                    // turn so the server can decode `encrypted_content`
+                    // and resume thinking — store it in the redacted
+                    // signature slot. Also surface the human-readable
+                    // summary as plain `Reasoning` text for any UI that
+                    // wants to display it without round-trip semantics.
+                    if let Some(item) = payload.get("item") {
+                        let id = item.get("id").and_then(Value::as_str).map(str::to_owned);
+                        let summary_text = item
+                            .get("summary")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n")
+                            })
+                            .unwrap_or_default();
+                        // Whole item as the redacted payload — the
+                        // server treats it as opaque on the next turn,
+                        // so we just round-trip the bytes.
+                        let data = serde_json::to_string(item).unwrap_or_default();
+                        let mut content = Vec::<aura_model::ThinkingContent>::with_capacity(2);
+                        if !summary_text.is_empty() {
+                            content
+                                .push(aura_model::ThinkingContent::Summary { text: summary_text });
+                        }
+                        content.push(aura_model::ThinkingContent::Redacted { data });
+                        out.push(Ok(StreamEvent::ThinkingBlock(
+                            aura_model::ContentBlock::Thinking { id, content },
+                        )));
+                    }
+                }
+                _ => {}
             }
-            let arguments_value: Value =
-                serde_json::from_str(&arguments_str).unwrap_or(Value::String(arguments_str));
-            out.push(Ok(StreamEvent::ToolCall(ToolCallInfo {
-                id: call_id,
-                name,
-                arguments: arguments_value,
-                signature: None,
-            })));
         }
         // Final event with usage totals.
         "response.completed" => {
@@ -873,12 +966,70 @@ fn translate_event(
                 .unwrap_or("openai-subscription: server-side stream error");
             out.push(Err(LlmError::Provider(message.to_owned())));
         }
-        _ => {
-            // Unknown event type — drop silently. Codex frequently introduces
-            // new event types; we don't want to fail the call on each one.
+        other => {
+            // Unknown event type — drop the payload but log the
+            // type at debug so operators can spot when Codex
+            // introduces a shape we don't parse yet (the reasoning
+            // family in particular has gone through several
+            // rename rounds).
+            debug!(
+                event_type = %other,
+                "openai-subscription: unhandled stream event (dropping)"
+            );
         }
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// Assemble a `function_call` accumulator into a `ToolCall` event.
+/// Pulled out of `translate_event` so both `output_item.done` and
+/// `function_call_arguments.done` can drive it.
+fn emit_function_call(
+    payload: &Value,
+    function_calls: &mut HashMap<String, FunctionCallAccumulator>,
+    out: &mut Vec<crate::Result<StreamEvent>>,
+) {
+    let Some(call_id) = payload
+        .get("call_id")
+        .or_else(|| payload.get("item").and_then(|i| i.get("call_id")))
+        .or_else(|| payload.get("item").and_then(|i| i.get("id")))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let acc = function_calls.remove(&call_id).unwrap_or_default();
+    let arguments_str = if acc.arguments.is_empty() {
+        payload
+            .get("item")
+            .and_then(|i| i.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    } else {
+        acc.arguments
+    };
+    let name = if acc.name.is_empty() {
+        payload
+            .get("item")
+            .and_then(|i| i.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    } else {
+        acc.name
+    };
+    if name.is_empty() {
+        return;
+    }
+    let arguments_value: Value =
+        serde_json::from_str(&arguments_str).unwrap_or(Value::String(arguments_str));
+    out.push(Ok(StreamEvent::ToolCall(ToolCallInfo {
+        id: call_id,
+        name: unsanitize_tool_name(&name),
+        arguments: arguments_value,
+        signature: None,
+    })));
 }
 
 /// Pure refresh-policy function — unit-testable without a tokio runtime.
@@ -1157,7 +1308,7 @@ mod tests {
 
     #[test]
     fn body_carries_model_and_text_user_input() {
-        let body = build_responses_body("gpt-5", &empty_request()).unwrap();
+        let body = build_responses_body("gpt-5", None, &empty_request()).unwrap();
         assert_eq!(body["model"], "gpt-5");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
@@ -1173,8 +1324,90 @@ mod tests {
     fn body_lifts_preamble_into_instructions() {
         let mut req = empty_request();
         req.preamble = Some("be terse".into());
-        let body = build_responses_body("gpt-5", &req).unwrap();
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
         assert_eq!(body["instructions"], "be terse");
+    }
+
+    /// Regression: the Codex Responses API rejects requests without
+    /// `instructions` (400 "Instructions are required"). `aura llm
+    /// probe` builds a request with no preamble, so the body builder
+    /// must inject a placeholder when the caller didn't provide one.
+    #[test]
+    fn body_supplies_default_instructions_when_preamble_is_absent() {
+        let req = empty_request();
+        assert!(req.preamble.is_none());
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let instructions = body["instructions"]
+            .as_str()
+            .expect("instructions must be present");
+        assert!(!instructions.is_empty());
+    }
+
+    /// Regression: Codex Responses returns 400 "Unsupported parameter:
+    /// temperature" when the field is forwarded. The reasoning models
+    /// pin sampling server-side; we drop the field even when the
+    /// caller (e.g. `aura llm probe`) sets one.
+    #[test]
+    fn body_drops_temperature_for_codex_responses() {
+        let mut req = empty_request();
+        req.temperature = Some(0.0);
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "temperature must not be forwarded; got body = {body}"
+        );
+    }
+
+    #[test]
+    fn body_emits_reasoning_when_effort_is_set() {
+        let req = empty_request();
+        let body = build_responses_body("gpt-5", Some("high"), &req).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn body_omits_reasoning_when_effort_is_none() {
+        let req = empty_request();
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        assert!(
+            body.get("reasoning").is_none(),
+            "reasoning must be absent when effort is None"
+        );
+        assert!(
+            body.get("include").is_none(),
+            "include must be absent when reasoning is off"
+        );
+    }
+
+    /// Regression: Codex Responses requires `tools[].name` to match
+    /// `^[a-zA-Z0-9_-]+$`. Aura's MCP-prefixed names (`browser/foo`)
+    /// must be encoded on the way out and decoded on the way back.
+    #[test]
+    fn tool_name_round_trips_through_sanitization() {
+        let original = "browser/navigate_page";
+        let sanitized = sanitize_tool_name(original);
+        assert!(
+            sanitized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "sanitized name must satisfy Codex regex: {sanitized}",
+        );
+        assert_eq!(unsanitize_tool_name(&sanitized), original);
+    }
+
+    #[test]
+    fn body_sanitizes_namespaced_tool_names() {
+        let mut req = empty_request();
+        req.tools.push(ToolDefinition {
+            name: "browser/take_screenshot".into(),
+            description: "snap".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        });
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["name"], "browser__take_screenshot");
     }
 
     #[test]
@@ -1185,7 +1418,7 @@ mod tests {
             description: "look stuff up".into(),
             parameters: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
         });
-        let body = build_responses_body("gpt-5", &req).unwrap();
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
@@ -1209,7 +1442,7 @@ mod tests {
                 additional_params: None,
             })),
         });
-        let body = build_responses_body("gpt-5", &req).unwrap();
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
         let input = body["input"].as_array().unwrap();
         let call_item = input
             .iter()
@@ -1233,7 +1466,7 @@ mod tests {
                 })),
             })),
         });
-        let body = build_responses_body("gpt-5", &req).unwrap();
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
         let input = body["input"].as_array().unwrap();
         let result_item = input
             .iter()
@@ -1514,6 +1747,7 @@ mod tests {
         let model = OpenAiSubscriptionCompletionModel::new(
             "gpt-5".into(),
             None,
+            None,
             token_store.clone(),
             BackgroundRefresh::Disabled,
         );
@@ -1559,6 +1793,7 @@ mod tests {
         token_store.save(&bundle).await.unwrap();
         let model = OpenAiSubscriptionCompletionModel::new(
             "gpt-5".into(),
+            None,
             None,
             token_store.clone(),
             BackgroundRefresh::Disabled,

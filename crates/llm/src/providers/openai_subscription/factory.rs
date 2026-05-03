@@ -125,6 +125,7 @@ fn build_model(
     Ok(OpenAiSubscriptionCompletionModel::new(
         config.model.clone(),
         config.base_url.clone(),
+        config.reasoning_effort.as_deref(),
         token_store,
         background,
     ))
@@ -149,6 +150,7 @@ mod tests {
             base_url: None,
             model: "gpt-5".into(),
             supports_vision: None,
+            reasoning_effort: None,
             vault,
         }
     }

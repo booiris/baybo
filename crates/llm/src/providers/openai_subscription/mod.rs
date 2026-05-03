@@ -4,6 +4,7 @@
 mod completion_model;
 mod factory;
 mod oauth;
+mod reasoning;
 mod token_bundle;
 mod token_store;
 
@@ -20,5 +21,6 @@ pub use oauth::{
     CALLBACK_PORT, CLIENT_ID, DeviceCode, ISSUER, ORIGINATOR, RefreshError, device_code_login,
     pkce_login, refresh, revoke,
 };
+pub use reasoning::allowed_efforts_for;
 pub use token_bundle::OAuthTokenBundle;
 pub use token_store::VaultTokenStore;

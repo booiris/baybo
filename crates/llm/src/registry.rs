@@ -23,6 +23,11 @@ pub struct LlmProviderConfig {
     /// Surfaces the corresponding field on `aura_config::LlmConfig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// Reasoning effort for Codex Responses (`openai-subscription`).
+    /// One of `none`/`minimal`/`low`/`medium`/`high`/`xhigh`. `None`
+    /// = provider default. Other providers ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Encrypted secret store. Required by providers that hold OAuth bearers
     /// (only `openai-subscription` for now); the rest ignore it. Skipped
     /// during serialization — vault is process-local state, not config.
@@ -42,6 +47,7 @@ impl std::fmt::Debug for LlmProviderConfig {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("supports_vision", &self.supports_vision)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("vault", &self.vault.as_ref().map(|_| "<vault>"))
             .finish()
     }
@@ -247,6 +253,7 @@ mod tests {
             base_url: None,
             model: "alpha".into(),
             supports_vision: None,
+            reasoning_effort: None,
             vault: None,
         };
         let entries = factory.live_models(&cfg).await.unwrap();

@@ -7,22 +7,20 @@ use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 
 use crate::error::{CliError, Result};
 
-/// Render a single-select radio list on stderr and return the index the
-/// user picked. `Esc` or `Ctrl-C` raise a cancellation error instead of
-/// returning an index, so callers never have to interpret "0" as "no
-/// choice".
-pub fn select_one(label: &str, options: &[&str]) -> Result<usize> {
+/// Render a single-select radio list on stderr and return the index
+/// the user picked. `Esc` or `Ctrl-C` raise a cancellation error
+/// instead of returning an index, so callers never have to interpret
+/// "0" as "no choice".
+pub(crate) fn select_one(label: &str, options: &[&str]) -> Result<usize> {
     if options.is_empty() {
-        return Err(CliError::Config(
-            "no channel types available to pick from".into(),
-        ));
+        return Err(CliError::Config("no options to pick from".into()));
     }
 
     let stdin = io::stdin();
     let stderr = io::stderr();
     if !stdin.is_terminal() || !stderr.is_terminal() {
         return Err(CliError::Config(
-            "interactive channel picker requires a terminal".into(),
+            "interactive picker requires a terminal".into(),
         ));
     }
 
@@ -68,10 +66,9 @@ pub fn select_one(label: &str, options: &[&str]) -> Result<usize> {
     };
 
     execute!(out, Show).map_err(|e| CliError::Io(format!("failed to restore cursor: {e}")))?;
-    // Leave raw mode before the trailing newline — in raw mode `\n` is
-    // pure LF (no CR), so the cursor would stay in the middle of the
-    // line and the next prompt (`bot token: `) would inherit the
-    // indentation.
+    // Leave raw mode before the trailing newline — in raw mode `\n`
+    // is pure LF (no CR), so the cursor would stay in the middle of
+    // the line and the next prompt would inherit the indentation.
     drop(_guard);
     writeln!(out, "  selected: {}", options[picked])?;
     Ok(picked)
@@ -111,7 +108,7 @@ fn cancel(out: &mut impl Write, rendered_lines: usize) -> Result<usize> {
         let _ = execute!(out, MoveToPreviousLine(1), Clear(ClearType::CurrentLine));
     }
     writeln!(out, "cancelled.")?;
-    Err(CliError::Config("channel add cancelled".into()))
+    Err(CliError::Config("interactive picker cancelled".into()))
 }
 
 struct RawModeGuard;

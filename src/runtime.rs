@@ -246,11 +246,14 @@ pub async fn build_managers(
     // content would degrade to a `[image: …]` text stub even on
     // vision-capable models.
     let llm_client = {
-        let client = Arc::new(boot::build_llm_client(
-            &config.llm,
-            Some(stores.blob.clone()),
-            Some(Arc::clone(&secret_vault)),
-        )?);
+        let client = Arc::new(
+            boot::build_llm_client(
+                config.as_ref(),
+                Some(stores.blob.clone()),
+                Some(Arc::clone(&secret_vault)),
+            )
+            .await?,
+        );
         info!(
             provider = %client.model_info().provider,
             model = %client.model_id(),

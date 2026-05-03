@@ -1,10 +1,15 @@
 use rig::client::CompletionClient;
 use rig::providers::anthropic;
+use serde::Deserialize;
 
-use crate::registry::{LlmProviderConfig, LlmProviderFactory};
+use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
 
-const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
+pub(crate) const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
+/// Origin host MiniMax exposes for OpenAI-compatible model listing.
+/// Operators on the international cluster (`api.minimax.io`) can flip
+/// this via the `MINIMAX_MODELS_HOST` env var.
+const MINIMAX_DEFAULT_MODELS_BASE: &str = "https://api.minimaxi.com/v1";
 
 /// Factory that creates `LlmClient` instances configured for MiniMax models.
 ///
@@ -14,6 +19,7 @@ const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 /// `https://api.minimax.io/anthropic` endpoint) via `LlmConfig.base_url`.
 pub struct MiniMaxProviderFactory;
 
+#[async_trait::async_trait]
 impl LlmProviderFactory for MiniMaxProviderFactory {
     fn provider_name(&self) -> &str {
         "minimax"
@@ -67,6 +73,70 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
             AnyCompletionModel::Anthropic(model),
         ))
     }
+
+    async fn live_models(&self, config: &LlmProviderConfig) -> crate::Result<Vec<LiveModelInfo>> {
+        let api_key = config.api_key.as_deref().ok_or_else(|| {
+            crate::LlmError::Config("MiniMax live discovery requires an API key".into())
+        })?;
+        // The configured `base_url` points at MiniMax's
+        // Anthropic-compat surface (`/anthropic`). Their model list
+        // lives on the OpenAI-compat surface (`/v1/models`); derive
+        // it by swapping the trailing path component on the same
+        // host. Operators on a custom host who need to override can
+        // set `MINIMAX_MODELS_BASE` in the env.
+        let base = std::env::var("MINIMAX_MODELS_BASE")
+            .unwrap_or_else(|_| derive_models_base(config.base_url.as_deref()));
+        let url = format!("{}/models", base.trim_end_matches('/'));
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .map_err(|e| crate::LlmError::Provider(format!("minimax GET /v1/models: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::LlmError::Provider(format!(
+                "minimax GET /v1/models returned {status}: {body}"
+            )));
+        }
+        let payload: ModelListResponse = resp.json().await.map_err(|e| {
+            crate::LlmError::Provider(format!("minimax /v1/models: parse response: {e}"))
+        })?;
+        let mut out: Vec<LiveModelInfo> = payload
+            .data
+            .into_iter()
+            .map(|m| LiveModelInfo {
+                id: m.id,
+                ..Default::default()
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+}
+
+fn derive_models_base(chat_base: Option<&str>) -> String {
+    // `https://api.minimax.io/anthropic` → `https://api.minimax.io/v1`
+    // Falls back to the global default when no custom host is set or
+    // the input doesn't end in `/anthropic`.
+    match chat_base {
+        Some(url) => match url.trim_end_matches('/').strip_suffix("/anthropic") {
+            Some(host) => format!("{host}/v1"),
+            None => MINIMAX_DEFAULT_MODELS_BASE.to_string(),
+        },
+        None => MINIMAX_DEFAULT_MODELS_BASE.to_string(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelListResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
 }
 
 #[cfg(test)]
@@ -88,6 +158,7 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            reasoning_effort: None,
             vault: None,
         };
         assert!(factory.create(&config).is_err());
@@ -102,6 +173,7 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            reasoning_effort: None,
             vault: None,
         };
         let client = factory.create(&config).expect("client builds with api key");
@@ -128,6 +200,7 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            reasoning_effort: None,
             vault: None,
         };
         let client = factory.create(&config).unwrap();
@@ -147,6 +220,7 @@ mod tests {
                 base_url: None,
                 model: "MiniMax-VL-01".into(),
                 supports_vision: Some(true),
+                reasoning_effort: None,
                 vault: None,
             })
             .unwrap();
@@ -166,6 +240,7 @@ mod tests {
                 base_url: None,
                 model: "claude-sonnet-4-6".into(),
                 supports_vision: Some(false),
+                reasoning_effort: None,
                 vault: None,
             })
             .unwrap();

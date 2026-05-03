@@ -101,6 +101,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
                 base_url: None,
                 model: "gpt-4o-mini".into(),
                 supports_vision: None,
+                reasoning_effort: None,
                 vault: None,
             })
             .expect("stub LLM client"),
