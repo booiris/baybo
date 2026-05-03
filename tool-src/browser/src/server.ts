@@ -78,6 +78,23 @@ import {
 } from "./docker.js";
 import { READ_PAGE_TOOL, handleReadPage } from "./read_page.js";
 
+// CDDM tools we hide from the agent's tool list. Lighthouse audits are
+// slow and rarely useful for browsing; WebMCP only fires on pages that
+// implement the WebMCP host protocol, which no normal site does — the
+// agent would just keep calling list_webmcp_tools and getting back
+// empty lists. `take_memory_snapshot` is debug-only (the rest of the
+// memory category is already gated behind `experimentalMemory` in CDDM
+// itself, but the take-snapshot tool ships unconditionally). Filtering
+// happens in the proxy's ListTools handler so the model never sees
+// them; CallTool rejects them defensively too in case a future model
+// hallucinates the name.
+const BLOCKED_TOOLS: ReadonlySet<string> = new Set([
+  "lighthouse_audit",
+  "list_webmcp_tools",
+  "execute_webmcp_tool",
+  "take_memory_snapshot",
+]);
+
 type ServerArgs = CreateMcpServerArgs;
 
 type InstallPhase = "installing" | "ready" | "failed" | DockerPhase;
@@ -278,8 +295,16 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
     redactNetworkHeaders: true,
     categoryNavigationAutomation: true,
     categoryDebugging: true,
-    categoryEmulation: true,
-    categoryPerformance: true,
+    // Drops `emulate` (CPU/network/device emulation) + `resize_page`.
+    // Viewport is fixed at sidecar boot via `AURA_BROWSER_VIEWPORT`, and
+    // the schema for `emulate` alone is ~1.2 KB of enum metadata that
+    // the agent rarely needs.
+    categoryEmulation: false,
+    // Performance/lighthouse tracing is niche enough that we'd rather not
+    // tempt the agent into multi-second trace recordings on every site
+    // visit. Operators who want the perf tooling can bring up DevTools
+    // by hand or run chrome-devtools-mcp standalone.
+    categoryPerformance: false,
     categoryNetwork: true,
     categoryExtensions: false,
     slim: false,
@@ -757,7 +782,8 @@ async function main(): Promise<void> {
   );
   proxy.setRequestHandler(ListToolsRequestSchema, async () => {
     const cddmTools = await cddmClient.listTools();
-    return { tools: [...cddmTools.tools, READ_PAGE_TOOL] };
+    const visible = cddmTools.tools.filter((t) => !BLOCKED_TOOLS.has(t.name));
+    return { tools: [...visible, READ_PAGE_TOOL] };
   });
   proxy.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (req.params.name === READ_PAGE_TOOL.name) {
@@ -765,6 +791,19 @@ async function main(): Promise<void> {
       const pageIdRaw = (raw as { pageId?: unknown }).pageId;
       const pageId = typeof pageIdRaw === "number" ? pageIdRaw : undefined;
       return await handleReadPage(cddmClient, { pageId });
+    }
+    if (BLOCKED_TOOLS.has(req.params.name)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Tool '${req.params.name}' is disabled in this Aura build. ` +
+              `It was hidden from tools/list — do not invoke it.`,
+          },
+        ],
+        isError: true,
+      };
     }
     return await cddmClient.callTool({
       name: req.params.name,
@@ -786,7 +825,8 @@ async function main(): Promise<void> {
       `viewport=${viewportStr} headless=${args.headless} ` +
       `sandbox=${chromeArgList.includes("--no-sandbox") ? "off" : "on"} ` +
       `telemetry=off page_id_routing=${args.experimentalPageIdRouting ? "on" : "off"} ` +
-      `install_state=${state.phase} extra_tools=read_page`,
+      `install_state=${state.phase} extra_tools=read_page ` +
+      `disabled_categories=emulation,performance,extensions disabled_tools=${[...BLOCKED_TOOLS].join(",")}`,
   );
 
   // Cap shutdown at the docker stop timeout (5s graceful + slack for
