@@ -1,53 +1,45 @@
 use serde::{Deserialize, Serialize};
 
-/// LLM provider configuration.
+/// One entry in the `llm` registry. Each entry is keyed by `name` and
+/// describes a provider/model pair plus its credentials. Multiple
+/// entries can target the same provider (e.g. one `openai`-based
+/// "gpt-5" entry and another for "gpt-4o").
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct LlmConfig {
-    /// Provider identifier, e.g. `"openai"`, `"anthropic"`, `"gemini"`, or `"minimax"`.
+pub struct LlmEntry {
+    /// Stable identifier for this entry. Referenced by `default-llm`
+    /// and by the operator CLI. Must be unique within the `llm` list.
+    pub name: String,
+    /// Provider id, e.g. `"openai"`, `"anthropic"`, `"gemini"`,
+    /// `"minimax"`, `"openai-subscription"`.
     pub provider: String,
-    /// Primary model identifier, e.g. `"gpt-4o-mini"`.
+    /// Model id, e.g. `"gpt-4o"`.
     pub model: String,
-    /// Optional fallback model if the primary call fails.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fallback_model: Option<String>,
-    /// Name of an environment variable holding the API key. When `None`, the
-    /// consumer falls back to provider-specific defaults (e.g. `OPENAI_API_KEY`).
-    /// The config never holds a literal API key — this field is a **reference**.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Name of an environment variable holding the API key. The config
+    /// never holds a literal API key — this field is a **reference**.
+    /// `None` means "look up the per-entry vault key, then fall back to
+    /// the provider-specific default env var" (e.g. `OPENAI_API_KEY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
-    /// Custom base URL for the provider API.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Custom base URL for the provider API. `None` lets each provider
+    /// pick its own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// Override the provider's default `supports_vision` flag.
-    ///
-    /// When `Some(true)`, the LLM client encodes inbound `Image` /
-    /// `Audio` / `File` content blocks as proper multimodal parts;
-    /// when `Some(false)`, they degrade to a `[image: …]` text stub
-    /// even on a vision-capable model. `None` keeps the factory
-    /// default.
+    /// Operator override for the factory's default `supports_vision`.
+    /// `None` keeps the factory default; `Some` forces the flag.
     ///
     /// Why this is overridable: providers don't always behave like
     /// their multimodal flag suggests. MiniMax-M2 advertises an
-    /// OpenAI-compatible API but silently uploads any inline image
-    /// to its OSS and shows the model only the URL — the conversion
-    /// succeeds, the model can't actually see the picture, and
-    /// nothing surfaces an error. For these "advertises support but
-    /// doesn't really" cases, an operator needs to flip vision off
-    /// for that specific deployment without recompiling.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// OpenAI-compatible API but silently uploads any inline image to
+    /// its OSS and shows the model only the URL — the conversion
+    /// succeeds, the model can't actually see the picture, and nothing
+    /// surfaces an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            provider: "openai".to_string(),
-            model: "gpt-4o-mini".to_string(),
-            fallback_model: None,
-            api_key_env: None,
-            base_url: None,
-            supports_vision: None,
-        }
-    }
+    /// Reasoning effort for providers that expose it (currently only
+    /// `openai-subscription` Codex Responses). One of `none`,
+    /// `minimal`, `low`, `medium`, `high`, `xhigh`. The provider
+    /// silently clamps to whatever the chosen `model` supports.
+    /// `None` lets the provider pick a sensible default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }

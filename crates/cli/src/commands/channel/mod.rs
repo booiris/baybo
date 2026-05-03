@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +20,9 @@ use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
 mod register;
-mod select;
+
+use crate::commands::prompt::{confirm, prompt_line};
+use crate::commands::select::select_one;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use register::run_registration;
@@ -110,25 +112,6 @@ fn validate_bot_id(bot_id: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn prompt_line<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    label: &str,
-) -> Result<String> {
-    writer.write_all(label.as_bytes())?;
-    writer.flush()?;
-    let mut buf = String::new();
-    let bytes = reader
-        .read_line(&mut buf)
-        .map_err(|e| CliError::Config(format!("failed to read interactive input: {e}")))?;
-    if bytes == 0 {
-        return Err(CliError::Io(
-            "stdin closed while reading interactive input".into(),
-        ));
-    }
-    Ok(buf.trim().to_string())
 }
 
 struct CliPrompter {
@@ -309,7 +292,7 @@ async fn add_bot(ctx: &CommandContext) -> Result<CommandOutput> {
         ));
     }
     let labels: Vec<&str> = channels.iter().map(|c| c.as_str()).collect();
-    let idx = select::select_one("Channel:", &labels)?;
+    let idx = select_one("Channel:", &labels)?;
     let ct = channels[idx].clone();
 
     let stdin = io::stdin();
@@ -343,21 +326,6 @@ async fn add_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     ))
 }
 
-fn confirm(question: &str) -> Result<bool> {
-    let stdin = io::stdin();
-    let stderr = io::stderr();
-    if !stdin.is_terminal() || !stderr.is_terminal() {
-        return Err(CliError::Config(
-            "interactive confirmation requires a terminal".into(),
-        ));
-    }
-    let mut reader = stdin.lock();
-    let mut writer = stderr.lock();
-    let label = format!("{question} [y/N]: ");
-    let ans = prompt_line(&mut reader, &mut writer, &label)?;
-    Ok(matches!(ans.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
-}
-
 async fn remove_bot(ctx: &CommandContext) -> Result<CommandOutput> {
     let (vault, store) = require_bot_deps(ctx)?;
     let bots = collect_all_bots(store).await?;
@@ -372,7 +340,7 @@ async fn remove_bot(ctx: &CommandContext) -> Result<CommandOutput> {
         .map(|(ct, row)| format!("{} ({})", row.bot_id, ct.as_str()))
         .collect();
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let idx = select::select_one("Bot:", &label_refs)?;
+    let idx = select_one("Bot:", &label_refs)?;
     let (ct, row) = &bots[idx];
     let ct = ct.clone();
     let bot_id = row.bot_id.clone();

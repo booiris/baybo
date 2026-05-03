@@ -28,7 +28,7 @@ Bottom-up along the dependency graph:
 
 ### Capability and Governance Layer
 
-- **llm** — LLM provider wrapping and response parsing.
+- **llm** — LLM provider wrapping and response parsing. Subscription/OAuth flavoured providers documented in [`llm-openai-subscription.md`](llm-openai-subscription.md).
 - **tools** — Tool abstraction, registration, capability declarations, runtime routing. The `mcp` submodule ships an MCP client (config in `<workspace>/.mcp.json`, OAuth via rmcp) that surfaces every server's tools to the agent loop as `<server>/<tool>`; the `McpReconciler` keeps the registry in sync without a gateway restart.
 - **[sandbox](sandbox.md)** — OS-native per-invocation isolation for tools declaring `ToolCapability::ExecCommand`. `bwrap` on Linux, `sandbox-exec` on macOS, `docker` as a cross-platform fallback when the native backend is unavailable; the `ToolExecutor` injects a `SandboxAdapter` into `ToolContext.sandbox` so `BashTool` (and any future ExecCommand tools) routes its child process through the platform's isolation primitive. Filesystem-scoped to the workspace; network gated all-or-nothing on the manifest's `Http` capability.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.

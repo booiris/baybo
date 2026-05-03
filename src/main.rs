@@ -138,7 +138,11 @@ async fn main() -> anyhow::Result<()> {
         // `llm` / `doctor` / `status` never send multimodal content,
         // so it's fine to skip the BlobStore wiring here — opening
         // libsql for a status probe would be wasteful.
-        match boot::build_llm_client(&config.llm, None) {
+        // No vault here either: argv-mode `llm` / `doctor` / `status` are
+        // probes that don't need OAuth tokens; the openai-subscription
+        // provider's create() returns a clear error if it's selected
+        // without a vault.
+        match boot::build_llm_client(&config, None, None).await {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 tracing::warn!(error = %e, "LLM client unavailable for this command");
@@ -188,11 +192,14 @@ async fn main() -> anyhow::Result<()> {
 /// else (channel/config/memory/session/skills/…) can boot without an
 /// LLM provider configured — they must not trip the bootstrap warning
 /// just by running.
+///
+/// `aura llm` subcommands intentionally aren't here: their handlers
+/// construct their own provider client with the vault wired in (see
+/// `cli/src/commands/llm.rs::probe`). Pre-building here would also
+/// fail for the openai-subscription default-llm because argv mode
+/// passes `None` for the vault.
 fn needs_llm(cmd: &Commands) -> bool {
-    matches!(
-        cmd,
-        Commands::Llm { .. } | Commands::Doctor | Commands::Status
-    )
+    matches!(cmd, Commands::Doctor | Commands::Status)
 }
 
 fn pick_format(cli: &Cli) -> OutputFormat {

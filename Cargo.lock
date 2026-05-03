@@ -525,17 +525,26 @@ name = "aura-llm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "aura-model",
+ "aura-security",
+ "aura-storage",
  "base64",
+ "bytes",
+ "chrono",
  "futures",
  "parking_lot",
+ "rand 0.10.1",
+ "reqwest 0.13.2",
  "rig-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

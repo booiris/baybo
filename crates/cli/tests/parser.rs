@@ -130,18 +130,51 @@ fn llm_status_parses() {
 }
 
 #[test]
-fn llm_models_and_probe_parse() {
-    let cli = parse(&["llm", "models"]);
-    assert!(matches!(
-        cli.command,
-        Some(Commands::Llm {
-            cmd: LlmCmd::Models
-        })
-    ));
+fn llm_subcommands_parse() {
     let cli = parse(&["llm", "probe"]);
     assert!(matches!(
         cli.command,
-        Some(Commands::Llm { cmd: LlmCmd::Probe })
+        Some(Commands::Llm {
+            cmd: LlmCmd::Probe { name: None }
+        })
+    ));
+    let cli = parse(&["llm", "probe", "openai"]);
+    match cli.command {
+        Some(Commands::Llm {
+            cmd: LlmCmd::Probe { name: Some(n) },
+        }) => assert_eq!(n, "openai"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    let cli = parse(&["llm", "live-model"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Llm {
+            cmd: LlmCmd::LiveModel { name: None }
+        })
+    ));
+    let cli = parse(&["llm", "add"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Llm { cmd: LlmCmd::Add })
+    ));
+    let cli = parse(&["llm", "edit"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Llm { cmd: LlmCmd::Edit })
+    ));
+    let cli = parse(&["llm", "remove"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Llm {
+            cmd: LlmCmd::Remove
+        })
+    ));
+    let cli = parse(&["llm", "default"]);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Llm {
+            cmd: LlmCmd::Default
+        })
     ));
 }
 

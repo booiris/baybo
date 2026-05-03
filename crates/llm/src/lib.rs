@@ -1,6 +1,7 @@
+pub mod credentials;
 mod error;
 pub mod multimodal;
-mod providers;
+pub mod providers;
 pub mod registry;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -26,7 +27,22 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 pub use crate::error::LlmError;
-pub use crate::registry::{LlmProviderConfig, LlmProviderRegistry, ProviderModels};
+pub use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, ProviderModels};
+
+/// Default chat-completion base URL for each built-in provider id.
+/// `None` for unknown providers — the operator must supply one.
+pub fn default_base_url_for_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some(crate::providers::openai::OPENAI_DEFAULT_BASE_URL),
+        "anthropic" => Some(crate::providers::anthropic::ANTHROPIC_DEFAULT_BASE_URL),
+        "gemini" => Some(crate::providers::gemini::GEMINI_DEFAULT_BASE_URL),
+        "minimax" => Some(crate::providers::minimax::MINIMAX_DEFAULT_BASE_URL),
+        crate::providers::openai_subscription::PROVIDER_NAME => {
+            Some(crate::providers::openai_subscription::DEFAULT_BASE_URL)
+        }
+        _ => None,
+    }
+}
 
 /// Strip `; charset=…` and lowercase, then map common MIME strings to
 /// rig's `ImageMediaType` enum. `None` means the model can't natively
@@ -263,6 +279,10 @@ pub(crate) enum AnyCompletionModel {
     OpenAI(openai::completion::CompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
+    /// ChatGPT/Codex OAuth subscription path. Doesn't go through rig — the
+    /// Codex Responses API uses a different request shape and needs custom
+    /// auth + 401-refresh handling. See `providers::openai_subscription`.
+    OpenAiSubscription(crate::providers::openai_subscription::OpenAiSubscriptionCompletionModel),
 }
 
 impl AnyCompletionModel {
@@ -298,6 +318,7 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
+            Self::OpenAiSubscription(m) => m.completion(request).await,
         }
     }
 
@@ -318,6 +339,7 @@ impl AnyCompletionModel {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_rig_stream(stream))
             }
+            Self::OpenAiSubscription(m) => m.stream(request).await,
         }
     }
 }
@@ -799,6 +821,11 @@ impl LlmClient {
             model: self.model_info.id.clone(),
             latency_ms: start.elapsed().as_millis() as u64,
             tokens: response.usage,
+            thinking_chars: response.thinking.as_ref().map(|s| s.chars().count()),
+            thinking_preview: response
+                .thinking
+                .as_ref()
+                .map(|s| s.lines().next().unwrap_or("").chars().take(120).collect()),
         })
     }
 }
@@ -810,6 +837,17 @@ pub struct ProbeReport {
     pub model: String,
     pub latency_ms: u64,
     pub tokens: TokenUsage,
+    /// Number of UTF-8 characters of reasoning summary the provider
+    /// returned. `None` when the model didn't emit any reasoning —
+    /// either because reasoning is disabled or because the provider
+    /// doesn't support it. Useful for `aura llm probe` to confirm
+    /// reasoning is actually flowing end-to-end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_chars: Option<usize>,
+    /// First line of the reasoning summary, truncated to 120 chars,
+    /// for human-readable verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_preview: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -927,6 +965,8 @@ mod multimodal_dispatch_tests {
                 base_url: None,
                 model: "MiniMax-VL-01".into(),
                 supports_vision: Some(true),
+                reasoning_effort: None,
+                vault: None,
             })
             .unwrap()
     }
@@ -1017,6 +1057,8 @@ mod multimodal_dispatch_tests {
                 base_url: None,
                 model: "gpt-3.5-turbo".into(),
                 supports_vision: None,
+                reasoning_effort: None,
+                vault: None,
             })
             .unwrap();
         // OpenAI factory may set vision=true on some models; force

@@ -1,12 +1,4 @@
 {
-  "llm": {
-    "provider": "openai",
-    "model": "gpt-4o-mini",
-    "fallback_model": "gpt-4o",
-    "api_key_env": "OPENAI_API_KEY",
-    "base_url": null,
-    "supports_vision": null
-  },
   "agent": {
     "max_iterations": 20,
     "default_tool_timeout_ms": 30000,

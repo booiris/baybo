@@ -423,13 +423,48 @@ pub enum PairCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum LlmCmd {
-    /// Show the configured LLM provider, model id, and capabilities.
+    /// List every registered LLM entry — name, provider, model, and
+    /// the env var the api key is read from. Includes a `*` marker
+    /// on the entry currently selected as `default-llm`.
     Status,
-    /// List the model catalog each registered provider advertises.
-    Models,
-    /// Send a one-token chat request to the configured provider to verify
-    /// connectivity and auth. Feeds `aura doctor`.
-    Probe,
+    /// Probe a configured LLM entry by chatting against its model and
+    /// timing the round-trip.
+    ///
+    /// Without `name`, an interactive picker opens; pass an entry name
+    /// to skip the picker.
+    Probe {
+        /// Optional entry name. Omit for an interactive picker.
+        name: Option<String>,
+    },
+    /// List the live catalog reported by an LLM entry's provider —
+    /// useful before running `aura llm add` to see which model ids the
+    /// account has access to.
+    ///
+    /// Without `name`, an interactive picker opens; pass an entry name
+    /// to skip the picker.
+    LiveModel {
+        /// Optional entry name. Omit for an interactive picker.
+        name: Option<String>,
+    },
+    /// Interactive flow that registers a new LLM entry: pick a built-in
+    /// provider, supply a name + base URL + credentials (api-key
+    /// stored in the vault, OAuth flow for subscription providers),
+    /// then choose the model from the live catalog. Persists the
+    /// resulting entry to the active config file.
+    Add,
+    /// Interactive editor that lets you change individual fields of
+    /// an existing LLM entry — model, base URL, API key, reasoning
+    /// effort, vision override. Each field shows the current value as
+    /// a placeholder; press enter to keep it.
+    Edit,
+    /// Interactive picker that deletes an LLM entry, clears its
+    /// vault-stored api key (and OAuth bundle for subscription
+    /// providers), and persists the config. Refuses to remove the
+    /// entry currently named in `default-llm`.
+    Remove,
+    /// Interactive picker that updates `default-llm` to the chosen
+    /// entry and persists the change to the active config file.
+    Default,
 }
 
 #[derive(Debug, Subcommand)]

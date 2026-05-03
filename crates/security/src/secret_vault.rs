@@ -77,6 +77,28 @@ impl SecretVault {
             .await
             .map_err(|e| SecurityError::Storage(e.to_string()))
     }
+
+    /// Store any `serde::Serialize` value as JSON inside an encrypted vault
+    /// entry. Same AES-GCM encryption as `store_secret`; just adds a JSON
+    /// envelope so callers don't have to hand-roll bytes for typed payloads
+    /// like OAuth bundles.
+    pub async fn store_typed<T: serde::Serialize>(&self, name: &str, value: &T) -> Result<()> {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|e| SecurityError::Storage(format!("serialize {name}: {e}")))?;
+        self.store_secret(name, &bytes).await
+    }
+
+    /// Counterpart to `store_typed`. Returns `None` when the entry is absent;
+    /// returns `SecurityError::Storage` when bytes exist but JSON-decode
+    /// fails (callers typically treat that as "corrupt — clear and re-init").
+    pub async fn get_typed<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        let Some(secret) = self.get_secret(name).await? else {
+            return Ok(None);
+        };
+        let value: T = serde_json::from_slice(secret.as_bytes())
+            .map_err(|e| SecurityError::Storage(format!("deserialize {name}: {e}")))?;
+        Ok(Some(value))
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +127,45 @@ mod tests {
         let vault = make_vault();
         let result = vault.get_secret("nonexistent").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn typed_round_trip() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Bundle {
+            access: String,
+            count: u32,
+        }
+        let vault = make_vault();
+        let original = Bundle {
+            access: "tok-abc".into(),
+            count: 7,
+        };
+        vault.store_typed("bundle", &original).await.unwrap();
+        let recovered: Bundle = vault.get_typed("bundle").await.unwrap().unwrap();
+        assert_eq!(recovered, original);
+    }
+
+    #[tokio::test]
+    async fn typed_missing_returns_none() {
+        let vault = make_vault();
+        let recovered: Option<String> = vault.get_typed("nope").await.unwrap();
+        assert!(recovered.is_none());
+    }
+
+    #[tokio::test]
+    async fn typed_corrupt_payload_errors() {
+        // Stored as raw bytes that don't parse as JSON; get_typed must fail
+        // loudly so the caller can treat it as "corrupt — clear and re-init".
+        let vault = make_vault();
+        vault
+            .store_secret("garbage", b"not-json-at-all")
+            .await
+            .unwrap();
+        let err = vault.get_typed::<u32>("garbage").await.unwrap_err();
+        match err {
+            SecurityError::Storage(msg) => assert!(msg.contains("deserialize garbage")),
+            other => panic!("expected SecurityError::Storage, got {other:?}"),
+        }
     }
 }

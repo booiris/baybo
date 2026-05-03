@@ -529,17 +529,20 @@ async fn channels_list_without_store_errors() {
 }
 
 #[tokio::test]
-async fn llm_status_errors_when_client_missing() {
+async fn llm_status_lists_configured_entries() {
     let ctx = context();
-    let err = dispatch::run(
+    let out = dispatch::run(
         &ctx,
         Commands::Llm {
             cmd: LlmCmd::Status,
         },
     )
     .await
-    .expect_err("llm status without client should fail");
-    assert!(format!("{err}").to_lowercase().contains("llm"));
+    .expect("llm status reads from config; no client required");
+    let data = out.data.expect("payload");
+    let entries = data["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), ctx.config.llm.len());
+    assert_eq!(data["default"].as_str().unwrap(), &ctx.config.default_llm);
 }
 
 fn tmp_workspace_dir(label: &str) -> PathBuf {
@@ -1789,14 +1792,14 @@ async fn config_get_returns_known_field() {
         &ctx,
         Commands::Config {
             cmd: ConfigCmd::Get {
-                path: "llm.model".into(),
+                path: "default-llm".into(),
             },
         },
     )
     .await
     .expect("get");
     let data = out.data.unwrap();
-    assert_eq!(data, serde_json::to_value(&ctx.config.llm.model).unwrap());
+    assert_eq!(data, serde_json::to_value(&ctx.config.default_llm).unwrap());
 }
 
 #[tokio::test]
@@ -1823,20 +1826,20 @@ async fn config_set_persists_value_to_resolved_path() {
         &ctx,
         Commands::Config {
             cmd: ConfigCmd::Set {
-                path: "llm.model".into(),
-                value: "gpt-5".into(),
+                path: "agent.max_iterations".into(),
+                value: "7".into(),
                 yes: false,
             },
         },
     )
     .await
     .expect("set");
-    assert!(out.human.contains("gpt-5"));
+    assert!(out.human.contains("7"));
     assert!(out.human.contains("restart"));
 
     let on_disk = std::fs::read_to_string(&tmp).expect("file exists");
     let reparsed: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
-    assert_eq!(reparsed["llm"]["model"].as_str().unwrap(), "gpt-5");
+    assert_eq!(reparsed["agent"]["max_iterations"].as_u64().unwrap(), 7);
     std::fs::remove_file(&tmp).ok();
 }
 
@@ -1848,8 +1851,8 @@ async fn config_set_slash_requires_yes() {
         &ctx,
         Commands::Config {
             cmd: ConfigCmd::Set {
-                path: "llm.model".into(),
-                value: "gpt-5".into(),
+                path: "agent.max_iterations".into(),
+                value: "7".into(),
                 yes: false,
             },
         },
@@ -1868,8 +1871,8 @@ async fn config_set_rejects_invalid_value() {
         &ctx,
         Commands::Config {
             cmd: ConfigCmd::Set {
-                path: "llm.provider".into(),
-                value: "\"\"".into(),
+                path: "agent.max_iterations".into(),
+                value: "0".into(),
                 yes: false,
             },
         },
@@ -1884,7 +1887,7 @@ async fn config_set_rejects_invalid_value() {
 async fn config_unset_persists_and_resets() {
     let tmp = tmp_config_path("unset-ok");
     let seeded = AuraConfig::default()
-        .set_at_path("llm.model", serde_json::json!("gpt-5"))
+        .set_at_path("agent.max_iterations", serde_json::json!(7))
         .unwrap();
     seeded.write_to_file(&tmp).await.unwrap();
 
@@ -1902,7 +1905,7 @@ async fn config_unset_persists_and_resets() {
         &ctx,
         Commands::Config {
             cmd: ConfigCmd::Unset {
-                path: "llm.model".into(),
+                path: "agent.max_iterations".into(),
                 yes: false,
             },
         },
@@ -1911,41 +1914,11 @@ async fn config_unset_persists_and_resets() {
     .expect("unset");
 
     let loaded = AuraConfig::load_from_file(&tmp).await.unwrap();
-    assert_eq!(loaded.llm.model, AuraConfig::default().llm.model);
+    assert_eq!(
+        loaded.agent.max_iterations,
+        AuraConfig::default().agent.max_iterations
+    );
     std::fs::remove_file(&tmp).ok();
-}
-
-#[tokio::test]
-async fn llm_models_lists_default_providers() {
-    let ctx = context();
-    let out = dispatch::run(
-        &ctx,
-        Commands::Llm {
-            cmd: LlmCmd::Models,
-        },
-    )
-    .await
-    .expect("llm models");
-    let data = out.data.expect("json payload");
-    let providers = data
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .expect("providers array");
-    let names: Vec<_> = providers
-        .iter()
-        .filter_map(|p| p.get("provider").and_then(|v| v.as_str()))
-        .collect();
-    assert!(names.contains(&"openai"));
-    assert!(names.contains(&"anthropic"));
-}
-
-#[tokio::test]
-async fn llm_probe_without_client_reports_unavailable() {
-    let ctx = context();
-    let err = dispatch::run(&ctx, Commands::Llm { cmd: LlmCmd::Probe })
-        .await
-        .expect_err("no client configured");
-    assert!(err.to_string().contains("llm client"));
 }
 
 // --- skills ---
