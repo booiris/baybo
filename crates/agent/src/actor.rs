@@ -26,6 +26,17 @@ pub enum AgentMessage {
         job_id: String,
         action: TriggerAction,
     },
+    /// A subagent was spawned. Carries the initial prompt assembled by
+    /// `LocalSubagentRuntime` and the parent's `JobId` for lineage.
+    /// The child actor runs `agent_loop.run` with `JobInput::Spawned`,
+    /// which `JobKind::Spawned.allowed_for(*) == true` lets through
+    /// regardless of the child session's root trigger — which it must,
+    /// because subagents inherit the parent's trigger (cron / system)
+    /// via `create_spawned_session`.
+    SubagentSpawned {
+        initial_message: Box<IncomingMessage>,
+        parent_job_id: aura_model::JobId,
+    },
     /// Gracefully shut down this actor.
     Shutdown,
 }
@@ -116,6 +127,21 @@ impl AgentActor {
                             job_id = %job_id,
                             error = %e,
                             "failed to handle cron trigger"
+                        );
+                    }
+                }
+                AgentMessage::SubagentSpawned {
+                    initial_message,
+                    parent_job_id,
+                } => {
+                    if let Err(e) = self
+                        .handle_subagent_spawned(*initial_message, parent_job_id)
+                        .await
+                    {
+                        error!(
+                            session_id = %self.session.id,
+                            error = %e,
+                            "failed to handle subagent spawn"
                         );
                     }
                 }
@@ -423,6 +449,45 @@ impl AgentActor {
         // Send response
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send response to channel");
+        }
+        self.emit_job_completed(outcome).await;
+
+        Ok(())
+    }
+
+    /// Run the agent loop for a subagent-spawned session. Distinct from
+    /// `handle_user_input` because the JobInput must be `Spawned` (not
+    /// `UserChat`) so `JobLifecycle::start_job`'s allowed-for check
+    /// passes regardless of the inherited trigger kind.
+    async fn handle_subagent_spawned(
+        &mut self,
+        incoming: IncomingMessage,
+        parent_job_id: aura_model::JobId,
+    ) -> anyhow::Result<()> {
+        let content = incoming.message.content;
+        let result = self
+            .agent_loop
+            .run(
+                &mut self.session,
+                JobInput::Spawned {
+                    initial_prompt: content.clone(),
+                },
+                content,
+                &self.job_lifecycle,
+                &self.span_recorder,
+                Some(parent_job_id),
+                Some(self.response_tx.clone()),
+                self.actor_token.child_token(),
+            )
+            .await;
+        let outcome = match &result {
+            Ok(_) => JobOutcome::Completed,
+            Err(_) => JobOutcome::Failed,
+        };
+        let response = result?;
+
+        if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
+            warn!(error = %e, "failed to send subagent response");
         }
         self.emit_job_completed(outcome).await;
 

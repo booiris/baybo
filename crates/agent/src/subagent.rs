@@ -236,8 +236,16 @@ impl SubagentRuntime for LocalSubagentRuntime {
                 metadata: MessageMetadata::default(),
             },
         };
+        // Dispatch via SubagentSpawned (not UserInput) so the child
+        // actor's handler runs `agent_loop.run` with `JobInput::Spawned`.
+        // `JobKind::Spawned.allowed_for(*) == true`, so this works even
+        // when the child session inherits a Cron / System root trigger
+        // from `create_spawned_session`.
         if let Err(e) = mailbox
-            .send(AgentMessage::UserInput(Box::new(incoming)))
+            .send(AgentMessage::SubagentSpawned {
+                initial_message: Box::new(incoming),
+                parent_job_id,
+            })
             .await
         {
             return SubagentResult {

@@ -311,6 +311,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawned_job_kind_allowed_under_every_root_trigger() {
+        // Pins the contract that the subagent dispatch path relies on:
+        // JobInput::Spawned must work for a child session whose root
+        // trigger is inherited from the parent (User / Cron / System).
+        let lc = make_lifecycle();
+        for trigger in [TriggerKind::User, TriggerKind::Cron, TriggerKind::System] {
+            let job = lc
+                .start_job(
+                    SessionId::from(format!("child-of-{trigger:?}")),
+                    trigger,
+                    JobInput::Spawned {
+                        initial_prompt: vec![ContentBlock::Text("task".into())],
+                    },
+                    "soul-v1",
+                    None,
+                )
+                .await;
+            assert!(
+                job.is_ok(),
+                "subagent dispatch under {trigger:?} root must be allowed: {:?}",
+                job.err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_chat_under_cron_session_is_rejected() {
+        // The bug this guards against: subagent.rs used to send
+        // AgentMessage::UserInput, which mapped to JobInput::UserChat —
+        // and a Cron-rooted child session rejected that with KindMismatch.
+        // The fix routes subagents through JobInput::Spawned (covered by
+        // the test above); this test pins the underlying state-machine
+        // rejection so a regression elsewhere can't silently restore the
+        // old shape.
+        let lc = make_lifecycle();
+        let err = lc
+            .start_job(
+                SessionId::from("cron-session"),
+                TriggerKind::Cron,
+                JobInput::UserChat {
+                    content: vec![ContentBlock::Text("hi".into())],
+                },
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JobError::KindMismatch(_)));
+    }
+
+    #[tokio::test]
     async fn cancel_with_partial_artifacts() {
         let lc = make_lifecycle();
         let job = lc
