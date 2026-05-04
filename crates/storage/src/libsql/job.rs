@@ -73,7 +73,7 @@ impl JobStore for LibsqlJobStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM jobs WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT data FROM jobs WHERE id = ?1",
                 libsql::params![job_id.to_string()],
             )
             .await
@@ -104,7 +104,7 @@ impl JobStore for LibsqlJobStore {
             .execute(
                 "UPDATE jobs SET status_kind = ?1, started_at = ?2, ended_at = ?3, \
                                   data = ?4 \
-                 WHERE id = ?5 AND deleted_at IS NULL",
+                 WHERE id = ?5",
                 libsql::params![
                     status_kind_str(job.status.kind()).to_string(),
                     job.started_at.map(super::time::to_us),
@@ -127,7 +127,7 @@ impl JobStore for LibsqlJobStore {
         let mut rows = conn
             .query(
                 "SELECT data FROM jobs \
-                 WHERE session_id = ?1 AND deleted_at IS NULL \
+                 WHERE session_id = ?1 \
                  ORDER BY created_at",
                 libsql::params![session_id.as_str().to_string()],
             )
@@ -153,7 +153,7 @@ impl JobStore for LibsqlJobStore {
         let mut rows = conn
             .query(
                 "SELECT data FROM jobs \
-                 WHERE status_kind = ?1 AND deleted_at IS NULL \
+                 WHERE status_kind = ?1 \
                  ORDER BY created_at",
                 libsql::params![status_kind_str(kind).to_string()],
             )
@@ -180,7 +180,6 @@ impl JobStore for LibsqlJobStore {
             .query(
                 "SELECT data FROM jobs \
                  WHERE status_kind IN ('pending', 'in_progress', 'stuck') \
-                   AND deleted_at IS NULL \
                  ORDER BY created_at",
                 (),
             )
@@ -206,7 +205,7 @@ impl JobStore for LibsqlJobStore {
         let mut rows = conn
             .query(
                 "SELECT data FROM jobs \
-                 WHERE parent_job_id = ?1 AND deleted_at IS NULL \
+                 WHERE parent_job_id = ?1 \
                  ORDER BY created_at",
                 libsql::params![parent_job_id.to_string()],
             )
@@ -230,7 +229,7 @@ impl JobStore for LibsqlJobStore {
     async fn list_all(&self) -> aura_job::Result<Vec<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM jobs WHERE deleted_at IS NULL", ())
+            .query("SELECT data FROM jobs", ())
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -266,7 +265,7 @@ impl JobStore for LibsqlJobStore {
         let mut rows = conn
             .query(
                 "SELECT data FROM job_transitions \
-                 WHERE job_id = ?1 AND deleted_at IS NULL ORDER BY id",
+                 WHERE job_id = ?1 ORDER BY id",
                 libsql::params![job_id.to_string()],
             )
             .await

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_storage::{BlobStore, ChannelPairingStore, CostStore, CronStore};
+use aura_storage::{BlobStore, ChannelPairingStore};
 use aura_workspace::WorkspacePaths;
 
 use fs_sweep::{DirSweep, EntryShape, is_log_file, is_session_log, is_uuid_dir, sweep_directory};
@@ -23,17 +23,10 @@ const LOG_FILE_TTL: Duration = Duration::from_secs(14 * 86_400);
 // blob whose `last_accessed_at` falls behind this window is reaped on
 // the next sweep.
 const BLOB_TTL: Duration = Duration::from_secs(7 * 86_400);
-// Raw `cost_records`. The per-month rollup in `user_monthly_cost` is
-// the durable summary, so dropping rows past 90d only loses per-call
-// detail, not totals.
-const COST_RECORDS_TTL: Duration = Duration::from_secs(90 * 86_400);
-// `cron_executions`. A 1-minute cron alone produces ~525k rows/yr;
-// past 30d the audit value drops below the storage cost.
-const CRON_EXECUTIONS_TTL: Duration = Duration::from_secs(30 * 86_400);
 // Pairing approvals — short-lived auth-flow ephemera, kept long enough
 // for the next channel reload to confirm them, then dropped.
 const PAIRING_APPROVAL_TTL: Duration = Duration::from_secs(7 * 86_400);
-// `channel_pairings` runs sub-hourly (much faster than the daily
+// `channel_pairings` runs hourly (much faster than the daily
 // sweep) because pending codes expire on the order of minutes; an
 // hourly cadence keeps the table from accumulating expired pending
 // rows between full sweeps.
@@ -61,8 +54,6 @@ pub struct JanitorReport {
     pub log_files_removed: usize,
     pub blobs_purged: u64,
     pub sidecar_dirs_removed: usize,
-    pub cost_records_purged: u64,
-    pub cron_executions_purged: u64,
     pub pairings_purged: u64,
 }
 
@@ -81,8 +72,6 @@ pub struct Janitor {
     paths: WorkspacePaths,
     blobs: Arc<dyn BlobStore>,
     sidecar_cache: Option<SidecarCache>,
-    costs: Option<Arc<dyn CostStore>>,
-    crons: Option<Arc<dyn CronStore>>,
     pairings: Option<Arc<dyn ChannelPairingStore>>,
 }
 
@@ -92,8 +81,6 @@ impl Janitor {
             paths,
             blobs,
             sidecar_cache: None,
-            costs: None,
-            crons: None,
             pairings: None,
         }
     }
@@ -108,22 +95,15 @@ impl Janitor {
         self
     }
 
-    /// Wire the store handles for the auto-growing-table retention
-    /// sweeps. Without this call those sweeps don't run.
+    /// Wire the pairing store for the hourly expired-code sweep.
+    /// Without this call the pairing sweep doesn't run.
     #[must_use]
-    pub fn with_retention_stores(
-        mut self,
-        costs: Arc<dyn CostStore>,
-        crons: Arc<dyn CronStore>,
-        pairings: Arc<dyn ChannelPairingStore>,
-    ) -> Self {
-        self.costs = Some(costs);
-        self.crons = Some(crons);
+    pub fn with_pairing_store(mut self, pairings: Arc<dyn ChannelPairingStore>) -> Self {
         self.pairings = Some(pairings);
         self
     }
 
-    /// Run all four sweeps once. Failures in one sweep are logged and
+    /// Run every wired sweep once. Failures in one sweep are logged and
     /// the others still run — janitor is best-effort.
     pub async fn sweep_once(&self) -> JanitorReport {
         let mut report = JanitorReport::default();
@@ -175,27 +155,11 @@ impl Janitor {
             Err(e) => tracing::warn!(error = %e, "blob sweep failed"),
         }
 
-        let now = chrono::Utc::now();
-        if let Some(costs) = self.costs.as_ref() {
-            let cutoff = now - chrono::Duration::seconds(COST_RECORDS_TTL.as_secs() as i64);
-            match costs.purge_cost_records_older_than(cutoff).await {
-                Ok(n) => report.cost_records_purged = n,
-                Err(e) => tracing::warn!(error = %e, "cost_records purge failed"),
-            }
-        }
-        if let Some(crons) = self.crons.as_ref() {
-            let cutoff_us = (now - chrono::Duration::seconds(CRON_EXECUTIONS_TTL.as_secs() as i64))
-                .timestamp_micros();
-            match crons.purge_completed_executions_older_than(cutoff_us).await {
-                Ok(n) => report.cron_executions_purged = n,
-                Err(e) => tracing::warn!(error = %e, "cron_executions purge failed"),
-            }
-        }
         // Pairings get a daily sweep here too so a long-running process
         // that never trips the hourly tick (e.g. heavy load deferring
         // every interval fire) still eventually reaps stale rows.
         if self.pairings.is_some() {
-            report.pairings_purged += self.sweep_pairings_once(now).await;
+            report.pairings_purged += self.sweep_pairings_once(chrono::Utc::now()).await;
         }
 
         tracing::info!(
@@ -203,8 +167,6 @@ impl Janitor {
             python_dirs_removed = report.python_dirs_removed,
             log_files_removed = report.log_files_removed,
             blobs_purged = report.blobs_purged,
-            cost_records_purged = report.cost_records_purged,
-            cron_executions_purged = report.cron_executions_purged,
             pairings_purged = report.pairings_purged,
             "janitor sweep complete",
         );
@@ -212,7 +174,7 @@ impl Janitor {
         report
     }
 
-    /// Sub-hourly pairing sweep. Returns the number of rows hard-deleted.
+    /// Hourly pairing sweep. Returns the number of rows hard-deleted.
     /// Pending rows expire on the order of minutes; without a
     /// faster-than-daily cadence the table fills with dead pending
     /// codes between the main sweep ticks.
@@ -457,7 +419,7 @@ mod tests {
             .sweep_once_with_blob_cutoff(future_cutoff)
             .await;
         assert_eq!(report.blobs_purged, 1);
-        assert_eq!(memory.len(), 0, "row should be soft-deleted");
+        assert_eq!(memory.len(), 0, "row should be deleted");
 
         // A second run is idempotent.
         let report2 = Janitor::new(paths, Arc::clone(&store)).sweep_once().await;
@@ -546,59 +508,6 @@ mod tests {
         assert_eq!(report.python_dirs_removed, 0);
         assert_eq!(report.log_files_removed, 0);
         assert_eq!(report.blobs_purged, 0);
-    }
-
-    #[tokio::test]
-    async fn cost_records_purge_drops_only_rows_past_cutoff() {
-        use aura_storage::CostRecord;
-        use aura_storage::CostStore;
-        use aura_storage::test_support::MemoryCostStore;
-
-        let tmp = TempDir::new().unwrap();
-        let paths = workspace_paths(tmp.path());
-        let cost = Arc::new(MemoryCostStore::new());
-        let cost_dyn: Arc<dyn aura_storage::CostStore> = Arc::clone(&cost) as _;
-
-        // Two records: one ancient (well past TTL), one fresh (now).
-        let ancient = CostRecord {
-            user_id: "u1".into(),
-            session_id: aura_model::SessionId::from("s1"),
-            job_id: aura_model::JobId::new(),
-            span_id: aura_model::SpanId::new(),
-            model: "m".into(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cost_usd: 0.0,
-            timestamp: chrono::Utc::now()
-                - chrono::Duration::seconds((COST_RECORDS_TTL.as_secs() + 86_400) as i64),
-            originating_session_deleted_at: None,
-        };
-        let fresh = CostRecord {
-            timestamp: chrono::Utc::now(),
-            ..ancient.clone()
-        };
-        cost.record(&ancient).await.unwrap();
-        cost.record(&fresh).await.unwrap();
-        assert_eq!(cost.len(), 2);
-
-        // CronStore + ChannelPairingStore aren't part of this assertion;
-        // wire stub Arcs of the same trait if/when memory impls land.
-        // The trait requires both to be set together via
-        // `with_retention_stores`, so take the shortcut of stubbing
-        // them via the libsql in-memory pool.
-        let pool = aura_storage::libsql::LibsqlPool::open_in_memory()
-            .await
-            .unwrap();
-        let crons: Arc<dyn aura_storage::CronStore> =
-            Arc::new(aura_storage::libsql::LibsqlCronStore::new(pool.clone()));
-        let pairings: Arc<dyn aura_storage::ChannelPairingStore> =
-            Arc::new(aura_storage::libsql::LibsqlChannelPairingStore::new(pool));
-
-        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
-            .with_retention_stores(cost_dyn, crons, pairings);
-        let report = janitor.sweep_once().await;
-        assert_eq!(report.cost_records_purged, 1);
-        assert_eq!(cost.len(), 1, "fresh record must survive");
     }
 
     #[tokio::test]

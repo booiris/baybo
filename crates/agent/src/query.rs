@@ -448,7 +448,7 @@ impl QueryApi {
         for s in &summaries {
             let job = match self.jobs.get(&s.id).await? {
                 Some(j) => j,
-                None => continue, // soft-deleted between calls; skip
+                None => continue, // deleted between calls; skip
             };
             let mut steps = self.trace.list_steps_by_job(&job.id).await?;
             steps.sort_by_key(|s| s.started_at);
@@ -534,7 +534,7 @@ mod tests {
                 .insert(session.id.clone(), session.clone());
             Ok(())
         }
-        async fn soft_delete(&self, _id: &SessionId) -> std::result::Result<bool, StorageError> {
+        async fn delete(&self, _id: &SessionId) -> std::result::Result<bool, StorageError> {
             Ok(true)
         }
         async fn list_expired(

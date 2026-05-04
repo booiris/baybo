@@ -221,11 +221,12 @@ impl AgentActor {
     /// Wraps the call in its own `Job` + `StepKind::ToolDirect` step (one
     /// tool `Span`, no LLM span — the variant exists specifically so this
     /// "no-LLM iteration" doesn't masquerade as an `LlmIteration` in cost
-    /// reports). On a crash this produces a half-open span the recovery
-    /// scan will rewrite as `Cancelled { SystemCrash }` and fold into the
-    /// job's `partial_artifacts`. Tool-execution failures propagate as
-    /// `Err` to the actor's run loop, which logs them; there is no
-    /// LLM-narrated diagnostic follow-up.
+    /// reports). On a crash this leaves a half-open span and a
+    /// non-terminal job that `find_recoverable_jobs` surfaces; the
+    /// auto-rewrite into `Cancelled { SystemCrash }` is not wired today.
+    /// Tool-execution failures propagate as `Err` to the actor's run
+    /// loop, which logs them; there is no LLM-narrated diagnostic
+    /// follow-up.
     async fn handle_cron_tool_call(
         &mut self,
         cron_job_id: &str,

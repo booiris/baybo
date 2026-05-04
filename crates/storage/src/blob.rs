@@ -36,8 +36,7 @@ pub struct BlobMeta {
     pub blob_id: String,
     pub mime_type: String,
     pub size: u64,
-    /// Unix microseconds at which the blob was first written (or revived
-    /// after a soft delete).
+    /// Unix microseconds at which the blob was first written.
     pub created_at: i64,
     /// Unguessable token required to read the blob via the gateway's
     /// side-channel. Prevents ID prediction across tenant boundaries.
@@ -84,7 +83,7 @@ pub trait BlobStore: Send + Sync {
     ) -> Result<BlobRef>;
 
     /// Read the full blob bytes. Returns [`StorageError::NotFound`]
-    /// when no live row exists for `blob_id` (missing or soft-deleted).
+    /// when no row exists for `blob_id`.
     async fn get(&self, blob_id: &str) -> Result<Vec<u8>>;
 
     /// Open a streaming reader for the blob's bytes. The caller owns
@@ -96,19 +95,19 @@ pub trait BlobStore: Send + Sync {
     /// Return metadata only. Same not-found semantics as `get`.
     async fn stat(&self, blob_id: &str) -> Result<BlobMeta>;
 
-    /// Soft-delete: marks the metadata row's `deleted_at`. The on-disk
-    /// bytes stay so a future `put` of the same content can revive the
-    /// row in O(1). Idempotent on missing / already-deleted ids.
+    /// Hard-delete the metadata row and unlink the on-disk payload
+    /// (when no other live row resolves to the same content path).
+    /// Idempotent on missing ids.
     async fn delete(&self, blob_id: &str) -> Result<()>;
 
-    /// Bulk garbage-collect every live blob whose `last_accessed_at <
+    /// Bulk garbage-collect every blob whose `last_accessed_at <
     /// cutoff_us` (Unix microseconds). LRU semantics: a successful
     /// `get`/`stat`/`open` bumps `last_accessed_at`, so blobs the
     /// system is still reading stay out of the sweep regardless of
-    /// when they were first written. Soft-deletes the metadata row and
-    /// (where the backend keeps payload files on disk) unlinks the byte
-    /// file iff no remaining live row resolves to the same on-disk
-    /// path. Returns the number of rows transitioned from live to
-    /// deleted. Idempotent: a no-op when no live row matches.
+    /// when they were first written. Hard-deletes the metadata row and
+    /// (where the backend keeps payload files on disk) unlinks the
+    /// byte file iff no remaining row resolves to the same on-disk
+    /// path. Returns the number of rows removed. Idempotent: a no-op
+    /// when no row matches.
     async fn purge_older_than(&self, cutoff_us: i64) -> Result<u64>;
 }

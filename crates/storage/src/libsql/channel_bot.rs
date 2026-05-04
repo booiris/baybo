@@ -22,7 +22,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let mut rows = conn
             .query(
                 "SELECT channel_type, bot_id, created_at FROM channel_bots
-                 WHERE channel_type = ?1 AND deleted_at IS NULL
+                 WHERE channel_type = ?1
                  ORDER BY created_at DESC",
                 libsql::params![channel_type.as_str().to_string()],
             )
@@ -57,7 +57,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let mut rows = conn
             .query(
                 "SELECT channel_type, bot_id, created_at FROM channel_bots
-                 WHERE channel_type = ?1 AND bot_id = ?2 AND deleted_at IS NULL",
+                 WHERE channel_type = ?1 AND bot_id = ?2",
                 libsql::params![channel_type.as_str().to_string(), bot_id.to_string()],
             )
             .await
@@ -88,15 +88,11 @@ impl ChannelBotStore for LibsqlChannelBotStore {
     async fn put(&self, channel_type: &ChannelType, bot_id: &str) -> Result<()> {
         let now = super::time::now_us();
         let conn = self.pool.conn();
+        // Live row wins: `INSERT OR IGNORE` preserves the existing
+        // `created_at` on a re-add, no-op on conflict.
         conn.execute(
-            "INSERT INTO channel_bots (channel_type, bot_id, created_at, deleted_at)
-             VALUES (?1, ?2, ?3, NULL)
-             ON CONFLICT(channel_type, bot_id) DO UPDATE SET
-                 created_at = CASE
-                     WHEN channel_bots.deleted_at IS NULL THEN channel_bots.created_at
-                     ELSE excluded.created_at
-                 END,
-                 deleted_at = NULL",
+            "INSERT OR IGNORE INTO channel_bots (channel_type, bot_id, created_at)
+             VALUES (?1, ?2, ?3)",
             libsql::params![channel_type.as_str().to_string(), bot_id.to_string(), now,],
         )
         .await
@@ -105,13 +101,11 @@ impl ChannelBotStore for LibsqlChannelBotStore {
     }
 
     async fn delete(&self, channel_type: &ChannelType, bot_id: &str) -> Result<()> {
-        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
-            "UPDATE channel_bots
-             SET deleted_at = ?3
-             WHERE channel_type = ?1 AND bot_id = ?2 AND deleted_at IS NULL",
-            libsql::params![channel_type.as_str().to_string(), bot_id.to_string(), now,],
+            "DELETE FROM channel_bots
+             WHERE channel_type = ?1 AND bot_id = ?2",
+            libsql::params![channel_type.as_str().to_string(), bot_id.to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;

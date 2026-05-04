@@ -290,13 +290,13 @@ async fn remove_bot(ctx: &CommandContext) -> Result<CommandOutput> {
         async move { store.delete(&ct, &id).await }
     })
     .await
-    .map_err(|e| CliError::Manager(format!("soft-delete bot metadata: {e}")))?;
+    .map_err(|e| CliError::Manager(format!("delete bot metadata: {e}")))?;
     let secret_name_owned = secret_name(&ct, &bot_id);
     retry_on_busy("vault.delete_secret", || {
         vault.delete_secret(&secret_name_owned)
     })
     .await
-    .map_err(|e| CliError::Manager(format!("soft-delete vault token: {e}")))?;
+    .map_err(|e| CliError::Manager(format!("delete vault token: {e}")))?;
 
     let human = format!(
         "Deregistered {} bot '{}'. A running gateway will stop it within a few seconds.",

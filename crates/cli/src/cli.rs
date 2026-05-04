@@ -243,9 +243,9 @@ pub enum ChannelCmd {
     Add,
     /// Deregister a bot. Opens an interactive single-select over every
     /// registered bot (showing bot id + channel), then asks for y/N
-    /// confirmation. Soft-deletes the row and removes its vault
-    /// secret; a running gateway's reconciler pushes a `StopBot` to
-    /// the sidecar on the next tick.
+    /// confirmation. Deletes the row and removes its vault secret; a
+    /// running gateway's reconciler pushes a `StopBot` to the sidecar
+    /// on the next tick.
     Remove,
 }
 
@@ -403,9 +403,9 @@ pub enum PairCmd {
         /// Short pairing code (6 chars, unambiguous alphabet).
         code: String,
     },
-    /// Soft-delete an approved or pending pairing. Subsequent
-    /// messages from the triple trigger a fresh pending row with a
-    /// fresh code.
+    /// Delete an approved or pending pairing. Subsequent messages
+    /// from the triple trigger a fresh pending row with a fresh
+    /// code.
     Revoke {
         /// Channel type, e.g. `telegram`.
         channel_type: String,

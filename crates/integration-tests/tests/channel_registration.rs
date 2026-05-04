@@ -1,11 +1,12 @@
 //! End-to-end registration test that drives the actual Telegram
 //! sidecar bundle (built and embedded by `crates/gateway/build.rs`)
-//! through the production registration driver. Sidecars run on the
-//! host's `node` binary at runtime.
+//! through the production registration driver. Channel sidecars run
+//! on the host's `bun` binary at runtime.
 //!
 //! Skipped when this build doesn't ship an embedded sidecar bundle —
 //! that path is the only safe escape hatch in degraded CI environments
-//! where esbuild couldn't run or `pnpm install` wasn't done.
+//! where the `bun build` step couldn't run or `pnpm install` wasn't
+//! done.
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;

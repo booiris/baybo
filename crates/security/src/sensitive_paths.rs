@@ -2,8 +2,9 @@
 //!
 //! Blocks access to credential-bearing files (SSH/AWS/GCP/Azure configs,
 //! `.env` variants, PEM/JKS key material, shell history, etc.). The
-//! check is path-string based — callers should canonicalize first so a
-//! symlink can't bypass the filter.
+//! check is path-string based; `is_sensitive_path` canonicalizes
+//! internally and falls back to the literal path if canonicalization
+//! fails (e.g. when the file does not exist yet).
 
 use std::path::Path;
 
@@ -55,8 +56,9 @@ const SENSITIVE_FILENAMES: &[&str] = &[
 /// Returns true if `path` points at a credential-bearing file or directory.
 ///
 /// Matching is done on the lowercased, forward-slash-normalized path
-/// string. Callers should pass a canonicalized path (e.g. via
-/// `std::fs::canonicalize`) to prevent symlink-based bypass.
+/// string. The function canonicalizes internally via
+/// `std::fs::canonicalize`; if canonicalization fails (e.g. the path
+/// does not yet exist), it falls back to the literal path.
 pub fn is_sensitive_path(path: &Path) -> bool {
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let path_str = resolved

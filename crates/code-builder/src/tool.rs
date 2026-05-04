@@ -280,10 +280,10 @@ impl Tool for CodeBuilderTool {
             // before it reaches the gate. ToolExecutor::reveal_in_value
             // unmasks placeholders before we get the params, so `p.task`
             // and any caller-supplied write path can carry plaintext
-            // secrets at this point. `build_safe_messages` does the
-            // same for the planning LLM call (lines 116–144); without
-            // this, a credential-bearing task whose plan needs the
-            // network or an out-of-scratch write would leak through the
+            // secrets at this point. `build_safe_messages` (above)
+            // does the same for the planning LLM call; without this,
+            // a credential-bearing task whose plan needs the network
+            // or an out-of-scratch write would leak through the
             // approval prompt to the channel UI.
             let approval_accesses = self.sanitize_accesses(raw_accesses).await?;
             let preview = self.sanitize_preview(&p.task, &plan).await?;

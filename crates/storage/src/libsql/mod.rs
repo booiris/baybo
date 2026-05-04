@@ -98,12 +98,9 @@ impl LibsqlPool {
 
     /// Create all required tables if they do not already exist.
     ///
-    /// All tables that support deletion carry a `deleted_at` column (Unix
-    /// **microseconds**, NULL when the row is live). See `soft_delete`
-    /// module rules. Most other timestamp columns (`created_at`,
-    /// `started_at` on `jobs`, etc.) are also Unix microseconds —
-    /// round-trip via `libsql::time::{to_us, from_us}`. µs is finer than
-    /// the millisecond granularity of typical web tooling so sub-ms
+    /// Timestamp columns (`created_at`, `started_at` on `jobs`, etc.) are Unix
+    /// microseconds — round-trip via `libsql::time::{to_us, from_us}`. µs is
+    /// finer than the millisecond granularity of typical web tooling so sub-ms
     /// ordering survives (useful for fast local tool spans), and
     /// `chrono::timestamp_micros` is infallible. API surfaces (HTTP /
     /// OpenAPI / web) re-encode as RFC3339 and don't expose raw µs.
@@ -112,10 +109,12 @@ impl LibsqlPool {
     /// / `ended_at` columns are TEXT generated columns extracted from
     /// the JSON `data` blob via `json_extract`. `aura-trace` serialises
     /// `chrono::DateTime<Utc>` as RFC3339 strings, so these columns
-    /// hold RFC3339 — sortable lexicographically because the format is
-    /// fixed-width zero-padded, but not the µs invariant the rest of
-    /// the schema follows. Querying these columns means string
-    /// comparison, not integer comparison.
+    /// hold RFC3339 — sortable lexicographically because the leading
+    /// `YYYY-MM-DDTHH:MM:SS` prefix is fixed-width and any
+    /// fractional-second suffix shares a common prefix length within
+    /// a single insertion path. They don't follow the µs invariant
+    /// the rest of the schema uses; querying these columns means
+    /// string comparison, not integer comparison.
     async fn init_db(&self) -> anyhow::Result<()> {
         self.conn
             .execute_batch(
@@ -129,30 +128,27 @@ impl LibsqlPool {
                     bound_soul_version    TEXT NOT NULL,
                     created_at            INTEGER NOT NULL,
                     last_active           INTEGER NOT NULL,
-                    data                  TEXT NOT NULL,
-                    deleted_at            INTEGER
+                    data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
-                    ON sessions(root_session_id) WHERE deleted_at IS NULL;
+                    ON sessions(root_session_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_parent
                     ON sessions(parent_session_id, lineage_kind)
-                    WHERE deleted_at IS NULL AND lineage_kind IS NOT NULL;
+                    WHERE lineage_kind IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_sessions_last_active
-                    ON sessions(last_active DESC) WHERE deleted_at IS NULL;
+                    ON sessions(last_active DESC);
 
                 CREATE TABLE IF NOT EXISTS memories (
                     id         TEXT PRIMARY KEY,
                     user_id    TEXT NOT NULL,
                     content    TEXT NOT NULL,
-                    data       TEXT NOT NULL,
-                    deleted_at INTEGER
+                    data       TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
 
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,
-                    encrypted_value BLOB NOT NULL,
-                    deleted_at      INTEGER
+                    encrypted_value BLOB NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cost_records (
@@ -165,12 +161,7 @@ impl LibsqlPool {
                     input_tokens                    INTEGER NOT NULL,
                     output_tokens                   INTEGER NOT NULL,
                     cost_usd                        REAL    NOT NULL,
-                    timestamp                       INTEGER NOT NULL,
-                    -- Mirrors sessions.deleted_at of session_id. Null while
-                    -- the originating session is live; populated when the
-                    -- session is soft-deleted so cost UIs can render
-                    -- 'source session deleted' without joining back.
-                    originating_session_deleted_at  INTEGER
+                    timestamp                       INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cost_user_id ON cost_records(user_id);
                 CREATE INDEX IF NOT EXISTS idx_cost_timestamp ON cost_records(timestamp);
@@ -182,7 +173,6 @@ impl LibsqlPool {
                     month       TEXT    NOT NULL,
                     cost_usd    REAL    NOT NULL,
                     updated_at  INTEGER NOT NULL,
-                    deleted_at  INTEGER,
                     PRIMARY KEY (user_id, month)
                 );
 
@@ -196,21 +186,19 @@ impl LibsqlPool {
                     created_at               INTEGER NOT NULL,
                     started_at               INTEGER,
                     ended_at                 INTEGER,
-                    data                     TEXT NOT NULL,
-                    deleted_at               INTEGER
+                    data                     TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_session
-                    ON jobs(session_id, created_at) WHERE deleted_at IS NULL;
+                    ON jobs(session_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_jobs_status
-                    ON jobs(status_kind) WHERE deleted_at IS NULL;
+                    ON jobs(status_kind);
                 CREATE INDEX IF NOT EXISTS idx_jobs_parent
-                    ON jobs(parent_job_id) WHERE deleted_at IS NULL;
+                    ON jobs(parent_job_id);
 
                 CREATE TABLE IF NOT EXISTS job_transitions (
                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_id     TEXT NOT NULL,
-                    data       TEXT NOT NULL,
-                    deleted_at INTEGER
+                    data       TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);
 
@@ -224,30 +212,27 @@ impl LibsqlPool {
                 CREATE TABLE IF NOT EXISTS steps (
                     id         TEXT PRIMARY KEY,
                     data       TEXT NOT NULL,
-                    deleted_at INTEGER,
                     job_id     TEXT GENERATED ALWAYS AS (json_extract(data, '$.job_id')) VIRTUAL,
                     started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
                     ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_steps_job
-                    ON steps(job_id, started_at) WHERE deleted_at IS NULL;
+                    ON steps(job_id, started_at);
 
                 CREATE TABLE IF NOT EXISTS spans (
                     id         TEXT PRIMARY KEY,
                     data       TEXT NOT NULL,
-                    deleted_at INTEGER,
                     step_id    TEXT GENERATED ALWAYS AS (json_extract(data, '$.step_id')) VIRTUAL,
                     started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
                     ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_spans_step
-                    ON spans(step_id, started_at) WHERE deleted_at IS NULL;
+                    ON spans(step_id, started_at);
 
                 CREATE TABLE IF NOT EXISTS span_events (
                     span_id    TEXT    NOT NULL,
                     seq        INTEGER NOT NULL,
                     data       TEXT    NOT NULL,
-                    deleted_at INTEGER,
                     PRIMARY KEY (span_id, seq)
                 );
 
@@ -259,8 +244,7 @@ impl LibsqlPool {
                     -- (replaces the empty-string sentinel from the prior
                     -- TEXT/RFC3339 schema).
                     next_trigger_at INTEGER NOT NULL DEFAULT 0,
-                    data            TEXT    NOT NULL,
-                    deleted_at      INTEGER
+                    data            TEXT    NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_due ON cron_jobs(status, next_trigger_at);
@@ -272,8 +256,7 @@ impl LibsqlPool {
                     scheduled_fire_time INTEGER NOT NULL DEFAULT 0,
                     triggered_at        INTEGER NOT NULL,
                     status              TEXT    NOT NULL DEFAULT 'pending',
-                    data                TEXT    NOT NULL,
-                    deleted_at          INTEGER
+                    data                TEXT    NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_job_id ON cron_executions(job_id);
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_user_id ON cron_executions(user_id);
@@ -288,7 +271,6 @@ impl LibsqlPool {
                     rationale    TEXT NOT NULL,
                     model        TEXT NOT NULL,
                     assessed_at  INTEGER NOT NULL,
-                    deleted_at   INTEGER,
                     PRIMARY KEY (skill_name, content_hash)
                 );
 
@@ -301,7 +283,6 @@ impl LibsqlPool {
                     last_error   TEXT,
                     created_at   INTEGER NOT NULL,
                     updated_at   INTEGER NOT NULL,
-                    deleted_at   INTEGER,
                     PRIMARY KEY (skill_name, content_hash)
                 );
                 CREATE INDEX IF NOT EXISTS idx_skill_risk_jobs_status
@@ -312,17 +293,15 @@ impl LibsqlPool {
                     user_id      TEXT    NOT NULL,
                     session_id   TEXT    NOT NULL,
                     created_at   INTEGER NOT NULL,
-                    deleted_at   INTEGER,
                     PRIMARY KEY (channel_type, user_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_channel_sessions_session
-                    ON channel_sessions(session_id) WHERE deleted_at IS NULL;
+                    ON channel_sessions(session_id);
 
                 CREATE TABLE IF NOT EXISTS channel_bots (
                     channel_type TEXT    NOT NULL,
                     bot_id       TEXT    NOT NULL,
                     created_at   INTEGER NOT NULL,
-                    deleted_at   INTEGER,
                     PRIMARY KEY (channel_type, bot_id)
                 );
 
@@ -333,8 +312,7 @@ impl LibsqlPool {
                     uploader_identity TEXT,
                     read_token        TEXT,
                     created_at        INTEGER NOT NULL,
-                    last_accessed_at  INTEGER NOT NULL,
-                    deleted_at        INTEGER
+                    last_accessed_at  INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS channel_pairings (
@@ -346,11 +324,10 @@ impl LibsqlPool {
                     created_at   INTEGER NOT NULL,
                     expires_at   INTEGER,
                     approved_at  INTEGER,
-                    deleted_at   INTEGER,
                     PRIMARY KEY (channel_type, bot_id, user_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_pairings_code
-                    ON channel_pairings(code) WHERE deleted_at IS NULL;
+                    ON channel_pairings(code);
 
                 -- Legacy WAL table from the dropped two-layer trace design.
                 -- No reader ever consumed it; drop on upgrade so it stops

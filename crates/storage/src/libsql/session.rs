@@ -29,7 +29,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM sessions WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT data FROM sessions WHERE id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
@@ -72,8 +72,6 @@ impl SessionStore for LibsqlSessionStore {
             .as_ref()
             .map(|l| l.parent_job_id.to_string());
         let lineage_kind = lineage_kind_str(session).map(|s| s.to_string());
-        // INSERT OR REPLACE rewrites the row, so `deleted_at` falls back to
-        // its NULL default — saving a previously soft-deleted id revives it.
         conn.execute(
             "INSERT OR REPLACE INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
@@ -97,26 +95,22 @@ impl SessionStore for LibsqlSessionStore {
         Ok(())
     }
 
-    async fn soft_delete(&self, session_id: &SessionId) -> Result<bool> {
+    async fn delete(&self, session_id: &SessionId) -> Result<bool> {
         // BEGIN IMMEDIATE acquires a write lock at start, so any concurrent
         // INSERT/UPDATE on `sessions` either blocks behind us or fails BUSY.
         // That's the atomicity contract callers rely on: a fork inserted
         // *after* the live-fork scan returns empty cannot land while we hold
-        // the lock, and the parent's deletion + cost-records mirror commit
-        // together or not at all.
+        // the lock.
         let conn = self.pool.conn();
         let tx = conn
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql begin soft_delete tx: {e}"))
-            })?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql begin delete tx: {e}")))?;
 
         let mut rows = tx
             .query(
                 "SELECT id FROM sessions \
-                 WHERE parent_session_id = ?1 AND lineage_kind = 'user_fork' \
-                   AND deleted_at IS NULL",
+                 WHERE parent_session_id = ?1 AND lineage_kind = 'user_fork'",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
@@ -140,11 +134,10 @@ impl SessionStore for LibsqlSessionStore {
             });
         }
 
-        let now = super::time::now_us();
         let affected = tx
             .execute(
-                "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-                libsql::params![now, session_id.as_str().to_string()],
+                "DELETE FROM sessions WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string()],
             )
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete session: {e}")))?;
@@ -152,15 +145,6 @@ impl SessionStore for LibsqlSessionStore {
             let _ = tx.rollback().await;
             return Ok(false);
         }
-        // Mirror the deletion onto cost_records.originating_session_deleted_at
-        // so cost UIs can render 'source deleted' without join-back.
-        tx.execute(
-            "UPDATE cost_records SET originating_session_deleted_at = ?1 \
-             WHERE session_id = ?2 AND originating_session_deleted_at IS NULL",
-            libsql::params![now, session_id.as_str().to_string()],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql cost_records mirror: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql commit: {e}")))?;
@@ -171,8 +155,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT id FROM sessions \
-                 WHERE deleted_at IS NULL AND last_active < ?1",
+                "SELECT id FROM sessions WHERE last_active < ?1",
                 libsql::params![super::time::to_us(before)],
             )
             .await
@@ -195,11 +178,7 @@ impl SessionStore for LibsqlSessionStore {
     async fn list_all(&self) -> Result<Vec<Session>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query(
-                "SELECT data FROM sessions \
-                 WHERE deleted_at IS NULL ORDER BY last_active DESC",
-                (),
-            )
+            .query("SELECT data FROM sessions ORDER BY last_active DESC", ())
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
@@ -227,8 +206,7 @@ impl SessionStore for LibsqlSessionStore {
         let mut rows = conn
             .query(
                 "SELECT id, lineage_kind, data FROM sessions \
-                 WHERE parent_session_id = ?1 AND lineage_kind IS NOT NULL \
-                   AND deleted_at IS NULL",
+                 WHERE parent_session_id = ?1 AND lineage_kind IS NOT NULL",
                 libsql::params![parent_session_id.as_str().to_string()],
             )
             .await
@@ -273,8 +251,7 @@ impl SessionStore for LibsqlSessionStore {
         let mut rows = conn
             .query(
                 "SELECT id FROM sessions \
-                 WHERE parent_session_id = ?1 AND lineage_kind = 'user_fork' \
-                   AND deleted_at IS NULL",
+                 WHERE parent_session_id = ?1 AND lineage_kind = 'user_fork'",
                 libsql::params![source_session_id.as_str().to_string()],
             )
             .await
@@ -361,7 +338,7 @@ mod tests {
         assert_eq!(loaded.root_session_id, s.id);
         assert_eq!(loaded.bound_soul_version, "soul-v1");
 
-        store.soft_delete(&s.id).await.unwrap();
+        store.delete(&s.id).await.unwrap();
         assert!(store.get(&s.id).await.unwrap().is_none());
     }
 
@@ -376,7 +353,7 @@ mod tests {
         let fork = make_fork_session("cli-fork", &parent.id, fork_at);
         store.save(&fork).await.unwrap();
 
-        let err = store.soft_delete(&parent.id).await.unwrap_err();
+        let err = store.delete(&parent.id).await.unwrap_err();
         match err {
             StorageError::HasLiveForks { fork_session_ids } => {
                 assert_eq!(fork_session_ids, vec![fork.id.clone()]);
@@ -397,9 +374,9 @@ mod tests {
         let fork = make_fork_session("cli-fork", &parent.id, fork_at);
         store.save(&fork).await.unwrap();
 
-        store.soft_delete(&fork.id).await.unwrap();
+        store.delete(&fork.id).await.unwrap();
         // After fork is gone, parent delete must succeed
-        store.soft_delete(&parent.id).await.unwrap();
+        store.delete(&parent.id).await.unwrap();
     }
 
     #[tokio::test]

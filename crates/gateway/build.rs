@@ -10,17 +10,21 @@
 //!   arm per asset. The runtime lazily decompresses the table on first
 //!   request.
 //! * **Sidecars** — runs `pnpm --filter @aura/channel-<name> bundle`
-//!   for each `channel-src/*` package (each script invokes `esbuild`
-//!   to produce a single self-contained ESM file at `dist/bundle.mjs`),
-//!   zstd-compresses the bundle plus any aux assets declared in
-//!   `package.json`, and emits `$OUT_DIR/sidecar_assets.rs` that the
-//!   gateway's `sidecar` module consumes. Sidecars are spawned at
-//!   runtime with the host's `node` binary (resolved from `PATH`) —
-//!   no JS runtime is shipped inside the gateway binary.
+//!   (and the analogous tool-sidecar bundle scripts) to produce a
+//!   single self-contained ESM file at `dist/bundle.mjs`. Channel
+//!   sidecars in `channel-src/*` use `bun build`; tool sidecars in
+//!   `tool-src/*` (e.g. the browser sidecar) use `esbuild` + `node`.
+//!   Each bundle plus any aux assets declared in `package.json` is
+//!   zstd-compressed and emitted into `$OUT_DIR/sidecar_assets.rs`
+//!   for the gateway's `sidecar` module to consume. At runtime
+//!   channel sidecars are spawned with the host's `bun` binary and
+//!   tool sidecars with the host's `node` binary (each resolved from
+//!   `PATH`) — no JS runtime is shipped inside the gateway binary.
 //!
 //! The sidecar pipeline degrades gracefully: if `pnpm` is missing,
-//! `node_modules` aren't populated, or esbuild chokes on a bundle, we
-//! emit an assets file with empty slices and print `cargo:warning=…`.
+//! `node_modules` aren't populated, or the bundler chokes on a
+//! bundle, we emit an assets file with empty slices and print
+//! `cargo:warning=…`.
 //! The gateway supervisor then skips spawning sidecars and logs a
 //! one-liner — `cargo build` itself never fails because of sidecar
 //! packaging trouble.
@@ -804,9 +808,10 @@ fn read_package_meta(package_json: &Path) -> Result<(String, String), String> {
 }
 
 /// Run `pnpm --filter <pkg> bundle` inside the workspace. The script
-/// is defined in each sidecar's `package.json` and invokes esbuild to
-/// emit a single self-contained `dist/bundle.mjs` for the host's
-/// `node` to consume at runtime.
+/// is defined in each sidecar's `package.json` and invokes its own
+/// bundler — `bun build` for channel sidecars, `esbuild` for tool
+/// sidecars — to emit a single self-contained `dist/bundle.mjs` for
+/// the host runtime (`bun` or `node` respectively) to consume.
 fn bundle_with_pnpm(ws_root: &Path, pkg_name: &str) -> Result<(), String> {
     let output = Command::new("pnpm")
         .arg("--filter")

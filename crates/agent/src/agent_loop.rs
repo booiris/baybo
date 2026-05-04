@@ -140,8 +140,9 @@ pub struct AgentLoop {
     /// Optional subagent runtime. When set, LLM `tool_use` calls
     /// targeting `spawn_subagent` short-circuit the regular
     /// tool_executor path and route through here. Unset →
-    /// `spawn_subagent` falls back to the regular tool catalogue (and
-    /// today returns an unknown-tool error).
+    /// `spawn_subagent` calls return a synthetic
+    /// `SubagentExitStatus::Failed("no subagent runtime registered")`
+    /// tool result.
     subagent_runtime: Option<Arc<dyn SubagentRuntime>>,
     /// Optional LLM risk assessor. When set, every skill candidate is
     /// checked before injection: `Dangerous` verdicts veto the skill,
@@ -150,7 +151,7 @@ pub struct AgentLoop {
     /// Optional per-session JSONL logger for LLM calls. When set, every
     /// `call_llm` invocation appends a record (request, response or
     /// error, latency, model metadata) to
-    /// `<state>/sessions/<session_id>.jsonl`.
+    /// `<workspace>/logs/sessions/<session_id>.jsonl`.
     session_log: Option<Arc<SessionLlmLogger>>,
 }
 
@@ -968,8 +969,8 @@ impl AgentLoop {
         let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
 
         // Buffer for a trailing fragment that might be the start of a
-        // placeholder (e.g. the chunk ends in "{{SECR"). We hold it back
-        // until a safe boundary is seen.
+        // placeholder (e.g. the chunk ends in "[{REDACTED_S"). We hold
+        // it back until a safe boundary is seen.
         let mut pending = String::new();
 
         while let Some(event) = stream.next().await {

@@ -267,7 +267,6 @@ impl CostSubscriber {
                             output_tokens,
                             cost_usd,
                             timestamp: now,
-                            originating_session_deleted_at: None,
                         };
                         if let Err(e) = store.record(&record).await {
                             warn!(error = %e, "failed to write cost_record");

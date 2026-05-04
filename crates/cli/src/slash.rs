@@ -122,7 +122,7 @@ impl SlashHandler for CliSlashHandler {
     }
 
     async fn handle(&self, raw: &str) -> SlashOutcome {
-        // Bare `/skills`, `/tools`, `/jobs`, `/sessions`, `/memory` (no args)
+        // Bare `/skills`, `/jobs`, `/sessions`, `/memory` (no args)
         // open the corresponding dashboard view in TUI-capable adapters;
         // adapters that don't support views treat this as a no-op.
         if let Some(kind) = dashboard_shortcut(raw) {

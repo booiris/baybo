@@ -60,8 +60,7 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
                 "SELECT channel_type, bot_id, user_id, code, status,
                         created_at, expires_at, approved_at
                  FROM channel_pairings
-                 WHERE channel_type = ?1 AND bot_id = ?2 AND user_id = ?3
-                       AND deleted_at IS NULL",
+                 WHERE channel_type = ?1 AND bot_id = ?2 AND user_id = ?3",
                 libsql::params![
                     channel_type.as_str().to_string(),
                     bot_id.to_string(),
@@ -80,7 +79,7 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
                 "SELECT channel_type, bot_id, user_id, code, status,
                         created_at, expires_at, approved_at
                  FROM channel_pairings
-                 WHERE code = ?1 AND deleted_at IS NULL",
+                 WHERE code = ?1",
                 libsql::params![code.to_string()],
             )
             .await
@@ -100,56 +99,49 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
         let conn = self.pool.conn();
         // Live-and-fresh rows win: an existing pending row whose
         // `expires_at > now` keeps its code/state so concurrent
-        // inbounds from the same user agree. Expired pending rows and
-        // tombstoned rows get overwritten with the new code and a
-        // fresh expires_at.
+        // inbounds from the same user agree. Expired pending rows
+        // get overwritten with the new code and a fresh expires_at.
         conn.execute(
             "INSERT INTO channel_pairings
                  (channel_type, bot_id, user_id, code, status,
-                  created_at, expires_at, approved_at, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, NULL, NULL)
+                  created_at, expires_at, approved_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, NULL)
              ON CONFLICT(channel_type, bot_id, user_id) DO UPDATE SET
                  code = CASE
-                     WHEN channel_pairings.deleted_at IS NULL
-                          AND channel_pairings.status = 'pending'
+                     WHEN channel_pairings.status = 'pending'
                           AND channel_pairings.expires_at IS NOT NULL
                           AND channel_pairings.expires_at > ?5
                      THEN channel_pairings.code
                      ELSE excluded.code
                  END,
                  status = CASE
-                     WHEN channel_pairings.deleted_at IS NULL
-                          AND channel_pairings.status = 'pending'
+                     WHEN channel_pairings.status = 'pending'
                           AND channel_pairings.expires_at IS NOT NULL
                           AND channel_pairings.expires_at > ?5
                      THEN channel_pairings.status
                      ELSE excluded.status
                  END,
                  created_at = CASE
-                     WHEN channel_pairings.deleted_at IS NULL
-                          AND channel_pairings.status = 'pending'
+                     WHEN channel_pairings.status = 'pending'
                           AND channel_pairings.expires_at IS NOT NULL
                           AND channel_pairings.expires_at > ?5
                      THEN channel_pairings.created_at
                      ELSE excluded.created_at
                  END,
                  expires_at = CASE
-                     WHEN channel_pairings.deleted_at IS NULL
-                          AND channel_pairings.status = 'pending'
+                     WHEN channel_pairings.status = 'pending'
                           AND channel_pairings.expires_at IS NOT NULL
                           AND channel_pairings.expires_at > ?5
                      THEN channel_pairings.expires_at
                      ELSE excluded.expires_at
                  END,
                  approved_at = CASE
-                     WHEN channel_pairings.deleted_at IS NULL
-                          AND channel_pairings.status = 'pending'
+                     WHEN channel_pairings.status = 'pending'
                           AND channel_pairings.expires_at IS NOT NULL
                           AND channel_pairings.expires_at > ?5
                      THEN channel_pairings.approved_at
                      ELSE NULL
-                 END,
-                 deleted_at = NULL",
+                 END",
             libsql::params![
                 channel_type.as_str().to_string(),
                 bot_id.to_string(),
@@ -180,7 +172,6 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
                      approved_at = ?2,
                      expires_at = NULL
                  WHERE code = ?1
-                       AND deleted_at IS NULL
                        AND status = 'pending'
                        AND (expires_at IS NULL OR expires_at > ?2)",
                 libsql::params![code.to_string(), now],
@@ -201,7 +192,7 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
                     "SELECT channel_type, bot_id, user_id, code, status,
                             created_at, expires_at, approved_at
                      FROM channel_pairings
-                     WHERE deleted_at IS NULL AND status = ?1
+                     WHERE status = ?1
                      ORDER BY created_at DESC",
                     libsql::params![s.as_str().to_string()],
                 )
@@ -212,7 +203,6 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
                     "SELECT channel_type, bot_id, user_id, code, status,
                             created_at, expires_at, approved_at
                      FROM channel_pairings
-                     WHERE deleted_at IS NULL
                      ORDER BY created_at DESC",
                     libsql::params![],
                 )
@@ -233,24 +223,14 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
         bot_id: &str,
         user_id: &str,
     ) -> Result<(), String> {
-        // The other timestamp columns on this row (`created_at`,
-        // `expires_at`, `approved_at`) are written by `aura-pairing` as
-        // Unix seconds; `purge_expired` also takes seconds. Keep
-        // `deleted_at` in the same unit so the row stays internally
-        // consistent and any future janitor sweep can compare across
-        // columns without unit drift.
-        let now_secs = chrono::Utc::now().timestamp();
         let conn = self.pool.conn();
         conn.execute(
-            "UPDATE channel_pairings
-             SET deleted_at = ?4
-             WHERE channel_type = ?1 AND bot_id = ?2 AND user_id = ?3
-                   AND deleted_at IS NULL",
+            "DELETE FROM channel_pairings
+             WHERE channel_type = ?1 AND bot_id = ?2 AND user_id = ?3",
             libsql::params![
                 channel_type.as_str().to_string(),
                 bot_id.to_string(),
                 user_id.to_string(),
-                now_secs,
             ],
         )
         .await
@@ -259,11 +239,6 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
     }
 
     async fn purge_expired(&self, now_secs: i64, approved_cutoff_secs: i64) -> Result<u64, String> {
-        // Hard-delete expired pairing codes. Documented retention exception
-        // (see docs/modules/storage.md "Retention exceptions"): pairing
-        // codes are short-lived and intentionally non-recoverable past
-        // expiry — keeping tombstones would let leaked codes resurface
-        // through audit replay.
         let conn = self.pool.conn();
         let affected = conn
             .execute(

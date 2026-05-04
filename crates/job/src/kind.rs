@@ -44,8 +44,8 @@ impl JobKind {
 /// `Cron::action_payload` is a serialized `aura_cron::TriggerAction` —
 /// kept as `Value` here so `aura-job` does not depend on `aura-cron`
 /// (which would invert the layer order). The marshal point is in
-/// `aura-cron` at job creation; the agent loop deserializes it at
-/// dispatch time.
+/// `aura-cron` at job creation; consumers (e.g. `aura-cron::tools`)
+/// deserialize it on demand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobInput {
