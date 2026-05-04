@@ -11,16 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::{
-    AgentLoop, ExecutionPolicy, JobManager, MemoryManager, ObservabilityRecorder, SecurityGateway,
-    TraceCollector,
+    AgentLoop, ExecutionPolicy, JobLifecycle, MemoryManager, SecurityGateway, SpanRecorder,
     actor::{AgentActor, AgentMessage},
-    cost::CostTracker,
     soul::Soul,
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_context::{ContextManager, TiktokenTokenizer, Truncate, budget::TokenBudget};
-use aura_hook::HookManager;
 use aura_llm::test_support::StubLlm;
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
@@ -30,7 +27,6 @@ use aura_storage::test_support::{
 };
 use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use chrono::Utc;
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -81,7 +77,7 @@ impl AgentTestHarness {
     pub async fn send_text(&mut self, text: impl Into<String>) -> anyhow::Result<()> {
         let message = Message {
             id: format!("msg-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
-            session_id: self.session.id.clone(),
+            session_id: self.session.id.to_string(),
             channel: self.session.channel.clone(),
             sender: self.session.user.clone(),
             content: vec![ContentBlock::Text(text.into())],
@@ -225,17 +221,26 @@ impl AgentTestHarnessBuilder {
         let trace_store = Arc::new(MemoryTraceStore::new());
         let memory_store = Arc::new(MemoryMemoryStore::new());
 
-        let job_manager = Arc::new(JobManager::new(share_job_store(&job_store)));
-        let cost_tracker = Arc::new(CostTracker::new(share_cost_store(&cost_store)));
-        let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
-            &session.id,
+        let job_lifecycle = Arc::new(JobLifecycle::new(share_job_store(&job_store)));
+        // One shared bus per harness — the recorder publishes into it
+        // and the cost subscriber drains the same bus. Constructing it
+        // upfront keeps both sides explicit about which stream they
+        // share (forgetting this is the silent under-billing bug
+        // SpanRecorder::new now refuses to compile around).
+        let trace_event_stream = aura_agent::TraceEventStream::new();
+        let span_recorder = Arc::new(SpanRecorder::new(
+            session.id.clone(),
+            session.user.id.clone(),
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
-        )));
-        let recorder = Arc::new(ObservabilityRecorder::new(
-            job_manager,
-            trace_collector,
-            cost_tracker,
+            trace_event_stream.clone(),
         ));
+        // Cost subscriber: pricing left empty for tests — token
+        // counts still land in cost_records, cost_usd reads as 0.
+        let _cost_handle = aura_agent::cost::CostSubscriber::new(
+            share_cost_store(&cost_store),
+            Arc::new(std::collections::HashMap::new()),
+        )
+        .spawn(&trace_event_stream);
 
         // Agent loop dependencies.
         let stub_llm = Arc::new(StubLlm::new());
@@ -281,18 +286,18 @@ impl AgentTestHarnessBuilder {
             soul,
             gateway.clone(),
         );
-
-        let hooks = Arc::new(HookManager::new());
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
+        let actor_parent_token = tokio_util::sync::CancellationToken::new();
         let actor = AgentActor::new(
             session.clone(),
             agent_loop,
             tool_executor,
             output_tx,
-            hooks,
-            recorder,
+            job_lifecycle,
+            span_recorder,
+            &actor_parent_token,
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));
 

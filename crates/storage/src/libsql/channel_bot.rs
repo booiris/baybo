@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use aura_model::ChannelType;
-use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::StorageError;
@@ -87,7 +86,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
     }
 
     async fn put(&self, channel_type: &ChannelType, bot_id: &str) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
             "INSERT INTO channel_bots (channel_type, bot_id, created_at, deleted_at)
@@ -106,7 +105,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
     }
 
     async fn delete(&self, channel_type: &ChannelType, bot_id: &str) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
             "UPDATE channel_bots

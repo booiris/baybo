@@ -3,7 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aura_model::{ChatMessage, ContentBlock, Role};
 
-use super::{CompressOutput, CompressionStrategy, SummarizeCallback};
+use super::{
+    CompressOutput, CompressionStrategy, SummarizeCallback, SummarizeOutput, pair_preserving_cut,
+};
 use crate::tokenizer::Tokenizer;
 
 /// Summarize compression: summarizes old non-system messages via an LLM
@@ -47,29 +49,37 @@ impl CompressionStrategy for Summarize {
         if non_system.len() <= self.keep_recent {
             return Ok(CompressOutput {
                 messages: messages.to_vec(),
+                llm_call: None,
             });
         }
 
-        // Split non-system messages into old (to summarize) and recent (to keep).
-        let split = non_system.len().saturating_sub(self.keep_recent);
+        // Split non-system messages into old (to summarize) and recent
+        // (to keep). The initial split by `keep_recent` may land between
+        // an `assistant { tool_use }` and the following
+        // `user { tool_result }`; pull the boundary left until every
+        // kept `ToolResult` has its `ToolUse` in the recent half so the
+        // LLM payload remains well-formed.
+        let initial_split = non_system.len().saturating_sub(self.keep_recent);
+        let split = pair_preserving_cut(&non_system, initial_split);
         let old = &non_system[..split];
         let recent = &non_system[split..];
 
         // Summarize old messages via the injected callback.
-        let summary_text = self.callback.summarize(old).await?;
+        let SummarizeOutput { summary, llm_call } = self.callback.summarize(old).await?;
 
         // Build new message list: system + summary + recent.
         let mut new_messages = system_msgs;
         new_messages.push(ChatMessage {
             role: Role::System,
             content: vec![ContentBlock::Text(format!(
-                "[Conversation Summary]\n{summary_text}"
+                "[Conversation Summary]\n{summary}"
             ))],
         });
         new_messages.extend_from_slice(recent);
 
         Ok(CompressOutput {
             messages: new_messages,
+            llm_call: Some(llm_call),
         })
     }
 }
@@ -82,8 +92,16 @@ mod tests {
 
     #[async_trait]
     impl SummarizeCallback for EchoSummarizer {
-        async fn summarize(&self, messages: &[ChatMessage]) -> crate::Result<String> {
-            Ok(format!("Summary of {} messages", messages.len()))
+        async fn summarize(&self, messages: &[ChatMessage]) -> crate::Result<SummarizeOutput> {
+            Ok(SummarizeOutput {
+                summary: format!("Summary of {} messages", messages.len()),
+                llm_call: crate::CompressionLlmCall {
+                    model_id: "test-model".into(),
+                    provider: "test".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                },
+            })
         }
     }
 

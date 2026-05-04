@@ -11,6 +11,29 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Decision returned by an approval gate.
+///
+/// Lives in `aura-model` so trace `SpanEvent`s can record approval
+/// outcomes without `aura-trace` having to depend on `aura-tools`.
+/// `aura-tools` re-exports this type so existing call sites keep
+/// working unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum ApprovalDecision {
+    /// Allow this call only.
+    Approve,
+    /// Allow this call and remember every resource it touches for the rest of
+    /// the session (persisted via `SessionState::approved_resources`).
+    ApproveAlways,
+    /// Reject the call. The executor surfaces this as `ToolError::Denied`.
+    Deny,
+}
+
 /// Concrete resource a single tool call touches, derived from its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -47,7 +70,7 @@ impl ResourceAccess {
                 ApprovedResource::WriteFile { path: path.clone() }
             }
             ResourceAccess::Http { host } => ApprovedResource::Http {
-                host: HostPattern::Exact(host.to_ascii_lowercase()),
+                host: HostPattern::exact(host),
             },
             ResourceAccess::ExecCommand { command } => ApprovedResource::ExecCommand {
                 command: command.clone(),
@@ -97,10 +120,20 @@ fn path_covers(approved: &Path, requested: &Path) -> bool {
 }
 
 /// Host pattern on `ApprovedResource::Http`.
+///
+/// Construct via [`HostPattern::exact`] / [`HostPattern::wildcard`]
+/// rather than the variants directly: those constructors lowercase
+/// the host so two equivalent-but-different-case entries
+/// (`api.GitHub.com` vs `api.github.com`) don't end up as separate
+/// `ApprovedResource` rows under PartialEq. `matches()` is already
+/// case-insensitive on both sides, so the only regression a
+/// non-normalized variant produces is dedup drift in stored
+/// approvals — but that's enough to make repeat approvals show up
+/// as new prompts to the user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum HostPattern {
-    /// Exact host, case-insensitive.
+    /// Exact host, case-insensitive at match time.
     Exact(String),
     /// The host itself and every subdomain under it.
     /// `Wildcard("foo.com")` matches `foo.com` and `api.foo.com` but not
@@ -109,6 +142,16 @@ pub enum HostPattern {
 }
 
 impl HostPattern {
+    /// Construct an `Exact` host pattern with the host lowercased.
+    pub fn exact(host: impl AsRef<str>) -> Self {
+        Self::Exact(host.as_ref().to_ascii_lowercase())
+    }
+
+    /// Construct a `Wildcard` host pattern with the host lowercased.
+    pub fn wildcard(host: impl AsRef<str>) -> Self {
+        Self::Wildcard(host.as_ref().to_ascii_lowercase())
+    }
+
     pub fn matches(&self, host: &str) -> bool {
         match self {
             HostPattern::Exact(h) => h.eq_ignore_ascii_case(host),
@@ -170,6 +213,27 @@ mod tests {
         assert!(p.matches("a.b.foo.com"));
         assert!(!p.matches("barfoo.com"));
         assert!(!p.matches("foo.com.evil"));
+    }
+
+    #[test]
+    fn host_pattern_constructors_lowercase() {
+        // Pin: equivalent-but-different-case patterns dedup under
+        // PartialEq when both go through the constructor.
+        assert_eq!(
+            HostPattern::exact("api.GitHub.com"),
+            HostPattern::exact("api.github.com"),
+        );
+        assert_eq!(
+            HostPattern::wildcard("Foo.Com"),
+            HostPattern::wildcard("foo.com"),
+        );
+        // Variant-direct construction still allows the drift the
+        // constructors guard against — that's the whole reason
+        // ResourceAccess::to_approved goes through the constructor.
+        assert_ne!(
+            HostPattern::Wildcard("Foo.Com".into()),
+            HostPattern::Wildcard("foo.com".into()),
+        );
     }
 
     #[test]

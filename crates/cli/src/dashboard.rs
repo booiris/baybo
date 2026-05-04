@@ -72,9 +72,9 @@ async fn jobs_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
                 .iter()
                 .map(|j| {
                     vec![
-                        j.id.clone(),
-                        j.session_id.clone(),
-                        j.status.to_string(),
+                        j.id.to_string(),
+                        j.session_id.to_string(),
+                        j.status.kind().to_string(),
                         j.created_at.to_rfc3339(),
                     ]
                 })
@@ -103,7 +103,7 @@ async fn sessions_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
                 .iter()
                 .map(|s| {
                     vec![
-                        s.id.clone(),
+                        s.id.to_string(),
                         s.channel.to_string(),
                         s.messages.len().to_string(),
                         s.last_active.to_rfc3339(),

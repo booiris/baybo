@@ -191,7 +191,6 @@ dependencies = [
  "aura-context",
  "aura-cron",
  "aura-gateway",
- "aura-hook",
  "aura-janitor",
  "aura-job",
  "aura-llm",
@@ -229,7 +228,6 @@ dependencies = [
  "aura-channels",
  "aura-context",
  "aura-cron",
- "aura-hook",
  "aura-job",
  "aura-llm",
  "aura-model",
@@ -447,21 +445,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-hook"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-channels",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "aura-integration-tests"
 version = "0.1.0"
 dependencies = [
@@ -472,7 +455,6 @@ dependencies = [
  "aura-cli",
  "aura-context",
  "aura-gateway",
- "aura-hook",
  "aura-job",
  "aura-llm",
  "aura-model",
@@ -480,12 +462,14 @@ dependencies = [
  "aura-skills",
  "aura-storage",
  "aura-tools",
+ "aura-trace",
  "chrono",
  "futures",
  "parking_lot",
  "regex",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -494,6 +478,7 @@ dependencies = [
 name = "aura-janitor"
 version = "0.1.0"
 dependencies = [
+ "aura-model",
  "aura-storage",
  "aura-workspace",
  "chrono",
@@ -509,14 +494,11 @@ name = "aura-job"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
+ "aura-model",
  "chrono",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -553,7 +535,9 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "ts-rs",
+ "ulid",
  "uuid",
 ]
 
@@ -621,6 +605,7 @@ dependencies = [
  "aura-model",
  "aura-storage",
  "chrono",
+ "futures",
  "parking_lot",
  "thiserror 2.0.18",
  "tokio",
@@ -733,15 +718,12 @@ name = "aura-trace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "aura-job",
  "aura-model",
  "chrono",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -4666,6 +4648,17 @@ name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
+
+[[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.4",
+ "serde",
+ "web-time",
+]
 
 [[package]]
 name = "unicase"

@@ -8,6 +8,7 @@ aura-model = { workspace = true }
 aura-storage = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

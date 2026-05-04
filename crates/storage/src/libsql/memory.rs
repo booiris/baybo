@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::error::StorageError;
@@ -95,7 +94,7 @@ impl MemoryStore for LibsqlMemoryStore {
 
     async fn delete(&self, id: &str) -> Result<()> {
         let conn = self.pool.conn();
-        let now = Utc::now().timestamp();
+        let now = super::time::now_us();
         conn.execute(
             "UPDATE memories SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
             libsql::params![now, id.to_string()],

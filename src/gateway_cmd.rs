@@ -355,7 +355,12 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     {
         let mut janitor =
-            aura_janitor::Janitor::new(workspace_paths.clone(), graph.stores.blob.clone());
+            aura_janitor::Janitor::new(workspace_paths.clone(), graph.stores.blob.clone())
+                .with_retention_stores(
+                    graph.stores.cost.clone(),
+                    graph.stores.cron.clone(),
+                    graph.stores.channel_pairing.clone(),
+                );
         if let Some(runtime) = sidecar_runtime.as_ref()
             && let Some(cache_root) = runtime.sidecars_cache_root()
         {
@@ -398,7 +403,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         config_path: boot::resolve_config_path(),
         runtime_config: runtime_cfg.clone(),
         session_manager: Arc::clone(&graph.session_manager),
-        job_manager: Arc::clone(&graph.job_manager),
+        job_lifecycle: Arc::clone(&graph.job_lifecycle),
         cron_scheduler: Arc::clone(&graph.cron_scheduler),
         memory_manager: Arc::clone(&graph.memory_manager),
         skill_registry: Arc::clone(&graph.skill_registry),

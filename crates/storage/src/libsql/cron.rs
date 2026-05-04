@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
@@ -14,33 +13,35 @@ impl LibsqlCronStore {
     }
 }
 
+fn col_string(row: &libsql::Row, i: i32) -> crate::cron::Result<String> {
+    row.get::<String>(i)
+        .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
+}
+
+fn col_i64(row: &libsql::Row, i: i32) -> crate::cron::Result<i64> {
+    row.get::<i64>(i)
+        .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
+}
+
 fn read_job_row(row: &libsql::Row) -> crate::cron::Result<CronJobRow> {
-    let get = |i| {
-        row.get::<String>(i)
-            .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
-    };
     Ok(CronJobRow {
-        id: get(0)?,
-        user_id: get(1)?,
-        status: get(2)?,
-        next_trigger_at: get(3)?,
-        data: get(4)?,
+        id: col_string(row, 0)?,
+        user_id: col_string(row, 1)?,
+        status: col_string(row, 2)?,
+        next_trigger_at: col_i64(row, 3)?,
+        data: col_string(row, 4)?,
     })
 }
 
 fn read_execution_row(row: &libsql::Row) -> crate::cron::Result<CronExecutionRow> {
-    let get = |i| {
-        row.get::<String>(i)
-            .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
-    };
     Ok(CronExecutionRow {
-        id: get(0)?,
-        job_id: get(1)?,
-        user_id: get(2)?,
-        scheduled_fire_time: get(3)?,
-        triggered_at: get(4)?,
-        status: get(5)?,
-        data: get(6)?,
+        id: col_string(row, 0)?,
+        job_id: col_string(row, 1)?,
+        user_id: col_string(row, 2)?,
+        scheduled_fire_time: col_i64(row, 3)?,
+        triggered_at: col_i64(row, 4)?,
+        status: col_string(row, 5)?,
+        data: col_string(row, 6)?,
     })
 }
 
@@ -55,7 +56,7 @@ impl CronStore for LibsqlCronStore {
                     row.id.clone(),
                     row.user_id.clone(),
                     row.status.clone(),
-                    row.next_trigger_at.clone(),
+                    row.next_trigger_at,
                     row.data.clone(),
                 ],
             )
@@ -96,7 +97,7 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![
                     row.user_id.clone(),
                     row.status.clone(),
-                    row.next_trigger_at.clone(),
+                    row.next_trigger_at,
                     row.data.clone(),
                     row.id.clone(),
                 ],
@@ -111,7 +112,7 @@ impl CronStore for LibsqlCronStore {
     }
 
     async fn delete(&self, job_id: &str) -> crate::cron::Result<()> {
-        let now = Utc::now().timestamp();
+        let now = super::time::now_us();
         let affected = self
             .pool
             .conn()
@@ -197,15 +198,15 @@ impl CronStore for LibsqlCronStore {
         Ok(out)
     }
 
-    async fn list_due(&self, now: &str) -> crate::cron::Result<Vec<CronJobRow>> {
+    async fn list_due(&self, now_us: i64) -> crate::cron::Result<Vec<CronJobRow>> {
         let mut rows = self
             .pool
             .conn()
             .query(
                 "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs \
-                 WHERE status = 'enabled' AND next_trigger_at != '' AND next_trigger_at <= ?1 \
+                 WHERE status = 'enabled' AND next_trigger_at != 0 AND next_trigger_at <= ?1 \
                  AND deleted_at IS NULL",
-                libsql::params![now.to_string()],
+                libsql::params![now_us],
             )
             .await
             .map_err(|e| CronStoreError::Internal(format!("libsql query: {e}")))?;
@@ -224,22 +225,33 @@ impl CronStore for LibsqlCronStore {
     // ── Execution records ──
 
     async fn record_execution(&self, row: &CronExecutionRow) -> crate::cron::Result<()> {
-        self.pool
+        // INSERT OR IGNORE so the (job_id, scheduled_fire_time) unique
+        // index distinguishes "lost the dedup race" from "DB is broken".
+        // 0 affected rows means another scheduler beat us to this slot;
+        // the caller treats that as benign and skips the dispatch.
+        let affected = self
+            .pool
             .conn()
             .execute(
-                "INSERT INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 libsql::params![
                     row.id.clone(),
                     row.job_id.clone(),
                     row.user_id.clone(),
-                    row.scheduled_fire_time.clone(),
-                    row.triggered_at.clone(),
+                    row.scheduled_fire_time,
+                    row.triggered_at,
                     row.status.clone(),
                     row.data.clone(),
                 ],
             )
             .await
             .map_err(|e| CronStoreError::Internal(format!("libsql insert: {e}")))?;
+        if affected == 0 {
+            return Err(CronStoreError::AlreadyExists(format!(
+                "{}@{}",
+                row.job_id, row.scheduled_fire_time
+            )));
+        }
         Ok(())
     }
 
@@ -296,14 +308,14 @@ impl CronStore for LibsqlCronStore {
     async fn has_execution_for_schedule(
         &self,
         job_id: &str,
-        scheduled_fire_time: &str,
+        scheduled_fire_time_us: i64,
     ) -> crate::cron::Result<bool> {
         let mut rows = self
             .pool
             .conn()
             .query(
                 "SELECT 1 FROM cron_executions WHERE job_id = ?1 AND scheduled_fire_time = ?2 LIMIT 1",
-                libsql::params![job_id.to_string(), scheduled_fire_time.to_string()],
+                libsql::params![job_id.to_string(), scheduled_fire_time_us],
             )
             .await
             .map_err(|e| CronStoreError::Internal(format!("libsql query: {e}")))?;
@@ -361,30 +373,59 @@ impl CronStore for LibsqlCronStore {
         }
         Ok(out)
     }
+
+    async fn purge_completed_executions_older_than(
+        &self,
+        cutoff_us: i64,
+    ) -> crate::cron::Result<u64> {
+        // Hard-delete past the retention horizon. Documented retention
+        // exception (see docs/modules/storage.md "Retention exceptions"):
+        // `cron_executions` is audit-ephemera, not recoverable past the
+        // horizon. `pending` rows are preserved because they might still
+        // be in-flight on another worker — reaping them silently would
+        // mask a long-stalled dispatch.
+        let affected = self
+            .pool
+            .conn()
+            .execute(
+                "DELETE FROM cron_executions \
+                 WHERE triggered_at < ?1 AND status != 'pending'",
+                libsql::params![cutoff_us],
+            )
+            .await
+            .map_err(|e| CronStoreError::Internal(format!("libsql delete: {e}")))?;
+        Ok(affected)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // 2099-01-01T00:00:00Z in Unix µs.
+    const FUTURE_US: i64 = 4_070_908_800_000_000;
+
     fn test_row(id: &str, user_id: &str, status: &str) -> CronJobRow {
         CronJobRow {
             id: id.to_string(),
             user_id: user_id.to_string(),
             status: status.to_string(),
-            next_trigger_at: "2099-01-01T00:00:00+00:00".to_string(),
+            next_trigger_at: FUTURE_US,
             data: format!(r#"{{"id":"{id}","user_id":"{user_id}"}}"#),
         }
     }
 
     fn test_exec_row(id: &str, job_id: &str, user_id: &str) -> CronExecutionRow {
-        // Use the id as part of scheduled_fire_time to satisfy the UNIQUE(job_id, scheduled_fire_time) constraint.
+        // Salt the schedule slot with the id's hash so the
+        // UNIQUE(job_id, scheduled_fire_time) constraint isn't tripped
+        // by repeat fixture rows.
+        let salt: i64 = id.chars().map(|c| c as i64).sum();
         CronExecutionRow {
             id: id.to_string(),
             job_id: job_id.to_string(),
             user_id: user_id.to_string(),
-            scheduled_fire_time: format!("2099-01-01T00:00:{id}"),
-            triggered_at: "2099-01-01T00:00:00+00:00".to_string(),
+            scheduled_fire_time: FUTURE_US + salt,
+            triggered_at: FUTURE_US,
             status: "pending".to_string(),
             data: format!(r#"{{"id":"{id}","job_id":"{job_id}"}}"#),
         }
@@ -488,23 +529,52 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlCronStore::new(pool);
 
+        // 2000-01-01T00:00:00Z and 2025-01-01T00:00:00Z in Unix µs.
+        const PAST_US: i64 = 946_684_800_000_000;
+        const NOW_US: i64 = 1_735_689_600_000_000;
+
         let mut past_due = test_row("cj-9", "u1", "enabled");
-        past_due.next_trigger_at = "2000-01-01T00:00:00+00:00".to_string();
+        past_due.next_trigger_at = PAST_US;
         store.create(&past_due).await.unwrap();
 
         let future = test_row("cj-10", "u1", "enabled");
         store.create(&future).await.unwrap();
 
         let mut disabled = test_row("cj-11", "u1", "disabled");
-        disabled.next_trigger_at = "2000-01-01T00:00:00+00:00".to_string();
+        disabled.next_trigger_at = PAST_US;
         store.create(&disabled).await.unwrap();
 
-        let due = store.list_due("2025-01-01T00:00:00+00:00").await.unwrap();
+        let due = store.list_due(NOW_US).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].id, "cj-9");
     }
 
     // ── Execution record tests ──
+
+    #[tokio::test]
+    async fn record_execution_dedup_returns_already_exists() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlCronStore::new(pool);
+
+        let mut row = test_exec_row("ce-dup-a", "cj-dup", "u1");
+        store.record_execution(&row).await.unwrap();
+
+        // Second instance of the same scheduler racing onto the same
+        // (job_id, scheduled_fire_time) slot — different `id`, same dedup key.
+        row.id = "ce-dup-b".into();
+        let err = store.record_execution(&row).await.unwrap_err();
+        match err {
+            CronStoreError::AlreadyExists(key) => {
+                assert!(key.starts_with("cj-dup@"), "key was {key}");
+            }
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+
+        // Original row remains; the loser produced no orphan.
+        let execs = store.list_executions_by_job("cj-dup").await.unwrap();
+        assert_eq!(execs.len(), 1);
+        assert_eq!(execs[0].id, "ce-dup-a");
+    }
 
     #[tokio::test]
     async fn record_and_list_executions_by_job() {

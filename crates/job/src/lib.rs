@@ -1,167 +1,259 @@
+//! Job lifecycle types — see `docs/modules/job.md` for the design.
+//!
+//! This crate is types-only: no async, no storage. The persistence /
+//! hook orchestrator (`JobLifecycle`) lives in `agent::job`.
+
+mod cancel;
+mod drift;
 mod error;
-mod operation;
+mod kind;
 
-pub use error::JobError;
-pub use operation::OperationKind;
-
+use aura_model::{JobId, SessionId, SpanId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use uuid::Uuid;
+
+pub use cancel::CancelReason;
+pub use drift::DriftRecord;
+pub use error::JobError;
+pub use kind::{JobInput, JobKind, JobOutput};
 
 pub type Result<T> = std::result::Result<T, JobError>;
 
-/// Job lifecycle status with a fixed state machine.
+// ── JobStatus ──────────────────────────────────────────────────────
+
+/// Job lifecycle status.
 ///
 /// ```text
-/// Pending -> InProgress -> Completed -> Submitted -> Accepted
-///                       \-> Failed
-///                       \-> Stuck -> InProgress
-///                                \-> Failed
+/// Pending → InProgress → Completed
+///                    \→ Stuck { reason } → InProgress
+///                                       \→ Failed { reason }
+///                                       \→ Cancelled { reason, partial_artifacts }
+///                    \→ Failed { reason }
+///                    \→ Cancelled { reason, partial_artifacts }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum JobStatus {
     Pending,
     InProgress,
+    Stuck {
+        reason: String,
+    },
+    Cancelled {
+        reason: CancelReason,
+        /// Spans that completed (or partially completed) before the
+        /// cancel. The next job's prompt-assembly step renders these as
+        /// a "previously completed steps:" preamble.
+        partial_artifacts: Vec<SpanId>,
+    },
+    Failed {
+        reason: String,
+    },
     Completed,
-    Submitted,
-    Accepted,
-    Failed,
+}
+
+/// Pure discriminator for `JobStatus`. Used to express the state
+/// machine without having to construct concrete variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobStatusKind {
+    Pending,
+    InProgress,
     Stuck,
+    Cancelled,
+    Failed,
+    Completed,
 }
 
 impl JobStatus {
-    /// Returns the set of statuses reachable from `self`.
-    pub fn allowed_transitions(&self) -> &'static [JobStatus] {
+    pub fn kind(&self) -> JobStatusKind {
         match self {
-            JobStatus::Pending => &[JobStatus::InProgress],
-            JobStatus::InProgress => &[JobStatus::Completed, JobStatus::Failed, JobStatus::Stuck],
-            JobStatus::Completed => &[JobStatus::Submitted],
-            JobStatus::Submitted => &[JobStatus::Accepted],
-            JobStatus::Stuck => &[JobStatus::InProgress, JobStatus::Failed],
-            JobStatus::Accepted | JobStatus::Failed => &[],
+            JobStatus::Pending => JobStatusKind::Pending,
+            JobStatus::InProgress => JobStatusKind::InProgress,
+            JobStatus::Stuck { .. } => JobStatusKind::Stuck,
+            JobStatus::Cancelled { .. } => JobStatusKind::Cancelled,
+            JobStatus::Failed { .. } => JobStatusKind::Failed,
+            JobStatus::Completed => JobStatusKind::Completed,
         }
     }
 
-    /// Check whether transitioning from `self` to `target` is legal.
-    pub fn can_transition_to(&self, target: &JobStatus) -> bool {
-        self.allowed_transitions().contains(target)
-    }
-
-    /// Whether this is a terminal status (`Accepted` or `Failed`).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, JobStatus::Accepted | JobStatus::Failed)
+        self.kind().is_terminal()
     }
 
-    /// Whether a job in this status needs recovery after a system restart.
-    ///
-    /// Returns `true` for any non-terminal status, since these jobs were
-    /// interrupted before reaching a final state.
     pub fn needs_recovery(&self) -> bool {
-        !self.is_terminal()
+        self.kind().needs_recovery()
     }
 }
 
-impl std::fmt::Display for JobStatus {
+impl JobStatusKind {
+    /// Set of statuses reachable from `self` via `Job::transition`.
+    pub fn allowed_transitions(self) -> &'static [JobStatusKind] {
+        use JobStatusKind::*;
+        match self {
+            Pending => &[InProgress, Cancelled, Failed],
+            InProgress => &[Completed, Stuck, Failed, Cancelled],
+            Stuck => &[InProgress, Failed, Cancelled],
+            Completed | Failed | Cancelled => &[],
+        }
+    }
+
+    pub fn can_transition_to(self, target: JobStatusKind) -> bool {
+        self.allowed_transitions().contains(&target)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobStatusKind::Completed | JobStatusKind::Failed | JobStatusKind::Cancelled
+        )
+    }
+
+    pub fn needs_recovery(self) -> bool {
+        matches!(
+            self,
+            JobStatusKind::Pending | JobStatusKind::InProgress | JobStatusKind::Stuck
+        )
+    }
+
+    /// Snake-case wire tag, matching the serde `rename_all` on
+    /// `JobStatus`. `Display` delegates here so formatted error
+    /// messages and JSON wire payloads use the same identifier — no
+    /// PascalCase-in-logs / snake_case-in-JSON mismatch.
+    pub fn as_snake_case(self) -> &'static str {
+        match self {
+            JobStatusKind::Pending => "pending",
+            JobStatusKind::InProgress => "in_progress",
+            JobStatusKind::Stuck => "stuck",
+            JobStatusKind::Cancelled => "cancelled",
+            JobStatusKind::Failed => "failed",
+            JobStatusKind::Completed => "completed",
+        }
+    }
+}
+
+impl std::fmt::Display for JobStatusKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            JobStatus::Pending => "Pending",
-            JobStatus::InProgress => "InProgress",
-            JobStatus::Completed => "Completed",
-            JobStatus::Submitted => "Submitted",
-            JobStatus::Accepted => "Accepted",
-            JobStatus::Failed => "Failed",
-            JobStatus::Stuck => "Stuck",
-        };
-        write!(f, "{s}")
+        f.write_str(self.as_snake_case())
     }
 }
 
-/// A tracked unit of asynchronous work within a session.
+// ── Job ─────────────────────────────────────────────────────────────
+
+/// One externally-triggered unit of work. Lives within a `Session` and
+/// owns a chain of `Step`s (in `aura-trace`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
-    pub id: String,
-    pub session_id: String,
-    pub parent_job_id: Option<String>,
-    pub kind: OperationKind,
+    pub id: JobId,
+    pub session_id: SessionId,
+    pub parent_job_id: Option<JobId>,
+
+    pub kind: JobKind,
+    pub input: JobInput,
     pub status: JobStatus,
-    pub input: Option<Value>,
-    pub output: Option<Value>,
-    pub error: Option<String>,
-    pub trace_span_id: Option<String>,
+
+    /// Final contractual output. Set when the job enters `Completed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_result: Option<JobOutput>,
+
+    /// Index of trace spans during this job that emitted user-visible
+    /// messages. Content lives in the trace tree, not here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emitted_span_ids: Vec<SpanId>,
+
+    /// Soul version actually loaded at this job's start time. Compare
+    /// against `Session.bound_soul_version` to detect drift.
+    pub effective_soul_version: String,
+
+    /// Empty unless this job ran under a soul different from the
+    /// session's `bound_soul_version`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance_drift: Vec<DriftRecord>,
+
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
-    /// Create a new job in `Pending` status with a generated UUID.
-    pub fn new(session_id: &str, kind: OperationKind, parent_job_id: Option<&str>) -> Self {
+    /// Construct a fresh job in `Pending` status.
+    pub fn new(
+        session_id: SessionId,
+        input: JobInput,
+        effective_soul_version: impl Into<String>,
+        parent_job_id: Option<JobId>,
+    ) -> Self {
+        let kind = input.kind();
         Self {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_owned(),
-            parent_job_id: parent_job_id.map(String::from),
+            id: JobId::new(),
+            session_id,
+            parent_job_id,
             kind,
+            input,
             status: JobStatus::Pending,
-            input: None,
-            output: None,
-            error: None,
-            trace_span_id: None,
+            final_result: None,
+            emitted_span_ids: Vec::new(),
+            effective_soul_version: effective_soul_version.into(),
+            provenance_drift: Vec::new(),
             created_at: Utc::now(),
             started_at: None,
-            completed_at: None,
+            ended_at: None,
         }
     }
 
-    /// Whether this job has reached a terminal state (`Accepted` or `Failed`).
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
     }
 
-    /// Apply a state transition. Validates the transition against the state
-    /// machine, mutates this job's status/timestamps/output/error, and returns
-    /// the corresponding `JobTransition` record.
+    /// Apply a state transition. Validates against the state machine,
+    /// mutates status / timestamps / final_result, and returns the
+    /// audit record.
     pub fn transition(
         &mut self,
         target: JobStatus,
-        output: Option<Value>,
-        error: Option<String>,
+        final_result: Option<JobOutput>,
         reason: Option<String>,
     ) -> Result<JobTransition> {
-        if !self.status.can_transition_to(&target) {
+        let from = self.status.clone();
+        if !from.kind().can_transition_to(target.kind()) {
             return Err(JobError::InvalidTransition(format!(
                 "{} -> {} (job {})",
-                self.status, target, self.id
+                from.kind(),
+                target.kind(),
+                self.id
             )));
         }
 
-        let from = self.status.clone();
         let now = Utc::now();
-
-        // Timestamp management
-        if target == JobStatus::InProgress && self.started_at.is_none() {
+        if matches!(target, JobStatus::InProgress) && self.started_at.is_none() {
             self.started_at = Some(now);
         }
-        if matches!(
-            target,
-            JobStatus::Completed | JobStatus::Accepted | JobStatus::Failed
-        ) {
-            self.completed_at = Some(now);
+        if target.kind().is_terminal() {
+            self.ended_at = Some(now);
+        }
+        // `final_result` is the contractual output of a successful run.
+        // Reject Failed/Cancelled/Stuck targets that try to write one —
+        // those carry their reason on the status variant itself; mixing
+        // a `final_result` with a non-Completed terminal would corrupt
+        // the audit invariant ("`final_result.is_some()` ⇔ `Completed`").
+        if let Some(out) = final_result {
+            if !matches!(target, JobStatus::Completed) {
+                return Err(JobError::InvalidTransition(format!(
+                    "{} -> {} carries a final_result but only Completed accepts one (job {})",
+                    from.kind(),
+                    target.kind(),
+                    self.id
+                )));
+            }
+            self.final_result = Some(out);
         }
 
-        self.status = target.clone();
-        if let Some(o) = output {
-            self.output = Some(o);
-        }
-        if let Some(e) = error {
-            self.error = Some(e);
-        }
+        let to = target.clone();
+        self.status = target;
 
         Ok(JobTransition {
-            job_id: self.id.clone(),
+            job_id: self.id,
             from,
-            to: target,
+            to,
             reason,
             timestamp: now,
         })
@@ -169,68 +261,78 @@ impl Job {
 
     // -- Convenience transition methods --
 
-    /// Transition from `Pending` to `InProgress`.
     pub fn start(&mut self) -> Result<JobTransition> {
-        self.transition(JobStatus::InProgress, None, None, None)
+        self.transition(JobStatus::InProgress, None, None)
     }
 
-    /// Transition from `InProgress` to `Completed` with output.
-    pub fn complete(&mut self, output: Value) -> Result<JobTransition> {
-        self.transition(JobStatus::Completed, Some(output), None, None)
+    /// Move from `InProgress` to `Completed` with the final contractual
+    /// output.
+    pub fn complete(&mut self, output: JobOutput) -> Result<JobTransition> {
+        self.transition(JobStatus::Completed, Some(output), None)
     }
 
-    /// Transition from `Completed` to `Submitted`.
-    pub fn submit(&mut self) -> Result<JobTransition> {
-        self.transition(JobStatus::Submitted, None, None, None)
+    pub fn fail(&mut self, reason: impl Into<String>) -> Result<JobTransition> {
+        let reason = reason.into();
+        self.transition(
+            JobStatus::Failed {
+                reason: reason.clone(),
+            },
+            None,
+            Some(reason),
+        )
     }
 
-    /// Transition from `Submitted` to `Accepted`.
-    pub fn accept(&mut self) -> Result<JobTransition> {
-        self.transition(JobStatus::Accepted, None, None, None)
+    pub fn cancel(
+        &mut self,
+        reason: CancelReason,
+        partial_artifacts: Vec<SpanId>,
+    ) -> Result<JobTransition> {
+        self.transition(
+            JobStatus::Cancelled {
+                reason,
+                partial_artifacts,
+            },
+            None,
+            None,
+        )
     }
 
-    /// Transition from `InProgress` or `Stuck` to `Failed` with error message.
-    pub fn fail(&mut self, error: &str) -> Result<JobTransition> {
-        self.transition(JobStatus::Failed, None, Some(error.to_owned()), None)
+    pub fn stuck(&mut self, reason: impl Into<String>) -> Result<JobTransition> {
+        let reason = reason.into();
+        self.transition(
+            JobStatus::Stuck {
+                reason: reason.clone(),
+            },
+            None,
+            Some(reason),
+        )
     }
 
-    /// Transition from `InProgress` to `Stuck` with a reason.
-    pub fn stuck(&mut self, reason: &str) -> Result<JobTransition> {
-        self.transition(JobStatus::Stuck, None, None, Some(reason.to_owned()))
-    }
-
-    /// Recover from `Stuck` back to `InProgress` with a reason.
-    pub fn recover(&mut self, reason: &str) -> Result<JobTransition> {
-        self.transition(JobStatus::InProgress, None, None, Some(reason.to_owned()))
-    }
-
-    /// Mark this job as interrupted by a system restart.
-    ///
-    /// Only `InProgress` jobs are transitioned to `Stuck`. Jobs in other
-    /// non-terminal states (`Pending`, `Completed`, `Submitted`, `Stuck`)
-    /// are left unchanged — they can be retried or resumed without a
-    /// state change.
-    ///
-    /// Returns `Some(transition)` if the status changed, `None` otherwise.
-    pub fn mark_interrupted(&mut self) -> Result<Option<JobTransition>> {
-        if self.status == JobStatus::InProgress {
-            let t = self.transition(
-                JobStatus::Stuck,
-                None,
-                None,
-                Some("system restart: interrupted while in progress".to_owned()),
-            )?;
-            Ok(Some(t))
-        } else {
-            Ok(None)
+    /// `Stuck → InProgress` only. Reaching `InProgress` from `Pending` is
+    /// the job of `start()`, which records the transition without a recovery
+    /// reason; conflating the two would let `recover()` masquerade as a
+    /// regular start and corrupt the recovery audit trail.
+    pub fn recover(&mut self, reason: impl Into<String>) -> Result<JobTransition> {
+        if !matches!(self.status, JobStatus::Stuck { .. }) {
+            return Err(JobError::InvalidTransition(format!(
+                "{} -> InProgress (job {}): recover() requires Stuck",
+                self.status.kind(),
+                self.id
+            )));
         }
+        self.transition(JobStatus::InProgress, None, Some(reason.into()))
     }
 }
 
-/// A record of a single state transition for a job.
+/// Audit record for a single state transition.
+///
+/// Dropping a `JobTransition` without persisting it loses the audit
+/// trail the state machine exists to produce; `JobLifecycle::record_transition`
+/// is the intended consumer.
+#[must_use = "JobTransition is the audit trail; persist it via JobLifecycle::record_transition"]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobTransition {
-    pub job_id: String,
+    pub job_id: JobId,
     pub from: JobStatus,
     pub to: JobStatus,
     pub reason: Option<String>,
@@ -238,268 +340,237 @@ pub struct JobTransition {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)] // tests assert on `j.status` directly; the JobTransition audit record isn't relevant here
 mod tests {
     use super::*;
+    use aura_model::ContentBlock;
 
-    fn test_kind() -> OperationKind {
-        OperationKind::LlmCall {
-            model: "test-model".into(),
+    fn user_chat_input() -> JobInput {
+        JobInput::UserChat {
+            content: vec![ContentBlock::Text("hi".into())],
         }
     }
 
-    // -- JobStatus tests --
+    fn fresh_job() -> Job {
+        Job::new(
+            SessionId::from("cli-test"),
+            user_chat_input(),
+            "soul-v1",
+            None,
+        )
+    }
+
+    fn dummy_output() -> JobOutput {
+        JobOutput::Message {
+            content: vec![ContentBlock::Text("ok".into())],
+        }
+    }
+
+    // -- JobStatusKind state machine --
 
     #[test]
-    fn pending_can_only_go_to_in_progress() {
-        let s = JobStatus::Pending;
-        assert!(s.can_transition_to(&JobStatus::InProgress));
-        assert!(!s.can_transition_to(&JobStatus::Completed));
-        assert!(!s.can_transition_to(&JobStatus::Failed));
-        assert!(!s.can_transition_to(&JobStatus::Accepted));
+    fn pending_can_start_or_be_cancelled_or_fail() {
+        let s = JobStatusKind::Pending;
+        assert!(s.can_transition_to(JobStatusKind::InProgress));
+        assert!(s.can_transition_to(JobStatusKind::Cancelled));
+        assert!(s.can_transition_to(JobStatusKind::Failed));
+        assert!(!s.can_transition_to(JobStatusKind::Completed));
+        assert!(!s.can_transition_to(JobStatusKind::Stuck));
     }
 
     #[test]
     fn in_progress_transitions() {
-        let s = JobStatus::InProgress;
-        assert!(s.can_transition_to(&JobStatus::Completed));
-        assert!(s.can_transition_to(&JobStatus::Failed));
-        assert!(s.can_transition_to(&JobStatus::Stuck));
-        assert!(!s.can_transition_to(&JobStatus::Accepted));
-        assert!(!s.can_transition_to(&JobStatus::Pending));
+        let s = JobStatusKind::InProgress;
+        assert!(s.can_transition_to(JobStatusKind::Completed));
+        assert!(s.can_transition_to(JobStatusKind::Stuck));
+        assert!(s.can_transition_to(JobStatusKind::Failed));
+        assert!(s.can_transition_to(JobStatusKind::Cancelled));
+        assert!(!s.can_transition_to(JobStatusKind::Pending));
     }
 
     #[test]
-    fn terminal_states_have_no_transitions() {
-        assert!(JobStatus::Accepted.allowed_transitions().is_empty());
-        assert!(JobStatus::Failed.allowed_transitions().is_empty());
+    fn terminal_kinds_have_no_transitions() {
+        assert!(JobStatusKind::Completed.allowed_transitions().is_empty());
+        assert!(JobStatusKind::Failed.allowed_transitions().is_empty());
+        assert!(JobStatusKind::Cancelled.allowed_transitions().is_empty());
     }
 
     #[test]
-    fn is_terminal() {
-        assert!(JobStatus::Accepted.is_terminal());
-        assert!(JobStatus::Failed.is_terminal());
-        assert!(!JobStatus::Pending.is_terminal());
-        assert!(!JobStatus::InProgress.is_terminal());
-        assert!(!JobStatus::Completed.is_terminal());
-        assert!(!JobStatus::Stuck.is_terminal());
+    fn is_terminal_and_needs_recovery_are_complementary() {
+        for k in [
+            JobStatusKind::Pending,
+            JobStatusKind::InProgress,
+            JobStatusKind::Stuck,
+            JobStatusKind::Cancelled,
+            JobStatusKind::Failed,
+            JobStatusKind::Completed,
+        ] {
+            assert_ne!(k.is_terminal(), k.needs_recovery());
+        }
     }
 
-    // -- Job constructor tests --
+    // -- Job::new --
 
     #[test]
     fn new_job_is_pending() {
-        let job = Job::new("s1", test_kind(), None);
-        assert_eq!(job.status, JobStatus::Pending);
-        assert!(!job.id.is_empty());
-        assert_eq!(job.session_id, "s1");
-        assert!(job.parent_job_id.is_none());
-        assert!(job.started_at.is_none());
-        assert!(job.completed_at.is_none());
-    }
-
-    #[test]
-    fn new_job_with_parent() {
-        let job = Job::new("s1", test_kind(), Some("parent-1"));
-        assert_eq!(job.parent_job_id.as_deref(), Some("parent-1"));
+        let j = fresh_job();
+        assert!(matches!(j.status, JobStatus::Pending));
+        assert_eq!(j.kind, JobKind::UserChat);
+        assert!(j.started_at.is_none());
+        assert!(j.ended_at.is_none());
+        assert!(j.final_result.is_none());
+        assert!(j.parent_job_id.is_none());
     }
 
     #[test]
     fn new_jobs_have_unique_ids() {
-        let a = Job::new("s1", test_kind(), None);
-        let b = Job::new("s1", test_kind(), None);
+        let a = fresh_job();
+        let b = fresh_job();
         assert_ne!(a.id, b.id);
     }
 
-    // -- State machine transition tests --
+    #[test]
+    fn job_kind_derived_from_input() {
+        let j = Job::new(
+            SessionId::from("s"),
+            JobInput::Spawned {
+                initial_prompt: vec![],
+            },
+            "soul-v1",
+            None,
+        );
+        assert_eq!(j.kind, JobKind::Spawned);
+    }
+
+    // -- Happy path --
 
     #[test]
     fn full_success_path() {
-        let mut job = Job::new("s1", test_kind(), None);
+        let mut j = fresh_job();
+        let t = j.start().unwrap();
+        assert_eq!(t.from, JobStatus::Pending);
+        assert!(matches!(t.to, JobStatus::InProgress));
+        assert!(j.started_at.is_some());
 
-        let t1 = job.start().unwrap();
-        assert_eq!(t1.from, JobStatus::Pending);
-        assert_eq!(t1.to, JobStatus::InProgress);
-        assert_eq!(job.status, JobStatus::InProgress);
-        assert!(job.started_at.is_some());
-
-        let t2 = job.complete(serde_json::json!({"ok": true})).unwrap();
-        assert_eq!(t2.from, JobStatus::InProgress);
-        assert_eq!(t2.to, JobStatus::Completed);
-        assert!(job.output.is_some());
-        assert!(job.completed_at.is_some());
-
-        let t3 = job.submit().unwrap();
-        assert_eq!(t3.from, JobStatus::Completed);
-        assert_eq!(t3.to, JobStatus::Submitted);
-
-        let t4 = job.accept().unwrap();
-        assert_eq!(t4.from, JobStatus::Submitted);
-        assert_eq!(t4.to, JobStatus::Accepted);
-        assert!(job.is_terminal());
+        let t = j.complete(dummy_output()).unwrap();
+        assert!(matches!(t.from, JobStatus::InProgress));
+        assert!(matches!(j.status, JobStatus::Completed));
+        assert!(j.is_terminal());
+        assert!(j.ended_at.is_some());
+        assert!(j.final_result.is_some());
     }
 
     #[test]
     fn fail_from_in_progress() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
+        let mut j = fresh_job();
+        j.start().unwrap();
+        let t = j.fail("timeout").unwrap();
+        assert!(matches!(t.to, JobStatus::Failed { .. }));
+        assert!(j.is_terminal());
+        assert!(j.ended_at.is_some());
+    }
 
-        let t = job.fail("timeout").unwrap();
-        assert_eq!(t.to, JobStatus::Failed);
-        assert_eq!(job.error.as_deref(), Some("timeout"));
-        assert!(job.is_terminal());
-        assert!(job.completed_at.is_some());
+    #[test]
+    fn cancel_from_in_progress_keeps_partial() {
+        let mut j = fresh_job();
+        j.start().unwrap();
+        let span = SpanId::new();
+        j.cancel(CancelReason::UserPreempt, vec![span]).unwrap();
+        match &j.status {
+            JobStatus::Cancelled {
+                reason,
+                partial_artifacts,
+            } => {
+                assert_eq!(*reason, CancelReason::UserPreempt);
+                assert_eq!(partial_artifacts.as_slice(), &[span]);
+            }
+            _ => panic!("expected Cancelled"),
+        }
+        assert!(j.is_terminal());
+    }
+
+    #[test]
+    fn cancel_from_pending() {
+        let mut j = fresh_job();
+        j.cancel(CancelReason::ParentDeleted, vec![]).unwrap();
+        assert!(matches!(j.status, JobStatus::Cancelled { .. }));
     }
 
     #[test]
     fn stuck_then_recover() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
-
-        let t1 = job.stuck("no response").unwrap();
-        assert_eq!(t1.to, JobStatus::Stuck);
-        assert_eq!(t1.reason.as_deref(), Some("no response"));
-
-        let t2 = job.recover("retrying").unwrap();
-        assert_eq!(t2.to, JobStatus::InProgress);
-        assert_eq!(t2.reason.as_deref(), Some("retrying"));
-
-        job.complete(serde_json::json!(null)).unwrap();
-        job.submit().unwrap();
-        job.accept().unwrap();
-        assert!(job.is_terminal());
+        let mut j = fresh_job();
+        j.start().unwrap();
+        j.stuck("hung").unwrap();
+        assert!(matches!(j.status, JobStatus::Stuck { .. }));
+        let t = j.recover("watchdog").unwrap();
+        assert!(matches!(t.to, JobStatus::InProgress));
+        assert_eq!(t.reason.as_deref(), Some("watchdog"));
     }
 
     #[test]
-    fn stuck_then_fail() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
-        job.stuck("hung").unwrap();
-
-        let t = job.fail("unrecoverable").unwrap();
-        assert_eq!(t.to, JobStatus::Failed);
-        assert!(job.is_terminal());
+    fn stuck_then_cancel() {
+        let mut j = fresh_job();
+        j.start().unwrap();
+        j.stuck("hung").unwrap();
+        j.cancel(CancelReason::ParentCancelled, vec![]).unwrap();
+        assert!(matches!(j.status, JobStatus::Cancelled { .. }));
     }
 
     #[test]
     fn cannot_complete_from_pending() {
-        let mut job = Job::new("s1", test_kind(), None);
-        let err = job.complete(serde_json::json!(null)).unwrap_err();
+        let mut j = fresh_job();
+        let err = j.complete(dummy_output()).unwrap_err();
         assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
     #[test]
-    fn cannot_accept_from_pending() {
-        let mut job = Job::new("s1", test_kind(), None);
-        let err = job.accept().unwrap_err();
+    fn recover_rejects_pending() {
+        let mut j = fresh_job();
+        let err = j.recover("oops").unwrap_err();
         assert!(matches!(err, JobError::InvalidTransition(_)));
+        assert!(matches!(j.status, JobStatus::Pending));
+    }
+
+    #[test]
+    fn recover_rejects_in_progress() {
+        let mut j = fresh_job();
+        j.start().unwrap();
+        let err = j.recover("oops").unwrap_err();
+        assert!(matches!(err, JobError::InvalidTransition(_)));
+        assert!(matches!(j.status, JobStatus::InProgress));
     }
 
     #[test]
     fn cannot_transition_from_terminal() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
-        job.fail("done").unwrap();
-
-        let err = job.start().unwrap_err();
+        let mut j = fresh_job();
+        j.start().unwrap();
+        j.fail("done").unwrap();
+        let err = j.start().unwrap_err();
         assert!(matches!(err, JobError::InvalidTransition(_)));
     }
 
-    #[test]
-    fn started_at_set_only_on_first_start() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
-        let first_start = job.started_at;
+    // -- Serde --
 
-        job.stuck("stalled").unwrap();
-        job.recover("retry").unwrap();
-        // started_at should not change on re-entry to InProgress
-        assert_eq!(job.started_at, first_start);
+    #[test]
+    fn job_round_trips_through_serde() {
+        let mut j = fresh_job();
+        j.start().unwrap();
+        j.complete(dummy_output()).unwrap();
+        let s = serde_json::to_string(&j).unwrap();
+        let back: Job = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.id, j.id);
+        assert_eq!(back.kind, j.kind);
+        assert_eq!(back.session_id, j.session_id);
     }
 
     #[test]
-    fn transition_returns_correct_record() {
-        let mut job = Job::new("s1", test_kind(), None);
-        let t = job.start().unwrap();
-        assert_eq!(t.job_id, job.id);
-        assert_eq!(t.from, JobStatus::Pending);
-        assert_eq!(t.to, JobStatus::InProgress);
-        assert!(t.reason.is_none());
-    }
-
-    // -- needs_recovery tests --
-
-    #[test]
-    fn needs_recovery_for_non_terminal() {
-        assert!(JobStatus::Pending.needs_recovery());
-        assert!(JobStatus::InProgress.needs_recovery());
-        assert!(JobStatus::Completed.needs_recovery());
-        assert!(JobStatus::Submitted.needs_recovery());
-        assert!(JobStatus::Stuck.needs_recovery());
-    }
-
-    #[test]
-    fn no_recovery_for_terminal() {
-        assert!(!JobStatus::Accepted.needs_recovery());
-        assert!(!JobStatus::Failed.needs_recovery());
-    }
-
-    // -- mark_interrupted tests --
-
-    #[test]
-    fn mark_interrupted_in_progress_becomes_stuck() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
-
-        let t = job.mark_interrupted().unwrap();
-        assert!(t.is_some());
-        let t = t.unwrap();
-        assert_eq!(t.from, JobStatus::InProgress);
-        assert_eq!(t.to, JobStatus::Stuck);
-        assert_eq!(
-            t.reason.as_deref(),
-            Some("system restart: interrupted while in progress")
-        );
-        assert_eq!(job.status, JobStatus::Stuck);
-    }
-
-    #[test]
-    fn mark_interrupted_pending_unchanged() {
-        let mut job = Job::new("s1", test_kind(), None);
-        let t = job.mark_interrupted().unwrap();
-        assert!(t.is_none());
-        assert_eq!(job.status, JobStatus::Pending);
-    }
-
-    #[test]
-    fn mark_interrupted_stuck_unchanged() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
-        job.stuck("hung").unwrap();
-
-        let t = job.mark_interrupted().unwrap();
-        assert!(t.is_none());
-        assert_eq!(job.status, JobStatus::Stuck);
-    }
-
-    #[test]
-    fn mark_interrupted_completed_unchanged() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
-        job.complete(serde_json::json!({"ok": true})).unwrap();
-
-        let t = job.mark_interrupted().unwrap();
-        assert!(t.is_none());
-        assert_eq!(job.status, JobStatus::Completed);
-    }
-
-    #[test]
-    fn mark_interrupted_terminal_unchanged() {
-        let mut job = Job::new("s1", test_kind(), None);
-        job.start().unwrap();
-        job.fail("done").unwrap();
-
-        let t = job.mark_interrupted().unwrap();
-        assert!(t.is_none());
-        assert_eq!(job.status, JobStatus::Failed);
+    fn job_status_round_trips_through_serde() {
+        let s = JobStatus::Cancelled {
+            reason: CancelReason::SystemCrash,
+            partial_artifacts: vec![SpanId::new()],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: JobStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind(), s.kind());
     }
 }

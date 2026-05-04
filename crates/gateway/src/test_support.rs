@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::auth::ChannelTokenTable;
 use aura_agent::service::ShutdownSignal;
-use aura_agent::{CronScheduler, JobManager, MemoryManager, SessionManager};
+use aura_agent::{CronScheduler, JobLifecycle, MemoryManager, SessionManager};
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
@@ -58,14 +58,16 @@ pub struct TestGateway {
 pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let db_path = tempdir.path().join("gateway-test.db");
-    let stores = Store::open(&db_path).await.expect("open in-memory store");
+    let stores = Store::open(&db_path)
+        .await
+        .expect("open tempdir-backed test store");
 
     let config = Arc::new(AuraConfig::default());
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
         chrono::Duration::seconds(300),
     ));
-    let job_manager = Arc::new(JobManager::new(stores.job.clone()));
+    let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
 
     let secret_vault = Arc::new(SecretVault::new(
         EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
@@ -124,7 +126,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         config_path: None,
         runtime_config,
         session_manager,
-        job_manager,
+        job_lifecycle,
         cron_scheduler,
         memory_manager,
         skill_registry,

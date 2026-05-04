@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_model::{ChannelType, ChatMessage, Session, SessionState, User};
+use aura_model::{ChannelType, ChatMessage, Session, SessionId, SessionState, TriggerSource, User};
 use aura_storage::{SessionStore, StorageError};
 use chrono::{Duration, Utc};
 use tracing::{debug, warn};
@@ -17,6 +17,10 @@ fn wrap(e: StorageError) -> SessionError {
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
     session_timeout: Duration,
+    /// Default soul version stamped on new sessions when the caller
+    /// does not supply one. The agent layer overrides this via
+    /// `create_session_with_options` once it loads the live config.
+    default_soul_version: String,
 }
 
 impl SessionManager {
@@ -24,29 +28,95 @@ impl SessionManager {
         Self {
             store,
             session_timeout,
+            default_soul_version: "soul-default".to_owned(),
         }
     }
 
+    /// Override the soul version stamped on subsequently-created
+    /// sessions. Useful in tests and at startup once the soul
+    /// configuration is known.
+    pub fn with_default_soul_version(mut self, soul_version: impl Into<String>) -> Self {
+        self.default_soul_version = soul_version.into();
+        self
+    }
+
+    /// Read-only view of the underlying `SessionStore`. Used by
+    /// callers (CLI / gateway admin) that need to construct
+    /// `QueryApi` against the same store the manager writes to.
+    pub fn store(&self) -> Arc<dyn SessionStore> {
+        Arc::clone(&self.store)
+    }
+
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
-        self.create_session_with_id(uuid::Uuid::new_v4().to_string(), user, channel)
-            .await
+        self.create_session_with_id(
+            SessionId::from(uuid::Uuid::new_v4().to_string()),
+            user,
+            channel,
+        )
+        .await
+    }
+
+    /// Create a session that descends from `parent` via the given
+    /// lineage (subagent or user-fork). The child inherits its
+    /// trigger from the parent's root session and gets a fresh
+    /// session_id prefixed with `subagent-` / `fork-` as a hint.
+    pub async fn create_spawned_session(
+        &self,
+        user: User,
+        channel: ChannelType,
+        parent: &Session,
+        lineage: aura_model::Lineage,
+    ) -> Result<Session> {
+        let prefix = match lineage.kind {
+            aura_model::LineageKind::Subagent => "subagent-",
+            aura_model::LineageKind::UserFork { .. } => "fork-",
+        };
+        let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        let now = Utc::now();
+        let session = Session {
+            id: id.clone(),
+            user,
+            channel,
+            messages: Vec::new(),
+            created_at: now,
+            last_active: now,
+            state: aura_model::SessionState::default(),
+            // Spawned sessions inherit `root_session_id` from the
+            // ultimate ancestor, not from their direct parent.
+            root_session_id: parent.root_session_id.clone(),
+            // Trigger inherits from root (Q2 design).
+            trigger: parent.trigger.clone(),
+            lineage: Some(lineage),
+            bound_soul_version: self.default_soul_version.clone(),
+        };
+        self.store.save(&session).await.map_err(wrap)?;
+        debug!(
+            session_id = %session.id,
+            parent_session_id = %parent.id,
+            "spawned subagent / fork session"
+        );
+        Ok(session)
     }
 
     async fn create_session_with_id(
         &self,
-        id: String,
+        id: SessionId,
         user: User,
         channel: ChannelType,
     ) -> Result<Session> {
         let now = Utc::now();
         let session = Session {
-            id,
+            id: id.clone(),
             user,
             channel,
             messages: Vec::new(),
             created_at: now,
             last_active: now,
             state: SessionState::default(),
+            root_session_id: id,
+            trigger: TriggerSource::User,
+            lineage: None,
+            bound_soul_version: self.default_soul_version.clone(),
         };
         self.store.save(&session).await.map_err(wrap)?;
         debug!(session_id = %session.id, "created new session");
@@ -55,28 +125,28 @@ impl SessionManager {
 
     pub async fn get_or_create(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
         user: User,
         channel: ChannelType,
     ) -> Result<Session> {
         if let Some(session) = self.store.get(session_id).await.map_err(wrap)? {
             let cutoff = Utc::now() - self.session_timeout;
             if session.last_active < cutoff {
-                debug!(session_id, "session expired, replacing with new session");
-                self.store.delete(session_id).await.map_err(wrap)?;
+                debug!(session_id = %session_id, "session expired, replacing with new session");
+                self.store.soft_delete(session_id).await.map_err(wrap)?;
                 return self
-                    .create_session_with_id(session_id.to_string(), user, channel)
+                    .create_session_with_id(session_id.clone(), user, channel)
                     .await;
             }
-            debug!(session_id, "returning existing session");
+            debug!(session_id = %session_id, "returning existing session");
             return Ok(session);
         }
-        debug!(session_id, "session not found, creating new session");
-        self.create_session_with_id(session_id.to_string(), user, channel)
+        debug!(session_id = %session_id, "session not found, creating new session");
+        self.create_session_with_id(session_id.clone(), user, channel)
             .await
     }
 
-    pub async fn get(&self, session_id: &str) -> Result<Option<Session>> {
+    pub async fn get(&self, session_id: &SessionId) -> Result<Option<Session>> {
         self.store.get(session_id).await.map_err(wrap)
     }
 
@@ -89,36 +159,37 @@ impl SessionManager {
 
     /// Return the transcript (`messages`) of the given session. Errors with
     /// `SessionError::NotFound` if the session does not exist.
-    pub async fn history(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
+    pub async fn history(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
         match self.store.get(session_id).await.map_err(wrap)? {
             Some(session) => Ok(session.messages),
             None => Err(SessionError::NotFound(format!("session {session_id}"))),
         }
     }
 
-    /// Remove a session by id. Errors with `SessionError::NotFound` if the
-    /// session did not exist at the time of the call so the operator sees
-    /// feedback instead of a silent no-op.
-    pub async fn delete(&self, session_id: &str) -> Result<()> {
-        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+    /// Soft-delete a session by id. Errors with `SessionError::NotFound`
+    /// if the session did not exist at the time of the call. Surfaces
+    /// `StorageError::HasLiveForks` (wrapped) when the session has live
+    /// forks pointing at it.
+    pub async fn delete(&self, session_id: &SessionId) -> Result<()> {
+        let deleted = self.store.soft_delete(session_id).await.map_err(wrap)?;
+        if !deleted {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
-        self.store.delete(session_id).await.map_err(wrap)?;
-        debug!(session_id, "deleted session");
+        debug!(session_id = %session_id, "deleted session");
         Ok(())
     }
 
-    pub async fn touch(&self, session_id: &str) -> Result<()> {
+    pub async fn touch(&self, session_id: &SessionId) -> Result<()> {
         let session = self.store.get(session_id).await.map_err(wrap)?;
         match session {
             Some(mut session) => {
                 session.last_active = Utc::now();
                 self.store.save(&session).await.map_err(wrap)?;
-                debug!(session_id, "touched session");
+                debug!(session_id = %session_id, "touched session");
                 Ok(())
             }
             None => {
-                warn!(session_id, "attempted to touch non-existent session");
+                warn!(session_id = %session_id, "attempted to touch non-existent session");
                 Err(SessionError::NotFound(format!("session {session_id}")))
             }
         }
@@ -130,9 +201,8 @@ impl SessionManager {
         let cutoff = Utc::now() - self.session_timeout;
         let expired_ids = self.store.list_expired(cutoff).await.map_err(wrap)?;
         let count = expired_ids.len();
-        for id in &expired_ids {
-            self.store.delete(id).await.map_err(wrap)?;
-        }
+        let deletes = expired_ids.iter().map(|id| self.store.soft_delete(id));
+        futures::future::try_join_all(deletes).await.map_err(wrap)?;
         if count > 0 {
             debug!(count, "cleaned up expired sessions");
         }
@@ -146,7 +216,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use aura_model::{ChannelType, Session, User};
+    use aura_model::{ChannelType, Session, SessionId, User};
     use aura_storage::session::Result as StoreResult;
     use chrono::{DateTime, Duration, Utc};
     use parking_lot::Mutex;
@@ -154,7 +224,7 @@ mod tests {
     use super::{SessionError, SessionManager, SessionStore};
 
     struct MemorySessionStore {
-        data: Mutex<HashMap<String, Session>>,
+        data: Mutex<HashMap<SessionId, Session>>,
     }
 
     impl MemorySessionStore {
@@ -167,36 +237,46 @@ mod tests {
 
     #[async_trait]
     impl SessionStore for MemorySessionStore {
-        async fn get(&self, session_id: &str) -> StoreResult<Option<Session>> {
-            let data = self.data.lock();
-            Ok(data.get(session_id).cloned())
+        async fn get(&self, session_id: &SessionId) -> StoreResult<Option<Session>> {
+            Ok(self.data.lock().get(session_id).cloned())
         }
 
         async fn save(&self, session: &Session) -> StoreResult<()> {
-            let mut data = self.data.lock();
-            data.insert(session.id.clone(), session.clone());
+            self.data.lock().insert(session.id.clone(), session.clone());
             Ok(())
         }
 
-        async fn delete(&self, session_id: &str) -> StoreResult<()> {
-            let mut data = self.data.lock();
-            data.remove(session_id);
-            Ok(())
+        async fn soft_delete(&self, session_id: &SessionId) -> StoreResult<bool> {
+            Ok(self.data.lock().remove(session_id).is_some())
         }
 
-        async fn list_expired(&self, before: DateTime<Utc>) -> StoreResult<Vec<String>> {
-            let data = self.data.lock();
-            let expired = data
+        async fn list_expired(&self, before: DateTime<Utc>) -> StoreResult<Vec<SessionId>> {
+            Ok(self
+                .data
+                .lock()
                 .values()
                 .filter(|s| s.last_active < before)
                 .map(|s| s.id.clone())
-                .collect();
-            Ok(expired)
+                .collect())
         }
 
         async fn list_all(&self) -> StoreResult<Vec<Session>> {
-            let data = self.data.lock();
-            Ok(data.values().cloned().collect())
+            Ok(self.data.lock().values().cloned().collect())
+        }
+
+        async fn list_live_forks(
+            &self,
+            _source_session_id: &SessionId,
+        ) -> StoreResult<Vec<SessionId>> {
+            // Test fake — we never construct lineage children here.
+            Ok(Vec::new())
+        }
+
+        async fn list_lineage_children(
+            &self,
+            _parent_session_id: &SessionId,
+        ) -> StoreResult<Vec<(SessionId, aura_model::LineageKind)>> {
+            Ok(Vec::new())
         }
     }
 
@@ -218,10 +298,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!session.id.is_empty());
+        assert!(!session.id.as_str().is_empty());
         assert_eq!(session.user.id, "user-1");
         assert_eq!(session.channel, ChannelType::tui());
         assert!(session.messages.is_empty());
+        assert_eq!(session.root_session_id, session.id);
+        assert!(session.lineage.is_none());
     }
 
     #[tokio::test]
@@ -247,13 +329,14 @@ mod tests {
         let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
+        let id = SessionId::from("cli-abc");
         let session = mgr
-            .get_or_create("cli-abc", test_user(), ChannelType::tui())
+            .get_or_create(&id, test_user(), ChannelType::tui())
             .await
             .unwrap();
 
-        assert_eq!(session.id, "cli-abc");
-        let reloaded = mgr.get("cli-abc").await.unwrap();
+        assert_eq!(session.id, id);
+        let reloaded = mgr.get(&id).await.unwrap();
         assert!(reloaded.is_some());
     }
 
@@ -284,8 +367,11 @@ mod tests {
         let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
-        let result = mgr.touch("nonexistent").await;
-        assert!(result.is_err());
+        let err = mgr
+            .touch(&SessionId::from("nonexistent"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -346,7 +432,10 @@ mod tests {
         let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
-        let err = mgr.history("nonexistent").await.unwrap_err();
+        let err = mgr
+            .history(&SessionId::from("nonexistent"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, SessionError::NotFound(_)));
     }
 
@@ -369,7 +458,10 @@ mod tests {
         let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(store, Duration::minutes(30));
 
-        let err = mgr.delete("nonexistent").await.unwrap_err();
+        let err = mgr
+            .delete(&SessionId::from("nonexistent"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, SessionError::NotFound(_)));
     }
 

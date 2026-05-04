@@ -12,7 +12,6 @@ members = [
     "crates/trace",
     "crates/security",
     "crates/sandbox",
-    "crates/hook",
     "crates/agent",
     "crates/storage",
     "crates/skills",
@@ -47,7 +46,6 @@ aura-job = { path = "crates/job" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
 aura-sandbox = { path = "crates/sandbox" }
-aura-hook = { path = "crates/hook" }
 aura-agent = { path = "crates/agent" }
 aura-storage = { path = "crates/storage" }
 aura-skills = { path = "crates/skills" }
@@ -78,6 +76,7 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
+ulid = { version = "1", features = ["serde"] }
 regex = "1"
 aho-corasick = "1"
 tokio-util = "0.7"
@@ -171,7 +170,6 @@ aura-job = { workspace = true }
 aura-trace = { workspace = true }
 aura-security = { workspace = true }
 aura-sandbox = { workspace = true }
-aura-hook = { workspace = true }
 aura-agent = { workspace = true }
 aura-cron = { workspace = true }
 aura-janitor = { workspace = true }

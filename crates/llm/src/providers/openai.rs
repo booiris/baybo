@@ -27,6 +27,24 @@ impl LlmProviderFactory for OpenAIProviderFactory {
         ]
     }
 
+    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
+        // Mirrors `create()`'s flat-per-provider pricing. Per-model
+        // pricing differentiation is a follow-up; today every OpenAI
+        // model attributes spend at the same rate.
+        self.known_models()
+            .iter()
+            .map(|m| {
+                (
+                    (*m).to_string(),
+                    ModelPricing {
+                        input_per_1m_tokens: 2.50,
+                        output_per_1m_tokens: 10.0,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key

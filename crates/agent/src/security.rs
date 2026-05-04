@@ -826,8 +826,9 @@ mod tests {
     }
 
     fn make_session() -> Session {
+        let id = aura_model::SessionId::from("sess-1");
         Session {
-            id: "sess-1".into(),
+            id: id.clone(),
             user: aura_model::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
@@ -838,6 +839,10 @@ mod tests {
             created_at: Utc::now(),
             last_active: Utc::now(),
             state: Default::default(),
+            root_session_id: id,
+            trigger: aura_model::TriggerSource::User,
+            lineage: None,
+            bound_soul_version: "soul-test".into(),
         }
     }
 
