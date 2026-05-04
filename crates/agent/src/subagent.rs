@@ -117,17 +117,38 @@ impl SubagentResult {
     }
 }
 
+/// Pre-created child plus the JobId the runtime intends to use for
+/// the child's root job. Returned by [`SubagentRuntime::prepare`] so
+/// the parent can open its `StepKind::Subagent` step with real IDs
+/// instead of placeholders.
+pub struct PreparedSubagent {
+    pub child_session: aura_model::Session,
+    pub planned_root_job_id: JobId,
+}
+
 /// Spawn a child agent session and wait for it to terminate.
 ///
-/// `parent_token` is the parent agent loop's cancellation token. The
-/// runtime constructs a child token from it so cancellation cascades
-/// the entire subagent subtree (per design Q5 B1).
+/// Two-phase API:
+/// 1. [`prepare`](Self::prepare) synchronously creates the child session
+///    row and pre-mints the root JobId. Callers use these values to
+///    open the `StepKind::Subagent` step with real provenance before
+///    dispatch.
+/// 2. [`run`](Self::run) drives the child to terminal state. Cancellation
+///    is via [`tokio_util::sync::CancellationToken`] — the runtime
+///    derives a child token so the parent's cancel cascades the entire
+///    subagent subtree.
 #[async_trait::async_trait]
 pub trait SubagentRuntime: Send + Sync {
-    async fn spawn(
+    async fn prepare(
         &self,
         parent_session: &aura_model::Session,
         parent_job_id: JobId,
+        request: &SubagentSpawnRequest,
+    ) -> Result<PreparedSubagent, String>;
+
+    async fn run(
+        &self,
+        prepared: PreparedSubagent,
         request: SubagentSpawnRequest,
         parent_token: CancellationToken,
     ) -> SubagentResult;
@@ -178,14 +199,12 @@ impl LocalSubagentRuntime {
 
 #[async_trait::async_trait]
 impl SubagentRuntime for LocalSubagentRuntime {
-    async fn spawn(
+    async fn prepare(
         &self,
         parent_session: &aura_model::Session,
         parent_job_id: JobId,
-        request: SubagentSpawnRequest,
-        parent_token: CancellationToken,
-    ) -> SubagentResult {
-        // 1. Construct the child session row.
+        _request: &SubagentSpawnRequest,
+    ) -> Result<PreparedSubagent, String> {
         let child_user = Self::build_child_user(&parent_session.user);
         let child_channel = child_user.channel.clone();
         let lineage = Lineage {
@@ -193,33 +212,41 @@ impl SubagentRuntime for LocalSubagentRuntime {
             parent_job_id,
             kind: LineageKind::Subagent,
         };
-        let child_session = match self
+        let child_session = self
             .sessions
-            .create_spawned_session(
-                child_user.clone(),
-                child_channel.clone(),
-                parent_session,
-                lineage,
-            )
+            .create_spawned_session(child_user, child_channel, parent_session, lineage)
             .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                return SubagentResult {
-                    child_session_id: SessionId::from(""),
-                    child_root_job_id: None,
-                    final_content: None,
-                    status: SubagentExitStatus::Failed(format!("create child session: {e}")),
-                };
-            }
-        };
+            .map_err(|e| format!("create child session: {e}"))?;
+        Ok(PreparedSubagent {
+            child_session,
+            planned_root_job_id: JobId::new(),
+        })
+    }
 
-        // 2. Spawn the child actor with our own response channel so
-        //    we can capture the final message synchronously.
+    async fn run(
+        &self,
+        prepared: PreparedSubagent,
+        request: SubagentSpawnRequest,
+        parent_token: CancellationToken,
+    ) -> SubagentResult {
+        let child_session = prepared.child_session;
+        let parent_job_id = child_session
+            .lineage
+            .as_ref()
+            .map(|l| l.parent_job_id)
+            .unwrap_or_default();
+        let child_user = child_session.user.clone();
+        let child_channel = child_session.channel.clone();
+
+        // Spawn the child actor with our own response channel so we
+        // can capture the final message synchronously.
         let (output_tx, mut output_rx) = mpsc::channel::<AgentOutput>(64);
         let mailbox = (self.spawn_actor)(child_session.clone(), output_tx);
 
-        // 3. Build the initial UserInput message and dispatch it.
+        // Build the initial prompt and dispatch via SubagentSpawned
+        // (not UserInput) so the child actor's handler runs
+        // `agent_loop.run` with `JobInput::Spawned` — passes the
+        // allowed-for check regardless of inherited trigger kind.
         let initial_content = Self::build_initial_prompt(&request);
         let incoming = IncomingMessage {
             message: Message {
@@ -236,11 +263,6 @@ impl SubagentRuntime for LocalSubagentRuntime {
                 metadata: MessageMetadata::default(),
             },
         };
-        // Dispatch via SubagentSpawned (not UserInput) so the child
-        // actor's handler runs `agent_loop.run` with `JobInput::Spawned`.
-        // `JobKind::Spawned.allowed_for(*) == true`, so this works even
-        // when the child session inherits a Cron / System root trigger
-        // from `create_spawned_session`.
         if let Err(e) = mailbox
             .send(AgentMessage::SubagentSpawned {
                 initial_message: Box::new(incoming),
@@ -250,7 +272,7 @@ impl SubagentRuntime for LocalSubagentRuntime {
         {
             return SubagentResult {
                 child_session_id: child_session.id,
-                child_root_job_id: None,
+                child_root_job_id: Some(prepared.planned_root_job_id),
                 final_content: None,
                 status: SubagentExitStatus::Failed(format!("dispatch child input: {e}")),
             };
@@ -307,16 +329,17 @@ impl SubagentRuntime for LocalSubagentRuntime {
         //    if the actor already exited that is fine.
         let _ = mailbox.send(AgentMessage::Shutdown).await;
 
+        let child_root_job_id = Some(prepared.planned_root_job_id);
         match wait_result {
             Ok(Ok(content)) => SubagentResult {
                 child_session_id: child_session.id,
-                child_root_job_id: None,
+                child_root_job_id,
                 final_content: content,
                 status: SubagentExitStatus::Completed,
             },
             Ok(Err(status)) => SubagentResult {
                 child_session_id: child_session.id,
-                child_root_job_id: None,
+                child_root_job_id,
                 final_content: None,
                 status,
             },
@@ -329,7 +352,7 @@ impl SubagentRuntime for LocalSubagentRuntime {
                 child_token.cancel();
                 SubagentResult {
                     child_session_id: child_session.id,
-                    child_root_job_id: None,
+                    child_root_job_id,
                     final_content: None,
                     status: SubagentExitStatus::Timeout,
                 }

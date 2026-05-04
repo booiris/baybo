@@ -1203,12 +1203,32 @@ impl AgentLoop {
             }
         }
 
+        // Prepare the child synchronously *before* opening the
+        // Subagent step so the step kind carries the real
+        // child_session_id and the planned root JobId — not the
+        // SessionId::from("") + fresh-but-orphan JobId placeholders
+        // the previous code wrote.
+        let prepared = match runtime.prepare(session, job_id, &request).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(SubagentResult {
+                    child_session_id: aura_model::SessionId::from(""),
+                    child_root_job_id: None,
+                    final_content: None,
+                    status: SubagentExitStatus::Failed(e),
+                }
+                .to_tool_result_text());
+            }
+        };
+        let child_session_id = prepared.child_session.id.clone();
+        let child_root_job_id = prepared.planned_root_job_id;
+
         let subagent_step = span_recorder
             .begin_step(
                 job_id,
                 StepKind::Subagent {
-                    child_session_id: aura_model::SessionId::from(""),
-                    child_root_job_id: aura_model::JobId::new(),
+                    child_session_id: child_session_id.clone(),
+                    child_root_job_id,
                 },
             )
             .await?;
@@ -1216,7 +1236,7 @@ impl AgentLoop {
             .begin_span(
                 &subagent_step,
                 SpanKind::SubagentStub {
-                    child_session_id: aura_model::SessionId::from(""),
+                    child_session_id: child_session_id.clone(),
                 },
                 None,
             )
@@ -1226,7 +1246,7 @@ impl AgentLoop {
         // throwaway. The runtime derives a child_token() from this for
         // its own bookkeeping; tripping our parent (via JobLifecycle::cancel)
         // cascades into every nested subagent.
-        let result = runtime.spawn(session, job_id, request, parent_cancel).await;
+        let result = runtime.run(prepared, request, parent_cancel).await;
 
         // Close stub span + subagent step.
         let outcome = match &result.status {
