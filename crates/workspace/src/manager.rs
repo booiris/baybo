@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::identity::{self, IdentityFiles};
-use crate::paths::{GITIGNORE_CONTENTS, IdentityKind, WorkspacePaths};
+use crate::paths::{IdentityKind, WorkspacePaths};
 
 /// Manages the workspace root directory and its identity/configuration files.
 pub struct WorkspaceManager {
@@ -14,11 +14,9 @@ impl WorkspaceManager {
     }
 
     /// Materialise the workspace skeleton: create `profile/`, `skills/`,
-    /// `state/`, `work/`, `logs/`, and write the allowlist `.gitignore` if
-    /// it does not already exist. Idempotent — safe to call on every boot.
-    ///
-    /// Existing `.gitignore` files are left untouched so users can hand-edit
-    /// the allowlist (e.g. add their own subdirectory).
+    /// `state/`, `work/`, `logs/`, and initialise a standalone git repo
+    /// inside each of `profile/` and `skills/` if it isn't one already.
+    /// Idempotent — safe to call on every boot.
     pub async fn ensure_layout(&self) -> anyhow::Result<()> {
         let paths = WorkspacePaths::new(self.root.clone());
         for dir in [
@@ -33,11 +31,8 @@ impl WorkspaceManager {
                 .map_err(|e| anyhow::anyhow!("create workspace dir {}: {e}", dir.display()))?;
         }
 
-        let gitignore = paths.gitignore_file();
-        if !gitignore.exists() {
-            tokio::fs::write(&gitignore, GITIGNORE_CONTENTS)
-                .await
-                .map_err(|e| anyhow::anyhow!("write {}: {e}", gitignore.display()))?;
+        for dir in [paths.profile_dir(), paths.skills_dir()] {
+            ensure_git_repo(&dir).await?;
         }
         Ok(())
     }
@@ -63,6 +58,28 @@ impl WorkspaceManager {
     }
 }
 
+/// Initialise a standalone git repository inside `dir` if one isn't
+/// already there. Idempotent — a no-op when `<dir>/.git` exists.
+async fn ensure_git_repo(dir: &Path) -> anyhow::Result<()> {
+    if dir.join(".git").exists() {
+        return Ok(());
+    }
+    let status = tokio::process::Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .arg(dir)
+        .status()
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn `git init {}`: {e}", dir.display()))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "`git init {}` exited with {status}",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,7 +95,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_layout_creates_dirs_and_gitignore() {
+    async fn ensure_layout_creates_dirs_and_local_git_repos() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test_tmp")
@@ -98,21 +115,16 @@ mod tests {
         ] {
             assert!(d.exists(), "missing dir {}", d.display());
         }
-        let gitignore = tokio::fs::read_to_string(paths.gitignore_file())
-            .await
-            .unwrap();
-        assert!(gitignore.contains("!/profile/"));
-        assert!(gitignore.contains("!/skills/"));
+        // No workspace-root .gitignore should exist anymore.
+        assert!(!dir.join(".gitignore").exists());
+        // Each of profile/ and skills/ is its own git repo.
+        assert!(paths.profile_dir().join(".git").is_dir());
+        assert!(paths.skills_dir().join(".git").is_dir());
 
-        // Idempotent: a hand-edited .gitignore must not be overwritten.
-        tokio::fs::write(paths.gitignore_file(), "# hand-edited\n")
-            .await
-            .unwrap();
+        // Idempotent: a re-apply must not re-init or fail.
         mgr.ensure_layout().await.expect("layout reapply");
-        let after = tokio::fs::read_to_string(paths.gitignore_file())
-            .await
-            .unwrap();
-        assert_eq!(after, "# hand-edited\n");
+        assert!(paths.profile_dir().join(".git").is_dir());
+        assert!(paths.skills_dir().join(".git").is_dir());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

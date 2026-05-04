@@ -371,10 +371,11 @@ pub async fn build_managers(
     // need an `Arc<ToolRegistry>` for sharing across tasks.
     let tool_registry = Arc::new(tool_registry);
 
-    // Sandbox FS scope is the workspace `work/` directory — the gitignored
-    // scratch root for tool-generated files. `ensure_layout` creates this
-    // before `build_managers` runs. Canonicalize so symlink-vs-real-path
-    // comparisons in the adapter line up with paths the tool may produce.
+    // Sandbox FS scope is the workspace `work/` directory — the
+    // ephemeral scratch root for tool-generated files. `ensure_layout`
+    // creates this before `build_managers` runs. Canonicalize so
+    // symlink-vs-real-path comparisons in the adapter line up with
+    // paths the tool may produce.
     let work_dir = workspace_paths.work_dir();
     let sandbox_root = work_dir.canonicalize().unwrap_or_else(|e| {
         tracing::warn!(
