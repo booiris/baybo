@@ -38,7 +38,7 @@ pub struct Span {
     /// Lifecycle state. `Pending` until the span ends.
     pub outcome: LifecycleOutcome,
 
-    /// Sub-events (sanitize hits / approvals / hook degradations).
+    /// Sub-events (sanitize hits / approvals).
     /// In storage these live in their own `span_events` table keyed by
     /// `(span_id, seq)`; loaded eagerly with the span for convenience.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -63,52 +63,24 @@ impl Span {
     }
 }
 
-/// Closed enum of every kind of atomic action. Each variant carries its
-/// own provenance and result fields — no superset struct, no
-/// `serde_json::Value` payload as a backdoor (with the explicit
-/// exception of `ToolCall.params` / `ToolCall.output` because tool
-/// schemas are dynamic).
+/// Closed enum of every kind of atomic action. Each variant splits its
+/// data into begin-time provenance (`begin`) and end-time result
+/// (`result`, `Option` because `Pending` / cancelled spans never see
+/// one written). No superset struct, no `serde_json::Value` payload as
+/// a backdoor — except `ToolCallBegin.params` / `ToolCallResult.output`
+/// where the schema is genuinely dynamic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SpanKind {
     LlmCall {
-        // Provenance (set at begin-time)
-        model_id: String,
-        provider: String,
-        provider_config_hash: String,
-
-        // Input (set at begin-time)
-        input_messages: Vec<ChatMessage>,
+        begin: LlmCallBegin,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        temperature: Option<f32>,
-
-        // Output (filled in at end-time)
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        output_content: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        thinking: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tool_calls: Vec<LlmToolCallRecord>,
-        #[serde(default)]
-        input_tokens: usize,
-        #[serde(default)]
-        output_tokens: usize,
+        result: Option<LlmCallResult>,
     },
     ToolCall {
-        // Provenance
-        tool_name: String,
-        tool_artifact_hash: String,
-        /// Pairing back to the LLM `Span` that emitted the tool_use
-        /// block. Empty when the tool call did not originate from an
-        /// LLM (e.g. `TriggerAction::ToolCall` — cron's direct invoke).
+        begin: ToolCallBegin,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        triggered_by: Option<ToolCallOrigin>,
-        // I/O — dynamic shapes per tool schema
-        params: Value,
-        #[serde(default)]
-        output: Value,
-        #[serde(default)]
-        success: bool,
+        result: Option<ToolCallResult>,
     },
     /// Inside a `StepKind::Subagent`. Carries no real execution state
     /// — bounds the parent's wait window. The actual work runs in
@@ -128,9 +100,60 @@ impl SpanKind {
     }
 }
 
+/// Begin-time data for an `LlmCall` span — set when the request is
+/// dispatched, never mutated afterwards.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmCallBegin {
+    pub model_id: String,
+    pub provider: String,
+    pub provider_config_hash: String,
+    pub input_messages: Vec<ChatMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+}
+
+/// End-time result for an `LlmCall` span — set when the response is
+/// received. `None` while the span is `Pending` or if it cancelled
+/// before producing a result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmCallResult {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<LlmToolCallRecord>,
+    #[serde(default)]
+    pub input_tokens: usize,
+    #[serde(default)]
+    pub output_tokens: usize,
+}
+
+/// Begin-time data for a `ToolCall` span.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallBegin {
+    pub tool_name: String,
+    pub tool_artifact_hash: String,
+    /// Pairing back to the LLM `Span` that emitted the tool_use block.
+    /// `None` when the tool call did not originate from an LLM (e.g.
+    /// `TriggerAction::ToolCall` — cron's direct invoke).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggered_by: Option<ToolCallOrigin>,
+    pub params: Value,
+}
+
+/// End-time result for a `ToolCall` span.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallResult {
+    #[serde(default)]
+    pub output: Value,
+    #[serde(default)]
+    pub success: bool,
+}
+
 /// One tool_use block emitted by an LLM. Recorded inside the LLM
-/// span's `tool_calls` so the next iteration's tool spans can pair
-/// back via `ToolCallOrigin`.
+/// span's `result.tool_calls` so the next iteration's tool spans can
+/// pair back via `ToolCallOrigin`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmToolCallRecord {
     /// Provider's `tool_use_id` (whatever the API uses to pair the
@@ -177,27 +200,19 @@ impl SpanHandle {
     }
 }
 
-/// Result data carried by `SpanRecorder::end_span`. Exists as a
-/// parallel sum to [`SpanKind`] so callers don't have to reconstruct
-/// the begin-time provenance fields at close time — the recorder
-/// merges this with the begin-time kind on the [`SpanHandle`] to
-/// produce the final stored row.
+/// End-time additions handed to `SpanRecorder::end_span`. Variants line
+/// up 1:1 with `SpanKind` value-bearing variants (`SubagentStub` and
+/// any cancel path use [`SpanFinalize::Empty`]). Mismatched variants
+/// at end-time are a programming error and surface as
+/// `TraceError::Internal`.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SpanResult {
-    LlmCall {
-        output_content: String,
-        thinking: Option<String>,
-        tool_calls: Vec<LlmToolCallRecord>,
-        input_tokens: usize,
-        output_tokens: usize,
-    },
-    ToolCall {
-        output: Value,
-        success: bool,
-    },
-    SubagentStub {
-        child_session_id: aura_model::SessionId,
-    },
+pub enum SpanFinalize {
+    LlmCall(LlmCallResult),
+    ToolCall(ToolCallResult),
+    /// No additional end-time data. Used for `SubagentStub` spans (the
+    /// `child_session_id` was set at begin) and for any cancel path
+    /// that closes without a meaningful result.
+    Empty,
 }
 
 #[cfg(test)]
@@ -206,30 +221,29 @@ mod tests {
 
     fn dummy_llm() -> SpanKind {
         SpanKind::LlmCall {
-            model_id: "claude-sonnet-4-6".into(),
-            provider: "anthropic".into(),
-            provider_config_hash: "cfg-hash".into(),
-            input_messages: vec![],
-            temperature: Some(0.7),
-            output_content: String::new(),
-            thinking: None,
-            tool_calls: vec![],
-            input_tokens: 0,
-            output_tokens: 0,
+            begin: LlmCallBegin {
+                model_id: "claude-sonnet-4-6".into(),
+                provider: "anthropic".into(),
+                provider_config_hash: "cfg-hash".into(),
+                input_messages: vec![],
+                temperature: Some(0.7),
+            },
+            result: None,
         }
     }
 
     fn dummy_tool() -> SpanKind {
         SpanKind::ToolCall {
-            tool_name: "bash".into(),
-            tool_artifact_hash: "tool-hash".into(),
-            triggered_by: Some(ToolCallOrigin {
-                llm_span_id: SpanId::new(),
-                tool_use_id: "tu-1".into(),
-            }),
-            params: serde_json::json!({"cmd": "ls"}),
-            output: serde_json::json!(null),
-            success: false,
+            begin: ToolCallBegin {
+                tool_name: "bash".into(),
+                tool_artifact_hash: "tool-hash".into(),
+                triggered_by: Some(ToolCallOrigin {
+                    llm_span_id: SpanId::new(),
+                    tool_use_id: "tu-1".into(),
+                }),
+                params: serde_json::json!({"cmd": "ls"}),
+            },
+            result: None,
         }
     }
 

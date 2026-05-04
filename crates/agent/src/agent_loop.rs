@@ -15,7 +15,9 @@ use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
 use aura_tools::{ToolOutput, ToolRegistry};
-use aura_trace::{LifecycleOutcome, SpanKind, SpanResult, StepHandle, StepKind};
+use aura_trace::{
+    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, StepHandle, StepKind,
+};
 use tracing::{debug, info, warn};
 
 use crate::error_recovery::ErrorHandler;
@@ -729,16 +731,14 @@ impl AgentLoop {
             .begin_span(
                 step,
                 SpanKind::LlmCall {
-                    model_id: model_info.id.clone(),
-                    provider: model_info.provider.clone(),
-                    provider_config_hash: String::new(),
-                    input_messages: session.messages.clone(),
-                    temperature: None,
-                    output_content: String::new(),
-                    thinking: None,
-                    tool_calls: vec![],
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    begin: LlmCallBegin {
+                        model_id: model_info.id.clone(),
+                        provider: model_info.provider.clone(),
+                        provider_config_hash: String::new(),
+                        input_messages: session.messages.clone(),
+                        temperature: None,
+                    },
+                    result: None,
                 },
                 None,
             )
@@ -802,13 +802,13 @@ impl AgentLoop {
                     .end_span(
                         span,
                         step.job_id,
-                        SpanResult::LlmCall {
+                        SpanFinalize::LlmCall(LlmCallResult {
                             output_content: response.content.clone(),
                             thinking: response.thinking.clone(),
                             tool_calls: trace_tool_calls,
                             input_tokens: response.usage.input_tokens,
                             output_tokens: response.usage.output_tokens,
-                        },
+                        }),
                         LifecycleOutcome::Ok,
                     )
                     .await?;
@@ -835,13 +835,7 @@ impl AgentLoop {
                     .end_span(
                         span,
                         step.job_id,
-                        SpanResult::LlmCall {
-                            output_content: String::new(),
-                            thinking: None,
-                            tool_calls: vec![],
-                            input_tokens: 0,
-                            output_tokens: 0,
-                        },
+                        SpanFinalize::Empty,
                         LifecycleOutcome::Failed {
                             reason: error_msg.clone(),
                         },
@@ -1131,14 +1125,7 @@ impl AgentLoop {
             },
         };
         span_recorder
-            .end_span(
-                stub_span,
-                job_id,
-                SpanResult::SubagentStub {
-                    child_session_id: result.child_session_id.clone(),
-                },
-                outcome.clone(),
-            )
+            .end_span(stub_span, job_id, SpanFinalize::Empty, outcome.clone())
             .await
             .ok();
         span_recorder.end_step(subagent_step, outcome).await.ok();
@@ -1195,16 +1182,14 @@ impl AgentLoop {
             .begin_span(
                 &step,
                 SpanKind::LlmCall {
-                    model_id: model_info.id.clone(),
-                    provider: model_info.provider.clone(),
-                    provider_config_hash: String::new(),
-                    input_messages: messages.clone(),
-                    temperature: None,
-                    output_content: String::new(),
-                    thinking: None,
-                    tool_calls: vec![],
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    begin: LlmCallBegin {
+                        model_id: model_info.id.clone(),
+                        provider: model_info.provider.clone(),
+                        provider_config_hash: String::new(),
+                        input_messages: messages.clone(),
+                        temperature: None,
+                    },
+                    result: None,
                 },
                 None,
             )
@@ -1222,13 +1207,13 @@ impl AgentLoop {
                     .end_span(
                         span,
                         job_id,
-                        SpanResult::LlmCall {
+                        SpanFinalize::LlmCall(LlmCallResult {
                             output_content: response.content.clone(),
                             thinking: response.thinking.clone(),
                             tool_calls: vec![],
                             input_tokens: response.usage.input_tokens,
                             output_tokens: response.usage.output_tokens,
-                        },
+                        }),
                         LifecycleOutcome::Ok,
                     )
                     .await
@@ -1250,18 +1235,7 @@ impl AgentLoop {
                     reason: reason.clone(),
                 };
                 span_recorder
-                    .end_span(
-                        span,
-                        job_id,
-                        SpanResult::LlmCall {
-                            output_content: String::new(),
-                            thinking: None,
-                            tool_calls: vec![],
-                            input_tokens: 0,
-                            output_tokens: 0,
-                        },
-                        failed.clone(),
-                    )
+                    .end_span(span, job_id, SpanFinalize::Empty, failed.clone())
                     .await
                     .ok();
                 span_recorder.end_step(step, failed).await.ok();
@@ -1301,16 +1275,14 @@ impl AgentLoop {
                 .begin_span(
                     &step,
                     SpanKind::LlmCall {
-                        model_id: call.model_id,
-                        provider: call.provider,
-                        provider_config_hash: String::new(),
-                        input_messages: Vec::new(),
-                        temperature: None,
-                        output_content: String::new(),
-                        thinking: None,
-                        tool_calls: vec![],
-                        input_tokens: 0,
-                        output_tokens: 0,
+                        begin: LlmCallBegin {
+                            model_id: call.model_id,
+                            provider: call.provider,
+                            provider_config_hash: String::new(),
+                            input_messages: Vec::new(),
+                            temperature: None,
+                        },
+                        result: None,
                     },
                     None,
                 )
@@ -1337,13 +1309,13 @@ impl AgentLoop {
                 .end_span(
                     span,
                     job_id,
-                    SpanResult::LlmCall {
+                    SpanFinalize::LlmCall(LlmCallResult {
                         output_content: String::new(),
                         thinking: None,
                         tool_calls: vec![],
                         input_tokens: call.input_tokens,
                         output_tokens: call.output_tokens,
-                    },
+                    }),
                     LifecycleOutcome::Ok,
                 )
                 .await

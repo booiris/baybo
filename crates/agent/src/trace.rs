@@ -11,7 +11,7 @@ use std::sync::Arc;
 use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
 use aura_storage::TraceStore;
 use aura_trace::{
-    LifecycleOutcome, Span, SpanEvent, SpanEventKind, SpanHandle, SpanKind, SpanResult, Step,
+    LifecycleOutcome, Span, SpanEvent, SpanEventKind, SpanFinalize, SpanHandle, SpanKind, Step,
     StepHandle, StepKind, TraceError,
 };
 use chrono::Utc;
@@ -225,43 +225,42 @@ impl SpanRecorder {
         ))
     }
 
-    /// Close a span. Merges the begin-time `kind` (carried on the
-    /// handle) with the caller-supplied [`SpanResult`] to form the
-    /// final stored row, then writes via INSERT OR REPLACE — no
-    /// SELECT. For `LlmCall` spans, also publishes an
-    /// `LlmSpanEnded` stream event so cost subscribers can write
-    /// `cost_records` asynchronously.
+    /// Close a span. Merges the [`SpanFinalize`] payload into the
+    /// begin-time kind on the handle, writes via INSERT OR REPLACE
+    /// (no SELECT), and publishes the stream events. For `LlmCall`
+    /// spans, also publishes an `LlmSpanEnded` event so cost
+    /// subscribers can write `cost_records` asynchronously.
+    ///
+    /// Variant mismatch (`finalize` does not match `handle.kind`) is a
+    /// programming error and surfaces as `TraceError::Internal`.
     pub async fn end_span(
         &self,
-        handle: SpanHandle,
+        mut handle: SpanHandle,
         job_id: JobId,
-        result: SpanResult,
+        finalize: SpanFinalize,
         outcome: LifecycleOutcome,
     ) -> Result<()> {
-        let final_kind = merge_span_kind(handle.kind, result, &handle.span_id)?;
+        finalize_span_kind(&mut handle.kind, finalize, &handle.span_id)?;
         if let SpanKind::LlmCall {
-            model_id,
-            provider,
-            input_tokens,
-            output_tokens,
-            ..
-        } = &final_kind
+            begin,
+            result: Some(result),
+        } = &handle.kind
         {
             self.stream.publish(TraceEvent::LlmSpanEnded {
                 span_id: handle.span_id,
                 job_id,
                 session_id: self.session_id.clone(),
                 user_id: self.user_id.clone(),
-                model_id: model_id.clone(),
-                provider: provider.clone(),
-                input_tokens: *input_tokens,
-                output_tokens: *output_tokens,
+                model_id: begin.model_id.clone(),
+                provider: begin.provider.clone(),
+                input_tokens: result.input_tokens,
+                output_tokens: result.output_tokens,
             });
         }
         let span = Span {
             id: handle.span_id,
             step_id: handle.step_id,
-            kind: final_kind,
+            kind: handle.kind,
             parallel_group: handle.parallel_group,
             started_at: handle.started_at,
             ended_at: Some(Utc::now()),
@@ -280,34 +279,19 @@ impl SpanRecorder {
 
     // ── SpanEvent ────────────────────────────────────────────────
 
-    /// Close a half-open span without supplying a fresh `SpanResult`.
-    /// Builds a default-shaped result matching the begin-time kind on
-    /// the handle and routes through `end_span`. Used by `?`-error
-    /// paths that need to release a half-open span quickly without
-    /// constructing a meaningful result.
+    /// Close a half-open span without supplying end-time data. Used
+    /// by `?`-error paths that need to release a half-open span
+    /// quickly without constructing a meaningful result; the stored
+    /// `SpanKind`'s `result` field stays `None` (or whatever it was
+    /// at begin time).
     pub async fn cancel_span(
         &self,
         handle: SpanHandle,
         job_id: JobId,
         outcome: LifecycleOutcome,
     ) -> Result<()> {
-        let result = match &handle.kind {
-            SpanKind::LlmCall { .. } => SpanResult::LlmCall {
-                output_content: String::new(),
-                thinking: None,
-                tool_calls: vec![],
-                input_tokens: 0,
-                output_tokens: 0,
-            },
-            SpanKind::ToolCall { .. } => SpanResult::ToolCall {
-                output: serde_json::Value::Null,
-                success: false,
-            },
-            SpanKind::SubagentStub { child_session_id } => SpanResult::SubagentStub {
-                child_session_id: child_session_id.clone(),
-            },
-        };
-        self.end_span(handle, job_id, result, outcome).await
+        self.end_span(handle, job_id, SpanFinalize::Empty, outcome)
+            .await
     }
 
     /// Emit a SpanEvent (sanitize hit / approval / hook degradation).
@@ -330,65 +314,23 @@ impl SpanRecorder {
     }
 }
 
-/// Merge a begin-time `SpanKind` (carried on the handle) with the
-/// caller's [`SpanResult`] to produce the row stored at end time.
-/// Begin-time provenance fields (model_id / tool_name / triggered_by /
-/// params / etc.) carry through unchanged; result fields fill in.
-///
-/// Variant mismatch (handle has `LlmCall` but result is `ToolCall`) is
-/// a programming error and surfaces as `TraceError::Internal`.
-fn merge_span_kind(begin: SpanKind, result: SpanResult, span_id: &SpanId) -> Result<SpanKind> {
-    match (begin, result) {
-        (
-            SpanKind::LlmCall {
-                model_id,
-                provider,
-                provider_config_hash,
-                input_messages,
-                temperature,
-                ..
-            },
-            SpanResult::LlmCall {
-                output_content,
-                thinking,
-                tool_calls,
-                input_tokens,
-                output_tokens,
-            },
-        ) => Ok(SpanKind::LlmCall {
-            model_id,
-            provider,
-            provider_config_hash,
-            input_messages,
-            temperature,
-            output_content,
-            thinking,
-            tool_calls,
-            input_tokens,
-            output_tokens,
-        }),
-        (
-            SpanKind::ToolCall {
-                tool_name,
-                tool_artifact_hash,
-                triggered_by,
-                params,
-                ..
-            },
-            SpanResult::ToolCall { output, success },
-        ) => Ok(SpanKind::ToolCall {
-            tool_name,
-            tool_artifact_hash,
-            triggered_by,
-            params,
-            output,
-            success,
-        }),
-        (SpanKind::SubagentStub { .. }, SpanResult::SubagentStub { child_session_id }) => {
-            Ok(SpanKind::SubagentStub { child_session_id })
+/// Apply a [`SpanFinalize`] payload to the begin-time `SpanKind` in
+/// place. Returns `Err(TraceError::Internal)` when the finalize variant
+/// does not match the kind variant — that's a caller bug. `Empty` is
+/// always allowed (used by `cancel_span`).
+fn finalize_span_kind(kind: &mut SpanKind, finalize: SpanFinalize, span_id: &SpanId) -> Result<()> {
+    match (kind, finalize) {
+        (SpanKind::LlmCall { result, .. }, SpanFinalize::LlmCall(r)) => {
+            *result = Some(r);
+            Ok(())
         }
+        (SpanKind::ToolCall { result, .. }, SpanFinalize::ToolCall(r)) => {
+            *result = Some(r);
+            Ok(())
+        }
+        (_, SpanFinalize::Empty) => Ok(()),
         _ => Err(TraceError::Internal(anyhow::anyhow!(
-            "span {} end_span result variant does not match begin-time kind",
+            "span {} end_span finalize variant does not match begin-time kind",
             span_id
         ))),
     }
@@ -409,27 +351,25 @@ mod tests {
 
     fn dummy_llm_kind() -> SpanKind {
         SpanKind::LlmCall {
-            model_id: "claude".into(),
-            provider: "anthropic".into(),
-            provider_config_hash: "h".into(),
-            input_messages: vec![],
-            temperature: None,
-            output_content: String::new(),
-            thinking: None,
-            tool_calls: vec![],
-            input_tokens: 0,
-            output_tokens: 0,
+            begin: aura_trace::LlmCallBegin {
+                model_id: "claude".into(),
+                provider: "anthropic".into(),
+                provider_config_hash: "h".into(),
+                input_messages: vec![],
+                temperature: None,
+            },
+            result: None,
         }
     }
 
-    fn llm_result(input_tokens: usize, output_tokens: usize) -> SpanResult {
-        SpanResult::LlmCall {
+    fn llm_finalize(input_tokens: usize, output_tokens: usize) -> SpanFinalize {
+        SpanFinalize::LlmCall(aura_trace::LlmCallResult {
             output_content: "hi".into(),
             thinking: None,
             tool_calls: vec![],
             input_tokens,
             output_tokens,
-        }
+        })
     }
 
     #[tokio::test]
@@ -449,9 +389,9 @@ mod tests {
     async fn cancel_span_releases_half_open_without_caller_span_result() {
         // Regression: tool_executor and compress_if_needed used to leak
         // half-open spans on early `?` return paths. cancel_span lets
-        // those paths release the span without constructing a fresh
-        // SpanResult — the begin-time kind on the handle drives a
-        // default-shaped result automatically.
+        // those paths release the span without supplying a finalize
+        // payload — `SpanKind`'s `result` stays `None` and `LlmSpanEnded`
+        // does NOT fire (a cancelled LLM call has no token counts).
         let rec = make_recorder();
         let mut rx = rec.stream().subscribe();
         let job = JobId::new();
@@ -466,14 +406,15 @@ mod tests {
         )
         .await
         .unwrap();
-        // The cancel publishes the same SpanEnded + LlmSpanEnded
-        // events the normal end_span path would.
         let mut tags = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             tags.push(format!("{ev:?}"));
         }
-        assert!(tags.iter().any(|t| t.contains("LlmSpanEnded")));
         assert!(tags.iter().any(|t| t.contains("SpanEnded")));
+        assert!(
+            !tags.iter().any(|t| t.contains("LlmSpanEnded")),
+            "cancelled span must not emit a token-count cost event",
+        );
     }
 
     #[tokio::test]
@@ -483,7 +424,7 @@ mod tests {
         let job = JobId::new();
         let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
         let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
-        rec.end_span(span, job, llm_result(10, 5), LifecycleOutcome::Ok)
+        rec.end_span(span, job, llm_finalize(10, 5), LifecycleOutcome::Ok)
             .await
             .unwrap();
         // Drain step started + span started + llm span ended + span ended
@@ -504,7 +445,7 @@ mod tests {
         let job = JobId::new();
         let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
         let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
-        rec.end_span(span, job, llm_result(123, 45), LifecycleOutcome::Ok)
+        rec.end_span(span, job, llm_finalize(123, 45), LifecycleOutcome::Ok)
             .await
             .unwrap();
         // Drain until LlmSpanEnded
@@ -536,10 +477,10 @@ mod tests {
             .end_span(
                 span,
                 job,
-                SpanResult::ToolCall {
+                SpanFinalize::ToolCall(aura_trace::ToolCallResult {
                     output: serde_json::Value::Null,
                     success: false,
-                },
+                }),
                 LifecycleOutcome::Ok,
             )
             .await

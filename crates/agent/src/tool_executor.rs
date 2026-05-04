@@ -13,7 +13,8 @@ use aura_tools::{
     ToolRegistry, approval::preview_params,
 };
 use aura_trace::{
-    LifecycleOutcome, SpanEventKind, SpanKind, SpanResult, StepHandle, ToolCallOrigin,
+    LifecycleOutcome, SpanEventKind, SpanFinalize, SpanKind, StepHandle, ToolCallBegin,
+    ToolCallOrigin, ToolCallResult,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -144,16 +145,17 @@ impl ToolExecutor {
             .begin_span(
                 step,
                 SpanKind::ToolCall {
-                    tool_name: tool_name.to_string(),
-                    // ToolManifest does not yet carry an artifact hash.
-                    tool_artifact_hash: String::new(),
-                    triggered_by: triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
-                        llm_span_id,
-                        tool_use_id: tool_use_id.clone(),
-                    }),
-                    params: params.clone(),
-                    output: Value::Null,
-                    success: false,
+                    begin: ToolCallBegin {
+                        tool_name: tool_name.to_string(),
+                        // ToolManifest does not yet carry an artifact hash.
+                        tool_artifact_hash: String::new(),
+                        triggered_by: triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
+                            llm_span_id,
+                            tool_use_id: tool_use_id.clone(),
+                        }),
+                        params: params.clone(),
+                    },
+                    result: None,
                 },
                 parallel_group,
             )
@@ -228,10 +230,7 @@ impl ToolExecutor {
                         .end_span(
                             span_handle,
                             step.job_id,
-                            SpanResult::ToolCall {
-                                output: Value::Null,
-                                success: false,
-                            },
+                            SpanFinalize::Empty,
                             LifecycleOutcome::Failed {
                                 reason: reason.clone(),
                             },
@@ -353,10 +352,10 @@ impl ToolExecutor {
                     .end_span(
                         span_handle,
                         step.job_id,
-                        SpanResult::ToolCall {
+                        SpanFinalize::ToolCall(ToolCallResult {
                             output: output_value,
                             success,
-                        },
+                        }),
                         outcome,
                     )
                     .await?;
@@ -373,10 +372,7 @@ impl ToolExecutor {
                     .end_span(
                         span_handle,
                         step.job_id,
-                        SpanResult::ToolCall {
-                            output: Value::Null,
-                            success: false,
-                        },
+                        SpanFinalize::Empty,
                         LifecycleOutcome::Failed {
                             reason: error_msg.clone(),
                         },
@@ -391,10 +387,7 @@ impl ToolExecutor {
                     .end_span(
                         span_handle,
                         step.job_id,
-                        SpanResult::ToolCall {
-                            output: Value::Null,
-                            success: false,
-                        },
+                        SpanFinalize::Empty,
                         LifecycleOutcome::Failed {
                             reason: error_msg.clone(),
                         },
