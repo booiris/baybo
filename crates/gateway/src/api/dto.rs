@@ -27,16 +27,27 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Envelope for list endpoints. Lets us add `next_cursor`, `total`,
-/// etc. later without breaking clients that parse `items`.
+/// Envelope for list endpoints. `next_cursor` is opaque — clients
+/// pass it back as `?cursor=` to fetch the next page, and treat
+/// `None` as "no more pages." The cursor's internal scheme may change
+/// across releases; clients must not parse it.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ListResponse<T> {
     pub items: Vec<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 impl<T> ListResponse<T> {
     pub fn new(items: Vec<T>) -> Self {
-        Self { items }
+        Self {
+            items,
+            next_cursor: None,
+        }
+    }
+
+    pub fn with_next_cursor(items: Vec<T>, next_cursor: Option<String>) -> Self {
+        Self { items, next_cursor }
     }
 }
 

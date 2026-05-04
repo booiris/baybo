@@ -541,6 +541,7 @@ export interface operations {
                             channel_type: components["schemas"]["ChannelType"];
                             status: string;
                         }[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -728,6 +729,7 @@ export interface operations {
                             updated_at: string;
                             user_id: string;
                         }[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -875,14 +877,30 @@ export interface operations {
     };
     list_jobs: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Restrict to a single session. Hits the per-session index in
+                 *     the store instead of scanning the full jobs table.
+                 */
+                session?: string | null;
+                /**
+                 * @description Restrict to one terminal/in-flight status discriminator.
+                 *     Snake-case, matching `JobStatusKind` (`pending`, `in_progress`,
+                 *     `stuck`, `cancelled`, `failed`, `completed`).
+                 */
+                status?: string | null;
+                /** @description Maximum items to return. Defaults to 50; capped at 500. */
+                limit?: number | null;
+                /** @description Opaque cursor from a previous response's `next_cursor`. */
+                cursor?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description All jobs currently tracked */
+            /** @description Paginated jobs */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -905,7 +923,17 @@ export interface operations {
                             started_at?: string | null;
                             status: components["schemas"]["JobStatus"];
                         }[];
+                        next_cursor?: string | null;
                     };
+                };
+            };
+            /** @description Invalid query parameters */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */
@@ -1147,6 +1175,7 @@ export interface operations {
                             source_session_id?: string | null;
                             user_id: string;
                         }[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -1268,6 +1297,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: string[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -1341,6 +1371,7 @@ export interface operations {
                             name: string;
                             parameters_schema: Record<string, never>;
                         }[];
+                        next_cursor?: string | null;
                     };
                 };
             };

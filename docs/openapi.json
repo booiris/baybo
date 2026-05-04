@@ -22,7 +22,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -45,6 +45,12 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -231,7 +237,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -300,6 +306,12 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -476,14 +488,65 @@
           "jobs"
         ],
         "operationId": "list_jobs",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "query",
+            "description": "Restrict to a single session. Hits the per-session index in\nthe store instead of scanning the full jobs table.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Restrict to one terminal/in-flight status discriminator.\nSnake-case, matching `JobStatusKind` (`pending`, `in_progress`,\n`stuck`, `cancelled`, `failed`, `completed`).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum items to return. Defaults to 50; capped at 500.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous response's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "All jobs currently tracked",
+            "description": "Paginated jobs",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -556,8 +619,24 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -921,7 +1000,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -990,6 +1069,12 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -1124,7 +1209,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -1134,6 +1219,12 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -1206,7 +1297,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -1233,6 +1324,12 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }

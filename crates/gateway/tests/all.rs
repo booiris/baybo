@@ -6,6 +6,8 @@ mod admin_has_no_channels;
 mod auth;
 #[path = "channel_ws.rs"]
 mod channel_ws;
+#[path = "jobs_pagination.rs"]
+mod jobs_pagination;
 #[path = "logs_endpoint.rs"]
 mod logs_endpoint;
 #[path = "openapi_spec_sync.rs"]
