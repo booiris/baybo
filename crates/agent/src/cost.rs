@@ -139,6 +139,41 @@ impl CostGuard {
 pub struct CostSubscriber {
     store: Arc<dyn CostStore>,
     pricing: Arc<HashMap<String, ModelPricing>>,
+    metrics: Arc<CostSubscriberMetrics>,
+}
+
+/// Cumulative metrics for `CostSubscriber`. Exposed so operators (or
+/// the gateway's status endpoint) can detect silent under-billing —
+/// a non-zero `lagged_events` count means the broadcast bus dropped
+/// LlmSpanEnded events before this subscriber could process them, so
+/// `cost_records` and the `CostGuard` quota check are undercounting.
+///
+/// Clone the `Arc` to read the counters from another task; the
+/// internal counters are `AtomicU64` so reads are lock-free.
+#[derive(Default)]
+pub struct CostSubscriberMetrics {
+    /// Number of `LlmSpanEnded` events the broadcast bus dropped
+    /// before this subscriber could pick them up. Each lagged event
+    /// is one missing `cost_records` row.
+    pub lagged_events: std::sync::atomic::AtomicU64,
+    /// Number of `cost_records` rows successfully written.
+    pub recorded_events: std::sync::atomic::AtomicU64,
+}
+
+impl CostSubscriberMetrics {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn lagged(&self) -> u64 {
+        self.lagged_events
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn recorded(&self) -> u64 {
+        self.recorded_events
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 fn compute_cost_usd(
@@ -156,7 +191,24 @@ fn compute_cost_usd(
 
 impl CostSubscriber {
     pub fn new(store: Arc<dyn CostStore>, pricing: Arc<HashMap<String, ModelPricing>>) -> Self {
-        Self { store, pricing }
+        Self::with_metrics(store, pricing, CostSubscriberMetrics::new())
+    }
+
+    pub fn with_metrics(
+        store: Arc<dyn CostStore>,
+        pricing: Arc<HashMap<String, ModelPricing>>,
+        metrics: Arc<CostSubscriberMetrics>,
+    ) -> Self {
+        Self {
+            store,
+            pricing,
+            metrics,
+        }
+    }
+
+    /// Clone the metrics handle so other tasks can read the counters.
+    pub fn metrics(&self) -> Arc<CostSubscriberMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Compute USD for the given token counts. Returns 0.0 when the
@@ -173,6 +225,7 @@ impl CostSubscriber {
         let mut rx = stream.subscribe();
         let store = Arc::clone(&self.store);
         let pricing = self.pricing;
+        let metrics = self.metrics;
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -205,6 +258,9 @@ impl CostSubscriber {
                             warn!(error = %e, "failed to write cost_record");
                             continue;
                         }
+                        metrics
+                            .recorded_events
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // Skip the monthly cache bump for system-driven
                         // events that lack a real user (e.g. an internal
                         // probe call); otherwise every such event would
@@ -223,6 +279,15 @@ impl CostSubscriber {
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Lagged events are LlmSpanEnded events the bus
+                        // dropped before we picked them up — each one
+                        // is a missing cost_record. Surface the count so
+                        // operators see silent under-billing in metrics
+                        // / status endpoints. A non-zero counter here
+                        // means CostGuard quota checks are undercounting.
+                        metrics
+                            .lagged_events
+                            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                         warn!(missed = n, "cost subscriber lagged on TraceEventStream");
                         continue;
                     }
@@ -267,5 +332,44 @@ mod tests {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let sub = CostSubscriber::new(store, pricing("m1", 3.0, 15.0));
         assert_eq!(sub.cost_usd_for("unknown", 1_000_000, 1_000_000), 0.0);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_recorded_events_through_real_stream() {
+        use aura_model::{JobId, SessionId, SpanId};
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let metrics = CostSubscriberMetrics::new();
+        let sub = CostSubscriber::with_metrics(
+            Arc::clone(&store),
+            pricing("m1", 3.0, 15.0),
+            Arc::clone(&metrics),
+        );
+        let stream = TraceEventStream::new();
+        let handle = sub.spawn(&stream);
+
+        for _ in 0..3 {
+            stream.publish(TraceEvent::LlmSpanEnded {
+                span_id: SpanId::new(),
+                job_id: JobId::new(),
+                session_id: SessionId::from("s1"),
+                user_id: "u1".into(),
+                model_id: "m1".into(),
+                provider: "anth".into(),
+                input_tokens: 100,
+                output_tokens: 200,
+            });
+        }
+        // Give the spawned task a tick to drain.
+        for _ in 0..10 {
+            if metrics.recorded() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(metrics.recorded(), 3, "all three events should land");
+        assert_eq!(metrics.lagged(), 0, "no lag in this test path");
+        drop(stream);
+        // Clean up: subscriber exits when the last sender drops.
+        let _ = handle.await;
     }
 }

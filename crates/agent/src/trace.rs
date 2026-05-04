@@ -101,7 +101,7 @@ impl TraceEventStream {
         self.sender.receiver_count()
     }
 
-    fn publish(&self, event: TraceEvent) {
+    pub(crate) fn publish(&self, event: TraceEvent) {
         // `send` returns Err only when there are no subscribers; that
         // is not a failure for fire-and-forget audit events.
         let _ = self.sender.send(event);

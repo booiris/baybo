@@ -23,7 +23,7 @@ pub use agent_loop::AgentLoop;
 pub use aura_cron::{CronScheduler, CronTriggerEvent};
 pub use aura_security::SecretVault;
 pub use cancel::{JobCancellationGuard, JobCancellationRegistry};
-pub use cost::{CostGuard, CostGuardError, SpendingLimits};
+pub use cost::{CostGuard, CostGuardError, CostSubscriberMetrics, SpendingLimits};
 pub use job::JobLifecycle;
 pub use memory::MemoryManager;
 pub use policy::ExecutionPolicy;
