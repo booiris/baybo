@@ -76,6 +76,27 @@ pub enum AgentOutput {
         level: NoticeLevel,
         text: String,
     },
+    /// Terminal-state notification for a job. Emitted by the agent
+    /// actor once `agent_loop.run` returns (success or failure) so
+    /// downstream observers — notably `LocalSubagentRuntime` — can
+    /// signal completion independently of the user-facing `Message`.
+    /// Required for the multi-job subagent path: the parent waits for
+    /// every child job to terminate, not just the first message.
+    JobCompleted {
+        session_id: String,
+        job_id: String,
+        outcome: JobOutcome,
+    },
+}
+
+/// Terminal job outcome carried by [`AgentOutput::JobCompleted`].
+/// Mirrors `aura_job::JobStatusKind`'s terminal subset; kept local to
+/// `aura-channels` so this crate stays job-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobOutcome {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 /// Severity attached to an `AgentOutput::Notice`. Used only for

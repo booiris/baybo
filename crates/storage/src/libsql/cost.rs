@@ -84,30 +84,50 @@ impl CostStore for LibsqlCostStore {
             )
             .await
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
         let row = rows
             .next()
             .await
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
             .ok_or_else(|| CostError::Storage("expected aggregate row".to_string()))?;
+        summary_from_aggregate_row(&row)
+    }
 
-        Ok(CostSummary {
-            total_cost_usd: row
-                .get::<f64>(0)
-                .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
-            total_input_tokens: row
-                .get::<i64>(1)
-                .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
-                as usize,
-            total_output_tokens: row
-                .get::<i64>(2)
-                .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
-                as usize,
-            record_count: row
-                .get::<i64>(3)
-                .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
-                as usize,
-        })
+    async fn query_session(&self, session_id: &SessionId) -> CostResult<CostSummary> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
+                        COALESCE(SUM(output_tokens), 0), COUNT(*) \
+                 FROM cost_records WHERE session_id = ?1",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+            .ok_or_else(|| CostError::Storage("expected aggregate row".to_string()))?;
+        summary_from_aggregate_row(&row)
+    }
+
+    async fn query_job(&self, job_id: &JobId) -> CostResult<CostSummary> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
+                        COALESCE(SUM(output_tokens), 0), COUNT(*) \
+                 FROM cost_records WHERE job_id = ?1",
+                libsql::params![job_id.to_string()],
+            )
+            .await
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+            .ok_or_else(|| CostError::Storage("expected aggregate row".to_string()))?;
+        summary_from_aggregate_row(&row)
     }
 
     async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64> {
@@ -217,6 +237,38 @@ impl CostStore for LibsqlCostStore {
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql update: {e}")))?;
         Ok(affected)
     }
+
+    async fn purge_cost_records_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64> {
+        let conn = self.pool.conn();
+        let affected = conn
+            .execute(
+                "DELETE FROM cost_records WHERE timestamp < ?1",
+                libsql::params![time::to_us(cutoff)],
+            )
+            .await
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
+        Ok(affected)
+    }
+}
+
+fn summary_from_aggregate_row(row: &libsql::Row) -> CostResult<CostSummary> {
+    Ok(CostSummary {
+        total_cost_usd: row
+            .get::<f64>(0)
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
+        total_input_tokens: row
+            .get::<i64>(1)
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            as usize,
+        total_output_tokens: row
+            .get::<i64>(2)
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            as usize,
+        record_count: row
+            .get::<i64>(3)
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            as usize,
+    })
 }
 
 fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {

@@ -180,6 +180,7 @@ impl CostSubscriber {
                         span_id,
                         job_id,
                         session_id,
+                        user_id,
                         model_id,
                         input_tokens,
                         output_tokens,
@@ -189,8 +190,7 @@ impl CostSubscriber {
                             compute_cost_usd(&pricing, &model_id, input_tokens, output_tokens);
                         let now = Utc::now();
                         let record = CostRecord {
-                            // user_id is not yet plumbed through TraceEvent.
-                            user_id: String::new(),
+                            user_id,
                             session_id,
                             job_id,
                             span_id,
@@ -205,10 +205,11 @@ impl CostSubscriber {
                             warn!(error = %e, "failed to write cost_record");
                             continue;
                         }
-                        // Skip the monthly cache bump until user_id is
-                        // plumbed through; otherwise every event lands
-                        // on a single ("", month) row that conflates
-                        // every user.
+                        // Skip the monthly cache bump for system-driven
+                        // events that lack a real user (e.g. an internal
+                        // probe call); otherwise every such event would
+                        // land on a single ("", month) row that conflates
+                        // unrelated traffic.
                         if record.user_id.is_empty() {
                             continue;
                         }

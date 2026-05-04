@@ -166,6 +166,7 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_cost_user_id ON cost_records(user_id);
                 CREATE INDEX IF NOT EXISTS idx_cost_timestamp ON cost_records(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_cost_session ON cost_records(session_id);
+                CREATE INDEX IF NOT EXISTS idx_cost_job ON cost_records(job_id);
 
                 CREATE TABLE IF NOT EXISTS user_monthly_cost (
                     user_id     TEXT    NOT NULL,
@@ -287,6 +288,7 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_user_id ON cron_executions(user_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_executions_dedup ON cron_executions(job_id, scheduled_fire_time);
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_status ON cron_executions(status);
+                CREATE INDEX IF NOT EXISTS idx_cron_executions_triggered_at ON cron_executions(triggered_at);
 
                 CREATE TABLE IF NOT EXISTS skill_risk_assessments (
                     skill_name   TEXT NOT NULL,

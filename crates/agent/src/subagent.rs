@@ -29,7 +29,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::{AgentOutput, IncomingMessage, Message};
+use aura_channels::{AgentOutput, IncomingMessage, JobOutcome, Message};
 use aura_model::{
     ChannelType, ContentBlock, JobId, Lineage, LineageKind, MessageMetadata, SessionId, User,
 };
@@ -248,12 +248,19 @@ impl SubagentRuntime for LocalSubagentRuntime {
             };
         }
 
-        // 4. Wait for the child to produce its final message — or for
-        //    timeout / parent cancellation. `output_rx` carries every
-        //    AgentOutput the child emits; we treat the first
-        //    `AgentOutput::Message` as the final reply (multi-job
-        //    child support is a follow-up — see module docs).
+        // 4. Wait for the child to terminate — or for timeout / parent
+        //    cancellation. The child actor emits both
+        //    `AgentOutput::Message` (user-visible reply) and
+        //    `AgentOutput::JobCompleted` (internal terminal-state
+        //    signal); we capture the most recent message while
+        //    streaming, and unblock on `JobCompleted`. Driving
+        //    completion off the explicit terminal signal is what makes
+        //    the multi-job child path correct: a failed child whose
+        //    `agent_loop.run` errored before producing a `Message`
+        //    still surfaces as `JobCompleted { Failed }` rather than
+        //    hanging until the spawn timeout.
         let child_token = parent_token.child_token();
+        let mut captured: Option<Vec<ContentBlock>> = None;
         let wait_result = tokio::time::timeout(request.timeout, async {
             loop {
                 tokio::select! {
@@ -262,12 +269,23 @@ impl SubagentRuntime for LocalSubagentRuntime {
                     }
                     msg = output_rx.recv() => {
                         match msg {
-                            Some(AgentOutput::Message(m)) => return Ok(m.content),
-                            // Skip progress / delta / notice — wait
-                            // for the canonical final message.
+                            Some(AgentOutput::Message(m)) => {
+                                captured = Some(m.content);
+                            }
+                            Some(AgentOutput::JobCompleted { outcome, .. }) => {
+                                return match outcome {
+                                    JobOutcome::Completed => Ok(captured.take()),
+                                    JobOutcome::Failed => Err(SubagentExitStatus::Failed(
+                                        "child job failed".into(),
+                                    )),
+                                    JobOutcome::Cancelled => Err(SubagentExitStatus::Cancelled),
+                                };
+                            }
+                            // Skip progress / delta / notice — wait for
+                            // the terminal `JobCompleted` signal.
                             Some(_) => continue,
                             None => return Err(SubagentExitStatus::Failed(
-                                "child output channel closed without final message".into(),
+                                "child output channel closed without terminal signal".into(),
                             )),
                         }
                     }
@@ -285,7 +303,7 @@ impl SubagentRuntime for LocalSubagentRuntime {
             Ok(Ok(content)) => SubagentResult {
                 child_session_id: child_session.id,
                 child_root_job_id: None,
-                final_content: Some(content),
+                final_content: content,
                 status: SubagentExitStatus::Completed,
             },
             Ok(Err(status)) => SubagentResult {

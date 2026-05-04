@@ -198,7 +198,10 @@ pub struct QueryApi {
     sessions: Arc<dyn SessionStore>,
     jobs: Arc<JobLifecycle>,
     trace: Arc<dyn TraceStore>,
-    costs: Arc<dyn CostStore>,
+    /// Optional. Callers that only need lineage / replay / job listing
+    /// (CLI `aura trace list/show/export`, gateway `/v1/traces/{id}`)
+    /// pass `None`; cost_summary then returns `Unsupported`.
+    costs: Option<Arc<dyn CostStore>>,
 }
 
 impl QueryApi {
@@ -212,7 +215,23 @@ impl QueryApi {
             sessions,
             jobs,
             trace,
-            costs,
+            costs: Some(costs),
+        }
+    }
+
+    /// Build a `QueryApi` without a `CostStore`. `cost_summary` calls
+    /// return `QueryError::Unsupported` — used by the CLI trace
+    /// commands which never touch cost data.
+    pub fn without_costs(
+        sessions: Arc<dyn SessionStore>,
+        jobs: Arc<JobLifecycle>,
+        trace: Arc<dyn TraceStore>,
+    ) -> Self {
+        Self {
+            sessions,
+            jobs,
+            trace,
+            costs: None,
         }
     }
 
@@ -376,10 +395,14 @@ impl QueryApi {
     // ── 8. cost_summary ────────────────────────────────────────
 
     pub async fn cost_summary(&self, scope: CostScope) -> Result<CostSummary> {
+        let costs = self
+            .costs
+            .as_ref()
+            .ok_or_else(|| QueryError::Unsupported("cost_summary requires a CostStore".into()))?;
         match scope {
-            CostScope::TimeRange(range) => Ok(self.costs.query_global(range).await?),
+            CostScope::TimeRange(range) => Ok(costs.query_global(range).await?),
             CostScope::User { user_id, range } => {
-                let records = self.costs.query_user(&user_id, range).await?;
+                let records = costs.query_user(&user_id, range).await?;
                 let mut summary = CostSummary::default();
                 for r in records {
                     summary.total_cost_usd += r.cost_usd;
@@ -389,13 +412,8 @@ impl QueryApi {
                 }
                 Ok(summary)
             }
-            CostScope::Session(_) => Err(QueryError::Unsupported(
-                "cost_summary by session requires CostStore::query_session — not implemented yet"
-                    .into(),
-            )),
-            CostScope::Job(_) => Err(QueryError::Unsupported(
-                "cost_summary by job requires CostStore::query_job — not implemented yet".into(),
-            )),
+            CostScope::Session(sid) => Ok(costs.query_session(&sid).await?),
+            CostScope::Job(jid) => Ok(costs.query_job(&jid).await?),
         }
     }
 
@@ -413,17 +431,23 @@ impl QueryApi {
         summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
         let mut jobs = Vec::with_capacity(summaries.len());
-        // Map for quick truncation lookup.
-        let mut step_id_to_job: HashMap<StepId, JobId> = HashMap::new();
-        for s in &summaries {
-            let steps = self.trace.list_steps_by_job(&s.id).await?;
-            for st in &steps {
-                step_id_to_job.insert(st.id, s.id);
+        // Truncation lookup is only needed when `until_step_id` is set.
+        // Skipping it on the common (CLI / gateway) path saves one
+        // `list_steps_by_job` round-trip per job.
+        let truncate_after_job: Option<JobId> = match until_step_id.as_ref() {
+            None => None,
+            Some(target) => {
+                let mut found = None;
+                for s in &summaries {
+                    let steps = self.trace.list_steps_by_job(&s.id).await?;
+                    if steps.iter().any(|st| &st.id == target) {
+                        found = Some(s.id);
+                        break;
+                    }
+                }
+                found
             }
-        }
-        let truncate_after_job: Option<JobId> = until_step_id
-            .as_ref()
-            .and_then(|sid| step_id_to_job.get(sid).copied());
+        };
 
         for s in &summaries {
             let job = match self.jobs.get(&s.id).await? {

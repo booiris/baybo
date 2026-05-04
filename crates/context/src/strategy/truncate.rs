@@ -42,6 +42,7 @@ impl CompressionStrategy for Truncate {
         if non_system.len() <= self.keep_recent {
             return Ok(CompressOutput {
                 messages: messages.to_vec(),
+                llm_call: None,
             });
         }
 
@@ -53,6 +54,7 @@ impl CompressionStrategy for Truncate {
 
         Ok(CompressOutput {
             messages: new_messages,
+            llm_call: None,
         })
     }
 }

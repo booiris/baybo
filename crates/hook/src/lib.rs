@@ -4,6 +4,7 @@ pub mod manager;
 pub mod matcher;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,15 @@ impl HookContext {
     }
 }
 
+/// Default per-call timeout for in-process trait hooks. Matches the
+/// `Trait` row in the `Hook timeout` table of `docs/modules/hook.md`.
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Number of consecutive timeouts after which `HookManager` auto-disables
+/// a hook. A hook that consistently misses its deadline is unhealthy
+/// enough that continuing to fire it just compounds latency.
+pub const HOOK_AUTO_DISABLE_AFTER_TIMEOUTS: u32 = 3;
+
 /// A lifecycle hook that can inspect and modify the execution context.
 #[async_trait]
 pub trait Hook: Send + Sync {
@@ -184,6 +194,13 @@ pub trait Hook: Send + Sync {
     /// Defaults to `false` (non-critical).
     fn critical(&self) -> bool {
         false
+    }
+
+    /// Per-call timeout for this hook. Override for handlers with
+    /// genuinely longer expected runtimes (e.g. external webhooks
+    /// sized in seconds). Defaults to [`DEFAULT_HOOK_TIMEOUT`].
+    fn timeout(&self) -> Duration {
+        DEFAULT_HOOK_TIMEOUT
     }
 
     /// Execute the hook logic against the provided context.

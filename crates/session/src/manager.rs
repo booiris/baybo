@@ -40,6 +40,13 @@ impl SessionManager {
         self
     }
 
+    /// Read-only view of the underlying `SessionStore`. Used by
+    /// callers (CLI / gateway admin) that need to construct
+    /// `QueryApi` against the same store the manager writes to.
+    pub fn store(&self) -> Arc<dyn SessionStore> {
+        Arc::clone(&self.store)
+    }
+
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
         self.create_session_with_id(
             SessionId::from(uuid::Uuid::new_v4().to_string()),

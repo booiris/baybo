@@ -47,7 +47,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_is_not_terminal() {
+    fn pending_is_in_flight() {
         assert!(!LifecycleOutcome::Pending.is_terminal());
     }
 

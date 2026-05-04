@@ -90,4 +90,12 @@ pub trait CronStore: Send + Sync {
     /// List all execution records with the given status.
     /// Used at startup to find `"pending"` executions that need re-dispatch.
     async fn list_executions_by_status(&self, status: &str) -> Result<Vec<CronExecutionRow>>;
+
+    /// Hard-delete completed cron execution rows older than
+    /// `cutoff_us` (Unix microseconds). A 1-minute cron alone produces
+    /// ~525k rows/yr, so unbounded growth is the failure mode this is
+    /// guarding against. `pending` and `dispatched` rows are left alone
+    /// — only completed rows are reaped. Returns the number of rows
+    /// removed.
+    async fn purge_completed_executions_older_than(&self, cutoff_us: i64) -> Result<u64>;
 }

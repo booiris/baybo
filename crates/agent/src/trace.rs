@@ -54,11 +54,14 @@ pub enum TraceEvent {
     SpanEventEmitted(SpanEvent),
     /// Fired specifically by `end_span` for `SpanKind::LlmCall` so
     /// `CostTracker` can subscribe and write cost rows asynchronously.
-    /// Carries everything `cost_records` needs.
+    /// Carries everything `cost_records` needs, including the owning
+    /// user (so `user_monthly_cost` rolls up per-user-per-month rather
+    /// than collapsing every event into one (`""`, month) row).
     LlmSpanEnded {
         span_id: SpanId,
         job_id: JobId,
         session_id: SessionId,
+        user_id: String,
         model_id: String,
         provider: String,
         input_tokens: usize,
@@ -112,6 +115,7 @@ impl TraceEventStream {
 /// `mpsc`-style broadcast sender).
 pub struct SpanRecorder {
     session_id: SessionId,
+    user_id: String,
     trace_store: Arc<dyn TraceStore>,
     event_store: Arc<dyn TraceEventStore>,
     stream: TraceEventStream,
@@ -120,11 +124,13 @@ pub struct SpanRecorder {
 impl SpanRecorder {
     pub fn new(
         session_id: SessionId,
+        user_id: String,
         trace_store: Arc<dyn TraceStore>,
         event_store: Arc<dyn TraceEventStore>,
     ) -> Self {
         Self {
             session_id,
+            user_id,
             trace_store,
             event_store,
             stream: TraceEventStream::new(),
@@ -285,6 +291,7 @@ impl SpanRecorder {
                 span_id: handle.span_id,
                 job_id,
                 session_id: self.session_id.clone(),
+                user_id: self.user_id.clone(),
                 model_id: model_id.clone(),
                 provider: provider.clone(),
                 input_tokens: *input_tokens,
@@ -417,6 +424,7 @@ fn merge_span_kind(begin: SpanKind, result: SpanResult, span_id: &SpanId) -> Res
         (SpanKind::SubagentStub { .. }, SpanResult::SubagentStub { child_session_id }) => {
             Ok(SpanKind::SubagentStub { child_session_id })
         }
+        (SpanKind::StepHost, SpanResult::StepHost) => Ok(SpanKind::StepHost),
         _ => Err(TraceError::Internal(anyhow::anyhow!(
             "span {} end_span result variant does not match begin-time kind",
             span_id
@@ -432,6 +440,7 @@ mod tests {
     fn make_recorder() -> SpanRecorder {
         SpanRecorder::new(
             SessionId::from("cli-test"),
+            "user-test".to_string(),
             Arc::new(MemoryTraceStore::new()),
             Arc::new(MemoryTraceEventStore::default()),
         )

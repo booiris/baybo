@@ -43,39 +43,36 @@ async fn get_trace(
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let typed_session = aura_model::SessionId::from(session_id.as_str());
-    // Walk Jobs → Steps → Spans for this session.
-    let jobs = state
-        .job_lifecycle
-        .list_by_session(&typed_session, None)
+    let api = aura_agent::QueryApi::new(
+        state.session_manager.store(),
+        std::sync::Arc::clone(&state.job_lifecycle),
+        std::sync::Arc::clone(&state.trace_store),
+        std::sync::Arc::clone(&state.cost_store),
+    );
+    let replay = api
+        .replay(&typed_session, None)
         .await
-        .map_err(|e: aura_job::JobError| GatewayError::Trace(e.to_string()))?;
+        .map_err(|e| GatewayError::Trace(e.to_string()))?;
 
-    if jobs.is_empty() {
+    if replay.jobs.is_empty() {
         return Err(GatewayError::NotFound(format!("trace {session_id}")));
     }
 
-    let mut job_blocks = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let steps = state
-            .trace_store
-            .list_steps_by_job(&job.id)
-            .await
-            .map_err(|e: aura_trace::TraceError| GatewayError::Trace(e.to_string()))?;
-        let mut step_blocks = Vec::with_capacity(steps.len());
-        for step in steps {
-            let spans = state
-                .trace_store
-                .list_spans_by_step(&step.id)
-                .await
-                .map_err(|e: aura_trace::TraceError| GatewayError::Trace(e.to_string()))?;
-            step_blocks.push(json!({ "step": step, "spans": spans }));
-        }
-        job_blocks.push(json!({
-            "job_id": job.id.to_string(),
-            "job_status_kind": job.status.kind().as_snake_case(),
-            "steps": step_blocks,
-        }));
-    }
+    let job_blocks: Vec<serde_json::Value> = replay
+        .jobs
+        .iter()
+        .map(|rj| {
+            json!({
+                "job_id": rj.job.id.to_string(),
+                "job_status_kind": rj.job.status.kind().as_snake_case(),
+                "steps": rj
+                    .steps
+                    .iter()
+                    .map(|rs| json!({ "step": rs.step, "spans": rs.spans }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
 
     Ok(Json(json!({
         "session_id": session_id,

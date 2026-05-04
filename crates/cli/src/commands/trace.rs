@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aura_agent::{JobFilter, QueryApi};
 use aura_model::SessionId;
 use aura_storage::TraceStore;
 use serde_json::json;
@@ -31,43 +32,67 @@ fn jobs(ctx: &CommandContext) -> Result<&aura_agent::JobLifecycle> {
         .ok_or_else(|| CliError::Manager("job manager is not available in this invocation".into()))
 }
 
+/// Build a `QueryApi` against the CLI's session / job / trace stores.
+/// Trace commands don't read cost data, so the cost store is omitted
+/// (`cost_summary` would return `Unsupported` if anyone called it).
+fn query_api(ctx: &CommandContext) -> Result<QueryApi> {
+    let session_mgr = ctx.session.as_ref().ok_or_else(|| {
+        CliError::Manager("session manager is not available in this invocation".into())
+    })?;
+    let job_lifecycle = ctx.job.as_ref().ok_or_else(|| {
+        CliError::Manager("job manager is not available in this invocation".into())
+    })?;
+    let trace_store = store(ctx)?;
+    Ok(QueryApi::without_costs(
+        session_mgr.store(),
+        Arc::clone(job_lifecycle),
+        Arc::clone(trace_store),
+    ))
+}
+
 /// Pull the (job_count, step_count, span_count) tuple for one session
-/// — handy for both list and show summaries.
+/// — handy for both list and show summaries. Backed by `QueryApi::replay`
+/// so the count walk reuses the same fork-aware view as `aura trace export`.
 async fn session_summary_counts(
     ctx: &CommandContext,
     session_id: &SessionId,
 ) -> Result<(usize, usize, usize)> {
-    let st = store(ctx)?;
-    let job_mgr = jobs(ctx)?;
-    let session_jobs = job_mgr
-        .list_by_session(session_id, None)
+    let api = query_api(ctx)?;
+    let replay = api
+        .replay(session_id, None)
         .await
-        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?;
+        .map_err(|e| CliError::Manager(format!("replay session: {e}")))?;
     let mut step_count = 0;
     let mut span_count = 0;
-    for j in &session_jobs {
-        let steps = st
-            .list_steps_by_job(&j.id)
-            .await
-            .map_err(|e: aura_trace::TraceError| CliError::Manager(format!("list steps: {e}")))?;
-        for step in &steps {
-            let spans =
-                st.list_spans_by_step(&step.id)
-                    .await
-                    .map_err(|e: aura_trace::TraceError| {
-                        CliError::Manager(format!("list spans: {e}"))
-                    })?;
-            span_count += spans.len();
-        }
-        step_count += steps.len();
+    for j in &replay.jobs {
+        step_count += j.steps.len();
+        span_count += j.steps.iter().map(|s| s.spans.len()).sum::<usize>();
     }
-    Ok((session_jobs.len(), step_count, span_count))
+    Ok((replay.jobs.len(), step_count, span_count))
 }
 
 async fn list(ctx: &CommandContext, session: Option<&str>, limit: usize) -> Result<CommandOutput> {
+    // `list_jobs` (via QueryApi) is per-session — to enumerate every
+    // session that has trace data we still need the raw job-store
+    // listing. For a single supplied session id we fall back to the
+    // QueryApi path for free.
     let job_mgr = jobs(ctx)?;
     let mut sessions: Vec<SessionId> = match session {
-        Some(s) => vec![SessionId::from(s)],
+        Some(s) => {
+            let sid = SessionId::from(s);
+            // Sanity check via QueryApi so the "no trace" message
+            // mirrors `show` / `export`.
+            let api = query_api(ctx)?;
+            let summaries = api
+                .list_jobs(&sid, JobFilter::default())
+                .await
+                .map_err(|e| CliError::Manager(format!("list jobs: {e}")))?;
+            if summaries.is_empty() {
+                Vec::new()
+            } else {
+                vec![sid]
+            }
+        }
         None => {
             let mut seen = std::collections::BTreeSet::new();
             for j in job_mgr
@@ -153,37 +178,30 @@ async fn export(
             out.unwrap_or("(stdout)")
         )));
     }
-    let st = store(ctx)?;
-    let job_mgr = jobs(ctx)?;
     let session_id = SessionId::from(id);
-    let session_jobs = job_mgr
-        .list_by_session(&session_id, None)
+    let api = query_api(ctx)?;
+    let replay = api
+        .replay(&session_id, None)
         .await
-        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?;
-    if session_jobs.is_empty() {
+        .map_err(|e| CliError::Manager(format!("replay session: {e}")))?;
+    if replay.jobs.is_empty() {
         return Err(CliError::Manager(format!(
             "no trace recorded for session {id}"
         )));
     }
 
-    let mut tree = Vec::with_capacity(session_jobs.len());
-    for job in session_jobs {
-        let steps = st
-            .list_steps_by_job(&job.id)
-            .await
-            .map_err(|e: aura_trace::TraceError| CliError::Manager(format!("list steps: {e}")))?;
-        let mut step_blocks = Vec::with_capacity(steps.len());
-        for step in steps {
-            let spans =
-                st.list_spans_by_step(&step.id)
-                    .await
-                    .map_err(|e: aura_trace::TraceError| {
-                        CliError::Manager(format!("list spans: {e}"))
-                    })?;
-            step_blocks.push(json!({ "step": step, "spans": spans }));
-        }
-        tree.push(json!({ "job": job, "steps": step_blocks }));
-    }
+    let tree: Vec<serde_json::Value> = replay
+        .jobs
+        .iter()
+        .map(|rj| {
+            let steps: Vec<serde_json::Value> = rj
+                .steps
+                .iter()
+                .map(|rs| json!({ "step": rs.step, "spans": rs.spans }))
+                .collect();
+            json!({ "job": rj.job, "steps": steps })
+        })
+        .collect();
     let exported = json!({ "session": id, "jobs": tree });
     let json_text = serde_json::to_string_pretty(&exported)
         .map_err(|e| CliError::Manager(format!("serialize trace: {e}")))?;

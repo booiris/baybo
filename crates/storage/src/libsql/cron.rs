@@ -362,6 +362,27 @@ impl CronStore for LibsqlCronStore {
         }
         Ok(out)
     }
+
+    async fn purge_completed_executions_older_than(
+        &self,
+        cutoff_us: i64,
+    ) -> crate::cron::Result<u64> {
+        // Purge anything past the retention horizon that isn't still
+        // mid-flight. `pending` rows might be in-flight on another
+        // worker; preserving them protects against a long-stalled
+        // dispatch from being silently reaped.
+        let affected = self
+            .pool
+            .conn()
+            .execute(
+                "DELETE FROM cron_executions \
+                 WHERE triggered_at < ?1 AND status != 'pending'",
+                libsql::params![cutoff_us],
+            )
+            .await
+            .map_err(|e| CronStoreError::Internal(format!("libsql delete: {e}")))?;
+        Ok(affected)
+    }
 }
 
 #[cfg(test)]

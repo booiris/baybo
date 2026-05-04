@@ -231,6 +231,33 @@ impl CostStore for MemoryCostStore {
         Ok(summary)
     }
 
+    async fn query_session(&self, session_id: &SessionId) -> CostResult<CostSummary> {
+        let mut summary = CostSummary::default();
+        for r in self
+            .records
+            .lock()
+            .iter()
+            .filter(|r| &r.session_id == session_id)
+        {
+            summary.total_cost_usd += r.cost_usd;
+            summary.total_input_tokens += r.input_tokens;
+            summary.total_output_tokens += r.output_tokens;
+            summary.record_count += 1;
+        }
+        Ok(summary)
+    }
+
+    async fn query_job(&self, job_id: &JobId) -> CostResult<CostSummary> {
+        let mut summary = CostSummary::default();
+        for r in self.records.lock().iter().filter(|r| &r.job_id == job_id) {
+            summary.total_cost_usd += r.cost_usd;
+            summary.total_input_tokens += r.input_tokens;
+            summary.total_output_tokens += r.output_tokens;
+            summary.record_count += 1;
+        }
+        Ok(summary)
+    }
+
     async fn bump_user_monthly_cost(
         &self,
         user_id: &str,
@@ -271,6 +298,16 @@ impl CostStore for MemoryCostStore {
         let before = map.len();
         map.retain(|_, v| v.updated_at >= cutoff);
         Ok((before - map.len()) as u64)
+    }
+
+    async fn purge_cost_records_older_than(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> CostResult<u64> {
+        let mut records = self.records.lock();
+        let before = records.len();
+        records.retain(|r| r.timestamp >= cutoff);
+        Ok((before - records.len()) as u64)
     }
 
     async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64> {

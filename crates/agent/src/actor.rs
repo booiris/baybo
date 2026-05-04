@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, IncomingMessage, OutgoingMessage};
+use aura_channels::{AgentOutput, IncomingMessage, JobOutcome, OutgoingMessage};
 use aura_cron::TriggerAction;
 use aura_hook::{HookContext, HookEventData, HookManager, HookPoint};
 use aura_job::{JobInput, JobOutput};
@@ -142,7 +142,7 @@ impl AgentActor {
         let content = vec![ContentBlock::Text(format!(
             "[{source}:{source_id}] {prompt}"
         ))];
-        let response = self
+        let result = self
             .agent_loop
             .run(
                 &mut self.session,
@@ -153,12 +153,34 @@ impl AgentActor {
                 parent_job_id,
                 None,
             )
-            .await?;
+            .await;
+
+        let outcome = match &result {
+            Ok(_) => JobOutcome::Completed,
+            Err(_) => JobOutcome::Failed,
+        };
+        let response = result?;
 
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send {source} response to channel");
         }
+        self.emit_job_completed(outcome).await;
         Ok(())
+    }
+
+    /// Emit a `JobCompleted` terminal signal on the response channel.
+    /// `job_id` is left empty — current subscribers (subagent runtime)
+    /// only need terminal-state detection, not job-level matching. Plumb
+    /// the real id through `agent_loop.run` if a subscriber starts to.
+    async fn emit_job_completed(&self, outcome: JobOutcome) {
+        let signal = AgentOutput::JobCompleted {
+            session_id: self.session.id.to_string(),
+            job_id: String::new(),
+            outcome,
+        };
+        if let Err(e) = self.response_tx.send(signal).await {
+            debug!(error = %e, "failed to send JobCompleted signal");
+        }
     }
 
     /// Execute a tool directly for a cron job, falling back to LLM on failure.
@@ -276,6 +298,7 @@ impl AgentActor {
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send cron tool result to channel");
         }
+        self.emit_job_completed(JobOutcome::Completed).await;
         Ok(())
     }
 
@@ -303,6 +326,7 @@ impl AgentActor {
             .await
             .ok();
         self.job_lifecycle.fail(&job_id, reason.clone()).await.ok();
+        self.emit_job_completed(JobOutcome::Failed).await;
         warn!(
             cron_job_id = %cron_job_id,
             tool = %tool_name,
@@ -348,7 +372,7 @@ impl AgentActor {
         // Run the agent loop. Pass a clone of the response channel so the
         // loop can stream text deltas as `AgentOutput::Delta` while the
         // final assembled message still flows through the normal path.
-        let response = self
+        let result = self
             .agent_loop
             .run(
                 &mut self.session,
@@ -361,7 +385,12 @@ impl AgentActor {
                 None,
                 Some(self.response_tx.clone()),
             )
-            .await?;
+            .await;
+        let outcome = match &result {
+            Ok(_) => JobOutcome::Completed,
+            Err(_) => JobOutcome::Failed,
+        };
+        let response = result?;
 
         // PreResponse hook
         let mut hook_ctx = HookContext {
@@ -382,6 +411,7 @@ impl AgentActor {
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send response to channel");
         }
+        self.emit_job_completed(outcome).await;
 
         Ok(())
     }

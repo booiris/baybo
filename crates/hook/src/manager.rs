@@ -1,20 +1,35 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tracing::{debug, warn};
 
-use crate::{Hook, HookAction, HookContext, HookPoint, Result};
+use crate::{HOOK_AUTO_DISABLE_AFTER_TIMEOUTS, Hook, HookAction, HookContext, HookPoint, Result};
 
 /// Stores registered hooks and triggers them at the appropriate lifecycle points.
 ///
 /// Hooks for the same `HookPoint` are executed serially in registration order.
 /// Decision precedence: `Abort` > `Block` > `ContinueWith` > `Continue`.
+///
+/// Each hook is wrapped in its own `tokio::time::timeout` (per
+/// `Hook::timeout`). Consecutive timeouts are counted; once a hook
+/// crosses [`HOOK_AUTO_DISABLE_AFTER_TIMEOUTS`] it is auto-disabled
+/// for the rest of the process lifetime so a wedged hook stops adding
+/// per-call latency to every subsequent fire. Successful fires reset
+/// the counter — a hook that misses occasionally is not penalised.
 pub struct HookManager {
     hooks: HashMap<HookPoint, Vec<RegisteredHook>>,
+}
+
+#[derive(Debug, Default)]
+struct HookHealth {
+    consecutive_timeouts: AtomicU32,
+    disabled: AtomicBool,
 }
 
 struct RegisteredHook {
     critical: bool,
     hook: Box<dyn Hook>,
+    health: HookHealth,
 }
 
 impl HookManager {
@@ -31,6 +46,7 @@ impl HookManager {
         self.hooks.entry(point).or_default().push(RegisteredHook {
             critical,
             hook: Box::new(hook),
+            health: HookHealth::default(),
         });
         debug!("Registered hook for {:?}", point);
     }
@@ -52,8 +68,12 @@ impl HookManager {
         let matcher_target = ctx.event_data.matcher_target().map(|s| s.to_string());
         let mut final_block: Option<String> = None;
 
-        for registered in hooks {
+        for registered in hooks.iter() {
             let hook_name = registered.hook.name();
+
+            if registered.health.disabled.load(Ordering::Relaxed) {
+                continue;
+            }
 
             // Evaluate matcher: skip this hook if the matcher doesn't match.
             if let Some(matcher) = registered.hook.matcher() {
@@ -74,7 +94,44 @@ impl HookManager {
 
             debug!("Executing hook '{}' at {:?}", hook_name, point);
 
-            let result = registered.hook.execute(ctx).await;
+            let timeout = registered.hook.timeout();
+            let exec = registered.hook.execute(ctx);
+            let result = match tokio::time::timeout(timeout, exec).await {
+                Ok(r) => {
+                    registered
+                        .health
+                        .consecutive_timeouts
+                        .store(0, Ordering::Relaxed);
+                    r
+                }
+                Err(_elapsed) => {
+                    let consecutive = registered
+                        .health
+                        .consecutive_timeouts
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    if consecutive >= HOOK_AUTO_DISABLE_AFTER_TIMEOUTS {
+                        registered.health.disabled.store(true, Ordering::Relaxed);
+                        warn!(
+                            hook = hook_name,
+                            ?point,
+                            timeout_ms = timeout.as_millis() as u64,
+                            consecutive,
+                            "hook auto-disabled after consecutive timeouts"
+                        );
+                    } else {
+                        warn!(
+                            hook = hook_name,
+                            ?point,
+                            timeout_ms = timeout.as_millis() as u64,
+                            consecutive,
+                            "hook exceeded timeout, treating as Continue"
+                        );
+                    }
+                    // Default-allow: a degraded hook does not block the chain.
+                    continue;
+                }
+            };
 
             match result {
                 Ok(HookAction::Continue) => {}
@@ -733,5 +790,99 @@ mod tests {
 
         assert_eq!(counter_all.load(Ordering::SeqCst), 1); // fires
         assert_eq!(counter_exact.load(Ordering::SeqCst), 0); // skipped
+    }
+
+    // -- Per-hook timeout / auto-disable --
+
+    struct SlowHook {
+        hook_name: &'static str,
+        point: HookPoint,
+        sleep: std::time::Duration,
+        budget: std::time::Duration,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Hook for SlowHook {
+        fn name(&self) -> &str {
+            self.hook_name
+        }
+        fn hook_point(&self) -> HookPoint {
+            self.point
+        }
+        fn timeout(&self) -> std::time::Duration {
+            self.budget
+        }
+        async fn execute(&self, _ctx: &mut HookContext) -> Result<HookAction> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.sleep).await;
+            Ok(HookAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_treated_as_continue_and_chain_proceeds() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut manager = HookManager::new();
+
+        manager.register(SlowHook {
+            hook_name: "slow",
+            point: HookPoint::PreMessage,
+            sleep: std::time::Duration::from_millis(50),
+            budget: std::time::Duration::from_millis(5),
+            invocations: invocations.clone(),
+        });
+        manager.register(CountingHook {
+            hook_name: "after-slow",
+            point: HookPoint::PreMessage,
+            counter: counter.clone(),
+        });
+
+        let mut ctx = make_ctx();
+        let action = manager
+            .trigger(HookPoint::PreMessage, &mut ctx)
+            .await
+            .unwrap();
+        assert!(matches!(action, HookAction::Continue));
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "slow hook still fired once"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "second hook still ran");
+    }
+
+    #[tokio::test]
+    async fn auto_disabled_after_consecutive_timeouts() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut manager = HookManager::new();
+        manager.register(SlowHook {
+            hook_name: "always-slow",
+            point: HookPoint::PreMessage,
+            sleep: std::time::Duration::from_millis(50),
+            budget: std::time::Duration::from_millis(5),
+            invocations: invocations.clone(),
+        });
+
+        for _ in 0..(crate::HOOK_AUTO_DISABLE_AFTER_TIMEOUTS as usize) {
+            let mut ctx = make_ctx();
+            manager
+                .trigger(HookPoint::PreMessage, &mut ctx)
+                .await
+                .unwrap();
+        }
+        let after_disable_threshold = invocations.load(Ordering::SeqCst);
+        // One more trigger after the threshold should be skipped entirely.
+        let mut ctx = make_ctx();
+        manager
+            .trigger(HookPoint::PreMessage, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            after_disable_threshold,
+            "hook must not fire after auto-disable",
+        );
     }
 }

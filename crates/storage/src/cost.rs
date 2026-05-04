@@ -79,6 +79,14 @@ pub trait CostStore: Send + Sync {
     /// Return an aggregated summary of all records within the given time range.
     async fn query_global(&self, range: TimeRange) -> CostResult<CostSummary>;
 
+    /// Return the aggregated cost summary for a single session. Drives
+    /// `QueryApi::cost_summary(CostScope::Session)`.
+    async fn query_session(&self, session_id: &aura_model::SessionId) -> CostResult<CostSummary>;
+
+    /// Return the aggregated cost summary for a single job. Drives
+    /// `QueryApi::cost_summary(CostScope::Job)`.
+    async fn query_job(&self, job_id: &aura_model::JobId) -> CostResult<CostSummary>;
+
     /// Return the sum of `cost_usd` for a user within the given time range.
     async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64>;
 
@@ -108,4 +116,11 @@ pub trait CostStore: Send + Sync {
     /// before `cutoff`. Returns the number of rows touched. Periodic
     /// invocation lives in `aura-janitor` (see retention policy).
     async fn purge_user_monthly_cost_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64>;
+
+    /// Hard-delete raw `cost_records` rows whose `timestamp` is strictly
+    /// before `cutoff`. Returns the number of rows removed. The
+    /// per-month aggregate in `user_monthly_cost` is the durable
+    /// rollup; raw records past the retention horizon stop being
+    /// useful and grow linearly with traffic, so they're safe to drop.
+    async fn purge_cost_records_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64>;
 }

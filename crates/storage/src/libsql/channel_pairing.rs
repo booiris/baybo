@@ -251,6 +251,20 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
         .map_err(|e| format!("libsql delete: {e}"))?;
         Ok(())
     }
+
+    async fn purge_expired(&self, now_secs: i64, approved_cutoff_secs: i64) -> Result<u64, String> {
+        let conn = self.pool.conn();
+        let affected = conn
+            .execute(
+                "DELETE FROM channel_pairings \
+                 WHERE (status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1) \
+                    OR (status = 'approved' AND approved_at IS NOT NULL AND approved_at < ?2)",
+                libsql::params![now_secs, approved_cutoff_secs],
+            )
+            .await
+            .map_err(|e| format!("libsql delete: {e}"))?;
+        Ok(affected)
+    }
 }
 
 #[cfg(test)]

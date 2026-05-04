@@ -723,6 +723,16 @@ mod tests {
                 .cloned()
                 .collect())
         }
+
+        async fn purge_completed_executions_older_than(
+            &self,
+            cutoff_us: i64,
+        ) -> aura_storage::cron::Result<u64> {
+            let mut execs = self.executions.lock();
+            let before = execs.len();
+            execs.retain(|r| !(r.triggered_at < cutoff_us && r.status != "pending"));
+            Ok((before - execs.len()) as u64)
+        }
     }
 
     fn make_scheduler(

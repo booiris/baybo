@@ -27,6 +27,7 @@ use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::soul::Soul;
+use aura_agent::subagent::{LocalSubagentRuntime, SubagentRuntime};
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
@@ -519,59 +520,111 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         aura_agent::cost::CostSubscriber::new(graph.cost_store.clone(), pricing)
             .spawn(&trace_event_stream);
 
+    // Spawner-vs-runtime build cycle: closure captures the slot and is
+    // built first, then `LocalSubagentRuntime` patches itself in.
+    let subagent_runtime_slot: Arc<std::sync::OnceLock<Arc<dyn SubagentRuntime>>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    // Single Arc-shared factory: router's `ActorSpawner` and
+    // `LocalSubagentRuntime` both spawn the same fully-wired actor.
+    let spawn_actor_for: Arc<
+        dyn Fn(
+                aura_model::Session,
+                mpsc::Sender<AgentOutput>,
+            ) -> mpsc::Sender<aura_agent::actor::AgentMessage>
+            + Send
+            + Sync,
+    > = {
+        let actor_llm_client = Arc::clone(&actor_llm_client);
+        let actor_tool_registry = Arc::clone(&actor_tool_registry);
+        let actor_skill_registry = Arc::clone(&actor_skill_registry);
+        let actor_tool_executor = Arc::clone(&actor_tool_executor);
+        let actor_memory_manager = Arc::clone(&actor_memory_manager);
+        let actor_tokenizer = Arc::clone(&actor_tokenizer);
+        let actor_hooks = Arc::clone(&actor_hooks);
+        let actor_trace_store = actor_trace_store.clone();
+        let actor_trace_event_store = actor_trace_event_store.clone();
+        let actor_job_lifecycle = Arc::clone(&actor_job_lifecycle);
+        let actor_skill_assessor = Arc::clone(&actor_skill_assessor);
+        let actor_security_gateway = Arc::clone(&actor_security_gateway);
+        let actor_session_logger = Arc::clone(&actor_session_logger);
+        let actor_trace_event_stream = actor_trace_event_stream.clone();
+        let subagent_runtime_slot_for_spawner = Arc::clone(&subagent_runtime_slot);
+        let token_budget = token_budget.clone();
+        let policy = policy.clone();
+        let system_prompt = system_prompt.clone();
+
+        Arc::new(
+            move |session: aura_model::Session, response_tx: mpsc::Sender<AgentOutput>| {
+                let mut agent_loop = AgentLoop::new(
+                    Arc::clone(&actor_llm_client),
+                    Arc::clone(&actor_tool_registry),
+                    Arc::clone(&actor_skill_registry),
+                    Arc::clone(&actor_tool_executor),
+                    ContextManager::new(
+                        Arc::clone(&actor_tokenizer),
+                        Box::new(Truncate::new(keep_recent)),
+                        token_budget.clone(),
+                    ),
+                    Arc::clone(&actor_memory_manager),
+                    policy.clone(),
+                    Soul::custom(system_prompt.clone()),
+                    Arc::clone(&actor_security_gateway),
+                )
+                .with_skill_assessor(Arc::clone(&actor_skill_assessor))
+                .with_session_log(Arc::clone(&actor_session_logger))
+                .with_hooks(Arc::clone(&actor_hooks));
+
+                if let Some(rt) = subagent_runtime_slot_for_spawner.get() {
+                    agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
+                }
+
+                let span_recorder = Arc::new(
+                    SpanRecorder::new(
+                        session.id.clone(),
+                        session.user.id.clone(),
+                        Arc::clone(&actor_trace_store),
+                        Arc::clone(&actor_trace_event_store),
+                    )
+                    .with_stream(actor_trace_event_stream.clone()),
+                );
+
+                let actor = AgentActor::new(
+                    session,
+                    agent_loop,
+                    Arc::clone(&actor_tool_executor),
+                    response_tx,
+                    Arc::clone(&actor_hooks),
+                    Arc::clone(&actor_job_lifecycle),
+                    span_recorder,
+                );
+                let (sender, mailbox) = mpsc::channel(buffer);
+                tokio::spawn(async move {
+                    actor.run(mailbox).await;
+                });
+                sender
+            },
+        )
+    };
+
+    let local_subagent_runtime: Arc<dyn SubagentRuntime> = Arc::new(LocalSubagentRuntime::new(
+        Arc::clone(&graph.session_manager),
+        Arc::clone(&spawn_actor_for),
+    ));
+    // Sole `set` site in the process — `is_err()` is unreachable barring
+    // a programming error in this file.
+    let set_ok = subagent_runtime_slot.set(local_subagent_runtime).is_ok();
+    debug_assert!(set_ok);
+
     let router = Router::new(
         Arc::clone(&graph.session_manager),
         supervisor,
         Arc::clone(&graph.channels_registry),
         Arc::clone(&graph.security_gateway),
     )
-    .with_actor_spawner(Box::new(move |session, response_tx| {
-        let agent_loop = AgentLoop::new(
-            Arc::clone(&actor_llm_client),
-            Arc::clone(&actor_tool_registry),
-            Arc::clone(&actor_skill_registry),
-            Arc::clone(&actor_tool_executor),
-            ContextManager::new(
-                Arc::clone(&actor_tokenizer),
-                Box::new(Truncate::new(keep_recent)),
-                token_budget.clone(),
-            ),
-            Arc::clone(&actor_memory_manager),
-            policy.clone(),
-            Soul::custom(system_prompt.clone()),
-            Arc::clone(&actor_security_gateway),
-        )
-        .with_skill_assessor(Arc::clone(&actor_skill_assessor))
-        .with_session_log(Arc::clone(&actor_session_logger))
-        .with_hooks(Arc::clone(&actor_hooks));
-
-        // Per-session `SpanRecorder` writes through to the libsql
-        // columnar tables and the WAL event log, and publishes into
-        // the shared process-wide stream so the single CostSubscriber
-        // can attribute every `LlmSpanEnded` to `cost_records`.
-        let span_recorder = Arc::new(
-            SpanRecorder::new(
-                session.id.clone(),
-                Arc::clone(&actor_trace_store),
-                Arc::clone(&actor_trace_event_store),
-            )
-            .with_stream(actor_trace_event_stream.clone()),
-        );
-
-        let actor = AgentActor::new(
-            session,
-            agent_loop,
-            Arc::clone(&actor_tool_executor),
-            response_tx,
-            Arc::clone(&actor_hooks),
-            Arc::clone(&actor_job_lifecycle),
-            span_recorder,
-        );
-        let (sender, mailbox) = mpsc::channel(buffer);
-        tokio::spawn(async move {
-            actor.run(mailbox).await;
-        });
-        sender
+    .with_actor_spawner(Box::new({
+        let spawn_actor_for = Arc::clone(&spawn_actor_for);
+        move |session, response_tx| spawn_actor_for(session, response_tx)
     }));
 
     // Attach cron triggers eagerly — a caller who forgot to plumb the

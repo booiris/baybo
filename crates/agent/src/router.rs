@@ -331,6 +331,10 @@ impl Router {
             AgentOutput::Message(outgoing) => {
                 (outgoing.session_id.clone(), outgoing.channel.clone())
             }
+            // Internal completion signal — observed by the subagent
+            // runtime over its dedicated output channel; the top-level
+            // router has no channel surface to forward it to.
+            AgentOutput::JobCompleted { .. } => return,
         };
 
         // `Message` is the only variant that carries user-visible prose

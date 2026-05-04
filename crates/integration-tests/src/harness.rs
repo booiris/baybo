@@ -228,6 +228,7 @@ impl AgentTestHarnessBuilder {
             Arc::new(MemoryTraceEventStore::new());
         let span_recorder = Arc::new(SpanRecorder::new(
             session.id.clone(),
+            session.user.id.clone(),
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
             trace_event_store,
         ));

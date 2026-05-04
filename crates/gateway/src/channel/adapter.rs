@@ -77,8 +77,11 @@ impl Sidecar {
         let translator_blobs = Arc::clone(&blob_store);
         tokio::spawn(async move {
             while let Some(output) = output_rx.recv().await {
-                let frame =
-                    agent_output_to_frame(output, &translator_ct, translator_blobs.as_ref()).await;
+                let Some(frame) =
+                    agent_output_to_frame(output, &translator_ct, translator_blobs.as_ref()).await
+                else {
+                    continue;
+                };
                 if translator_tx.send(frame).await.is_err() {
                     break;
                 }
@@ -203,21 +206,21 @@ async fn agent_output_to_frame(
     output: AgentOutput,
     channel_type: &ChannelType,
     blob_store: &dyn BlobStore,
-) -> Frame {
+) -> Option<Frame> {
     match output {
         AgentOutput::Delta {
             session_id,
             user_id,
             text,
             ..
-        } => Frame::Delta {
+        } => Some(Frame::Delta {
             session_id,
             user_id,
             text,
-        },
+        }),
         AgentOutput::Message(response) => {
             let (content, attachments) = split_content(&response.content, blob_store).await;
-            Frame::Message(WireMessage {
+            Some(Frame::Message(WireMessage {
                 content,
                 session_id: response.session_id,
                 // Populate with the addressee so sidecars can route by
@@ -231,7 +234,7 @@ async fn agent_output_to_frame(
                 bot_id: String::new(),
                 attachments,
                 platform_msg_id: String::new(),
-            })
+            }))
         }
         AgentOutput::Notice {
             session_id,
@@ -244,13 +247,15 @@ async fn agent_output_to_frame(
                 NoticeLevel::Warn => "warn",
                 NoticeLevel::Error => "error",
             };
-            Frame::Notice {
+            Some(Frame::Notice {
                 session_id,
                 user_id,
                 level: level.to_owned(),
                 text,
-            }
+            })
         }
+        // Internal completion signal — never crosses the wire.
+        AgentOutput::JobCompleted { .. } => None,
     }
 }
 
