@@ -23,7 +23,7 @@ pub use memory::LibsqlMemoryStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
 pub use skill_risk::LibsqlSkillRiskStore;
-pub use trace::{LibsqlTraceEventStore, LibsqlTraceStore};
+pub use trace::LibsqlTraceStore;
 
 use std::sync::Arc;
 
@@ -246,22 +246,6 @@ impl LibsqlPool {
                     PRIMARY KEY (span_id, seq)
                 );
 
-                -- Append-only WAL log of step / span begin / end events
-                -- plus job transitions. Recovery source of truth — survives
-                -- crashes that left the columnar tables behind.
-                CREATE TABLE IF NOT EXISTS trace_events (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id  TEXT    NOT NULL,
-                    job_id      TEXT    NOT NULL,
-                    at          INTEGER NOT NULL,
-                    data        TEXT    NOT NULL,
-                    deleted_at  INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS idx_trace_events_session
-                    ON trace_events(session_id, at) WHERE deleted_at IS NULL;
-                CREATE INDEX IF NOT EXISTS idx_trace_events_at
-                    ON trace_events(at) WHERE deleted_at IS NULL;
-
                 CREATE TABLE IF NOT EXISTS cron_jobs (
                     id              TEXT    PRIMARY KEY,
                     user_id         TEXT    NOT NULL,
@@ -361,7 +345,13 @@ impl LibsqlPool {
                     PRIMARY KEY (channel_type, bot_id, user_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_pairings_code
-                    ON channel_pairings(code) WHERE deleted_at IS NULL;",
+                    ON channel_pairings(code) WHERE deleted_at IS NULL;
+
+                -- Legacy WAL table from the dropped two-layer trace design.
+                -- No reader ever consumed it; drop on upgrade so it stops
+                -- accumulating writes from any pre-update binary that
+                -- happens to share the file.
+                DROP TABLE IF EXISTS trace_events;",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;

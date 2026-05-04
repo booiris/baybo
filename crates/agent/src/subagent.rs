@@ -73,7 +73,6 @@ pub struct SubagentSpawnRequest {
 #[derive(Debug, Clone)]
 pub struct SubagentResult {
     pub child_session_id: SessionId,
-    pub child_root_job_id: Option<JobId>,
     pub final_content: Option<Vec<ContentBlock>>,
     pub status: SubagentExitStatus,
 }
@@ -117,22 +116,19 @@ impl SubagentResult {
     }
 }
 
-/// Pre-created child plus the JobId the runtime intends to use for
-/// the child's root job. Returned by [`SubagentRuntime::prepare`] so
-/// the parent can open its `StepKind::Subagent` step with real IDs
-/// instead of placeholders.
+/// Pre-created child session. Returned by [`SubagentRuntime::prepare`]
+/// so the parent can open its `StepKind::Subagent` step with the real
+/// child session id instead of a placeholder.
 pub struct PreparedSubagent {
     pub child_session: aura_model::Session,
-    pub planned_root_job_id: JobId,
 }
 
 /// Spawn a child agent session and wait for it to terminate.
 ///
 /// Two-phase API:
 /// 1. [`prepare`](Self::prepare) synchronously creates the child session
-///    row and pre-mints the root JobId. Callers use these values to
-///    open the `StepKind::Subagent` step with real provenance before
-///    dispatch.
+///    row. Callers use the returned id to open the
+///    `StepKind::Subagent` step before dispatch.
 /// 2. [`run`](Self::run) drives the child to terminal state. Cancellation
 ///    is via [`tokio_util::sync::CancellationToken`] — the runtime
 ///    derives a child token so the parent's cancel cascades the entire
@@ -217,10 +213,7 @@ impl SubagentRuntime for LocalSubagentRuntime {
             .create_spawned_session(child_user, child_channel, parent_session, lineage)
             .await
             .map_err(|e| format!("create child session: {e}"))?;
-        Ok(PreparedSubagent {
-            child_session,
-            planned_root_job_id: JobId::new(),
-        })
+        Ok(PreparedSubagent { child_session })
     }
 
     async fn run(
@@ -267,13 +260,11 @@ impl SubagentRuntime for LocalSubagentRuntime {
             .send(AgentMessage::SubagentSpawned {
                 initial_message: Box::new(incoming),
                 parent_job_id,
-                planned_root_job_id: prepared.planned_root_job_id,
             })
             .await
         {
             return SubagentResult {
                 child_session_id: child_session.id,
-                child_root_job_id: Some(prepared.planned_root_job_id),
                 final_content: None,
                 status: SubagentExitStatus::Failed(format!("dispatch child input: {e}")),
             };
@@ -330,17 +321,14 @@ impl SubagentRuntime for LocalSubagentRuntime {
         //    if the actor already exited that is fine.
         let _ = mailbox.send(AgentMessage::Shutdown).await;
 
-        let child_root_job_id = Some(prepared.planned_root_job_id);
         match wait_result {
             Ok(Ok(content)) => SubagentResult {
                 child_session_id: child_session.id,
-                child_root_job_id,
                 final_content: content,
                 status: SubagentExitStatus::Completed,
             },
             Ok(Err(status)) => SubagentResult {
                 child_session_id: child_session.id,
-                child_root_job_id,
                 final_content: None,
                 status,
             },
@@ -353,7 +341,6 @@ impl SubagentRuntime for LocalSubagentRuntime {
                 child_token.cancel();
                 SubagentResult {
                     child_session_id: child_session.id,
-                    child_root_job_id,
                     final_content: None,
                     status: SubagentExitStatus::Timeout,
                 }
@@ -441,7 +428,6 @@ mod tests {
     fn to_tool_result_text_completed_extracts_text() {
         let r = SubagentResult {
             child_session_id: SessionId::from("c"),
-            child_root_job_id: None,
             final_content: Some(vec![ContentBlock::Text("hello".into())]),
             status: SubagentExitStatus::Completed,
         };
@@ -452,7 +438,6 @@ mod tests {
     fn to_tool_result_text_failure_modes_carry_reason() {
         let r = SubagentResult {
             child_session_id: SessionId::from("c"),
-            child_root_job_id: None,
             final_content: None,
             status: SubagentExitStatus::Failed("boom".into()),
         };
@@ -460,7 +445,6 @@ mod tests {
 
         let r = SubagentResult {
             child_session_id: SessionId::from("c"),
-            child_root_job_id: None,
             final_content: None,
             status: SubagentExitStatus::Timeout,
         };

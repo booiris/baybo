@@ -6,7 +6,7 @@
 //!
 //! No persistence here — `agent::trace::SpanRecorder` (in `aura-agent`)
 //! owns lifecycle and writes; `aura-storage` defines the `TraceStore`
-//! and `TraceEventStore` traits.
+//! trait.
 
 mod error;
 mod event;

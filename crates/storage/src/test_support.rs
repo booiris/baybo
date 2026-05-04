@@ -432,55 +432,6 @@ impl TraceStore for MemoryTraceStore {
     }
 }
 
-/// In-memory `TraceEventStore` for tests. Append-only WAL log; replay
-/// returns events in insertion order; compaction drops events whose
-/// `at` is strictly before the cutoff.
-#[derive(Debug, Default)]
-pub struct MemoryTraceEventStore {
-    by_session: Mutex<HashMap<aura_model::SessionId, Vec<crate::trace::TraceLogEvent>>>,
-}
-
-impl MemoryTraceEventStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl crate::trace::TraceEventStore for MemoryTraceEventStore {
-    async fn append(&self, event: &crate::trace::TraceLogEvent) -> TraceStoreResult<()> {
-        self.by_session
-            .lock()
-            .entry(event.session_id.clone())
-            .or_default()
-            .push(event.clone());
-        Ok(())
-    }
-
-    async fn replay_session(
-        &self,
-        session_id: &aura_model::SessionId,
-    ) -> TraceStoreResult<Vec<crate::trace::TraceLogEvent>> {
-        Ok(self
-            .by_session
-            .lock()
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn compact_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> TraceStoreResult<u64> {
-        let mut by_session = self.by_session.lock();
-        let mut purged = 0u64;
-        for events in by_session.values_mut() {
-            let before = events.len();
-            events.retain(|e| e.at >= cutoff);
-            purged += (before - events.len()) as u64;
-        }
-        Ok(purged)
-    }
-}
-
 /// In-memory `MemoryStore` for tests. Keyed by `entry.id`. Search is a
 /// case-insensitive substring match against `key + value` — good enough
 /// for asserting "the entry I just stored shows up in search".

@@ -4,7 +4,7 @@
 
 The `trace` crate defines domain types for the four-tier observability model (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `LlmToolCallRecord`, `ToolCallOrigin`, `DriftRecord`) and provides the recovery scan utility for half-open spans.
 
-Business logic (`SpanRecorder` — span lifecycle management, persistence, and `TraceEvent` emission) lives in `agent::trace`. The `TraceStore` and `TraceEventStore` traits are defined in `storage::trace`.
+Business logic (`SpanRecorder` — span lifecycle management, persistence, and `TraceEvent` emission) lives in `agent::trace`. The `TraceStore` trait is defined in `storage::trace`.
 
 Trace answers **"what exactly did this operation do"** by recording sanitized inputs, results, latency, and execution provenance. Its difference from `job` is: **Job manages state, Trace manages content.**
 
@@ -29,7 +29,7 @@ pub enum StepKind {
     MemoryRecall,
     MemoryWrite,
     SkillSelection,
-    Subagent { child_session_id: SessionId, child_root_job_id: JobId },
+    Subagent { child_session_id: SessionId },
 }
 
 pub enum SpanKind {
@@ -73,14 +73,9 @@ SpanEvents never fire hooks themselves — they are observation, not control.
 - `placeholder_ids` are kept in `SanitizeHit` so replay can resolve them via `SecretVault`
 - Apply uniform sanitization to every `SpanKind` result variant — error paths included
 
-### Two-layer WAL persistence
+### Single-table persistence
 
-Step and Span lifecycle writes flow through two physical layers:
-
-1. **Append-only event log** (`trace_events` table): every `SpanBegin`, `SpanEnd`, `StepBegin`, `StepEnd`, `JobTransition` writes one small row, fsync immediate. Survives crash.
-2. **Columnar main tables** (`steps`, `spans`, `span_events`): crystallized at Span/Step end. Indexed for query.
-
-The event log is the recovery ground truth. Main tables are reconstructable from it if they fall behind.
+Step and Span lifecycle writes go directly to the columnar main tables (`steps`, `spans`, `span_events`). Each row carries queryable columns (`kind`, `started_at`, `ended_at`, `outcome`, `parallel_group`) plus a JSON `data` blob for full-fidelity round-trip. The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was removed once it became clear no reader consumed it: recovery scans the columnar `spans` table directly, and there is no replay / OTel-export path yet that would benefit from the append-only log. If one is added later, the WAL can come back together with its consumer.
 
 ### Async writes with LLM/tool fences
 
@@ -101,8 +96,8 @@ When listing jobs / steps / spans for a session whose `Lineage` is `UserFork { f
 - Types crate with recovery utility — no facade or persistence logic (those live in `agent::trace::SpanRecorder`)
 - Depends on `aura-job` (for `JobId`, `CancelReason`, `DriftRecord`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.)
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
-- Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity), plus the append-only `trace_events` log; the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
-- Soft-delete protocol applies to all main tables; the append-only event log is compactable at the retention horizon
+- Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
+- Soft-delete protocol applies to all main tables
 - `SpanRecorder` (in `agent::trace`) holds locks only for short critical sections, never across `await`
 
 ## Collaboration
@@ -111,6 +106,6 @@ When listing jobs / steps / spans for a session whose `Lineage` is `UserFork { f
 | --------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `job`     | Job manages state, Trace manages content; linked via `JobId`; `partial_artifacts: Vec<SpanId>` references trace spans         |
 | `agent`   | `agent::trace::SpanRecorder` owns span lifecycle + `TraceEvent` emission; `JobLifecycle` and `SpanRecorder` are sibling facades |
-| `storage` | Defines `TraceStore` and `TraceEventStore` traits; provides libsql implementations of both                                    |
+| `storage` | Defines the `TraceStore` trait; provides the libsql implementation                                                              |
 | `model`   | Provides `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, `PlaceholderId`, `ApprovalDecision`, `ResourceAccess`       |
 | `hook`    | `SpanEvent::HookDegraded` records hook timeout / disabling decisions made by the hook router                                  |

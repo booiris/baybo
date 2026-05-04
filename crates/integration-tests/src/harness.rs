@@ -24,8 +24,7 @@ use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_storage::test_support::{
-    MemoryCostStore, MemoryJobStore, MemoryMemoryStore, MemorySecretStore, MemoryTraceEventStore,
-    MemoryTraceStore,
+    MemoryCostStore, MemoryJobStore, MemoryMemoryStore, MemorySecretStore, MemoryTraceStore,
 };
 use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use chrono::Utc;
@@ -224,13 +223,10 @@ impl AgentTestHarnessBuilder {
         let memory_store = Arc::new(MemoryMemoryStore::new());
 
         let job_lifecycle = Arc::new(JobLifecycle::new(share_job_store(&job_store)));
-        let trace_event_store: Arc<dyn aura_storage::TraceEventStore> =
-            Arc::new(MemoryTraceEventStore::new());
         let span_recorder = Arc::new(SpanRecorder::new(
             session.id.clone(),
             session.user.id.clone(),
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
-            trace_event_store,
         ));
         // Cost subscriber: pricing left empty for tests — token
         // counts still land in cost_records, cost_usd reads as 0.

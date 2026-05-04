@@ -1,15 +1,14 @@
-//! libsql implementation of `TraceStore` + `TraceEventStore`.
+//! libsql implementation of `TraceStore`.
 //!
 //! Schema lives in `super::mod::init_db` (`steps`, `spans`,
-//! `span_events`, `trace_events`). Soft-delete + recovery semantics are
-//! enforced here.
+//! `span_events`). Soft-delete + recovery semantics are enforced here.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 use super::LibsqlPool;
-use crate::trace::{TraceEventStore, TraceLogEvent, TraceStore};
-use aura_model::{JobId, SessionId, SpanId, StepId};
+use crate::trace::TraceStore;
+use aura_model::{JobId, SpanId, StepId};
 use aura_trace::{
     LifecycleOutcome, RecoveredSpan, RecoveryReport, Span, SpanEvent, Step, TraceError,
 };
@@ -19,16 +18,6 @@ pub struct LibsqlTraceStore {
 }
 
 impl LibsqlTraceStore {
-    pub fn new(pool: LibsqlPool) -> Self {
-        Self { pool }
-    }
-}
-
-pub struct LibsqlTraceEventStore {
-    pool: LibsqlPool,
-}
-
-impl LibsqlTraceEventStore {
     pub fn new(pool: LibsqlPool) -> Self {
         Self { pool }
     }
@@ -347,71 +336,6 @@ impl TraceStore for LibsqlTraceStore {
     }
 }
 
-#[async_trait]
-impl TraceEventStore for LibsqlTraceEventStore {
-    async fn append(&self, event: &TraceLogEvent) -> aura_trace::Result<()> {
-        let conn = self.pool.conn();
-        let data = serde_json::to_string(event)
-            .map_err(|e| TraceError::Storage(format!("serialize trace_event: {e}")))?;
-        conn.execute(
-            "INSERT INTO trace_events (session_id, job_id, at, data) \
-             VALUES (?1, ?2, ?3, ?4)",
-            libsql::params![
-                event.session_id.as_str().to_string(),
-                event.job_id.to_string(),
-                super::time::to_us(event.at),
-                data,
-            ],
-        )
-        .await
-        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert trace_event: {e}")))?;
-        Ok(())
-    }
-
-    async fn replay_session(
-        &self,
-        session_id: &SessionId,
-    ) -> aura_trace::Result<Vec<TraceLogEvent>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data FROM trace_events \
-                 WHERE session_id = ?1 AND deleted_at IS NULL ORDER BY id",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-
-        let mut events = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            events.push(
-                serde_json::from_str(&data)
-                    .map_err(|e| TraceError::Storage(format!("deserialize trace_event: {e}")))?,
-            );
-        }
-        Ok(events)
-    }
-
-    async fn compact_before(&self, cutoff: DateTime<Utc>) -> aura_trace::Result<u64> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "DELETE FROM trace_events WHERE at < ?1",
-                libsql::params![super::time::to_us(cutoff)],
-            )
-            .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
-        Ok(affected)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,26 +470,5 @@ mod tests {
         let listed = store.list_span_events(&span_id).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].seq, 0);
-    }
-
-    #[tokio::test]
-    async fn trace_event_log_round_trips() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceEventStore::new(pool);
-        let session_id = SessionId::from("cli-1");
-        let job_id = JobId::new();
-        let step_id = StepId::new();
-        let event = TraceLogEvent {
-            session_id: session_id.clone(),
-            job_id,
-            at: Utc::now(),
-            kind: crate::trace::TraceLogEventKind::StepBegin {
-                step_id,
-                payload: serde_json::json!({}),
-            },
-        };
-        store.append(&event).await.unwrap();
-        let replayed = store.replay_session(&session_id).await.unwrap();
-        assert_eq!(replayed.len(), 1);
     }
 }

@@ -36,11 +36,6 @@ pub enum AgentMessage {
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
         parent_job_id: aura_model::JobId,
-        /// Pre-minted root `JobId` from `LocalSubagentRuntime::prepare`.
-        /// The child actor uses this when calling `agent_loop.run` so the
-        /// parent's `StepKind::Subagent { child_root_job_id }` edge
-        /// resolves to the actual row in the `jobs` table.
-        planned_root_job_id: aura_model::JobId,
     },
     /// Gracefully shut down this actor.
     Shutdown,
@@ -138,14 +133,9 @@ impl AgentActor {
                 AgentMessage::SubagentSpawned {
                     initial_message,
                     parent_job_id,
-                    planned_root_job_id,
                 } => {
                     if let Err(e) = self
-                        .handle_subagent_spawned(
-                            *initial_message,
-                            parent_job_id,
-                            planned_root_job_id,
-                        )
+                        .handle_subagent_spawned(*initial_message, parent_job_id)
                         .await
                     {
                         error!(
@@ -487,14 +477,12 @@ impl AgentActor {
         &mut self,
         incoming: IncomingMessage,
         parent_job_id: aura_model::JobId,
-        planned_root_job_id: aura_model::JobId,
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
         let result = self
             .agent_loop
-            .run_with_planned_id(
+            .run(
                 &mut self.session,
-                Some(planned_root_job_id),
                 JobInput::Spawned {
                     initial_prompt: content.clone(),
                 },

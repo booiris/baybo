@@ -74,33 +74,6 @@ impl JobLifecycle {
         effective_soul_version: impl Into<String>,
         parent_job_id: Option<JobId>,
     ) -> Result<Job> {
-        self.start_job_with_id(
-            None,
-            session_id,
-            session_trigger_kind,
-            input,
-            effective_soul_version,
-            parent_job_id,
-        )
-        .await
-    }
-
-    /// Create a new job, optionally using a caller-supplied `JobId`.
-    ///
-    /// The subagent dispatch path uses this so the planned root job id
-    /// recorded on the parent's `StepKind::Subagent` step matches the
-    /// id of the row eventually inserted by the child actor — keeping
-    /// the lineage edge resolvable. All other callers should use
-    /// [`start_job`](Self::start_job) and let the id be minted fresh.
-    pub async fn start_job_with_id(
-        &self,
-        planned_id: Option<JobId>,
-        session_id: SessionId,
-        session_trigger_kind: TriggerKind,
-        input: JobInput,
-        effective_soul_version: impl Into<String>,
-        parent_job_id: Option<JobId>,
-    ) -> Result<Job> {
         let job_kind = input.kind();
         if !job_kind.allowed_for(session_trigger_kind) {
             return Err(JobError::KindMismatch(format!(
@@ -108,12 +81,7 @@ impl JobLifecycle {
                  (see aura_job::kind allowed-for table)"
             )));
         }
-        let job = match planned_id {
-            Some(id) => {
-                Job::new_with_id(id, session_id, input, effective_soul_version, parent_job_id)
-            }
-            None => Job::new(session_id, input, effective_soul_version, parent_job_id),
-        };
+        let job = Job::new(session_id, input, effective_soul_version, parent_job_id);
         self.store.create(&job).await?;
         Ok(job)
     }

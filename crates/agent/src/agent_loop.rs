@@ -301,37 +301,6 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
-        self.run_with_planned_id(
-            session,
-            None,
-            job_input,
-            user_content,
-            job_lifecycle,
-            span_recorder,
-            parent_job_id,
-            delta_tx,
-            cancel_token,
-        )
-        .await
-    }
-
-    /// Variant of [`run`](Self::run) that lets the caller pre-mint the
-    /// root `JobId` for this invocation. Used by the subagent dispatch
-    /// path so the parent's `StepKind::Subagent { child_root_job_id }`
-    /// edge points at the row the child actor actually creates.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_with_planned_id(
-        &mut self,
-        session: &mut Session,
-        planned_job_id: Option<JobId>,
-        job_input: JobInput,
-        user_content: Vec<ContentBlock>,
-        job_lifecycle: &Arc<JobLifecycle>,
-        span_recorder: &Arc<SpanRecorder>,
-        parent_job_id: Option<JobId>,
-        delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        cancel_token: CancellationToken,
-    ) -> anyhow::Result<OutgoingMessage> {
         // `job_input` records why this job exists (provenance: which
         // trigger kicked it off — User / Cron / System / Spawned).
         // `user_content` is what we feed the LLM as the first user
@@ -339,8 +308,7 @@ impl AgentLoop {
         // `Cron` / `System` where the input is a synthesized prompt
         // rather than the raw trigger payload.
         let job = job_lifecycle
-            .start_job_with_id(
-                planned_job_id,
+            .start_job(
                 session.id.clone(),
                 session.trigger.kind(),
                 job_input,
@@ -1213,7 +1181,6 @@ impl AgentLoop {
             None => {
                 return Ok(SubagentResult {
                     child_session_id: aura_model::SessionId::from(""),
-                    child_root_job_id: None,
                     final_content: None,
                     status: SubagentExitStatus::Failed("no subagent runtime registered".into()),
                 }
@@ -1242,15 +1209,12 @@ impl AgentLoop {
 
         // Prepare the child synchronously *before* opening the
         // Subagent step so the step kind carries the real
-        // child_session_id and the planned root JobId — not the
-        // SessionId::from("") + fresh-but-orphan JobId placeholders
-        // the previous code wrote.
+        // child_session_id instead of an empty placeholder.
         let prepared = match runtime.prepare(session, job_id, &request).await {
             Ok(p) => p,
             Err(e) => {
                 return Ok(SubagentResult {
                     child_session_id: aura_model::SessionId::from(""),
-                    child_root_job_id: None,
                     final_content: None,
                     status: SubagentExitStatus::Failed(e),
                 }
@@ -1258,14 +1222,12 @@ impl AgentLoop {
             }
         };
         let child_session_id = prepared.child_session.id.clone();
-        let child_root_job_id = prepared.planned_root_job_id;
 
         let subagent_step = span_recorder
             .begin_step(
                 job_id,
                 StepKind::Subagent {
                     child_session_id: child_session_id.clone(),
-                    child_root_job_id,
                 },
             )
             .await?;

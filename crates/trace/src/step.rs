@@ -74,9 +74,12 @@ pub enum StepKind {
     /// Special: the actual work runs in `child_session_id`. The step's
     /// inner span is a `SpanKind::SubagentStub` that records the parent's
     /// wait window only — no tool calls, no LLM calls live here.
+    ///
+    /// The child's root `JobId` is not stored here — given
+    /// `child_session_id`, callers can recover the lineage by querying
+    /// `Job` rows where `parent_job_id` matches the parent step's job.
     Subagent {
         child_session_id: SessionId,
-        child_root_job_id: JobId,
     },
 }
 
@@ -152,7 +155,6 @@ mod tests {
     fn subagent_round_trips_with_child_refs() {
         let s = fresh_step(StepKind::Subagent {
             child_session_id: SessionId::from("cli-child"),
-            child_root_job_id: JobId::new(),
         });
         let json = serde_json::to_string(&s).unwrap();
         let back: Step = serde_json::from_str(&json).unwrap();

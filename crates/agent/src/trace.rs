@@ -9,23 +9,19 @@
 use std::sync::Arc;
 
 use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
-use aura_storage::{TraceEventStore, TraceLogEvent, TraceLogEventKind, TraceStore};
+use aura_storage::TraceStore;
 use aura_trace::{
     LifecycleOutcome, Span, SpanEvent, SpanEventKind, SpanHandle, SpanKind, SpanResult, Step,
     StepHandle, StepKind, TraceError,
 };
 use chrono::Utc;
 use tokio::sync::broadcast;
-use tracing::warn;
 
 type Result<T> = std::result::Result<T, TraceError>;
 
 const TRACE_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// One event published on a session's `TraceEventStream`.
-///
-/// Mirrors the `TraceLogEvent` written to the WAL but carries fully-typed
-/// payloads convenient for in-process subscribers.
 #[derive(Debug, Clone)]
 pub enum TraceEvent {
     StepStarted {
@@ -117,22 +113,15 @@ pub struct SpanRecorder {
     session_id: SessionId,
     user_id: String,
     trace_store: Arc<dyn TraceStore>,
-    event_store: Arc<dyn TraceEventStore>,
     stream: TraceEventStream,
 }
 
 impl SpanRecorder {
-    pub fn new(
-        session_id: SessionId,
-        user_id: String,
-        trace_store: Arc<dyn TraceStore>,
-        event_store: Arc<dyn TraceEventStore>,
-    ) -> Self {
+    pub fn new(session_id: SessionId, user_id: String, trace_store: Arc<dyn TraceStore>) -> Self {
         Self {
             session_id,
             user_id,
             trace_store,
-            event_store,
             stream: TraceEventStream::new(),
         }
     }
@@ -156,8 +145,7 @@ impl SpanRecorder {
     // ── Step lifecycle ────────────────────────────────────────────
 
     /// Open a new `Step` under `job_id`. Persists immediately to the
-    /// columnar `steps` table and writes a `StepBegin` event to the
-    /// WAL log.
+    /// columnar `steps` table.
     pub async fn begin_step(&self, job_id: JobId, kind: StepKind) -> Result<StepHandle> {
         let started_at = Utc::now();
         let step_id = StepId::new();
@@ -170,14 +158,6 @@ impl SpanRecorder {
             outcome: LifecycleOutcome::Pending,
         };
         self.trace_store.save_step(&step).await?;
-        self.append_log_event(
-            job_id,
-            TraceLogEventKind::StepBegin {
-                step_id,
-                payload: serde_json::json!({ "kind": kind.tag() }),
-            },
-        )
-        .await;
         self.stream.publish(TraceEvent::StepStarted {
             step_id,
             job_id,
@@ -199,16 +179,6 @@ impl SpanRecorder {
             outcome: outcome.clone(),
         };
         self.trace_store.save_step(&step).await?;
-        self.append_log_event(
-            handle.job_id,
-            TraceLogEventKind::StepEnd {
-                step_id: handle.step_id,
-                payload: serde_json::json!({
-                    "outcome": outcome.tag(),
-                }),
-            },
-        )
-        .await;
         self.stream.publish(TraceEvent::StepEnded {
             step_id: handle.step_id,
             job_id: handle.job_id,
@@ -219,8 +189,7 @@ impl SpanRecorder {
 
     // ── Span lifecycle ────────────────────────────────────────────
 
-    /// Open a new `Span` under `step`. Persists immediately and
-    /// writes a `SpanBegin` event to the WAL log.
+    /// Open a new `Span` under `step`. Persists immediately.
     pub async fn begin_span(
         &self,
         step: &StepHandle,
@@ -241,15 +210,6 @@ impl SpanRecorder {
         };
         let kind_tag = kind.tag();
         self.trace_store.save_span(&span).await?;
-        self.append_log_event(
-            step.job_id,
-            TraceLogEventKind::SpanBegin {
-                span_id,
-                step_id: step.step_id,
-                payload: serde_json::json!({ "kind": kind_tag }),
-            },
-        )
-        .await;
         self.stream.publish(TraceEvent::SpanStarted {
             span_id,
             step_id: step.step_id,
@@ -298,7 +258,6 @@ impl SpanRecorder {
                 output_tokens: *output_tokens,
             });
         }
-        let kind_tag = final_kind.tag();
         let span = Span {
             id: handle.span_id,
             step_id: handle.step_id,
@@ -310,18 +269,6 @@ impl SpanRecorder {
             events: Vec::new(),
         };
         self.trace_store.save_span(&span).await?;
-        self.append_log_event(
-            job_id,
-            TraceLogEventKind::SpanEnd {
-                span_id: handle.span_id,
-                step_id: handle.step_id,
-                payload: serde_json::json!({
-                    "outcome": outcome.tag(),
-                    "kind": kind_tag,
-                }),
-            },
-        )
-        .await;
         self.stream.publish(TraceEvent::SpanEnded {
             span_id: handle.span_id,
             step_id: handle.step_id,
@@ -381,20 +328,6 @@ impl SpanRecorder {
     /// the actor accepts messages.
     pub async fn recover_half_open(&self) -> Result<aura_trace::RecoveryReport> {
         self.trace_store.recover_half_open_spans().await
-    }
-
-    // ── Internal: WAL log ────────────────────────────────────────
-
-    async fn append_log_event(&self, job_id: JobId, kind: TraceLogEventKind) {
-        let event = TraceLogEvent {
-            session_id: self.session_id.clone(),
-            job_id,
-            at: Utc::now(),
-            kind,
-        };
-        if let Err(e) = self.event_store.append(&event).await {
-            warn!(error = %e, "failed to append trace WAL event");
-        }
     }
 }
 
@@ -466,14 +399,13 @@ fn merge_span_kind(begin: SpanKind, result: SpanResult, span_id: &SpanId) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_storage::test_support::{MemoryTraceEventStore, MemoryTraceStore};
+    use aura_storage::test_support::MemoryTraceStore;
 
     fn make_recorder() -> SpanRecorder {
         SpanRecorder::new(
             SessionId::from("cli-test"),
             "user-test".to_string(),
             Arc::new(MemoryTraceStore::new()),
-            Arc::new(MemoryTraceEventStore::default()),
         )
     }
 

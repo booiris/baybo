@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_storage::{BlobStore, ChannelPairingStore, CostStore, CronStore, TraceEventStore};
+use aura_storage::{BlobStore, ChannelPairingStore, CostStore, CronStore};
 use aura_workspace::WorkspacePaths;
 
 use fs_sweep::{DirSweep, EntryShape, is_log_file, is_session_log, is_uuid_dir, sweep_directory};
@@ -23,9 +23,6 @@ const LOG_FILE_TTL: Duration = Duration::from_secs(14 * 86_400);
 // blob whose `last_accessed_at` falls behind this window is reaped on
 // the next sweep.
 const BLOB_TTL: Duration = Duration::from_secs(7 * 86_400);
-// `trace_events` is a recovery-only WAL — safe to drop once past the
-// recovery horizon, since the columnar tables are the read source.
-const TRACE_EVENTS_TTL: Duration = Duration::from_secs(30 * 86_400);
 // Raw `cost_records`. The per-month rollup in `user_monthly_cost` is
 // the durable summary, so dropping rows past 90d only loses per-call
 // detail, not totals.
@@ -64,7 +61,6 @@ pub struct JanitorReport {
     pub log_files_removed: usize,
     pub blobs_purged: u64,
     pub sidecar_dirs_removed: usize,
-    pub trace_events_purged: u64,
     pub cost_records_purged: u64,
     pub cron_executions_purged: u64,
     pub pairings_purged: u64,
@@ -85,7 +81,6 @@ pub struct Janitor {
     paths: WorkspacePaths,
     blobs: Arc<dyn BlobStore>,
     sidecar_cache: Option<SidecarCache>,
-    trace_events: Option<Arc<dyn TraceEventStore>>,
     costs: Option<Arc<dyn CostStore>>,
     crons: Option<Arc<dyn CronStore>>,
     pairings: Option<Arc<dyn ChannelPairingStore>>,
@@ -97,7 +92,6 @@ impl Janitor {
             paths,
             blobs,
             sidecar_cache: None,
-            trace_events: None,
             costs: None,
             crons: None,
             pairings: None,
@@ -119,12 +113,10 @@ impl Janitor {
     #[must_use]
     pub fn with_retention_stores(
         mut self,
-        trace_events: Arc<dyn TraceEventStore>,
         costs: Arc<dyn CostStore>,
         crons: Arc<dyn CronStore>,
         pairings: Arc<dyn ChannelPairingStore>,
     ) -> Self {
-        self.trace_events = Some(trace_events);
         self.costs = Some(costs);
         self.crons = Some(crons);
         self.pairings = Some(pairings);
@@ -184,13 +176,6 @@ impl Janitor {
         }
 
         let now = chrono::Utc::now();
-        if let Some(events) = self.trace_events.as_ref() {
-            let cutoff = now - chrono::Duration::seconds(TRACE_EVENTS_TTL.as_secs() as i64);
-            match events.compact_before(cutoff).await {
-                Ok(n) => report.trace_events_purged = n,
-                Err(e) => tracing::warn!(error = %e, "trace_events compaction failed"),
-            }
-        }
         if let Some(costs) = self.costs.as_ref() {
             let cutoff = now - chrono::Duration::seconds(COST_RECORDS_TTL.as_secs() as i64);
             match costs.purge_cost_records_older_than(cutoff).await {
@@ -218,7 +203,6 @@ impl Janitor {
             python_dirs_removed = report.python_dirs_removed,
             log_files_removed = report.log_files_removed,
             blobs_purged = report.blobs_purged,
-            trace_events_purged = report.trace_events_purged,
             cost_records_purged = report.cost_records_purged,
             cron_executions_purged = report.cron_executions_purged,
             pairings_purged = report.pairings_purged,
@@ -568,14 +552,12 @@ mod tests {
     async fn cost_records_purge_drops_only_rows_past_cutoff() {
         use aura_storage::CostRecord;
         use aura_storage::CostStore;
-        use aura_storage::test_support::{MemoryCostStore, MemoryTraceEventStore};
+        use aura_storage::test_support::MemoryCostStore;
 
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
         let cost = Arc::new(MemoryCostStore::new());
         let cost_dyn: Arc<dyn aura_storage::CostStore> = Arc::clone(&cost) as _;
-        let trace_events: Arc<dyn aura_storage::TraceEventStore> =
-            Arc::new(MemoryTraceEventStore::new());
 
         // Two records: one ancient (well past TTL), one fresh (now).
         let ancient = CostRecord {
@@ -612,12 +594,8 @@ mod tests {
         let pairings: Arc<dyn aura_storage::ChannelPairingStore> =
             Arc::new(aura_storage::libsql::LibsqlChannelPairingStore::new(pool));
 
-        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new())).with_retention_stores(
-            trace_events,
-            cost_dyn,
-            crons,
-            pairings,
-        );
+        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
+            .with_retention_stores(cost_dyn, crons, pairings);
         let report = janitor.sweep_once().await;
         assert_eq!(report.cost_records_purged, 1);
         assert_eq!(cost.len(), 1, "fresh record must survive");

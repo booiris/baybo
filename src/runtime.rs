@@ -490,26 +490,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     let supervisor = AgentSupervisor::new(response_tx);
 
-    let actor_llm_client: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&graph.llm_client) as _;
-    let actor_tool_registry = Arc::clone(&graph.tool_registry);
-    let actor_skill_registry = Arc::clone(&graph.skill_registry);
-    let actor_tool_executor = Arc::clone(&graph.tool_executor);
-    let actor_memory_manager = Arc::clone(&graph.memory_manager);
-    let actor_tokenizer = Arc::clone(&tokenizer);
-    let actor_hooks = Arc::clone(&graph.hook_manager);
-    let actor_trace_store = graph.stores.trace.clone();
-    let actor_trace_event_store = graph.stores.trace_events.clone();
-    let actor_job_lifecycle = Arc::clone(&graph.job_lifecycle);
-    let actor_skill_assessor = Arc::clone(&graph.skill_assessor);
-    let actor_security_gateway = Arc::clone(&graph.security_gateway);
-    let actor_session_logger = Arc::clone(&session_logger);
-
     // Process-wide trace event bus. Every `SpanRecorder` publishes
     // through it, and a single `CostSubscriber` task drains it for
     // the entire process — no per-session subscriber and no per-session
     // pricing clones.
     let trace_event_stream = TraceEventStream::new();
-    let actor_trace_event_stream = trace_event_stream.clone();
     let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> = {
         // Seed with every provider's `known_pricings()`, then layer the
         // active model's pricing on top so a config-flip mid-flight
@@ -547,21 +532,20 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             + Send
             + Sync,
     > = {
-        let actor_llm_client = Arc::clone(&actor_llm_client);
-        let actor_tool_registry = Arc::clone(&actor_tool_registry);
-        let actor_skill_registry = Arc::clone(&actor_skill_registry);
-        let actor_tool_executor = Arc::clone(&actor_tool_executor);
-        let actor_memory_manager = Arc::clone(&actor_memory_manager);
-        let actor_tokenizer = Arc::clone(&actor_tokenizer);
-        let actor_hooks = Arc::clone(&actor_hooks);
-        let actor_trace_store = actor_trace_store.clone();
-        let actor_trace_event_store = actor_trace_event_store.clone();
-        let actor_job_lifecycle = Arc::clone(&actor_job_lifecycle);
-        let actor_skill_assessor = Arc::clone(&actor_skill_assessor);
-        let actor_security_gateway = Arc::clone(&actor_security_gateway);
-        let actor_session_logger = Arc::clone(&actor_session_logger);
-        let actor_trace_event_stream = actor_trace_event_stream.clone();
-        let subagent_runtime_slot_for_spawner = Arc::clone(&subagent_runtime_slot);
+        let llm_client: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&graph.llm_client) as _;
+        let tool_registry = Arc::clone(&graph.tool_registry);
+        let skill_registry = Arc::clone(&graph.skill_registry);
+        let tool_executor = Arc::clone(&graph.tool_executor);
+        let memory_manager = Arc::clone(&graph.memory_manager);
+        let hooks = Arc::clone(&graph.hook_manager);
+        let trace_store = graph.stores.trace.clone();
+        let job_lifecycle = Arc::clone(&graph.job_lifecycle);
+        let skill_assessor = Arc::clone(&graph.skill_assessor);
+        let security_gateway = Arc::clone(&graph.security_gateway);
+        let session_logger = Arc::clone(&session_logger);
+        let tokenizer = Arc::clone(&tokenizer);
+        let trace_event_stream = trace_event_stream.clone();
+        let subagent_runtime_slot = Arc::clone(&subagent_runtime_slot);
         let token_budget = token_budget.clone();
         let policy = policy.clone();
         let system_prompt = system_prompt.clone();
@@ -569,25 +553,25 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         Arc::new(
             move |session: aura_model::Session, response_tx: mpsc::Sender<AgentOutput>| {
                 let mut agent_loop = AgentLoop::new(
-                    Arc::clone(&actor_llm_client),
-                    Arc::clone(&actor_tool_registry),
-                    Arc::clone(&actor_skill_registry),
-                    Arc::clone(&actor_tool_executor),
+                    Arc::clone(&llm_client),
+                    Arc::clone(&tool_registry),
+                    Arc::clone(&skill_registry),
+                    Arc::clone(&tool_executor),
                     ContextManager::new(
-                        Arc::clone(&actor_tokenizer),
+                        Arc::clone(&tokenizer),
                         Box::new(Truncate::new(keep_recent)),
                         token_budget.clone(),
                     ),
-                    Arc::clone(&actor_memory_manager),
+                    Arc::clone(&memory_manager),
                     policy.clone(),
                     Soul::custom(system_prompt.clone()),
-                    Arc::clone(&actor_security_gateway),
+                    Arc::clone(&security_gateway),
                 )
-                .with_skill_assessor(Arc::clone(&actor_skill_assessor))
-                .with_session_log(Arc::clone(&actor_session_logger))
-                .with_hooks(Arc::clone(&actor_hooks));
+                .with_skill_assessor(Arc::clone(&skill_assessor))
+                .with_session_log(Arc::clone(&session_logger))
+                .with_hooks(Arc::clone(&hooks));
 
-                if let Some(rt) = subagent_runtime_slot_for_spawner.get() {
+                if let Some(rt) = subagent_runtime_slot.get() {
                     agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
                 }
 
@@ -595,19 +579,18 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     SpanRecorder::new(
                         session.id.clone(),
                         session.user.id.clone(),
-                        Arc::clone(&actor_trace_store),
-                        Arc::clone(&actor_trace_event_store),
+                        Arc::clone(&trace_store),
                     )
-                    .with_stream(actor_trace_event_stream.clone()),
+                    .with_stream(trace_event_stream.clone()),
                 );
 
                 let actor = AgentActor::new(
                     session,
                     agent_loop,
-                    Arc::clone(&actor_tool_executor),
+                    Arc::clone(&tool_executor),
                     response_tx,
-                    Arc::clone(&actor_hooks),
-                    Arc::clone(&actor_job_lifecycle),
+                    Arc::clone(&hooks),
+                    Arc::clone(&job_lifecycle),
                     span_recorder,
                 );
                 let (sender, mailbox) = mpsc::channel(buffer);
@@ -634,9 +617,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         Arc::clone(&graph.channels_registry),
         Arc::clone(&graph.security_gateway),
     )
-    .with_actor_spawner(Box::new({
-        let spawn_actor_for = Arc::clone(&spawn_actor_for);
-        move |session, response_tx| spawn_actor_for(session, response_tx)
+    .with_actor_spawner(Box::new(move |session, response_tx| {
+        spawn_actor_for(session, response_tx)
     }));
 
     // Attach cron triggers eagerly — a caller who forgot to plumb the
