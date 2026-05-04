@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use aura_job::{Job, JobStatusKind, JobTransition, VerificationTransition};
+use aura_job::{Job, JobStatusKind, JobTransition};
 use aura_model::{BlobRef, JobId, MemoryEntry, SessionId, SpanId, StepId};
 use aura_trace::{LifecycleOutcome, RecoveredSpan, RecoveryReport, Span, SpanEvent, Step};
 use futures::StreamExt;
@@ -80,7 +80,6 @@ impl SecretStore for MemorySecretStore {
 pub struct MemoryJobStore {
     jobs: Mutex<HashMap<JobId, Job>>,
     transitions: Mutex<HashMap<JobId, Vec<JobTransition>>>,
-    verification_transitions: Mutex<HashMap<JobId, Vec<VerificationTransition>>>,
 }
 
 impl MemoryJobStore {
@@ -169,30 +168,6 @@ impl JobStore for MemoryJobStore {
     async fn get_transitions(&self, job_id: &JobId) -> JobStoreResult<Vec<JobTransition>> {
         Ok(self
             .transitions
-            .lock()
-            .get(job_id)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn record_verification_transition(
-        &self,
-        transition: &VerificationTransition,
-    ) -> JobStoreResult<()> {
-        self.verification_transitions
-            .lock()
-            .entry(transition.job_id)
-            .or_default()
-            .push(transition.clone());
-        Ok(())
-    }
-
-    async fn get_verification_transitions(
-        &self,
-        job_id: &JobId,
-    ) -> JobStoreResult<Vec<VerificationTransition>> {
-        Ok(self
-            .verification_transitions
             .lock()
             .get(job_id)
             .cloned()

@@ -385,17 +385,16 @@ export interface components {
         JobKind: "user_chat" | "cron" | "system" | "spawned";
         /**
          * @description Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
-         *     the domain enum carries (cancel reason, partial-artifact span IDs,
-         *     verification substate); the wire shape collapses inner-variant
-         *     content into `Option`-typed fields so HTTP clients can decode
-         *     without needing the full Rust enum machinery.
+         *     the domain enum carries (cancel reason, partial-artifact span IDs);
+         *     the wire shape collapses inner-variant content into `Option`-typed
+         *     fields so HTTP clients can decode without needing the full Rust
+         *     enum machinery.
          */
         JobStatus: {
             cancel_reason?: string | null;
             kind: components["schemas"]["JobStatusKind"];
             partial_artifacts?: string[];
             reason?: string | null;
-            verification?: string | null;
         };
         /** @enum {string} */
         JobStatusKind: "pending" | "in_progress" | "stuck" | "cancelled" | "failed" | "completed";

@@ -6,10 +6,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use aura_job::JobStatus;
-use aura_job::{
-    CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition, SubmissionChannel,
-    VerificationOutcome, VerificationTransition, VerifierRef,
-};
+use aura_job::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
 use aura_model::{JobId, SessionId, SpanId, TriggerKind};
 use aura_storage::JobStore;
 
@@ -44,7 +41,6 @@ impl JobLifecycle {
         input: JobInput,
         effective_soul_version: impl Into<String>,
         parent_job_id: Option<JobId>,
-        verifier: Option<VerifierRef>,
     ) -> Result<Job> {
         let job_kind = input.kind();
         if !job_kind.allowed_for(session_trigger_kind) {
@@ -53,13 +49,7 @@ impl JobLifecycle {
                  (see aura_job::kind allowed-for table)"
             )));
         }
-        let job = Job::new(
-            session_id,
-            input,
-            effective_soul_version,
-            parent_job_id,
-            verifier,
-        );
+        let job = Job::new(session_id, input, effective_soul_version, parent_job_id);
         self.store.create(&job).await?;
         Ok(job)
     }
@@ -70,8 +60,7 @@ impl JobLifecycle {
         self.persist(job, transition).await
     }
 
-    /// Move `InProgress → Completed { Unverified }` with a final
-    /// output. The verification chain (if any) advances separately.
+    /// Move `InProgress → Completed` with a final output.
     pub async fn complete(&self, job_id: &JobId, output: aura_job::JobOutput) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
         self.persist(job, transition).await
@@ -111,37 +100,6 @@ impl JobLifecycle {
         self.persist(job, transition).await
     }
 
-    /// Convenience — kick off the verification chain. Requires
-    /// `Job.verifier` to be set.
-    pub async fn submit_verification(
-        &self,
-        job_id: &JobId,
-        channel: SubmissionChannel,
-    ) -> Result<()> {
-        let mut job = self.load_job(job_id).await?;
-        let transition = job.submit_verification(channel)?;
-        self.store.save(&job).await?;
-        self.store
-            .record_verification_transition(&transition)
-            .await?;
-        Ok(())
-    }
-
-    /// Advance the verification chain (Submitted → Accepted | Rejected).
-    pub async fn advance_verification(
-        &self,
-        job_id: &JobId,
-        target: VerificationOutcome,
-    ) -> Result<()> {
-        let mut job = self.load_job(job_id).await?;
-        let transition = job.advance_verification(target)?;
-        self.store.save(&job).await?;
-        self.store
-            .record_verification_transition(&transition)
-            .await?;
-        Ok(())
-    }
-
     pub async fn get(&self, job_id: &JobId) -> Result<Option<Job>> {
         self.store.get(job_id).await
     }
@@ -174,13 +132,6 @@ impl JobLifecycle {
 
     pub async fn get_history(&self, job_id: &JobId) -> Result<Vec<JobTransition>> {
         self.store.get_transitions(job_id).await
-    }
-
-    pub async fn get_verification_history(
-        &self,
-        job_id: &JobId,
-    ) -> Result<Vec<VerificationTransition>> {
-        self.store.get_verification_transitions(job_id).await
     }
 
     /// Recover non-terminal jobs after a process restart.
@@ -248,7 +199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_success_path_no_verifier() {
+    async fn full_success_path() {
         let lc = make_lifecycle();
         let job = lc
             .start_job(
@@ -256,7 +207,6 @@ mod tests {
                 TriggerKind::User,
                 user_chat_input(),
                 "soul-v1",
-                None,
                 None,
             )
             .await
@@ -268,7 +218,7 @@ mod tests {
 
         let history = lc.get_history(&job.id).await.unwrap();
         assert_eq!(history.len(), 2);
-        assert!(matches!(history[1].to, JobStatus::Completed { .. }));
+        assert!(matches!(history[1].to, JobStatus::Completed));
     }
 
     #[tokio::test]
@@ -280,7 +230,6 @@ mod tests {
                 TriggerKind::User,
                 user_chat_input(),
                 "soul-v1",
-                None,
                 None,
             )
             .await
@@ -313,7 +262,6 @@ mod tests {
             user_chat_input(),
             "soul-v1",
             None,
-            None,
         )
         .await
         .unwrap();
@@ -324,7 +272,6 @@ mod tests {
                 TriggerKind::User,
                 user_chat_input(),
                 "soul-v1",
-                None,
                 None,
             )
             .await
@@ -338,7 +285,6 @@ mod tests {
                 user_chat_input(),
                 "soul-v1",
                 None,
-                None,
             )
             .await
             .unwrap();
@@ -351,73 +297,6 @@ mod tests {
         let after = lc.get(&in_progress.id).await.unwrap().unwrap();
         assert!(matches!(after.status, JobStatus::Stuck { .. }));
         let still_completed = lc.get(&completed.id).await.unwrap().unwrap();
-        assert!(matches!(
-            still_completed.status,
-            JobStatus::Completed { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn verification_chain_requires_verifier() {
-        let lc = make_lifecycle();
-        let job = lc
-            .start_job(
-                SessionId::from("s1"),
-                TriggerKind::User,
-                user_chat_input(),
-                "soul-v1",
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        lc.start(&job.id).await.unwrap();
-        lc.complete(&job.id, dummy_output()).await.unwrap();
-        let err = lc
-            .submit_verification(&job.id, SubmissionChannel::Ui)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JobError::VerificationNotAllowed(_)));
-    }
-
-    #[tokio::test]
-    async fn full_verification_chain_accept() {
-        let lc = make_lifecycle();
-        let job = lc
-            .start_job(
-                SessionId::from("s1"),
-                TriggerKind::User,
-                user_chat_input(),
-                "soul-v1",
-                None,
-                Some(VerifierRef::User {
-                    user_id: "u1".into(),
-                }),
-            )
-            .await
-            .unwrap();
-        lc.start(&job.id).await.unwrap();
-        lc.complete(&job.id, dummy_output()).await.unwrap();
-        lc.submit_verification(&job.id, SubmissionChannel::Ui)
-            .await
-            .unwrap();
-        lc.advance_verification(
-            &job.id,
-            VerificationOutcome::Accepted {
-                decided_at: chrono::Utc::now(),
-                by: VerifierRef::User {
-                    user_id: "u1".into(),
-                },
-                evidence: serde_json::json!({}),
-            },
-        )
-        .await
-        .unwrap();
-        let history = lc.get_verification_history(&job.id).await.unwrap();
-        assert_eq!(history.len(), 2);
-        assert!(matches!(
-            history[1].to,
-            VerificationOutcome::Accepted { .. }
-        ));
+        assert!(matches!(still_completed.status, JobStatus::Completed));
     }
 }

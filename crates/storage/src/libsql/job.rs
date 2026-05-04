@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 use crate::job::JobStore;
-use aura_job::{Job, JobError, JobStatusKind, JobTransition, VerificationTransition};
+use aura_job::{Job, JobError, JobStatusKind, JobTransition};
 use aura_model::{JobId, SessionId};
 
 pub struct LibsqlJobStore {
@@ -49,8 +49,8 @@ impl JobStore for LibsqlJobStore {
         conn.execute(
             "INSERT INTO jobs \
              (id, session_id, parent_job_id, kind, status_kind, effective_soul_version, \
-              has_verifier, created_at, started_at, ended_at, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              created_at, started_at, ended_at, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             libsql::params![
                 job.id.to_string(),
                 job.session_id.as_str().to_string(),
@@ -58,7 +58,6 @@ impl JobStore for LibsqlJobStore {
                 job_kind_str(job.kind).to_string(),
                 status_kind_str(job.status.kind()).to_string(),
                 job.effective_soul_version.clone(),
-                job.verifier.is_some() as i64,
                 super::time::to_us(job.created_at),
                 job.started_at.map(super::time::to_us),
                 job.ended_at.map(super::time::to_us),
@@ -288,53 +287,6 @@ impl JobStore for LibsqlJobStore {
         }
         Ok(transitions)
     }
-
-    async fn record_verification_transition(
-        &self,
-        transition: &VerificationTransition,
-    ) -> aura_job::Result<()> {
-        let conn = self.pool.conn();
-        let data = serde_json::to_string(transition)
-            .map_err(|e| JobError::Storage(format!("failed to serialize verification: {e}")))?;
-        conn.execute(
-            "INSERT INTO job_verification_transitions (job_id, data) VALUES (?1, ?2)",
-            libsql::params![transition.job_id.to_string(), data],
-        )
-        .await
-        .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
-        Ok(())
-    }
-
-    async fn get_verification_transitions(
-        &self,
-        job_id: &JobId,
-    ) -> aura_job::Result<Vec<VerificationTransition>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data FROM job_verification_transitions \
-                 WHERE job_id = ?1 AND deleted_at IS NULL ORDER BY id",
-                libsql::params![job_id.to_string()],
-            )
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let mut transitions = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let t: VerificationTransition = serde_json::from_str(&data).map_err(|e| {
-                JobError::Storage(format!("failed to deserialize verification: {e}"))
-            })?;
-            transitions.push(t);
-        }
-        Ok(transitions)
-    }
 }
 
 #[cfg(test)]
@@ -350,7 +302,6 @@ mod tests {
                 content: vec![ContentBlock::Text("hi".into())],
             },
             "soul-v1",
-            None,
             None,
         )
     }
@@ -431,7 +382,7 @@ mod tests {
         assert_eq!(recoverable.len(), 3);
         // Completed must be excluded
         for j in &recoverable {
-            assert!(!matches!(j.status, JobStatus::Completed { .. }));
+            assert!(!matches!(j.status, JobStatus::Completed));
         }
     }
 

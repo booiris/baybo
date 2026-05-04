@@ -263,10 +263,10 @@ impl From<aura_model::MemoryEntry> for MemoryEntry {
 // ── Job ──────────────────────────────────────────────────────────────
 
 /// Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
-/// the domain enum carries (cancel reason, partial-artifact span IDs,
-/// verification substate); the wire shape collapses inner-variant
-/// content into `Option`-typed fields so HTTP clients can decode
-/// without needing the full Rust enum machinery.
+/// the domain enum carries (cancel reason, partial-artifact span IDs);
+/// the wire shape collapses inner-variant content into `Option`-typed
+/// fields so HTTP clients can decode without needing the full Rust
+/// enum machinery.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct JobStatus {
@@ -277,8 +277,6 @@ pub struct JobStatus {
     pub cancel_reason: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub partial_artifacts: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verification: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -309,12 +307,13 @@ impl From<aura_job::JobStatus> for JobStatus {
     fn from(v: aura_job::JobStatus) -> Self {
         let kind = JobStatusKind::from(v.kind());
         match v {
-            aura_job::JobStatus::Pending | aura_job::JobStatus::InProgress => Self {
+            aura_job::JobStatus::Pending
+            | aura_job::JobStatus::InProgress
+            | aura_job::JobStatus::Completed => Self {
                 kind,
                 reason: None,
                 cancel_reason: None,
                 partial_artifacts: Vec::new(),
-                verification: None,
             },
             aura_job::JobStatus::Stuck { reason } | aura_job::JobStatus::Failed { reason } => {
                 Self {
@@ -322,7 +321,6 @@ impl From<aura_job::JobStatus> for JobStatus {
                     reason: Some(reason),
                     cancel_reason: None,
                     partial_artifacts: Vec::new(),
-                    verification: None,
                 }
             }
             aura_job::JobStatus::Cancelled {
@@ -336,14 +334,6 @@ impl From<aura_job::JobStatus> for JobStatus {
                     .into_iter()
                     .map(|s| s.to_string())
                     .collect(),
-                verification: None,
-            },
-            aura_job::JobStatus::Completed { verification } => Self {
-                kind,
-                reason: None,
-                cancel_reason: None,
-                partial_artifacts: Vec::new(),
-                verification: Some(verification.outcome_tag().to_string()),
             },
         }
     }

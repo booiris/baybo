@@ -183,7 +183,6 @@ impl LibsqlPool {
                     kind                     TEXT NOT NULL,
                     status_kind              TEXT NOT NULL,
                     effective_soul_version   TEXT NOT NULL,
-                    has_verifier             INTEGER NOT NULL DEFAULT 0,
                     created_at               INTEGER NOT NULL,
                     started_at               INTEGER,
                     ended_at                 INTEGER,
@@ -204,15 +203,6 @@ impl LibsqlPool {
                     deleted_at INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);
-
-                CREATE TABLE IF NOT EXISTS job_verification_transitions (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id     TEXT NOT NULL,
-                    data       TEXT NOT NULL,
-                    deleted_at INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS idx_job_verif_job_id
-                    ON job_verification_transitions(job_id);
 
                 CREATE TABLE IF NOT EXISTS steps (
                     id          TEXT PRIMARY KEY,

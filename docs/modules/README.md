@@ -40,7 +40,7 @@ Bottom-up along the dependency graph:
 ### Runtime and Observability Layer
 
 - **trace** — Step / Span / SpanEvent domain types (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `LlmToolCallRecord`, `ToolCallOrigin`) and the half-open-span recovery utility. Closed strong-typed enums; OTel-aligned naming.
-- **job** — Job domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `VerificationOutcome`, `CancelReason`, `JobTransition`, `DriftRecord`) and state machine. Verification is a `Completed` substate, not a separate top-level state. `Cancelled` and `Failed` are independent terminal states.
+- **job** — Job domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `DriftRecord`) and state machine. `Cancelled` and `Failed` are independent terminal states.
 - **hook** — Lifecycle extension points.
 
 ### Infrastructure and Assembly Layer
@@ -91,7 +91,7 @@ bootstrap ──► config + all domain crates it assembles (entry point only)
 - Store traits defined in `storage`; domain types in their own crates; business logic in `agent`; `model` contains shared content primitives and memory domain types
 - Logs, Trace, and Job must not record sensitive plaintext — only placeholders or sanitized summaries
 - Tool/skill extensions must carry source, version, hash, trust level, and capability declarations
-- The Job state machine is fixed: `Pending → InProgress → Completed { verification }` (with `Stuck`, `Failed`, and `Cancelled` branches). `verification` is a `Completed` substate (`Unverified` / `Submitted` / `Accepted` / `Rejected`); a chat job ends terminal at `Completed { Unverified }`. `Cancelled` carries a `reason` and `partial_artifacts: Vec<SpanId>` for resume context
+- The Job state machine is fixed: `Pending → InProgress → Completed` (with `Stuck`, `Failed`, and `Cancelled` branches). `Cancelled` carries a `reason` and `partial_artifacts: Vec<SpanId>` for resume context
 - Multimedia passed by reference — no raw binary in sessions or Trace
 - Hot reload, tool updates, identity changes, and config changes must leave provenance records in Trace
 - Cron and background execution must all enter Job and Trace

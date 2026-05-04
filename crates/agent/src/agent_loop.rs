@@ -237,7 +237,6 @@ impl AgentLoop {
                 job_input,
                 session.bound_soul_version.clone(),
                 parent_job_id,
-                None,
             )
             .await?;
         let job_id = job.id;
@@ -286,7 +285,6 @@ impl AgentLoop {
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<OutgoingMessage> {
-        // Hush unused warning until verifier-gated submit ceremony lands.
         let _ = job_lifecycle;
         self.ensure_system_prompt(session).await;
 

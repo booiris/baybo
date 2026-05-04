@@ -626,7 +626,6 @@ mod tests {
                 user_input(),
                 "soul-v1",
                 None,
-                None,
             )
             .await
             .unwrap();
@@ -637,7 +636,6 @@ mod tests {
                 TriggerKind::User,
                 user_input(),
                 "soul-v1",
-                None,
                 None,
             )
             .await
@@ -650,7 +648,6 @@ mod tests {
                 TriggerKind::User,
                 user_input(),
                 "soul-v1",
-                None,
                 None,
             )
             .await
@@ -727,7 +724,6 @@ mod tests {
                 user_input(),
                 "soul-v1",
                 None,
-                None,
             )
             .await
             .unwrap();
@@ -739,7 +735,6 @@ mod tests {
                 TriggerKind::User,
                 user_input(),
                 "soul-v1",
-                None,
                 None,
             )
             .await
@@ -783,7 +778,6 @@ mod tests {
                 user_input(),
                 "soul-v1",
                 None,
-                None,
             )
             .await
             .unwrap();
@@ -793,7 +787,6 @@ mod tests {
                 TriggerKind::User,
                 user_input(),
                 "soul-v1",
-                None,
                 None,
             )
             .await

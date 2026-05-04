@@ -2,18 +2,18 @@
 
 ## Overview
 
-The `job` crate defines domain types for job lifecycle management (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `VerificationOutcome`, `CancelReason`, `JobTransition`) and the `JobError` error type. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself.
+The `job` crate defines domain types for job lifecycle management (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`) and the `JobError` error type. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself.
 
 Business logic (`JobLifecycle` — persistence orchestration and hook invocation) lives in `agent::job`. The `JobStore` trait is defined in `storage::job`.
 
-Job answers **"what step is this operation at"**, not "what exactly did it do." Detailed input/output is recorded by `trace`. Each job carries its own `final_result` for the contract value (what acceptance is judged against), but progress messages emitted mid-job live in the trace tree — `Job.emitted_span_ids` is an index, not a copy.
+Job answers **"what step is this operation at"**, not "what exactly did it do." Detailed input/output is recorded by `trace`. Each job carries its own `final_result` for the final contractual value, but progress messages emitted mid-job live in the trace tree — `Job.emitted_span_ids` is an index, not a copy.
 
 ## Design Decisions
 
 ### State machine
 
 ```
-Pending → InProgress → Completed { verification }
+Pending → InProgress → Completed
                    \→ Stuck { reason } → InProgress
                                       \→ Failed { reason }
                                       \→ Cancelled { reason, partial_artifacts }
@@ -26,13 +26,9 @@ Pending → InProgress → Completed { verification }
 - **Stuck { reason }**: hung or unknown state, awaiting recovery decision (non-terminal)
 - **Cancelled { reason, partial_artifacts }**: stopped before completion (terminal)
 - **Failed { reason }**: errored (terminal)
-- **Completed { verification }**: agent finished its work (terminal); `verification` is a substate (`Unverified` / `Submitted` / `Accepted` / `Rejected`)
+- **Completed**: agent finished its work (terminal)
 
 Every transition is validated strictly. Illegal transitions return errors, never silently overwrite.
-
-### Verification is a Completed substate, not a separate top-level state
-
-A normal chat job ends at `Completed { Unverified }` and is fully terminal — no ceremony, no waiting on phantom `Submitted` / `Accepted` events that will never come. Only jobs with a declared external verifier (review flow, bounty, scored task) can transition `Unverified → Submitted → Accepted | Rejected`. `Rejected` is **not** `Failed`: "did the work, work wasn't accepted" and "execution crashed" have different cost-attribution and replay-UI semantics.
 
 ### Cancelled is independent of Failed
 
@@ -59,7 +55,7 @@ Invariant: `session.trigger.kind() == job.kind()` at job creation time. `JobInpu
 
 - `Job::new(session_id, kind, input, parent)` — constructor with ULID, `Pending` status, timestamps
 - `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns `JobTransition` record
-- Convenience methods: `start()`, `complete(output)`, `submit()`, `accept(...)`, `reject(...)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover()`
+- Convenience methods: `start()`, `complete(output)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover()`
 - `Job::mark_interrupted()` — for restart recovery; transitions `InProgress → Stuck { reason: "system_crash" }`, returns `None` for other statuses
 - `Job::is_terminal()` — true for `Completed | Cancelled | Failed`
 - `JobStatus::needs_recovery()` — true for `Pending | InProgress | Stuck`
@@ -78,7 +74,7 @@ Additionally, `JobLifecycle::recover_interrupted()` handles startup recovery —
 
 ### Restart recovery
 
-On startup, `JobLifecycle::recover_interrupted()` scans all non-terminal jobs. `InProgress` jobs are moved to `Stuck` (via `Job::mark_interrupted()`) because the executing context was lost; other non-terminal states (`Pending`, `Stuck`, `Completed { Submitted }`) are left unchanged — they can resume without a state change. Half-open spans under those jobs are rewritten by the trace recovery scan to `Cancelled { SystemCrash }` and rolled into `partial_artifacts`. Upper-layer logic then decides whether to `recover()` or `fail()` each `Stuck` job.
+On startup, `JobLifecycle::recover_interrupted()` scans all non-terminal jobs. `InProgress` jobs are moved to `Stuck` (via `Job::mark_interrupted()`) because the executing context was lost; other non-terminal states (`Pending`, `Stuck`) are left unchanged — they can resume without a state change. Half-open spans under those jobs are rewritten by the trace recovery scan to `Cancelled { SystemCrash }` and rolled into `partial_artifacts`. Upper-layer logic then decides whether to `recover()` or `fail()` each `Stuck` job.
 
 ### Job hierarchy
 
@@ -111,7 +107,6 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 - `input` / `final_result` / `partial_artifacts` store sanitized JSON / span-id lists only — sensitive values must already be placeholders
 - `save()` and `record_transition()` should run in the same transaction (enforced by `JobLifecycle`)
 - `session.trigger.kind() == job.kind()` invariant is enforced at `Job::new`
-- A `Job` whose declared verifier is `None` cannot transition past `Completed { Unverified }`
 - Does not depend on `trace`, `llm`, `tools`, or `agent`
 
 ## Collaboration

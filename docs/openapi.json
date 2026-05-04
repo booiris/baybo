@@ -1664,7 +1664,7 @@
       },
       "JobStatus": {
         "type": "object",
-        "description": "Wire mirror of [`aura_job::JobStatus`]. Carries the same payload\nthe domain enum carries (cancel reason, partial-artifact span IDs,\nverification substate); the wire shape collapses inner-variant\ncontent into `Option`-typed fields so HTTP clients can decode\nwithout needing the full Rust enum machinery.",
+        "description": "Wire mirror of [`aura_job::JobStatus`]. Carries the same payload\nthe domain enum carries (cancel reason, partial-artifact span IDs);\nthe wire shape collapses inner-variant content into `Option`-typed\nfields so HTTP clients can decode without needing the full Rust\nenum machinery.",
         "required": [
           "kind"
         ],
@@ -1685,12 +1685,6 @@
             }
           },
           "reason": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "verification": {
             "type": [
               "string",
               "null"

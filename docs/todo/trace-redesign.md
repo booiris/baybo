@@ -3,7 +3,7 @@
 The full design is implemented and reflected in:
 
 - [`docs/modules/session.md`](../modules/session.md) — Session, lineage, trigger, fork rejection
-- [`docs/modules/job.md`](../modules/job.md) — Job state machine (`Completed { verification }`, `Cancelled`, etc.)
+- [`docs/modules/job.md`](../modules/job.md) — Job state machine (`Completed`, `Cancelled`, etc.)
 - [`docs/modules/trace.md`](../modules/trace.md) — Step / Span / SpanEvent
 
 These specs are authoritative; this file no longer carries the active design.
@@ -114,7 +114,7 @@ LRU method on the relevant store; only `trace_events` and
 | `cron_executions` | `status='completed' AND triggered_at < cutoff` | 30d | A 1-min cron alone produces ~525k rows/yr. |
 | `blobs` | `last_accessed_at < cutoff AND <no live spans/cost_records reference>` | 30d | LRU eviction. The `last_accessed_at` column is already maintained for this purpose. |
 | `channel_pairings` | `expires_at < now() OR (status='approved' AND approved_at < cutoff)` | hourly / 7d | Auth-flow ephemera; pairing codes are short-lived by nature. |
-| `job_transitions` / `job_verification_transitions` | cascade with hard-purge of the owning job (no independent sweep needed) | — | Bounded per job (~3-5 rows). Don't need a standalone task — fold into whatever drives `jobs` hard-deletes. |
+| `job_transitions` | cascade with hard-purge of the owning job (no independent sweep needed) | — | Bounded per job (~3-5 rows). Don't need a standalone task — fold into whatever drives `jobs` hard-deletes. |
 
 Out of scope (do **not** auto-purge): `steps`, `spans`, `span_events`,
 `skill_risk_assessment_jobs`, `user_monthly_cost`. Trace data + monthly

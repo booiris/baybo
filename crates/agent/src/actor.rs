@@ -192,7 +192,6 @@ impl AgentActor {
                 },
                 self.session.bound_soul_version.clone(),
                 None,
-                None,
             )
             .await?;
         self.job_lifecycle.start(&job.id).await?;
