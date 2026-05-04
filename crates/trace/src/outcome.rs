@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Spans / steps start in `Pending` (i.e. `started_at` set, no outcome
 /// recorded yet). They transition to exactly one of the three terminal
-/// outcomes when they end. The recovery scan rewrites half-open spans
-/// (`Pending` outcome at process startup) as `Cancelled { SystemCrash }`.
+/// outcomes when they end.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum LifecycleOutcome {

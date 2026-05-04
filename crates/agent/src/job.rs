@@ -187,25 +187,6 @@ impl JobLifecycle {
         self.store.get_transitions(job_id).await
     }
 
-    /// Recover non-terminal jobs after a process restart.
-    ///
-    /// `InProgress` jobs become `Stuck { reason: "system restart..." }`
-    /// (their executing context was lost). Other non-terminal statuses
-    /// are left unchanged. Callers (typically `main`) then decide
-    /// whether to `recover()` or `fail()` each `Stuck` job.
-    ///
-    /// Returns the count of jobs that actually transitioned.
-    pub async fn recover_interrupted(&self) -> Result<usize> {
-        let mut recovered = 0;
-        for mut job in self.store.list_recoverable().await? {
-            if let Some(transition) = job.mark_interrupted()? {
-                self.persist(job, transition).await?;
-                recovered += 1;
-            }
-        }
-        Ok(recovered)
-    }
-
     async fn apply<F>(&self, job_id: &JobId, f: F) -> Result<(Job, JobTransition)>
     where
         F: FnOnce(&mut Job) -> Result<JobTransition>,
@@ -430,53 +411,5 @@ mod tests {
             }
             _ => panic!("expected Cancelled"),
         }
-    }
-
-    #[tokio::test]
-    async fn recover_interrupted_moves_in_progress_to_stuck() {
-        let lc = make_lifecycle();
-        // Pending — left alone
-        lc.start_job(
-            SessionId::from("s1"),
-            TriggerKind::User,
-            user_chat_input(),
-            "soul-v1",
-            None,
-        )
-        .await
-        .unwrap();
-        // InProgress — should become Stuck
-        let in_progress = lc
-            .start_job(
-                SessionId::from("s1"),
-                TriggerKind::User,
-                user_chat_input(),
-                "soul-v1",
-                None,
-            )
-            .await
-            .unwrap();
-        lc.start(&in_progress.id).await.unwrap();
-        // Completed — left alone
-        let completed = lc
-            .start_job(
-                SessionId::from("s1"),
-                TriggerKind::User,
-                user_chat_input(),
-                "soul-v1",
-                None,
-            )
-            .await
-            .unwrap();
-        lc.start(&completed.id).await.unwrap();
-        lc.complete(&completed.id, dummy_output()).await.unwrap();
-
-        let count = lc.recover_interrupted().await.unwrap();
-        assert_eq!(count, 1);
-
-        let after = lc.get(&in_progress.id).await.unwrap().unwrap();
-        assert!(matches!(after.status, JobStatus::Stuck { .. }));
-        let still_completed = lc.get(&completed.id).await.unwrap().unwrap();
-        assert!(matches!(still_completed.status, JobStatus::Completed));
     }
 }

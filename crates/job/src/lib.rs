@@ -309,29 +309,6 @@ impl Job {
         }
         self.transition(JobStatus::InProgress, None, Some(reason.into()))
     }
-
-    /// Mark this job as interrupted by a system restart.
-    ///
-    /// `InProgress` jobs become `Stuck` (executing context lost). Other
-    /// non-terminal statuses (`Pending`, `Stuck`) are left unchanged —
-    /// they can resume without a state change. The trace recovery scan
-    /// separately rewrites half-open spans as `Cancelled { SystemCrash }`
-    /// and folds them into `partial_artifacts` of their parent job
-    /// (handled by `JobLifecycle::recover_interrupted`).
-    pub fn mark_interrupted(&mut self) -> Result<Option<JobTransition>> {
-        if matches!(self.status, JobStatus::InProgress) {
-            let t = self.transition(
-                JobStatus::Stuck {
-                    reason: "system restart: interrupted while in progress".to_owned(),
-                },
-                None,
-                Some("system restart".to_owned()),
-            )?;
-            Ok(Some(t))
-        } else {
-            Ok(None)
-        }
-    }
 }
 
 /// Audit record for a single state transition.
@@ -557,34 +534,6 @@ mod tests {
         j.fail("done").unwrap();
         let err = j.start().unwrap_err();
         assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    // -- mark_interrupted --
-
-    #[test]
-    fn mark_interrupted_in_progress_becomes_stuck() {
-        let mut j = fresh_job();
-        j.start().unwrap();
-        let t = j.mark_interrupted().unwrap().unwrap();
-        assert!(matches!(t.from, JobStatus::InProgress));
-        assert!(matches!(j.status, JobStatus::Stuck { .. }));
-    }
-
-    #[test]
-    fn mark_interrupted_pending_unchanged() {
-        let mut j = fresh_job();
-        let t = j.mark_interrupted().unwrap();
-        assert!(t.is_none());
-        assert!(matches!(j.status, JobStatus::Pending));
-    }
-
-    #[test]
-    fn mark_interrupted_terminal_unchanged() {
-        let mut j = fresh_job();
-        j.start().unwrap();
-        j.fail("done").unwrap();
-        let t = j.mark_interrupted().unwrap();
-        assert!(t.is_none());
     }
 
     // -- Serde --

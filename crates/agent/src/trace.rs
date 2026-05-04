@@ -294,7 +294,7 @@ impl SpanRecorder {
             .await
     }
 
-    /// Emit a SpanEvent (sanitize hit / approval / hook degradation).
+    /// Emit a SpanEvent (sanitize hit / approval).
     /// `seq` is caller-supplied because the recorder does not own
     /// per-span sequence counters — each call site that emits
     /// multiple events on the same span manages its own counter.
@@ -303,14 +303,6 @@ impl SpanRecorder {
         self.trace_store.append_span_event(&event).await?;
         self.stream.publish(TraceEvent::SpanEventEmitted(event));
         Ok(())
-    }
-
-    // ── Recovery ─────────────────────────────────────────────────
-
-    /// Run the half-open span recovery scan. Used at startup, before
-    /// the actor accepts messages.
-    pub async fn recover_half_open(&self) -> Result<aura_trace::RecoveryReport> {
-        self.trace_store.recover_half_open_spans().await
     }
 }
 

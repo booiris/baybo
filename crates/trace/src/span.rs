@@ -40,7 +40,9 @@ pub struct Span {
 
     /// Sub-events (sanitize hits / approvals).
     /// In storage these live in their own `span_events` table keyed by
-    /// `(span_id, seq)`; loaded eagerly with the span for convenience.
+    /// `(span_id, seq)`. `load_span` does NOT join — fetch via
+    /// `list_span_events(span_id)` when this field needs to be populated
+    /// (see `agent::query::QueryApi::load_step` / `replay`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<SpanEvent>,
 }

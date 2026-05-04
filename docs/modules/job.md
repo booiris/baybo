@@ -32,9 +32,9 @@ Every transition is validated strictly. Illegal transitions return errors, never
 
 ### Cancelled is independent of Failed
 
-`Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `HookAborted`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. The next job's prompt-assembly step reads these spans and renders a "previously completed steps:" preamble so the LLM has context. Content lives only in the trace; `Job.partial_artifacts` is indices.
+`Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `OperatorCancel`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. The next job's prompt-assembly step reads these spans and renders a "previously completed steps:" preamble so the LLM has context. Content lives only in the trace; `Job.partial_artifacts` is indices.
 
-`Cancelled` is reused for crash recovery — the recovery scan rewrites half-open spans with `reason: SystemCrash` and rolls them up into the parent job's `partial_artifacts`.
+`SystemCrash` is reserved for a future restart-recovery scan — there is no production code path that mints it today.
 
 ### Job kind mirrors session trigger
 
@@ -56,9 +56,8 @@ Invariant: `session.trigger.kind() == job.kind()` at job creation time. `JobInpu
 - `Job::new(session_id, kind, input, parent)` — constructor with ULID, `Pending` status, timestamps
 - `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns `JobTransition` record
 - Convenience methods: `start()`, `complete(output)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover()`
-- `Job::mark_interrupted()` — for restart recovery; transitions `InProgress → Stuck { reason: "system_crash" }`, returns `None` for other statuses
 - `Job::is_terminal()` — true for `Completed | Cancelled | Failed`
-- `JobStatus::needs_recovery()` — true for `Pending | InProgress | Stuck`
+- `JobStatus::needs_recovery()` — true for `Pending | InProgress | Stuck` (consumed by admin queries that surface in-flight jobs)
 
 Timestamp rules are enforced inside `transition()`:
 - `started_at` is set on first entry to `InProgress` (not on recovery re-entry)
@@ -70,11 +69,9 @@ This keeps the state machine invariants co-located with the type and makes them 
 
 `JobLifecycle` in `agent::job` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator.
 
-Additionally, `JobLifecycle::recover_interrupted()` handles startup recovery — scan non-terminal jobs and apply `mark_interrupted()` to each. Called once at system startup before accepting messages.
-
 ### Restart recovery
 
-On startup, `JobLifecycle::recover_interrupted()` scans all non-terminal jobs. `InProgress` jobs are moved to `Stuck` (via `Job::mark_interrupted()`) because the executing context was lost; other non-terminal states (`Pending`, `Stuck`) are left unchanged — they can resume without a state change. Half-open spans under those jobs are rewritten by the trace recovery scan to `Cancelled { SystemCrash }` and rolled into `partial_artifacts`. Upper-layer logic then decides whether to `recover()` or `fail()` each `Stuck` job.
+Not implemented yet. The state-machine and storage shape leave room for it (`Stuck` is non-terminal; `Job.partial_artifacts` indexes spans that the next job should preamble-render), but there is currently no production code path that scans non-terminal jobs at startup or rewrites half-open spans. A crash leaves jobs and spans in their last-persisted state until an operator cancels them via the admin API.
 
 ### Job hierarchy
 

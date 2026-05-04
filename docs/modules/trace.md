@@ -25,6 +25,7 @@ Steps cannot nest. Spans within a Step can be parallel (siblings sharing a `para
 ```rust
 pub enum StepKind {
     LlmIteration,
+    ToolDirect,
     Compression,
     MemoryRecall,
     MemoryWrite,
@@ -79,11 +80,9 @@ The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was r
 
 Writes are asynchronous, with **synchronous fences** before any LLM or tool call: previous span's `end` and current span's `begin` must be durable before the request goes out. Other writes happen on a background writer task — the agent actor never blocks on persistence except at fences.
 
-### Recovery rewrites half-open spans as Cancelled { SystemCrash }
+### Restart recovery
 
-`recover_half_open_spans()` finds spans with `started_at IS NOT NULL AND ended_at IS NULL AND deleted_at IS NULL`, marks each `Cancelled { reason: SystemCrash }`, and returns their `SpanId`s grouped by `JobId` so `JobLifecycle` can fold them into the parent job's `partial_artifacts`. Runs once at startup, before accepting messages, in lockstep with `JobLifecycle::recover_interrupted()`.
-
-Sessions soft-deleted during downtime are tombstone-finalised first (in-flight spans → `Cancelled { ParentDeleted }`) before the deleted_at marker is honoured by recovery — recovery never writes through a deleted_at row.
+Not implemented yet. The schema indexes the half-open lookup (`spans.ended_at IS NULL AND deleted_at IS NULL`), and `CancelReason::SystemCrash` is reserved for it, but the scan + rewrite is not wired. After a crash, half-open spans stay half-open until an operator cancels the parent job via the admin API.
 
 ### Fork view-layer union
 
@@ -91,7 +90,7 @@ When listing jobs / steps / spans for a session whose `Lineage` is `UserFork { f
 
 ## Constraints
 
-- Types crate with recovery utility — no facade or persistence logic (those live in `agent::trace::SpanRecorder`)
+- Types crate — no facade or persistence logic (those live in `agent::trace::SpanRecorder`)
 - Depends on `aura-job` (for `JobId`, `CancelReason`, `DriftRecord`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.)
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
 - Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists

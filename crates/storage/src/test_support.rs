@@ -11,7 +11,7 @@ use std::io::Cursor;
 use async_trait::async_trait;
 use aura_job::{Job, JobStatusKind, JobTransition};
 use aura_model::{BlobRef, JobId, MemoryEntry, SessionId, SpanId, StepId};
-use aura_trace::{LifecycleOutcome, RecoveredSpan, RecoveryReport, Span, SpanEvent, Step};
+use aura_trace::{Span, SpanEvent, Step};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -322,9 +322,7 @@ impl CostStore for MemoryCostStore {
 }
 
 /// In-memory `TraceStore` for tests. Steps are keyed by `StepId`,
-/// spans by `SpanId`, span events by `(SpanId, seq)`. The recovery
-/// scan rewrites half-open spans the same way the libsql implementation
-/// does (`Cancelled { SystemCrash }` outcome + `ended_at` stamp).
+/// spans by `SpanId`, span events by `(SpanId, seq)`.
 #[derive(Debug, Default)]
 pub struct MemoryTraceStore {
     steps: Mutex<HashMap<StepId, Step>>,
@@ -406,29 +404,6 @@ impl TraceStore for MemoryTraceStore {
             .get(span_id)
             .cloned()
             .unwrap_or_default())
-    }
-
-    async fn recover_half_open_spans(&self) -> TraceStoreResult<RecoveryReport> {
-        let now = chrono::Utc::now();
-        let steps_by_id: HashMap<StepId, JobId> = self
-            .steps
-            .lock()
-            .iter()
-            .map(|(k, v)| (*k, v.job_id))
-            .collect();
-        let mut spans = self.spans.lock();
-        let mut recovered = Vec::new();
-        for span in spans.values_mut() {
-            if span.ended_at.is_none() {
-                let job_id = steps_by_id.get(&span.step_id).copied().unwrap_or_default();
-                span.ended_at = Some(now);
-                span.outcome = LifecycleOutcome::Cancelled {
-                    reason: aura_job::CancelReason::SystemCrash,
-                };
-                recovered.push(RecoveredSpan::for_system_crash(job_id, span.id, now));
-            }
-        }
-        Ok(RecoveryReport::new(recovered))
     }
 }
 

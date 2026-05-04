@@ -83,7 +83,7 @@ Cron jobs flow through the Actor model and observability chain: `CronScheduler` 
 
 ### Startup recovery
 
-On system startup, before accepting any messages, `JobManager::recover_interrupted()` scans all non-terminal jobs left over from a prior run. `InProgress` jobs are moved to `Stuck` (their executing context was lost); other non-terminal states are left unchanged. This is called once in `main()` after constructing the `JobManager`.
+Not implemented yet — see `docs/modules/job.md` "Restart recovery" and `docs/modules/trace.md` "Restart recovery". After a crash, in-flight jobs and half-open spans stay in their last-persisted state until an operator cancels them via the admin API.
 
 ### Router's upstream responsibilities
 
@@ -107,7 +107,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `workspace` | Identity files for system prompt |
 | `cron` | Provides `CronJob`, `CronExecution` domain types; `CronScheduler` in agent manages lifecycle, converts between domain and storage row types |
 | `context` | Conversation window and compression |
-| `job` | Provides domain types (`Job`, `JobStatus`, `OperationKind`) used by `agent::job::JobManager`; startup recovery via `recover_interrupted()` |
+| `job` | Provides domain types (`Job`, `JobStatus`, `JobKind`) used by `agent::job::JobLifecycle` |
 | `trace` | Provides domain types and tree/fork utilities used by `agent::trace::TraceCollector` |
 | `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |

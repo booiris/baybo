@@ -1,9 +1,9 @@
 //! `SpanEvent` — zero-duration markers attached to a `Span`.
 //!
-//! Sanitize hits, approval decisions, and hook degradation all surface
-//! here. Compound key is `(span_id, seq)` — `seq` is span-local and
-//! starts at 0 for the first event on a given span. Cross-span queries
-//! join by `event_kind` when needed.
+//! Sanitize hits and approval decisions surface here. Compound key is
+//! `(span_id, seq)` — `seq` is span-local and starts at 0 for the first
+//! event on a given span. Cross-span queries join by `event_kind` when
+//! needed.
 
 use aura_model::{ApprovalDecision, PlaceholderId, ResourceAccess, SecretKind, SpanId};
 use chrono::{DateTime, Utc};

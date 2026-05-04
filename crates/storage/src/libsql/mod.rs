@@ -211,11 +211,8 @@ impl LibsqlPool {
                 -- the virtual columns in lockstep with `data`, so there
                 -- is no two-side write contract for the storage layer
                 -- to enforce — adding a new field is a serde change in
-                -- `aura-trace`, no schema migration. Old data is not
-                -- preserved across this cutover (an explicit decision
-                -- documented in `docs/modules/trace.md`).
-                DROP TABLE IF EXISTS steps;
-                CREATE TABLE steps (
+                -- `aura-trace`, no schema migration.
+                CREATE TABLE IF NOT EXISTS steps (
                     id         TEXT PRIMARY KEY,
                     data       TEXT NOT NULL,
                     deleted_at INTEGER,
@@ -226,8 +223,7 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_steps_job
                     ON steps(job_id, started_at) WHERE deleted_at IS NULL;
 
-                DROP TABLE IF EXISTS spans;
-                CREATE TABLE spans (
+                CREATE TABLE IF NOT EXISTS spans (
                     id         TEXT PRIMARY KEY,
                     data       TEXT NOT NULL,
                     deleted_at INTEGER,
@@ -237,14 +233,8 @@ impl LibsqlPool {
                 );
                 CREATE INDEX IF NOT EXISTS idx_spans_step
                     ON spans(step_id, started_at) WHERE deleted_at IS NULL;
-                -- Used by recover_half_open_spans at startup. `ended_at`
-                -- is the json_extract result; absent JSON field → NULL.
-                CREATE INDEX IF NOT EXISTS idx_spans_half_open
-                    ON spans(ended_at)
-                    WHERE ended_at IS NULL AND deleted_at IS NULL;
 
-                DROP TABLE IF EXISTS span_events;
-                CREATE TABLE span_events (
+                CREATE TABLE IF NOT EXISTS span_events (
                     span_id    TEXT    NOT NULL,
                     seq        INTEGER NOT NULL,
                     data       TEXT    NOT NULL,

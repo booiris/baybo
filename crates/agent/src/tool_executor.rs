@@ -297,8 +297,7 @@ impl ToolExecutor {
             .await
         {
             // The tool span is already open; close it as Failed before
-            // bubbling the error so it can't sit half-open until the
-            // recovery scan rewrites it as Cancelled { SystemCrash }.
+            // bubbling the error so it can't sit half-open in storage.
             let _ = recorder
                 .cancel_span(
                     span_handle,

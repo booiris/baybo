@@ -282,13 +282,7 @@ pub async fn build_managers(
         boot::to_session_timeout(&config.session),
     ));
 
-    let job_lifecycle = JobLifecycle::new(stores.job.clone());
-    match job_lifecycle.recover_interrupted().await {
-        Ok(0) => {}
-        Ok(n) => info!(count = n, "recovered interrupted jobs from prior run"),
-        Err(e) => tracing::warn!(error = %e, "failed to recover interrupted jobs"),
-    }
-    let job_lifecycle = Arc::new(job_lifecycle);
+    let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
     // CostTracker has been retired in favour of a TraceEventStream
     // subscriber. The bootstrap below wires it once `SpanRecorder`s
     // exist (per-actor); see `spawn_actor` below for the subscription.

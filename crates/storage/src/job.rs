@@ -22,9 +22,9 @@ pub trait JobStore: Send + Sync {
     async fn list_children(&self, parent_job_id: &JobId) -> Result<Vec<Job>>;
     /// Return every stored job. Ordering unspecified — callers sort.
     async fn list_all(&self) -> Result<Vec<Job>>;
-    /// Return jobs whose `JobStatusKind` is in the recovery set
-    /// (`Pending` / `InProgress` / `Stuck`). Used at startup by
-    /// `JobLifecycle::recover_interrupted`.
+    /// Return jobs whose `JobStatusKind` is in the non-terminal set
+    /// (`Pending` / `InProgress` / `Stuck`). Used by admin queries
+    /// surfacing jobs that need attention.
     async fn list_recoverable(&self) -> Result<Vec<Job>>;
 
     /// Append a state-machine transition audit row.
