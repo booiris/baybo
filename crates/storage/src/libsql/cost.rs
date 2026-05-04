@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
 use super::time;
@@ -223,30 +222,6 @@ impl CostStore for LibsqlCostStore {
             }
         }
     }
-
-    async fn purge_user_monthly_cost_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "DELETE FROM user_monthly_cost WHERE updated_at < ?1",
-                libsql::params![time::to_us(cutoff)],
-            )
-            .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
-        Ok(affected)
-    }
-
-    async fn purge_cost_records_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "DELETE FROM cost_records WHERE timestamp < ?1",
-                libsql::params![time::to_us(cutoff)],
-            )
-            .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
-        Ok(affected)
-    }
 }
 
 fn summary_from_aggregate_row(row: &libsql::Row) -> CostResult<CostSummary> {
@@ -321,7 +296,7 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use chrono::{Duration, Utc};
 
     fn test_record(user_id: &str, cost: f64) -> CostRecord {
         CostRecord {

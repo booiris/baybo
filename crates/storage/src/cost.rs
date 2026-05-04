@@ -104,16 +104,4 @@ pub trait CostStore: Send + Sync {
         user_id: &str,
         month: &str,
     ) -> CostResult<Option<UserMonthlyCost>>;
-
-    /// Hard-delete every cached row whose `updated_at` is strictly
-    /// before `cutoff`. Returns the number of rows removed. Periodic
-    /// invocation lives in `aura-janitor` (see retention policy).
-    async fn purge_user_monthly_cost_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64>;
-
-    /// Hard-delete raw `cost_records` rows whose `timestamp` is strictly
-    /// before `cutoff`. Returns the number of rows removed. The
-    /// per-month aggregate in `user_monthly_cost` is the durable
-    /// rollup; raw records past the retention horizon stop being
-    /// useful and grow linearly with traffic, so they're safe to drop.
-    async fn purge_cost_records_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64>;
 }

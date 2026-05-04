@@ -290,26 +290,6 @@ impl CostStore for MemoryCostStore {
             .cloned())
     }
 
-    async fn purge_user_monthly_cost_older_than(
-        &self,
-        cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> CostResult<u64> {
-        let mut map = self.monthly.lock();
-        let before = map.len();
-        map.retain(|_, v| v.updated_at >= cutoff);
-        Ok((before - map.len()) as u64)
-    }
-
-    async fn purge_cost_records_older_than(
-        &self,
-        cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> CostResult<u64> {
-        let mut records = self.records.lock();
-        let before = records.len();
-        records.retain(|r| r.timestamp >= cutoff);
-        Ok((before - records.len()) as u64)
-    }
-
     async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64> {
         Ok(self
             .records
