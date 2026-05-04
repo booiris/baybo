@@ -1,208 +1,509 @@
-use std::collections::HashMap;
+//! `SpanRecorder` — facade that owns Step / Span / SpanEvent
+//! lifecycle for one session, and `TraceEventStream` — the
+//! `tokio::sync::broadcast` bus that downstream observers (cost
+//! tracker, hook router, TUI) subscribe to.
+//!
+//! Replaces the legacy `TraceCollector` + `ObservabilityRecorder`
+//! split. See `docs/modules/trace.md` for the design.
+
 use std::sync::Arc;
 
-use aura_job::OperationKind;
+use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
 use aura_storage::TraceStore;
-use aura_trace::tree::{attach_child, create_root_node, set_active_leaf};
 use aura_trace::{
-    ExecutionProvenance, SessionTrace, SpanHandle, SpanInput, SpanResult, TraceError, TraceNodeId,
+    LifecycleOutcome, LifecycleState, Span, SpanEvent, SpanEventKind, SpanFinalize, SpanHandle,
+    SpanKind, Step, StepHandle, StepKind, TraceError,
 };
-
-/// Collects trace spans for a single session and persists them via a `TraceStore`.
-pub struct TraceCollector {
-    session_trace: SessionTrace,
-    store: Arc<dyn TraceStore>,
-}
+use chrono::Utc;
+use tokio::sync::broadcast;
 
 type Result<T> = std::result::Result<T, TraceError>;
 
-impl TraceCollector {
-    pub fn new(session_id: &str, store: Arc<dyn TraceStore>) -> Self {
-        let (root_id, root_node) = create_root_node(session_id);
-        let mut nodes = HashMap::new();
-        nodes.insert(root_id.clone(), root_node);
+const TRACE_EVENT_CHANNEL_CAPACITY: usize = 256;
 
-        let session_trace = SessionTrace {
-            session_id: session_id.to_owned(),
-            root: root_id.clone(),
-            nodes,
-            forks: Vec::new(),
-            active_leaf: root_id,
-        };
+/// One event published on a session's `TraceEventStream`.
+#[derive(Debug, Clone)]
+pub enum TraceEvent {
+    StepStarted {
+        step_id: StepId,
+        job_id: JobId,
+        kind: StepKind,
+    },
+    StepEnded {
+        step_id: StepId,
+        job_id: JobId,
+        outcome: LifecycleOutcome,
+    },
+    SpanStarted {
+        span_id: SpanId,
+        step_id: StepId,
+        job_id: JobId,
+        /// String tag of the kind (`"llm_call"`, `"tool_call"`, etc.).
+        kind_tag: &'static str,
+    },
+    SpanEnded {
+        span_id: SpanId,
+        step_id: StepId,
+        job_id: JobId,
+        outcome: LifecycleOutcome,
+    },
+    SpanEventEmitted(SpanEvent),
+    /// Fired specifically by `end_span` for `SpanKind::LlmCall` so
+    /// `CostTracker` can subscribe and write cost rows asynchronously.
+    /// Carries everything `cost_records` needs, including the owning
+    /// user (so `user_monthly_cost` rolls up per-user-per-month rather
+    /// than collapsing every event into one (`""`, month) row).
+    LlmSpanEnded {
+        span_id: SpanId,
+        job_id: JobId,
+        session_id: SessionId,
+        user_id: String,
+        model_id: String,
+        provider: String,
+        input_tokens: usize,
+        output_tokens: usize,
+    },
+}
 
-        Self {
-            session_trace,
-            store,
-        }
-    }
+/// Per-session broadcast bus. Cheap to clone; subscribers receive
+/// every event published after they call `subscribe()`. Slow
+/// subscribers may lag (broadcast::error::RecvError::Lagged) — they
+/// should treat that as "I missed N events" and reconcile against the
+/// columnar store.
+#[derive(Debug, Clone)]
+pub struct TraceEventStream {
+    sender: broadcast::Sender<TraceEvent>,
+}
 
-    pub fn begin_span(
-        &mut self,
-        kind: OperationKind,
-        job_id: Option<&str>,
-        provenance: ExecutionProvenance,
-        input: SpanInput,
-    ) -> SpanHandle {
-        let parent_id = self.session_trace.active_leaf.clone();
-
-        let input_clone = input.clone();
-        let provenance_clone = provenance.clone();
-        let node_id = match attach_child(
-            &mut self.session_trace,
-            &parent_id,
-            kind,
-            job_id,
-            provenance,
-            input,
-        ) {
-            Ok(id) => id,
-            Err(_) => {
-                let fallback_parent = self.session_trace.root.clone();
-                let session_id = self.session_trace.session_id.clone();
-                attach_child(
-                    &mut self.session_trace,
-                    &fallback_parent,
-                    OperationKind::UserMessageHandling { session_id },
-                    job_id,
-                    provenance_clone,
-                    input_clone,
-                )
-                .unwrap_or_else(|_| self.session_trace.root.clone())
-            }
-        };
-
-        set_active_leaf(&mut self.session_trace, node_id.clone());
-
-        SpanHandle { node_id }
-    }
-
-    pub fn end_span(&mut self, handle: SpanHandle, result: SpanResult) {
-        if let Some(node) = self.session_trace.nodes.get_mut(&handle.node_id) {
-            node.span.ended_at = Some(chrono::Utc::now());
-            node.span.result = Some(result);
-
-            if let Some(ref parent_id) = node.parent.clone() {
-                set_active_leaf(&mut self.session_trace, parent_id.clone());
-            }
-        }
-    }
-
-    pub async fn flush(&self) -> Result<()> {
-        self.store.save_trace(&self.session_trace).await
-    }
-
-    /// Snapshot the store handle and the current `SessionTrace` for async
-    /// flushing. Used by callers that hold the collector behind a sync lock
-    /// (e.g. `ObservabilityRecorder`) to avoid awaiting while the guard
-    /// is held.
-    pub fn flush_snapshot(&self) -> (Arc<dyn TraceStore>, SessionTrace) {
-        (Arc::clone(&self.store), self.session_trace.clone())
-    }
-
-    pub fn active_leaf(&self) -> &TraceNodeId {
-        &self.session_trace.active_leaf
+impl Default for TraceEventStream {
+    fn default() -> Self {
+        let (sender, _rx) = broadcast::channel(TRACE_EVENT_CHANNEL_CAPACITY);
+        Self { sender }
     }
 }
 
-#[cfg(test)]
-impl TraceCollector {
-    fn session_trace(&self) -> &SessionTrace {
-        &self.session_trace
+impl TraceEventStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<TraceEvent> {
+        self.sender.subscribe()
+    }
+
+    /// Number of currently active subscribers. Mostly for tests +
+    /// metrics — `publish` is fire-and-forget regardless.
+    pub fn receiver_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
+
+    pub(crate) fn publish(&self, event: TraceEvent) {
+        // `send` returns Err only when there are no subscribers; that
+        // is not a failure for fire-and-forget audit events.
+        let _ = self.sender.send(event);
+    }
+}
+
+/// Owns the per-session Step / Span / SpanEvent write path.
+///
+/// One `SpanRecorder` per session — held by `AgentActor` alongside its
+/// `JobLifecycle`. Cheap to construct (just three Arc clones + an
+/// `mpsc`-style broadcast sender).
+pub struct SpanRecorder {
+    session_id: SessionId,
+    user_id: String,
+    trace_store: Arc<dyn TraceStore>,
+    stream: TraceEventStream,
+}
+
+impl SpanRecorder {
+    /// Construct a recorder. `stream` is **required** because the
+    /// `CostSubscriber` and any other downstream listeners subscribe
+    /// to one shared bus; a recorder that publishes into a private
+    /// bus silently under-bills (and the lag counter doesn't fire
+    /// either, because lag only counts events the *subscribed* bus
+    /// dropped). Callers without a process-wide bus pass
+    /// `TraceEventStream::new()` explicitly so the choice is on
+    /// record at the call site.
+    pub fn new(
+        session_id: SessionId,
+        user_id: String,
+        trace_store: Arc<dyn TraceStore>,
+        stream: TraceEventStream,
+    ) -> Self {
+        Self {
+            session_id,
+            user_id,
+            trace_store,
+            stream,
+        }
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn stream(&self) -> &TraceEventStream {
+        &self.stream
+    }
+
+    // ── Step lifecycle ────────────────────────────────────────────
+
+    /// Open a new `Step` under `job_id`. Persists immediately to the
+    /// columnar `steps` table.
+    pub async fn begin_step(&self, job_id: JobId, kind: StepKind) -> Result<StepHandle> {
+        let started_at = Utc::now();
+        let step_id = StepId::new();
+        let step = Step {
+            id: step_id,
+            job_id,
+            kind: kind.clone(),
+            started_at,
+            ended_at: None,
+            outcome: LifecycleState::Pending,
+        };
+        self.trace_store.save_step(&step).await?;
+        self.stream.publish(TraceEvent::StepStarted {
+            step_id,
+            job_id,
+            kind: kind.clone(),
+        });
+        Ok(StepHandle::new(step_id, job_id, kind, started_at))
+    }
+
+    /// Close a step. Constructs the closed `Step` row from the handle
+    /// (which carries the begin-time `kind` + `started_at`) so the
+    /// columnar write is a single INSERT OR REPLACE — no SELECT.
+    pub async fn end_step(&self, handle: StepHandle, outcome: LifecycleOutcome) -> Result<()> {
+        let step = Step {
+            id: handle.step_id,
+            job_id: handle.job_id,
+            kind: handle.kind,
+            started_at: handle.started_at,
+            ended_at: Some(Utc::now()),
+            outcome: LifecycleState::Done(outcome.clone()),
+        };
+        self.trace_store.save_step(&step).await?;
+        self.stream.publish(TraceEvent::StepEnded {
+            step_id: handle.step_id,
+            job_id: handle.job_id,
+            outcome,
+        });
+        Ok(())
+    }
+
+    // ── Span lifecycle ────────────────────────────────────────────
+
+    /// Open a new `Span` under `step`. Persists immediately.
+    pub async fn begin_span(
+        &self,
+        step: &StepHandle,
+        kind: SpanKind,
+        parallel_group: Option<ParallelGroup>,
+    ) -> Result<SpanHandle> {
+        let started_at = Utc::now();
+        let span_id = SpanId::new();
+        let span = Span {
+            id: span_id,
+            step_id: step.step_id,
+            kind: kind.clone(),
+            parallel_group,
+            started_at,
+            ended_at: None,
+            outcome: LifecycleState::Pending,
+            events: Vec::new(),
+        };
+        let kind_tag = kind.tag();
+        self.trace_store.save_span(&span).await?;
+        self.stream.publish(TraceEvent::SpanStarted {
+            span_id,
+            step_id: step.step_id,
+            job_id: step.job_id,
+            kind_tag,
+        });
+        Ok(SpanHandle::new(
+            span_id,
+            step.step_id,
+            kind,
+            started_at,
+            parallel_group,
+        ))
+    }
+
+    /// Close a span. Merges the [`SpanFinalize`] payload into the
+    /// begin-time kind on the handle, writes via INSERT OR REPLACE
+    /// (no SELECT), and publishes the stream events. For `LlmCall`
+    /// spans, also publishes an `LlmSpanEnded` event so cost
+    /// subscribers can write `cost_records` asynchronously.
+    ///
+    /// Variant mismatch (`finalize` does not match `handle.kind`) is a
+    /// programming error and surfaces as `TraceError::Internal`.
+    pub async fn end_span(
+        &self,
+        mut handle: SpanHandle,
+        job_id: JobId,
+        finalize: SpanFinalize,
+        outcome: LifecycleOutcome,
+    ) -> Result<()> {
+        finalize_span_kind(&mut handle.kind, finalize, &handle.span_id)?;
+        if let SpanKind::LlmCall {
+            begin,
+            result: Some(result),
+        } = &handle.kind
+        {
+            self.stream.publish(TraceEvent::LlmSpanEnded {
+                span_id: handle.span_id,
+                job_id,
+                session_id: self.session_id.clone(),
+                user_id: self.user_id.clone(),
+                model_id: begin.model_id.clone(),
+                provider: begin.provider.clone(),
+                input_tokens: result.input_tokens,
+                output_tokens: result.output_tokens,
+            });
+        }
+        let span = Span {
+            id: handle.span_id,
+            step_id: handle.step_id,
+            kind: handle.kind,
+            parallel_group: handle.parallel_group,
+            started_at: handle.started_at,
+            ended_at: Some(Utc::now()),
+            outcome: LifecycleState::Done(outcome.clone()),
+            events: Vec::new(),
+        };
+        self.trace_store.save_span(&span).await?;
+        self.stream.publish(TraceEvent::SpanEnded {
+            span_id: handle.span_id,
+            step_id: handle.step_id,
+            job_id,
+            outcome,
+        });
+        Ok(())
+    }
+
+    // ── SpanEvent ────────────────────────────────────────────────
+
+    /// Close a half-open span without supplying end-time data. Used
+    /// by `?`-error paths that need to release a half-open span
+    /// quickly without constructing a meaningful result; the stored
+    /// `SpanKind`'s `result` field stays `None` (or whatever it was
+    /// at begin time).
+    pub async fn cancel_span(
+        &self,
+        handle: SpanHandle,
+        job_id: JobId,
+        outcome: LifecycleOutcome,
+    ) -> Result<()> {
+        self.end_span(handle, job_id, SpanFinalize::Empty, outcome)
+            .await
+    }
+
+    /// Emit a SpanEvent (sanitize hit / approval).
+    /// `seq` is caller-supplied because the recorder does not own
+    /// per-span sequence counters — each call site that emits
+    /// multiple events on the same span manages its own counter.
+    pub async fn emit_event(&self, span_id: SpanId, seq: u32, kind: SpanEventKind) -> Result<()> {
+        let event = SpanEvent::new(span_id, seq, kind);
+        self.trace_store.append_span_event(&event).await?;
+        self.stream.publish(TraceEvent::SpanEventEmitted(event));
+        Ok(())
+    }
+}
+
+/// Apply a [`SpanFinalize`] payload to the begin-time `SpanKind` in
+/// place. Returns `Err(TraceError::Internal)` when the finalize variant
+/// does not match the kind variant — that's a caller bug. `Empty` is
+/// always allowed (used by `cancel_span`).
+fn finalize_span_kind(kind: &mut SpanKind, finalize: SpanFinalize, span_id: &SpanId) -> Result<()> {
+    match (kind, finalize) {
+        (SpanKind::LlmCall { result, .. }, SpanFinalize::LlmCall(r)) => {
+            *result = Some(r);
+            Ok(())
+        }
+        (SpanKind::ToolCall { result, .. }, SpanFinalize::ToolCall(r)) => {
+            *result = Some(r);
+            Ok(())
+        }
+        (_, SpanFinalize::Empty) => Ok(()),
+        _ => Err(TraceError::Internal(anyhow::anyhow!(
+            "span {} end_span finalize variant does not match begin-time kind",
+            span_id
+        ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use aura_trace::{SpanResult, TraceFilter, TraceNode};
-    use parking_lot::Mutex;
+    use aura_storage::test_support::MemoryTraceStore;
 
-    struct MemoryTraceStore {
-        traces: Mutex<HashMap<String, SessionTrace>>,
+    fn make_recorder() -> SpanRecorder {
+        SpanRecorder::new(
+            SessionId::from("cli-test"),
+            "user-test".to_string(),
+            Arc::new(MemoryTraceStore::new()),
+            TraceEventStream::new(),
+        )
     }
 
-    impl MemoryTraceStore {
-        fn new() -> Self {
-            Self {
-                traces: Mutex::new(HashMap::new()),
+    fn dummy_llm_kind() -> SpanKind {
+        SpanKind::LlmCall {
+            begin: aura_trace::LlmCallBegin {
+                model_id: "claude".into(),
+                provider: "anthropic".into(),
+                provider_config_hash: "h".into(),
+                input_messages: vec![],
+                temperature: None,
+            },
+            result: None,
+        }
+    }
+
+    fn llm_finalize(input_tokens: usize, output_tokens: usize) -> SpanFinalize {
+        SpanFinalize::LlmCall(aura_trace::LlmCallResult {
+            output_content: "hi".into(),
+            thinking: None,
+            tool_calls: vec![],
+            input_tokens,
+            output_tokens,
+        })
+    }
+
+    #[tokio::test]
+    async fn step_round_trip_emits_events() {
+        let rec = make_recorder();
+        let mut rx = rec.stream().subscribe();
+        let job = JobId::new();
+        let h = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        rec.end_step(h, LifecycleOutcome::Ok).await.unwrap();
+        let started = rx.recv().await.unwrap();
+        assert!(matches!(started, TraceEvent::StepStarted { .. }));
+        let ended = rx.recv().await.unwrap();
+        assert!(matches!(ended, TraceEvent::StepEnded { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancel_span_releases_half_open_without_caller_span_result() {
+        // Regression: tool_executor and compress_if_needed used to leak
+        // half-open spans on early `?` return paths. cancel_span lets
+        // those paths release the span without supplying a finalize
+        // payload — `SpanKind`'s `result` stays `None` and `LlmSpanEnded`
+        // does NOT fire (a cancelled LLM call has no token counts).
+        let rec = make_recorder();
+        let mut rx = rec.stream().subscribe();
+        let job = JobId::new();
+        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
+        rec.cancel_span(
+            span,
+            job,
+            LifecycleOutcome::Failed {
+                reason: "sanitize failed".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut tags = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            tags.push(format!("{ev:?}"));
+        }
+        assert!(tags.iter().any(|t| t.contains("SpanEnded")));
+        assert!(
+            !tags.iter().any(|t| t.contains("LlmSpanEnded")),
+            "cancelled span must not emit a token-count cost event",
+        );
+    }
+
+    #[tokio::test]
+    async fn span_lifecycle_emits_started_and_ended() {
+        let rec = make_recorder();
+        let mut rx = rec.stream().subscribe();
+        let job = JobId::new();
+        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
+        rec.end_span(span, job, llm_finalize(10, 5), LifecycleOutcome::Ok)
+            .await
+            .unwrap();
+        // Drain step started + span started + llm span ended + span ended
+        let mut tags = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            tags.push(format!("{ev:?}"));
+        }
+        assert!(tags.iter().any(|t| t.contains("StepStarted")));
+        assert!(tags.iter().any(|t| t.contains("SpanStarted")));
+        assert!(tags.iter().any(|t| t.contains("LlmSpanEnded")));
+        assert!(tags.iter().any(|t| t.contains("SpanEnded")));
+    }
+
+    #[tokio::test]
+    async fn llm_span_end_emits_token_counts_for_cost_subscriber() {
+        let rec = make_recorder();
+        let mut rx = rec.stream().subscribe();
+        let job = JobId::new();
+        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
+        rec.end_span(span, job, llm_finalize(123, 45), LifecycleOutcome::Ok)
+            .await
+            .unwrap();
+        // Drain until LlmSpanEnded
+        loop {
+            match rx.recv().await.unwrap() {
+                TraceEvent::LlmSpanEnded {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
+                    assert_eq!(input_tokens, 123);
+                    assert_eq!(output_tokens, 45);
+                    break;
+                }
+                _ => continue,
             }
         }
     }
 
-    #[async_trait]
-    impl TraceStore for MemoryTraceStore {
-        async fn save_trace(&self, trace: &SessionTrace) -> Result<()> {
-            self.traces
-                .lock()
-                .insert(trace.session_id.clone(), trace.clone());
-            Ok(())
-        }
-
-        async fn load_trace(&self, session_id: &str) -> Result<Option<SessionTrace>> {
-            Ok(self.traces.lock().get(session_id).cloned())
-        }
-
-        async fn query_traces(&self, _filter: TraceFilter) -> Result<Vec<SessionTrace>> {
-            Ok(self.traces.lock().values().cloned().collect())
-        }
-
-        async fn load_node(
-            &self,
-            session_id: &str,
-            node_id: &TraceNodeId,
-        ) -> Result<Option<TraceNode>> {
-            Ok(self
-                .traces
-                .lock()
-                .get(session_id)
-                .and_then(|t| t.nodes.get(node_id).cloned()))
-        }
-    }
-
-    fn make_collector() -> TraceCollector {
-        let store = Arc::new(MemoryTraceStore::new());
-        TraceCollector::new("sess-1", store)
-    }
-
-    #[test]
-    fn begin_and_end_span() {
-        let mut collector = make_collector();
-
-        let handle = collector.begin_span(
-            OperationKind::LlmCall {
-                model: "gpt-4".to_owned(),
-            },
-            Some("job-1"),
-            ExecutionProvenance::default(),
-            SpanInput::None,
-        );
-
-        let node_id = handle.node_id.clone();
-        collector.end_span(
-            handle,
-            SpanResult::LlmResponse {
-                output_content: "hello".to_owned(),
-                input_tokens: 10,
-                output_tokens: 5,
-                thinking: None,
-                tool_calls: Vec::new(),
-                latency: std::time::Duration::from_millis(100),
-            },
-        );
-
-        let node = collector.session_trace().nodes.get(&node_id).unwrap();
-        assert!(node.span.ended_at.is_some());
-        assert!(node.span.result.is_some());
+    #[tokio::test]
+    async fn end_span_rejects_variant_mismatch() {
+        let rec = make_recorder();
+        let job = JobId::new();
+        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
+        // Begin-time kind is LlmCall; result variant is ToolCall —
+        // programming error, surfaces as TraceError::Internal.
+        let err = rec
+            .end_span(
+                span,
+                job,
+                SpanFinalize::ToolCall(aura_trace::ToolCallResult {
+                    output: serde_json::Value::Null,
+                    success: false,
+                }),
+                LifecycleOutcome::Ok,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TraceError::Internal(_)));
     }
 
     #[tokio::test]
-    async fn flush_persists_trace() {
-        let store = Arc::new(MemoryTraceStore::new());
-        let collector = TraceCollector::new("sess-flush", store.clone());
-        collector.flush().await.unwrap();
-
-        let loaded = store.load_trace("sess-flush").await.unwrap();
-        assert!(loaded.is_some());
+    async fn emit_event_publishes_and_persists() {
+        let rec = make_recorder();
+        let mut rx = rec.stream().subscribe();
+        let span = SpanId::new();
+        rec.emit_event(
+            span,
+            0,
+            SpanEventKind::Approval {
+                decision: aura_model::ApprovalDecision::Approve,
+                resource: aura_model::ResourceAccess::ReadFile {
+                    path: std::path::PathBuf::from("/tmp/foo"),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let ev = rx.recv().await.unwrap();
+        assert!(matches!(ev, TraceEvent::SpanEventEmitted(_)));
     }
 }

@@ -1,0 +1,826 @@
+//! Query API v1 — the read surface from `docs/todo/trace-redesign.md` §12.
+//!
+//! 9 endpoints:
+//!
+//! 1. `load_session` — resolves lineage
+//! 2. `list_jobs` — fork-prefix UNION + `is_inherited` flag
+//! 3. `load_job` — Job + step list
+//! 4. `load_step` — Step + spans + span events
+//! 5. `find_recoverable_jobs` — recovery scan
+//! 6. `list_active_subagents` — live Subagent-lineage children
+//! 7. `lineage_tree` — ancestry + immediate descendants
+//! 8. `cost_summary` — User / Session / Job / TimeRange
+//! 9. `replay` — chronological Job → Step → Span tree (also the
+//!    backend for fork's view-layer UNION)
+//!
+//! Errors collapse into a single `QueryError` so callers don't need to
+//! match four different store error types.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use aura_job::{Job, JobError, JobKind, JobStatus, JobStatusKind};
+use aura_model::{JobId, Lineage, LineageKind, Session, SessionId, StepId};
+use aura_storage::{
+    CostError, CostStore, CostSummary, SessionStore, StorageError, TimeRange, TraceStore,
+};
+use aura_trace::{Span, SpanEvent, Step, TraceError};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::job::JobLifecycle;
+
+#[derive(Debug, Error)]
+pub enum QueryError {
+    #[error("session error: {0}")]
+    Session(#[from] StorageError),
+    #[error("job error: {0}")]
+    Job(#[from] JobError),
+    #[error("trace error: {0}")]
+    Trace(#[from] TraceError),
+    #[error("cost error: {0}")]
+    Cost(#[from] CostError),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+}
+
+pub type Result<T> = std::result::Result<T, QueryError>;
+
+// ── DTOs ────────────────────────────────────────────────────────────
+
+/// Filter for `list_jobs`. All fields are AND-combined; `None` means
+/// no constraint.
+#[derive(Debug, Clone, Default)]
+pub struct JobFilter {
+    pub status_kind: Option<JobStatusKind>,
+    pub kind: Option<JobKind>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// Lightweight row returned by `list_jobs`. `is_inherited = true`
+/// means the job lives in another session and is being surfaced via
+/// the fork view-layer UNION; `inherited_from_session_id` then
+/// names the source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSummary {
+    pub id: JobId,
+    pub session_id: SessionId,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub is_inherited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_from_session_id: Option<SessionId>,
+}
+
+impl JobSummary {
+    fn from_owned(j: &Job) -> Self {
+        Self {
+            id: j.id,
+            session_id: j.session_id.clone(),
+            kind: j.kind,
+            status: j.status.clone(),
+            created_at: j.created_at,
+            started_at: j.started_at,
+            ended_at: j.ended_at,
+            is_inherited: false,
+            inherited_from_session_id: None,
+        }
+    }
+
+    fn from_inherited(j: &Job, source: SessionId) -> Self {
+        Self {
+            id: j.id,
+            session_id: j.session_id.clone(),
+            kind: j.kind,
+            status: j.status.clone(),
+            created_at: j.created_at,
+            started_at: j.started_at,
+            ended_at: j.ended_at,
+            is_inherited: true,
+            inherited_from_session_id: Some(source),
+        }
+    }
+}
+
+/// Job + its step list. Step children are *not* eagerly loaded; call
+/// `load_step` for each step's spans.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobDetail {
+    pub job: Job,
+    pub steps: Vec<Step>,
+}
+
+/// Step + every span under it (plus each span's `events` already
+/// inlined by the `Span` struct). Heavier than `JobDetail::steps`
+/// because it eagerly fetches spans.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepDetail {
+    pub step: Step,
+    pub spans: Vec<Span>,
+}
+
+/// One node in the lineage tree returned by `lineage_tree`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineageNode {
+    pub session_id: SessionId,
+    /// `Some` when this node is the descendant of another via
+    /// `Lineage`. `None` for the root node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_kind: Option<LineageKind>,
+    pub children: Vec<LineageNode>,
+}
+
+fn build_lineage_node(
+    id: SessionId,
+    via_kind: Option<LineageKind>,
+    edges: &HashMap<SessionId, Vec<(SessionId, LineageKind)>>,
+) -> LineageNode {
+    let children = edges
+        .get(&id)
+        .map(|kids| {
+            kids.iter()
+                .map(|(cid, kind)| build_lineage_node(cid.clone(), Some(kind.clone()), edges))
+                .collect()
+        })
+        .unwrap_or_default();
+    LineageNode {
+        session_id: id,
+        via_kind,
+        children,
+    }
+}
+
+/// Scope for `cost_summary`.
+#[derive(Debug, Clone)]
+pub enum CostScope {
+    User { user_id: String, range: TimeRange },
+    Session(SessionId),
+    Job(JobId),
+    TimeRange(TimeRange),
+}
+
+/// Chronological replay of a session's job/step/span tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayedConversation {
+    pub session_id: SessionId,
+    pub jobs: Vec<ReplayJob>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayJob {
+    pub job: Job,
+    pub steps: Vec<ReplayStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayStep {
+    pub step: Step,
+    pub spans: Vec<Span>,
+}
+
+// ── QueryApi ────────────────────────────────────────────────────────
+
+/// Read-only view onto the session/job/trace/cost stores.
+///
+/// `Arc<JobLifecycle>` rather than `Arc<dyn JobStore>` because the
+/// lifecycle facade already wraps the store with the strong-typed
+/// API the query layer wants (`list(Option<JobStatusKind>)` →
+/// pre-sorted, status-filtered job lists).
+pub struct QueryApi {
+    sessions: Arc<dyn SessionStore>,
+    jobs: Arc<JobLifecycle>,
+    trace: Arc<dyn TraceStore>,
+    /// Optional. Callers that only need lineage / replay / job listing
+    /// (CLI `aura trace list/show/export`, gateway `/v1/traces/{id}`)
+    /// pass `None`; cost_summary then returns `Unsupported`.
+    costs: Option<Arc<dyn CostStore>>,
+}
+
+impl QueryApi {
+    pub fn new(
+        sessions: Arc<dyn SessionStore>,
+        jobs: Arc<JobLifecycle>,
+        trace: Arc<dyn TraceStore>,
+        costs: Arc<dyn CostStore>,
+    ) -> Self {
+        Self {
+            sessions,
+            jobs,
+            trace,
+            costs: Some(costs),
+        }
+    }
+
+    /// Build a `QueryApi` without a `CostStore`. `cost_summary` calls
+    /// return `QueryError::Unsupported` — used by the CLI trace
+    /// commands which never touch cost data.
+    pub fn without_costs(
+        sessions: Arc<dyn SessionStore>,
+        jobs: Arc<JobLifecycle>,
+        trace: Arc<dyn TraceStore>,
+    ) -> Self {
+        Self {
+            sessions,
+            jobs,
+            trace,
+            costs: None,
+        }
+    }
+
+    // ── 1. load_session ────────────────────────────────────────
+
+    pub async fn load_session(&self, id: &SessionId) -> Result<Option<Session>> {
+        Ok(self.sessions.get(id).await?)
+    }
+
+    // ── 2. list_jobs (with fork-prefix UNION) ──────────────────
+
+    pub async fn list_jobs(
+        &self,
+        session_id: &SessionId,
+        filter: JobFilter,
+    ) -> Result<Vec<JobSummary>> {
+        // Always include this session's own jobs first.
+        let mut summaries: Vec<JobSummary> = self
+            .jobs
+            .list_by_session(session_id, filter.status_kind)
+            .await?
+            .into_iter()
+            .filter(|j| filter_matches(j, &filter))
+            .map(|j| JobSummary::from_owned(&j))
+            .collect();
+
+        // If this is a UserFork session, prepend the source's prefix.
+        if let Some(session) = self.sessions.get(session_id).await?
+            && let Some(Lineage {
+                parent_session_id,
+                kind: LineageKind::UserFork { fork_at_job_id, .. },
+                ..
+            }) = session.lineage
+        {
+            let source_jobs: Vec<Job> = self
+                .jobs
+                .list_by_session(&parent_session_id, filter.status_kind)
+                .await?
+                .into_iter()
+                .filter(|j| filter_matches(j, &filter))
+                .collect();
+            // Tie-break by JobId after `created_at` so two jobs minted in
+            // the same microsecond on the source session don't both pass
+            // the cutoff (or both get dropped). `created_at` resolution
+            // is µs; ULID JobIds give a deterministic secondary order.
+            let cutoff = source_jobs
+                .iter()
+                .find(|j| j.id == fork_at_job_id)
+                .map(|j| (j.created_at, j.id));
+            let prefix: Vec<JobSummary> = source_jobs
+                .into_iter()
+                .filter(|j| match cutoff {
+                    Some((c_at, c_id)) => (j.created_at, j.id) <= (c_at, c_id),
+                    None => true,
+                })
+                .map(|j| JobSummary::from_inherited(&j, parent_session_id.clone()))
+                .collect();
+            let mut combined = prefix;
+            combined.append(&mut summaries);
+            summaries = combined;
+        }
+        // Newest-first (already sorted by JobLifecycle::list, but the
+        // UNION above interleaved two streams).
+        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(summaries)
+    }
+
+    // ── 3. load_job ────────────────────────────────────────────
+
+    pub async fn load_job(&self, id: &JobId) -> Result<JobDetail> {
+        let job = self
+            .jobs
+            .get(id)
+            .await?
+            .ok_or_else(|| QueryError::NotFound(format!("job {id}")))?;
+        let steps = self.trace.list_steps_by_job(id).await?;
+        Ok(JobDetail { job, steps })
+    }
+
+    // ── 4. load_step ───────────────────────────────────────────
+
+    pub async fn load_step(&self, id: &StepId) -> Result<StepDetail> {
+        let step = self
+            .trace
+            .load_step(id)
+            .await?
+            .ok_or_else(|| QueryError::NotFound(format!("step {id}")))?;
+        let mut spans = self.trace.list_spans_by_step(id).await?;
+        // Span events are stored separately; fold them in so callers
+        // get a fully self-contained `StepDetail`.
+        for span in &mut spans {
+            if span.events.is_empty() {
+                let evs: Vec<SpanEvent> = self.trace.list_span_events(&span.id).await?;
+                span.events = evs;
+            }
+        }
+        Ok(StepDetail { step, spans })
+    }
+
+    // ── 5. find_recoverable_jobs ───────────────────────────────
+
+    pub async fn find_recoverable_jobs(&self) -> Result<Vec<Job>> {
+        Ok(self.jobs.list_recoverable().await?)
+    }
+
+    // ── 6. list_active_subagents ───────────────────────────────
+
+    pub async fn list_active_subagents(&self, session_id: &SessionId) -> Result<Vec<SessionId>> {
+        let children = self.sessions.list_lineage_children(session_id).await?;
+        let mut out = Vec::new();
+        for (child_id, kind) in children {
+            if !matches!(kind, LineageKind::Subagent) {
+                continue;
+            }
+            // "Active" = at least one non-terminal job in this child.
+            let active = self
+                .jobs
+                .list_by_session(&child_id, None)
+                .await?
+                .iter()
+                .any(|j| !j.status.is_terminal());
+            if active {
+                out.push(child_id);
+            }
+        }
+        Ok(out)
+    }
+
+    // ── 7. lineage_tree ────────────────────────────────────────
+
+    /// Walks descendants via `list_lineage_children`. Cycle protection
+    /// caps recursion at `MAX_DEPTH = 32` — a runaway lineage tree
+    /// indicates a bug and we'd rather truncate than stack overflow.
+    pub async fn lineage_tree(&self, root_session_id: &SessionId) -> Result<LineageNode> {
+        const MAX_DEPTH: usize = 32;
+        // BFS to fetch every parent → children edge, then assemble the
+        // tree in safe code. Two passes so the async fetch loop owns no
+        // node references that could be invalidated by a later push.
+        let mut edges: HashMap<SessionId, Vec<(SessionId, LineageKind)>> = HashMap::new();
+        let mut frontier: Vec<(SessionId, usize)> = vec![(root_session_id.clone(), 0)];
+        while let Some((parent_id, depth)) = frontier.pop() {
+            if depth >= MAX_DEPTH {
+                continue;
+            }
+            let kids = self.sessions.list_lineage_children(&parent_id).await?;
+            for (cid, kind) in kids {
+                edges
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push((cid.clone(), kind));
+                frontier.push((cid, depth + 1));
+            }
+        }
+        Ok(build_lineage_node(root_session_id.clone(), None, &edges))
+    }
+
+    // ── 8. cost_summary ────────────────────────────────────────
+
+    pub async fn cost_summary(&self, scope: CostScope) -> Result<CostSummary> {
+        let costs = self
+            .costs
+            .as_ref()
+            .ok_or_else(|| QueryError::Unsupported("cost_summary requires a CostStore".into()))?;
+        match scope {
+            CostScope::TimeRange(range) => Ok(costs.query_global(range).await?),
+            CostScope::User { user_id, range } => {
+                let records = costs.query_user(&user_id, range).await?;
+                let mut summary = CostSummary::default();
+                for r in records {
+                    summary.total_cost_usd += r.cost_usd;
+                    summary.total_input_tokens += r.input_tokens;
+                    summary.total_output_tokens += r.output_tokens;
+                    summary.record_count += 1;
+                }
+                Ok(summary)
+            }
+            CostScope::Session(sid) => Ok(costs.query_session(&sid).await?),
+            CostScope::Job(jid) => Ok(costs.query_job(&jid).await?),
+        }
+    }
+
+    // ── 9. replay ──────────────────────────────────────────────
+
+    pub async fn replay(
+        &self,
+        session_id: &SessionId,
+        until_step_id: Option<StepId>,
+    ) -> Result<ReplayedConversation> {
+        // Use `list_jobs` so fork-prefix UNION is honoured.
+        let summaries = self.list_jobs(session_id, JobFilter::default()).await?;
+        // Re-sort oldest-first for replay.
+        let mut summaries = summaries;
+        summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        let mut jobs = Vec::with_capacity(summaries.len());
+        // Truncation lookup is only needed when `until_step_id` is set.
+        // Skipping it on the common (CLI / gateway) path saves one
+        // `list_steps_by_job` round-trip per job.
+        let truncate_after_job: Option<JobId> = match until_step_id.as_ref() {
+            None => None,
+            Some(target) => {
+                let mut found = None;
+                for s in &summaries {
+                    let steps = self.trace.list_steps_by_job(&s.id).await?;
+                    if steps.iter().any(|st| &st.id == target) {
+                        found = Some(s.id);
+                        break;
+                    }
+                }
+                found
+            }
+        };
+
+        for s in &summaries {
+            let job = match self.jobs.get(&s.id).await? {
+                Some(j) => j,
+                None => continue, // soft-deleted between calls; skip
+            };
+            let mut steps = self.trace.list_steps_by_job(&job.id).await?;
+            steps.sort_by_key(|s| s.started_at);
+            let mut step_blocks = Vec::with_capacity(steps.len());
+            for step in steps {
+                let mut spans = self.trace.list_spans_by_step(&step.id).await?;
+                for span in &mut spans {
+                    if span.events.is_empty() {
+                        span.events = self.trace.list_span_events(&span.id).await?;
+                    }
+                }
+                let stop_after = until_step_id == Some(step.id);
+                step_blocks.push(ReplayStep { step, spans });
+                if stop_after {
+                    break;
+                }
+            }
+            jobs.push(ReplayJob {
+                job,
+                steps: step_blocks,
+            });
+            if Some(s.id) == truncate_after_job {
+                break;
+            }
+        }
+
+        Ok(ReplayedConversation {
+            session_id: session_id.clone(),
+            jobs,
+        })
+    }
+}
+
+fn filter_matches(j: &Job, f: &JobFilter) -> bool {
+    if let Some(k) = f.kind
+        && j.kind != k
+    {
+        return false;
+    }
+    if let Some(s) = f.since
+        && j.created_at < s
+    {
+        return false;
+    }
+    if let Some(u) = f.until
+        && j.created_at >= u
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aura_job::JobInput;
+    use aura_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
+    use aura_storage::SessionStore;
+    use aura_storage::test_support::{MemoryCostStore, MemoryJobStore, MemoryTraceStore};
+    use std::sync::Arc;
+
+    fn user_input() -> JobInput {
+        JobInput::UserChat {
+            content: vec![ContentBlock::Text("hi".into())],
+        }
+    }
+
+    /// Minimal in-memory `SessionStore` for query-API tests — we
+    /// only need `get` + `list_lineage_children` for these.
+    struct MemSessionStore {
+        sessions: parking_lot::Mutex<HashMap<SessionId, Session>>,
+        children: parking_lot::Mutex<HashMap<SessionId, Vec<(SessionId, LineageKind)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore for MemSessionStore {
+        async fn get(&self, id: &SessionId) -> std::result::Result<Option<Session>, StorageError> {
+            Ok(self.sessions.lock().get(id).cloned())
+        }
+        async fn save(&self, session: &Session) -> std::result::Result<(), StorageError> {
+            self.sessions
+                .lock()
+                .insert(session.id.clone(), session.clone());
+            Ok(())
+        }
+        async fn soft_delete(&self, _id: &SessionId) -> std::result::Result<bool, StorageError> {
+            Ok(true)
+        }
+        async fn list_expired(
+            &self,
+            _before: DateTime<Utc>,
+        ) -> std::result::Result<Vec<SessionId>, StorageError> {
+            Ok(Vec::new())
+        }
+        async fn list_all(&self) -> std::result::Result<Vec<Session>, StorageError> {
+            Ok(self.sessions.lock().values().cloned().collect())
+        }
+        async fn list_live_forks(
+            &self,
+            _src: &SessionId,
+        ) -> std::result::Result<Vec<SessionId>, StorageError> {
+            Ok(Vec::new())
+        }
+        async fn list_lineage_children(
+            &self,
+            parent: &SessionId,
+        ) -> std::result::Result<Vec<(SessionId, LineageKind)>, StorageError> {
+            Ok(self
+                .children
+                .lock()
+                .get(parent)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    fn make_session(id: &str) -> Session {
+        let id = SessionId::from(id);
+        Session {
+            id: id.clone(),
+            user: aura_model::User {
+                id: "u1".into(),
+                name: None,
+                channel: ChannelType::tui(),
+                bot_id: None,
+            },
+            channel: ChannelType::tui(),
+            messages: vec![],
+            created_at: Utc::now(),
+            last_active: Utc::now(),
+            state: Default::default(),
+            root_session_id: id,
+            trigger: TriggerSource::User,
+            lineage: None,
+            bound_soul_version: "soul-test".into(),
+        }
+    }
+
+    fn make_query_api(sessions: Arc<dyn SessionStore>) -> QueryApi {
+        let job_store = Arc::new(MemoryJobStore::new());
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let cost_store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        QueryApi::new(sessions, lifecycle, trace_store, cost_store)
+    }
+
+    #[tokio::test]
+    async fn load_session_returns_session() {
+        let store = Arc::new(MemSessionStore {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            children: parking_lot::Mutex::new(HashMap::new()),
+        });
+        let s = make_session("cli-1");
+        store.save(&s).await.unwrap();
+        let api = make_query_api(store);
+        let loaded = api.load_session(&s.id).await.unwrap();
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().id, s.id);
+    }
+
+    #[tokio::test]
+    async fn load_session_missing_returns_none() {
+        let store = Arc::new(MemSessionStore {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            children: parking_lot::Mutex::new(HashMap::new()),
+        });
+        let api = make_query_api(store);
+        assert!(
+            api.load_session(&SessionId::from("nope"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recoverable_jobs_filters_to_non_terminal() {
+        let store = Arc::new(MemSessionStore {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            children: parking_lot::Mutex::new(HashMap::new()),
+        });
+        let job_store = Arc::new(MemoryJobStore::new());
+        let lifecycle = Arc::new(JobLifecycle::new(job_store.clone()));
+        let api = QueryApi::new(
+            store,
+            lifecycle.clone(),
+            Arc::new(MemoryTraceStore::new()),
+            Arc::new(MemoryCostStore::default()),
+        );
+
+        // Pending (recoverable)
+        lifecycle
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        // InProgress (recoverable)
+        let j = lifecycle
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j.id).await.unwrap();
+        // Completed (NOT recoverable)
+        let j2 = lifecycle
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j2.id).await.unwrap();
+        lifecycle
+            .complete(
+                &j2.id,
+                aura_job::JobOutput::Message {
+                    content: vec![ContentBlock::Text("ok".into())],
+                },
+            )
+            .await
+            .unwrap();
+
+        let recoverable = api.find_recoverable_jobs().await.unwrap();
+        assert_eq!(recoverable.len(), 2);
+        for r in &recoverable {
+            assert!(!r.status.is_terminal());
+        }
+    }
+
+    #[tokio::test]
+    async fn lineage_tree_walks_two_levels() {
+        let store = Arc::new(MemSessionStore {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            children: parking_lot::Mutex::new(HashMap::new()),
+        });
+        let parent = SessionId::from("parent");
+        let mid = SessionId::from("mid");
+        let leaf = SessionId::from("leaf");
+        store
+            .children
+            .lock()
+            .insert(parent.clone(), vec![(mid.clone(), LineageKind::Subagent)]);
+        store
+            .children
+            .lock()
+            .insert(mid.clone(), vec![(leaf.clone(), LineageKind::Subagent)]);
+
+        let api = make_query_api(store);
+        let tree = api.lineage_tree(&parent).await.unwrap();
+        assert_eq!(tree.session_id, parent);
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].session_id, mid);
+        assert_eq!(tree.children[0].children.len(), 1);
+        assert_eq!(tree.children[0].children[0].session_id, leaf);
+    }
+
+    #[tokio::test]
+    async fn list_active_subagents_filters_terminal() {
+        let store = Arc::new(MemSessionStore {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            children: parking_lot::Mutex::new(HashMap::new()),
+        });
+        let parent = SessionId::from("parent");
+        let active_child = SessionId::from("child-active");
+        let done_child = SessionId::from("child-done");
+        store.children.lock().insert(
+            parent.clone(),
+            vec![
+                (active_child.clone(), LineageKind::Subagent),
+                (done_child.clone(), LineageKind::Subagent),
+            ],
+        );
+
+        let job_store = Arc::new(MemoryJobStore::new());
+        let lifecycle = Arc::new(JobLifecycle::new(job_store.clone()));
+        // Active child has an InProgress job
+        let j_active = lifecycle
+            .start_job(
+                active_child.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j_active.id).await.unwrap();
+        // Done child has a Completed job
+        let j_done = lifecycle
+            .start_job(
+                done_child.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j_done.id).await.unwrap();
+        lifecycle
+            .complete(
+                &j_done.id,
+                aura_job::JobOutput::Message {
+                    content: vec![ContentBlock::Text("ok".into())],
+                },
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            store,
+            lifecycle,
+            Arc::new(MemoryTraceStore::new()),
+            Arc::new(MemoryCostStore::default()),
+        );
+        let live = api.list_active_subagents(&parent).await.unwrap();
+        assert_eq!(live, vec![active_child]);
+    }
+
+    #[tokio::test]
+    async fn replay_returns_jobs_in_chronological_order() {
+        let store = Arc::new(MemSessionStore {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            children: parking_lot::Mutex::new(HashMap::new()),
+        });
+        let s = make_session("cli-1");
+        store.save(&s).await.unwrap();
+        let job_store = Arc::new(MemoryJobStore::new());
+        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+
+        let _j1 = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        let _j2 = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            store,
+            lifecycle,
+            Arc::new(MemoryTraceStore::new()),
+            Arc::new(MemoryCostStore::default()),
+        );
+        let replay = api.replay(&s.id, None).await.unwrap();
+        assert_eq!(replay.jobs.len(), 2);
+        assert!(replay.jobs[0].job.created_at <= replay.jobs[1].job.created_at);
+    }
+}

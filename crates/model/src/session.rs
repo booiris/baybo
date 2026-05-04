@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::ChatMessage;
 use crate::approval::ApprovedResource;
+use crate::ids::{JobId, SessionId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -87,15 +88,129 @@ impl std::fmt::Display for ChannelType {
     }
 }
 
+/// What externally observable signal started this session.
+///
+/// `Cron` and `System` carry their own contextual reference; `User` is
+/// purely "a person typed a message". A session spawned via subagent or
+/// user-fork **inherits its trigger from its root session** — the
+/// `TriggerSource` answers "who paid for this work" / "what was the
+/// business reason", not "who literally constructed this session row".
+///
+/// Closed strong-typed enum. Extend by adding variants, never by string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerSource {
+    User,
+    Cron { cron_job_id: String },
+    System { reason: SystemReason },
+}
+
+impl TriggerSource {
+    /// Kind discriminator (matches `JobKind` 1:1 — see invariant in
+    /// `aura-job`).
+    pub fn kind(&self) -> TriggerKind {
+        match self {
+            TriggerSource::User => TriggerKind::User,
+            TriggerSource::Cron { .. } => TriggerKind::Cron,
+            TriggerSource::System { .. } => TriggerKind::System,
+        }
+    }
+}
+
+/// Discriminator for `TriggerSource`. Used to enforce the invariant
+/// `session.trigger.kind() == job.kind()` at job creation time without
+/// having to clone the trigger payload.
+///
+/// `Spawned` has no `TriggerSource` counterpart (a spawned session
+/// inherits its trigger), but spawned **jobs** do — they carry
+/// `JobKind::Spawned` while still belonging to a session whose
+/// `TriggerSource` reflects the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerKind {
+    User,
+    Cron,
+    System,
+    Spawned,
+}
+
+/// Why an internal subsystem started this session.
+///
+/// Closed enum — add a variant when a new subsystem needs to attribute
+/// work back to itself. Never use the open-ended `Other` antipattern.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemReason {
+    /// `aura review` or equivalent retrospective pass over a prior session.
+    HistoryReview,
+    /// Background memory consolidation / summarization task.
+    MemoryConsolidation,
+}
+
+/// Direct parent relationship for sessions spawned from another session.
+///
+/// `parent_session_id` + `parent_job_id` together pin the **exact moment**
+/// in the parent's lifeline that the spawn happened. `kind` distinguishes
+/// the two semantically distinct spawn paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    pub parent_session_id: SessionId,
+    pub parent_job_id: JobId,
+    pub kind: LineageKind,
+}
+
+/// How this session was spawned from its parent.
+///
+/// `Subagent`: the parent agent invoked the spawn-subagent tool inside an
+/// LLM iteration; the parent waits synchronously for the child to finish
+/// (cancellation propagates down via the cancellation-token tree).
+///
+/// `UserFork`: a human chose to branch the parent's conversation at a
+/// specific job boundary. `fork_at_job_id` and `prefix_state_hash`
+/// together let the read-time view UNION the source's prefix with this
+/// session's own jobs while detecting source mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LineageKind {
+    Subagent,
+    UserFork {
+        fork_at_job_id: JobId,
+        prefix_state_hash: String,
+    },
+}
+
+/// A persisted conversation session — the root container of one trace
+/// tree (Job → Step → Span). Trigger and lineage are **orthogonal**:
+/// trigger names the business source of work, lineage names the parent
+/// session relationship.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    pub id: String,
+    pub id: SessionId,
     pub user: User,
     pub channel: ChannelType,
     pub messages: Vec<ChatMessage>,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub state: SessionState,
+
+    /// Topmost ancestor in the lineage chain. Equal to `id` for
+    /// root sessions; otherwise points to the ultimate parent. Lets
+    /// "all work descended from session X" queries hit one row.
+    pub root_session_id: SessionId,
+
+    /// What started this session. A spawned session inherits its
+    /// trigger from its root.
+    pub trigger: TriggerSource,
+
+    /// Direct parent relationship, present iff this session was spawned
+    /// from another (subagent or user-fork).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
+
+    /// Soul (system prompt / persona) version locked at session creation.
+    /// `Job::effective_soul_version` records what was actually loaded at
+    /// each job's start; divergence is recorded on `Job.provenance_drift`.
+    pub bound_soul_version: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -146,5 +261,64 @@ mod tests {
         assert_eq!(s, "\"slack\"");
         let back: ChannelType = serde_json::from_str(&s).unwrap();
         assert_eq!(back, ct);
+    }
+
+    #[test]
+    fn trigger_source_user_round_trip() {
+        let t = TriggerSource::User;
+        let s = serde_json::to_string(&t).unwrap();
+        assert_eq!(s, "{\"kind\":\"user\"}");
+        let back: TriggerSource = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.kind(), TriggerKind::User);
+    }
+
+    #[test]
+    fn trigger_source_cron_round_trip() {
+        let t = TriggerSource::Cron {
+            cron_job_id: "cron-1".into(),
+        };
+        let s = serde_json::to_string(&t).unwrap();
+        let back: TriggerSource = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.kind(), TriggerKind::Cron);
+    }
+
+    #[test]
+    fn trigger_source_system_round_trip() {
+        let t = TriggerSource::System {
+            reason: SystemReason::HistoryReview,
+        };
+        let s = serde_json::to_string(&t).unwrap();
+        let back: TriggerSource = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.kind(), TriggerKind::System);
+    }
+
+    #[test]
+    fn lineage_subagent_round_trip() {
+        let l = Lineage {
+            parent_session_id: SessionId::from("cli-parent"),
+            parent_job_id: JobId::new(),
+            kind: LineageKind::Subagent,
+        };
+        let s = serde_json::to_string(&l).unwrap();
+        let back: Lineage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, l);
+    }
+
+    #[test]
+    fn lineage_user_fork_round_trip() {
+        let l = Lineage {
+            parent_session_id: SessionId::from("cli-source"),
+            parent_job_id: JobId::new(),
+            kind: LineageKind::UserFork {
+                fork_at_job_id: JobId::new(),
+                prefix_state_hash: "deadbeef".into(),
+            },
+        };
+        let s = serde_json::to_string(&l).unwrap();
+        let back: Lineage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, l);
     }
 }

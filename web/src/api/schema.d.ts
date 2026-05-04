@@ -388,29 +388,47 @@ export interface components {
             kind: "wildcard";
             value: string;
         };
-        /** @description Mirror of [`aura_job::Job`]. */
+        /**
+         * @description Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
+         *     state machine (Q6) — `final_result` replaces `output`/`error`,
+         *     `emitted_span_ids` replaces `trace_span_id`.
+         */
         Job: {
             /** Format: date-time */
-            completed_at?: string | null;
-            /** Format: date-time */
             created_at: string;
-            error?: string | null;
+            effective_soul_version: string;
+            emitted_span_ids: string[];
+            /** Format: date-time */
+            ended_at?: string | null;
+            final_result?: Record<string, never> | null;
             id: string;
-            input?: Record<string, never> | null;
-            kind: components["schemas"]["OperationKind"];
-            output?: Record<string, never> | null;
+            kind: components["schemas"]["JobKind"];
             parent_job_id?: string | null;
             session_id: string;
             /** Format: date-time */
             started_at?: string | null;
             status: components["schemas"]["JobStatus"];
-            trace_span_id?: string | null;
         };
         /**
-         * @description Mirror of [`aura_job::JobStatus`].
+         * @description Wire mirror of [`aura_job::JobKind`].
          * @enum {string}
          */
-        JobStatus: "pending" | "in_progress" | "completed" | "submitted" | "accepted" | "failed" | "stuck";
+        JobKind: "user_chat" | "cron" | "system" | "spawned";
+        /**
+         * @description Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
+         *     the domain enum carries (cancel reason, partial-artifact span IDs);
+         *     the wire shape collapses inner-variant content into `Option`-typed
+         *     fields so HTTP clients can decode without needing the full Rust
+         *     enum machinery.
+         */
+        JobStatus: {
+            cancel_reason?: string | null;
+            kind: components["schemas"]["JobStatusKind"];
+            partial_artifacts?: string[];
+            reason?: string | null;
+        };
+        /** @enum {string} */
+        JobStatusKind: "pending" | "in_progress" | "stuck" | "cancelled" | "failed" | "completed";
         /** @description Current LLM provider descriptor. */
         LlmInfo: {
             model_id: string;
@@ -489,36 +507,6 @@ export interface components {
             requires_restart: boolean;
             written_to: string;
         };
-        /** @description Mirror of [`aura_job::OperationKind`]. */
-        OperationKind: {
-            model: string;
-            /** @enum {string} */
-            type: "llm_call";
-        } | {
-            tool_name: string;
-            /** @enum {string} */
-            type: "tool_execution";
-        } | {
-            skill_name: string;
-            /** @enum {string} */
-            type: "skill_execution";
-        } | {
-            cron_job_id: string;
-            /** @enum {string} */
-            type: "cron_execution";
-        } | {
-            strategy: string;
-            /** @enum {string} */
-            type: "context_compression";
-        } | {
-            operation: string;
-            /** @enum {string} */
-            type: "memory_operation";
-        } | {
-            session_id: string;
-            /** @enum {string} */
-            type: "user_message_handling";
-        };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -584,6 +572,7 @@ export interface operations {
                             channel_type: components["schemas"]["ChannelType"];
                             status: string;
                         }[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -828,6 +817,7 @@ export interface operations {
                             updated_at: string;
                             user_id: string;
                         }[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -975,14 +965,30 @@ export interface operations {
     };
     list_jobs: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Restrict to a single session. Hits the per-session index in
+                 *     the store instead of scanning the full jobs table.
+                 */
+                session?: string | null;
+                /**
+                 * @description Restrict to one terminal/in-flight status discriminator.
+                 *     Snake-case, matching `JobStatusKind` (`pending`, `in_progress`,
+                 *     `stuck`, `cancelled`, `failed`, `completed`).
+                 */
+                status?: string | null;
+                /** @description Maximum items to return. Defaults to 50; capped at 500. */
+                limit?: number | null;
+                /** @description Opaque cursor from a previous response's `next_cursor`. */
+                cursor?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description All jobs currently tracked */
+            /** @description Paginated jobs */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -991,22 +997,31 @@ export interface operations {
                     "application/json": {
                         items: {
                             /** Format: date-time */
-                            completed_at?: string | null;
-                            /** Format: date-time */
                             created_at: string;
-                            error?: string | null;
+                            effective_soul_version: string;
+                            emitted_span_ids: string[];
+                            /** Format: date-time */
+                            ended_at?: string | null;
+                            final_result?: Record<string, never> | null;
                             id: string;
-                            input?: Record<string, never> | null;
-                            kind: components["schemas"]["OperationKind"];
-                            output?: Record<string, never> | null;
+                            kind: components["schemas"]["JobKind"];
                             parent_job_id?: string | null;
                             session_id: string;
                             /** Format: date-time */
                             started_at?: string | null;
                             status: components["schemas"]["JobStatus"];
-                            trace_span_id?: string | null;
                         }[];
+                        next_cursor?: string | null;
                     };
+                };
+            };
+            /** @description Invalid query parameters */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */
@@ -1050,6 +1065,15 @@ export interface operations {
                     "application/json": components["schemas"]["Job"];
                 };
             };
+            /** @description Invalid job id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             /** @description Unauthorized */
             401: {
                 headers: {
@@ -1091,8 +1115,26 @@ export interface operations {
                     "application/json": components["schemas"]["Job"];
                 };
             };
+            /** @description Invalid job id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1248,6 +1290,7 @@ export interface operations {
                             source_session_id?: string | null;
                             user_id: string;
                         }[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -1369,6 +1412,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: string[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -1442,6 +1486,7 @@ export interface operations {
                             name: string;
                             parameters_schema: Record<string, never>;
                         }[];
+                        next_cursor?: string | null;
                     };
                 };
             };
@@ -1468,7 +1513,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Raw trace tree for the session. Shape mirrors `aura_trace::TraceNode` but is emitted as untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
+            /** @description Per-session trace tree: jobs, their steps, and the spans under each step. Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
             200: {
                 headers: {
                     [name: string]: unknown;

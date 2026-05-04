@@ -67,7 +67,7 @@ Required-ness beyond serde (non-empty strings, numeric ranges, URL schemes) is e
 
 ### JSON format (not TOML or YAML)
 
-JSON is the sole supported format. It has the widest tooling support, round-trips through `serde_json`, and matches the project's existing use of JSON for hook I/O and trace payloads.
+JSON is the sole supported format. It has the widest tooling support, round-trips through `serde_json`, and matches the project's existing use of JSON for trace payloads.
 
 ### Unknown fields
 
@@ -124,7 +124,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 
 ## Reload semantics
 
-`aura-config` has **no reload API today**. Configuration is loaded once at startup; live changes require a process restart. The `ConfigChange` hook in `aura-hook` exists for future hot-reload support and for startup-time provenance, not for current runtime mutation.
+`aura-config` has **no reload API today**. Configuration is loaded once at startup; live changes require a process restart.
 
 When hot reload is implemented, the following contract must be in place **before** reload code lands:
 
@@ -132,9 +132,6 @@ When hot reload is implemented, the following contract must be in place **before
 - **Atomic swap** — a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden.
 - **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError::Validation` to the caller; no partial state is exposed.
 - **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config.
-- **Provenance** — every successful reload emits a `ConfigChange` hook event with the old/new config hashes, and `trace` records the transition in `ExecutionProvenance`.
-
-Until reload is implemented, `ConfigChange` fires exactly once at startup (for provenance) and any "reload" is restart-mediated.
 
 ## Validation Rules
 

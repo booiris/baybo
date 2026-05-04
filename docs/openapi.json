@@ -22,7 +22,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -45,6 +45,12 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -321,7 +327,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -390,6 +396,12 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -566,14 +578,65 @@
           "jobs"
         ],
         "operationId": "list_jobs",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "query",
+            "description": "Restrict to a single session. Hits the per-session index in\nthe store instead of scanning the full jobs table.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Restrict to one terminal/in-flight status discriminator.\nSnake-case, matching `JobStatusKind` (`pending`, `in_progress`,\n`stuck`, `cancelled`, `failed`, `completed`).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum items to return. Defaults to 50; capped at 500.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous response's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "All jobs currently tracked",
+            "description": "Paginated jobs",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -582,49 +645,48 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Mirror of [`aura_job::Job`].",
+                        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
                         "required": [
                           "id",
                           "session_id",
                           "kind",
                           "status",
+                          "emitted_span_ids",
+                          "effective_soul_version",
                           "created_at"
                         ],
                         "properties": {
-                          "completed_at": {
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "effective_soul_version": {
+                            "type": "string"
+                          },
+                          "emitted_span_ids": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "ended_at": {
                             "type": [
                               "string",
                               "null"
                             ],
                             "format": "date-time"
                           },
-                          "created_at": {
-                            "type": "string",
-                            "format": "date-time"
-                          },
-                          "error": {
+                          "final_result": {
                             "type": [
-                              "string",
+                              "object",
                               "null"
                             ]
                           },
                           "id": {
                             "type": "string"
                           },
-                          "input": {
-                            "type": [
-                              "object",
-                              "null"
-                            ]
-                          },
                           "kind": {
-                            "$ref": "#/components/schemas/OperationKind"
-                          },
-                          "output": {
-                            "type": [
-                              "object",
-                              "null"
-                            ]
+                            "$ref": "#/components/schemas/JobKind"
                           },
                           "parent_job_id": {
                             "type": [
@@ -644,17 +706,27 @@
                           },
                           "status": {
                             "$ref": "#/components/schemas/JobStatus"
-                          },
-                          "trace_span_id": {
-                            "type": [
-                              "string",
-                              "null"
-                            ]
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -710,6 +782,16 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid job id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized",
             "content": {
@@ -761,8 +843,28 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid job id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -1018,7 +1120,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -1087,6 +1189,12 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -1221,7 +1329,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -1231,6 +1339,12 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -1303,7 +1417,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Envelope for list endpoints. Lets us add `next_cursor`, `total`,\netc. later without breaking clients that parse `items`.",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
                   "required": [
                     "items"
                   ],
@@ -1330,6 +1444,12 @@
                           }
                         }
                       }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -1368,7 +1488,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Raw trace tree for the session. Shape mirrors `aura_trace::TraceNode` but is emitted as untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
+            "description": "Per-session trace tree: jobs, their steps, and the spans under each step. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
             "content": {
               "application/json": {
                 "schema": {}
@@ -1705,49 +1825,48 @@
       },
       "Job": {
         "type": "object",
-        "description": "Mirror of [`aura_job::Job`].",
+        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
         "required": [
           "id",
           "session_id",
           "kind",
           "status",
+          "emitted_span_ids",
+          "effective_soul_version",
           "created_at"
         ],
         "properties": {
-          "completed_at": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "effective_soul_version": {
+            "type": "string"
+          },
+          "emitted_span_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ended_at": {
             "type": [
               "string",
               "null"
             ],
             "format": "date-time"
           },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "error": {
+          "final_result": {
             "type": [
-              "string",
+              "object",
               "null"
             ]
           },
           "id": {
             "type": "string"
           },
-          "input": {
-            "type": [
-              "object",
-              "null"
-            ]
-          },
           "kind": {
-            "$ref": "#/components/schemas/OperationKind"
-          },
-          "output": {
-            "type": [
-              "object",
-              "null"
-            ]
+            "$ref": "#/components/schemas/JobKind"
           },
           "parent_job_id": {
             "type": [
@@ -1767,8 +1886,42 @@
           },
           "status": {
             "$ref": "#/components/schemas/JobStatus"
+          }
+        }
+      },
+      "JobKind": {
+        "type": "string",
+        "description": "Wire mirror of [`aura_job::JobKind`].",
+        "enum": [
+          "user_chat",
+          "cron",
+          "system",
+          "spawned"
+        ]
+      },
+      "JobStatus": {
+        "type": "object",
+        "description": "Wire mirror of [`aura_job::JobStatus`]. Carries the same payload\nthe domain enum carries (cancel reason, partial-artifact span IDs);\nthe wire shape collapses inner-variant content into `Option`-typed\nfields so HTTP clients can decode without needing the full Rust\nenum machinery.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "cancel_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "trace_span_id": {
+          "kind": {
+            "$ref": "#/components/schemas/JobStatusKind"
+          },
+          "partial_artifacts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reason": {
             "type": [
               "string",
               "null"
@@ -1776,17 +1929,15 @@
           }
         }
       },
-      "JobStatus": {
+      "JobStatusKind": {
         "type": "string",
-        "description": "Mirror of [`aura_job::JobStatus`].",
         "enum": [
           "pending",
           "in_progress",
-          "completed",
-          "submitted",
-          "accepted",
+          "stuck",
+          "cancelled",
           "failed",
-          "stuck"
+          "completed"
         ]
       },
       "LlmInfo": {
@@ -1988,137 +2139,6 @@
             "type": "string"
           }
         }
-      },
-      "OperationKind": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "model",
-              "type"
-            ],
-            "properties": {
-              "model": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "llm_call"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "tool_name",
-              "type"
-            ],
-            "properties": {
-              "tool_name": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "tool_execution"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "skill_name",
-              "type"
-            ],
-            "properties": {
-              "skill_name": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "skill_execution"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "cron_job_id",
-              "type"
-            ],
-            "properties": {
-              "cron_job_id": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "cron_execution"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "strategy",
-              "type"
-            ],
-            "properties": {
-              "strategy": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "context_compression"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "operation",
-              "type"
-            ],
-            "properties": {
-              "operation": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "memory_operation"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "session_id",
-              "type"
-            ],
-            "properties": {
-              "session_id": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "user_message_handling"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "Mirror of [`aura_job::OperationKind`]."
       },
       "SetConfigRequest": {
         "type": "object",

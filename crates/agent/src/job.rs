@@ -1,132 +1,255 @@
+//! `JobLifecycle` — thin orchestration layer over `JobStore` for the
+//! Job state machine. Replaces the legacy `JobManager` /
+//! `ObservabilityRecorder`. See `docs/modules/job.md` for the design.
+
 use std::sync::Arc;
 
-use aura_job::{Job, JobError, JobStatus, JobTransition, OperationKind};
+#[cfg(test)]
+use aura_job::JobStatus;
+use aura_job::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
+use aura_model::{JobId, SessionId, SpanId, TriggerKind};
 use aura_storage::JobStore;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+
+use crate::cancel::{JobCancellationGuard, JobCancellationRegistry};
 
 type Result<T> = std::result::Result<T, JobError>;
 
-/// Manages job lifecycle: load from store, apply transition, persist.
+/// Process-wide capacity for the terminal-event broadcast bus.
 ///
-/// State machine validation and timestamp management live on `Job` itself.
-/// This manager is a thin persistence orchestrator.
-pub struct JobManager {
-    store: Arc<dyn JobStore>,
+/// Sized to absorb the burst a multi-job subagent fan-out can produce
+/// without lagging the parent's wait loop. Subscribers that lag still
+/// reconcile against `list_by_session` so dropped events don't cause
+/// lost terminations — capacity is a latency knob, not correctness.
+const JOB_TERMINAL_EVENT_CAPACITY: usize = 256;
+
+/// Terminal-state notification published by `JobLifecycle` whenever a
+/// job transitions to `Completed`, `Failed`, or `Cancelled`. Carries
+/// the minimum identifiers a subscriber needs to filter without going
+/// back to the store: the terminating `JobId`, its session, and the
+/// optional parent for hierarchy-scoped waits (subagent path).
+///
+/// `kind` is always one of the three terminal `JobStatusKind`
+/// discriminants — non-terminal transitions (`start`, `stuck`,
+/// `recover`) are not published.
+#[derive(Debug, Clone)]
+pub struct JobTerminalEvent {
+    pub job_id: JobId,
+    pub session_id: SessionId,
+    pub parent_job_id: Option<JobId>,
+    pub kind: JobStatusKind,
 }
 
-impl JobManager {
+/// Inputs needed to create a new `Job`. Bundled into a struct so
+/// `crate::scope::with_job` can own the full
+/// `start_job → start → body → complete/fail` lifecycle without
+/// ballooning its parameter list — production callers must go through
+/// `with_job`, not `JobLifecycle::start_job` directly, so the cancel
+/// state machine can't be skipped.
+pub(crate) struct JobSpec {
+    pub session_id: SessionId,
+    pub session_trigger_kind: TriggerKind,
+    pub input: JobInput,
+    pub effective_soul_version: String,
+    pub parent_job_id: Option<JobId>,
+}
+
+/// Owns the job state machine + persistence orchestration. Pure
+/// passthrough to `Job`'s internal transition validation —
+/// `JobLifecycle` itself contains no state machine logic.
+pub struct JobLifecycle {
+    store: Arc<dyn JobStore>,
+    /// Process-wide registry of `JobId → CancellationToken` for
+    /// in-flight jobs. `cancel()` trips the matching token (if any)
+    /// in addition to flipping the DB row. See `agent::cancel`.
+    cancellation: Arc<JobCancellationRegistry>,
+    /// Fire-and-forget bus for terminal transitions. The subagent
+    /// runtime subscribes to this so the parent unblocks on the
+    /// child's `Completed` / `Failed` / `Cancelled` regardless of
+    /// whether the child also produced an `AgentOutput::Message`.
+    terminal_events: broadcast::Sender<JobTerminalEvent>,
+}
+
+impl JobLifecycle {
     pub fn new(store: Arc<dyn JobStore>) -> Self {
-        Self { store }
+        Self::with_cancellation(store, Arc::new(JobCancellationRegistry::new()))
     }
 
-    pub async fn create_job(
+    pub fn with_cancellation(
+        store: Arc<dyn JobStore>,
+        cancellation: Arc<JobCancellationRegistry>,
+    ) -> Self {
+        let (terminal_events, _rx) = broadcast::channel(JOB_TERMINAL_EVENT_CAPACITY);
+        Self {
+            store,
+            cancellation,
+            terminal_events,
+        }
+    }
+
+    /// Subscribe to terminal-state events. Subscribers must reconcile
+    /// against the store (e.g. `list_by_session`) on
+    /// `broadcast::error::RecvError::Lagged` — a dropped event is not
+    /// re-published.
+    pub fn subscribe_terminal_events(&self) -> broadcast::Receiver<JobTerminalEvent> {
+        self.terminal_events.subscribe()
+    }
+
+    /// Register an in-flight job's cancellation token. The returned
+    /// guard unregisters on drop, so the agent loop's early-`?` paths
+    /// can't leak entries. `cancel(job_id, ...)` while the guard is
+    /// alive will trip the token (and only afterwards flip the DB
+    /// row), so the in-flight execution sees the cancel before
+    /// terminal-state observers do.
+    pub fn register_running(
         &self,
-        session_id: &str,
-        kind: OperationKind,
-        parent: Option<&str>,
+        job_id: JobId,
+        token: CancellationToken,
+    ) -> JobCancellationGuard {
+        self.cancellation.register(job_id, token);
+        JobCancellationGuard::new(Arc::clone(&self.cancellation), job_id)
+    }
+
+    /// Create a new job in `Pending`. The caller chooses the soul
+    /// version (typically `Session.bound_soul_version`, or whatever
+    /// the live agent has actually loaded if drift is being recorded
+    /// upstream).
+    ///
+    /// `session_trigger_kind` is the root trigger kind of the owning
+    /// session — used to enforce the `JobKind ↔ TriggerKind` invariant
+    /// documented in `aura_job::kind`. Mismatches return
+    /// `JobError::KindMismatch` with a descriptive message (rather than
+    /// passing through silently as before).
+    ///
+    /// **Production code does not call this directly** — it goes
+    /// through [`crate::scope::with_job`] (which builds a [`JobSpec`]
+    /// and owns the full create→start→run→complete chain) so the
+    /// cancel state machine can't be skipped. The method is left
+    /// `pub` only for tests in this crate (and downstream test
+    /// fixtures) that need to construct jobs in arbitrary states.
+    pub async fn start_job(
+        &self,
+        session_id: SessionId,
+        session_trigger_kind: TriggerKind,
+        input: JobInput,
+        effective_soul_version: impl Into<String>,
+        parent_job_id: Option<JobId>,
     ) -> Result<Job> {
-        let job = Job::new(session_id, kind, parent);
+        let job_kind = input.kind();
+        if !job_kind.allowed_for(session_trigger_kind) {
+            return Err(JobError::KindMismatch(format!(
+                "job kind {job_kind:?} not allowed in {session_trigger_kind:?}-trigger session \
+                 (see aura_job::kind allowed-for table)"
+            )));
+        }
+        let job = Job::new(session_id, input, effective_soul_version, parent_job_id);
         self.store.create(&job).await?;
         Ok(job)
     }
 
-    pub async fn start(&self, job_id: &str) -> Result<()> {
+    /// Move `Pending → InProgress`.
+    pub async fn start(&self, job_id: &JobId) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.start()).await?;
         self.persist(job, transition).await
     }
 
-    pub async fn complete(&self, job_id: &str, output: serde_json::Value) -> Result<()> {
+    /// Move `InProgress → Completed` with a final output.
+    pub async fn complete(&self, job_id: &JobId, output: aura_job::JobOutput) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
+        self.persist_and_publish(job, transition).await
+    }
+
+    /// Move to `Failed { reason }`.
+    pub async fn fail(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
+        let reason = reason.into();
+        let (job, transition) = self.apply(job_id, |j| j.fail(&reason)).await?;
+        self.persist_and_publish(job, transition).await
+    }
+
+    /// Move to `Cancelled { reason, partial_artifacts }`.
+    ///
+    /// Trips the in-flight cancellation token (if any) before flipping
+    /// the DB row, so the running execution observes the cancel and
+    /// can short-circuit instead of running to completion.
+    ///
+    /// Idempotent on terminal jobs: a cancel that races against natural
+    /// completion returns `Ok(())` without touching the row, so admin
+    /// callers don't see a 500 for a job that finished a moment earlier.
+    pub async fn cancel(
+        &self,
+        job_id: &JobId,
+        reason: CancelReason,
+        partial_artifacts: Vec<SpanId>,
+    ) -> Result<()> {
+        self.cancellation.cancel(job_id);
+        let job = self.load_job(job_id).await?;
+        if job.is_terminal() {
+            return Ok(());
+        }
+        let (job, transition) = self
+            .apply(job_id, |j| j.cancel(reason, partial_artifacts.clone()))
+            .await?;
+        self.persist_and_publish(job, transition).await
+    }
+
+    /// Move to `Stuck { reason }` from `InProgress`.
+    pub async fn stuck(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
+        let reason = reason.into();
+        let (job, transition) = self.apply(job_id, |j| j.stuck(&reason)).await?;
         self.persist(job, transition).await
     }
 
-    pub async fn submit(&self, job_id: &str) -> Result<()> {
-        let (job, transition) = self.apply(job_id, |j| j.submit()).await?;
+    /// Move `Stuck → InProgress`.
+    pub async fn recover(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
+        let reason = reason.into();
+        let (job, transition) = self.apply(job_id, |j| j.recover(&reason)).await?;
         self.persist(job, transition).await
     }
 
-    pub async fn accept(&self, job_id: &str) -> Result<()> {
-        let (job, transition) = self.apply(job_id, |j| j.accept()).await?;
-        self.persist(job, transition).await
-    }
-
-    pub async fn fail(&self, job_id: &str, error: &str) -> Result<()> {
-        let (job, transition) = self.apply(job_id, |j| j.fail(error)).await?;
-        self.persist(job, transition).await
-    }
-
-    /// Look up a job by id.
-    pub async fn get(&self, job_id: &str) -> Result<Option<Job>> {
+    pub async fn get(&self, job_id: &JobId) -> Result<Option<Job>> {
         self.store.get(job_id).await
     }
 
-    /// List jobs, optionally filtered by status. When `status` is `None`
-    /// every persisted job is returned; otherwise only those matching.
-    /// Ordering: newest `created_at` first.
-    pub async fn list(&self, status: Option<JobStatus>) -> Result<Vec<Job>> {
+    /// List jobs, optionally filtered by status discriminator. Newest
+    /// `created_at` first.
+    pub async fn list(&self, status: Option<JobStatusKind>) -> Result<Vec<Job>> {
         let mut jobs = match status {
-            Some(s) => self.store.list_by_status(s).await?,
+            Some(k) => self.store.list_by_status_kind(k).await?,
             None => self.store.list_all().await?,
         };
         jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(jobs)
     }
 
-    /// Cancel a job. Transitions the job to `Failed` with a cancellation
-    /// reason. `Pending` jobs are first started, then failed (the state
-    /// machine does not allow `Pending -> Failed` directly). Terminal jobs
-    /// (`Accepted`, `Failed`) and already-settled jobs (`Completed`,
-    /// `Submitted`) are rejected as no-ops so the operator gets a clear
-    /// error rather than silently losing audit trail for work that has
-    /// already produced output.
-    pub async fn cancel(&self, job_id: &str) -> Result<Job> {
-        let job = self.load_job(job_id).await?;
-        let reason = "cancelled by operator";
-        match job.status {
-            JobStatus::Pending => {
-                self.start(job_id).await?;
-                self.fail(job_id, reason).await?;
-            }
-            JobStatus::InProgress | JobStatus::Stuck => {
-                self.fail(job_id, reason).await?;
-            }
-            other => {
-                return Err(JobError::InvalidTransition(format!(
-                    "cannot cancel job {job_id} in status {other}"
-                )));
-            }
-        }
-        self.load_job(job_id).await
+    /// List every non-terminal job (`Pending` / `InProgress` / `Stuck`)
+    /// in one query. One trip to the store instead of three —
+    /// `QueryApi::find_recoverable_jobs` used to call `list(Some(k))`
+    /// for each kind serially.
+    pub async fn list_recoverable(&self) -> Result<Vec<Job>> {
+        self.store.list_recoverable().await
     }
 
-    /// Recover jobs that were interrupted by a system restart.
-    ///
-    /// Scans all non-terminal jobs and calls `mark_interrupted()` on each.
-    /// `InProgress` jobs are moved to `Stuck`; others are left unchanged.
-    /// Returns the number of jobs that were transitioned.
-    pub async fn recover_interrupted(&self) -> Result<usize> {
-        let statuses = [
-            JobStatus::Pending,
-            JobStatus::InProgress,
-            JobStatus::Completed,
-            JobStatus::Submitted,
-            JobStatus::Stuck,
-        ];
-
-        let mut recovered = 0;
-        for status in statuses {
-            let jobs = self.store.list_by_status(status).await?;
-            for mut job in jobs {
-                if let Some(transition) = job.mark_interrupted()? {
-                    self.persist(job, transition).await?;
-                    recovered += 1;
-                }
-            }
+    /// List jobs scoped to one session. Hits the `idx_jobs_session`
+    /// index instead of scanning the full table. Newest first.
+    pub async fn list_by_session(
+        &self,
+        session_id: &aura_model::SessionId,
+        status: Option<JobStatusKind>,
+    ) -> Result<Vec<Job>> {
+        let mut jobs = self.store.list_by_session(session_id).await?;
+        if let Some(k) = status {
+            jobs.retain(|j| j.status.kind() == k);
         }
-        Ok(recovered)
+        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(jobs)
     }
 
-    /// Load a job, apply a transition closure, return the mutated job and transition.
-    async fn apply<F>(&self, job_id: &str, f: F) -> Result<(Job, JobTransition)>
+    pub async fn get_history(&self, job_id: &JobId) -> Result<Vec<JobTransition>> {
+        self.store.get_transitions(job_id).await
+    }
+
+    async fn apply<F>(&self, job_id: &JobId, f: F) -> Result<(Job, JobTransition)>
     where
         F: FnOnce(&mut Job) -> Result<JobTransition>,
     {
@@ -135,14 +258,32 @@ impl JobManager {
         Ok((job, transition))
     }
 
-    /// Persist the updated job and its transition record.
     async fn persist(&self, job: Job, transition: JobTransition) -> Result<()> {
         self.store.save(&job).await?;
         self.store.record_transition(&transition).await?;
         Ok(())
     }
 
-    async fn load_job(&self, job_id: &str) -> Result<Job> {
+    /// Persist a terminal transition, then fire the matching event on
+    /// the broadcast bus. Publish happens **after** the store write
+    /// succeeds so a subscriber that races back into the lifecycle
+    /// (e.g. to look the job up by id) is guaranteed to see the
+    /// terminal row. Send errors are dropped on the floor — broadcast
+    /// `send` only fails when there are no subscribers, which is the
+    /// normal state for non-subagent jobs.
+    async fn persist_and_publish(&self, job: Job, transition: JobTransition) -> Result<()> {
+        let event = JobTerminalEvent {
+            job_id: job.id,
+            session_id: job.session_id.clone(),
+            parent_job_id: job.parent_job_id,
+            kind: job.status.kind(),
+        };
+        self.persist(job, transition).await?;
+        let _ = self.terminal_events.send(event);
+        Ok(())
+    }
+
+    async fn load_job(&self, job_id: &JobId) -> Result<Job> {
         self.store
             .get(job_id)
             .await?
@@ -151,378 +292,205 @@ impl JobManager {
 }
 
 #[cfg(test)]
-impl JobManager {
-    async fn stuck(&self, job_id: &str, reason: &str) -> Result<()> {
-        let (job, transition) = self.apply(job_id, |j| j.stuck(reason)).await?;
-        self.persist(job, transition).await
-    }
-
-    async fn recover(&self, job_id: &str, reason: &str) -> Result<()> {
-        let (job, transition) = self.apply(job_id, |j| j.recover(reason)).await?;
-        self.persist(job, transition).await
-    }
-
-    async fn get_history(&self, job_id: &str) -> Result<Vec<JobTransition>> {
-        self.store.get_transitions(job_id).await
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use parking_lot::Mutex;
+    use aura_model::ContentBlock;
+    use aura_storage::test_support::MemoryJobStore;
 
-    struct InMemoryJobStore {
-        jobs: Mutex<Vec<Job>>,
-        transitions: Mutex<Vec<JobTransition>>,
-    }
-
-    impl InMemoryJobStore {
-        fn new() -> Self {
-            Self {
-                jobs: Mutex::new(Vec::new()),
-                transitions: Mutex::new(Vec::new()),
-            }
+    fn user_chat_input() -> JobInput {
+        JobInput::UserChat {
+            content: vec![ContentBlock::Text("hi".into())],
         }
     }
 
-    #[async_trait]
-    impl JobStore for InMemoryJobStore {
-        async fn create(&self, job: &Job) -> Result<()> {
-            self.jobs.lock().push(job.clone());
-            Ok(())
-        }
-
-        async fn get(&self, job_id: &str) -> Result<Option<Job>> {
-            Ok(self.jobs.lock().iter().find(|j| j.id == job_id).cloned())
-        }
-
-        async fn save(&self, job: &Job) -> Result<()> {
-            let mut jobs = self.jobs.lock();
-            let stored = jobs
-                .iter_mut()
-                .find(|j| j.id == job.id)
-                .ok_or_else(|| JobError::NotFound(format!("job {}", job.id)))?;
-            *stored = job.clone();
-            Ok(())
-        }
-
-        async fn list_by_session(&self, session_id: &str) -> Result<Vec<Job>> {
-            Ok(self
-                .jobs
-                .lock()
-                .iter()
-                .filter(|j| j.session_id == session_id)
-                .cloned()
-                .collect())
-        }
-
-        async fn list_by_status(&self, status: JobStatus) -> Result<Vec<Job>> {
-            Ok(self
-                .jobs
-                .lock()
-                .iter()
-                .filter(|j| j.status == status)
-                .cloned()
-                .collect())
-        }
-
-        async fn list_children(&self, parent_job_id: &str) -> Result<Vec<Job>> {
-            Ok(self
-                .jobs
-                .lock()
-                .iter()
-                .filter(|j| j.parent_job_id.as_deref() == Some(parent_job_id))
-                .cloned()
-                .collect())
-        }
-
-        async fn list_all(&self) -> Result<Vec<Job>> {
-            Ok(self.jobs.lock().clone())
-        }
-
-        async fn record_transition(&self, transition: &JobTransition) -> Result<()> {
-            self.transitions.lock().push(transition.clone());
-            Ok(())
-        }
-
-        async fn get_transitions(&self, job_id: &str) -> Result<Vec<JobTransition>> {
-            Ok(self
-                .transitions
-                .lock()
-                .iter()
-                .filter(|t| t.job_id == job_id)
-                .cloned()
-                .collect())
+    fn dummy_output() -> aura_job::JobOutput {
+        aura_job::JobOutput::Message {
+            content: vec![ContentBlock::Text("ok".into())],
         }
     }
 
-    fn test_kind() -> OperationKind {
-        OperationKind::LlmCall {
-            model: "test-model".into(),
-        }
-    }
-
-    fn make_manager() -> JobManager {
-        JobManager::new(Arc::new(InMemoryJobStore::new()))
+    fn make_lifecycle() -> JobLifecycle {
+        JobLifecycle::new(Arc::new(MemoryJobStore::new()))
     }
 
     #[tokio::test]
     async fn full_success_path() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        assert_eq!(job.status, JobStatus::Pending);
-
-        mgr.start(&job.id).await.unwrap();
-        mgr.complete(&job.id, serde_json::json!({"ok": true}))
+        let lc = make_lifecycle();
+        let job = lc
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_chat_input(),
+                "soul-v1",
+                None,
+            )
             .await
             .unwrap();
-        mgr.submit(&job.id).await.unwrap();
-        mgr.accept(&job.id).await.unwrap();
+        assert!(matches!(job.status, JobStatus::Pending));
 
-        let history = mgr.get_history(&job.id).await.unwrap();
-        assert_eq!(history.len(), 4);
-        assert_eq!(history[0].from, JobStatus::Pending);
-        assert_eq!(history[0].to, JobStatus::InProgress);
-        assert_eq!(history[3].to, JobStatus::Accepted);
-    }
+        lc.start(&job.id).await.unwrap();
+        lc.complete(&job.id, dummy_output()).await.unwrap();
 
-    #[tokio::test]
-    async fn fail_from_in_progress() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        mgr.fail(&job.id, "timeout").await.unwrap();
-
-        let history = mgr.get_history(&job.id).await.unwrap();
+        let history = lc.get_history(&job.id).await.unwrap();
         assert_eq!(history.len(), 2);
-        assert_eq!(history[1].to, JobStatus::Failed);
+        assert!(matches!(history[1].to, JobStatus::Completed));
     }
 
     #[tokio::test]
-    async fn stuck_then_recover() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        mgr.stuck(&job.id, "no response").await.unwrap();
-        mgr.recover(&job.id, "retrying").await.unwrap();
-        mgr.complete(&job.id, serde_json::json!(null))
+    async fn cancel_trips_registered_token_and_unregisters_via_guard() {
+        let lc = make_lifecycle();
+        let job = lc
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_chat_input(),
+                "soul-v1",
+                None,
+            )
             .await
             .unwrap();
-        mgr.submit(&job.id).await.unwrap();
-        mgr.accept(&job.id).await.unwrap();
+        lc.start(&job.id).await.unwrap();
 
-        let history = mgr.get_history(&job.id).await.unwrap();
-        assert_eq!(history.len(), 6);
+        let token = CancellationToken::new();
+        let guard = lc.register_running(job.id, token.clone());
+        assert!(!token.is_cancelled());
+
+        // External cancel observes the token before flipping the row.
+        lc.cancel(&job.id, CancelReason::UserPreempt, vec![])
+            .await
+            .unwrap();
+        assert!(token.is_cancelled(), "registered token must be tripped");
+
+        // Drop the guard; subsequent cancels for the same job_id find
+        // no live token (the registry is empty).
+        drop(guard);
+        let unrelated_token = CancellationToken::new();
+        // Cancelling an already-terminal job is rejected by the state
+        // machine, but we just want to assert the registry didn't keep
+        // the entry alive past the guard's drop.
+        let job2 = lc
+            .start_job(
+                SessionId::from("s2"),
+                TriggerKind::User,
+                user_chat_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&job2.id).await.unwrap();
+        let _job2_guard = lc.register_running(job2.id, unrelated_token.clone());
+        // Cancelling job (already terminal) should not trip job2's token.
+        let _ = lc.cancel(&job.id, CancelReason::UserPreempt, vec![]).await;
+        assert!(
+            !unrelated_token.is_cancelled(),
+            "cancel of unrelated job_id must not trip our token"
+        );
     }
 
     #[tokio::test]
-    async fn stuck_then_fail() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        mgr.stuck(&job.id, "hung").await.unwrap();
-        mgr.fail(&job.id, "unrecoverable").await.unwrap();
-
-        let history = mgr.get_history(&job.id).await.unwrap();
-        assert_eq!(history.last().unwrap().to, JobStatus::Failed);
+    async fn spawned_job_kind_allowed_under_every_root_trigger() {
+        // Pins the contract that the subagent dispatch path relies on:
+        // JobInput::Spawned must work for a child session whose root
+        // trigger is inherited from the parent (User / Cron / System).
+        let lc = make_lifecycle();
+        for trigger in [TriggerKind::User, TriggerKind::Cron, TriggerKind::System] {
+            let job = lc
+                .start_job(
+                    SessionId::from(format!("child-of-{trigger:?}")),
+                    trigger,
+                    JobInput::Spawned {
+                        initial_prompt: vec![ContentBlock::Text("task".into())],
+                    },
+                    "soul-v1",
+                    None,
+                )
+                .await;
+            assert!(
+                job.is_ok(),
+                "subagent dispatch under {trigger:?} root must be allowed: {:?}",
+                job.err()
+            );
+        }
     }
 
     #[tokio::test]
-    async fn cannot_complete_from_pending() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        let err = mgr
-            .complete(&job.id, serde_json::json!(null))
+    async fn user_chat_under_cron_session_is_rejected() {
+        // The bug this guards against: subagent.rs used to send
+        // AgentMessage::UserInput, which mapped to JobInput::UserChat —
+        // and a Cron-rooted child session rejected that with KindMismatch.
+        // The fix routes subagents through JobInput::Spawned (covered by
+        // the test above); this test pins the underlying state-machine
+        // rejection so a regression elsewhere can't silently restore the
+        // old shape.
+        let lc = make_lifecycle();
+        let err = lc
+            .start_job(
+                SessionId::from("cron-session"),
+                TriggerKind::Cron,
+                JobInput::UserChat {
+                    content: vec![ContentBlock::Text("hi".into())],
+                },
+                "soul-v1",
+                None,
+            )
             .await
             .unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
+        assert!(matches!(err, JobError::KindMismatch(_)));
     }
 
     #[tokio::test]
-    async fn cannot_accept_from_pending() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        let err = mgr.accept(&job.id).await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
-    async fn not_found_returns_error() {
-        let mgr = make_manager();
-        let err = mgr.start("nonexistent").await.unwrap_err();
-        assert!(matches!(err, JobError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn recover_interrupted_moves_in_progress_to_stuck() {
-        let mgr = make_manager();
-
-        // Create jobs in various states
-        let pending_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-
-        let in_progress_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&in_progress_job.id).await.unwrap();
-
-        let completed_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&completed_job.id).await.unwrap();
-        mgr.complete(&completed_job.id, serde_json::json!(null))
+    async fn cancel_on_terminal_job_is_noop() {
+        let lc = make_lifecycle();
+        let job = lc
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_chat_input(),
+                "soul-v1",
+                None,
+            )
             .await
             .unwrap();
+        lc.start(&job.id).await.unwrap();
+        lc.complete(&job.id, dummy_output()).await.unwrap();
+        // Race: an admin cancel arriving after natural completion must
+        // not return InvalidTransition — it's a benign "already done".
+        lc.cancel(&job.id, CancelReason::OperatorCancel, vec![])
+            .await
+            .expect("cancel of terminal job is no-op");
+        let loaded = lc.get(&job.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.status, JobStatus::Completed));
+    }
 
-        let accepted_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&accepted_job.id).await.unwrap();
-        mgr.complete(&accepted_job.id, serde_json::json!(null))
+    #[tokio::test]
+    async fn cancel_with_partial_artifacts() {
+        let lc = make_lifecycle();
+        let job = lc
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_chat_input(),
+                "soul-v1",
+                None,
+            )
             .await
             .unwrap();
-        mgr.submit(&accepted_job.id).await.unwrap();
-        mgr.accept(&accepted_job.id).await.unwrap();
-
-        let failed_job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&failed_job.id).await.unwrap();
-        mgr.fail(&failed_job.id, "err").await.unwrap();
-
-        // Recover — only the InProgress job should transition
-        let count = mgr.recover_interrupted().await.unwrap();
-        assert_eq!(count, 1);
-
-        // Verify the in_progress job is now Stuck
-        let job = mgr.store.get(&in_progress_job.id).await.unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Stuck);
-
-        // Verify others unchanged
-        let job = mgr.store.get(&pending_job.id).await.unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Pending);
-
-        let job = mgr.store.get(&completed_job.id).await.unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Completed);
-
-        let job = mgr.store.get(&accepted_job.id).await.unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Accepted);
-
-        let job = mgr.store.get(&failed_job.id).await.unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn recover_interrupted_no_jobs_returns_zero() {
-        let mgr = make_manager();
-        let count = mgr.recover_interrupted().await.unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn list_returns_all_jobs_when_status_is_none() {
-        let mgr = make_manager();
-        mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.create_job("s2", test_kind(), None).await.unwrap();
-
-        let all = mgr.list(None).await.unwrap();
-        assert_eq!(all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn list_filters_by_status() {
-        let mgr = make_manager();
-        let pending = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        let running = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&running.id).await.unwrap();
-
-        let pendings = mgr.list(Some(JobStatus::Pending)).await.unwrap();
-        assert_eq!(pendings.len(), 1);
-        assert_eq!(pendings[0].id, pending.id);
-
-        let runnings = mgr.list(Some(JobStatus::InProgress)).await.unwrap();
-        assert_eq!(runnings.len(), 1);
-        assert_eq!(runnings[0].id, running.id);
-    }
-
-    #[tokio::test]
-    async fn get_returns_none_for_missing() {
-        let mgr = make_manager();
-        assert!(mgr.get("missing").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn cancel_pending_job_transitions_through_in_progress() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-
-        let out = mgr.cancel(&job.id).await.unwrap();
-        assert_eq!(out.status, JobStatus::Failed);
-        assert_eq!(out.error.as_deref(), Some("cancelled by operator"));
-
-        let history = mgr.get_history(&job.id).await.unwrap();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].to, JobStatus::InProgress);
-        assert_eq!(history[1].to, JobStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn cancel_in_progress_job_fails_directly() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-
-        let out = mgr.cancel(&job.id).await.unwrap();
-        assert_eq!(out.status, JobStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn cancel_stuck_job_fails() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        mgr.stuck(&job.id, "hung").await.unwrap();
-
-        let out = mgr.cancel(&job.id).await.unwrap();
-        assert_eq!(out.status, JobStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn cancel_terminal_job_errors() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        mgr.fail(&job.id, "nope").await.unwrap();
-
-        let err = mgr.cancel(&job.id).await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
-    async fn cancel_completed_job_errors() {
-        let mgr = make_manager();
-        let job = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        mgr.start(&job.id).await.unwrap();
-        mgr.complete(&job.id, serde_json::json!(null))
+        lc.start(&job.id).await.unwrap();
+        let span = SpanId::new();
+        lc.cancel(&job.id, CancelReason::UserPreempt, vec![span])
             .await
             .unwrap();
-
-        let err = mgr.cancel(&job.id).await.unwrap_err();
-        assert!(matches!(err, JobError::InvalidTransition(_)));
-    }
-
-    #[tokio::test]
-    async fn cancel_missing_job_errors() {
-        let mgr = make_manager();
-        let err = mgr.cancel("nonexistent").await.unwrap_err();
-        assert!(matches!(err, JobError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn parent_child_relationship() {
-        let mgr = make_manager();
-        let parent = mgr.create_job("s1", test_kind(), None).await.unwrap();
-        let child = mgr
-            .create_job("s1", test_kind(), Some(&parent.id))
-            .await
-            .unwrap();
-        assert_eq!(child.parent_job_id.as_deref(), Some(parent.id.as_str()));
-
-        let children = mgr.store.list_children(&parent.id).await.unwrap();
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0].id, child.id);
+        let loaded = lc.get(&job.id).await.unwrap().unwrap();
+        match loaded.status {
+            JobStatus::Cancelled {
+                reason,
+                partial_artifacts,
+            } => {
+                assert_eq!(reason, CancelReason::UserPreempt);
+                assert_eq!(partial_artifacts, vec![span]);
+            }
+            _ => panic!("expected Cancelled"),
+        }
     }
 }

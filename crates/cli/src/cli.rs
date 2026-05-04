@@ -518,8 +518,8 @@ pub enum SessionCmd {
 pub enum JobCmd {
     /// List tracked jobs, optionally filtered by status.
     List {
-        /// Filter by status: pending, in-progress, completed, submitted,
-        /// accepted, failed, stuck.
+        /// Filter by status: pending, in-progress, stuck, cancelled,
+        /// failed, completed.
         #[arg(long)]
         status: Option<JobStatusArg>,
     },
@@ -538,17 +538,18 @@ pub enum JobCmd {
     },
 }
 
-/// Status filter accepted by `aura job list --status`.
+/// Status filter accepted by `aura job list --status`. Mirrors
+/// `aura_job::JobStatusKind` 1:1 — adding a new kind here without
+/// the matching `From` arm in `commands/job.rs` is a compile error.
 #[derive(Debug, Copy, Clone, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum JobStatusArg {
     Pending,
     InProgress,
-    Completed,
-    Submitted,
-    Accepted,
-    Failed,
     Stuck,
+    Cancelled,
+    Failed,
+    Completed,
 }
 
 #[derive(Debug, Subcommand)]

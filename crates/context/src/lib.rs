@@ -6,9 +6,9 @@ pub mod tokenizer;
 pub use budget::TokenBudget;
 pub use error::ContextError;
 pub use strategy::CompressionStrategy;
-pub use strategy::SummarizeCallback;
 pub use strategy::summarize::Summarize;
 pub use strategy::truncate::Truncate;
+pub use strategy::{SummarizeCallback, SummarizeOutput};
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 
 pub type Result<T> = std::result::Result<T, ContextError>;
@@ -30,6 +30,24 @@ pub struct CompressStats {
     pub after_tokens: usize,
     /// Wall-clock time spent on compression.
     pub latency: Duration,
+    /// Set when the strategy made an LLM call (e.g. `Summarize` via
+    /// `SummarizeCallback`). The agent loop uses this to retroactively
+    /// open a `StepKind::Compression` step + `SpanKind::LlmCall` span
+    /// so compression cost is visible to per-step aggregation. Empty
+    /// for non-LLM strategies (`Truncate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_call: Option<CompressionLlmCall>,
+}
+
+/// Provenance + token usage for an LLM call performed inside a
+/// compression strategy. Surfaced so the agent loop can record the
+/// call as a `SpanKind::LlmCall` after the fact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionLlmCall {
+    pub model_id: String,
+    pub provider: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
 }
 
 /// Manages session context: appending messages with automatic compression
@@ -82,6 +100,7 @@ impl ContextManager {
             .compress(&session.messages, &*self.tokenizer)
             .await?;
 
+        let llm_call = output.llm_call.clone();
         session.messages = output.messages;
         let after_tokens = self.count_tokens(&session.messages);
         self.budget.update(after_tokens);
@@ -103,6 +122,7 @@ impl ContextManager {
             before_tokens,
             after_tokens,
             latency: start.elapsed(),
+            llm_call,
         };
 
         debug!(
@@ -139,6 +159,7 @@ impl ContextManager {
             .compress(&session.messages, &*self.tokenizer)
             .await?;
 
+        let llm_call = output.llm_call.clone();
         session.messages = output.messages;
         let after_tokens = self.count_tokens(&session.messages);
         self.budget.update(after_tokens);
@@ -159,6 +180,7 @@ impl ContextManager {
             before_tokens,
             after_tokens,
             latency: start.elapsed(),
+            llm_call,
         };
 
         debug!(
@@ -219,8 +241,9 @@ mod tests {
     }
 
     fn make_session(messages: Vec<ChatMessage>) -> Session {
+        let id = aura_model::SessionId::from("test-session");
         Session {
-            id: "test-session".to_string(),
+            id: id.clone(),
             user: aura_model::User {
                 id: "user-1".to_string(),
                 name: None,
@@ -232,6 +255,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
             state: Default::default(),
+            root_session_id: id,
+            trigger: aura_model::TriggerSource::User,
+            lineage: None,
+            bound_soul_version: "soul-test".into(),
         }
     }
 

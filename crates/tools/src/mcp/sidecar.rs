@@ -220,14 +220,19 @@ mod tests {
             channel: ChannelType::tui(),
             bot_id: None,
         };
+        let id = aura_model::SessionId::from("s");
         Session {
-            id: "s".into(),
+            id: id.clone(),
             user: user.clone(),
             channel: user.channel.clone(),
             messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),
             state: Default::default(),
+            root_session_id: id,
+            trigger: aura_model::TriggerSource::User,
+            lineage: None,
+            bound_soul_version: "soul-test".into(),
         }
     }
 

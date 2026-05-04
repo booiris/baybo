@@ -233,7 +233,13 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
         bot_id: &str,
         user_id: &str,
     ) -> Result<(), String> {
-        let now = chrono::Utc::now().timestamp();
+        // The other timestamp columns on this row (`created_at`,
+        // `expires_at`, `approved_at`) are written by `aura-pairing` as
+        // Unix seconds; `purge_expired` also takes seconds. Keep
+        // `deleted_at` in the same unit so the row stays internally
+        // consistent and any future janitor sweep can compare across
+        // columns without unit drift.
+        let now_secs = chrono::Utc::now().timestamp();
         let conn = self.pool.conn();
         conn.execute(
             "UPDATE channel_pairings
@@ -244,12 +250,31 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
                 channel_type.as_str().to_string(),
                 bot_id.to_string(),
                 user_id.to_string(),
-                now,
+                now_secs,
             ],
         )
         .await
         .map_err(|e| format!("libsql delete: {e}"))?;
         Ok(())
+    }
+
+    async fn purge_expired(&self, now_secs: i64, approved_cutoff_secs: i64) -> Result<u64, String> {
+        // Hard-delete expired pairing codes. Documented retention exception
+        // (see docs/modules/storage.md "Retention exceptions"): pairing
+        // codes are short-lived and intentionally non-recoverable past
+        // expiry — keeping tombstones would let leaked codes resurface
+        // through audit replay.
+        let conn = self.pool.conn();
+        let affected = conn
+            .execute(
+                "DELETE FROM channel_pairings \
+                 WHERE (status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1) \
+                    OR (status = 'approved' AND approved_at IS NOT NULL AND approved_at < ?2)",
+                libsql::params![now_secs, approved_cutoff_secs],
+            )
+            .await
+            .map_err(|e| format!("libsql delete: {e}"))?;
+        Ok(affected)
     }
 }
 

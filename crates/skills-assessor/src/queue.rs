@@ -203,7 +203,7 @@ async fn assess_full(
         level,
         rationale,
         model: llm.model_info().id.clone(),
-        assessed_at: chrono::Utc::now().timestamp(),
+        assessed_at: chrono::Utc::now().timestamp_micros(),
     };
     store
         .put(&verdict)

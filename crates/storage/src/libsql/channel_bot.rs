@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use aura_model::ChannelType;
-use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::StorageError;
@@ -110,7 +109,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         bot_id: &str,
         metadata: HashMap<String, String>,
     ) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now = super::time::now_us();
         let metadata_json = serialize_metadata(&metadata)?;
         let conn = self.pool.conn();
         // The conflict branch bumps `revision` even when nothing
@@ -142,7 +141,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
     }
 
     async fn delete(&self, channel_type: &ChannelType, bot_id: &str) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
             "UPDATE channel_bots

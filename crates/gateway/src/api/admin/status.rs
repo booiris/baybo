@@ -30,10 +30,10 @@ async fn status(State(state): State<AdminState>) -> Result<axum::Json<StatusResp
         .map_err(|e| crate::GatewayError::Session(e.to_string()))?
         .len();
     let jobs_in_flight = state
-        .job_manager
-        .list(Some(aura_job::JobStatus::InProgress))
+        .job_lifecycle
+        .list(Some(aura_job::JobStatusKind::InProgress))
         .await
-        .map_err(|e| crate::GatewayError::Job(e.to_string()))?
+        .map_err(|e: aura_job::JobError| crate::GatewayError::Job(e.to_string()))?
         .len();
     Ok(axum::Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_owned(),

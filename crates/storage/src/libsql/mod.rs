@@ -9,6 +9,7 @@ mod memory;
 mod secret;
 mod session;
 mod skill_risk;
+mod time;
 mod trace;
 
 pub use blob::LibsqlBlobStore;
@@ -98,15 +99,46 @@ impl LibsqlPool {
     /// Create all required tables if they do not already exist.
     ///
     /// All tables that support deletion carry a `deleted_at` column (Unix
-    /// seconds, NULL when the row is live). See `soft_delete` module rules.
+    /// **microseconds**, NULL when the row is live). See `soft_delete`
+    /// module rules. Most other timestamp columns (`created_at`,
+    /// `started_at` on `jobs`, etc.) are also Unix microseconds —
+    /// round-trip via `libsql::time::{to_us, from_us}`. µs is finer than
+    /// the millisecond granularity of typical web tooling so sub-ms
+    /// ordering survives (useful for fast local tool spans), and
+    /// `chrono::timestamp_micros` is infallible. API surfaces (HTTP /
+    /// OpenAPI / web) re-encode as RFC3339 and don't expose raw µs.
+    ///
+    /// **Exception — trace tables (`steps`, `spans`).** The `started_at`
+    /// / `ended_at` columns are TEXT generated columns extracted from
+    /// the JSON `data` blob via `json_extract`. `aura-trace` serialises
+    /// `chrono::DateTime<Utc>` as RFC3339 strings, so these columns
+    /// hold RFC3339 — sortable lexicographically because the format is
+    /// fixed-width zero-padded, but not the µs invariant the rest of
+    /// the schema follows. Querying these columns means string
+    /// comparison, not integer comparison.
     async fn init_db(&self) -> anyhow::Result<()> {
         self.conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS sessions (
-                    id         TEXT PRIMARY KEY,
-                    data       TEXT NOT NULL,
-                    deleted_at INTEGER
+                    id                    TEXT PRIMARY KEY,
+                    root_session_id       TEXT NOT NULL,
+                    trigger_kind          TEXT NOT NULL,
+                    parent_session_id     TEXT,
+                    parent_job_id         TEXT,
+                    lineage_kind          TEXT,
+                    bound_soul_version    TEXT NOT NULL,
+                    created_at            INTEGER NOT NULL,
+                    last_active           INTEGER NOT NULL,
+                    data                  TEXT NOT NULL,
+                    deleted_at            INTEGER
                 );
+                CREATE INDEX IF NOT EXISTS idx_sessions_root
+                    ON sessions(root_session_id) WHERE deleted_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_sessions_parent
+                    ON sessions(parent_session_id, lineage_kind)
+                    WHERE deleted_at IS NULL AND lineage_kind IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_sessions_last_active
+                    ON sessions(last_active DESC) WHERE deleted_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS memories (
                     id         TEXT PRIMARY KEY,
@@ -117,44 +149,6 @@ impl LibsqlPool {
                 );
                 CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
 
-                CREATE TABLE IF NOT EXISTS session_traces (
-                    session_id  TEXT PRIMARY KEY,
-                    root_node   TEXT NOT NULL,
-                    active_leaf TEXT NOT NULL,
-                    created_at  TEXT NOT NULL,
-                    updated_at  TEXT NOT NULL,
-                    deleted_at  INTEGER
-                );
-
-                CREATE TABLE IF NOT EXISTS trace_nodes (
-                    id         TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    parent_id  TEXT,
-                    kind       TEXT NOT NULL,
-                    job_id     TEXT,
-                    provenance TEXT NOT NULL DEFAULT '{}',
-                    input      TEXT NOT NULL DEFAULT '{}',
-                    result     TEXT,
-                    started_at TEXT NOT NULL,
-                    ended_at   TEXT,
-                    deleted_at INTEGER,
-                    PRIMARY KEY (session_id, id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_trace_nodes_started
-                    ON trace_nodes(session_id, started_at);
-
-                CREATE TABLE IF NOT EXISTS trace_forks (
-                    id         TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    from_node  TEXT NOT NULL,
-                    fork_root  TEXT NOT NULL,
-                    reason     TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    deleted_at INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS idx_trace_forks_session
-                    ON trace_forks(session_id);
-
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,
                     encrypted_value BLOB NOT NULL,
@@ -162,25 +156,55 @@ impl LibsqlPool {
                 );
 
                 CREATE TABLE IF NOT EXISTS cost_records (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id       TEXT    NOT NULL,
-                    session_id    TEXT    NOT NULL,
-                    job_id        TEXT    NOT NULL,
-                    trace_span_id TEXT    NOT NULL,
-                    model         TEXT    NOT NULL,
-                    input_tokens  INTEGER NOT NULL,
-                    output_tokens INTEGER NOT NULL,
-                    cost_usd      REAL    NOT NULL,
-                    timestamp     TEXT    NOT NULL
+                    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id                         TEXT    NOT NULL,
+                    session_id                      TEXT    NOT NULL,
+                    job_id                          TEXT    NOT NULL,
+                    span_id                         TEXT    NOT NULL,
+                    model                           TEXT    NOT NULL,
+                    input_tokens                    INTEGER NOT NULL,
+                    output_tokens                   INTEGER NOT NULL,
+                    cost_usd                        REAL    NOT NULL,
+                    timestamp                       INTEGER NOT NULL,
+                    -- Mirrors sessions.deleted_at of session_id. Null while
+                    -- the originating session is live; populated when the
+                    -- session is soft-deleted so cost UIs can render
+                    -- 'source session deleted' without joining back.
+                    originating_session_deleted_at  INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_cost_user_id ON cost_records(user_id);
                 CREATE INDEX IF NOT EXISTS idx_cost_timestamp ON cost_records(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_cost_session ON cost_records(session_id);
+                CREATE INDEX IF NOT EXISTS idx_cost_job ON cost_records(job_id);
+
+                CREATE TABLE IF NOT EXISTS user_monthly_cost (
+                    user_id     TEXT    NOT NULL,
+                    month       TEXT    NOT NULL,
+                    cost_usd    REAL    NOT NULL,
+                    updated_at  INTEGER NOT NULL,
+                    deleted_at  INTEGER,
+                    PRIMARY KEY (user_id, month)
+                );
 
                 CREATE TABLE IF NOT EXISTS jobs (
-                    id         TEXT PRIMARY KEY,
-                    data       TEXT NOT NULL,
-                    deleted_at INTEGER
+                    id                       TEXT PRIMARY KEY,
+                    session_id               TEXT NOT NULL,
+                    parent_job_id            TEXT,
+                    kind                     TEXT NOT NULL,
+                    status_kind              TEXT NOT NULL,
+                    effective_soul_version   TEXT NOT NULL,
+                    created_at               INTEGER NOT NULL,
+                    started_at               INTEGER,
+                    ended_at                 INTEGER,
+                    data                     TEXT NOT NULL,
+                    deleted_at               INTEGER
                 );
+                CREATE INDEX IF NOT EXISTS idx_jobs_session
+                    ON jobs(session_id, created_at) WHERE deleted_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_jobs_status
+                    ON jobs(status_kind) WHERE deleted_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_jobs_parent
+                    ON jobs(parent_job_id) WHERE deleted_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS job_transitions (
                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,31 +214,72 @@ impl LibsqlPool {
                 );
                 CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);
 
+                -- Trace tables: a single canonical JSON `data` blob per
+                -- row plus VIRTUAL generated columns extracted by
+                -- `json_extract` for the indexed lookups. SQLite keeps
+                -- the virtual columns in lockstep with `data`, so there
+                -- is no two-side write contract for the storage layer
+                -- to enforce — adding a new field is a serde change in
+                -- `aura-trace`, no schema migration.
+                CREATE TABLE IF NOT EXISTS steps (
+                    id         TEXT PRIMARY KEY,
+                    data       TEXT NOT NULL,
+                    deleted_at INTEGER,
+                    job_id     TEXT GENERATED ALWAYS AS (json_extract(data, '$.job_id')) VIRTUAL,
+                    started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
+                    ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_steps_job
+                    ON steps(job_id, started_at) WHERE deleted_at IS NULL;
+
+                CREATE TABLE IF NOT EXISTS spans (
+                    id         TEXT PRIMARY KEY,
+                    data       TEXT NOT NULL,
+                    deleted_at INTEGER,
+                    step_id    TEXT GENERATED ALWAYS AS (json_extract(data, '$.step_id')) VIRTUAL,
+                    started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
+                    ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_spans_step
+                    ON spans(step_id, started_at) WHERE deleted_at IS NULL;
+
+                CREATE TABLE IF NOT EXISTS span_events (
+                    span_id    TEXT    NOT NULL,
+                    seq        INTEGER NOT NULL,
+                    data       TEXT    NOT NULL,
+                    deleted_at INTEGER,
+                    PRIMARY KEY (span_id, seq)
+                );
+
                 CREATE TABLE IF NOT EXISTS cron_jobs (
-                    id              TEXT PRIMARY KEY,
-                    user_id         TEXT NOT NULL,
-                    status          TEXT NOT NULL,
-                    next_trigger_at TEXT NOT NULL DEFAULT '',
-                    data            TEXT NOT NULL,
+                    id              TEXT    PRIMARY KEY,
+                    user_id         TEXT    NOT NULL,
+                    status          TEXT    NOT NULL,
+                    -- Unix µs; 0 means 'no scheduled fire'
+                    -- (replaces the empty-string sentinel from the prior
+                    -- TEXT/RFC3339 schema).
+                    next_trigger_at INTEGER NOT NULL DEFAULT 0,
+                    data            TEXT    NOT NULL,
                     deleted_at      INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_due ON cron_jobs(status, next_trigger_at);
 
                 CREATE TABLE IF NOT EXISTS cron_executions (
-                    id                  TEXT PRIMARY KEY,
-                    job_id              TEXT NOT NULL,
-                    user_id             TEXT NOT NULL,
-                    scheduled_fire_time TEXT NOT NULL DEFAULT '',
-                    triggered_at        TEXT NOT NULL,
-                    status              TEXT NOT NULL DEFAULT 'pending',
-                    data                TEXT NOT NULL,
+                    id                  TEXT    PRIMARY KEY,
+                    job_id              TEXT    NOT NULL,
+                    user_id             TEXT    NOT NULL,
+                    scheduled_fire_time INTEGER NOT NULL DEFAULT 0,
+                    triggered_at        INTEGER NOT NULL,
+                    status              TEXT    NOT NULL DEFAULT 'pending',
+                    data                TEXT    NOT NULL,
                     deleted_at          INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_job_id ON cron_executions(job_id);
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_user_id ON cron_executions(user_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_executions_dedup ON cron_executions(job_id, scheduled_fire_time);
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_status ON cron_executions(status);
+                CREATE INDEX IF NOT EXISTS idx_cron_executions_triggered_at ON cron_executions(triggered_at);
 
                 CREATE TABLE IF NOT EXISTS skill_risk_assessments (
                     skill_name   TEXT NOT NULL,
@@ -287,7 +352,13 @@ impl LibsqlPool {
                     PRIMARY KEY (channel_type, bot_id, user_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_pairings_code
-                    ON channel_pairings(code) WHERE deleted_at IS NULL;",
+                    ON channel_pairings(code) WHERE deleted_at IS NULL;
+
+                -- Legacy WAL table from the dropped two-layer trace design.
+                -- No reader ever consumed it; drop on upgrade so it stops
+                -- accumulating writes from any pre-update binary that
+                -- happens to share the file.
+                DROP TABLE IF EXISTS trace_events;",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;

@@ -76,7 +76,7 @@ impl ChannelSessionResolver {
         // one wins (see `LibsqlChannelSessionStore::put`), so a re-read
         // here is what the caller should trust.
         self.store
-            .put(channel_type, user_id, &session.id)
+            .put(channel_type, user_id, session.id.as_str())
             .await
             .map_err(|e| ResolverError::Store(e.to_string()))?;
 
@@ -87,7 +87,7 @@ impl ChannelSessionResolver {
             .get(channel_type, user_id)
             .await
             .map_err(|e| ResolverError::Store(e.to_string()))?
-            .unwrap_or(session.id);
+            .unwrap_or_else(|| session.id.to_string());
         Ok(canonical)
     }
 
@@ -122,7 +122,7 @@ impl ChannelSessionResolver {
             .map_err(|e| ResolverError::SessionManager(e.to_string()))?;
 
         self.store
-            .put(channel_type, user_id, &session.id)
+            .put(channel_type, user_id, session.id.as_str())
             .await
             .map_err(|e| ResolverError::Store(e.to_string()))?;
 
@@ -132,7 +132,7 @@ impl ChannelSessionResolver {
             session_id = %session.id,
             "channel mapping repointed to fresh session (/new)",
         );
-        Ok(session.id)
+        Ok(session.id.to_string())
     }
 }
 

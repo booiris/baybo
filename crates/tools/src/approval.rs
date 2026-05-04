@@ -31,24 +31,11 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-pub use aura_model::approval::{ApprovedResource, HostPattern, ResourceAccess};
+pub use aura_model::approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
 
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
-
-/// Decision returned by an [`ApprovalGate`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalDecision {
-    /// Allow this call only.
-    Approve,
-    /// Allow this call and remember every resource it touches for the rest of
-    /// the session (persisted via `SessionState::approved_resources`).
-    ApproveAlways,
-    /// Reject the call. The executor surfaces this as `ToolError::Denied`.
-    Deny,
-}
 
 /// A pending approval request forwarded to the gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]

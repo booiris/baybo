@@ -35,6 +35,21 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         ]
     }
 
+    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
+        self.known_models()
+            .iter()
+            .map(|m| {
+                (
+                    (*m).to_string(),
+                    ModelPricing {
+                        input_per_1m_tokens: 0.30,
+                        output_per_1m_tokens: 1.20,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key

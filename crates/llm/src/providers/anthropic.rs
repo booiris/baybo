@@ -27,6 +27,21 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         ]
     }
 
+    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
+        self.known_models()
+            .iter()
+            .map(|m| {
+                (
+                    (*m).to_string(),
+                    ModelPricing {
+                        input_per_1m_tokens: 3.0,
+                        output_per_1m_tokens: 15.0,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key

@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use aura_channels::{AgentOutput, NoticeLevel, OutgoingMessage};
 use aura_context::ContextManager;
-use aura_job::OperationKind;
+use aura_job::{JobInput, JobOutput};
 use aura_llm::{
     ChatRequest, LlmCompletion, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
-use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_model::{ChatMessage, ContentBlock, JobId, Role};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -16,25 +16,45 @@ use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
 use aura_tools::mcp::{NoSidecarMcp, SidecarMcpProvider};
 use aura_tools::{ToolOutput, ToolRegistry, preview_params};
-use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
-use serde_json::Value;
+use aura_trace::{
+    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, StepHandle, StepKind,
+    ToolCallBegin, ToolCallResult,
+};
 use tracing::{debug, info, warn};
 
 use crate::error_recovery::ErrorHandler;
-use crate::observability::ObservabilityRecorder;
+use crate::job::{JobLifecycle, JobSpec};
 use crate::policy::ExecutionPolicy;
 use crate::security::SecurityGateway;
 use crate::session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
 };
 use crate::soul::Soul;
+use crate::subagent::{
+    SPAWN_SUBAGENT_TOOL_NAME, SubagentExitStatus, SubagentResult, SubagentRuntime,
+    parse_spawn_request,
+};
 use crate::tool_executor::ToolExecutor;
+use crate::trace::SpanRecorder;
+use tokio_util::sync::CancellationToken;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
 /// for a placeholder to complete. If a chunk ends with an open `[{` but no
 /// closing `}]` arrives within this many bytes, we flush anyway — no real
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
+
+/// Cap on attachments carried into the final `OutgoingMessage`. Tools
+/// like `browser_screenshot` and `send_local_file` push into a
+/// per-turn `accumulated_attachments` vec; without a cap a chatty
+/// agent (multi-iteration browse, page-each screenshot, …) would
+/// dump every blob produced over the loop into one channel message.
+/// 16 is well above any plausible "user asked for N artifacts" case
+/// and small enough that a runaway loop doesn't drown the channel.
+/// FIFO eviction: keep the newest, drop the oldest — older
+/// screenshots from earlier iterations are typically stale anyway
+/// (page state has moved on).
+const MAX_ATTACHMENTS_PER_TURN: usize = 16;
 
 /// Hard timeout on sidecar MCP `tools/call` round-trips. Bounds how
 /// long a hung rmcp peer (sidecar process stuck, network partition,
@@ -49,11 +69,6 @@ const STREAM_BUFFER_HIGH_WATER: usize = 128;
 /// an orphan waiter on the sidecar side and silently dropped (Codex
 /// review). The 60s buffer absorbs rmcp round-trip latency + clock
 /// skew so the race is effectively impossible.
-///
-/// Pre-Phase-3.6 this was 30s — too short for interactive sidecar
-/// tools and the source of the lost-reply bug. New tools that need
-/// to wait longer than 600s need to either grow rmcp cancellation
-/// support or bump this constant in lockstep.
 const SIDECAR_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(660);
 
 /// Cap on the byte length of `params_preview` / `result_preview` carried
@@ -77,18 +92,6 @@ fn truncate_preview(text: &str, max_len: usize) -> String {
     }
     format!("{}…", &text[..end])
 }
-
-/// Cap on attachments carried into the final `OutgoingMessage`. Tools
-/// like `browser_screenshot` and `send_local_file` push into a
-/// per-turn `accumulated_attachments` vec; without a cap a chatty
-/// agent (multi-iteration browse, page-each screenshot, …) would
-/// dump every blob produced over the loop into one channel message.
-/// 16 is well above any plausible "user asked for N artifacts" case
-/// and small enough that a runaway loop doesn't drown the channel.
-/// FIFO eviction: keep the newest, drop the oldest — older
-/// screenshots from earlier iterations are typically stale anyway
-/// (page state has moved on).
-const MAX_ATTACHMENTS_PER_TURN: usize = 16;
 
 /// Compute the byte index at which it is safe to flush `pending` to the
 /// output stream. Anything after that index is withheld because it might
@@ -145,6 +148,22 @@ enum SkillGate {
     Block { rationale: String },
 }
 
+/// What one `LlmIteration` step's body produced. The terminal-vs-loop
+/// distinction lives here (rather than the body short-circuiting via
+/// `?`) so the `with_step` wrapper sees a clean `Ok(...)` either way
+/// and closes the step before the parent loop runs the next thing.
+enum IterationOutcome {
+    /// Final assistant response — caller returns this from `run_inner`.
+    Final(OutgoingMessage),
+    /// LLM emitted tool calls; loop continues. `deferred_subagents`
+    /// must be dispatched as **peer** steps (each its own
+    /// `StepKind::Subagent`) after the iteration step closes — per
+    /// `trace.md`, steps cannot nest.
+    Continue {
+        deferred_subagents: Vec<(String, serde_json::Value)>,
+    },
+}
+
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
     llm_client: Arc<dyn LlmCompletion>,
@@ -157,6 +176,12 @@ pub struct AgentLoop {
     soul: Soul,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
+    /// Optional subagent runtime. When set, LLM `tool_use` calls
+    /// targeting `spawn_subagent` short-circuit the regular
+    /// tool_executor path and route through here. Unset →
+    /// `spawn_subagent` falls back to the regular tool catalogue (and
+    /// today returns an unknown-tool error).
+    subagent_runtime: Option<Arc<dyn SubagentRuntime>>,
     /// Optional LLM risk assessor. When set, every skill candidate is
     /// checked before injection: `Dangerous` verdicts veto the skill,
     /// `Suspicious` verdicts log a warning but allow it through.
@@ -198,10 +223,24 @@ impl AgentLoop {
             soul,
             security_gateway,
             error_handler: ErrorHandler::default(),
+            subagent_runtime: None,
             skill_assessor: None,
             session_log: None,
             sidecar_mcp: Arc::new(NoSidecarMcp),
         }
+    }
+
+    pub fn with_sidecar_mcp(mut self, provider: Arc<dyn SidecarMcpProvider>) -> Self {
+        self.sidecar_mcp = provider;
+        self
+    }
+
+    /// Attach the subagent runtime so LLM-emitted `spawn_subagent`
+    /// tool calls route through it instead of the regular tool
+    /// catalogue.
+    pub fn with_subagent_runtime(mut self, rt: Arc<dyn SubagentRuntime>) -> Self {
+        self.subagent_runtime = Some(rt);
+        self
     }
 
     pub fn with_skill_assessor(mut self, assessor: Arc<SkillAssessor>) -> Self {
@@ -214,11 +253,6 @@ impl AgentLoop {
         self
     }
 
-    pub fn with_sidecar_mcp(mut self, provider: Arc<dyn SidecarMcpProvider>) -> Self {
-        self.sidecar_mcp = provider;
-        self
-    }
-
     /// Run the main conversation loop for a single user message.
     ///
     /// When `delta_tx` is `Some`, each text chunk emitted by the LLM is
@@ -227,14 +261,72 @@ impl AgentLoop {
     /// `OutgoingMessage` returned here should still be dispatched by the
     /// caller as `AgentOutput::Message` so non-streaming adapters receive
     /// the canonical response.
+    // Each parameter is genuinely independent (provenance, LLM input,
+    // facade handles, lineage hint, streaming sink). Grouping them
+    // into a struct would obscure the call site without saving
+    // anything.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &mut self,
         session: &mut Session,
+        job_input: JobInput,
         user_content: Vec<ContentBlock>,
-        recorder: &ObservabilityRecorder,
-        parent_job_id: Option<&str>,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        parent_job_id: Option<JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
+        // `job_input` records why this job exists (provenance: which
+        // trigger kicked it off — User / Cron / System / Spawned).
+        // `user_content` is what we feed the LLM as the first user
+        // message. They coincide for `UserChat` but differ for
+        // `Cron` / `System` where the input is a synthesized prompt
+        // rather than the raw trigger payload.
+        let spec = JobSpec {
+            session_id: session.id.clone(),
+            session_trigger_kind: session.trigger.kind(),
+            input: job_input,
+            effective_soul_version: session.bound_soul_version.clone(),
+            parent_job_id,
+        };
+        crate::scope::with_job(
+            job_lifecycle,
+            cancel_token.clone(),
+            spec,
+            |job_id| async move {
+                let outgoing = self
+                    .run_inner(
+                        session,
+                        user_content,
+                        job_lifecycle,
+                        span_recorder,
+                        job_id,
+                        delta_tx,
+                        cancel_token,
+                    )
+                    .await?;
+                let output = JobOutput::Message {
+                    content: outgoing.content.clone(),
+                };
+                Ok((output, outgoing))
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_inner(
+        &mut self,
+        session: &mut Session,
+        user_content: Vec<ContentBlock>,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<OutgoingMessage> {
+        let _ = job_lifecycle;
         self.ensure_system_prompt(session).await;
 
         // Recall relevant memories
@@ -334,321 +426,92 @@ impl AgentLoop {
         // delivers them out-of-band; never echoed back to the LLM.
         let mut accumulated_attachments: Vec<ContentBlock> = Vec::new();
         loop {
+            // Cooperative cancel checkpoint between iterations. Without
+            // this, a `cancel(job_id, ...)` admin call (which trips the
+            // registered token before flipping the row) lets the loop
+            // finish whatever it's doing and run another LLM call /
+            // compress / tool-call before observing the cancel. Tools
+            // and the LLM still get the token via their own paths;
+            // this catches the orchestration-layer wait windows.
+            if cancel_token.is_cancelled() {
+                warn!(job_id = %job_id, iterations, "cancel observed at iteration boundary; aborting loop");
+                return Err(anyhow::anyhow!("agent loop cancelled"));
+            }
             if iterations >= self.policy.max_iterations {
                 warn!(max = self.policy.max_iterations, "max iterations reached");
                 break;
             }
             iterations += 1;
 
-            // Proactive compression before building the ChatRequest
-            if let Some(stats) = self.context_manager.maybe_compress(session).await? {
-                debug!(
-                    before = stats.before_tokens,
-                    after = stats.after_tokens,
-                    "compressed context before LLM call"
-                );
-            }
+            // Proactive compression before building the ChatRequest.
+            self.compress_if_needed(session, span_recorder, job_id, &cancel_token)
+                .await?;
 
-            // Call LLM with retry on transient errors. Deltas are only
-            // streamed on the first iteration of the loop — subsequent
-            // iterations are post-tool-call continuations that should be
-            // rendered as a single block once complete.
+            // Deltas are only streamed on the first iteration of the loop.
             let iter_delta_tx = if iterations == 1 {
                 delta_tx.as_ref()
             } else {
                 None
             };
-            let response = self
-                .call_llm_with_retry(session, recorder, parent_job_id, iter_delta_tx)
-                .await?;
 
-            // If no tool calls, we have the final response
-            if response.tool_calls.is_empty() {
-                // Use content_blocks when available, falling back to the text string.
-                let response_blocks = if response.content_blocks.is_empty() {
-                    vec![ContentBlock::Text(response.content.clone())]
-                } else {
-                    response.content_blocks.clone()
-                };
-
-                // Append the tool_use blocks issued during intermediate
-                // iterations after the final narration so channels that
-                // key off them (e.g. the TUI cron hint) can render below
-                // the assistant's reply.
-                let mut final_blocks = response_blocks.clone();
-                final_blocks.extend(std::mem::take(&mut accumulated_tool_uses));
-                final_blocks.extend(std::mem::take(&mut accumulated_attachments));
-
-                let final_text = aura_llm::multimodal::extract_text(&response_blocks);
-
-                info!(
-                    iterations,
-                    content_len = final_text.len(),
-                    "conversation loop complete"
-                );
-
-                // Append only the final response blocks to context —
-                // intermediate tool_use blocks were already appended in
-                // prior iterations.
-                let assistant_msg = ChatMessage {
-                    role: Role::Assistant,
-                    content: response_blocks,
-                };
-                self.append_context_message(session, &assistant_msg).await?;
-
-                // Maybe store memory
-                if let Err(e) = self.memory_manager.maybe_store(session, &final_text).await {
-                    warn!(error = %e, "failed to auto-store memory");
-                }
-
-                return Ok(OutgoingMessage {
-                    session_id: session.id.clone(),
-                    user_id: session.user.id.clone(),
-                    channel: session.channel.clone(),
-                    content: final_blocks,
-                    reply_to: None,
-                    metadata: Default::default(),
-                });
-            }
-
-            // Append assistant message including thinking and tool-call
-            // blocks so the LLM sees its own prior reasoning and tool
-            // invocations on the next turn.
-            let mut assistant_blocks = if response.content_blocks.is_empty() {
-                // Fallback: build from the flat content string.
-                if response.content.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![ContentBlock::Text(response.content.clone())]
-                }
-            } else {
-                response.content_blocks.clone()
-            };
-            for tc in &response.tool_calls {
-                let block = ContentBlock::ToolUse {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    input: tc.arguments.clone(),
-                    signature: tc.signature.clone(),
-                };
-                assistant_blocks.push(block.clone());
-                accumulated_tool_uses.push(block);
-            }
-            let assistant_msg = ChatMessage {
-                role: Role::Assistant,
-                content: assistant_blocks,
-            };
-            self.append_context_message(session, &assistant_msg).await?;
-
-            // Execute tool calls. Approved resources are shared via a
-            // Mutex so concurrent tool calls (when supported) see each
-            // other's grants immediately. Wrapped in an `Arc` so that
-            // any persist-always closure injected into `ToolContext`
-            // mid-execution can clone its handle into the executor
-            // boundary without a borrow-lifetime escape.
-            let approved = std::sync::Arc::new(parking_lot::Mutex::new(
-                session.state.approved_resources.clone(),
-            ));
-
-            for tool_call in &response.tool_calls {
-                debug!(
-                    tool = %tool_call.name,
-                    "executing tool call"
-                );
-
-                if let Some(tx) = delta_tx.as_ref() {
-                    let _ = tx
-                        .send(AgentOutput::ToolCallStarted {
-                            session_id: session.id.clone(),
-                            user_id: session.user.id.clone(),
-                            channel: session.channel.clone(),
-                            call_id: tool_call.id.clone(),
-                            tool: tool_call.name.clone(),
-                            params_preview: preview_params(
-                                &tool_call.arguments,
-                                TOOL_TELEMETRY_PREVIEW_LEN,
-                            ),
-                            description: None,
-                        })
-                        .await;
-                }
-                let tool_call_started = std::time::Instant::now();
-
-                // Sidecar MCP tools (e.g. `lark/feishu_get_chat_info`)
-                // are not in the local `ToolRegistry` — they live
-                // behind the channel sidecar's MCP server. Approval
-                // gate + local sandbox don't apply (the call is a
-                // remote query against an already-trusted tenant
-                // API, not a local resource access), but we still
-                // need the rest of the security pipeline:
-                //   * `reveal_in_value` so placeholder secrets in
-                //     params expand to plaintext for the remote API,
-                //   * a hard timeout so a hung rmcp peer can't pin
-                //     the actor,
-                //   * `sanitize_tool_output` so a remote response
-                //     containing a leaked secret gets minted into a
-                //     placeholder before it reaches the LLM context
-                //     or session log,
-                //   * an observability span so the call shows up in
-                //     traces alongside local tool executions.
-                let claims = self.sidecar_mcp.claims_tool(session, &tool_call.name).await;
-                let tool_result: anyhow::Result<ToolOutput> = if claims {
-                    self.dispatch_sidecar_tool(
+            let outcome = crate::scope::with_step(
+                span_recorder.as_ref(),
+                job_id,
+                StepKind::LlmIteration,
+                Some((&cancel_token, aura_job::CancelReason::ParentCancelled)),
+                |step| {
+                    let fut = self.run_iteration(
                         session,
-                        &tool_call.name,
-                        tool_call.arguments.clone(),
-                        recorder,
-                        parent_job_id,
-                    )
-                    .await
-                } else {
-                    self.tool_executor
-                        .execute(
-                            &tool_call.name,
-                            tool_call.arguments.clone(),
-                            &session.id,
-                            &session.user,
-                            &approved,
-                            recorder,
-                            parent_job_id,
-                        )
-                        .await
-                };
+                        span_recorder,
+                        step,
+                        job_id,
+                        iterations,
+                        iter_delta_tx,
+                        &cancel_token,
+                        &mut accumulated_tool_uses,
+                        &mut accumulated_attachments,
+                    );
+                    async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
+                },
+            )
+            .await?;
 
-                // Classify the outcome for telemetry before consuming
-                // the result for the LLM context. Errors / denials feed
-                // the `error` field on the Completed event so streaming
-                // sidecars can switch the indicator's color/icon.
-                //
-                // Telemetry rides the channel wire and lands in the
-                // sidecar's logs / cards — sanitize through the security
-                // gateway before emit so a tool error containing a
-                // bearer token, connection string, or revealed secret
-                // placeholder does not leak. `Ok(ToolOutput::Error)`
-                // already passed `sanitize_tool_output` inside the
-                // executor; the raw `Err(e)` path did not.
-                let telemetry_error: Option<String> = match &tool_result {
-                    Ok(ToolOutput::Error(msg)) => Some(msg.clone()),
-                    Err(e) => {
-                        if let Some(aura_tools::ToolError::Denied { .. }) =
-                            e.downcast_ref::<aura_tools::ToolError>()
-                        {
-                            Some("denied by user".to_string())
-                        } else {
-                            let raw = e.to_string();
-                            Some(
-                                self.security_gateway
-                                    .sanitize_error(&raw)
-                                    .await
-                                    .unwrap_or(raw),
+            match outcome {
+                IterationOutcome::Final(msg) => return Ok(msg),
+                IterationOutcome::Continue { deferred_subagents } => {
+                    // Now that the iteration step is closed, dispatch
+                    // any deferred subagent calls as peer steps. Each
+                    // invocation appends a tool_result message into
+                    // context so the next iteration's LLM call sees the
+                    // outcome.
+                    for (tool_use_id, arguments) in deferred_subagents {
+                        let raw = match self
+                            .dispatch_subagent(
+                                session,
+                                job_id,
+                                span_recorder,
+                                arguments,
+                                cancel_token.clone(),
                             )
-                        }
-                    }
-                    _ => None,
-                };
-
-                let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
-                let raw_result_text = match &tool_result {
-                    Ok(ToolOutput::Text(s)) => s.clone(),
-                    Ok(ToolOutput::Json(v)) => {
-                        serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
-                    }
-                    Ok(ToolOutput::WithAttachments { text, attachments }) => {
-                        push_bounded(&mut accumulated_attachments, attachments.iter().cloned());
-                        text.clone()
-                    }
-                    Ok(ToolOutput::MultiModalText { text, llm_images }) => {
-                        // LLM-visible images go in BOTH directions: a
-                        // follow-up User-role message (so the next turn
-                        // sees them through the standard multimodal user
-                        // path) AND the final OutgoingMessage (so the
-                        // user channel renders them too).
-                        push_bounded(&mut accumulated_attachments, llm_images.iter().cloned());
-                        llm_visible_images.extend(llm_images.iter().cloned());
-                        text.clone()
-                    }
-                    Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
-                    Err(e) => {
-                        if let Some(denied) = e.downcast_ref::<aura_tools::ToolError>()
-                            && matches!(denied, aura_tools::ToolError::Denied { .. })
+                            .await
                         {
-                            format!(
-                                "The user explicitly denied permission for tool '{}'. \
-                                 Do NOT retry this tool call. Either use an alternative \
-                                 approach or inform the user that the operation was skipped.",
-                                tool_call.name
-                            )
-                        } else {
-                            format!("Error: {e}")
-                        }
+                            Ok(text) => text,
+                            Err(e) => format!("[spawn_subagent error: {e}]"),
+                        };
+                        let wrapped = self
+                            .security_gateway
+                            .wrap_tool_output_for_llm(SPAWN_SUBAGENT_TOOL_NAME, &raw);
+                        let tool_msg = ChatMessage {
+                            role: Role::Tool,
+                            content: vec![ContentBlock::ToolResult {
+                                tool_use_id,
+                                content: wrapped,
+                            }],
+                        };
+                        self.append_context_message(session, &tool_msg).await?;
                     }
-                };
-
-                if let Some(tx) = delta_tx.as_ref() {
-                    let result_preview = if telemetry_error.is_some() {
-                        String::new()
-                    } else {
-                        truncate_preview(&raw_result_text, TOOL_TELEMETRY_PREVIEW_LEN)
-                    };
-                    let _ = tx
-                        .send(AgentOutput::ToolCallCompleted {
-                            session_id: session.id.clone(),
-                            user_id: session.user.id.clone(),
-                            channel: session.channel.clone(),
-                            call_id: tool_call.id.clone(),
-                            tool: tool_call.name.clone(),
-                            result_preview,
-                            error: telemetry_error,
-                            duration_ms: u64::try_from(tool_call_started.elapsed().as_millis())
-                                .unwrap_or(u64::MAX),
-                        })
-                        .await;
-                }
-
-                // Cap size before wrapping so the truncation notice lands
-                // inside the `<tool_output>` envelope, then wrap so the LLM
-                // sees a clear boundary around untrusted tool output.
-                let capped = self.security_gateway.cap_tool_output(raw_result_text).await;
-                let wrapped = self
-                    .security_gateway
-                    .wrap_tool_output_for_llm(&tool_call.name, &capped);
-
-                // Append tool result to context with the tool_use_id so the
-                // LLM can correlate results with their originating calls.
-                let tool_msg = ChatMessage {
-                    role: Role::Tool,
-                    content: vec![ContentBlock::ToolResult {
-                        tool_use_id: tool_call.id.clone(),
-                        content: wrapped,
-                    }],
-                };
-                self.append_context_message(session, &tool_msg).await?;
-
-                // ToolResult.content is text-only; provider adapters
-                // serialize it as plain text. To get images back into
-                // the LLM's view, follow with a User-role message that
-                // carries the same images plus a marker tying them to
-                // this tool call. Vision-capable providers fetch the
-                // blob bytes via the existing user_content_for_block
-                // path; non-vision providers fall back to a text stub.
-                if !llm_visible_images.is_empty() {
-                    let mut content: Vec<ContentBlock> =
-                        Vec::with_capacity(llm_visible_images.len() + 1);
-                    content.push(ContentBlock::Text(format!(
-                        "[image attachment(s) returned by tool `{}` (tool_use_id={})]",
-                        tool_call.name, tool_call.id
-                    )));
-                    content.extend(llm_visible_images);
-                    let image_msg = ChatMessage {
-                        role: Role::User,
-                        content,
-                    };
-                    self.append_context_message(session, &image_msg).await?;
                 }
             }
-
-            // Flush accumulated approvals back into session state.
-            session.state.approved_resources = approved.lock().clone();
         }
 
         // If we exhausted iterations, return what we have. Tail-append any
@@ -659,7 +522,7 @@ impl AgentLoop {
         )];
         content.extend(std::mem::take(&mut accumulated_attachments));
         Ok(OutgoingMessage {
-            session_id: session.id.clone(),
+            session_id: session.id.to_string(),
             user_id: session.user.id.clone(),
             channel: session.channel.clone(),
             content,
@@ -668,126 +531,480 @@ impl AgentLoop {
         })
     }
 
+    /// One iteration of the agentic loop, scoped to a single
+    /// `LlmIteration` step (opened by [`crate::scope::with_step`] in
+    /// the caller). Calls the LLM, executes any non-subagent tool
+    /// calls, appends their results to context. `spawn_subagent` calls
+    /// are deferred — returned in [`IterationOutcome::Continue`] so
+    /// the caller can dispatch them as **peer** steps once `with_step`
+    /// has closed this iteration's step (steps cannot nest per
+    /// `trace.md`).
+    ///
+    /// Returns [`IterationOutcome::Final`] when the LLM produced no
+    /// tool calls — that's the final assistant response and the loop
+    /// terminates.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_iteration(
+        &mut self,
+        session: &mut Session,
+        span_recorder: &Arc<SpanRecorder>,
+        step: StepHandle,
+        job_id: JobId,
+        iterations: usize,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        cancel_token: &CancellationToken,
+        accumulated_tool_uses: &mut Vec<ContentBlock>,
+        accumulated_attachments: &mut Vec<ContentBlock>,
+    ) -> anyhow::Result<IterationOutcome> {
+        let (response, llm_span_id) = self
+            .call_llm_with_retry(session, span_recorder, &step, delta_tx)
+            .await?;
+
+        // If no tool calls, we have the final response.
+        if response.tool_calls.is_empty() {
+            // Use content_blocks when available, falling back to the
+            // text string.
+            let response_blocks = if response.content_blocks.is_empty() {
+                vec![ContentBlock::Text(response.content.clone())]
+            } else {
+                response.content_blocks.clone()
+            };
+
+            // Append the tool_use blocks issued during intermediate
+            // iterations after the final narration so channels that key
+            // off them (e.g. the TUI cron hint) can render below the
+            // assistant's reply.
+            let mut final_blocks = response_blocks.clone();
+            final_blocks.extend(std::mem::take(accumulated_tool_uses));
+            final_blocks.extend(std::mem::take(accumulated_attachments));
+
+            let final_text = aura_llm::multimodal::extract_text(&response_blocks);
+
+            info!(
+                iterations,
+                content_len = final_text.len(),
+                "conversation loop complete"
+            );
+
+            // Append only the final response blocks to context —
+            // intermediate tool_use blocks were already appended in
+            // prior iterations.
+            let assistant_msg = ChatMessage {
+                role: Role::Assistant,
+                content: response_blocks,
+            };
+            self.append_context_message(session, &assistant_msg).await?;
+
+            // Maybe store memory.
+            if let Err(e) = self.memory_manager.maybe_store(session, &final_text).await {
+                warn!(error = %e, "failed to auto-store memory");
+            }
+
+            return Ok(IterationOutcome::Final(OutgoingMessage {
+                session_id: session.id.to_string(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                content: final_blocks,
+                reply_to: None,
+                metadata: Default::default(),
+            }));
+        }
+
+        // Append assistant message including thinking and tool-call
+        // blocks so the LLM sees its own prior reasoning and tool
+        // invocations on the next turn.
+        let mut assistant_blocks = if response.content_blocks.is_empty() {
+            // Fallback: build from the flat content string.
+            if response.content.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text(response.content.clone())]
+            }
+        } else {
+            response.content_blocks.clone()
+        };
+        for tc in &response.tool_calls {
+            let block = ContentBlock::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: tc.arguments.clone(),
+                signature: tc.signature.clone(),
+            };
+            assistant_blocks.push(block.clone());
+            accumulated_tool_uses.push(block);
+        }
+        let assistant_msg = ChatMessage {
+            role: Role::Assistant,
+            content: assistant_blocks,
+        };
+        self.append_context_message(session, &assistant_msg).await?;
+
+        // Execute tool calls. Approved resources are shared via a Mutex
+        // so concurrent tool calls (when supported) see each other's
+        // grants immediately. Wrapped in an `Arc` so that any
+        // persist-always closure injected into `ToolContext`
+        // mid-execution can clone its handle into the executor boundary
+        // without a borrow-lifetime escape.
+        let approved = std::sync::Arc::new(parking_lot::Mutex::new(
+            session.state.approved_resources.clone(),
+        ));
+
+        // `spawn_subagent` requests are deferred until *after* the
+        // enclosing LlmIteration step closes. Per `trace.md`, steps
+        // cannot nest — the subagent's own `StepKind::Subagent` step
+        // must run as a peer of this iteration's, not inside it. The
+        // deferred dispatch order matches the LLM's tool_use order, so
+        // the next iteration sees results in the same sequence the
+        // model produced.
+        let mut deferred_subagents: Vec<(String, serde_json::Value)> = Vec::new();
+
+        for tool_call in &response.tool_calls {
+            debug!(
+                tool = %tool_call.name,
+                "executing tool call"
+            );
+
+            if tool_call.name == SPAWN_SUBAGENT_TOOL_NAME {
+                deferred_subagents.push((tool_call.id.clone(), tool_call.arguments.clone()));
+                continue;
+            }
+
+            if let Some(tx) = delta_tx {
+                let _ = tx
+                    .send(AgentOutput::ToolCallStarted {
+                        session_id: session.id.to_string(),
+                        user_id: session.user.id.clone(),
+                        channel: session.channel.clone(),
+                        call_id: tool_call.id.clone(),
+                        tool: tool_call.name.clone(),
+                        params_preview: preview_params(
+                            &tool_call.arguments,
+                            TOOL_TELEMETRY_PREVIEW_LEN,
+                        ),
+                        description: None,
+                    })
+                    .await;
+            }
+            let tool_call_started = std::time::Instant::now();
+
+            // Sidecar MCP tools (e.g. `lark/feishu_get_chat_info`) are
+            // not in the local `ToolRegistry` — they live behind the
+            // channel sidecar's MCP server. Approval gate + local
+            // sandbox don't apply (the call is a remote query against
+            // an already-trusted tenant API, not a local resource
+            // access), but we still need the rest of the security
+            // pipeline: `reveal_in_value`, hard timeout,
+            // `sanitize_tool_output`, and a trace span.
+            let claims = self.sidecar_mcp.claims_tool(session, &tool_call.name).await;
+            let tool_result: anyhow::Result<ToolOutput> = if claims {
+                self.dispatch_sidecar_tool(
+                    session,
+                    &tool_call.name,
+                    tool_call.arguments.clone(),
+                    span_recorder,
+                    &step,
+                    Some(llm_span_id),
+                    tool_call.id.clone(),
+                    job_id,
+                )
+                .await
+            } else {
+                self.tool_executor
+                    .execute(
+                        &tool_call.name,
+                        tool_call.arguments.clone(),
+                        &session.id,
+                        &session.user,
+                        &approved,
+                        span_recorder,
+                        &step,
+                        Some(llm_span_id),
+                        tool_call.id.clone(),
+                        None,
+                        Some(job_id),
+                        cancel_token.child_token(),
+                    )
+                    .await
+            };
+
+            // Classify the outcome for telemetry before consuming the
+            // result for the LLM context. Errors / denials feed the
+            // `error` field on the Completed event so streaming
+            // sidecars can switch the indicator's color/icon.
+            //
+            // Telemetry rides the channel wire and lands in the
+            // sidecar's logs / cards — sanitize through the security
+            // gateway before emit so a tool error containing a bearer
+            // token, connection string, or revealed secret placeholder
+            // does not leak. `Ok(ToolOutput::Error)` already passed
+            // `sanitize_tool_output` inside the executor; the raw
+            // `Err(e)` path did not.
+            let telemetry_error: Option<String> = match &tool_result {
+                Ok(ToolOutput::Error(msg)) => Some(msg.clone()),
+                Err(e) => {
+                    if let Some(aura_tools::ToolError::Denied { .. }) =
+                        e.downcast_ref::<aura_tools::ToolError>()
+                    {
+                        Some("denied by user".to_string())
+                    } else {
+                        let raw = e.to_string();
+                        Some(
+                            self.security_gateway
+                                .sanitize_error(&raw)
+                                .await
+                                .unwrap_or(raw),
+                        )
+                    }
+                }
+                _ => None,
+            };
+
+            let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
+            let raw_result_text = match &tool_result {
+                Ok(ToolOutput::Text(s)) => s.clone(),
+                Ok(ToolOutput::Json(v)) => {
+                    serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
+                }
+                Ok(ToolOutput::WithAttachments { text, attachments }) => {
+                    push_bounded(accumulated_attachments, attachments.iter().cloned());
+                    text.clone()
+                }
+                Ok(ToolOutput::MultiModalText { text, llm_images }) => {
+                    // LLM-visible images go in BOTH directions: a
+                    // follow-up User-role message (so the next turn
+                    // sees them through the standard multimodal user
+                    // path) AND the final OutgoingMessage (so the user
+                    // channel renders them too).
+                    push_bounded(accumulated_attachments, llm_images.iter().cloned());
+                    llm_visible_images.extend(llm_images.iter().cloned());
+                    text.clone()
+                }
+                Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
+                Err(e) => {
+                    if let Some(denied) = e.downcast_ref::<aura_tools::ToolError>()
+                        && matches!(denied, aura_tools::ToolError::Denied { .. })
+                    {
+                        format!(
+                            "The user explicitly denied permission for tool '{}'. \
+                             Do NOT retry this tool call. Either use an alternative \
+                             approach or inform the user that the operation was skipped.",
+                            tool_call.name
+                        )
+                    } else {
+                        format!("Error: {e}")
+                    }
+                }
+            };
+
+            if let Some(tx) = delta_tx {
+                let result_preview = if telemetry_error.is_some() {
+                    String::new()
+                } else {
+                    truncate_preview(&raw_result_text, TOOL_TELEMETRY_PREVIEW_LEN)
+                };
+                let _ = tx
+                    .send(AgentOutput::ToolCallCompleted {
+                        session_id: session.id.to_string(),
+                        user_id: session.user.id.clone(),
+                        channel: session.channel.clone(),
+                        call_id: tool_call.id.clone(),
+                        tool: tool_call.name.clone(),
+                        result_preview,
+                        error: telemetry_error,
+                        duration_ms: u64::try_from(tool_call_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                    })
+                    .await;
+            }
+
+            // Cap size before wrapping so the truncation notice lands
+            // inside the `<tool_output>` envelope, then wrap so the LLM
+            // sees a clear boundary around untrusted tool output.
+            let capped = self.security_gateway.cap_tool_output(raw_result_text).await;
+            let wrapped = self
+                .security_gateway
+                .wrap_tool_output_for_llm(&tool_call.name, &capped);
+
+            // Append tool result to context with the tool_use_id so the
+            // LLM can correlate results with their originating calls.
+            let tool_msg = ChatMessage {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: tool_call.id.clone(),
+                    content: wrapped,
+                }],
+            };
+            self.append_context_message(session, &tool_msg).await?;
+
+            // ToolResult.content is text-only; provider adapters
+            // serialize it as plain text. To get images back into the
+            // LLM's view, follow with a User-role message that carries
+            // the same images plus a marker tying them to this tool
+            // call. Vision-capable providers fetch the blob bytes via
+            // the existing user_content_for_block path; non-vision
+            // providers fall back to a text stub.
+            if !llm_visible_images.is_empty() {
+                let mut content: Vec<ContentBlock> =
+                    Vec::with_capacity(llm_visible_images.len() + 1);
+                content.push(ContentBlock::Text(format!(
+                    "[image attachment(s) returned by tool `{}` (tool_use_id={})]",
+                    tool_call.name, tool_call.id
+                )));
+                content.extend(llm_visible_images);
+                let image_msg = ChatMessage {
+                    role: Role::User,
+                    content,
+                };
+                self.append_context_message(session, &image_msg).await?;
+            }
+        }
+
+        // Flush accumulated approvals back into session state.
+        session.state.approved_resources = approved.lock().clone();
+
+        Ok(IterationOutcome::Continue { deferred_subagents })
+    }
+
     /// Dispatch a tool call the sidecar MCP provider has claimed.
     ///
-    /// Mirrors the security pipeline `ToolExecutor::execute` applies
-    /// to local tools — minus approval gate / sandbox / trust gate
-    /// (sidecar tools are remote tenant-API queries, not local
-    /// resource accesses):
-    ///
-    ///  * `reveal_in_value` on params so placeholder-form secrets
-    ///    expand to plaintext before they ride the rmcp wire.
-    ///  * Observability span via `recorder.begin/succeed/fail` so
-    ///    sidecar tool calls show up in traces alongside local
-    ///    tool executions, with proper elapsed-time accounting.
-    ///  * Hard `SIDECAR_MCP_TIMEOUT` on the rmcp round-trip so a
-    ///    hung peer can't pin the per-session actor.
-    ///  * `sanitize_tool_output` on the result so any secret-looking
-    ///    bytes the remote API returned get minted into placeholders
-    ///    before they reach the LLM context, session log, or
-    ///    telemetry preview.
+    /// Mirrors the security pipeline `ToolExecutor::execute` applies to
+    /// local tools — minus approval gate / sandbox / trust gate (sidecar
+    /// tools are remote tenant-API queries, not local resource accesses):
+    /// `reveal_in_value` on params before the rmcp wire, `with_span`
+    /// `SpanKind::ToolCall` for trace parity with local tool calls, a
+    /// hard `SIDECAR_MCP_TIMEOUT` so a hung peer can't pin the actor,
+    /// and `sanitize_tool_output` on the result before it reaches
+    /// context / session log / telemetry.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_sidecar_tool(
         &self,
         session: &Session,
         tool_name: &str,
-        params: Value,
-        recorder: &ObservabilityRecorder,
-        parent_job_id: Option<&str>,
+        params: serde_json::Value,
+        span_recorder: &Arc<SpanRecorder>,
+        step: &StepHandle,
+        triggering_llm_span: Option<aura_model::SpanId>,
+        tool_use_id: String,
+        job_id: JobId,
     ) -> anyhow::Result<ToolOutput> {
-        // Begin the observability span first so denial / timeout
-        // failures still appear in the trace.
-        let handle = recorder
-            .begin(
-                &session.id,
-                OperationKind::ToolExecution {
-                    tool_name: tool_name.to_string(),
+        let tool_name_owned = tool_name.to_string();
+        crate::scope::with_span(
+            span_recorder.as_ref(),
+            step,
+            job_id,
+            SpanKind::ToolCall {
+                begin: ToolCallBegin {
+                    tool_name: tool_name_owned.clone(),
+                    tool_artifact_hash: String::new(),
+                    triggered_by: triggering_llm_span.map(|llm_span_id| {
+                        aura_trace::ToolCallOrigin {
+                            llm_span_id,
+                            tool_use_id: tool_use_id.clone(),
+                        }
+                    }),
+                    params: params.clone(),
                 },
-                parent_job_id,
-                ExecutionProvenance::default(),
-                SpanInput::ToolExecution {
-                    parameters: params.clone(),
-                },
-            )
-            .await?;
+                result: None,
+            },
+            None,
+            None,
+            |_span_handle| async move {
+                // Reveal placeholders so the remote API receives plaintext.
+                let mut params_revealed = params;
+                if let Err(e) = self
+                    .security_gateway
+                    .reveal_in_value(&mut params_revealed)
+                    .await
+                {
+                    return Err(anyhow::anyhow!("reveal_in_value: {e}"));
+                }
 
-        // Reveal placeholders so the remote API receives plaintext.
-        // The pre-reveal `params` was captured in the span input
-        // above; the trace surface keeps placeholder form.
-        let mut params_revealed = params;
-        if let Err(e) = self
-            .security_gateway
-            .reveal_in_value(&mut params_revealed)
-            .await
-        {
-            recorder
-                .fail(handle, &format!("reveal_in_value: {e}"))
-                .await?;
-            return Err(e.into());
-        }
+                let dispatch_fut =
+                    self.sidecar_mcp
+                        .execute_for_session(session, &tool_name_owned, params_revealed);
 
-        let dispatch_fut =
-            self.sidecar_mcp
-                .execute_for_session(session, tool_name, params_revealed);
+                let dispatch_result =
+                    match tokio::time::timeout(SIDECAR_MCP_TIMEOUT, dispatch_fut).await {
+                        Ok(outcome) => outcome,
+                        Err(_elapsed) => {
+                            let msg = format!(
+                                "sidecar mcp call timed out after {SIDECAR_MCP_TIMEOUT:?}"
+                            );
+                            let output = ToolOutput::Error(msg);
+                            let output_value =
+                                serde_json::to_value(&output).unwrap_or(serde_json::Value::Null);
+                            return Ok((
+                                SpanFinalize::ToolCall(ToolCallResult {
+                                    output: output_value,
+                                    success: false,
+                                }),
+                                LifecycleOutcome::Failed {
+                                    reason: "sidecar mcp timeout".into(),
+                                },
+                                output,
+                            ));
+                        }
+                    };
 
-        let started = std::time::Instant::now();
-        let dispatch_result = match tokio::time::timeout(SIDECAR_MCP_TIMEOUT, dispatch_fut).await {
-            Ok(outcome) => outcome,
-            Err(_elapsed) => {
-                let msg = format!("sidecar mcp call timed out after {SIDECAR_MCP_TIMEOUT:?}");
-                recorder.fail(handle, &msg).await?;
-                return Ok(ToolOutput::Error(msg));
-            }
-        };
-        let elapsed = started.elapsed();
+                // claims_tool returned true, so dispatch returning None is
+                // a race (sidecar disconnected mid-call). Surface as an
+                // error rather than falling through to local — the tool
+                // doesn't exist locally either.
+                let mut output = match dispatch_result {
+                    Some(Ok(out)) => out,
+                    Some(Err(reason)) => ToolOutput::Error(reason),
+                    None => ToolOutput::Error(
+                        "sidecar mcp: tool was claimed at preflight but unavailable at dispatch \
+                         (sidecar likely disconnected); retry on next turn"
+                            .to_string(),
+                    ),
+                };
 
-        // claims_tool returned true, so dispatch returning None is
-        // a race (sidecar disconnected mid-call). Surface as an
-        // error rather than falling through to local — the tool
-        // doesn't exist locally either.
-        let mut output = match dispatch_result {
-            Some(Ok(out)) => out,
-            Some(Err(reason)) => ToolOutput::Error(reason),
-            None => ToolOutput::Error(
-                "sidecar mcp: tool was claimed at preflight but unavailable at dispatch \
-                 (sidecar likely disconnected); retry on next turn"
-                    .to_string(),
-            ),
-        };
+                if let Err(e) = self
+                    .security_gateway
+                    .sanitize_tool_output(&mut output)
+                    .await
+                {
+                    warn!(error = %e, tool = %tool_name_owned, "sidecar mcp: sanitize_tool_output failed");
+                }
 
-        if let Err(e) = self
-            .security_gateway
-            .sanitize_tool_output(&mut output)
-            .await
-        {
-            warn!(error = %e, tool = tool_name, "sidecar mcp: sanitize_tool_output failed");
-        }
-
-        let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
-        let span_result = SpanResult::ToolResult {
-            output: output_value.clone(),
-            success: !matches!(output, ToolOutput::Error(_)),
-            latency: elapsed,
-        };
-        recorder.succeed(handle, output_value, span_result).await?;
-
-        Ok(output)
+                let output_value = serde_json::to_value(&output).unwrap_or(serde_json::Value::Null);
+                let success = !matches!(output, ToolOutput::Error(_));
+                let outcome = if success {
+                    LifecycleOutcome::Ok
+                } else {
+                    LifecycleOutcome::Failed {
+                        reason: "sidecar tool returned error output".into(),
+                    }
+                };
+                Ok((
+                    SpanFinalize::ToolCall(ToolCallResult {
+                        output: output_value,
+                        success,
+                    }),
+                    outcome,
+                    output,
+                ))
+            },
+        )
+        .await
     }
 
     /// Call the LLM with retry on transient errors using `ErrorHandler`.
+    /// Returns the response paired with the `SpanId` of the
+    /// **last attempt's** `LlmCall` span — that's the span tools spawned
+    /// from this response should pair back to via `ToolCallOrigin`.
     async fn call_llm_with_retry(
         &self,
         session: &Session,
-        recorder: &ObservabilityRecorder,
-        parent_job_id: Option<&str>,
+        span_recorder: &Arc<SpanRecorder>,
+        step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-    ) -> anyhow::Result<LlmResponse> {
+    ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
-            match self
-                .call_llm(session, recorder, parent_job_id, delta_tx)
-                .await
-            {
-                Ok(response) => return Ok(response),
+            match self.call_llm(session, span_recorder, step, delta_tx).await {
+                Ok(pair) => return Ok(pair),
                 Err(e) => {
                     if !self.error_handler.should_retry(attempt, &e) {
                         return Err(e);
@@ -806,34 +1023,19 @@ impl AgentLoop {
         }
     }
 
-    /// Call the LLM with the current session context.
+    /// Call the LLM with the current session context. Opens an
+    /// `LlmCall` span inside `step`, fills it with the response (or
+    /// failure) before closing. Cost recording happens automatically:
+    /// `SpanRecorder::end_span(LlmCall { tokens })` publishes
+    /// `TraceEvent::LlmSpanEnded` for the cost subscriber.
     async fn call_llm(
         &self,
         session: &Session,
-        recorder: &ObservabilityRecorder,
-        parent_job_id: Option<&str>,
+        span_recorder: &Arc<SpanRecorder>,
+        step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-    ) -> anyhow::Result<LlmResponse> {
-        let model_id = self.llm_client.model_info().id.clone();
-
-        let handle = recorder
-            .begin(
-                &session.id,
-                OperationKind::LlmCall {
-                    model: model_id.clone(),
-                },
-                parent_job_id,
-                ExecutionProvenance {
-                    model_id: Some(model_id.clone()),
-                    provider: Some(self.llm_client.model_info().provider.clone()),
-                    ..Default::default()
-                },
-                SpanInput::LlmCall {
-                    input_messages: session.messages.clone(),
-                    temperature: None,
-                },
-            )
-            .await?;
+    ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
+        let model_info = self.llm_client.model_info();
 
         let mut tool_defs: Vec<ToolDefinitionForLlm> = self
             .tool_registry
@@ -862,110 +1064,96 @@ impl AgentLoop {
             tools: tool_defs,
         };
 
-        let started_at = std::time::Instant::now();
-        let llm_result = match delta_tx {
-            Some(tx) => self.chat_streaming(&request, session, tx).await,
-            None => self.llm_client.chat(&request).await,
-        };
-        let latency_ms = started_at.elapsed().as_millis() as u64;
-
-        match llm_result {
-            Ok(mut response) => {
-                // Defensive scrub of LLM output before it touches trace,
-                // memory, or session history. The LLM never saw real
-                // secrets (input is already sanitized), but it may echo
-                // back placeholders or fabricate secret-looking strings.
-                if let Err(e) = self
-                    .security_gateway
-                    .sanitize_llm_response(&mut response)
-                    .await
-                {
-                    warn!(error = %e, "failed to sanitize LLM response");
-                }
-                self.write_session_log(
-                    session,
-                    &request,
-                    LlmCallOutcome::Ok {
-                        response: LlmResponseMeta::from_response(&response),
-                        latency_ms,
-                    },
-                )
-                .await;
-                let trace_tool_calls: Vec<aura_trace::LlmToolCallRecord> = response
-                    .tool_calls
-                    .iter()
-                    .map(|tc| aura_trace::LlmToolCallRecord {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
-                    })
-                    .collect();
-
-                let result = SpanResult::LlmResponse {
-                    output_content: response.content.clone(),
-                    input_tokens: response.usage.input_tokens,
-                    output_tokens: response.usage.output_tokens,
-                    thinking: response.thinking.clone(),
-                    tool_calls: trace_tool_calls,
-                    latency: std::time::Duration::from_millis(0),
+        crate::scope::with_span(
+            span_recorder.as_ref(),
+            step,
+            step.job_id,
+            SpanKind::LlmCall {
+                begin: LlmCallBegin {
+                    model_id: model_info.id.clone(),
+                    provider: model_info.provider.clone(),
+                    provider_config_hash: String::new(),
+                    input_messages: session.messages.clone(),
+                    temperature: None,
+                },
+                result: None,
+            },
+            None,
+            None,
+            |span| async move {
+                let started_at = std::time::Instant::now();
+                let llm_result = match delta_tx {
+                    Some(tx) => self.chat_streaming(&request, session, tx).await,
+                    None => self.llm_client.chat(&request).await,
                 };
+                let latency_ms = started_at.elapsed().as_millis() as u64;
 
-                let pricing = &self.llm_client.model_info().pricing;
-                let cost_usd = (response.usage.input_tokens as f64 / 1_000_000.0
-                    * pricing.input_per_1m_tokens)
-                    + (response.usage.output_tokens as f64 / 1_000_000.0
-                        * pricing.output_per_1m_tokens);
-
-                recorder
-                    .succeed(
-                        handle,
-                        serde_json::to_value(&response).unwrap_or(Value::Null),
-                        result,
-                    )
-                    .await?;
-
-                recorder
-                    .record_cost(
-                        &session.user.id,
-                        &session.id,
-                        "",
-                        "",
-                        &model_id,
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
-                        cost_usd,
-                    )
-                    .await;
-
-                if let Err(e) = recorder.flush().await {
-                    warn!(error = %e, "failed to flush trace after LLM call");
+                match llm_result {
+                    Ok(mut response) => {
+                        // Defensive scrub of LLM output.
+                        if let Err(e) = self
+                            .security_gateway
+                            .sanitize_llm_response(&mut response)
+                            .await
+                        {
+                            warn!(error = %e, "failed to sanitize LLM response");
+                        }
+                        self.write_session_log(
+                            session,
+                            &request,
+                            LlmCallOutcome::Ok {
+                                response: LlmResponseMeta::from_response(&response),
+                                latency_ms,
+                            },
+                        )
+                        .await;
+                        let trace_tool_calls: Vec<aura_trace::LlmToolCallRecord> = response
+                            .tool_calls
+                            .iter()
+                            .map(|tc| aura_trace::LlmToolCallRecord {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                arguments: tc.arguments.clone(),
+                            })
+                            .collect();
+                        let finalize = SpanFinalize::LlmCall(LlmCallResult {
+                            output_content: response.content.clone(),
+                            thinking: response.thinking.clone(),
+                            tool_calls: trace_tool_calls,
+                            input_tokens: response.usage.input_tokens,
+                            output_tokens: response.usage.output_tokens,
+                        });
+                        Ok((finalize, LifecycleOutcome::Ok, (response, span.span_id)))
+                    }
+                    Err(e) => {
+                        // Surface the *sanitized* message: this Err
+                        // bubbles into `with_span`, which writes
+                        // `e.to_string()` into the span's
+                        // `Failed { reason }` (via `outcome_for`) and
+                        // from there into persisted trace storage.
+                        // Returning the raw `e` would leak any secrets
+                        // in the upstream provider error text.
+                        let raw = e.to_string();
+                        let error_msg = self
+                            .security_gateway
+                            .sanitize_error(&raw)
+                            .await
+                            .unwrap_or(raw);
+                        self.write_session_log(
+                            session,
+                            &request,
+                            LlmCallOutcome::Err {
+                                error: error_msg.clone(),
+                                latency_ms,
+                            },
+                        )
+                        .await;
+                        Err(anyhow::anyhow!(error_msg))
+                    }
                 }
-
-                Ok(response)
-            }
-            Err(e) => {
-                let raw = e.to_string();
-                let error_msg = self
-                    .security_gateway
-                    .sanitize_error(&raw)
-                    .await
-                    .unwrap_or(raw);
-                self.write_session_log(
-                    session,
-                    &request,
-                    LlmCallOutcome::Err {
-                        error: error_msg.clone(),
-                        latency_ms,
-                    },
-                )
-                .await;
-                recorder.fail(handle, &error_msg).await?;
-                if let Err(fe) = recorder.flush().await {
-                    warn!(error = %fe, "failed to flush trace after LLM failure");
-                }
-                Err(e.into())
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Append a single LLM call record to the per-session JSONL log.
@@ -990,7 +1178,7 @@ impl AgentLoop {
         };
         let record = LlmCallRecord {
             timestamp: chrono::Utc::now(),
-            session_id: session.id.clone(),
+            session_id: session.id.to_string(),
             provider: info.provider.clone(),
             model: info.id.clone(),
             request,
@@ -1030,7 +1218,7 @@ impl AgentLoop {
         let Some(logger) = self.session_log.as_ref() else {
             return;
         };
-        if let Err(e) = logger.log_message(&session.id, message).await {
+        if let Err(e) = logger.log_message(session.id.as_str(), message).await {
             warn!(error = %e, "failed to append session message log");
         }
     }
@@ -1137,7 +1325,7 @@ impl AgentLoop {
 
         if delta_tx
             .send(AgentOutput::Delta {
-                session_id: session.id.clone(),
+                session_id: session.id.to_string(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 text: sanitized,
@@ -1147,6 +1335,276 @@ impl AgentLoop {
         {
             debug!("delta receiver dropped, continuing without forwarding");
         }
+    }
+
+    /// Dispatch one `spawn_subagent` tool_use through the subagent
+    /// runtime. Opens a dedicated `StepKind::Subagent` step + a
+    /// single `SubagentStub` span that bounds the parent's wait
+    /// window. Returns the rendered tool_result text the parent's
+    /// next LLM iteration will see.
+    async fn dispatch_subagent(
+        &self,
+        session: &Session,
+        job_id: JobId,
+        span_recorder: &Arc<SpanRecorder>,
+        arguments: serde_json::Value,
+        parent_cancel: CancellationToken,
+    ) -> anyhow::Result<String> {
+        let runtime = match self.subagent_runtime.as_ref() {
+            Some(rt) => Arc::clone(rt),
+            None => {
+                return Ok(SubagentResult {
+                    child_session_id: aura_model::SessionId::from(""),
+                    final_content: None,
+                    status: SubagentExitStatus::Failed("no subagent runtime registered".into()),
+                }
+                .to_tool_result_text());
+            }
+        };
+        let mut request = parse_spawn_request(&arguments).map_err(|e| anyhow::anyhow!(e))?;
+
+        // Q10 A3: prepend a parent-conversation summary so the child
+        // has provenance without inheriting the full transcript.
+        // Failures degrade silently.
+        match self
+            .summarize_for_subagent(session, span_recorder, job_id)
+            .await
+        {
+            Ok(Some(summary)) => {
+                request
+                    .must_include_context
+                    .insert(0, format!("Parent conversation summary:\n{summary}"));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "subagent context summarization failed; spawning without it")
+            }
+        }
+
+        // Prepare the child synchronously *before* opening the
+        // Subagent step so the step kind carries the real
+        // child_session_id instead of an empty placeholder.
+        let prepared = match runtime.prepare(session, job_id, &request).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(SubagentResult {
+                    child_session_id: aura_model::SessionId::from(""),
+                    final_content: None,
+                    status: SubagentExitStatus::Failed(e),
+                }
+                .to_tool_result_text());
+            }
+        };
+        let child_session_id = prepared.child_session.id.clone();
+
+        // Real parent token from the agent loop's cancel tree, not a
+        // throwaway. The runtime derives a child_token() from this for
+        // its own bookkeeping; tripping our parent (via JobLifecycle::cancel)
+        // cascades into every nested subagent.
+        let result_text = crate::scope::with_step(
+            span_recorder.as_ref(),
+            job_id,
+            StepKind::Subagent {
+                child_session_id: child_session_id.clone(),
+            },
+            None,
+            |step| async move {
+                crate::scope::with_span(
+                    span_recorder.as_ref(),
+                    &step,
+                    job_id,
+                    SpanKind::SubagentStub {
+                        child_session_id: child_session_id.clone(),
+                    },
+                    None,
+                    None,
+                    |_span| async move {
+                        let result = runtime.run(prepared, request, parent_cancel).await;
+                        let outcome = match &result.status {
+                            SubagentExitStatus::Completed => LifecycleOutcome::Ok,
+                            SubagentExitStatus::Cancelled => LifecycleOutcome::Cancelled {
+                                reason: aura_job::CancelReason::ParentCancelled,
+                            },
+                            SubagentExitStatus::Failed(reason) => LifecycleOutcome::Failed {
+                                reason: reason.clone(),
+                            },
+                            SubagentExitStatus::Timeout => LifecycleOutcome::Cancelled {
+                                reason: aura_job::CancelReason::SubagentTimeout,
+                            },
+                        };
+                        Ok((SpanFinalize::Empty, outcome.clone(), (outcome, result)))
+                    },
+                )
+                .await
+                .map(|(outcome, result)| (outcome, result.to_tool_result_text()))
+            },
+        )
+        .await?;
+
+        Ok(result_text)
+    }
+
+    /// Condense the parent's recent non-system messages into a summary
+    /// for a child subagent, wrapped in a Compression step / LlmCall
+    /// span. Returns `Ok(None)` for brand-new sessions or empty LLM
+    /// output — the subagent still launches.
+    async fn summarize_for_subagent(
+        &self,
+        session: &Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+    ) -> anyhow::Result<Option<String>> {
+        let has_real_history = session
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, Role::Assistant | Role::Tool));
+        if !has_real_history {
+            return Ok(None);
+        }
+
+        let model_info = self.llm_client.model_info();
+        let summarize_prompt = ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text(
+                "Summarize the prior conversation into a concise briefing for a subagent. \
+                 Focus on the user's current goal, decisions already made, \
+                 outstanding questions, and constraints. Output plain prose, \
+                 no preamble."
+                    .to_string(),
+            )],
+        };
+        let mut messages: Vec<ChatMessage> = session
+            .messages
+            .iter()
+            .filter(|m| !matches!(m.role, Role::System))
+            .cloned()
+            .collect();
+        messages.push(summarize_prompt);
+
+        let llm_call_kind = SpanKind::LlmCall {
+            begin: LlmCallBegin {
+                model_id: model_info.id.clone(),
+                provider: model_info.provider.clone(),
+                provider_config_hash: String::new(),
+                input_messages: messages.clone(),
+                temperature: None,
+            },
+            result: None,
+        };
+
+        let rec = span_recorder.as_ref();
+        let llm = &self.llm_client;
+        let content = crate::scope::with_step(
+            rec,
+            job_id,
+            StepKind::Compression,
+            None,
+            |step| async move {
+                let v = crate::scope::with_span(
+                    rec,
+                    &step,
+                    job_id,
+                    llm_call_kind,
+                    None,
+                    None,
+                    |_span| async move {
+                        let request = ChatRequest {
+                            messages,
+                            temperature: None,
+                            tools: Vec::new(),
+                        };
+                        let response = llm.chat(&request).await?;
+                        let finalize = SpanFinalize::LlmCall(LlmCallResult {
+                            output_content: response.content.clone(),
+                            thinking: response.thinking.clone(),
+                            tool_calls: vec![],
+                            input_tokens: response.usage.input_tokens,
+                            output_tokens: response.usage.output_tokens,
+                        });
+                        Ok((finalize, LifecycleOutcome::Ok, response.content))
+                    },
+                )
+                .await?;
+                Ok((LifecycleOutcome::Ok, v))
+            },
+        )
+        .await?;
+
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
+    /// Compress if the budget calls for it. When the strategy ran an
+    /// LLM call, brackets it in a `StepKind::Compression` step +
+    /// `SpanKind::LlmCall` span so the cost lands in per-step
+    /// aggregation. Strategies that don't call an LLM (e.g. `Truncate`)
+    /// don't open a step.
+    async fn compress_if_needed(
+        &mut self,
+        session: &mut Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        cancel_token: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let outcome = self.context_manager.maybe_compress(session).await?;
+        let Some(stats) = outcome else {
+            return Ok(());
+        };
+        debug!(
+            before = stats.before_tokens,
+            after = stats.after_tokens,
+            "compressed context before LLM call"
+        );
+        let Some(call) = stats.llm_call else {
+            return Ok(());
+        };
+
+        // Post-hoc record — `SpanRecorder::end_span` publishes
+        // `LlmSpanEnded` for the cost subscriber regardless of
+        // wall-clock ordering.
+        let llm_call_kind = SpanKind::LlmCall {
+            begin: LlmCallBegin {
+                model_id: call.model_id,
+                provider: call.provider,
+                provider_config_hash: String::new(),
+                input_messages: Vec::new(),
+                temperature: None,
+            },
+            result: None,
+        };
+        let finalize = SpanFinalize::LlmCall(LlmCallResult {
+            output_content: String::new(),
+            thinking: None,
+            tool_calls: vec![],
+            input_tokens: call.input_tokens,
+            output_tokens: call.output_tokens,
+        });
+        let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
+        let rec = span_recorder.as_ref();
+        crate::scope::with_step(
+            rec,
+            job_id,
+            StepKind::Compression,
+            cancel_ctx,
+            |step| async move {
+                crate::scope::with_span(
+                    rec,
+                    &step,
+                    job_id,
+                    llm_call_kind,
+                    None,
+                    cancel_ctx,
+                    |_span| async move { Ok((finalize, LifecycleOutcome::Ok, ())) },
+                )
+                .await?;
+                Ok((LifecycleOutcome::Ok, ()))
+            },
+        )
+        .await
     }
 
     async fn ensure_system_prompt(&self, session: &mut Session) {
@@ -1231,7 +1689,7 @@ impl AgentLoop {
         let text = format!("Skill '{skill_name}' {headline}: {rationale}");
         if tx
             .send(AgentOutput::Notice {
-                session_id: session.id.clone(),
+                session_id: session.id.to_string(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 level,
