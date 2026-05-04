@@ -357,29 +357,48 @@ export interface components {
             kind: "wildcard";
             value: string;
         };
-        /** @description Mirror of [`aura_job::Job`]. */
+        /**
+         * @description Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
+         *     state machine (Q6) — `final_result` replaces `output`/`error`,
+         *     `emitted_span_ids` replaces `trace_span_id`.
+         */
         Job: {
             /** Format: date-time */
-            completed_at?: string | null;
-            /** Format: date-time */
             created_at: string;
-            error?: string | null;
+            effective_soul_version: string;
+            emitted_span_ids: string[];
+            /** Format: date-time */
+            ended_at?: string | null;
+            final_result?: Record<string, never> | null;
             id: string;
-            input?: Record<string, never> | null;
-            kind: components["schemas"]["OperationKind"];
-            output?: Record<string, never> | null;
+            kind: components["schemas"]["JobKind"];
             parent_job_id?: string | null;
             session_id: string;
             /** Format: date-time */
             started_at?: string | null;
             status: components["schemas"]["JobStatus"];
-            trace_span_id?: string | null;
         };
         /**
-         * @description Mirror of [`aura_job::JobStatus`].
+         * @description Wire mirror of [`aura_job::JobKind`].
          * @enum {string}
          */
-        JobStatus: "pending" | "in_progress" | "completed" | "submitted" | "accepted" | "failed" | "stuck";
+        JobKind: "user_chat" | "cron" | "system" | "spawned";
+        /**
+         * @description Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
+         *     the domain enum carries (cancel reason, partial-artifact span IDs,
+         *     verification substate); the wire shape collapses inner-variant
+         *     content into `Option`-typed fields so HTTP clients can decode
+         *     without needing the full Rust enum machinery.
+         */
+        JobStatus: {
+            cancel_reason?: string | null;
+            kind: components["schemas"]["JobStatusKind"];
+            partial_artifacts?: string[];
+            reason?: string | null;
+            verification?: string | null;
+        };
+        /** @enum {string} */
+        JobStatusKind: "pending" | "in_progress" | "stuck" | "cancelled" | "failed" | "completed";
         /** @description Current LLM provider descriptor. */
         LlmInfo: {
             model_id: string;
@@ -457,36 +476,6 @@ export interface components {
             path: string;
             requires_restart: boolean;
             written_to: string;
-        };
-        /** @description Mirror of [`aura_job::OperationKind`]. */
-        OperationKind: {
-            model: string;
-            /** @enum {string} */
-            type: "llm_call";
-        } | {
-            tool_name: string;
-            /** @enum {string} */
-            type: "tool_execution";
-        } | {
-            skill_name: string;
-            /** @enum {string} */
-            type: "skill_execution";
-        } | {
-            cron_job_id: string;
-            /** @enum {string} */
-            type: "cron_execution";
-        } | {
-            strategy: string;
-            /** @enum {string} */
-            type: "context_compression";
-        } | {
-            operation: string;
-            /** @enum {string} */
-            type: "memory_operation";
-        } | {
-            session_id: string;
-            /** @enum {string} */
-            type: "user_message_handling";
         };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
@@ -903,20 +892,19 @@ export interface operations {
                     "application/json": {
                         items: {
                             /** Format: date-time */
-                            completed_at?: string | null;
-                            /** Format: date-time */
                             created_at: string;
-                            error?: string | null;
+                            effective_soul_version: string;
+                            emitted_span_ids: string[];
+                            /** Format: date-time */
+                            ended_at?: string | null;
+                            final_result?: Record<string, never> | null;
                             id: string;
-                            input?: Record<string, never> | null;
-                            kind: components["schemas"]["OperationKind"];
-                            output?: Record<string, never> | null;
+                            kind: components["schemas"]["JobKind"];
                             parent_job_id?: string | null;
                             session_id: string;
                             /** Format: date-time */
                             started_at?: string | null;
                             status: components["schemas"]["JobStatus"];
-                            trace_span_id?: string | null;
                         }[];
                     };
                 };
@@ -1380,7 +1368,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Raw trace tree for the session. Shape mirrors `aura_trace::TraceNode` but is emitted as untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
+            /** @description Per-session trace tree: jobs, their steps, and the spans under each step. Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -22,7 +22,7 @@ Bottom-up along the dependency graph:
 
 ### Ingress and Security Boundary Layer
 
-- **session** — `SessionError` and `SessionManager` (lifecycle logic). Session domain types (`User`, `ChannelType`, `Session`, `SessionState`) live in `model`; the `SessionStore` trait lives in `storage`. `aura-session` depends on both.
+- **session** — `SessionError` and `SessionManager` (lifecycle logic). Session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`) live in `model`; the `SessionStore` trait lives in `storage`. A `Session` is the top of one trace tree (1 trace = 1 session); fork and subagent spawn create new sessions linked through `Lineage`. `aura-session` depends on both `model` and `storage`.
 - **channels** — Channel adapter trait, shared message types (Message, IncomingMessage, OutgoingMessage), slash/dashboard trait definitions (`SlashHandler`, `DashboardProvider`, `ViewKind`), and `ChannelRegistry`. No built-in adapters — the terminal UI now lives in its own `aura-tui` crate (see [`tui.md`](./tui.md)).
 - **security** — Cryptographic primitives (EncryptionKey, encrypt/decrypt), leak detection (LeakDetector), error types.
 
@@ -39,15 +39,15 @@ Bottom-up along the dependency graph:
 
 ### Runtime and Observability Layer
 
-- **trace** — Trace domain types (SessionTrace, TraceNode, SpanHandle) and tree/fork utilities.
-- **job** — Job domain types (Job, JobStatus, JobTransition) and state machine. Owns OperationKind.
+- **trace** — Step / Span / SpanEvent domain types (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `LlmToolCallRecord`, `ToolCallOrigin`) and the half-open-span recovery utility. Closed strong-typed enums; OTel-aligned naming.
+- **job** — Job domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `VerificationOutcome`, `CancelReason`, `JobTransition`, `DriftRecord`) and state machine. Verification is a `Completed` substate, not a separate top-level state. `Cancelled` and `Failed` are independent terminal states.
 - **hook** — Lifecycle extension points.
 
 ### Infrastructure and Assembly Layer
 
 - **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free. `ChannelPairingStore` defines `ChannelPairingRow` / `PairingStatus` so `aura-pairing` can stay a business-logic crate.
 - **[pairing](pairing.md)** — Per-user pairing gate for sidecar-routed inbound messages. `PairingService` checks the `(channel_type, bot_id, user_id)` triple, mints 6-char codes for unknown senders, and refuses with a `Frame::Notice` until `aura pair approve <code>` flips the row to `approved`. Store trait + row lives in `storage`; `aura-pairing` is the service + code generator.
-- **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, ObservabilityRecorder, cost management (CostTracker, CostGuard), plus all domain managers (SessionManager, MemoryManager, TraceCollector, JobManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
+- **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, observability facades (`JobLifecycle` for the job state machine and lifecycle hooks, `SpanRecorder` for Step/Span/SpanEvent writes), cost management (`CostTracker` as a `TraceEventStream` subscriber, `CostGuard`), plus all domain managers (SessionManager, MemoryManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
 - **bootstrap** — Binary entry point (`src/main.rs`) and `boot` submodule. Loads `AuraConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
 - **cli** — Operator-facing command layer (`aura-cli`). One `clap` tree drives both argv-mode commands (`aura config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input that resolves to a CLI command never enters the agent's context. User-invocable skills are the one sanctioned exception: `/<skill>` is forwarded to the agent as a normal chat message so `SkillRegistry::select` can narrow on the exact-match branch.
 - **[tui](tui.md)** — Interactive terminal UI (`aura-tui`). Ratatui + Crossterm frontend driven by a WS+MessagePack `WsTransport` client of `aura-gateway`; no local manager graph, no workspace singleton. Hosts `TuiAdapter`, `TuiSlashHandler`, and `TuiDashboardProvider`. Input-history persistence is delivered over the same WS via `Frame::HistorySnapshot` / `Frame::HistoryAppend` — the TUI never opens the vault itself. Depends on `aura-channels` for shared trait definitions only.
@@ -91,7 +91,7 @@ bootstrap ──► config + all domain crates it assembles (entry point only)
 - Store traits defined in `storage`; domain types in their own crates; business logic in `agent`; `model` contains shared content primitives and memory domain types
 - Logs, Trace, and Job must not record sensitive plaintext — only placeholders or sanitized summaries
 - Tool/skill extensions must carry source, version, hash, trust level, and capability declarations
-- The Job state machine is fixed: `Pending → InProgress → Completed → Submitted → Accepted` (with `Failed` and `Stuck` branches)
+- The Job state machine is fixed: `Pending → InProgress → Completed { verification }` (with `Stuck`, `Failed`, and `Cancelled` branches). `verification` is a `Completed` substate (`Unverified` / `Submitted` / `Accepted` / `Rejected`); a chat job ends terminal at `Completed { Unverified }`. `Cancelled` carries a `reason` and `partial_artifacts: Vec<SpanId>` for resume context
 - Multimedia passed by reference — no raw binary in sessions or Trace
 - Hot reload, tool updates, identity changes, and config changes must leave provenance records in Trace
 - Cron and background execution must all enter Job and Trace
