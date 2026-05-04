@@ -277,12 +277,16 @@ impl TraceStore for LibsqlTraceStore {
             to_rewrite.push((span_id_str, span));
         }
 
-        // Rewrite each half-open span: stamp ended_at + cancelled outcome.
+        // Rewrite each half-open span: stamp ended_at + cancelled outcome
+        // atomically via Span::close so the lifecycle pairing invariant
+        // can't drift.
         for (span_id, mut span) in to_rewrite {
-            span.ended_at = Some(now);
-            span.outcome = LifecycleOutcome::Cancelled {
-                reason: aura_job::CancelReason::SystemCrash,
-            };
+            span.close(
+                LifecycleOutcome::Cancelled {
+                    reason: aura_job::CancelReason::SystemCrash,
+                },
+                now,
+            )?;
             let data = serde_json::to_string(&span)
                 .map_err(|e| TraceError::Storage(format!("reserialize span: {e}")))?;
             conn.execute(

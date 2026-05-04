@@ -116,7 +116,9 @@ impl JobStatusKind {
     }
 
     /// Snake-case wire tag, matching the serde `rename_all` on
-    /// `JobStatus`. The `Display` impl uses PascalCase for human output.
+    /// `JobStatus`. `Display` delegates here so formatted error
+    /// messages and JSON wire payloads use the same identifier — no
+    /// PascalCase-in-logs / snake_case-in-JSON mismatch.
     pub fn as_snake_case(self) -> &'static str {
         match self {
             JobStatusKind::Pending => "pending",
@@ -131,15 +133,7 @@ impl JobStatusKind {
 
 impl std::fmt::Display for JobStatusKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            JobStatusKind::Pending => "Pending",
-            JobStatusKind::InProgress => "InProgress",
-            JobStatusKind::Stuck => "Stuck",
-            JobStatusKind::Cancelled => "Cancelled",
-            JobStatusKind::Failed => "Failed",
-            JobStatusKind::Completed => "Completed",
-        };
-        f.write_str(s)
+        f.write_str(self.as_snake_case())
     }
 }
 
@@ -341,6 +335,11 @@ impl Job {
 }
 
 /// Audit record for a single state transition.
+///
+/// Dropping a `JobTransition` without persisting it loses the audit
+/// trail the state machine exists to produce; `JobLifecycle::record_transition`
+/// is the intended consumer.
+#[must_use = "JobTransition is the audit trail; persist it via JobLifecycle::record_transition"]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobTransition {
     pub job_id: JobId,
@@ -351,6 +350,7 @@ pub struct JobTransition {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)] // tests assert on `j.status` directly; the JobTransition audit record isn't relevant here
 mod tests {
     use super::*;
     use aura_model::ContentBlock;

@@ -1,4 +1,4 @@
-use aura_model::{ChannelType, User};
+use aura_model::{ChannelType, JobId, SessionId, User};
 use aura_model::{ContentBlock, MessageMetadata};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -82,9 +82,15 @@ pub enum AgentOutput {
     /// signal completion independently of the user-facing `Message`.
     /// Required for the multi-job subagent path: the parent waits for
     /// every child job to terminate, not just the first message.
+    ///
+    /// `job_id` is `None` until the agent loop is reworked to surface
+    /// the produced `JobId` back through `agent_loop.run`'s return —
+    /// today's subscriber (`LocalSubagentRuntime`) only needs terminal
+    /// detection, not job-level matching. A future caller that needs
+    /// per-job dispatch must wait for that plumbing.
     JobCompleted {
-        session_id: String,
-        job_id: String,
+        session_id: SessionId,
+        job_id: Option<JobId>,
         outcome: JobOutcome,
     },
 }

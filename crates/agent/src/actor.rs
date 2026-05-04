@@ -169,13 +169,13 @@ impl AgentActor {
     }
 
     /// Emit a `JobCompleted` terminal signal on the response channel.
-    /// `job_id` is left empty — current subscribers (subagent runtime)
-    /// only need terminal-state detection, not job-level matching. Plumb
-    /// the real id through `agent_loop.run` if a subscriber starts to.
+    /// `job_id` is `None` — current subscribers (subagent runtime) only
+    /// need terminal-state detection, not job-level matching. Plumb the
+    /// real id through `agent_loop.run`'s return when a subscriber starts to.
     async fn emit_job_completed(&self, outcome: JobOutcome) {
         let signal = AgentOutput::JobCompleted {
-            session_id: self.session.id.to_string(),
-            job_id: String::new(),
+            session_id: self.session.id.clone(),
+            job_id: None,
             outcome,
         };
         if let Err(e) = self.response_tx.send(signal).await {

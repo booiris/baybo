@@ -290,6 +290,7 @@ impl JobStore for LibsqlJobStore {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)] // tests build state machines via direct calls; the JobTransition audit record isn't the assertion target
 mod tests {
     use super::*;
     use aura_job::{JobInput, JobStatus};

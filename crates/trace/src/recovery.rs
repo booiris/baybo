@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::outcome::LifecycleOutcome;
 
 /// One half-open span that the recovery scan rewrote.
+#[must_use = "RecoveredSpan represents recovery work that must be folded into the parent job's partial_artifacts"]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveredSpan {
     pub job_id: JobId,
@@ -56,6 +57,7 @@ impl RecoveredSpan {
 
 /// The result of one recovery scan, grouped by parent job for the
 /// `JobLifecycle` to consume.
+#[must_use = "RecoveryReport must be handed to JobLifecycle::recover_interrupted; dropping it skips the recovery audit"]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryReport {
     pub recovered: Vec<RecoveredSpan>,

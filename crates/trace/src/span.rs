@@ -15,6 +15,11 @@ use crate::event::SpanEvent;
 use crate::outcome::LifecycleOutcome;
 
 /// One atomic action recorded in the trace tree.
+///
+/// **Lifecycle invariant:** `outcome.is_terminal() ⟺ ended_at.is_some()`.
+/// Mutate the two together via [`Span::close`]; never set one without
+/// the other. Recovery, storage rewrites, and replay all rely on this
+/// pairing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Span {
     pub id: SpanId,
@@ -38,6 +43,24 @@ pub struct Span {
     /// `(span_id, seq)`; loaded eagerly with the span for convenience.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<SpanEvent>,
+}
+
+impl Span {
+    /// Atomically transition this span to a terminal outcome. Sets
+    /// both `outcome` and `ended_at` from the single call so the
+    /// lifecycle invariant cannot be violated. Returns an error if
+    /// `outcome` is `LifecycleOutcome::Pending`.
+    pub fn close(&mut self, outcome: LifecycleOutcome, at: DateTime<Utc>) -> crate::Result<()> {
+        if !outcome.is_terminal() {
+            return Err(crate::TraceError::InvalidOperation(format!(
+                "Span::close requires a terminal LifecycleOutcome, got {}",
+                outcome.tag()
+            )));
+        }
+        self.outcome = outcome;
+        self.ended_at = Some(at);
+        Ok(())
+    }
 }
 
 /// Closed enum of every kind of atomic action. Each variant carries its
@@ -216,6 +239,38 @@ mod tests {
             output: serde_json::json!(null),
             success: false,
         }
+    }
+
+    fn pending_span(kind: SpanKind) -> Span {
+        Span {
+            id: SpanId::new(),
+            step_id: StepId::new(),
+            kind,
+            parallel_group: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            outcome: LifecycleOutcome::Pending,
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn close_pairs_outcome_and_ended_at() {
+        let mut span = pending_span(dummy_llm());
+        let now = Utc::now();
+        span.close(LifecycleOutcome::Ok, now).unwrap();
+        assert_eq!(span.outcome, LifecycleOutcome::Ok);
+        assert_eq!(span.ended_at, Some(now));
+    }
+
+    #[test]
+    fn close_rejects_pending() {
+        let mut span = pending_span(dummy_tool());
+        let err = span
+            .close(LifecycleOutcome::Pending, Utc::now())
+            .unwrap_err();
+        assert!(matches!(err, crate::TraceError::InvalidOperation(_)));
+        assert!(span.ended_at.is_none());
     }
 
     #[test]
