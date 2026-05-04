@@ -235,7 +235,7 @@ impl AgentTestHarnessBuilder {
         // counts still land in cost_records, cost_usd reads as 0.
         let _cost_handle = aura_agent::cost::CostSubscriber::new(
             share_cost_store(&cost_store),
-            std::collections::HashMap::new(),
+            Arc::new(std::collections::HashMap::new()),
         )
         .spawn(span_recorder.stream());
 

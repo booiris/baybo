@@ -70,16 +70,25 @@ impl StepKind {
 }
 
 /// Opaque handle returned by `SpanRecorder::begin_step`. Carries
-/// enough context to call `end_step(handle, outcome)` later.
+/// enough context to call `end_step(handle, outcome)` later — including
+/// the begin-time `kind` and `started_at` so the recorder can persist
+/// the closed step without an extra SELECT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepHandle {
     pub step_id: StepId,
     pub job_id: JobId,
+    pub kind: StepKind,
+    pub started_at: DateTime<Utc>,
 }
 
 impl StepHandle {
-    pub fn new(step_id: StepId, job_id: JobId) -> Self {
-        Self { step_id, job_id }
+    pub fn new(step_id: StepId, job_id: JobId, kind: StepKind, started_at: DateTime<Utc>) -> Self {
+        Self {
+            step_id,
+            job_id,
+            kind,
+            started_at,
+        }
     }
 }
 
@@ -127,7 +136,12 @@ mod tests {
 
     #[test]
     fn step_handle_is_constructible() {
-        let h = StepHandle::new(StepId::new(), JobId::new());
+        let h = StepHandle::new(
+            StepId::new(),
+            JobId::new(),
+            StepKind::LlmIteration,
+            Utc::now(),
+        );
         assert_eq!(h, h.clone());
     }
 }

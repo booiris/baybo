@@ -17,7 +17,7 @@ use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
 use aura_tools::{ToolOutput, ToolRegistry};
-use aura_trace::{LifecycleOutcome, SpanKind, StepHandle, StepKind};
+use aura_trace::{LifecycleOutcome, SpanKind, SpanResult, StepHandle, StepKind};
 use tracing::{debug, info, warn};
 
 use crate::error_recovery::ErrorHandler;
@@ -759,17 +759,15 @@ impl AgentLoop {
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<LlmResponse> {
         let model_info = self.llm_client.model_info();
-        let model_id = model_info.id.clone();
-        let provider = model_info.provider.clone();
-        let provider_config_hash = String::new(); // wired in step-6
 
         let span = span_recorder
             .begin_span(
                 step,
                 SpanKind::LlmCall {
-                    model_id: model_id.clone(),
-                    provider: provider.clone(),
-                    provider_config_hash: provider_config_hash.clone(),
+                    model_id: model_info.id.clone(),
+                    provider: model_info.provider.clone(),
+                    // wired in step-6
+                    provider_config_hash: String::new(),
                     input_messages: session.messages.clone(),
                     temperature: None,
                     output_content: String::new(),
@@ -805,7 +803,6 @@ impl AgentLoop {
             None => self.llm_client.chat(&request).await,
         };
         let latency_ms = started_at.elapsed().as_millis() as u64;
-        let input_messages_for_span = session.messages.clone();
 
         match llm_result {
             Ok(mut response) => {
@@ -836,20 +833,19 @@ impl AgentLoop {
                     })
                     .collect();
 
-                let final_kind = SpanKind::LlmCall {
-                    model_id,
-                    provider,
-                    provider_config_hash,
-                    input_messages: input_messages_for_span,
-                    temperature: None,
-                    output_content: response.content.clone(),
-                    thinking: response.thinking.clone(),
-                    tool_calls: trace_tool_calls,
-                    input_tokens: response.usage.input_tokens,
-                    output_tokens: response.usage.output_tokens,
-                };
                 span_recorder
-                    .end_span(span, step.job_id, final_kind, LifecycleOutcome::Ok)
+                    .end_span(
+                        span,
+                        step.job_id,
+                        SpanResult::LlmCall {
+                            output_content: response.content.clone(),
+                            thinking: response.thinking.clone(),
+                            tool_calls: trace_tool_calls,
+                            input_tokens: response.usage.input_tokens,
+                            output_tokens: response.usage.output_tokens,
+                        },
+                        LifecycleOutcome::Ok,
+                    )
                     .await?;
 
                 Ok(response)
@@ -870,23 +866,17 @@ impl AgentLoop {
                     },
                 )
                 .await;
-                let final_kind = SpanKind::LlmCall {
-                    model_id,
-                    provider,
-                    provider_config_hash,
-                    input_messages: input_messages_for_span,
-                    temperature: None,
-                    output_content: String::new(),
-                    thinking: None,
-                    tool_calls: vec![],
-                    input_tokens: 0,
-                    output_tokens: 0,
-                };
                 span_recorder
                     .end_span(
                         span,
                         step.job_id,
-                        final_kind,
+                        SpanResult::LlmCall {
+                            output_content: String::new(),
+                            thinking: None,
+                            tool_calls: vec![],
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        },
                         LifecycleOutcome::Failed {
                             reason: error_msg.clone(),
                         },
@@ -1143,11 +1133,15 @@ impl AgentLoop {
                 reason: "subagent timeout".to_string(),
             },
         };
-        let final_kind = SpanKind::SubagentStub {
-            child_session_id: result.child_session_id.clone(),
-        };
         span_recorder
-            .end_span(stub_span, job_id, final_kind, outcome.clone())
+            .end_span(
+                stub_span,
+                job_id,
+                SpanResult::SubagentStub {
+                    child_session_id: result.child_session_id.clone(),
+                },
+                outcome.clone(),
+            )
             .await
             .ok();
         span_recorder.end_step(subagent_step, outcome).await.ok();

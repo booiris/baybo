@@ -11,8 +11,8 @@ use std::sync::Arc;
 use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
 use aura_storage::{TraceEventStore, TraceLogEvent, TraceLogEventKind, TraceStore};
 use aura_trace::{
-    LifecycleOutcome, Span, SpanEvent, SpanEventKind, SpanHandle, SpanKind, Step, StepHandle,
-    StepKind, TraceError,
+    LifecycleOutcome, Span, SpanEvent, SpanEventKind, SpanHandle, SpanKind, SpanResult, Step,
+    StepHandle, StepKind, TraceError,
 };
 use chrono::Utc;
 use tokio::sync::broadcast;
@@ -153,46 +153,45 @@ impl SpanRecorder {
     /// columnar `steps` table and writes a `StepBegin` event to the
     /// WAL log.
     pub async fn begin_step(&self, job_id: JobId, kind: StepKind) -> Result<StepHandle> {
+        let started_at = Utc::now();
+        let step_id = StepId::new();
         let step = Step {
-            id: StepId::new(),
+            id: step_id,
             job_id,
             kind: kind.clone(),
-            started_at: Utc::now(),
+            started_at,
             ended_at: None,
             outcome: LifecycleOutcome::Pending,
         };
-        let handle = StepHandle::new(step.id, step.job_id);
         self.trace_store.save_step(&step).await?;
         self.append_log_event(
             job_id,
             TraceLogEventKind::StepBegin {
-                step_id: step.id,
+                step_id,
                 payload: serde_json::json!({ "kind": kind.tag() }),
             },
         )
         .await;
         self.stream.publish(TraceEvent::StepStarted {
-            step_id: step.id,
+            step_id,
             job_id,
-            kind,
+            kind: kind.clone(),
         });
-        Ok(handle)
+        Ok(StepHandle::new(step_id, job_id, kind, started_at))
     }
 
-    /// Close a step. The recorder loads the step, stamps `ended_at +
-    /// outcome`, and re-saves. Emits a WAL `StepEnd` event and a
-    /// `StepEnded` stream event.
+    /// Close a step. Constructs the closed `Step` row from the handle
+    /// (which carries the begin-time `kind` + `started_at`) so the
+    /// columnar write is a single INSERT OR REPLACE — no SELECT.
     pub async fn end_step(&self, handle: StepHandle, outcome: LifecycleOutcome) -> Result<()> {
-        let mut step = self
-            .trace_store
-            .load_step(&handle.step_id)
-            .await?
-            .ok_or_else(|| TraceError::NotFound(format!("step {}", handle.step_id)))?;
-        if step.ended_at.is_some() {
-            return Err(TraceError::AlreadyEnded(format!("step {}", handle.step_id)));
-        }
-        step.ended_at = Some(Utc::now());
-        step.outcome = outcome.clone();
+        let step = Step {
+            id: handle.step_id,
+            job_id: handle.job_id,
+            kind: handle.kind,
+            started_at: handle.started_at,
+            ended_at: Some(Utc::now()),
+            outcome: outcome.clone(),
+        };
         self.trace_store.save_step(&step).await?;
         self.append_log_event(
             handle.job_id,
@@ -222,62 +221,58 @@ impl SpanRecorder {
         kind: SpanKind,
         parallel_group: Option<ParallelGroup>,
     ) -> Result<SpanHandle> {
+        let started_at = Utc::now();
+        let span_id = SpanId::new();
         let span = Span {
-            id: SpanId::new(),
+            id: span_id,
             step_id: step.step_id,
             kind: kind.clone(),
             parallel_group,
-            started_at: Utc::now(),
+            started_at,
             ended_at: None,
             outcome: LifecycleOutcome::Pending,
             events: Vec::new(),
         };
-        let handle = SpanHandle::new(span.id, span.step_id);
         let kind_tag = kind.tag();
         self.trace_store.save_span(&span).await?;
         self.append_log_event(
             step.job_id,
             TraceLogEventKind::SpanBegin {
-                span_id: span.id,
+                span_id,
                 step_id: step.step_id,
                 payload: serde_json::json!({ "kind": kind_tag }),
             },
         )
         .await;
         self.stream.publish(TraceEvent::SpanStarted {
-            span_id: span.id,
+            span_id,
             step_id: step.step_id,
             job_id: step.job_id,
             kind_tag,
         });
-        Ok(handle)
+        Ok(SpanHandle::new(
+            span_id,
+            step.step_id,
+            kind,
+            started_at,
+            parallel_group,
+        ))
     }
 
-    /// Close a span with the given final `kind` (containing the
-    /// filled-in result fields) + outcome. Replaces the span row
-    /// (`INSERT OR REPLACE` semantics from `TraceStore::save_span`).
-    /// Emits a `SpanEnd` WAL event, a `SpanEnded` stream event, and
-    /// (for `LlmCall` spans) an `LlmSpanEnded` event so cost
-    /// subscribers can write `cost_records` asynchronously.
+    /// Close a span. Merges the begin-time `kind` (carried on the
+    /// handle) with the caller-supplied [`SpanResult`] to form the
+    /// final stored row, then writes via INSERT OR REPLACE — no
+    /// SELECT. For `LlmCall` spans, also publishes an
+    /// `LlmSpanEnded` stream event so cost subscribers can write
+    /// `cost_records` asynchronously.
     pub async fn end_span(
         &self,
         handle: SpanHandle,
         job_id: JobId,
-        final_kind: SpanKind,
+        result: SpanResult,
         outcome: LifecycleOutcome,
     ) -> Result<()> {
-        let mut span = self
-            .trace_store
-            .load_span(&handle.span_id)
-            .await?
-            .ok_or_else(|| TraceError::NotFound(format!("span {}", handle.span_id)))?;
-        if span.ended_at.is_some() {
-            return Err(TraceError::AlreadyEnded(format!("span {}", handle.span_id)));
-        }
-        span.ended_at = Some(Utc::now());
-        span.outcome = outcome.clone();
-        // Cost subscribers care about LlmCall token counts — emit
-        // before we move `final_kind` into the row.
+        let final_kind = merge_span_kind(handle.kind, result, &handle.span_id)?;
         if let SpanKind::LlmCall {
             model_id,
             provider,
@@ -297,7 +292,16 @@ impl SpanRecorder {
             });
         }
         let kind_tag = final_kind.tag();
-        span.kind = final_kind;
+        let span = Span {
+            id: handle.span_id,
+            step_id: handle.step_id,
+            kind: final_kind,
+            parallel_group: handle.parallel_group,
+            started_at: handle.started_at,
+            ended_at: Some(Utc::now()),
+            outcome: outcome.clone(),
+            events: Vec::new(),
+        };
         self.trace_store.save_span(&span).await?;
         self.append_log_event(
             job_id,
@@ -356,6 +360,70 @@ impl SpanRecorder {
     }
 }
 
+/// Merge a begin-time `SpanKind` (carried on the handle) with the
+/// caller's [`SpanResult`] to produce the row stored at end time.
+/// Begin-time provenance fields (model_id / tool_name / triggered_by /
+/// params / etc.) carry through unchanged; result fields fill in.
+///
+/// Variant mismatch (handle has `LlmCall` but result is `ToolCall`) is
+/// a programming error and surfaces as `TraceError::Internal`.
+fn merge_span_kind(begin: SpanKind, result: SpanResult, span_id: &SpanId) -> Result<SpanKind> {
+    match (begin, result) {
+        (
+            SpanKind::LlmCall {
+                model_id,
+                provider,
+                provider_config_hash,
+                input_messages,
+                temperature,
+                ..
+            },
+            SpanResult::LlmCall {
+                output_content,
+                thinking,
+                tool_calls,
+                input_tokens,
+                output_tokens,
+            },
+        ) => Ok(SpanKind::LlmCall {
+            model_id,
+            provider,
+            provider_config_hash,
+            input_messages,
+            temperature,
+            output_content,
+            thinking,
+            tool_calls,
+            input_tokens,
+            output_tokens,
+        }),
+        (
+            SpanKind::ToolCall {
+                tool_name,
+                tool_artifact_hash,
+                triggered_by,
+                params,
+                ..
+            },
+            SpanResult::ToolCall { output, success },
+        ) => Ok(SpanKind::ToolCall {
+            tool_name,
+            tool_artifact_hash,
+            triggered_by,
+            params,
+            output,
+            success,
+        }),
+        (SpanKind::SubagentStub { .. }, SpanResult::SubagentStub { child_session_id }) => {
+            Ok(SpanKind::SubagentStub { child_session_id })
+        }
+        _ => Err(TraceError::Internal(anyhow::anyhow!(
+            "span {} end_span result variant does not match begin-time kind",
+            span_id
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,13 +452,8 @@ mod tests {
         }
     }
 
-    fn finished_llm_kind(input_tokens: usize, output_tokens: usize) -> SpanKind {
-        SpanKind::LlmCall {
-            model_id: "claude".into(),
-            provider: "anthropic".into(),
-            provider_config_hash: "h".into(),
-            input_messages: vec![],
-            temperature: None,
+    fn llm_result(input_tokens: usize, output_tokens: usize) -> SpanResult {
+        SpanResult::LlmCall {
             output_content: "hi".into(),
             thinking: None,
             tool_calls: vec![],
@@ -419,7 +482,7 @@ mod tests {
         let job = JobId::new();
         let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
         let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
-        rec.end_span(span, job, finished_llm_kind(10, 5), LifecycleOutcome::Ok)
+        rec.end_span(span, job, llm_result(10, 5), LifecycleOutcome::Ok)
             .await
             .unwrap();
         // Drain step started + span started + llm span ended + span ended
@@ -440,7 +503,7 @@ mod tests {
         let job = JobId::new();
         let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
         let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
-        rec.end_span(span, job, finished_llm_kind(123, 45), LifecycleOutcome::Ok)
+        rec.end_span(span, job, llm_result(123, 45), LifecycleOutcome::Ok)
             .await
             .unwrap();
         // Drain until LlmSpanEnded
@@ -461,13 +524,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn double_end_step_errors() {
+    async fn end_span_rejects_variant_mismatch() {
         let rec = make_recorder();
         let job = JobId::new();
-        let h = rec.begin_step(job, StepKind::Compression).await.unwrap();
-        rec.end_step(h.clone(), LifecycleOutcome::Ok).await.unwrap();
-        let err = rec.end_step(h, LifecycleOutcome::Ok).await.unwrap_err();
-        assert!(matches!(err, TraceError::AlreadyEnded(_)));
+        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
+        // Begin-time kind is LlmCall; result variant is ToolCall —
+        // programming error, surfaces as TraceError::Internal.
+        let err = rec
+            .end_span(
+                span,
+                job,
+                SpanResult::ToolCall {
+                    output: serde_json::Value::Null,
+                    success: false,
+                },
+                LifecycleOutcome::Ok,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TraceError::Internal(_)));
     }
 
     #[tokio::test]

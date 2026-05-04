@@ -39,13 +39,10 @@ async fn session_summary_counts(
 ) -> Result<(usize, usize, usize)> {
     let st = store(ctx)?;
     let job_mgr = jobs(ctx)?;
-    let session_jobs: Vec<_> = job_mgr
-        .list(None)
+    let session_jobs = job_mgr
+        .list_by_session(session_id, None)
         .await
-        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?
-        .into_iter()
-        .filter(|j| &j.session_id == session_id)
-        .collect();
+        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?;
     let mut step_count = 0;
     let mut span_count = 0;
     for j in &session_jobs {
@@ -159,13 +156,10 @@ async fn export(
     let st = store(ctx)?;
     let job_mgr = jobs(ctx)?;
     let session_id = SessionId::from(id);
-    let session_jobs: Vec<_> = job_mgr
-        .list(None)
+    let session_jobs = job_mgr
+        .list_by_session(&session_id, None)
         .await
-        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?
-        .into_iter()
-        .filter(|j| j.session_id == session_id)
-        .collect();
+        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?;
     if session_jobs.is_empty() {
         return Err(CliError::Manager(format!(
             "no trace recorded for session {id}"

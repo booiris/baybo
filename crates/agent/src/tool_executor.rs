@@ -12,7 +12,9 @@ use aura_tools::{
     ExecSandbox, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
     ToolRegistry, approval::preview_params,
 };
-use aura_trace::{LifecycleOutcome, SpanEventKind, SpanKind, StepHandle, ToolCallOrigin};
+use aura_trace::{
+    LifecycleOutcome, SpanEventKind, SpanKind, SpanResult, StepHandle, ToolCallOrigin,
+};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -134,19 +136,19 @@ impl ToolExecutor {
         }
 
         // Open the tool span up front so denials and approval failures
-        // still appear in the trace tree.
-        let triggered_by = triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
-            llm_span_id,
-            tool_use_id: String::new(),
-        });
-        let tool_artifact_hash = String::new();
+        // still appear in the trace tree. The handle carries the
+        // begin-time kind, so close-time only supplies the result.
         let span_handle = recorder
             .begin_span(
                 step,
                 SpanKind::ToolCall {
                     tool_name: tool_name.to_string(),
-                    tool_artifact_hash: tool_artifact_hash.clone(),
-                    triggered_by,
+                    // ToolManifest does not yet carry an artifact hash.
+                    tool_artifact_hash: String::new(),
+                    triggered_by: triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
+                        llm_span_id,
+                        tool_use_id: String::new(),
+                    }),
                     params: params.clone(),
                     output: Value::Null,
                     success: false,
@@ -220,22 +222,14 @@ impl ToolExecutor {
                 }
                 ApprovalDecision::Deny => {
                     let reason = "user denied approval".to_string();
-                    let final_kind = SpanKind::ToolCall {
-                        tool_name: tool_name.to_string(),
-                        tool_artifact_hash: tool_artifact_hash.clone(),
-                        triggered_by: triggering_llm_span.map(|s| ToolCallOrigin {
-                            llm_span_id: s,
-                            tool_use_id: String::new(),
-                        }),
-                        params: params.clone(),
-                        output: Value::Null,
-                        success: false,
-                    };
                     let _ = recorder
                         .end_span(
                             span_handle,
                             step.job_id,
-                            final_kind,
+                            SpanResult::ToolCall {
+                                output: Value::Null,
+                                success: false,
+                            },
                             LifecycleOutcome::Failed {
                                 reason: reason.clone(),
                             },
@@ -315,17 +309,6 @@ impl ToolExecutor {
                     .await?;
                 let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
                 let success = !matches!(output, ToolOutput::Error(_));
-                let final_kind = SpanKind::ToolCall {
-                    tool_name: tool_name.to_string(),
-                    tool_artifact_hash,
-                    triggered_by: triggering_llm_span.map(|s| ToolCallOrigin {
-                        llm_span_id: s,
-                        tool_use_id: String::new(),
-                    }),
-                    params,
-                    output: output_value,
-                    success,
-                };
                 let outcome = if success {
                     LifecycleOutcome::Ok
                 } else {
@@ -334,7 +317,15 @@ impl ToolExecutor {
                     }
                 };
                 recorder
-                    .end_span(span_handle, step.job_id, final_kind, outcome)
+                    .end_span(
+                        span_handle,
+                        step.job_id,
+                        SpanResult::ToolCall {
+                            output: output_value,
+                            success,
+                        },
+                        outcome,
+                    )
                     .await?;
                 Ok(output)
             }
@@ -345,22 +336,14 @@ impl ToolExecutor {
                     .sanitize_error(&raw)
                     .await
                     .unwrap_or(raw);
-                let final_kind = SpanKind::ToolCall {
-                    tool_name: tool_name.to_string(),
-                    tool_artifact_hash,
-                    triggered_by: triggering_llm_span.map(|s| ToolCallOrigin {
-                        llm_span_id: s,
-                        tool_use_id: String::new(),
-                    }),
-                    params,
-                    output: Value::Null,
-                    success: false,
-                };
                 recorder
                     .end_span(
                         span_handle,
                         step.job_id,
-                        final_kind,
+                        SpanResult::ToolCall {
+                            output: Value::Null,
+                            success: false,
+                        },
                         LifecycleOutcome::Failed {
                             reason: error_msg.clone(),
                         },
@@ -371,22 +354,14 @@ impl ToolExecutor {
             Err(_) => {
                 let error_msg =
                     format!("tool '{}' exceeded timeout ({:?})", tool_name, ctx.timeout);
-                let final_kind = SpanKind::ToolCall {
-                    tool_name: tool_name.to_string(),
-                    tool_artifact_hash,
-                    triggered_by: triggering_llm_span.map(|s| ToolCallOrigin {
-                        llm_span_id: s,
-                        tool_use_id: String::new(),
-                    }),
-                    params,
-                    output: Value::Null,
-                    success: false,
-                };
                 recorder
                     .end_span(
                         span_handle,
                         step.job_id,
-                        final_kind,
+                        SpanResult::ToolCall {
+                            output: Value::Null,
+                            success: false,
+                        },
                         LifecycleOutcome::Failed {
                             reason: error_msg.clone(),
                         },

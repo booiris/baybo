@@ -232,10 +232,10 @@ impl QueryApi {
         // Always include this session's own jobs first.
         let mut summaries: Vec<JobSummary> = self
             .jobs
-            .list(filter.status_kind)
+            .list_by_session(session_id, filter.status_kind)
             .await?
             .into_iter()
-            .filter(|j| &j.session_id == session_id && filter_matches(j, &filter))
+            .filter(|j| filter_matches(j, &filter))
             .map(|j| JobSummary::from_owned(&j))
             .collect();
 
@@ -249,10 +249,10 @@ impl QueryApi {
         {
             let source_jobs: Vec<Job> = self
                 .jobs
-                .list(filter.status_kind)
+                .list_by_session(&parent_session_id, filter.status_kind)
                 .await?
                 .into_iter()
-                .filter(|j| j.session_id == parent_session_id && filter_matches(j, &filter))
+                .filter(|j| filter_matches(j, &filter))
                 .collect();
             let cutoff = source_jobs
                 .iter()
@@ -331,14 +331,13 @@ impl QueryApi {
             if !matches!(kind, LineageKind::Subagent) {
                 continue;
             }
-            // "Active" = at least one non-terminal job.
-            let mut active = false;
-            for j in self.jobs.list(None).await? {
-                if j.session_id == child_id && !j.status.is_terminal() {
-                    active = true;
-                    break;
-                }
-            }
+            // "Active" = at least one non-terminal job in this child.
+            let active = self
+                .jobs
+                .list_by_session(&child_id, None)
+                .await?
+                .iter()
+                .any(|j| !j.status.is_terminal());
             if active {
                 out.push(child_id);
             }

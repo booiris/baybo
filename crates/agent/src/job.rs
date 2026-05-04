@@ -157,6 +157,21 @@ impl JobLifecycle {
         Ok(jobs)
     }
 
+    /// List jobs scoped to one session. Hits the `idx_jobs_session`
+    /// index instead of scanning the full table. Newest first.
+    pub async fn list_by_session(
+        &self,
+        session_id: &aura_model::SessionId,
+        status: Option<JobStatusKind>,
+    ) -> Result<Vec<Job>> {
+        let mut jobs = self.store.list_by_session(session_id).await?;
+        if let Some(k) = status {
+            jobs.retain(|j| j.status.kind() == k);
+        }
+        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(jobs)
+    }
+
     pub async fn get_history(&self, job_id: &JobId) -> Result<Vec<JobTransition>> {
         self.store.get_transitions(job_id).await
     }

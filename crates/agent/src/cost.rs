@@ -131,12 +131,14 @@ impl CostGuard {
     }
 }
 
-/// Subscribes to a session's `TraceEventStream` and writes
-/// `cost_records` + lazily updates the `user_monthly_cost` cache for
-/// every `TraceEvent::LlmSpanEnded` it sees. One subscriber per session.
+/// Subscribes to a `TraceEventStream` and writes `cost_records` +
+/// lazily updates the `user_monthly_cost` cache for every
+/// `TraceEvent::LlmSpanEnded` it sees. Designed to run process-wide
+/// behind a shared stream — every session's `SpanRecorder` publishes
+/// into the same bus, one task drains it.
 pub struct CostSubscriber {
     store: Arc<dyn CostStore>,
-    pricing: HashMap<String, ModelPricing>,
+    pricing: Arc<HashMap<String, ModelPricing>>,
 }
 
 fn compute_cost_usd(
@@ -153,7 +155,7 @@ fn compute_cost_usd(
 }
 
 impl CostSubscriber {
-    pub fn new(store: Arc<dyn CostStore>, pricing: HashMap<String, ModelPricing>) -> Self {
+    pub fn new(store: Arc<dyn CostStore>, pricing: Arc<HashMap<String, ModelPricing>>) -> Self {
         Self { store, pricing }
     }
 
@@ -238,7 +240,7 @@ mod tests {
     use super::*;
     use aura_storage::test_support::MemoryCostStore;
 
-    fn pricing(model: &str, input: f64, output: f64) -> HashMap<String, ModelPricing> {
+    fn pricing(model: &str, input: f64, output: f64) -> Arc<HashMap<String, ModelPricing>> {
         let mut h = HashMap::new();
         h.insert(
             model.to_string(),
@@ -247,7 +249,7 @@ mod tests {
                 output_per_1m_tokens: output,
             },
         );
-        h
+        Arc::new(h)
     }
 
     #[test]

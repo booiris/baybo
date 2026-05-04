@@ -19,7 +19,7 @@ pub use error::TraceError;
 pub use event::{SpanEvent, SpanEventKind};
 pub use outcome::LifecycleOutcome;
 pub use recovery::{RecoveredSpan, RecoveryReport};
-pub use span::{LlmToolCallRecord, Span, SpanHandle, SpanKind, ToolCallOrigin};
+pub use span::{LlmToolCallRecord, Span, SpanHandle, SpanKind, SpanResult, ToolCallOrigin};
 pub use step::{Step, StepHandle, StepKind};
 
 pub type Result<T> = std::result::Result<T, TraceError>;

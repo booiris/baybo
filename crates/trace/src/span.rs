@@ -124,20 +124,57 @@ pub struct ToolCallOrigin {
     pub tool_use_id: String,
 }
 
-/// Opaque handle returned by `SpanRecorder::begin_span`. Carries enough
-/// context to call `end_span(handle, outcome)` later. Lives in
-/// `aura-trace` because it is a pure data type, not a persistence
-/// behavior.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Opaque handle returned by `SpanRecorder::begin_span`. Carries the
+/// begin-time `kind`, `started_at`, and `parallel_group` so the recorder
+/// can persist the closed span without re-loading.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpanHandle {
     pub span_id: SpanId,
     pub step_id: StepId,
+    pub kind: SpanKind,
+    pub started_at: DateTime<Utc>,
+    pub parallel_group: Option<ParallelGroup>,
 }
 
 impl SpanHandle {
-    pub fn new(span_id: SpanId, step_id: StepId) -> Self {
-        Self { span_id, step_id }
+    pub fn new(
+        span_id: SpanId,
+        step_id: StepId,
+        kind: SpanKind,
+        started_at: DateTime<Utc>,
+        parallel_group: Option<ParallelGroup>,
+    ) -> Self {
+        Self {
+            span_id,
+            step_id,
+            kind,
+            started_at,
+            parallel_group,
+        }
     }
+}
+
+/// Result data carried by `SpanRecorder::end_span`. Exists as a
+/// parallel sum to [`SpanKind`] so callers don't have to reconstruct
+/// the begin-time provenance fields at close time — the recorder
+/// merges this with the begin-time kind on the [`SpanHandle`] to
+/// produce the final stored row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanResult {
+    LlmCall {
+        output_content: String,
+        thinking: Option<String>,
+        tool_calls: Vec<LlmToolCallRecord>,
+        input_tokens: usize,
+        output_tokens: usize,
+    },
+    ToolCall {
+        output: Value,
+        success: bool,
+    },
+    SubagentStub {
+        child_session_id: aura_model::SessionId,
+    },
 }
 
 #[cfg(test)]
@@ -231,7 +268,7 @@ mod tests {
 
     #[test]
     fn span_handle_is_constructible() {
-        let h = SpanHandle::new(SpanId::new(), StepId::new());
-        assert_eq!(h.span_id, h.span_id);
+        let h = SpanHandle::new(SpanId::new(), StepId::new(), dummy_llm(), Utc::now(), None);
+        assert_eq!(h.span_id, h.clone().span_id);
     }
 }

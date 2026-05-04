@@ -31,7 +31,7 @@ use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
     CronScheduler, CronTriggerEvent, JobLifecycle, MemoryManager, SecretVault, SecurityGateway,
-    SessionManager, SpanRecorder,
+    SessionManager, SpanRecorder, TraceEventStream,
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
@@ -499,18 +499,25 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let actor_trace_store = graph.stores.trace.clone();
     let actor_trace_event_store = graph.stores.trace_events.clone();
     let actor_job_lifecycle = Arc::clone(&graph.job_lifecycle);
-    let actor_cost_store = graph.cost_store.clone();
     let actor_skill_assessor = Arc::clone(&graph.skill_assessor);
     let actor_security_gateway = Arc::clone(&graph.security_gateway);
     let actor_session_logger = Arc::clone(&session_logger);
-    // Snapshot the live model's pricing for the cost subscriber. The
-    // bootstrap uses a single shared LLM client, so a single-entry
-    // map is enough for now; multi-model bootstraps will populate
-    // the map from the provider registry.
-    let actor_pricing: std::collections::HashMap<String, aura_llm::ModelPricing> = {
+
+    // Process-wide trace event bus. Every `SpanRecorder` publishes
+    // through it, and a single `CostSubscriber` task drains it for
+    // the entire process — no per-session subscriber and no per-session
+    // pricing clones.
+    let trace_event_stream = TraceEventStream::new();
+    let actor_trace_event_stream = trace_event_stream.clone();
+    let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> = {
         let info = graph.llm_client.model_info();
-        std::iter::once((info.id.clone(), info.pricing.clone())).collect()
+        let map: std::collections::HashMap<_, _> =
+            std::iter::once((info.id.clone(), info.pricing.clone())).collect();
+        Arc::new(map)
     };
+    let _cost_subscriber_handle =
+        aura_agent::cost::CostSubscriber::new(graph.cost_store.clone(), pricing)
+            .spawn(&trace_event_stream);
 
     let router = Router::new(
         Arc::clone(&graph.session_manager),
@@ -539,22 +546,17 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         .with_hooks(Arc::clone(&actor_hooks));
 
         // Per-session `SpanRecorder` writes through to the libsql
-        // columnar tables and the WAL event log. The bus drives the
-        // cost subscriber below; events flow as
-        // `TraceEvent::LlmSpanEnded` → `cost_records`.
-        let span_recorder = Arc::new(SpanRecorder::new(
-            session.id.clone(),
-            Arc::clone(&actor_trace_store),
-            Arc::clone(&actor_trace_event_store),
-        ));
-        // Cost subscriber (per-session). Shutdown when the session
-        // closes by following `tokio::sync::broadcast` semantics: the
-        // task exits when the recorder Arc is dropped.
-        let subscriber = aura_agent::cost::CostSubscriber::new(
-            Arc::clone(&actor_cost_store),
-            actor_pricing.clone(),
+        // columnar tables and the WAL event log, and publishes into
+        // the shared process-wide stream so the single CostSubscriber
+        // can attribute every `LlmSpanEnded` to `cost_records`.
+        let span_recorder = Arc::new(
+            SpanRecorder::new(
+                session.id.clone(),
+                Arc::clone(&actor_trace_store),
+                Arc::clone(&actor_trace_event_store),
+            )
+            .with_stream(actor_trace_event_stream.clone()),
         );
-        let _cost_handle = subscriber.spawn(span_recorder.stream());
 
         let actor = AgentActor::new(
             session,

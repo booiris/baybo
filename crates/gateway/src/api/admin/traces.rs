@@ -46,12 +46,9 @@ async fn get_trace(
     // Walk Jobs → Steps → Spans for this session.
     let jobs = state
         .job_lifecycle
-        .list(None)
+        .list_by_session(&typed_session, None)
         .await
-        .map_err(|e: aura_job::JobError| GatewayError::Trace(e.to_string()))?
-        .into_iter()
-        .filter(|j| j.session_id == typed_session)
-        .collect::<Vec<_>>();
+        .map_err(|e: aura_job::JobError| GatewayError::Trace(e.to_string()))?;
 
     if jobs.is_empty() {
         return Err(GatewayError::NotFound(format!("trace {session_id}")));
