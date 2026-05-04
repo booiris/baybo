@@ -219,8 +219,9 @@ mod tests {
     }
 
     fn make_session(messages: Vec<ChatMessage>) -> Session {
+        let id = aura_model::SessionId::from("test-session");
         Session {
-            id: "test-session".to_string(),
+            id: id.clone(),
             user: aura_model::User {
                 id: "user-1".to_string(),
                 name: None,
@@ -231,6 +232,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
             state: Default::default(),
+            root_session_id: id,
+            trigger: aura_model::TriggerSource::User,
+            lineage: None,
+            bound_soul_version: "soul-test".into(),
         }
     }
 

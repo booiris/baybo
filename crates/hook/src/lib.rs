@@ -36,6 +36,13 @@ pub enum HookPoint {
     PreLLMCall,
     PostLLMCall,
 
+    // Agent Loop step boundary (per agent-loop iteration / compression /
+    // memory recall / etc.). PreStep can return Abort to short-circuit
+    // the surrounding job. See `docs/modules/agent.md` for the
+    // timeout / degraded protocol.
+    PreStep,
+    PostStep,
+
     // Agentic Loop (per tool call)
     PreToolUse,
     PostToolUse,
@@ -81,6 +88,7 @@ impl HookPoint {
             Self::UserPromptSubmit
                 | Self::Stop
                 | Self::PreToolUse
+                | Self::PreStep
                 | Self::PermissionRequest
                 | Self::SubagentStop
                 | Self::TaskCreated

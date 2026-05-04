@@ -43,6 +43,18 @@ pub enum HookEventData {
         token_usage: Option<Value>,
     },
 
+    // -- Agent Loop step boundary --
+    PreStep {
+        job_id: String,
+        step_kind: String,
+    },
+    PostStep {
+        job_id: String,
+        step_id: String,
+        step_kind: String,
+        outcome: String,
+    },
+
     // -- Agentic Loop Events --
     PreToolUse {
         tool_name: String,
@@ -169,6 +181,8 @@ impl HookEventData {
             Self::StopFailure { .. } => HookPoint::StopFailure,
             Self::PreLlmCall { .. } => HookPoint::PreLLMCall,
             Self::PostLlmCall { .. } => HookPoint::PostLLMCall,
+            Self::PreStep { .. } => HookPoint::PreStep,
+            Self::PostStep { .. } => HookPoint::PostStep,
             Self::PreToolUse { .. } => HookPoint::PreToolUse,
             Self::PostToolUse { .. } => HookPoint::PostToolUse,
             Self::PostToolUseFailure { .. } => HookPoint::PostToolUseFailure,
@@ -212,6 +226,10 @@ impl HookEventData {
             // LLM Lifecycle
             Self::PreLlmCall { provider_name, .. } => Some(provider_name),
             Self::PostLlmCall { provider_name, .. } => Some(provider_name),
+
+            // Agent loop step boundary (matcher = step_kind tag)
+            Self::PreStep { step_kind, .. } => Some(step_kind),
+            Self::PostStep { step_kind, .. } => Some(step_kind),
 
             // Agentic Loop (tool name)
             Self::PreToolUse { tool_name, .. } => Some(tool_name),

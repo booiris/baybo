@@ -4,8 +4,8 @@ pub mod cost;
 pub mod error_recovery;
 pub mod job;
 pub mod memory;
-pub mod observability;
 pub mod policy;
+pub mod query;
 pub mod router;
 pub mod sandbox;
 pub mod security;
@@ -13,6 +13,7 @@ pub mod service;
 pub mod session;
 pub mod session_log;
 pub mod soul;
+pub mod subagent;
 pub mod supervisor;
 pub mod tool_executor;
 pub mod trace;
@@ -21,10 +22,13 @@ pub use agent_loop::AgentLoop;
 pub use aura_cron::{CronScheduler, CronTriggerEvent};
 pub use aura_security::SecretVault;
 pub use cost::{CostGuard, CostGuardError, SpendingLimits};
-pub use job::JobManager;
+pub use job::JobLifecycle;
 pub use memory::MemoryManager;
-pub use observability::ObservabilityRecorder;
 pub use policy::ExecutionPolicy;
+pub use query::{
+    CostScope, JobDetail, JobFilter, JobSummary, LineageNode, QueryApi, QueryError, ReplayJob,
+    ReplayStep, ReplayedConversation, StepDetail,
+};
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};
 pub use service::{ShutdownSignal, TaskTracker};
@@ -35,4 +39,4 @@ pub use session_log::{
 };
 pub use supervisor::AgentSupervisor;
 pub use tool_executor::ToolExecutor;
-pub use trace::TraceCollector;
+pub use trace::{SpanRecorder, TraceEvent, TraceEventStream};

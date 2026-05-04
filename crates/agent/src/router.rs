@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aura_channels::{AgentOutput, Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
-use aura_model::{Session, User};
+use aura_model::{Session, SessionId, User};
 
 use aura_cron::CronTriggerEvent;
 
@@ -185,12 +185,13 @@ impl Router {
             "routing cron trigger"
         );
 
+        let typed_session_id = SessionId::from(session_id.as_str());
         let session = self
             .session_manager
-            .get_or_create(&session_id, user, event.channel.clone())
+            .get_or_create(&typed_session_id, user, event.channel.clone())
             .await?;
 
-        self.session_manager.touch(&session_id).await?;
+        self.session_manager.touch(&typed_session_id).await?;
 
         let message = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
@@ -256,9 +257,10 @@ impl Router {
         }
 
         // Get or create session
+        let typed_session_id = SessionId::from(session_id.as_str());
         let mut session = self
             .session_manager
-            .get_or_create(&session_id, user, channel)
+            .get_or_create(&typed_session_id, user, channel)
             .await?;
 
         // Sanitize input through the security gateway before routing.
@@ -276,7 +278,7 @@ impl Router {
         }
 
         // Update last active time
-        self.session_manager.touch(&session_id).await?;
+        self.session_manager.touch(&typed_session_id).await?;
 
         // Route to actor. If no actor exists and we have a spawner,
         // create one on-demand and retry.
@@ -369,7 +371,8 @@ impl Router {
         );
         let _guard = span.enter();
 
-        let session = match self.session_manager.get(&outgoing.session_id).await {
+        let outgoing_session_id = SessionId::from(outgoing.session_id.as_str());
+        let session = match self.session_manager.get(&outgoing_session_id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
                 warn!(

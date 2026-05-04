@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use aura_job::OperationKind;
-use aura_model::TrustLevel;
-use aura_model::User;
+use aura_model::{
+    HookPhase, JobId, ParallelGroup, SecretKind, SessionId, SpanId, TrustLevel, User,
+};
 
 use aura_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use aura_tools::{
@@ -14,15 +14,15 @@ use aura_tools::{
     ExecSandbox, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
     ToolRegistry, approval::preview_params,
 };
-use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
+use aura_trace::{LifecycleOutcome, SpanEventKind, SpanKind, StepHandle, ToolCallOrigin};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::observability::ObservabilityRecorder;
 use crate::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
+use crate::trace::SpanRecorder;
 
 /// Preview length used when rendering parameters inside an approval prompt.
 const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
@@ -66,9 +66,6 @@ impl ToolExecutor {
     }
 
     /// Validate that the tool's trust level permits execution with its declared capabilities.
-    ///
-    /// - Untrusted tools are never auto-executed.
-    /// - Installed tools cannot use `WriteFile` or `ExecCommand`.
     fn validate_trust(&self, tool_name: &str, manifest: &ToolManifest) -> anyhow::Result<()> {
         match manifest.trust_level {
             TrustLevel::Untrusted => {
@@ -105,25 +102,32 @@ impl ToolExecutor {
         Ok(())
     }
 
-    /// Execute a tool call with full observability and approval gating.
+    /// Execute a tool call inside the given `step`, with full
+    /// observability and approval gating.
+    ///
+    /// Tool calls live as `Span`s under their parent agent-loop `Step`
+    /// (see `docs/modules/trace.md`). `triggering_llm_span` is the LLM
+    /// span that emitted the `tool_use` block; `parallel_group` ties
+    /// concurrent siblings together; `job_id` is the parent job (for
+    /// the WAL log).
     ///
     /// `approved_resources` is a shared, mutable set of session-scoped
     /// approvals. The executor reads it to check coverage and writes to
-    /// it on `ApproveAlways`, so concurrent tool calls within a turn see
-    /// each other's grants immediately. The caller flushes the final
-    /// contents back into `session.state` after all calls complete.
-    /// `Arc` so the persist-always closure injected into `ToolContext`
-    /// can outlive the borrowed slot of any one call.
+    /// it on `ApproveAlways`, so concurrent tool calls within a turn
+    /// see each other's grants immediately.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         tool_name: &str,
         params: Value,
-        session_id: &str,
+        session_id: &SessionId,
         user: &User,
         approved_resources: &Arc<Mutex<Vec<ApprovedResource>>>,
-        recorder: &ObservabilityRecorder,
-        parent_job_id: Option<&str>,
+        recorder: &Arc<SpanRecorder>,
+        step: &StepHandle,
+        triggering_llm_span: Option<SpanId>,
+        parallel_group: Option<ParallelGroup>,
+        _parent_job_for_log: Option<JobId>,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
@@ -131,27 +135,34 @@ impl ToolExecutor {
             self.validate_trust(tool_name, &manifest)?;
         }
 
-        // Begin observability recording up front so denial / approval
-        // failures still appear in the trace.
-        let handle = recorder
-            .begin(
-                session_id,
-                OperationKind::ToolExecution {
+        // Open the tool span up front so denials and approval failures
+        // still appear in the trace tree.
+        let triggered_by = triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
+            llm_span_id,
+            tool_use_id: String::new(),
+        });
+        // ToolManifest does not (yet) carry an artifact hash; record an
+        // empty string for now so the trace schema stays consistent.
+        // Wired in as part of step-6 provenance work per design doc Q11.
+        let tool_artifact_hash = String::new();
+        let span_handle = recorder
+            .begin_span(
+                step,
+                SpanKind::ToolCall {
                     tool_name: tool_name.to_string(),
+                    tool_artifact_hash: tool_artifact_hash.clone(),
+                    triggered_by,
+                    params: params.clone(),
+                    output: Value::Null,
+                    success: false,
                 },
-                parent_job_id,
-                ExecutionProvenance::default(),
-                SpanInput::ToolExecution {
-                    parameters: params.clone(),
-                },
+                parallel_group,
             )
             .await?;
+        let mut event_seq: u32 = 0;
 
-        // Approval gate: derive resource accesses from the tool and check
-        // them against the session's cached approvals. If any access is
-        // uncovered, prompt the user via the gate. We also capture the
-        // tool's per-call label here so the approval prompt can show a
-        // human-readable summary alongside the JSON preview.
+        // Approval gate: derive resource accesses from the tool and
+        // check them against the session's cached approvals.
         let (accesses, call_label) = self
             .tool_registry
             .get(tool_name)
@@ -163,7 +174,6 @@ impl ToolExecutor {
             accesses
                 .iter()
                 .filter(|acc| {
-                    // Read-only accesses are always allowed without approval.
                     if matches!(acc, ResourceAccess::ReadFile { .. }) {
                         return false;
                     }
@@ -174,7 +184,7 @@ impl ToolExecutor {
         };
 
         if !uncovered.is_empty() {
-            let gate = self.gate_map.get(&user.channel, session_id);
+            let gate = self.gate_map.get(&user.channel, session_id.as_str());
             let decision = gate
                 .request(ApprovalRequest {
                     call_id: Uuid::new_v4().to_string(),
@@ -186,6 +196,20 @@ impl ToolExecutor {
                     description: call_label.clone(),
                 })
                 .await;
+            // Audit: every approval decision is recorded (Q18 B1).
+            for access in &uncovered {
+                let _ = recorder
+                    .emit_event(
+                        span_handle.span_id,
+                        event_seq,
+                        SpanEventKind::Approval {
+                            decision,
+                            resource: access.clone(),
+                        },
+                    )
+                    .await;
+                event_seq += 1;
+            }
             match decision {
                 ApprovalDecision::Approve => {
                     info!(tool = tool_name, "tool call approved once");
@@ -202,7 +226,27 @@ impl ToolExecutor {
                 }
                 ApprovalDecision::Deny => {
                     let reason = "user denied approval".to_string();
-                    recorder.fail(handle, &reason).await?;
+                    let final_kind = SpanKind::ToolCall {
+                        tool_name: tool_name.to_string(),
+                        tool_artifact_hash: tool_artifact_hash.clone(),
+                        triggered_by: triggering_llm_span.map(|s| ToolCallOrigin {
+                            llm_span_id: s,
+                            tool_use_id: String::new(),
+                        }),
+                        params: params.clone(),
+                        output: Value::Null,
+                        success: false,
+                    };
+                    let _ = recorder
+                        .end_span(
+                            span_handle,
+                            step.job_id,
+                            final_kind,
+                            LifecycleOutcome::Failed {
+                                reason: reason.clone(),
+                            },
+                        )
+                        .await;
                     return Err(ToolError::Denied {
                         tool: tool_name.to_string(),
                         reason,
@@ -213,16 +257,6 @@ impl ToolExecutor {
         }
 
         // Build per-call sandbox adapter for tools declaring ExecCommand.
-        // ExecCommand-capable tools (today: only `Bash`) get the
-        // permissive filesystem model: workspace_root + $HOME bound RW
-        // (FHS roots stay RO), with a denylist of credential vaults
-        // (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker`,
-        // plus the agent's own state dir under `~/.aura`) masked by
-        // per-call tmpfs. Network is granted unconditionally — shells
-        // are general-purpose and almost always need git/cargo/npm to
-        // reach upstream. Tighter isolation is still available for
-        // CodeBuilder (which constructs its own SandboxSpec with
-        // `FilesystemPolicy::Workspace`).
         let sandbox: Option<Arc<dyn ExecSandbox>> = if let Some(manifest) =
             self.tool_registry.get_manifest(tool_name)
             && manifest.capabilities.contains(&ToolCapability::ExecCommand)
@@ -247,15 +281,8 @@ impl ToolExecutor {
             None
         };
 
-        // Mid-execution approval handle. Tools that decide which
-        // resources to touch only after some internal work (e.g.
-        // CodeBuilder runs an LLM to draft the program before knowing
-        // what files it needs) prompt the user through this handle.
-        // We pass the SAME `Arc<Mutex<Vec<ApprovedResource>>>` the
-        // pre-execute gate (lines 140–200) reads/writes, so the
-        // mid-execution path filters covered accesses up front and
-        // persists `ApproveAlways` decisions back into the same cache.
-        let approval_gate = self.gate_map.get(&user.channel, session_id);
+        // Mid-execution approval handle.
+        let approval_gate = self.gate_map.get(&user.channel, session_id.as_str());
         let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
 
         // Build tool context
@@ -270,48 +297,51 @@ impl ToolExecutor {
         };
 
         // Reveal placeholders in the tool's arguments just before
-        // execution. The pre-reveal `params` was already captured in
-        // `SpanInput::ToolExecution` above and in the approval prompt, so
-        // the trace / approval surfaces keep placeholder form while the
-        // tool itself receives plaintext for its API call.
+        // execution. The pre-reveal `params` is what the trace + approval
+        // surfaces saw; the tool itself receives plaintext for its API call.
         let mut params_revealed = params.clone();
         self.security_gateway
             .reveal_in_value(&mut params_revealed)
             .await?;
 
-        // Execute with timeout enforcement. The outer deadline pads
-        // `ctx.timeout` with `APPROVAL_HEADROOM` so a tool that prompts
-        // mid-execution (CodeBuilder via `ApprovalHandle::request`) is
-        // not killed while the user is reading the modal — the channel
-        // gate already caps user wait at `APPROVAL_TIMEOUT`. The tool
-        // itself still sees `ctx.timeout` for its inner timing, so a
-        // hung post-approval phase still falls back to the kill switch
-        // before `outer_deadline` elapses.
+        // Execute with timeout enforcement.
         let outer_deadline = ctx.timeout + APPROVAL_HEADROOM;
-        let start = std::time::Instant::now();
         let result = tokio::time::timeout(
             outer_deadline,
             self.tool_registry.execute(tool_name, params_revealed, &ctx),
         )
         .await;
 
-        let elapsed = start.elapsed();
-
         match result {
             Ok(Ok(mut output)) => {
-                // Defensive: if the tool echoed back any secret-looking
-                // content, sanitize before the result flows into trace,
-                // memory, or the next LLM call as a tool-result message.
+                // Defensive sanitize before result flows into trace /
+                // memory / next LLM call.
                 self.security_gateway
                     .sanitize_tool_output(&mut output)
                     .await?;
                 let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
-                let result = SpanResult::ToolResult {
-                    output: output_value.clone(),
-                    success: !matches!(output, ToolOutput::Error(_)),
-                    latency: elapsed,
+                let success = !matches!(output, ToolOutput::Error(_));
+                let final_kind = SpanKind::ToolCall {
+                    tool_name: tool_name.to_string(),
+                    tool_artifact_hash,
+                    triggered_by: triggering_llm_span.map(|s| ToolCallOrigin {
+                        llm_span_id: s,
+                        tool_use_id: String::new(),
+                    }),
+                    params,
+                    output: output_value,
+                    success,
                 };
-                recorder.succeed(handle, output_value, result).await?;
+                let outcome = if success {
+                    LifecycleOutcome::Ok
+                } else {
+                    LifecycleOutcome::Failed {
+                        reason: "tool returned error output".into(),
+                    }
+                };
+                recorder
+                    .end_span(span_handle, step.job_id, final_kind, outcome)
+                    .await?;
                 Ok(output)
             }
             Ok(Err(e)) => {
@@ -321,13 +351,53 @@ impl ToolExecutor {
                     .sanitize_error(&raw)
                     .await
                     .unwrap_or(raw);
-                recorder.fail(handle, &error_msg).await?;
+                let final_kind = SpanKind::ToolCall {
+                    tool_name: tool_name.to_string(),
+                    tool_artifact_hash,
+                    triggered_by: triggering_llm_span.map(|s| ToolCallOrigin {
+                        llm_span_id: s,
+                        tool_use_id: String::new(),
+                    }),
+                    params,
+                    output: Value::Null,
+                    success: false,
+                };
+                recorder
+                    .end_span(
+                        span_handle,
+                        step.job_id,
+                        final_kind,
+                        LifecycleOutcome::Failed {
+                            reason: error_msg.clone(),
+                        },
+                    )
+                    .await?;
                 Err(e.into())
             }
             Err(_) => {
                 let error_msg =
                     format!("tool '{}' exceeded timeout ({:?})", tool_name, ctx.timeout);
-                recorder.fail(handle, &error_msg).await?;
+                let final_kind = SpanKind::ToolCall {
+                    tool_name: tool_name.to_string(),
+                    tool_artifact_hash,
+                    triggered_by: triggering_llm_span.map(|s| ToolCallOrigin {
+                        llm_span_id: s,
+                        tool_use_id: String::new(),
+                    }),
+                    params,
+                    output: Value::Null,
+                    success: false,
+                };
+                recorder
+                    .end_span(
+                        span_handle,
+                        step.job_id,
+                        final_kind,
+                        LifecycleOutcome::Failed {
+                            reason: error_msg.clone(),
+                        },
+                    )
+                    .await?;
                 Err(anyhow::anyhow!(
                     "timeout: tool '{}' exceeded timeout",
                     tool_name
@@ -336,3 +406,8 @@ impl ToolExecutor {
         }
     }
 }
+
+// silence unused-import lint until SecretKind / HookPhase are
+// referenced from event-emitting helpers landed in step 6.
+#[allow(dead_code)]
+fn _doc_anchors(_s: SecretKind, _p: HookPhase) {}

@@ -3,15 +3,17 @@ use std::sync::Arc;
 use aura_channels::{AgentOutput, IncomingMessage, OutgoingMessage};
 use aura_cron::TriggerAction;
 use aura_hook::{HookContext, HookEventData, HookManager, HookPoint};
-use aura_model::Session;
-use aura_model::{ApprovedResource, ContentBlock, MessageMetadata};
+use aura_job::{JobInput, JobOutput};
+use aura_model::{ApprovedResource, ContentBlock, JobId, MessageMetadata, Session};
 use aura_tools::ToolOutput;
+use aura_trace::{LifecycleOutcome, StepHandle, StepKind};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::AgentLoop;
-use crate::observability::ObservabilityRecorder;
+use crate::job::JobLifecycle;
 use crate::tool_executor::ToolExecutor;
+use crate::trace::SpanRecorder;
 
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
@@ -34,7 +36,8 @@ pub struct AgentActor {
     tool_executor: Arc<ToolExecutor>,
     response_tx: mpsc::Sender<AgentOutput>,
     hooks: Arc<HookManager>,
-    recorder: Arc<ObservabilityRecorder>,
+    job_lifecycle: Arc<JobLifecycle>,
+    span_recorder: Arc<SpanRecorder>,
 }
 
 impl AgentActor {
@@ -44,7 +47,8 @@ impl AgentActor {
         tool_executor: Arc<ToolExecutor>,
         response_tx: mpsc::Sender<AgentOutput>,
         hooks: Arc<HookManager>,
-        recorder: Arc<ObservabilityRecorder>,
+        job_lifecycle: Arc<JobLifecycle>,
+        span_recorder: Arc<SpanRecorder>,
     ) -> Self {
         Self {
             session,
@@ -52,7 +56,8 @@ impl AgentActor {
             tool_executor,
             response_tx,
             hooks,
-            recorder,
+            job_lifecycle,
+            span_recorder,
         }
     }
 
@@ -70,13 +75,20 @@ impl AgentActor {
                             "failed to handle user input"
                         );
                     }
-                    self.flush_trace().await;
                 }
                 AgentMessage::CronTrigger { job_id, action } => {
                     debug!(session_id = %self.session.id, job_id = %job_id, "received cron trigger");
                     let result = match &action {
                         TriggerAction::Prompt { prompt } => {
-                            self.dispatch_prompt(prompt, "cron", &job_id).await
+                            let job_input = JobInput::Cron {
+                                action_payload: serde_json::json!({
+                                    "kind": "prompt",
+                                    "cron_job_id": job_id,
+                                    "prompt": prompt,
+                                }),
+                            };
+                            self.dispatch_prompt(prompt, "cron", &job_id, job_input, None)
+                                .await
                         }
                         TriggerAction::ToolCall {
                             tool_name,
@@ -100,7 +112,6 @@ impl AgentActor {
                             "failed to handle cron trigger"
                         );
                     }
-                    self.flush_trace().await;
                 }
                 AgentMessage::Shutdown => {
                     debug!(session_id = %self.session.id, "actor shutting down");
@@ -109,28 +120,39 @@ impl AgentActor {
             }
         }
 
-        // Flush observability data
-        if let Err(e) = self.recorder.flush().await {
-            warn!(error = %e, "failed to flush observability data on shutdown");
-        }
-
         info!(session_id = %self.session.id, "agent actor stopped");
     }
 
-    /// Dispatch a system-generated prompt (cron or routine) through the agent loop
-    /// and send the response to the output channel.
+    /// Dispatch a system-generated prompt (cron or routine) through the
+    /// agent loop and send the response to the output channel.
+    ///
+    /// `job_input` records the trigger provenance (e.g. `JobInput::Cron`
+    /// or `JobInput::System`) — this MUST match the session's root
+    /// trigger or `JobLifecycle::start_job` will reject it. The
+    /// synthesized `[{source}:{source_id}] {prompt}` content is what the
+    /// LLM sees; the `JobInput` is purely for the Job record.
     async fn dispatch_prompt(
         &mut self,
         prompt: &str,
         source: &str,
         source_id: &str,
+        job_input: JobInput,
+        parent_job_id: Option<aura_model::JobId>,
     ) -> anyhow::Result<()> {
         let content = vec![ContentBlock::Text(format!(
             "[{source}:{source_id}] {prompt}"
         ))];
         let response = self
             .agent_loop
-            .run(&mut self.session, content, &self.recorder, None, None)
+            .run(
+                &mut self.session,
+                job_input,
+                content,
+                &self.job_lifecycle,
+                &self.span_recorder,
+                parent_job_id,
+                None,
+            )
             .await?;
 
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
@@ -140,13 +162,47 @@ impl AgentActor {
     }
 
     /// Execute a tool directly for a cron job, falling back to LLM on failure.
+    ///
+    /// Wraps the call in its own `Job` + `StepKind::ToolDirect` step (one
+    /// tool `Span`, no LLM span — the variant exists specifically so this
+    /// "no-LLM iteration" doesn't masquerade as an `LlmIteration` in cost
+    /// reports). On a crash this produces a half-open span the recovery
+    /// scan will rewrite as `Cancelled { SystemCrash }` and fold into the
+    /// job's `partial_artifacts`.
     async fn handle_cron_tool_call(
         &mut self,
-        job_id: &str,
+        cron_job_id: &str,
         tool_name: &str,
         params: serde_json::Value,
         pre_approved: Vec<ApprovedResource>,
     ) -> anyhow::Result<()> {
+        // 1. Open a Job for this cron action.
+        let job = self
+            .job_lifecycle
+            .start_job(
+                self.session.id.clone(),
+                self.session.trigger.kind(),
+                JobInput::Cron {
+                    action_payload: serde_json::json!({
+                        "kind": "tool_call",
+                        "cron_job_id": cron_job_id,
+                        "tool_name": tool_name,
+                        "params": params,
+                    }),
+                },
+                self.session.bound_soul_version.clone(),
+                None,
+                None,
+            )
+            .await?;
+        self.job_lifecycle.start(&job.id).await?;
+
+        // 2. Open a Step for the iteration.
+        let step = self
+            .span_recorder
+            .begin_step(job.id, StepKind::ToolDirect)
+            .await?;
+
         let approved = std::sync::Arc::new(parking_lot::Mutex::new(pre_approved));
 
         let tool_result = self
@@ -157,79 +213,118 @@ impl AgentActor {
                 &self.session.id,
                 &self.session.user,
                 &approved,
-                &self.recorder,
-                Some(job_id),
+                &self.span_recorder,
+                &step,
+                None, // no triggering LLM span — direct cron invocation
+                None, // no parallel group
+                Some(job.id),
             )
             .await;
 
-        match tool_result {
-            Ok(output) => {
-                let (text, attachments) = match &output {
-                    ToolOutput::Text(t) => (t.clone(), Vec::new()),
-                    ToolOutput::Json(v) => (
-                        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
-                        Vec::new(),
-                    ),
-                    ToolOutput::WithAttachments { text, attachments } => {
-                        (text.clone(), attachments.clone())
-                    }
-                    ToolOutput::MultiModalText { text, llm_images } => {
-                        (text.clone(), llm_images.clone())
-                    }
-                    ToolOutput::Error(e) => {
-                        // Tool returned an error output — fall back to LLM
-                        let diagnostic = format!(
-                            "[cron:{job_id}] Tool '{tool_name}' returned error: {e}\n\
-                             Diagnose the issue and report to the user.",
-                        );
-                        return self.dispatch_prompt(&diagnostic, "cron", job_id).await;
-                    }
-                };
-
-                // Carry attachments through so a cron-scheduled SendFile actually
-                // delivers the file — without this, the user would see the textual
-                // confirmation but never receive the attachment.
-                let mut content = vec![ContentBlock::Text(format!("[cron:{job_id}] {text}"))];
-                content.extend(attachments);
-                let response = OutgoingMessage {
-                    session_id: self.session.id.clone(),
-                    user_id: self.session.user.id.clone(),
-                    channel: self.session.user.channel.clone(),
-                    content,
-                    reply_to: None,
-                    metadata: MessageMetadata::default(),
-                };
-                if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
-                    warn!(error = %e, "failed to send cron tool result to channel");
-                }
-                Ok(())
+        let output = match tool_result {
+            Ok(ToolOutput::Error(e)) => {
+                return self
+                    .fail_cron_tool_and_diagnose(step, job.id, cron_job_id, tool_name, e)
+                    .await;
             }
+            Ok(output) => output,
             Err(e) => {
-                // Execution failed — fall back to LLM for diagnosis
-                warn!(
-                    job_id = %job_id,
-                    tool = %tool_name,
-                    error = %e,
-                    "cron tool call failed, falling back to LLM"
-                );
-                let diagnostic = format!(
-                    "[cron:{job_id}] Tool '{tool_name}' failed with error: {e}\n\
-                     Diagnose the issue and report to the user.",
-                );
-                self.dispatch_prompt(&diagnostic, "cron", job_id).await
+                return self
+                    .fail_cron_tool_and_diagnose(step, job.id, cron_job_id, tool_name, e)
+                    .await;
             }
+        };
+
+        self.span_recorder
+            .end_step(step, LifecycleOutcome::Ok)
+            .await
+            .ok();
+
+        let (text, attachments) = match &output {
+            ToolOutput::Text(t) => (t.clone(), Vec::new()),
+            ToolOutput::Json(v) => (
+                serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
+                Vec::new(),
+            ),
+            ToolOutput::WithAttachments { text, attachments } => {
+                (text.clone(), attachments.clone())
+            }
+            ToolOutput::MultiModalText { text, llm_images } => (text.clone(), llm_images.clone()),
+            ToolOutput::Error(_) => unreachable!("handled above"),
+        };
+
+        // Carry attachments through so a cron-scheduled SendFile
+        // actually delivers the file.
+        let mut content = vec![ContentBlock::Text(format!("[cron:{cron_job_id}] {text}"))];
+        content.extend(attachments);
+        let response = OutgoingMessage {
+            session_id: self.session.id.to_string(),
+            user_id: self.session.user.id.clone(),
+            channel: self.session.user.channel.clone(),
+            content: content.clone(),
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+        };
+        self.job_lifecycle
+            .complete(
+                &job.id,
+                JobOutput::Message {
+                    content: response.content.clone(),
+                },
+            )
+            .await
+            .ok();
+        if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
+            warn!(error = %e, "failed to send cron tool result to channel");
         }
+        Ok(())
     }
 
-    /// Best-effort flush of trace data after each turn.
-    async fn flush_trace(&self) {
-        if let Err(e) = self.recorder.flush().await {
-            warn!(
-                session_id = %self.session.id,
-                error = %e,
-                "failed to flush trace after turn"
-            );
-        }
+    /// Common Failed-then-LLM-diagnose path shared by both
+    /// `Ok(ToolOutput::Error(...))` and `Err(...)` outcomes of a cron
+    /// direct-tool call. Hands off to a child diagnostic job that
+    /// references the failed tool job via `parent_job_id` so lineage
+    /// queries can show the chain.
+    async fn fail_cron_tool_and_diagnose(
+        &mut self,
+        step: StepHandle,
+        job_id: JobId,
+        cron_job_id: &str,
+        tool_name: &str,
+        error: impl std::fmt::Display,
+    ) -> anyhow::Result<()> {
+        let reason = error.to_string();
+        self.span_recorder
+            .end_step(
+                step,
+                LifecycleOutcome::Failed {
+                    reason: reason.clone(),
+                },
+            )
+            .await
+            .ok();
+        self.job_lifecycle.fail(&job_id, reason.clone()).await.ok();
+        warn!(
+            cron_job_id = %cron_job_id,
+            tool = %tool_name,
+            error = %reason,
+            "cron tool call failed, falling back to LLM"
+        );
+        let diagnostic = format!(
+            "[cron:{cron_job_id}] Tool '{tool_name}' failed: {reason}\n\
+             Diagnose the issue and report to the user.",
+        );
+        let diag_input = JobInput::Cron {
+            action_payload: serde_json::json!({
+                "kind": "tool_failure_diagnostic",
+                "cron_job_id": cron_job_id,
+                "tool_name": tool_name,
+                "failed_tool_job_id": job_id.to_string(),
+                "error": reason,
+            }),
+        };
+        self.dispatch_prompt(&diagnostic, "cron", cron_job_id, diag_input, Some(job_id))
+            .await
     }
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
@@ -238,7 +333,7 @@ impl AgentActor {
 
         // PreMessage hook
         let mut hook_ctx = HookContext {
-            session_id: self.session.id.clone(),
+            session_id: self.session.id.to_string(),
             user_id: Some(self.session.user.id.clone()),
             event_data: HookEventData::PreMessage,
             message: Some(message_clone),
@@ -258,8 +353,12 @@ impl AgentActor {
             .agent_loop
             .run(
                 &mut self.session,
+                JobInput::UserChat {
+                    content: content.clone(),
+                },
                 content,
-                &self.recorder,
+                &self.job_lifecycle,
+                &self.span_recorder,
                 None,
                 Some(self.response_tx.clone()),
             )
@@ -267,7 +366,7 @@ impl AgentActor {
 
         // PreResponse hook
         let mut hook_ctx = HookContext {
-            session_id: self.session.id.clone(),
+            session_id: self.session.id.to_string(),
             user_id: Some(self.session.user.id.clone()),
             event_data: HookEventData::PreResponse,
             message: None,

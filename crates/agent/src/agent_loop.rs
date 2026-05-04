@@ -1,12 +1,14 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use aura_channels::{AgentOutput, NoticeLevel, OutgoingMessage};
 use aura_context::ContextManager;
-use aura_job::OperationKind;
+use aura_hook::{HookAction, HookContext, HookEventData, HookManager, HookPoint};
+use aura_job::{JobInput, JobOutput};
 use aura_llm::{
     ChatRequest, LlmCompletion, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
-use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_model::{ChatMessage, ContentBlock, JobId, Role};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -15,25 +17,59 @@ use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
 use aura_tools::{ToolOutput, ToolRegistry};
-use aura_trace::{ExecutionProvenance, SpanInput, SpanResult};
-use serde_json::Value;
+use aura_trace::{LifecycleOutcome, SpanKind, StepHandle, StepKind};
 use tracing::{debug, info, warn};
 
 use crate::error_recovery::ErrorHandler;
-use crate::observability::ObservabilityRecorder;
+use crate::job::JobLifecycle;
 use crate::policy::ExecutionPolicy;
 use crate::security::SecurityGateway;
 use crate::session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
 };
 use crate::soul::Soul;
+use crate::subagent::{
+    SPAWN_SUBAGENT_TOOL_NAME, SubagentExitStatus, SubagentResult, SubagentRuntime,
+    parse_spawn_request,
+};
 use crate::tool_executor::ToolExecutor;
+use crate::trace::SpanRecorder;
+use tokio_util::sync::CancellationToken;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
 /// for a placeholder to complete. If a chunk ends with an open `[{` but no
 /// closing `}]` arrives within this many bytes, we flush anyway — no real
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
+
+fn step_kind_tag(k: &StepKind) -> &'static str {
+    match k {
+        StepKind::LlmIteration => "llm_iteration",
+        StepKind::ToolDirect => "tool_direct",
+        StepKind::Compression => "compression",
+        StepKind::MemoryRecall => "memory_recall",
+        StepKind::MemoryWrite => "memory_write",
+        StepKind::SkillSelection => "skill_selection",
+        StepKind::Subagent { .. } => "subagent",
+    }
+}
+
+fn outcome_tag(o: &LifecycleOutcome) -> &'static str {
+    match o {
+        LifecycleOutcome::Pending => "pending",
+        LifecycleOutcome::Ok => "ok",
+        LifecycleOutcome::Failed { .. } => "failed",
+        LifecycleOutcome::Cancelled { .. } => "cancelled",
+    }
+}
+
+/// Per-call timeout for `PreStep` / `PostStep` hooks. A hook that
+/// overruns is treated as `Continue` (PreStep timeout = pass per
+/// design Patch 3) and a `tracing::warn` is emitted. Persisting a
+/// `SpanEvent::HookDegraded` for the audit trail is a step-6
+/// follow-up — `SpanEvent`s require a `span_id`, which the step
+/// boundary itself does not have, so a host-marker span needs design.
+const STEP_HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Cap on attachments carried into the final `OutgoingMessage`. Tools
 /// like `browser_screenshot` and `send_local_file` push into a
@@ -114,6 +150,16 @@ pub struct AgentLoop {
     soul: Soul,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
+    /// Step boundary hook manager. Drives `PreStep` / `PostStep` with
+    /// the timeout / degraded protocol. Optional so test harnesses
+    /// that don't care about hooks can leave it unset.
+    hooks: Option<Arc<HookManager>>,
+    /// Optional subagent runtime. When set, LLM `tool_use` calls
+    /// targeting `spawn_subagent` short-circuit the regular
+    /// tool_executor path and route through here. Unset →
+    /// `spawn_subagent` falls back to the regular tool catalogue (and
+    /// today returns an unknown-tool error).
+    subagent_runtime: Option<Arc<dyn SubagentRuntime>>,
     /// Optional LLM risk assessor. When set, every skill candidate is
     /// checked before injection: `Dangerous` verdicts veto the skill,
     /// `Suspicious` verdicts log a warning but allow it through.
@@ -149,9 +195,25 @@ impl AgentLoop {
             soul,
             security_gateway,
             error_handler: ErrorHandler::default(),
+            hooks: None,
+            subagent_runtime: None,
             skill_assessor: None,
             session_log: None,
         }
+    }
+
+    /// Attach the step-boundary hook manager.
+    pub fn with_hooks(mut self, hooks: Arc<HookManager>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Attach the subagent runtime so LLM-emitted `spawn_subagent`
+    /// tool calls route through it instead of the regular tool
+    /// catalogue.
+    pub fn with_subagent_runtime(mut self, rt: Arc<dyn SubagentRuntime>) -> Self {
+        self.subagent_runtime = Some(rt);
+        self
     }
 
     pub fn with_skill_assessor(mut self, assessor: Arc<SkillAssessor>) -> Self {
@@ -172,14 +234,85 @@ impl AgentLoop {
     /// `OutgoingMessage` returned here should still be dispatched by the
     /// caller as `AgentOutput::Message` so non-streaming adapters receive
     /// the canonical response.
+    // Each parameter is genuinely independent (provenance, LLM input,
+    // facade handles, lineage hint, streaming sink). Grouping them
+    // into a struct would obscure the call site without saving
+    // anything.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &mut self,
         session: &mut Session,
+        job_input: JobInput,
         user_content: Vec<ContentBlock>,
-        recorder: &ObservabilityRecorder,
-        parent_job_id: Option<&str>,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        parent_job_id: Option<JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<OutgoingMessage> {
+        // `job_input` records why this job exists (provenance: which
+        // trigger kicked it off — User / Cron / System / Spawned).
+        // `user_content` is what we feed the LLM as the first user
+        // message. They coincide for `UserChat` but differ for
+        // `Cron` / `System` where the input is a synthesized prompt
+        // rather than the raw trigger payload.
+        let job = job_lifecycle
+            .start_job(
+                session.id.clone(),
+                session.trigger.kind(),
+                job_input,
+                session.bound_soul_version.clone(),
+                parent_job_id,
+                None,
+            )
+            .await?;
+        let job_id = job.id;
+        job_lifecycle.start(&job_id).await?;
+
+        match self
+            .run_inner(
+                session,
+                user_content,
+                job_lifecycle,
+                span_recorder,
+                job_id,
+                delta_tx,
+            )
+            .await
+        {
+            Ok(outgoing) => {
+                if let Err(e) = job_lifecycle
+                    .complete(
+                        &job_id,
+                        JobOutput::Message {
+                            content: outgoing.content.clone(),
+                        },
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to mark job complete");
+                }
+                Ok(outgoing)
+            }
+            Err(e) => {
+                if let Err(fe) = job_lifecycle.fail(&job_id, e.to_string()).await {
+                    warn!(error = %fe, "failed to mark job failed");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn run_inner(
+        &mut self,
+        session: &mut Session,
+        user_content: Vec<ContentBlock>,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        delta_tx: Option<mpsc::Sender<AgentOutput>>,
+    ) -> anyhow::Result<OutgoingMessage> {
+        // Hush unused warning until verifier-gated submit ceremony lands.
+        let _ = job_lifecycle;
         self.ensure_system_prompt(session).await;
 
         // Recall relevant memories
@@ -294,21 +427,60 @@ impl AgentLoop {
                 );
             }
 
+            // PreStep hook: fires before opening the step. On `Abort`
+            // we cancel the job; on timeout (default-allow per design
+            // Patch 3) we proceed with a warn log.
+            if self
+                .fire_pre_step(session, job_id, &StepKind::LlmIteration)
+                .await
+                .is_err()
+            {
+                return Err(anyhow::anyhow!("step aborted by PreStep hook"));
+            }
+
+            // Open one Step per iteration. Spans (LLM + tools) live
+            // inside it.
+            let step = span_recorder
+                .begin_step(job_id, StepKind::LlmIteration)
+                .await?;
+
             // Call LLM with retry on transient errors. Deltas are only
-            // streamed on the first iteration of the loop — subsequent
-            // iterations are post-tool-call continuations that should be
-            // rendered as a single block once complete.
+            // streamed on the first iteration of the loop.
             let iter_delta_tx = if iterations == 1 {
                 delta_tx.as_ref()
             } else {
                 None
             };
-            let response = self
-                .call_llm_with_retry(session, recorder, parent_job_id, iter_delta_tx)
-                .await?;
+            let llm_result = self
+                .call_llm_with_retry(session, span_recorder, &step, iter_delta_tx)
+                .await;
+            let response = match llm_result {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    span_recorder
+                        .end_step(step, LifecycleOutcome::Failed { reason: err_str })
+                        .await
+                        .ok();
+                    return Err(e);
+                }
+            };
 
             // If no tool calls, we have the final response
             if response.tool_calls.is_empty() {
+                let step_id_for_hook = step.step_id;
+                span_recorder
+                    .end_step(step, LifecycleOutcome::Ok)
+                    .await
+                    .ok();
+                self.fire_post_step(
+                    session,
+                    job_id,
+                    step_id_for_hook,
+                    &StepKind::LlmIteration,
+                    &LifecycleOutcome::Ok,
+                )
+                .await;
                 // Use content_blocks when available, falling back to the text string.
                 let response_blocks = if response.content_blocks.is_empty() {
                     vec![ContentBlock::Text(response.content.clone())]
@@ -347,7 +519,7 @@ impl AgentLoop {
                 }
 
                 return Ok(OutgoingMessage {
-                    session_id: session.id.clone(),
+                    session_id: session.id.to_string(),
                     user_id: session.user.id.clone(),
                     channel: session.channel.clone(),
                     content: final_blocks,
@@ -401,6 +573,43 @@ impl AgentLoop {
                     "executing tool call"
                 );
 
+                // Subagent special-case (Q10 + Q5).
+                //
+                // `spawn_subagent` short-circuits the regular tool
+                // path: the parent's current step is closed, a
+                // dedicated `StepKind::Subagent` step is opened, the
+                // subagent runtime drives the child to completion,
+                // and the result is folded back as the tool_result
+                // for the parent's next iteration. The current LLM
+                // iteration then ends and the loop continues.
+                if tool_call.name == SPAWN_SUBAGENT_TOOL_NAME {
+                    let raw = match self
+                        .dispatch_subagent(
+                            session,
+                            job_id,
+                            span_recorder,
+                            &step,
+                            tool_call.arguments.clone(),
+                        )
+                        .await
+                    {
+                        Ok(text) => text,
+                        Err(e) => format!("[spawn_subagent error: {e}]"),
+                    };
+                    let wrapped = self
+                        .security_gateway
+                        .wrap_tool_output_for_llm(&tool_call.name, &raw);
+                    let tool_msg = ChatMessage {
+                        role: Role::Tool,
+                        content: vec![ContentBlock::ToolResult {
+                            tool_use_id: tool_call.id.clone(),
+                            content: wrapped,
+                        }],
+                    };
+                    self.append_context_message(session, &tool_msg).await?;
+                    continue;
+                }
+
                 let tool_result = self
                     .tool_executor
                     .execute(
@@ -409,8 +618,11 @@ impl AgentLoop {
                         &session.id,
                         &session.user,
                         &approved,
-                        recorder,
-                        parent_job_id,
+                        span_recorder,
+                        &step,
+                        None,
+                        None,
+                        Some(job_id),
                     )
                     .await;
 
@@ -495,6 +707,21 @@ impl AgentLoop {
 
             // Flush accumulated approvals back into session state.
             session.state.approved_resources = approved.lock().clone();
+
+            // Close this iteration's step.
+            let step_id_for_hook = step.step_id;
+            span_recorder
+                .end_step(step, LifecycleOutcome::Ok)
+                .await
+                .ok();
+            self.fire_post_step(
+                session,
+                job_id,
+                step_id_for_hook,
+                &StepKind::LlmIteration,
+                &LifecycleOutcome::Ok,
+            )
+            .await;
         }
 
         // If we exhausted iterations, return what we have. Tail-append any
@@ -505,7 +732,7 @@ impl AgentLoop {
         )];
         content.extend(std::mem::take(&mut accumulated_attachments));
         Ok(OutgoingMessage {
-            session_id: session.id.clone(),
+            session_id: session.id.to_string(),
             user_id: session.user.id.clone(),
             channel: session.channel.clone(),
             content,
@@ -518,16 +745,13 @@ impl AgentLoop {
     async fn call_llm_with_retry(
         &self,
         session: &Session,
-        recorder: &ObservabilityRecorder,
-        parent_job_id: Option<&str>,
+        span_recorder: &Arc<SpanRecorder>,
+        step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<LlmResponse> {
         let mut attempt = 0u32;
         loop {
-            match self
-                .call_llm(session, recorder, parent_job_id, delta_tx)
-                .await
-            {
+            match self.call_llm(session, span_recorder, step, delta_tx).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if !self.error_handler.should_retry(attempt, &e) {
@@ -547,32 +771,39 @@ impl AgentLoop {
         }
     }
 
-    /// Call the LLM with the current session context.
+    /// Call the LLM with the current session context. Opens an
+    /// `LlmCall` span inside `step`, fills it with the response (or
+    /// failure) before closing. Cost recording happens automatically:
+    /// `SpanRecorder::end_span(LlmCall { tokens })` publishes
+    /// `TraceEvent::LlmSpanEnded` for the cost subscriber.
     async fn call_llm(
         &self,
         session: &Session,
-        recorder: &ObservabilityRecorder,
-        parent_job_id: Option<&str>,
+        span_recorder: &Arc<SpanRecorder>,
+        step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<LlmResponse> {
-        let model_id = self.llm_client.model_info().id.clone();
+        let model_info = self.llm_client.model_info();
+        let model_id = model_info.id.clone();
+        let provider = model_info.provider.clone();
+        let provider_config_hash = String::new(); // wired in step-6
 
-        let handle = recorder
-            .begin(
-                &session.id,
-                OperationKind::LlmCall {
-                    model: model_id.clone(),
-                },
-                parent_job_id,
-                ExecutionProvenance {
-                    model_id: Some(model_id.clone()),
-                    provider: Some(self.llm_client.model_info().provider.clone()),
-                    ..Default::default()
-                },
-                SpanInput::LlmCall {
+        let span = span_recorder
+            .begin_span(
+                step,
+                SpanKind::LlmCall {
+                    model_id: model_id.clone(),
+                    provider: provider.clone(),
+                    provider_config_hash: provider_config_hash.clone(),
                     input_messages: session.messages.clone(),
                     temperature: None,
+                    output_content: String::new(),
+                    thinking: None,
+                    tool_calls: vec![],
+                    input_tokens: 0,
+                    output_tokens: 0,
                 },
+                None,
             )
             .await?;
 
@@ -599,13 +830,11 @@ impl AgentLoop {
             None => self.llm_client.chat(&request).await,
         };
         let latency_ms = started_at.elapsed().as_millis() as u64;
+        let input_messages_for_span = session.messages.clone();
 
         match llm_result {
             Ok(mut response) => {
-                // Defensive scrub of LLM output before it touches trace,
-                // memory, or session history. The LLM never saw real
-                // secrets (input is already sanitized), but it may echo
-                // back placeholders or fabricate secret-looking strings.
+                // Defensive scrub of LLM output.
                 if let Err(e) = self
                     .security_gateway
                     .sanitize_llm_response(&mut response)
@@ -632,45 +861,21 @@ impl AgentLoop {
                     })
                     .collect();
 
-                let result = SpanResult::LlmResponse {
+                let final_kind = SpanKind::LlmCall {
+                    model_id,
+                    provider,
+                    provider_config_hash,
+                    input_messages: input_messages_for_span,
+                    temperature: None,
                     output_content: response.content.clone(),
-                    input_tokens: response.usage.input_tokens,
-                    output_tokens: response.usage.output_tokens,
                     thinking: response.thinking.clone(),
                     tool_calls: trace_tool_calls,
-                    latency: std::time::Duration::from_millis(0),
+                    input_tokens: response.usage.input_tokens,
+                    output_tokens: response.usage.output_tokens,
                 };
-
-                let pricing = &self.llm_client.model_info().pricing;
-                let cost_usd = (response.usage.input_tokens as f64 / 1_000_000.0
-                    * pricing.input_per_1m_tokens)
-                    + (response.usage.output_tokens as f64 / 1_000_000.0
-                        * pricing.output_per_1m_tokens);
-
-                recorder
-                    .succeed(
-                        handle,
-                        serde_json::to_value(&response).unwrap_or(Value::Null),
-                        result,
-                    )
+                span_recorder
+                    .end_span(span, step.job_id, final_kind, LifecycleOutcome::Ok)
                     .await?;
-
-                recorder
-                    .record_cost(
-                        &session.user.id,
-                        &session.id,
-                        "",
-                        "",
-                        &model_id,
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
-                        cost_usd,
-                    )
-                    .await;
-
-                if let Err(e) = recorder.flush().await {
-                    warn!(error = %e, "failed to flush trace after LLM call");
-                }
 
                 Ok(response)
             }
@@ -690,10 +895,28 @@ impl AgentLoop {
                     },
                 )
                 .await;
-                recorder.fail(handle, &error_msg).await?;
-                if let Err(fe) = recorder.flush().await {
-                    warn!(error = %fe, "failed to flush trace after LLM failure");
-                }
+                let final_kind = SpanKind::LlmCall {
+                    model_id,
+                    provider,
+                    provider_config_hash,
+                    input_messages: input_messages_for_span,
+                    temperature: None,
+                    output_content: String::new(),
+                    thinking: None,
+                    tool_calls: vec![],
+                    input_tokens: 0,
+                    output_tokens: 0,
+                };
+                span_recorder
+                    .end_span(
+                        span,
+                        step.job_id,
+                        final_kind,
+                        LifecycleOutcome::Failed {
+                            reason: error_msg.clone(),
+                        },
+                    )
+                    .await?;
                 Err(e.into())
             }
         }
@@ -721,7 +944,7 @@ impl AgentLoop {
         };
         let record = LlmCallRecord {
             timestamp: chrono::Utc::now(),
-            session_id: session.id.clone(),
+            session_id: session.id.to_string(),
             provider: info.provider.clone(),
             model: info.id.clone(),
             request,
@@ -761,7 +984,7 @@ impl AgentLoop {
         let Some(logger) = self.session_log.as_ref() else {
             return;
         };
-        if let Err(e) = logger.log_message(&session.id, message).await {
+        if let Err(e) = logger.log_message(session.id.as_str(), message).await {
             warn!(error = %e, "failed to append session message log");
         }
     }
@@ -868,7 +1091,7 @@ impl AgentLoop {
 
         if delta_tx
             .send(AgentOutput::Delta {
-                session_id: session.id.clone(),
+                session_id: session.id.to_string(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 text: sanitized,
@@ -877,6 +1100,190 @@ impl AgentLoop {
             .is_err()
         {
             debug!("delta receiver dropped, continuing without forwarding");
+        }
+    }
+
+    /// Dispatch one `spawn_subagent` tool_use through the subagent
+    /// runtime. Opens a dedicated `StepKind::Subagent` step + a
+    /// single `SubagentStub` span that bounds the parent's wait
+    /// window. Returns the rendered tool_result text the parent's
+    /// next LLM iteration will see.
+    async fn dispatch_subagent(
+        &self,
+        session: &Session,
+        job_id: JobId,
+        span_recorder: &Arc<SpanRecorder>,
+        _enclosing_llm_step: &StepHandle,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        let runtime = match self.subagent_runtime.as_ref() {
+            Some(rt) => Arc::clone(rt),
+            None => {
+                return Ok(SubagentResult {
+                    child_session_id: aura_model::SessionId::from(""),
+                    child_root_job_id: None,
+                    final_content: None,
+                    status: SubagentExitStatus::Failed("no subagent runtime registered".into()),
+                }
+                .to_tool_result_text());
+            }
+        };
+        let request = parse_spawn_request(&arguments).map_err(|e| anyhow::anyhow!(e))?;
+
+        // Open the Subagent step. The inner SubagentStub span bounds
+        // the wait window so the trace tree stays consistent (a step
+        // always contains at least one span).
+        let subagent_step = span_recorder
+            .begin_step(
+                job_id,
+                StepKind::Subagent {
+                    // child_session_id / child_root_job_id are filled
+                    // in *after* the runtime returns — we record the
+                    // step's kind here with placeholders. The columnar
+                    // row will be re-saved when end_step lands.
+                    child_session_id: aura_model::SessionId::from(""),
+                    child_root_job_id: aura_model::JobId::new(),
+                },
+            )
+            .await?;
+        let stub_span = span_recorder
+            .begin_span(
+                &subagent_step,
+                SpanKind::SubagentStub {
+                    child_session_id: aura_model::SessionId::from(""),
+                },
+                None,
+            )
+            .await?;
+
+        // Drive the runtime. Parent token isn't threaded down from
+        // the actor yet (TODO: wire `AgentActor.cancel_token` through
+        // `run`), so for the moment we mint a fresh token per spawn
+        // and the child cancellation tree dangles off it. Multi-level
+        // cancel cascade lands when the actor token plumbing arrives.
+        let parent_token = CancellationToken::new();
+        let result = runtime.spawn(session, job_id, request, parent_token).await;
+
+        // Close stub span + subagent step.
+        let outcome = match &result.status {
+            SubagentExitStatus::Completed => LifecycleOutcome::Ok,
+            SubagentExitStatus::Cancelled => LifecycleOutcome::Cancelled {
+                reason: aura_job::CancelReason::ParentCancelled,
+            },
+            SubagentExitStatus::Failed(reason) => LifecycleOutcome::Failed {
+                reason: reason.clone(),
+            },
+            SubagentExitStatus::Timeout => LifecycleOutcome::Failed {
+                reason: "subagent timeout".to_string(),
+            },
+        };
+        let final_kind = SpanKind::SubagentStub {
+            child_session_id: result.child_session_id.clone(),
+        };
+        span_recorder
+            .end_span(stub_span, job_id, final_kind, outcome.clone())
+            .await
+            .ok();
+        span_recorder.end_step(subagent_step, outcome).await.ok();
+
+        Ok(result.to_tool_result_text())
+    }
+
+    /// Fire `PreStep` synchronously with a per-call timeout.
+    ///
+    /// Returns `Err(())` only when the hook chain returns
+    /// `HookAction::Abort` (the surrounding job is then cancelled by
+    /// the caller). On `Block` or timeout we proceed (default-allow
+    /// per design Patch 3); a `tracing::warn` is emitted on timeout.
+    async fn fire_pre_step(
+        &self,
+        session: &Session,
+        job_id: JobId,
+        step_kind: &StepKind,
+    ) -> std::result::Result<(), ()> {
+        let Some(hooks) = self.hooks.as_ref() else {
+            return Ok(());
+        };
+        let mut ctx = HookContext {
+            session_id: session.id.to_string(),
+            user_id: Some(session.user.id.clone()),
+            event_data: HookEventData::PreStep {
+                job_id: job_id.to_string(),
+                step_kind: step_kind_tag(step_kind).to_string(),
+            },
+            message: None,
+            response: None,
+            job_id: Some(job_id.to_string()),
+            trace_span_id: None,
+            extra: Default::default(),
+        };
+        match tokio::time::timeout(
+            STEP_HOOK_TIMEOUT,
+            hooks.trigger(HookPoint::PreStep, &mut ctx),
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                warn!(
+                    timeout_ms = STEP_HOOK_TIMEOUT.as_millis() as u64,
+                    "PreStep hook exceeded timeout, proceeding (default-allow)"
+                );
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "PreStep hook chain failed, proceeding");
+                Ok(())
+            }
+            Ok(Ok(HookAction::Abort(reason))) => {
+                warn!(reason = %reason, "PreStep hook aborted step");
+                Err(())
+            }
+            Ok(Ok(_)) => Ok(()),
+        }
+    }
+
+    /// Fire `PostStep` synchronously with a per-call timeout.
+    /// Observation only — return value is ignored.
+    async fn fire_post_step(
+        &self,
+        session: &Session,
+        job_id: JobId,
+        step_id: aura_model::StepId,
+        step_kind: &StepKind,
+        outcome: &LifecycleOutcome,
+    ) {
+        let Some(hooks) = self.hooks.as_ref() else {
+            return;
+        };
+        let mut ctx = HookContext {
+            session_id: session.id.to_string(),
+            user_id: Some(session.user.id.clone()),
+            event_data: HookEventData::PostStep {
+                job_id: job_id.to_string(),
+                step_id: step_id.to_string(),
+                step_kind: step_kind_tag(step_kind).to_string(),
+                outcome: outcome_tag(outcome).to_string(),
+            },
+            message: None,
+            response: None,
+            job_id: Some(job_id.to_string()),
+            trace_span_id: None,
+            extra: Default::default(),
+        };
+        match tokio::time::timeout(
+            STEP_HOOK_TIMEOUT,
+            hooks.trigger(HookPoint::PostStep, &mut ctx),
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                warn!(
+                    timeout_ms = STEP_HOOK_TIMEOUT.as_millis() as u64,
+                    "PostStep hook exceeded timeout"
+                );
+            }
+            Ok(Err(e)) => warn!(error = %e, "PostStep hook chain failed"),
+            Ok(Ok(_)) => {}
         }
     }
 
@@ -962,7 +1369,7 @@ impl AgentLoop {
         let text = format!("Skill '{skill_name}' {headline}: {rationale}");
         if tx
             .send(AgentOutput::Notice {
-                session_id: session.id.clone(),
+                session_id: session.id.to_string(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 level,

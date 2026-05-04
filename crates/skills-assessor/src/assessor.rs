@@ -279,7 +279,7 @@ impl SkillAssessor {
         dir: &Path,
         full_hash: &str,
     ) -> Result<(), AssessError> {
-        let now = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().timestamp_micros();
         let row = AssessmentJob {
             skill_name: skill.name.clone(),
             content_hash: full_hash.to_string(),
@@ -369,7 +369,7 @@ impl SkillAssessor {
             level,
             rationale,
             model: self.llm.model_info().id.clone(),
-            assessed_at: chrono::Utc::now().timestamp(),
+            assessed_at: chrono::Utc::now().timestamp_micros(),
         })
     }
 }
@@ -386,7 +386,7 @@ fn disabled_verdict(skill: &SkillDefinition) -> AssessedSkill {
             level: RiskLevel::Safe,
             rationale: "skill risk assessment disabled".to_string(),
             model: String::new(),
-            assessed_at: chrono::Utc::now().timestamp(),
+            assessed_at: chrono::Utc::now().timestamp_micros(),
         },
         scope: AssessmentScope::Disabled,
         background_pending: false,
