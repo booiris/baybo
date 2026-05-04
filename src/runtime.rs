@@ -511,9 +511,15 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let trace_event_stream = TraceEventStream::new();
     let actor_trace_event_stream = trace_event_stream.clone();
     let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> = {
+        // Seed with every provider's `known_pricings()`, then layer the
+        // active model's pricing on top so a config-flip mid-flight
+        // doesn't drop spans of the previous model to $0. Providers that
+        // haven't published `known_pricings` yet contribute nothing —
+        // the active-model fallback still covers their case.
+        let registry = aura_llm::LlmProviderRegistry::with_default_providers();
+        let mut map = registry.all_known_pricings();
         let info = graph.llm_client.model_info();
-        let map: std::collections::HashMap<_, _> =
-            std::iter::once((info.id.clone(), info.pricing.clone())).collect();
+        map.insert(info.id.clone(), info.pricing.clone());
         Arc::new(map)
     };
     let _cost_subscriber_handle =

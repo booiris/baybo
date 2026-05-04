@@ -26,6 +26,21 @@ impl LlmProviderFactory for GeminiProviderFactory {
         ]
     }
 
+    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
+        self.known_models()
+            .iter()
+            .map(|m| {
+                (
+                    (*m).to_string(),
+                    ModelPricing {
+                        input_per_1m_tokens: 0.075,
+                        output_per_1m_tokens: 0.30,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key

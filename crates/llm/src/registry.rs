@@ -71,6 +71,16 @@ pub trait LlmProviderFactory: Send + Sync {
         &[]
     }
 
+    /// Static pricing table for this provider's known models. Used by
+    /// the cost subscriber to attribute spend to non-active models
+    /// (e.g. a session that started under one model and got config-
+    /// flipped mid-flight). Default: empty map — providers that
+    /// haven't been ported to publish pricing fall back to the
+    /// active-model-only path. `(input_per_1m, output_per_1m)` USD.
+    fn known_pricings(&self) -> HashMap<String, crate::ModelPricing> {
+        HashMap::new()
+    }
+
     /// Live discovery: ask the provider's catalog endpoint what models the
     /// caller actually has access to **right now**.
     ///
@@ -164,6 +174,22 @@ impl LlmProviderRegistry {
             .insert(factory.provider_name().to_string(), Box::new(factory));
     }
 
+    /// Aggregate every registered factory's `known_pricings()` into a
+    /// single `model_id -> ModelPricing` map. Used by the runtime to
+    /// seed the `CostSubscriber` so spans from non-active models still
+    /// resolve to real USD instead of 0.0. Conflicting model-id entries
+    /// across providers are last-wins; in practice the model-id space
+    /// is provider-disjoint so this doesn't matter.
+    pub fn all_known_pricings(&self) -> HashMap<String, crate::ModelPricing> {
+        let mut all = HashMap::new();
+        for factory in self.factories.values() {
+            for (id, pricing) in factory.known_pricings() {
+                all.insert(id, pricing);
+            }
+        }
+        all
+    }
+
     /// Return the catalog advertised by each registered factory.
     ///
     /// Output is sorted by provider name for stable display.
@@ -242,6 +268,31 @@ mod tests {
         }
         // Deliberately do NOT override live_models — that's the point of
         // the test.
+    }
+
+    #[test]
+    fn all_known_pricings_aggregates_default_providers() {
+        // Pin: every default provider that publishes known_pricings()
+        // shows up in the aggregate. Used by `runtime::wire_router` to
+        // seed the cost subscriber so non-active models still attribute
+        // spend instead of falling to $0.
+        let registry = LlmProviderRegistry::with_default_providers();
+        let pricings = registry.all_known_pricings();
+        // openai, anthropic, gemini, minimax all publish known_pricings;
+        // openai_subscription's known_models is empty (account-tier
+        // dependent), so it contributes nothing — that's expected.
+        assert!(pricings.contains_key("gpt-4o"));
+        assert!(pricings.contains_key("claude-sonnet-4-6"));
+        assert!(pricings.contains_key("gemini-2.5-flash"));
+        assert!(pricings.contains_key("MiniMax-M2"));
+        // No model id should map to (0.0, 0.0) — that would mean a
+        // provider regressed its pricing publication.
+        for (id, p) in &pricings {
+            assert!(
+                p.input_per_1m_tokens > 0.0 || p.output_per_1m_tokens > 0.0,
+                "model {id} has zero pricing in known_pricings",
+            );
+        }
     }
 
     #[tokio::test]
