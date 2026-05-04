@@ -18,7 +18,7 @@ use aura_trace::{
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::sandbox::SandboxAdapter;
@@ -347,7 +347,7 @@ impl ToolExecutor {
                         reason: "tool returned error output".into(),
                     }
                 };
-                recorder
+                if let Err(close_err) = recorder
                     .end_span(
                         span_handle,
                         step.job_id,
@@ -357,7 +357,10 @@ impl ToolExecutor {
                         }),
                         outcome,
                     )
-                    .await?;
+                    .await
+                {
+                    warn!(error = %close_err, tool = %tool_name, "end_span failed on tool success path");
+                }
                 Ok(output)
             }
             Ok(Err(e)) => {
@@ -367,7 +370,7 @@ impl ToolExecutor {
                     .sanitize_error(&raw)
                     .await
                     .unwrap_or(raw);
-                recorder
+                if let Err(close_err) = recorder
                     .end_span(
                         span_handle,
                         step.job_id,
@@ -376,13 +379,16 @@ impl ToolExecutor {
                             reason: error_msg.clone(),
                         },
                     )
-                    .await?;
+                    .await
+                {
+                    warn!(error = %close_err, tool = %tool_name, original = %e, "end_span failed on tool error path");
+                }
                 Err(e.into())
             }
             Err(_) => {
                 let error_msg =
                     format!("tool '{}' exceeded timeout ({:?})", tool_name, ctx.timeout);
-                recorder
+                if let Err(close_err) = recorder
                     .end_span(
                         span_handle,
                         step.job_id,
@@ -391,7 +397,10 @@ impl ToolExecutor {
                             reason: error_msg.clone(),
                         },
                     )
-                    .await?;
+                    .await
+                {
+                    warn!(error = %close_err, tool = %tool_name, "end_span failed on tool timeout path");
+                }
                 Err(anyhow::anyhow!(
                     "timeout: tool '{}' exceeded timeout",
                     tool_name

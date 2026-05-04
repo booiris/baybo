@@ -156,8 +156,18 @@ pub struct CostSubscriberMetrics {
     /// before this subscriber could pick them up. Each lagged event
     /// is one missing `cost_records` row.
     pub lagged_events: std::sync::atomic::AtomicU64,
-    /// Number of `cost_records` rows successfully written.
+    /// Total `cost_records` rows successfully written, including
+    /// system-driven events with empty `user_id` (e.g. internal
+    /// probes). Use [`recorded_user_events`] for user-billable counts.
+    ///
+    /// [`recorded_user_events`]: Self::recorded_user_events
     pub recorded_events: std::sync::atomic::AtomicU64,
+    /// `cost_records` rows attributable to a real user (non-empty
+    /// `user_id`) — i.e. the subset that also bumps the monthly cache
+    /// and counts toward `CostGuard` quota checks. Operators dashboards
+    /// should usually display this counter, not `recorded_events`,
+    /// because the difference is system traffic with no billing impact.
+    pub recorded_user_events: std::sync::atomic::AtomicU64,
 }
 
 impl CostSubscriberMetrics {
@@ -172,6 +182,11 @@ impl CostSubscriberMetrics {
 
     pub fn recorded(&self) -> u64 {
         self.recorded_events
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn recorded_user(&self) -> u64 {
+        self.recorded_user_events
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -265,10 +280,15 @@ impl CostSubscriber {
                         // events that lack a real user (e.g. an internal
                         // probe call); otherwise every such event would
                         // land on a single ("", month) row that conflates
-                        // unrelated traffic.
+                        // unrelated traffic. The user-billable counter
+                        // only ticks past this guard so dashboards don't
+                        // conflate probe traffic with real spend.
                         if record.user_id.is_empty() {
                             continue;
                         }
+                        metrics
+                            .recorded_user_events
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let month = format!("{:04}-{:02}", now.year(), now.month());
                         if let Err(e) = store
                             .bump_user_monthly_cost(&record.user_id, &month, cost_usd)

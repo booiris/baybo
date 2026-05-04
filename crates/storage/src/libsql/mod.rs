@@ -100,13 +100,22 @@ impl LibsqlPool {
     ///
     /// All tables that support deletion carry a `deleted_at` column (Unix
     /// **microseconds**, NULL when the row is live). See `soft_delete`
-    /// module rules. All other timestamp columns (`created_at`,
-    /// `started_at`, etc.) are also Unix microseconds — round-trip via
-    /// `libsql::time::{to_us, from_us}`. µs is finer than the millisecond
-    /// granularity of typical web tooling so sub-ms ordering survives
-    /// (useful for fast local tool spans), and `chrono::timestamp_micros`
-    /// is infallible. API surfaces (HTTP / OpenAPI / web) re-encode as
-    /// RFC3339 and don't expose raw µs.
+    /// module rules. Most other timestamp columns (`created_at`,
+    /// `started_at` on `jobs`, etc.) are also Unix microseconds —
+    /// round-trip via `libsql::time::{to_us, from_us}`. µs is finer than
+    /// the millisecond granularity of typical web tooling so sub-ms
+    /// ordering survives (useful for fast local tool spans), and
+    /// `chrono::timestamp_micros` is infallible. API surfaces (HTTP /
+    /// OpenAPI / web) re-encode as RFC3339 and don't expose raw µs.
+    ///
+    /// **Exception — trace tables (`steps`, `spans`).** The `started_at`
+    /// / `ended_at` columns are TEXT generated columns extracted from
+    /// the JSON `data` blob via `json_extract`. `aura-trace` serialises
+    /// `chrono::DateTime<Utc>` as RFC3339 strings, so these columns
+    /// hold RFC3339 — sortable lexicographically because the format is
+    /// fixed-width zero-padded, but not the µs invariant the rest of
+    /// the schema follows. Querying these columns means string
+    /// comparison, not integer comparison.
     async fn init_db(&self) -> anyhow::Result<()> {
         self.conn
             .execute_batch(

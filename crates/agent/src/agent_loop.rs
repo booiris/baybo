@@ -226,46 +226,24 @@ impl AgentLoop {
             )
             .await?;
         let job_id = job.id;
-        // Register the in-flight token before transitioning to
-        // InProgress so `JobLifecycle::cancel` can find us. The
-        // guard's Drop runs after `run_inner` returns / panics /
-        // unwinds, so the registry stays consistent on every path.
-        let _cancel_guard = job_lifecycle.register_running(job_id, cancel_token.clone());
-        job_lifecycle.start(&job_id).await?;
-
-        match self
-            .run_inner(
-                session,
-                user_content,
-                job_lifecycle,
-                span_recorder,
-                job_id,
-                delta_tx,
-                cancel_token.clone(),
-            )
-            .await
-        {
-            Ok(outgoing) => {
-                if let Err(e) = job_lifecycle
-                    .complete(
-                        &job_id,
-                        JobOutput::Message {
-                            content: outgoing.content.clone(),
-                        },
-                    )
-                    .await
-                {
-                    warn!(error = %e, "failed to mark job complete");
-                }
-                Ok(outgoing)
-            }
-            Err(e) => {
-                if let Err(fe) = job_lifecycle.fail(&job_id, e.to_string()).await {
-                    warn!(error = %fe, "failed to mark job failed");
-                }
-                Err(e)
-            }
-        }
+        crate::scope::with_job(job_lifecycle, cancel_token.clone(), job_id, |job_id| async move {
+            let outgoing = self
+                .run_inner(
+                    session,
+                    user_content,
+                    job_lifecycle,
+                    span_recorder,
+                    job_id,
+                    delta_tx,
+                    cancel_token,
+                )
+                .await?;
+            let output = JobOutput::Message {
+                content: outgoing.content.clone(),
+            };
+            Ok((output, outgoing))
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -379,6 +357,17 @@ impl AgentLoop {
         // delivers them out-of-band; never echoed back to the LLM.
         let mut accumulated_attachments: Vec<ContentBlock> = Vec::new();
         loop {
+            // Cooperative cancel checkpoint between iterations. Without
+            // this, a `cancel(job_id, ...)` admin call (which trips the
+            // registered token before flipping the row) lets the loop
+            // finish whatever it's doing and run another LLM call /
+            // compress / tool-call before observing the cancel. Tools
+            // and the LLM still get the token via their own paths;
+            // this catches the orchestration-layer wait windows.
+            if cancel_token.is_cancelled() {
+                warn!(job_id = %job_id, iterations, "cancel observed at iteration boundary; aborting loop");
+                return Err(anyhow::anyhow!("agent loop cancelled"));
+            }
             if iterations >= self.policy.max_iterations {
                 warn!(max = self.policy.max_iterations, "max iterations reached");
                 break;
@@ -386,7 +375,7 @@ impl AgentLoop {
             iterations += 1;
 
             // Proactive compression before building the ChatRequest.
-            self.compress_if_needed(session, span_recorder, job_id)
+            self.compress_if_needed(session, span_recorder, job_id, &cancel_token)
                 .await?;
 
             let step = span_recorder
@@ -1095,7 +1084,7 @@ impl AgentLoop {
                 },
             )
             .await?;
-        let stub_span = span_recorder
+        let stub_span = match span_recorder
             .begin_span(
                 &subagent_step,
                 SpanKind::SubagentStub {
@@ -1103,7 +1092,23 @@ impl AgentLoop {
                 },
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(span) => span,
+            Err(e) => {
+                // Release the half-open Subagent step before bubbling.
+                span_recorder
+                    .end_step(
+                        subagent_step,
+                        LifecycleOutcome::Failed {
+                            reason: format!("begin_span failed: {e}"),
+                        },
+                    )
+                    .await
+                    .ok();
+                return Err(e.into());
+            }
+        };
 
         // Real parent token from the agent loop's cancel tree, not a
         // throwaway. The runtime derives a child_token() from this for
@@ -1151,15 +1156,7 @@ impl AgentLoop {
             return Ok(None);
         }
 
-        let step = span_recorder
-            .begin_step(job_id, StepKind::Compression)
-            .await?;
         let model_info = self.llm_client.model_info();
-
-        // Build a fresh ChatRequest scoped to "summarize the prior
-        // conversation". The user message carries explicit instructions
-        // so the prompt stays self-describing without depending on the
-        // soul's system prompt.
         let summarize_prompt = ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text(
@@ -1178,69 +1175,45 @@ impl AgentLoop {
             .collect();
         messages.push(summarize_prompt);
 
-        let span = span_recorder
-            .begin_span(
-                &step,
-                SpanKind::LlmCall {
-                    begin: LlmCallBegin {
-                        model_id: model_info.id.clone(),
-                        provider: model_info.provider.clone(),
-                        provider_config_hash: String::new(),
-                        input_messages: messages.clone(),
-                        temperature: None,
-                    },
-                    result: None,
-                },
-                None,
-            )
-            .await?;
-
-        let request = ChatRequest {
-            messages,
-            temperature: None,
-            tools: Vec::new(),
+        let llm_call_kind = SpanKind::LlmCall {
+            begin: LlmCallBegin {
+                model_id: model_info.id.clone(),
+                provider: model_info.provider.clone(),
+                provider_config_hash: String::new(),
+                input_messages: messages.clone(),
+                temperature: None,
+            },
+            result: None,
         };
-        let result = self.llm_client.chat(&request).await;
-        match result {
-            Ok(response) => {
-                span_recorder
-                    .end_span(
-                        span,
-                        job_id,
-                        SpanFinalize::LlmCall(LlmCallResult {
-                            output_content: response.content.clone(),
-                            thinking: response.thinking.clone(),
-                            tool_calls: vec![],
-                            input_tokens: response.usage.input_tokens,
-                            output_tokens: response.usage.output_tokens,
-                        }),
-                        LifecycleOutcome::Ok,
-                    )
-                    .await
-                    .ok();
-                span_recorder
-                    .end_step(step, LifecycleOutcome::Ok)
-                    .await
-                    .ok();
-                let trimmed = response.content.trim();
-                if trimmed.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(trimmed.to_string()))
-                }
-            }
-            Err(e) => {
-                let reason = e.to_string();
-                let failed = LifecycleOutcome::Failed {
-                    reason: reason.clone(),
+
+        let rec = span_recorder.as_ref();
+        let llm = &self.llm_client;
+        let content = crate::scope::with_step(rec, job_id, StepKind::Compression, None, |step| async move {
+            crate::scope::with_span(rec, &step, job_id, llm_call_kind, None, None, |_span| async move {
+                let request = ChatRequest {
+                    messages,
+                    temperature: None,
+                    tools: Vec::new(),
                 };
-                span_recorder
-                    .end_span(span, job_id, SpanFinalize::Empty, failed.clone())
-                    .await
-                    .ok();
-                span_recorder.end_step(step, failed).await.ok();
-                Err(e.into())
-            }
+                let response = llm.chat(&request).await?;
+                let finalize = SpanFinalize::LlmCall(LlmCallResult {
+                    output_content: response.content.clone(),
+                    thinking: response.thinking.clone(),
+                    tool_calls: vec![],
+                    input_tokens: response.usage.input_tokens,
+                    output_tokens: response.usage.output_tokens,
+                });
+                Ok((finalize, response.content))
+            })
+            .await
+        })
+        .await?;
+
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
         }
     }
 
@@ -1254,6 +1227,7 @@ impl AgentLoop {
         session: &mut Session,
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
+        cancel_token: &CancellationToken,
     ) -> anyhow::Result<()> {
         let outcome = self.context_manager.maybe_compress(session).await?;
         let Some(stats) = outcome else {
@@ -1264,68 +1238,39 @@ impl AgentLoop {
             after = stats.after_tokens,
             "compressed context before LLM call"
         );
-        if let Some(call) = stats.llm_call {
-            // Post-hoc record — `SpanRecorder::end_span` publishes
-            // `LlmSpanEnded` for the cost subscriber regardless of
-            // wall-clock ordering.
-            let step = span_recorder
-                .begin_step(job_id, StepKind::Compression)
-                .await?;
-            let span = match span_recorder
-                .begin_span(
-                    &step,
-                    SpanKind::LlmCall {
-                        begin: LlmCallBegin {
-                            model_id: call.model_id,
-                            provider: call.provider,
-                            provider_config_hash: String::new(),
-                            input_messages: Vec::new(),
-                            temperature: None,
-                        },
-                        result: None,
-                    },
-                    None,
-                )
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    // begin_span failed — release the half-open
-                    // Compression step so it doesn't leak past the
-                    // recovery horizon.
-                    span_recorder
-                        .end_step(
-                            step,
-                            LifecycleOutcome::Failed {
-                                reason: format!("begin_span failed: {e}"),
-                            },
-                        )
-                        .await
-                        .ok();
-                    return Err(e.into());
-                }
-            };
-            span_recorder
-                .end_span(
-                    span,
-                    job_id,
-                    SpanFinalize::LlmCall(LlmCallResult {
-                        output_content: String::new(),
-                        thinking: None,
-                        tool_calls: vec![],
-                        input_tokens: call.input_tokens,
-                        output_tokens: call.output_tokens,
-                    }),
-                    LifecycleOutcome::Ok,
-                )
-                .await
-                .ok();
-            span_recorder
-                .end_step(step, LifecycleOutcome::Ok)
-                .await
-                .ok();
-        }
-        Ok(())
+        let Some(call) = stats.llm_call else {
+            return Ok(());
+        };
+
+        // Post-hoc record — `SpanRecorder::end_span` publishes
+        // `LlmSpanEnded` for the cost subscriber regardless of
+        // wall-clock ordering.
+        let llm_call_kind = SpanKind::LlmCall {
+            begin: LlmCallBegin {
+                model_id: call.model_id,
+                provider: call.provider,
+                provider_config_hash: String::new(),
+                input_messages: Vec::new(),
+                temperature: None,
+            },
+            result: None,
+        };
+        let finalize = SpanFinalize::LlmCall(LlmCallResult {
+            output_content: String::new(),
+            thinking: None,
+            tool_calls: vec![],
+            input_tokens: call.input_tokens,
+            output_tokens: call.output_tokens,
+        });
+        let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
+        let rec = span_recorder.as_ref();
+        crate::scope::with_step(rec, job_id, StepKind::Compression, cancel_ctx, |step| async move {
+            crate::scope::with_span(rec, &step, job_id, llm_call_kind, None, cancel_ctx, |_span| async move {
+                Ok((finalize, ()))
+            })
+            .await
+        })
+        .await
     }
 
     async fn ensure_system_prompt(&self, session: &mut Session) {

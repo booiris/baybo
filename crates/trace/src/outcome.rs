@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum LifecycleOutcome {
-    /// Started but not yet ended. Persisted only in the WAL event log
-    /// — main tables get a row only at end time, with one of the
-    /// terminal variants below.
+    /// Started but not yet ended. Persisted on the main `steps` /
+    /// `spans` row with `ended_at = NULL`; the row is rewritten in
+    /// place when the lifecycle ends with one of the terminal variants
+    /// below.
     Pending,
     /// Completed normally. The kind variant's result fields carry the
     /// actual data (LLM tokens, tool output, etc.).

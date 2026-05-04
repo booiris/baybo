@@ -1,5 +1,6 @@
-//! Cancellation reasons for `JobStatus::Cancelled` and (reused) for
-//! span-level cancellation when the recovery scan finds half-open spans.
+//! Cancellation reasons for `JobStatus::Cancelled`, also reused on
+//! `LifecycleOutcome::Cancelled` for step / span lifecycles when a
+//! cancel is observed mid-flight.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,9 +17,11 @@ pub enum CancelReason {
     /// running job's partial output is preserved on
     /// `JobStatus::Cancelled.partial_artifacts`.
     UserPreempt,
-    /// Process restart found a job that was `InProgress` at crash time.
-    /// The recovery scan rewrites half-open spans with the same reason
-    /// and folds them into the parent job's `partial_artifacts`.
+    /// Reserved for a future restart-recovery scan: a job that was
+    /// `InProgress` at crash time and is rolled to `Cancelled` on the
+    /// next process boot. No production code path mints this variant
+    /// today — the recovery scan was removed; the variant is kept so
+    /// the wire/serde shape doesn't churn when recovery is restored.
     SystemCrash,
     /// `spawn_subagent` exceeded its declared timeout. Triggers
     /// cancellation of the entire descendant subtree via the

@@ -11,6 +11,7 @@ use crate::cost::CostGuard;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::actor::AgentMessage;
@@ -60,8 +61,23 @@ impl RateLimiter {
 /// Returns the mailbox sender for communicating with the spawned actor.
 /// The closure captures all dependencies needed to construct an actor
 /// (AgentLoop, HookManager, JobLifecycle, SpanRecorder, etc.).
-pub type ActorSpawner =
-    Box<dyn Fn(Session, mpsc::Sender<AgentOutput>) -> mpsc::Sender<AgentMessage> + Send + Sync>;
+///
+/// `parent_token` is the cancellation parent the child actor's
+/// `actor_token` is derived from. Tripping the parent cascades cancel
+/// down through every job / tool / nested subagent the child runs. For
+/// top-level user / cron sessions the router passes a process-wide
+/// token bridged to `ShutdownSignal`. For subagent dispatch the parent's
+/// per-job cancel token is passed instead, so admin `cancel_job(parent)`
+/// trips the entire descendant subtree.
+pub type ActorSpawner = Box<
+    dyn Fn(
+            Session,
+            mpsc::Sender<AgentOutput>,
+            &CancellationToken,
+        ) -> mpsc::Sender<AgentMessage>
+        + Send
+        + Sync,
+>;
 
 /// Routes incoming messages to the appropriate AgentActor.
 pub struct Router {
@@ -73,6 +89,13 @@ pub struct Router {
     rate_limiter: RateLimiter,
     actor_spawner: Option<ActorSpawner>,
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    /// Cancellation parent passed to every top-level actor the router
+    /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
+    /// each actor derives its `actor_token` as a child of this so
+    /// process shutdown cascades into every in-flight job. Defaults
+    /// to a fresh standalone token if `with_actor_parent_token` was
+    /// never called.
+    actor_parent_token: CancellationToken,
 }
 
 /// Default rate limit: 30 requests per 60 seconds per user.
@@ -98,7 +121,18 @@ impl Router {
             ),
             actor_spawner: None,
             cron_trigger_rx: None,
+            actor_parent_token: CancellationToken::new(),
         }
+    }
+
+    /// Set the cancellation parent passed to every top-level actor the
+    /// router spawns. Wired upstream to `ShutdownSignal` so process
+    /// shutdown cascades into every in-flight job. Without this, the
+    /// router uses a fresh standalone token and shutdown does not
+    /// reach in-flight LLM / tool calls.
+    pub fn with_actor_parent_token(mut self, token: CancellationToken) -> Self {
+        self.actor_parent_token = token;
+        self
     }
 
     /// Set a `CostGuard` for quota checks before routing messages.
@@ -204,7 +238,7 @@ impl Router {
             if let Some(ref spawner) = self.actor_spawner {
                 info!(session_id = %session_id, "creating new actor for cron session");
                 let response_tx = self.supervisor.response_tx().clone();
-                let sender = spawner(session, response_tx);
+                let sender = spawner(session, response_tx, &self.actor_parent_token);
                 self.supervisor.register(session_id.clone(), sender);
 
                 if !self.supervisor.route(&session_id, message).await {
@@ -294,7 +328,7 @@ impl Router {
             if let Some(ref spawner) = self.actor_spawner {
                 info!(session_id = %session_id, "creating new actor for session");
                 let response_tx = self.supervisor.response_tx().clone();
-                let sender = spawner(session, response_tx);
+                let sender = spawner(session, response_tx, &self.actor_parent_token);
                 self.supervisor.register(session_id.clone(), sender);
 
                 // Retry routing now that the actor exists.

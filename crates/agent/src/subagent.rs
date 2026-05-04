@@ -45,8 +45,18 @@ use crate::actor::AgentMessage;
 /// mailbox sender. Mirrors [`crate::router::ActorSpawner`] but kept
 /// separate so the subagent path can swap in spawn-specific knobs
 /// (e.g. tighter output buffer, preconfigured hooks).
+///
+/// `parent_token` is the cancellation parent for the spawned child —
+/// `LocalSubagentRuntime::run` passes its own `parent_token` parameter
+/// (the parent job's per-job cancel token) so admin
+/// `cancel_job(parent_id)` cascades into the child's tools / LLM /
+/// nested subagents.
 pub type SubagentActorSpawner = Arc<
-    dyn Fn(aura_model::Session, mpsc::Sender<AgentOutput>) -> mpsc::Sender<AgentMessage>
+    dyn Fn(
+            aura_model::Session,
+            mpsc::Sender<AgentOutput>,
+            &CancellationToken,
+        ) -> mpsc::Sender<AgentMessage>
         + Send
         + Sync,
 >;
@@ -234,7 +244,12 @@ impl SubagentRuntime for LocalSubagentRuntime {
         // Spawn the child actor with our own response channel so we
         // can capture the final message synchronously.
         let (output_tx, mut output_rx) = mpsc::channel::<AgentOutput>(64);
-        let mailbox = (self.spawn_actor)(child_session.clone(), output_tx);
+        // Pass the parent's cancel token as the child actor's
+        // cancellation parent. Admin `cancel_job(parent)` trips
+        // `parent_token`; the child actor's `actor_token` is its
+        // child, so cascading cancel reaches the child's tools,
+        // LLM calls, and nested subagents.
+        let mailbox = (self.spawn_actor)(child_session.clone(), output_tx, &parent_token);
 
         // Build the initial prompt and dispatch via SubagentSpawned
         // (not UserInput) so the child actor's handler runs

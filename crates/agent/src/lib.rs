@@ -9,6 +9,7 @@ pub mod policy;
 pub mod query;
 pub mod router;
 pub mod sandbox;
+mod scope;
 pub mod security;
 pub mod service;
 pub mod session;

@@ -230,7 +230,20 @@ impl Job {
         if target.kind().is_terminal() {
             self.ended_at = Some(now);
         }
+        // `final_result` is the contractual output of a successful run.
+        // Reject Failed/Cancelled/Stuck targets that try to write one —
+        // those carry their reason on the status variant itself; mixing
+        // a `final_result` with a non-Completed terminal would corrupt
+        // the audit invariant ("`final_result.is_some()` ⇔ `Completed`").
         if let Some(out) = final_result {
+            if !matches!(target, JobStatus::Completed) {
+                return Err(JobError::InvalidTransition(format!(
+                    "{} -> {} carries a final_result but only Completed accepts one (job {})",
+                    from.kind(),
+                    target.kind(),
+                    self.id
+                )));
+            }
             self.final_result = Some(out);
         }
 

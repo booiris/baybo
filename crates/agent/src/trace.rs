@@ -117,21 +117,26 @@ pub struct SpanRecorder {
 }
 
 impl SpanRecorder {
-    pub fn new(session_id: SessionId, user_id: String, trace_store: Arc<dyn TraceStore>) -> Self {
+    /// Construct a recorder. `stream` is **required** because the
+    /// `CostSubscriber` and any other downstream listeners subscribe
+    /// to one shared bus; a recorder that publishes into a private
+    /// bus silently under-bills (and the lag counter doesn't fire
+    /// either, because lag only counts events the *subscribed* bus
+    /// dropped). Callers without a process-wide bus pass
+    /// `TraceEventStream::new()` explicitly so the choice is on
+    /// record at the call site.
+    pub fn new(
+        session_id: SessionId,
+        user_id: String,
+        trace_store: Arc<dyn TraceStore>,
+        stream: TraceEventStream,
+    ) -> Self {
         Self {
             session_id,
             user_id,
             trace_store,
-            stream: TraceEventStream::new(),
+            stream,
         }
-    }
-
-    /// Inject an externally-built stream (e.g. when the actor wants
-    /// to share one bus with multiple recorders, or wire it into a
-    /// gateway-wide aggregator). Defaults to a fresh per-session bus.
-    pub fn with_stream(mut self, stream: TraceEventStream) -> Self {
-        self.stream = stream;
-        self
     }
 
     pub fn session_id(&self) -> &SessionId {
@@ -338,6 +343,7 @@ mod tests {
             SessionId::from("cli-test"),
             "user-test".to_string(),
             Arc::new(MemoryTraceStore::new()),
+            TraceEventStream::new(),
         )
     }
 

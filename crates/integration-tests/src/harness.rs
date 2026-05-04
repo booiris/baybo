@@ -222,10 +222,17 @@ impl AgentTestHarnessBuilder {
         let memory_store = Arc::new(MemoryMemoryStore::new());
 
         let job_lifecycle = Arc::new(JobLifecycle::new(share_job_store(&job_store)));
+        // One shared bus per harness — the recorder publishes into it
+        // and the cost subscriber drains the same bus. Constructing it
+        // upfront keeps both sides explicit about which stream they
+        // share (forgetting this is the silent under-billing bug
+        // SpanRecorder::new now refuses to compile around).
+        let trace_event_stream = aura_agent::TraceEventStream::new();
         let span_recorder = Arc::new(SpanRecorder::new(
             session.id.clone(),
             session.user.id.clone(),
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
+            trace_event_stream.clone(),
         ));
         // Cost subscriber: pricing left empty for tests — token
         // counts still land in cost_records, cost_usd reads as 0.
@@ -233,7 +240,7 @@ impl AgentTestHarnessBuilder {
             share_cost_store(&cost_store),
             Arc::new(std::collections::HashMap::new()),
         )
-        .spawn(span_recorder.stream());
+        .spawn(&trace_event_stream);
 
         // Agent loop dependencies.
         let stub_llm = Arc::new(StubLlm::new());
@@ -282,6 +289,7 @@ impl AgentTestHarnessBuilder {
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
+        let actor_parent_token = tokio_util::sync::CancellationToken::new();
         let actor = AgentActor::new(
             session.clone(),
             agent_loop,
@@ -289,6 +297,7 @@ impl AgentTestHarnessBuilder {
             output_tx,
             job_lifecycle,
             span_recorder,
+            &actor_parent_token,
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));
 
