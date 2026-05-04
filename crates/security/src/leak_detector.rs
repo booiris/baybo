@@ -144,12 +144,11 @@ impl LeakDetector {
 
     /// Load a standard set of rules for common secret patterns.
     ///
-    /// Pattern ordering matters: more-specific rules come first so their
-    /// matches are recorded with the narrower rule name even though rule
-    /// results are aggregated per-fragment. In particular, the vendor-specific
-    /// `sk-…` rules (Anthropic, OpenRouter, Stripe) must precede the broader
-    /// `openai_api_key` pattern so that a `sk-ant-api…` key is reported under
-    /// the Anthropic rule rather than being first captured by the OpenAI rule.
+    /// `scan_text` runs every rule against the input and aggregates
+    /// every match, so order does not affect what gets reported; each
+    /// vendor-specific `sk-…` regex is narrow enough that a key for
+    /// one vendor (e.g. `sk-ant-api…`) is not also captured by the
+    /// patterns for another vendor.
     fn add_default_rules(&mut self) {
         let rules = vec![
             // Cloud providers

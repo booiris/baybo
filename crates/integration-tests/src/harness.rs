@@ -323,7 +323,7 @@ impl AgentTestHarnessBuilder {
 // --- Helpers to obtain `Box<dyn Trait>` handles from `Arc<Concrete>` ---
 //
 // Each in-memory store is constructed once as an `Arc` and shared
-// directly with the managers — `JobManager`, `CostTracker`, and
+// directly with the managers — `JobLifecycle`, `CostSubscriber`, and
 // `MemoryManager` all accept `Arc<dyn Trait>`, so the test handle and the
 // manager-owned handle point at the same instance and post-run
 // assertions see real state.

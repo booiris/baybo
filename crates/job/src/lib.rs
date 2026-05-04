@@ -42,8 +42,9 @@ pub enum JobStatus {
     Cancelled {
         reason: CancelReason,
         /// Spans that completed (or partially completed) before the
-        /// cancel. The next job's prompt-assembly step renders these as
-        /// a "previously completed steps:" preamble.
+        /// cancel. Reserved for a future prompt-assembly preamble that
+        /// surfaces them to the next job's LLM; no consumer reads this
+        /// field today.
         partial_artifacts: Vec<SpanId>,
     },
     Failed {
@@ -327,9 +328,10 @@ impl Job {
 /// Audit record for a single state transition.
 ///
 /// Dropping a `JobTransition` without persisting it loses the audit
-/// trail the state machine exists to produce; `JobLifecycle::record_transition`
-/// is the intended consumer.
-#[must_use = "JobTransition is the audit trail; persist it via JobLifecycle::record_transition"]
+/// trail the state machine exists to produce; the `JobLifecycle`
+/// lifecycle methods (`start`/`complete`/`fail`/`cancel`/`stuck`/`recover`)
+/// are the intended consumers.
+#[must_use = "JobTransition is the audit trail; let JobLifecycle persist it via its lifecycle methods"]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobTransition {
     pub job_id: JobId,

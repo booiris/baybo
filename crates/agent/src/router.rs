@@ -60,7 +60,7 @@ impl RateLimiter {
 ///
 /// Returns the mailbox sender for communicating with the spawned actor.
 /// The closure captures all dependencies needed to construct an actor
-/// (AgentLoop, HookManager, JobLifecycle, SpanRecorder, etc.).
+/// (AgentLoop, ToolExecutor, JobLifecycle, SpanRecorder, etc.).
 ///
 /// `parent_token` is the cancellation parent the child actor's
 /// `actor_token` is derived from. Tripping the parent cascades cancel

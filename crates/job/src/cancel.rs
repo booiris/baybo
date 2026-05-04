@@ -20,8 +20,10 @@ pub enum CancelReason {
     /// Reserved for a future restart-recovery scan: a job that was
     /// `InProgress` at crash time and is rolled to `Cancelled` on the
     /// next process boot. No production code path mints this variant
-    /// today — the recovery scan was removed; the variant is kept so
-    /// the wire/serde shape doesn't churn when recovery is restored.
+    /// today — the auto-cancel rewrite at boot was removed (the
+    /// `find_recoverable_jobs` listing still exists). The variant is
+    /// kept so the wire/serde shape doesn't churn when the rewrite
+    /// is restored.
     SystemCrash,
     /// `spawn_subagent` exceeded its declared timeout. Triggers
     /// cancellation of the entire descendant subtree via the

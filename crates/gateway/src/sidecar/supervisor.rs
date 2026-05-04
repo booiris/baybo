@@ -15,7 +15,7 @@
 //! gains one at runtime spawns within one discovery tick. The supervisor
 //! does not currently tear a sidecar down when its bot count drops back
 //! to zero — the [`crate::channel::ChannelBotReconciler`] keeps the
-//! sidecar's roster in sync, so an idle sidecar costs only the node
+//! sidecar's roster in sync, so an idle sidecar costs only the bun
 //! process; explicit stop-on-empty would just kill a process that's
 //! already doing nothing.
 //!

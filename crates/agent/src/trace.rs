@@ -1,7 +1,7 @@
 //! `SpanRecorder` — facade that owns Step / Span / SpanEvent
 //! lifecycle for one session, and `TraceEventStream` — the
 //! `tokio::sync::broadcast` bus that downstream observers (cost
-//! tracker, hook router, TUI) subscribe to.
+//! subscriber, TUI / Web UI) subscribe to.
 //!
 //! Replaces the legacy `TraceCollector` + `ObservabilityRecorder`
 //! split. See `docs/modules/trace.md` for the design.

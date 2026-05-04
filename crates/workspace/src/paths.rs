@@ -261,8 +261,9 @@ impl WorkspacePaths {
         self.root.join(LOGS_DIR)
     }
 
-    /// Per-channel sidecar log directory:
-    /// `<root>/logs/channel/<channel_type>.log.YYYY-MM-DD`.
+    /// Per-channel sidecar log directory: `<root>/logs/channel/`.
+    /// Individual files inside are named
+    /// `<channel_type>.log.YYYY-MM-DD`.
     pub fn channel_logs_dir(&self) -> PathBuf {
         self.logs_dir().join(CHANNEL_LOGS_SUBDIR)
     }

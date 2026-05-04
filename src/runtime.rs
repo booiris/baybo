@@ -294,9 +294,10 @@ pub async fn build_managers(
     ));
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
-    // CostTracker has been retired in favour of a TraceEventStream
-    // subscriber. The bootstrap below wires it once `SpanRecorder`s
-    // exist (per-actor); see `spawn_actor` below for the subscription.
+    // CostTracker has been retired in favour of a process-wide
+    // `TraceEventStream` subscriber wired once in `wire_router`
+    // against the shared stream that every per-actor `SpanRecorder`
+    // publishes into.
     let cost_store_for_subscriber = stores.cost.clone();
 
     // --- cron scheduler (built before ToolExecutor so its tools register
@@ -464,7 +465,7 @@ pub async fn build_managers(
 /// Router + channel handles a chat loop needs to drive.
 ///
 /// `incoming_tx` is handed to each channel transport at registration
-/// time (the WS sidecar pulls it via `ChannelServerDeps`); `incoming_rx`
+/// time (the WS sidecar pulls it via `GatewayDeps`); `incoming_rx`
 /// and `response_rx` feed [`Router::run`]. Dropping the handle before
 /// calling `.run` leaks the
 /// router's background actor spawner, so callers should either drive it

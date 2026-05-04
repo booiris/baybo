@@ -9,12 +9,12 @@
 //!
 //! `start` is a long-running server: it acquires the per-workspace
 //! singleton, builds the full manager graph via [`crate::runtime`]
-//! (passing [`BootMode::Gateway`] so the auth token is registered as
-//! a log redaction rule), and drives the router, admin
-//! [`GatewayServer`], and the loopback-TCP [`ChannelServer`] side by
-//! side under a shared `ShutdownSignal`. Sidecars register
-//! themselves with the channel registry from the WS route task when
-//! they connect.
+//! (seeding `runtime::build_leak_detector` with the gateway-owned
+//! tokens so any log line that echoes them is masked), and drives the
+//! router, admin [`GatewayServer`], and the loopback-TCP
+//! [`ChannelServer`] side by side under a shared `ShutdownSignal`.
+//! Sidecars register themselves with the channel registry from the WS
+//! route task when they connect.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -417,9 +417,9 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to
-    // `<workspace>/channel.port` (same workspace identity dir as the
-    // singleton lockfile) so TUI and sidecars can discover it without
-    // a config roundtrip.
+    // `<workspace>/state/channel.port` (next to the singleton
+    // lockfile) so TUI and sidecars can discover it without a config
+    // roundtrip.
     let channel_server = ChannelServer::bind(&deps, port_file, channel_tokens.clone())
         .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();

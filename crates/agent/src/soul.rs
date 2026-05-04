@@ -61,11 +61,11 @@ impl Soul {
 /// Render the agent-facing environment block. Mirrors what `runtime.rs`
 /// hands the tool layer: `ToolContext.workspace_root` is the workspace
 /// `work/` subdirectory (also the OS sandbox FS scope), and the
-/// surrounding `<root>` carries identity / state / logs. Both paths
-/// are absolutised before rendering — a relative workspace root (e.g.
-/// the debug-build default `./.aura`) would otherwise leak a
-/// cwd-relative path into the prompt and the agent has no way to know
-/// what cwd the runtime started from.
+/// surrounding `<root>` carries identity / state / logs. The work
+/// dir is absolutised before rendering — a relative workspace root
+/// (e.g. the debug-build default `./.aura`) would otherwise leak a
+/// cwd-relative path into the prompt and the agent has no way to
+/// know what cwd the runtime started from.
 fn build_env_block(workspace: &WorkspaceManager) -> String {
     let paths = WorkspacePaths::new(workspace.root.clone());
     let work_dir = absolutise(&paths.work_dir());

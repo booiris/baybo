@@ -11,7 +11,7 @@
 //!     [`SubagentActorSpawner`] closure (mirrors the top-level
 //!     [`crate::router::ActorSpawner`] but isolated so the subagent
 //!     path can override per-spawn behavior — e.g. a different
-//!     output channel size, custom hooks).
+//!     output channel size).
 //!  3. Driving the initial prompt into the child mailbox and waiting
 //!     for the child to return a final [`AgentOutput::Message`] (or
 //!     hit the spawn timeout / be cancelled by the parent's token
@@ -21,7 +21,7 @@
 //!
 //! The implementation is **synchronous from the parent's
 //! perspective**: parent's LLM iteration step blocks on the
-//! [`SubagentRuntime::spawn`] future until the child terminates.
+//! [`SubagentRuntime::run`] future until the child terminates.
 //! Cancellation is via [`tokio_util::sync::CancellationToken`] — the
 //! request carries the parent's token; the runtime constructs a
 //! child token from it so propagation is automatic on cancel.
@@ -47,7 +47,7 @@ use crate::job::JobLifecycle;
 /// Caller-supplied closure that builds a child actor and returns its
 /// mailbox sender. Mirrors [`crate::router::ActorSpawner`] but kept
 /// separate so the subagent path can swap in spawn-specific knobs
-/// (e.g. tighter output buffer, preconfigured hooks).
+/// (e.g. a tighter output buffer).
 ///
 /// `parent_token` is the cancellation parent for the spawned child —
 /// `LocalSubagentRuntime::run` passes its own `parent_token` parameter
@@ -77,8 +77,9 @@ pub struct SubagentSpawnRequest {
     #[serde(default)]
     pub must_include_context: Vec<String>,
     /// Hard wait limit. Exceeding this returns
-    /// `SubagentExitStatus::Timeout` and trips the parent's token
-    /// (the child's descendant tokens cascade automatically).
+    /// `SubagentExitStatus::Timeout` and trips the runtime's child
+    /// token (derived from the parent's), so the child's descendant
+    /// tokens cascade automatically.
     pub timeout: Duration,
 }
 

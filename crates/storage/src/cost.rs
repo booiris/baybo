@@ -50,9 +50,7 @@ pub struct CostSummary {
 
 /// Cached per-user-per-month total. Populated lazily by
 /// `CostSubscriber` after each `cost_records` write; read by
-/// `CostGuard` for monthly-quota checks. The retention sweep purges
-/// stale rows past the horizon — raw `cost_records` is the audit
-/// truth and the durable rollup is this cache.
+/// `CostGuard` for monthly-quota checks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserMonthlyCost {
     pub user_id: String,

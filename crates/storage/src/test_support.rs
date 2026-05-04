@@ -388,8 +388,9 @@ impl TraceStore for MemoryTraceStore {
 }
 
 /// In-memory `MemoryStore` for tests. Keyed by `entry.id`. Search is a
-/// case-insensitive substring match against `key + value` — good enough
-/// for asserting "the entry I just stored shows up in search".
+/// case-insensitive substring match against the entry's `content` —
+/// good enough for asserting "the entry I just stored shows up in
+/// search".
 #[derive(Debug, Default)]
 pub struct MemoryMemoryStore {
     entries: Mutex<HashMap<String, MemoryEntry>>,

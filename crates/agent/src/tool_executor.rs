@@ -334,7 +334,7 @@ impl ToolExecutor {
                     }
                     Ok(Err(e)) => {
                         // Surface the *sanitized* message: this Err
-                        // bubbles into `with_span_outcome`, which writes
+                        // bubbles into `with_span`, which writes
                         // `e.to_string()` into the span's
                         // `Failed { reason }` and from there into
                         // persisted trace storage. Returning the raw

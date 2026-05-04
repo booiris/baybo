@@ -26,7 +26,7 @@ const BLOB_TTL: Duration = Duration::from_secs(7 * 86_400);
 // Pairing approvals — short-lived auth-flow ephemera, kept long enough
 // for the next channel reload to confirm them, then dropped.
 const PAIRING_APPROVAL_TTL: Duration = Duration::from_secs(7 * 86_400);
-// `channel_pairings` runs sub-hourly (much faster than the daily
+// `channel_pairings` runs hourly (much faster than the daily
 // sweep) because pending codes expire on the order of minutes; an
 // hourly cadence keeps the table from accumulating expired pending
 // rows between full sweeps.
@@ -95,7 +95,7 @@ impl Janitor {
         self
     }
 
-    /// Wire the pairing store for the sub-hourly expired-code sweep.
+    /// Wire the pairing store for the hourly expired-code sweep.
     /// Without this call the pairing sweep doesn't run.
     #[must_use]
     pub fn with_pairing_store(mut self, pairings: Arc<dyn ChannelPairingStore>) -> Self {
@@ -103,7 +103,7 @@ impl Janitor {
         self
     }
 
-    /// Run all four sweeps once. Failures in one sweep are logged and
+    /// Run every wired sweep once. Failures in one sweep are logged and
     /// the others still run — janitor is best-effort.
     pub async fn sweep_once(&self) -> JanitorReport {
         let mut report = JanitorReport::default();
@@ -174,7 +174,7 @@ impl Janitor {
         report
     }
 
-    /// Sub-hourly pairing sweep. Returns the number of rows hard-deleted.
+    /// Hourly pairing sweep. Returns the number of rows hard-deleted.
     /// Pending rows expire on the order of minutes; without a
     /// faster-than-daily cadence the table fills with dead pending
     /// codes between the main sweep ticks.

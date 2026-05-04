@@ -109,10 +109,12 @@ impl LibsqlPool {
     /// / `ended_at` columns are TEXT generated columns extracted from
     /// the JSON `data` blob via `json_extract`. `aura-trace` serialises
     /// `chrono::DateTime<Utc>` as RFC3339 strings, so these columns
-    /// hold RFC3339 — sortable lexicographically because the format is
-    /// fixed-width zero-padded, but not the µs invariant the rest of
-    /// the schema follows. Querying these columns means string
-    /// comparison, not integer comparison.
+    /// hold RFC3339 — sortable lexicographically because the leading
+    /// `YYYY-MM-DDTHH:MM:SS` prefix is fixed-width and any
+    /// fractional-second suffix shares a common prefix length within
+    /// a single insertion path. They don't follow the µs invariant
+    /// the rest of the schema uses; querying these columns means
+    /// string comparison, not integer comparison.
     async fn init_db(&self) -> anyhow::Result<()> {
         self.conn
             .execute_batch(

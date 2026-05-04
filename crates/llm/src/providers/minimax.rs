@@ -8,7 +8,7 @@ use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
 pub(crate) const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 /// Origin host MiniMax exposes for OpenAI-compatible model listing.
 /// Operators on the international cluster (`api.minimax.io`) can flip
-/// this via the `MINIMAX_MODELS_HOST` env var.
+/// this via the `MINIMAX_MODELS_BASE` env var.
 const MINIMAX_DEFAULT_MODELS_BASE: &str = "https://api.minimaxi.com/v1";
 
 /// Factory that creates `LlmClient` instances configured for MiniMax models.
