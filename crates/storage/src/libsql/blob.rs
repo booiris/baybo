@@ -121,7 +121,7 @@ impl LibsqlBlobStore {
 }
 
 fn now_unix() -> i64 {
-    chrono::Utc::now().timestamp()
+    super::time::now_us()
 }
 
 /// Cosmetic file extension to append to a blob's on-disk filename so a
@@ -985,9 +985,12 @@ mod tests {
         let stale = store.put(b"stale", "text/plain", None).await.unwrap();
         let fresh = store.put(b"fresh", "text/plain", None).await.unwrap();
         let now = now_unix();
-        antedate_last_accessed(&store, &stale.blob_id, now - 10 * 86_400).await;
+        antedate_last_accessed(&store, &stale.blob_id, now - 10 * 86_400_000_000).await;
 
-        let purged = store.purge_older_than(now - 3 * 86_400).await.unwrap();
+        let purged = store
+            .purge_older_than(now - 3 * 86_400_000_000)
+            .await
+            .unwrap();
         assert_eq!(purged, 1);
 
         // Stale row is soft-deleted.
@@ -1026,9 +1029,12 @@ mod tests {
         let stale = store.put(b"shared", "text/plain", None).await.unwrap();
         let live = store.put(b"shared", "text/plain", None).await.unwrap();
         let now = now_unix();
-        antedate_last_accessed(&store, &stale.blob_id, now - 10 * 86_400).await;
+        antedate_last_accessed(&store, &stale.blob_id, now - 10 * 86_400_000_000).await;
 
-        let purged = store.purge_older_than(now - 3 * 86_400).await.unwrap();
+        let purged = store
+            .purge_older_than(now - 3 * 86_400_000_000)
+            .await
+            .unwrap();
         assert_eq!(purged, 1);
 
         // Stale row is soft-deleted...
@@ -1061,7 +1067,7 @@ mod tests {
     async fn purge_older_than_is_idempotent_and_returns_zero_on_empty_match() {
         let (store, _dir) = build().await;
         let _ = store.put(b"recent", "text/plain", None).await.unwrap();
-        let cutoff = now_unix() - 30 * 86_400;
+        let cutoff = now_unix() - 30 * 86_400_000_000;
         assert_eq!(store.purge_older_than(cutoff).await.unwrap(), 0);
         // Second call with the same cutoff still finds nothing.
         assert_eq!(store.purge_older_than(cutoff).await.unwrap(), 0);
@@ -1078,14 +1084,17 @@ mod tests {
         let now = now_unix();
 
         // Backdate so the blob would be a victim if untouched.
-        antedate_last_accessed(&store, &blob.blob_id, now - 10 * 86_400).await;
+        antedate_last_accessed(&store, &blob.blob_id, now - 10 * 86_400_000_000).await;
 
         // A read fires the touch — bumps last_accessed_at to ~now.
         assert_eq!(store.get(&blob.blob_id).await.unwrap(), b"hot");
 
         // Sweep with a 7-day cutoff finds nothing, because the touch
         // pushed the timestamp inside the window.
-        let purged = store.purge_older_than(now - 7 * 86_400).await.unwrap();
+        let purged = store
+            .purge_older_than(now - 7 * 86_400_000_000)
+            .await
+            .unwrap();
         assert_eq!(purged, 0, "freshly-accessed blob must survive sweep");
         assert_eq!(store.get(&blob.blob_id).await.unwrap(), b"hot");
 

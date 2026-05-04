@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use aura_job::{Job, JobStatus, JobTransition};
-use aura_model::{BlobRef, MemoryEntry};
-use aura_trace::{SessionTrace, TraceFilter, TraceNode, TraceNodeId};
+use aura_job::{Job, JobStatusKind, JobTransition, VerificationTransition};
+use aura_model::{BlobRef, JobId, MemoryEntry, SessionId, SpanId, StepId};
+use aura_trace::{LifecycleOutcome, RecoveredSpan, RecoveryReport, Span, SpanEvent, Step};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -20,7 +20,7 @@ use crate::StorageError;
 use crate::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };
-use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange, UserMonthlyCost};
 use crate::job::{JobStore, Result as JobStoreResult};
 use crate::memory::{MemoryStore, Result as MemoryStoreResult};
 use crate::secret::{Result as SecretResult, SecretStore};
@@ -78,8 +78,9 @@ impl SecretStore for MemorySecretStore {
 /// appends to a per-job vector so the order of transitions is preserved.
 #[derive(Debug, Default)]
 pub struct MemoryJobStore {
-    jobs: Mutex<HashMap<String, Job>>,
-    transitions: Mutex<HashMap<String, Vec<JobTransition>>>,
+    jobs: Mutex<HashMap<JobId, Job>>,
+    transitions: Mutex<HashMap<JobId, Vec<JobTransition>>>,
+    verification_transitions: Mutex<HashMap<JobId, Vec<VerificationTransition>>>,
 }
 
 impl MemoryJobStore {
@@ -99,45 +100,55 @@ impl MemoryJobStore {
 #[async_trait]
 impl JobStore for MemoryJobStore {
     async fn create(&self, job: &Job) -> JobStoreResult<()> {
-        self.jobs.lock().insert(job.id.clone(), job.clone());
+        self.jobs.lock().insert(job.id, job.clone());
         Ok(())
     }
 
-    async fn get(&self, job_id: &str) -> JobStoreResult<Option<Job>> {
+    async fn get(&self, job_id: &JobId) -> JobStoreResult<Option<Job>> {
         Ok(self.jobs.lock().get(job_id).cloned())
     }
 
     async fn save(&self, job: &Job) -> JobStoreResult<()> {
-        self.jobs.lock().insert(job.id.clone(), job.clone());
+        self.jobs.lock().insert(job.id, job.clone());
         Ok(())
     }
 
-    async fn list_by_session(&self, session_id: &str) -> JobStoreResult<Vec<Job>> {
+    async fn list_by_session(&self, session_id: &SessionId) -> JobStoreResult<Vec<Job>> {
         Ok(self
             .jobs
             .lock()
             .values()
-            .filter(|j| j.session_id == session_id)
+            .filter(|j| &j.session_id == session_id)
             .cloned()
             .collect())
     }
 
-    async fn list_by_status(&self, status: JobStatus) -> JobStoreResult<Vec<Job>> {
+    async fn list_by_status_kind(&self, kind: JobStatusKind) -> JobStoreResult<Vec<Job>> {
         Ok(self
             .jobs
             .lock()
             .values()
-            .filter(|j| j.status == status)
+            .filter(|j| j.status.kind() == kind)
             .cloned()
             .collect())
     }
 
-    async fn list_children(&self, parent_job_id: &str) -> JobStoreResult<Vec<Job>> {
+    async fn list_recoverable(&self) -> JobStoreResult<Vec<Job>> {
         Ok(self
             .jobs
             .lock()
             .values()
-            .filter(|j| j.parent_job_id.as_deref() == Some(parent_job_id))
+            .filter(|j| j.status.kind().needs_recovery())
+            .cloned()
+            .collect())
+    }
+
+    async fn list_children(&self, parent_job_id: &JobId) -> JobStoreResult<Vec<Job>> {
+        Ok(self
+            .jobs
+            .lock()
+            .values()
+            .filter(|j| j.parent_job_id.as_ref() == Some(parent_job_id))
             .cloned()
             .collect())
     }
@@ -149,15 +160,39 @@ impl JobStore for MemoryJobStore {
     async fn record_transition(&self, transition: &JobTransition) -> JobStoreResult<()> {
         self.transitions
             .lock()
-            .entry(transition.job_id.clone())
+            .entry(transition.job_id)
             .or_default()
             .push(transition.clone());
         Ok(())
     }
 
-    async fn get_transitions(&self, job_id: &str) -> JobStoreResult<Vec<JobTransition>> {
+    async fn get_transitions(&self, job_id: &JobId) -> JobStoreResult<Vec<JobTransition>> {
         Ok(self
             .transitions
+            .lock()
+            .get(job_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn record_verification_transition(
+        &self,
+        transition: &VerificationTransition,
+    ) -> JobStoreResult<()> {
+        self.verification_transitions
+            .lock()
+            .entry(transition.job_id)
+            .or_default()
+            .push(transition.clone());
+        Ok(())
+    }
+
+    async fn get_verification_transitions(
+        &self,
+        job_id: &JobId,
+    ) -> JobStoreResult<Vec<VerificationTransition>> {
+        Ok(self
+            .verification_transitions
             .lock()
             .get(job_id)
             .cloned()
@@ -166,10 +201,13 @@ impl JobStore for MemoryJobStore {
 }
 
 /// In-memory `CostStore` for tests. Records are appended in arrival
-/// order; queries scan linearly. Plenty fast for tests.
+/// order; queries scan linearly. Plenty fast for tests. Carries the
+/// `user_monthly_cost` cache too so `CostSubscriber` integration
+/// tests can read it back.
 #[derive(Debug, Default)]
 pub struct MemoryCostStore {
     records: Mutex<Vec<CostRecord>>,
+    monthly: Mutex<HashMap<(String, String), UserMonthlyCost>>,
 }
 
 impl MemoryCostStore {
@@ -218,6 +256,48 @@ impl CostStore for MemoryCostStore {
         Ok(summary)
     }
 
+    async fn bump_user_monthly_cost(
+        &self,
+        user_id: &str,
+        month: &str,
+        delta_usd: f64,
+    ) -> CostResult<()> {
+        let now = chrono::Utc::now();
+        let key = (user_id.to_string(), month.to_string());
+        let mut map = self.monthly.lock();
+        let entry = map.entry(key).or_insert_with(|| UserMonthlyCost {
+            user_id: user_id.to_string(),
+            month: month.to_string(),
+            cost_usd: 0.0,
+            updated_at: now,
+        });
+        entry.cost_usd += delta_usd;
+        entry.updated_at = now;
+        Ok(())
+    }
+
+    async fn get_user_monthly_cost(
+        &self,
+        user_id: &str,
+        month: &str,
+    ) -> CostResult<Option<UserMonthlyCost>> {
+        Ok(self
+            .monthly
+            .lock()
+            .get(&(user_id.to_string(), month.to_string()))
+            .cloned())
+    }
+
+    async fn purge_user_monthly_cost_older_than(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> CostResult<u64> {
+        let mut map = self.monthly.lock();
+        let before = map.len();
+        map.retain(|_, v| v.updated_at >= cutoff);
+        Ok((before - map.len()) as u64)
+    }
+
     async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64> {
         Ok(self
             .records
@@ -229,12 +309,15 @@ impl CostStore for MemoryCostStore {
     }
 }
 
-/// In-memory `TraceStore` for tests. Keyed by `session_id`; `save_trace`
-/// overwrites prior state for that session (mirrors libsql upsert
-/// semantics from the assembly layer's perspective).
+/// In-memory `TraceStore` for tests. Steps are keyed by `StepId`,
+/// spans by `SpanId`, span events by `(SpanId, seq)`. The recovery
+/// scan rewrites half-open spans the same way the libsql implementation
+/// does (`Cancelled { SystemCrash }` outcome + `ended_at` stamp).
 #[derive(Debug, Default)]
 pub struct MemoryTraceStore {
-    traces: Mutex<HashMap<String, SessionTrace>>,
+    steps: Mutex<HashMap<StepId, Step>>,
+    spans: Mutex<HashMap<SpanId, Span>>,
+    span_events: Mutex<HashMap<SpanId, Vec<SpanEvent>>>,
 }
 
 impl MemoryTraceStore {
@@ -243,7 +326,7 @@ impl MemoryTraceStore {
     }
 
     pub fn len(&self) -> usize {
-        self.traces.lock().len()
+        self.spans.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -253,41 +336,136 @@ impl MemoryTraceStore {
 
 #[async_trait]
 impl TraceStore for MemoryTraceStore {
-    async fn save_trace(&self, trace: &SessionTrace) -> TraceStoreResult<()> {
-        self.traces
-            .lock()
-            .insert(trace.session_id.clone(), trace.clone());
+    async fn save_step(&self, step: &Step) -> TraceStoreResult<()> {
+        self.steps.lock().insert(step.id, step.clone());
         Ok(())
     }
 
-    async fn load_trace(&self, session_id: &str) -> TraceStoreResult<Option<SessionTrace>> {
-        Ok(self.traces.lock().get(session_id).cloned())
+    async fn load_step(&self, step_id: &StepId) -> TraceStoreResult<Option<Step>> {
+        Ok(self.steps.lock().get(step_id).cloned())
     }
 
-    async fn query_traces(&self, filter: TraceFilter) -> TraceStoreResult<Vec<SessionTrace>> {
-        let traces = self.traces.lock();
-        Ok(traces
+    async fn list_steps_by_job(&self, job_id: &JobId) -> TraceStoreResult<Vec<Step>> {
+        let mut out: Vec<Step> = self
+            .steps
+            .lock()
             .values()
-            .filter(|t| {
-                filter
-                    .session_id
-                    .as_deref()
-                    .is_none_or(|sid| t.session_id == sid)
-            })
+            .filter(|s| &s.job_id == job_id)
             .cloned()
-            .collect())
+            .collect();
+        out.sort_by_key(|s| s.started_at);
+        Ok(out)
     }
 
-    async fn load_node(
-        &self,
-        session_id: &str,
-        node_id: &TraceNodeId,
-    ) -> TraceStoreResult<Option<TraceNode>> {
+    async fn save_span(&self, span: &Span) -> TraceStoreResult<()> {
+        self.spans.lock().insert(span.id, span.clone());
+        Ok(())
+    }
+
+    async fn load_span(&self, span_id: &SpanId) -> TraceStoreResult<Option<Span>> {
+        Ok(self.spans.lock().get(span_id).cloned())
+    }
+
+    async fn list_spans_by_step(&self, step_id: &StepId) -> TraceStoreResult<Vec<Span>> {
+        let mut out: Vec<Span> = self
+            .spans
+            .lock()
+            .values()
+            .filter(|s| &s.step_id == step_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|s| s.started_at);
+        Ok(out)
+    }
+
+    async fn append_span_event(&self, event: &SpanEvent) -> TraceStoreResult<()> {
+        self.span_events
+            .lock()
+            .entry(event.span_id)
+            .or_default()
+            .push(event.clone());
+        Ok(())
+    }
+
+    async fn list_span_events(&self, span_id: &SpanId) -> TraceStoreResult<Vec<SpanEvent>> {
         Ok(self
-            .traces
+            .span_events
+            .lock()
+            .get(span_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn recover_half_open_spans(&self) -> TraceStoreResult<RecoveryReport> {
+        let now = chrono::Utc::now();
+        let steps_by_id: HashMap<StepId, JobId> = self
+            .steps
+            .lock()
+            .iter()
+            .map(|(k, v)| (*k, v.job_id))
+            .collect();
+        let mut spans = self.spans.lock();
+        let mut recovered = Vec::new();
+        for span in spans.values_mut() {
+            if span.ended_at.is_none() {
+                let job_id = steps_by_id.get(&span.step_id).copied().unwrap_or_default();
+                span.ended_at = Some(now);
+                span.outcome = LifecycleOutcome::Cancelled {
+                    reason: aura_job::CancelReason::SystemCrash,
+                };
+                recovered.push(RecoveredSpan::for_system_crash(job_id, span.id, now));
+            }
+        }
+        Ok(RecoveryReport::new(recovered))
+    }
+}
+
+/// In-memory `TraceEventStore` for tests. Append-only WAL log; replay
+/// returns events in insertion order; compaction drops events whose
+/// `at` is strictly before the cutoff.
+#[derive(Debug, Default)]
+pub struct MemoryTraceEventStore {
+    by_session: Mutex<HashMap<aura_model::SessionId, Vec<crate::trace::TraceLogEvent>>>,
+}
+
+impl MemoryTraceEventStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl crate::trace::TraceEventStore for MemoryTraceEventStore {
+    async fn append(&self, event: &crate::trace::TraceLogEvent) -> TraceStoreResult<()> {
+        self.by_session
+            .lock()
+            .entry(event.session_id.clone())
+            .or_default()
+            .push(event.clone());
+        Ok(())
+    }
+
+    async fn replay_session(
+        &self,
+        session_id: &aura_model::SessionId,
+    ) -> TraceStoreResult<Vec<crate::trace::TraceLogEvent>> {
+        Ok(self
+            .by_session
             .lock()
             .get(session_id)
-            .and_then(|t| t.nodes.get(node_id).cloned()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn compact_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> TraceStoreResult<u64> {
+        let mut by_session = self.by_session.lock();
+        let mut purged = 0u64;
+        for events in by_session.values_mut() {
+            let before = events.len();
+            events.retain(|e| e.at >= cutoff);
+            purged += (before - events.len()) as u64;
+        }
+        Ok(purged)
     }
 }
 

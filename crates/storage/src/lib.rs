@@ -21,7 +21,9 @@ pub use blob::{BlobMeta, BlobStore, SHA256_PREFIX};
 pub use channel_bot::{ChannelBotRow, ChannelBotStore};
 pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 pub use channel_session::ChannelSessionStore;
-pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+pub use cost::{
+    CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange, UserMonthlyCost,
+};
 pub use cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 pub use error::StorageError;
 pub use job::JobStore;
@@ -30,7 +32,7 @@ pub use retry::retry_on_busy;
 pub use secret::SecretStore;
 pub use session::SessionStore;
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
-pub use trace::TraceStore;
+pub use trace::{TraceEventStore, TraceLogEvent, TraceLogEventKind, TraceStore};
 
 /// Bundles all store implementations into a single container
 /// for dependency injection by the assembly layer.
@@ -44,6 +46,7 @@ pub struct Store {
     pub session: std::sync::Arc<dyn SessionStore>,
     pub memory: std::sync::Arc<dyn MemoryStore>,
     pub trace: std::sync::Arc<dyn TraceStore>,
+    pub trace_events: std::sync::Arc<dyn TraceEventStore>,
     pub secret: std::sync::Arc<dyn SecretStore>,
     pub cost: std::sync::Arc<dyn CostStore>,
     pub job: std::sync::Arc<dyn JobStore>,
@@ -83,6 +86,7 @@ impl Store {
             session: std::sync::Arc::new(libsql::LibsqlSessionStore::new(pool.clone())),
             memory: std::sync::Arc::new(libsql::LibsqlMemoryStore::new(pool.clone())),
             trace: std::sync::Arc::new(libsql::LibsqlTraceStore::new(pool.clone())),
+            trace_events: std::sync::Arc::new(libsql::LibsqlTraceEventStore::new(pool.clone())),
             secret: std::sync::Arc::new(libsql::LibsqlSecretStore::new(pool.clone())),
             cost: std::sync::Arc::new(libsql::LibsqlCostStore::new(pool.clone())),
             job: std::sync::Arc::new(libsql::LibsqlJobStore::new(pool.clone())),

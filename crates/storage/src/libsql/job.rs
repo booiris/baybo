@@ -2,7 +2,8 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 use crate::job::JobStore;
-use aura_job::{Job, JobError, JobStatus, JobTransition};
+use aura_job::{Job, JobError, JobStatusKind, JobTransition, VerificationTransition};
+use aura_model::{JobId, SessionId};
 
 pub struct LibsqlJobStore {
     pool: LibsqlPool,
@@ -14,6 +15,31 @@ impl LibsqlJobStore {
     }
 }
 
+fn status_kind_str(k: JobStatusKind) -> &'static str {
+    match k {
+        JobStatusKind::Pending => "pending",
+        JobStatusKind::InProgress => "in_progress",
+        JobStatusKind::Stuck => "stuck",
+        JobStatusKind::Cancelled => "cancelled",
+        JobStatusKind::Failed => "failed",
+        JobStatusKind::Completed => "completed",
+    }
+}
+
+fn job_kind_str(k: aura_job::JobKind) -> &'static str {
+    match k {
+        aura_job::JobKind::UserChat => "user_chat",
+        aura_job::JobKind::Cron => "cron",
+        aura_job::JobKind::System => "system",
+        aura_job::JobKind::Spawned => "spawned",
+    }
+}
+
+fn deserialize_job(data: &str) -> aura_job::Result<Job> {
+    serde_json::from_str(data)
+        .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))
+}
+
 #[async_trait]
 impl JobStore for LibsqlJobStore {
     async fn create(&self, job: &Job) -> aura_job::Result<()> {
@@ -21,15 +47,30 @@ impl JobStore for LibsqlJobStore {
         let data = serde_json::to_string(job)
             .map_err(|e| JobError::Storage(format!("failed to serialize job: {e}")))?;
         conn.execute(
-            "INSERT INTO jobs (id, data) VALUES (?1, ?2)",
-            libsql::params![job.id.clone(), data],
+            "INSERT INTO jobs \
+             (id, session_id, parent_job_id, kind, status_kind, effective_soul_version, \
+              has_verifier, created_at, started_at, ended_at, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            libsql::params![
+                job.id.to_string(),
+                job.session_id.as_str().to_string(),
+                job.parent_job_id.map(|p| p.to_string()),
+                job_kind_str(job.kind).to_string(),
+                status_kind_str(job.status.kind()).to_string(),
+                job.effective_soul_version.clone(),
+                job.verifier.is_some() as i64,
+                super::time::to_us(job.created_at),
+                job.started_at.map(super::time::to_us),
+                job.ended_at.map(super::time::to_us),
+                data,
+            ],
         )
         .await
         .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
         Ok(())
     }
 
-    async fn get(&self, job_id: &str) -> aura_job::Result<Option<Job>> {
+    async fn get(&self, job_id: &JobId) -> aura_job::Result<Option<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
@@ -49,9 +90,7 @@ impl JobStore for LibsqlJobStore {
                 let data: String = row
                     .get(0)
                     .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let job: Job = serde_json::from_str(&data)
-                    .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
-                Ok(Some(job))
+                Ok(Some(deserialize_job(&data)?))
             }
             None => Ok(None),
         }
@@ -64,22 +103,35 @@ impl JobStore for LibsqlJobStore {
 
         let rows_affected = conn
             .execute(
-                "UPDATE jobs SET data = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-                libsql::params![data, job.id.clone()],
+                "UPDATE jobs SET status_kind = ?1, started_at = ?2, ended_at = ?3, \
+                                  data = ?4 \
+                 WHERE id = ?5 AND deleted_at IS NULL",
+                libsql::params![
+                    status_kind_str(job.status.kind()).to_string(),
+                    job.started_at.map(super::time::to_us),
+                    job.ended_at.map(super::time::to_us),
+                    data,
+                    job.id.to_string(),
+                ],
             )
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql update error: {e}")))?;
 
         if rows_affected == 0 {
-            return Err(JobError::NotFound(job.id.clone()));
+            return Err(JobError::NotFound(job.id.to_string()));
         }
         Ok(())
     }
 
-    async fn list_by_session(&self, session_id: &str) -> aura_job::Result<Vec<Job>> {
+    async fn list_by_session(&self, session_id: &SessionId) -> aura_job::Result<Vec<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM jobs WHERE deleted_at IS NULL", ())
+            .query(
+                "SELECT data FROM jobs \
+                 WHERE session_id = ?1 AND deleted_at IS NULL \
+                 ORDER BY created_at",
+                libsql::params![session_id.as_str().to_string()],
+            )
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -92,19 +144,20 @@ impl JobStore for LibsqlJobStore {
             let data: String = row
                 .get(0)
                 .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let job: Job = serde_json::from_str(&data)
-                .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
-            if job.session_id == session_id {
-                jobs.push(job);
-            }
+            jobs.push(deserialize_job(&data)?);
         }
         Ok(jobs)
     }
 
-    async fn list_by_status(&self, status: JobStatus) -> aura_job::Result<Vec<Job>> {
+    async fn list_by_status_kind(&self, kind: JobStatusKind) -> aura_job::Result<Vec<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM jobs WHERE deleted_at IS NULL", ())
+            .query(
+                "SELECT data FROM jobs \
+                 WHERE status_kind = ?1 AND deleted_at IS NULL \
+                 ORDER BY created_at",
+                libsql::params![status_kind_str(kind).to_string()],
+            )
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -117,19 +170,21 @@ impl JobStore for LibsqlJobStore {
             let data: String = row
                 .get(0)
                 .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let job: Job = serde_json::from_str(&data)
-                .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
-            if job.status == status {
-                jobs.push(job);
-            }
+            jobs.push(deserialize_job(&data)?);
         }
         Ok(jobs)
     }
 
-    async fn list_children(&self, parent_job_id: &str) -> aura_job::Result<Vec<Job>> {
+    async fn list_recoverable(&self) -> aura_job::Result<Vec<Job>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT data FROM jobs WHERE deleted_at IS NULL", ())
+            .query(
+                "SELECT data FROM jobs \
+                 WHERE status_kind IN ('pending', 'in_progress', 'stuck') \
+                   AND deleted_at IS NULL \
+                 ORDER BY created_at",
+                (),
+            )
             .await
             .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -142,11 +197,33 @@ impl JobStore for LibsqlJobStore {
             let data: String = row
                 .get(0)
                 .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let job: Job = serde_json::from_str(&data)
-                .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
-            if job.parent_job_id.as_deref() == Some(parent_job_id) {
-                jobs.push(job);
-            }
+            jobs.push(deserialize_job(&data)?);
+        }
+        Ok(jobs)
+    }
+
+    async fn list_children(&self, parent_job_id: &JobId) -> aura_job::Result<Vec<Job>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT data FROM jobs \
+                 WHERE parent_job_id = ?1 AND deleted_at IS NULL \
+                 ORDER BY created_at",
+                libsql::params![parent_job_id.to_string()],
+            )
+            .await
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+
+        let mut jobs = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            jobs.push(deserialize_job(&data)?);
         }
         Ok(jobs)
     }
@@ -167,9 +244,7 @@ impl JobStore for LibsqlJobStore {
             let data: String = row
                 .get(0)
                 .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let job: Job = serde_json::from_str(&data)
-                .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))?;
-            jobs.push(job);
+            jobs.push(deserialize_job(&data)?);
         }
         Ok(jobs)
     }
@@ -180,18 +255,19 @@ impl JobStore for LibsqlJobStore {
             .map_err(|e| JobError::Storage(format!("failed to serialize transition: {e}")))?;
         conn.execute(
             "INSERT INTO job_transitions (job_id, data) VALUES (?1, ?2)",
-            libsql::params![transition.job_id.clone(), data],
+            libsql::params![transition.job_id.to_string(), data],
         )
         .await
         .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
         Ok(())
     }
 
-    async fn get_transitions(&self, job_id: &str) -> aura_job::Result<Vec<JobTransition>> {
+    async fn get_transitions(&self, job_id: &JobId) -> aura_job::Result<Vec<JobTransition>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM job_transitions WHERE job_id = ?1 AND deleted_at IS NULL",
+                "SELECT data FROM job_transitions \
+                 WHERE job_id = ?1 AND deleted_at IS NULL ORDER BY id",
                 libsql::params![job_id.to_string()],
             )
             .await
@@ -206,9 +282,56 @@ impl JobStore for LibsqlJobStore {
             let data: String = row
                 .get(0)
                 .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let transition: JobTransition = serde_json::from_str(&data)
+            let t: JobTransition = serde_json::from_str(&data)
                 .map_err(|e| JobError::Storage(format!("failed to deserialize transition: {e}")))?;
-            transitions.push(transition);
+            transitions.push(t);
+        }
+        Ok(transitions)
+    }
+
+    async fn record_verification_transition(
+        &self,
+        transition: &VerificationTransition,
+    ) -> aura_job::Result<()> {
+        let conn = self.pool.conn();
+        let data = serde_json::to_string(transition)
+            .map_err(|e| JobError::Storage(format!("failed to serialize verification: {e}")))?;
+        conn.execute(
+            "INSERT INTO job_verification_transitions (job_id, data) VALUES (?1, ?2)",
+            libsql::params![transition.job_id.to_string(), data],
+        )
+        .await
+        .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_verification_transitions(
+        &self,
+        job_id: &JobId,
+    ) -> aura_job::Result<Vec<VerificationTransition>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT data FROM job_verification_transitions \
+                 WHERE job_id = ?1 AND deleted_at IS NULL ORDER BY id",
+                libsql::params![job_id.to_string()],
+            )
+            .await
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+
+        let mut transitions = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let t: VerificationTransition = serde_json::from_str(&data).map_err(|e| {
+                JobError::Storage(format!("failed to deserialize verification: {e}"))
+            })?;
+            transitions.push(t);
         }
         Ok(transitions)
     }
@@ -217,42 +340,41 @@ impl JobStore for LibsqlJobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_job::OperationKind;
+    use aura_job::{JobInput, JobStatus};
+    use aura_model::ContentBlock;
 
-    fn test_job(id: &str) -> Job {
-        let mut job = Job::new(
-            "sess-1",
-            OperationKind::LlmCall {
-                model: "gpt-4".to_string(),
+    fn test_job() -> Job {
+        Job::new(
+            SessionId::from("sess-1"),
+            JobInput::UserChat {
+                content: vec![ContentBlock::Text("hi".into())],
             },
+            "soul-v1",
             None,
-        );
-        job.id = id.to_string();
-        job
+            None,
+        )
     }
 
     #[tokio::test]
     async fn create_and_get() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
-        store.create(&test_job("j1")).await.unwrap();
-        let job = store.get("j1").await.unwrap();
-        assert!(job.is_some());
-        assert_eq!(job.unwrap().id, "j1");
+        let j = test_job();
+        store.create(&j).await.unwrap();
+        let loaded = store.get(&j.id).await.unwrap().unwrap();
+        assert_eq!(loaded.id, j.id);
     }
 
     #[tokio::test]
-    async fn save_updates_job() {
+    async fn save_updates_status() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
-        let mut job = test_job("j2");
-        store.create(&job).await.unwrap();
-
-        job.start().unwrap();
-        store.save(&job).await.unwrap();
-
-        let loaded = store.get("j2").await.unwrap().unwrap();
-        assert_eq!(loaded.status, JobStatus::InProgress);
+        let mut j = test_job();
+        store.create(&j).await.unwrap();
+        j.start().unwrap();
+        store.save(&j).await.unwrap();
+        let loaded = store.get(&j.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.status, JobStatus::InProgress));
         assert!(loaded.started_at.is_some());
     }
 
@@ -260,35 +382,69 @@ mod tests {
     async fn save_nonexistent_returns_not_found() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
-        let job = test_job("nonexistent");
-        let err = store.save(&job).await.unwrap_err();
+        let j = test_job();
+        let err = store.save(&j).await.unwrap_err();
         assert!(matches!(err, JobError::NotFound(_)));
     }
 
     #[tokio::test]
-    async fn list_by_session() {
+    async fn list_by_session_filters() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
-        store.create(&test_job("j3")).await.unwrap();
-        store.create(&test_job("j4")).await.unwrap();
-        let jobs = store.list_by_session("sess-1").await.unwrap();
+        let a = test_job();
+        let b = test_job();
+        store.create(&a).await.unwrap();
+        store.create(&b).await.unwrap();
+        let jobs = store
+            .list_by_session(&SessionId::from("sess-1"))
+            .await
+            .unwrap();
         assert_eq!(jobs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_recoverable_includes_pending_in_progress_stuck() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlJobStore::new(pool);
+        let pending = test_job();
+        store.create(&pending).await.unwrap();
+
+        let mut in_progress = test_job();
+        in_progress.start().unwrap();
+        store.create(&in_progress).await.unwrap();
+
+        let mut stuck = test_job();
+        stuck.start().unwrap();
+        stuck.stuck("hung").unwrap();
+        store.create(&stuck).await.unwrap();
+
+        let mut completed = test_job();
+        completed.start().unwrap();
+        completed
+            .complete(aura_job::JobOutput::Message {
+                content: vec![ContentBlock::Text("ok".into())],
+            })
+            .unwrap();
+        store.create(&completed).await.unwrap();
+
+        let recoverable = store.list_recoverable().await.unwrap();
+        assert_eq!(recoverable.len(), 3);
+        // Completed must be excluded
+        for j in &recoverable {
+            assert!(!matches!(j.status, JobStatus::Completed { .. }));
+        }
     }
 
     #[tokio::test]
     async fn record_and_get_transitions() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
-        let transition = JobTransition {
-            job_id: "j5".to_string(),
-            from: JobStatus::Pending,
-            to: JobStatus::InProgress,
-            reason: Some("started".to_string()),
-            timestamp: chrono::Utc::now(),
-        };
-        store.record_transition(&transition).await.unwrap();
-        let transitions = store.get_transitions("j5").await.unwrap();
-        assert_eq!(transitions.len(), 1);
-        assert_eq!(transitions[0].to, JobStatus::InProgress);
+        let mut j = test_job();
+        store.create(&j).await.unwrap();
+        let t = j.start().unwrap();
+        store.record_transition(&t).await.unwrap();
+        let ts = store.get_transitions(&j.id).await.unwrap();
+        assert_eq!(ts.len(), 1);
+        assert!(matches!(ts[0].to, JobStatus::InProgress));
     }
 }

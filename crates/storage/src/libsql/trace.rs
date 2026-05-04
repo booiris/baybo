@@ -1,13 +1,18 @@
-use std::collections::HashMap;
+//! libsql implementation of `TraceStore` + `TraceEventStore`.
+//!
+//! Schema lives in `super::mod::init_db` (`steps`, `spans`,
+//! `span_events`, `trace_events`). Soft-delete + recovery semantics are
+//! enforced here.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use crate::trace::{Result, TraceStore};
+use crate::trace::{TraceEventStore, TraceLogEvent, TraceStore};
+use aura_model::{JobId, SessionId, SpanId, StepId};
 use aura_trace::{
-    ExecutionProvenance, ForkRecord, SessionTrace, SpanInput, SpanResult, TraceError, TraceFilter,
-    TraceNode, TraceNodeId, TraceSpan,
+    LifecycleOutcome, RecoveredSpan, RecoveryReport, Span, SpanEvent, SpanEventKind, SpanKind,
+    Step, StepKind, TraceError,
 };
 
 pub struct LibsqlTraceStore {
@@ -20,623 +25,537 @@ impl LibsqlTraceStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn ser<T: serde::Serialize>(val: &T) -> Result<String> {
-    serde_json::to_string(val).map_err(|e| TraceError::Storage(format!("serialize: {e}")))
+pub struct LibsqlTraceEventStore {
+    pool: LibsqlPool,
 }
 
-fn de<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
-    serde_json::from_str(s).map_err(|e| TraceError::Storage(format!("deserialize: {e}")))
+impl LibsqlTraceEventStore {
+    pub fn new(pool: LibsqlPool) -> Self {
+        Self { pool }
+    }
 }
 
-fn ie(msg: impl std::fmt::Display) -> TraceError {
-    TraceError::Internal(anyhow::anyhow!("{msg}"))
+fn step_kind_str(k: &StepKind) -> &'static str {
+    match k {
+        StepKind::LlmIteration => "llm_iteration",
+        StepKind::ToolDirect => "tool_direct",
+        StepKind::Compression => "compression",
+        StepKind::MemoryRecall => "memory_recall",
+        StepKind::MemoryWrite => "memory_write",
+        StepKind::SkillSelection => "skill_selection",
+        StepKind::Subagent { .. } => "subagent",
+    }
 }
 
-// ---------------------------------------------------------------------------
-// TraceStore implementation
-// ---------------------------------------------------------------------------
+fn span_kind_str(k: &SpanKind) -> &'static str {
+    match k {
+        SpanKind::LlmCall { .. } => "llm_call",
+        SpanKind::ToolCall { .. } => "tool_call",
+        SpanKind::SubagentStub { .. } => "subagent_stub",
+    }
+}
+
+fn span_event_kind_str(k: &SpanEventKind) -> &'static str {
+    match k {
+        SpanEventKind::SanitizeHit { .. } => "sanitize_hit",
+        SpanEventKind::Approval { .. } => "approval",
+        SpanEventKind::HookDegraded { .. } => "hook_degraded",
+    }
+}
+
+fn outcome_str(o: &LifecycleOutcome) -> &'static str {
+    match o {
+        LifecycleOutcome::Pending => "pending",
+        LifecycleOutcome::Ok => "ok",
+        LifecycleOutcome::Failed { .. } => "failed",
+        LifecycleOutcome::Cancelled { .. } => "cancelled",
+    }
+}
 
 #[async_trait]
 impl TraceStore for LibsqlTraceStore {
-    async fn save_trace(&self, trace: &SessionTrace) -> Result<()> {
+    async fn save_step(&self, step: &Step) -> aura_trace::Result<()> {
         let conn = self.pool.conn();
-        let sid = &trace.session_id;
-        let now = Utc::now().to_rfc3339();
-
-        let tx = conn
-            .transaction()
-            .await
-            .map_err(|e| ie(format!("begin tx: {e}")))?;
-
-        // Upsert trace header (reset deleted_at on re-insert to revive soft-deleted rows).
-        tx.execute(
-            "INSERT INTO session_traces (session_id, root_node, active_leaf, created_at, updated_at, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)
-             ON CONFLICT(session_id) DO UPDATE SET
-                 root_node   = excluded.root_node,
-                 active_leaf = excluded.active_leaf,
-                 updated_at  = excluded.updated_at,
-                 deleted_at  = NULL",
+        let data = serde_json::to_string(step)
+            .map_err(|e| TraceError::Storage(format!("serialize step: {e}")))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO steps \
+             (id, job_id, kind, started_at, ended_at, outcome, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             libsql::params![
-                sid.clone(),
-                trace.root.clone(),
-                trace.active_leaf.clone(),
-                now.clone(),
-                now.clone()
+                step.id.to_string(),
+                step.job_id.to_string(),
+                step_kind_str(&step.kind).to_string(),
+                super::time::to_us(step.started_at),
+                step.ended_at.map(super::time::to_us),
+                outcome_str(&step.outcome).to_string(),
+                data,
             ],
         )
         .await
-        .map_err(|e| ie(format!("upsert session_traces: {e}")))?;
-
-        // Soft-delete all existing nodes; current nodes are revived below.
-        let ts = Utc::now().timestamp();
-        tx.execute(
-            "UPDATE trace_nodes SET deleted_at = ?1 WHERE session_id = ?2 AND deleted_at IS NULL",
-            libsql::params![ts, sid.clone()],
-        )
-        .await
-        .map_err(|e| ie(format!("soft-delete trace_nodes: {e}")))?;
-
-        // Upsert every node with proper columns.
-        for node in trace.nodes.values() {
-            let kind_json = ser(&node.span.kind)?;
-            let prov_json = ser(&node.span.provenance)?;
-            let input_json = ser(&node.span.input)?;
-            let result_json: Option<String> = node.span.result.as_ref().map(ser).transpose()?;
-            let started = node.span.started_at.to_rfc3339();
-            let ended: Option<String> = node.span.ended_at.map(|t| t.to_rfc3339());
-
-            tx.execute(
-                "INSERT OR REPLACE INTO trace_nodes
-                    (id, session_id, parent_id, kind, job_id, provenance,
-                     input, result, started_at, ended_at, deleted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
-                libsql::params![
-                    node.id.clone(),
-                    sid.clone(),
-                    node.parent.clone().unwrap_or_default(),
-                    kind_json,
-                    node.span.job_id.clone().unwrap_or_default(),
-                    prov_json,
-                    input_json,
-                    result_json.unwrap_or_default(),
-                    started,
-                    ended.unwrap_or_default()
-                ],
-            )
-            .await
-            .map_err(|e| ie(format!("upsert trace_node {}: {e}", node.id)))?;
-        }
-
-        // Soft-delete old forks; current forks are revived below.
-        tx.execute(
-            "UPDATE trace_forks SET deleted_at = ?1 WHERE session_id = ?2 AND deleted_at IS NULL",
-            libsql::params![ts, sid.clone()],
-        )
-        .await
-        .map_err(|e| ie(format!("soft-delete trace_forks: {e}")))?;
-
-        for fork in &trace.forks {
-            tx.execute(
-                "INSERT OR REPLACE INTO trace_forks
-                    (id, session_id, from_node, fork_root, reason, created_at, deleted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-                libsql::params![
-                    fork.id.clone(),
-                    sid.clone(),
-                    fork.from_node.clone(),
-                    fork.fork_root.clone(),
-                    fork.reason.clone(),
-                    fork.created_at.to_rfc3339()
-                ],
-            )
-            .await
-            .map_err(|e| ie(format!("upsert trace_fork {}: {e}", fork.id)))?;
-        }
-
-        tx.commit().await.map_err(|e| ie(format!("commit: {e}")))?;
+        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert step: {e}")))?;
         Ok(())
     }
 
-    async fn load_trace(&self, session_id: &str) -> Result<Option<SessionTrace>> {
+    async fn load_step(&self, step_id: &StepId) -> aura_trace::Result<Option<Step>> {
         let conn = self.pool.conn();
-
-        // Load header.
         let mut rows = conn
             .query(
-                "SELECT root_node, active_leaf FROM session_traces WHERE session_id = ?1 AND deleted_at IS NULL",
-                libsql::params![session_id.to_string()],
+                "SELECT data FROM steps WHERE id = ?1 AND deleted_at IS NULL",
+                libsql::params![step_id.to_string()],
             )
             .await
-            .map_err(|e| ie(format!("query session_traces: {e}")))?;
-
-        let Some(hdr) = rows.next().await.map_err(|e| ie(format!("row: {e}")))? else {
-            return Ok(None);
-        };
-
-        let root: String = hdr.get(0).map_err(|e| ie(format!("get root: {e}")))?;
-        let active_leaf: String = hdr.get(1).map_err(|e| ie(format!("get leaf: {e}")))?;
-
-        // Load all live nodes.
-        let nodes = self.load_nodes(conn, session_id).await?;
-
-        // Load forks.
-        let forks = self.load_forks(conn, session_id).await?;
-
-        Ok(Some(SessionTrace {
-            session_id: session_id.to_string(),
-            root,
-            nodes,
-            forks,
-            active_leaf,
-        }))
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
+        match row {
+            Some(row) => {
+                let data: String = row
+                    .get(0)
+                    .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let s: Step = serde_json::from_str(&data)
+                    .map_err(|e| TraceError::Storage(format!("deserialize step: {e}")))?;
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
     }
 
-    async fn query_traces(&self, filter: TraceFilter) -> Result<Vec<SessionTrace>> {
+    async fn list_steps_by_job(&self, job_id: &JobId) -> aura_trace::Result<Vec<Step>> {
         let conn = self.pool.conn();
-
-        // Query headers.
-        let mut rows = if let Some(ref sid) = filter.session_id {
-            conn.query(
-                "SELECT session_id, root_node, active_leaf FROM session_traces WHERE session_id = ?1 AND deleted_at IS NULL",
-                libsql::params![sid.clone()],
+        let mut rows = conn
+            .query(
+                "SELECT data FROM steps \
+                 WHERE job_id = ?1 AND deleted_at IS NULL ORDER BY started_at",
+                libsql::params![job_id.to_string()],
             )
             .await
-        } else {
-            conn.query(
-                "SELECT session_id, root_node, active_leaf FROM session_traces WHERE deleted_at IS NULL",
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let mut steps = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            steps.push(
+                serde_json::from_str(&data)
+                    .map_err(|e| TraceError::Storage(format!("deserialize step: {e}")))?,
+            );
+        }
+        Ok(steps)
+    }
+
+    async fn save_span(&self, span: &Span) -> aura_trace::Result<()> {
+        let conn = self.pool.conn();
+        let data = serde_json::to_string(span)
+            .map_err(|e| TraceError::Storage(format!("serialize span: {e}")))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO spans \
+             (id, step_id, kind, parallel_group, started_at, ended_at, outcome, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            libsql::params![
+                span.id.to_string(),
+                span.step_id.to_string(),
+                span_kind_str(&span.kind).to_string(),
+                span.parallel_group.map(|g| g.to_string()),
+                super::time::to_us(span.started_at),
+                span.ended_at.map(super::time::to_us),
+                outcome_str(&span.outcome).to_string(),
+                data,
+            ],
+        )
+        .await
+        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert span: {e}")))?;
+        Ok(())
+    }
+
+    async fn load_span(&self, span_id: &SpanId) -> aura_trace::Result<Option<Span>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT data FROM spans WHERE id = ?1 AND deleted_at IS NULL",
+                libsql::params![span_id.to_string()],
+            )
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
+        match row {
+            Some(row) => {
+                let data: String = row
+                    .get(0)
+                    .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let s: Span = serde_json::from_str(&data)
+                    .map_err(|e| TraceError::Storage(format!("deserialize span: {e}")))?;
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn list_spans_by_step(&self, step_id: &StepId) -> aura_trace::Result<Vec<Span>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT data FROM spans \
+                 WHERE step_id = ?1 AND deleted_at IS NULL ORDER BY started_at",
+                libsql::params![step_id.to_string()],
+            )
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let mut spans = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            spans.push(
+                serde_json::from_str(&data)
+                    .map_err(|e| TraceError::Storage(format!("deserialize span: {e}")))?,
+            );
+        }
+        Ok(spans)
+    }
+
+    async fn append_span_event(&self, event: &SpanEvent) -> aura_trace::Result<()> {
+        let conn = self.pool.conn();
+        let data = serde_json::to_string(event)
+            .map_err(|e| TraceError::Storage(format!("serialize span_event: {e}")))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO span_events (span_id, seq, at, kind, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            libsql::params![
+                event.span_id.to_string(),
+                event.seq as i64,
+                super::time::to_us(event.at),
+                span_event_kind_str(&event.kind).to_string(),
+                data,
+            ],
+        )
+        .await
+        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert span_event: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_span_events(&self, span_id: &SpanId) -> aura_trace::Result<Vec<SpanEvent>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT data FROM span_events \
+                 WHERE span_id = ?1 AND deleted_at IS NULL ORDER BY seq",
+                libsql::params![span_id.to_string()],
+            )
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let mut events = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            events.push(
+                serde_json::from_str(&data)
+                    .map_err(|e| TraceError::Storage(format!("deserialize span_event: {e}")))?,
+            );
+        }
+        Ok(events)
+    }
+
+    async fn recover_half_open_spans(&self) -> aura_trace::Result<RecoveryReport> {
+        let conn = self.pool.conn();
+        // Find half-open spans + their parent job (joining via the step).
+        let mut rows = conn
+            .query(
+                "SELECT spans.id, steps.job_id, spans.data \
+                 FROM spans \
+                 JOIN steps ON steps.id = spans.step_id \
+                 WHERE spans.ended_at IS NULL \
+                   AND spans.deleted_at IS NULL",
                 (),
             )
             .await
-        }
-        .map_err(|e| ie(format!("query session_traces: {e}")))?;
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
-        let mut headers = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| ie(format!("row: {e}")))? {
-            let sid: String = row.get(0).map_err(|e| ie(format!("get sid: {e}")))?;
-            let root: String = row.get(1).map_err(|e| ie(format!("get root: {e}")))?;
-            let leaf: String = row.get(2).map_err(|e| ie(format!("get leaf: {e}")))?;
-            headers.push((sid, root, leaf));
-        }
-
-        let mut traces = Vec::new();
-        for (sid, root, leaf) in headers {
-            let nodes = self.load_nodes(conn, &sid).await?;
-            let forks = self.load_forks(conn, &sid).await?;
-
-            let trace = SessionTrace {
-                session_id: sid,
-                root,
-                nodes,
-                forks,
-                active_leaf: leaf,
-            };
-
-            // Apply time filters.
-            if let Some(ref from) = filter.from
-                && trace.nodes.values().all(|n| n.span.started_at < *from)
-            {
-                continue;
-            }
-            if let Some(ref to) = filter.to
-                && trace.nodes.values().all(|n| n.span.started_at >= *to)
-            {
-                continue;
-            }
-
-            traces.push(trace);
-        }
-
-        Ok(traces)
-    }
-
-    async fn load_node(
-        &self,
-        session_id: &str,
-        node_id: &TraceNodeId,
-    ) -> Result<Option<TraceNode>> {
-        let conn = self.pool.conn();
-
-        let mut rows = conn
-            .query(
-                "SELECT id, parent_id, kind, job_id, provenance, input,
-                        result, started_at, ended_at
-                 FROM trace_nodes
-                 WHERE session_id = ?1 AND id = ?2 AND deleted_at IS NULL",
-                libsql::params![session_id.to_string(), node_id.clone()],
-            )
-            .await
-            .map_err(|e| ie(format!("query trace_node: {e}")))?;
-
-        let Some(row) = rows.next().await.map_err(|e| ie(format!("row: {e}")))? else {
-            return Ok(None);
-        };
-
-        let node = Self::row_to_node(&row)?;
-
-        // Populate children by querying nodes whose parent_id matches.
-        let mut child_rows = conn
-            .query(
-                "SELECT id FROM trace_nodes
-                 WHERE session_id = ?1 AND parent_id = ?2 AND deleted_at IS NULL",
-                libsql::params![session_id.to_string(), node_id.clone()],
-            )
-            .await
-            .map_err(|e| ie(format!("query children: {e}")))?;
-
-        let mut children = Vec::new();
-        while let Some(cr) = child_rows
+        let now = Utc::now();
+        let mut recovered = Vec::new();
+        let mut to_rewrite: Vec<(String, Span)> = Vec::new();
+        while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| ie(format!("child row: {e}")))?
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
         {
-            let cid: String = cr.get(0).map_err(|e| ie(format!("get child id: {e}")))?;
-            children.push(cid);
+            let span_id_str: String = row
+                .get(0)
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let job_id_str: String = row
+                .get(1)
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let data: String = row
+                .get(2)
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let span: Span = serde_json::from_str(&data)
+                .map_err(|e| TraceError::Storage(format!("deserialize span: {e}")))?;
+            let job_id: JobId = job_id_str
+                .parse()
+                .map_err(|e| TraceError::Storage(format!("decode job_id: {e}")))?;
+            recovered.push(RecoveredSpan::for_system_crash(job_id, span.id, now));
+            to_rewrite.push((span_id_str, span));
         }
 
-        Ok(Some(TraceNode { children, ..node }))
+        // Rewrite each half-open span: stamp ended_at + cancelled outcome.
+        for (span_id, mut span) in to_rewrite {
+            span.ended_at = Some(now);
+            span.outcome = LifecycleOutcome::Cancelled {
+                reason: aura_job::CancelReason::SystemCrash,
+            };
+            let data = serde_json::to_string(&span)
+                .map_err(|e| TraceError::Storage(format!("reserialize span: {e}")))?;
+            conn.execute(
+                "UPDATE spans SET ended_at = ?1, outcome = 'cancelled', data = ?2 \
+                 WHERE id = ?3 AND ended_at IS NULL AND deleted_at IS NULL",
+                libsql::params![super::time::to_us(now), data, span_id],
+            )
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql update: {e}")))?;
+        }
+        Ok(RecoveryReport::new(recovered))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
-impl LibsqlTraceStore {
-    /// Load all live nodes for a session and reconstruct the children lists
-    /// from `parent_id` references.
-    async fn load_nodes(
-        &self,
-        conn: &libsql::Connection,
-        session_id: &str,
-    ) -> Result<HashMap<TraceNodeId, TraceNode>> {
-        let mut rows = conn
-            .query(
-                "SELECT id, parent_id, kind, job_id, provenance, input,
-                        result, started_at, ended_at
-                 FROM trace_nodes
-                 WHERE session_id = ?1 AND deleted_at IS NULL
-                 ORDER BY started_at",
-                libsql::params![session_id.to_string()],
-            )
-            .await
-            .map_err(|e| ie(format!("query trace_nodes: {e}")))?;
-
-        let mut nodes = HashMap::new();
-        while let Some(row) = rows.next().await.map_err(|e| ie(format!("row: {e}")))? {
-            let node = Self::row_to_node(&row)?;
-            nodes.insert(node.id.clone(), node);
-        }
-
-        // Derive children from parent_id.
-        let parent_map: Vec<(TraceNodeId, Option<TraceNodeId>)> = nodes
-            .values()
-            .map(|n| (n.id.clone(), n.parent.clone()))
-            .collect();
-        for (child_id, parent_id) in parent_map {
-            if let Some(pid) = parent_id
-                && let Some(parent) = nodes.get_mut(&pid)
-            {
-                parent.children.push(child_id);
-            }
-        }
-
-        Ok(nodes)
+#[async_trait]
+impl TraceEventStore for LibsqlTraceEventStore {
+    async fn append(&self, event: &TraceLogEvent) -> aura_trace::Result<()> {
+        let conn = self.pool.conn();
+        let data = serde_json::to_string(event)
+            .map_err(|e| TraceError::Storage(format!("serialize trace_event: {e}")))?;
+        conn.execute(
+            "INSERT INTO trace_events (session_id, job_id, at, data) \
+             VALUES (?1, ?2, ?3, ?4)",
+            libsql::params![
+                event.session_id.as_str().to_string(),
+                event.job_id.to_string(),
+                super::time::to_us(event.at),
+                data,
+            ],
+        )
+        .await
+        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert trace_event: {e}")))?;
+        Ok(())
     }
 
-    /// Load fork records for a session.
-    async fn load_forks(
+    async fn replay_session(
         &self,
-        conn: &libsql::Connection,
-        session_id: &str,
-    ) -> Result<Vec<ForkRecord>> {
+        session_id: &SessionId,
+    ) -> aura_trace::Result<Vec<TraceLogEvent>> {
+        let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT id, from_node, fork_root, reason, created_at
-                 FROM trace_forks WHERE session_id = ?1 AND deleted_at IS NULL ORDER BY created_at",
-                libsql::params![session_id.to_string()],
+                "SELECT data FROM trace_events \
+                 WHERE session_id = ?1 AND deleted_at IS NULL ORDER BY id",
+                libsql::params![session_id.as_str().to_string()],
             )
             .await
-            .map_err(|e| ie(format!("query trace_forks: {e}")))?;
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
-        let mut forks = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| ie(format!("row: {e}")))? {
-            let id: String = row.get(0).map_err(|e| ie(format!("get: {e}")))?;
-            let from_node: String = row.get(1).map_err(|e| ie(format!("get: {e}")))?;
-            let fork_root: String = row.get(2).map_err(|e| ie(format!("get: {e}")))?;
-            let reason: String = row.get(3).map_err(|e| ie(format!("get: {e}")))?;
-            let created_str: String = row.get(4).map_err(|e| ie(format!("get: {e}")))?;
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            forks.push(ForkRecord {
-                id,
-                from_node,
-                fork_root,
-                reason,
-                created_at,
-            });
+        let mut events = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            events.push(
+                serde_json::from_str(&data)
+                    .map_err(|e| TraceError::Storage(format!("deserialize trace_event: {e}")))?,
+            );
         }
-        Ok(forks)
+        Ok(events)
     }
 
-    /// Convert a single database row into a `TraceNode` (with empty children;
-    /// the caller fills them in from `parent_id` relationships).
-    fn row_to_node(row: &libsql::Row) -> Result<TraceNode> {
-        let id: String = row.get(0).map_err(|e| ie(format!("get id: {e}")))?;
-        let parent_raw: String = row.get(1).map_err(|e| ie(format!("get parent: {e}")))?;
-        let kind_json: String = row.get(2).map_err(|e| ie(format!("get kind: {e}")))?;
-        let job_raw: String = row.get(3).map_err(|e| ie(format!("get job: {e}")))?;
-        let prov_json: String = row.get(4).map_err(|e| ie(format!("get prov: {e}")))?;
-        let input_json: String = row.get(5).map_err(|e| ie(format!("get input: {e}")))?;
-        let result_raw: String = row.get(6).map_err(|e| ie(format!("get result: {e}")))?;
-        let started_str: String = row.get(7).map_err(|e| ie(format!("get started: {e}")))?;
-        let ended_raw: String = row.get(8).map_err(|e| ie(format!("get ended: {e}")))?;
-
-        let parent = if parent_raw.is_empty() {
-            None
-        } else {
-            Some(parent_raw)
-        };
-
-        let kind = de(&kind_json)?;
-
-        let provenance: ExecutionProvenance = if prov_json.is_empty() {
-            ExecutionProvenance::default()
-        } else {
-            de(&prov_json)?
-        };
-
-        let input: SpanInput = if input_json.is_empty() {
-            SpanInput::None
-        } else {
-            de(&input_json)?
-        };
-
-        let result: Option<SpanResult> = if result_raw.is_empty() {
-            None
-        } else {
-            Some(de(&result_raw)?)
-        };
-
-        let started_at = chrono::DateTime::parse_from_rfc3339(&started_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-
-        let ended_at = if ended_raw.is_empty() {
-            None
-        } else {
-            chrono::DateTime::parse_from_rfc3339(&ended_raw)
-                .map(|dt| Some(dt.with_timezone(&Utc)))
-                .unwrap_or(None)
-        };
-
-        let job_id = if job_raw.is_empty() {
-            None
-        } else {
-            Some(job_raw)
-        };
-
-        Ok(TraceNode {
-            id,
-            parent,
-            children: Vec::new(), // populated by caller
-            span: TraceSpan {
-                kind,
-                job_id,
-                provenance,
-                input,
-                started_at,
-                ended_at,
-                result,
-            },
-        })
+    async fn compact_before(&self, cutoff: DateTime<Utc>) -> aura_trace::Result<u64> {
+        let conn = self.pool.conn();
+        let now = super::time::now_us();
+        let affected = conn
+            .execute(
+                "UPDATE trace_events SET deleted_at = ?1 \
+                 WHERE at < ?2 AND deleted_at IS NULL",
+                libsql::params![now, super::time::to_us(cutoff)],
+            )
+            .await
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql update: {e}")))?;
+        Ok(affected)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_job::OperationKind;
-    use aura_trace::SpanResult;
+    use aura_trace::ToolCallOrigin;
 
-    fn make_trace(session_id: &str) -> SessionTrace {
-        let node_id = "n1".to_string();
-        let node = TraceNode {
-            id: node_id.clone(),
-            parent: None,
-            children: vec![],
-            span: TraceSpan {
-                kind: OperationKind::LlmCall {
-                    model: "gpt-4".to_string(),
-                },
-                job_id: None,
-                provenance: ExecutionProvenance::default(),
-                input: SpanInput::None,
-                started_at: Utc::now(),
-                ended_at: None,
-                result: None,
-            },
-        };
-        let mut nodes = HashMap::new();
-        nodes.insert(node_id.clone(), node);
-        SessionTrace {
-            session_id: session_id.to_string(),
-            root: node_id.clone(),
-            nodes,
-            forks: vec![],
-            active_leaf: node_id,
+    fn make_step(job_id: JobId) -> Step {
+        Step {
+            id: StepId::new(),
+            job_id,
+            kind: StepKind::LlmIteration,
+            started_at: Utc::now(),
+            ended_at: None,
+            outcome: LifecycleOutcome::Pending,
         }
     }
 
-    fn make_trace_with_child(session_id: &str) -> SessionTrace {
-        let root_id = "root".to_string();
-        let child_id = "child".to_string();
-        let root = TraceNode {
-            id: root_id.clone(),
-            parent: None,
-            children: vec![child_id.clone()],
-            span: TraceSpan {
-                kind: OperationKind::UserMessageHandling {
-                    session_id: session_id.to_string(),
-                },
-                job_id: None,
-                provenance: ExecutionProvenance::default(),
-                input: SpanInput::None,
-                started_at: Utc::now(),
-                ended_at: Some(Utc::now()),
-                result: None,
+    fn make_llm_span(step_id: StepId) -> Span {
+        Span {
+            id: SpanId::new(),
+            step_id,
+            kind: SpanKind::LlmCall {
+                model_id: "claude".into(),
+                provider: "anthropic".into(),
+                provider_config_hash: "h".into(),
+                input_messages: vec![],
+                temperature: None,
+                output_content: String::new(),
+                thinking: None,
+                tool_calls: vec![],
+                input_tokens: 0,
+                output_tokens: 0,
             },
-        };
-        let child = TraceNode {
-            id: child_id.clone(),
-            parent: Some(root_id.clone()),
-            children: vec![],
-            span: TraceSpan {
-                kind: OperationKind::LlmCall {
-                    model: "claude".to_string(),
-                },
-                job_id: Some("job-1".to_string()),
-                provenance: ExecutionProvenance {
-                    model_id: Some("claude".to_string()),
-                    ..Default::default()
-                },
-                input: SpanInput::None,
-                started_at: Utc::now(),
-                ended_at: Some(Utc::now()),
-                result: Some(SpanResult::LlmResponse {
-                    output_content: "hello world".to_string(),
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    thinking: Some("let me think".to_string()),
-                    tool_calls: vec![],
-                    latency: std::time::Duration::from_millis(100),
+            parallel_group: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            outcome: LifecycleOutcome::Pending,
+            events: vec![],
+        }
+    }
+
+    fn make_tool_span(step_id: StepId, llm_span_id: SpanId) -> Span {
+        Span {
+            id: SpanId::new(),
+            step_id,
+            kind: SpanKind::ToolCall {
+                tool_name: "bash".into(),
+                tool_artifact_hash: "h".into(),
+                triggered_by: Some(ToolCallOrigin {
+                    llm_span_id,
+                    tool_use_id: "tu1".into(),
                 }),
+                params: serde_json::json!({}),
+                output: serde_json::json!({}),
+                success: false,
+            },
+            parallel_group: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            outcome: LifecycleOutcome::Pending,
+            events: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn step_round_trip() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlTraceStore::new(pool);
+        let s = make_step(JobId::new());
+        store.save_step(&s).await.unwrap();
+        let loaded = store.load_step(&s.id).await.unwrap().unwrap();
+        assert_eq!(loaded.id, s.id);
+    }
+
+    #[tokio::test]
+    async fn span_round_trip_and_list_by_step() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlTraceStore::new(pool);
+        let job_id = JobId::new();
+        let step = make_step(job_id);
+        store.save_step(&step).await.unwrap();
+
+        let llm = make_llm_span(step.id);
+        store.save_span(&llm).await.unwrap();
+        let tool = make_tool_span(step.id, llm.id);
+        store.save_span(&tool).await.unwrap();
+
+        let spans = store.list_spans_by_step(&step.id).await.unwrap();
+        assert_eq!(spans.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recover_half_open_spans_marks_cancelled() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlTraceStore::new(pool);
+        let job_id = JobId::new();
+        let step = make_step(job_id);
+        store.save_step(&step).await.unwrap();
+        let span = make_llm_span(step.id);
+        store.save_span(&span).await.unwrap();
+
+        let report = store.recover_half_open_spans().await.unwrap();
+        assert_eq!(report.recovered.len(), 1);
+        assert_eq!(report.recovered[0].job_id, job_id);
+        assert_eq!(report.recovered[0].span_id, span.id);
+        assert!(matches!(
+            report.recovered[0].new_outcome,
+            LifecycleOutcome::Cancelled {
+                reason: aura_job::CancelReason::SystemCrash,
+            }
+        ));
+
+        // Idempotent: re-running yields no new recoveries
+        let again = store.recover_half_open_spans().await.unwrap();
+        assert!(again.recovered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn span_event_round_trip() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlTraceStore::new(pool);
+        let span_id = SpanId::new();
+        let event = SpanEvent::new(
+            span_id,
+            0,
+            SpanEventKind::HookDegraded {
+                hook_name: "h".into(),
+                timeout_ms: 100,
+                phase: aura_model::HookPhase::PreStep,
+            },
+        );
+        store.append_span_event(&event).await.unwrap();
+        let listed = store.list_span_events(&span_id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].seq, 0);
+    }
+
+    #[tokio::test]
+    async fn trace_event_log_round_trips() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlTraceEventStore::new(pool);
+        let session_id = SessionId::from("cli-1");
+        let job_id = JobId::new();
+        let step_id = StepId::new();
+        let event = TraceLogEvent {
+            session_id: session_id.clone(),
+            job_id,
+            at: Utc::now(),
+            kind: crate::trace::TraceLogEventKind::StepBegin {
+                step_id,
+                payload: serde_json::json!({}),
             },
         };
-        let mut nodes = HashMap::new();
-        nodes.insert(root_id.clone(), root);
-        nodes.insert(child_id.clone(), child);
-        SessionTrace {
-            session_id: session_id.to_string(),
-            root: root_id,
-            nodes,
-            forks: vec![],
-            active_leaf: child_id,
-        }
-    }
-
-    #[tokio::test]
-    async fn save_and_load() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
-
-        let trace = make_trace("s1");
-        store.save_trace(&trace).await.unwrap();
-
-        let loaded = store.load_trace("s1").await.unwrap().unwrap();
-        assert_eq!(loaded.session_id, "s1");
-        assert_eq!(loaded.root, "n1");
-        assert_eq!(loaded.active_leaf, "n1");
-        assert_eq!(loaded.nodes.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn children_reconstructed_from_parent_id() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
-
-        store
-            .save_trace(&make_trace_with_child("s1"))
-            .await
-            .unwrap();
-
-        let loaded = store.load_trace("s1").await.unwrap().unwrap();
-        assert_eq!(loaded.nodes.len(), 2);
-
-        let root = &loaded.nodes["root"];
-        assert_eq!(root.children, vec!["child"]);
-        assert!(root.parent.is_none());
-
-        let child = &loaded.nodes["child"];
-        assert!(child.children.is_empty());
-        assert_eq!(child.parent.as_deref(), Some("root"));
-        assert_eq!(child.span.job_id.as_deref(), Some("job-1"));
-
-        // Verify SpanResult round-trips.
-        let result = child.span.result.as_ref().unwrap();
-        match result {
-            SpanResult::LlmResponse {
-                output_content,
-                thinking,
-                ..
-            } => {
-                assert_eq!(output_content, "hello world");
-                assert_eq!(thinking.as_deref(), Some("let me think"));
-            }
-            other => panic!("unexpected result: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn load_single_node_with_children() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
-
-        store
-            .save_trace(&make_trace_with_child("s1"))
-            .await
-            .unwrap();
-
-        let root = store.load_node("s1", &"root".to_string()).await.unwrap();
-        assert!(root.is_some());
-        let root = root.unwrap();
-        assert_eq!(root.children, vec!["child"]);
-
-        let missing = store.load_node("s1", &"nope".to_string()).await.unwrap();
-        assert!(missing.is_none());
-    }
-
-    #[tokio::test]
-    async fn query_by_session_id() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
-
-        store.save_trace(&make_trace("s1")).await.unwrap();
-        store.save_trace(&make_trace("s2")).await.unwrap();
-
-        let filter = TraceFilter {
-            session_id: Some("s1".to_string()),
-            from: None,
-            to: None,
-        };
-        let results = store.query_traces(filter).await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].session_id, "s1");
-    }
-
-    #[tokio::test]
-    async fn forks_round_trip() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
-
-        let mut trace = make_trace("s1");
-        trace.forks.push(ForkRecord {
-            id: "fork-1".to_string(),
-            from_node: "n1".to_string(),
-            fork_root: "n1-fork".to_string(),
-            reason: "rollback".to_string(),
-            created_at: Utc::now(),
-        });
-        store.save_trace(&trace).await.unwrap();
-
-        let loaded = store.load_trace("s1").await.unwrap().unwrap();
-        assert_eq!(loaded.forks.len(), 1);
-        assert_eq!(loaded.forks[0].id, "fork-1");
-        assert_eq!(loaded.forks[0].reason, "rollback");
+        store.append(&event).await.unwrap();
+        let replayed = store.replay_session(&session_id).await.unwrap();
+        assert_eq!(replayed.len(), 1);
     }
 }

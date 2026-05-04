@@ -233,7 +233,7 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
         bot_id: &str,
         user_id: &str,
     ) -> Result<(), String> {
-        let now = chrono::Utc::now().timestamp();
+        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
             "UPDATE channel_pairings
