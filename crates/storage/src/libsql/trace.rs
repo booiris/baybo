@@ -201,7 +201,7 @@ impl TraceStore for LibsqlTraceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_trace::{LifecycleOutcome, SpanEventKind, SpanKind, StepKind, ToolCallOrigin};
+    use aura_trace::{LifecycleState, SpanEventKind, SpanKind, StepKind, ToolCallOrigin};
     use chrono::Utc;
 
     fn make_step(job_id: JobId) -> Step {
@@ -211,7 +211,7 @@ mod tests {
             kind: StepKind::LlmIteration,
             started_at: Utc::now(),
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
         }
     }
 
@@ -232,7 +232,7 @@ mod tests {
             parallel_group: None,
             started_at: Utc::now(),
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
             events: vec![],
         }
     }
@@ -256,7 +256,7 @@ mod tests {
             parallel_group: None,
             started_at: Utc::now(),
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
             events: vec![],
         }
     }

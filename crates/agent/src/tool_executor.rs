@@ -18,7 +18,7 @@ use aura_trace::{
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::sandbox::SandboxAdapter;
@@ -138,274 +138,227 @@ impl ToolExecutor {
             self.validate_trust(tool_name, &manifest)?;
         }
 
+        let job_id = step.job_id;
+        let tool_name_owned = tool_name.to_string();
+        // Reborrow the cancel token so the closure can move its
+        // ownership into `ctx` while `with_span` keeps a borrow for
+        // the cancel-aware close-on-Err path.
+        let cancel_for_close = cancel_token.clone();
+
         // Open the tool span up front so denials and approval failures
         // still appear in the trace tree. The handle carries the
         // begin-time kind, so close-time only supplies the result.
-        let span_handle = recorder
-            .begin_span(
-                step,
-                SpanKind::ToolCall {
-                    begin: ToolCallBegin {
-                        tool_name: tool_name.to_string(),
-                        // ToolManifest does not yet carry an artifact hash.
-                        tool_artifact_hash: String::new(),
-                        triggered_by: triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
-                            llm_span_id,
-                            tool_use_id: tool_use_id.clone(),
-                        }),
-                        params: params.clone(),
-                    },
-                    result: None,
+        crate::scope::with_span(
+            recorder.as_ref(),
+            step,
+            job_id,
+            SpanKind::ToolCall {
+                begin: ToolCallBegin {
+                    tool_name: tool_name_owned.clone(),
+                    // ToolManifest does not yet carry an artifact hash.
+                    tool_artifact_hash: String::new(),
+                    triggered_by: triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
+                        llm_span_id,
+                        tool_use_id: tool_use_id.clone(),
+                    }),
+                    params: params.clone(),
                 },
-                parallel_group,
-            )
-            .await?;
-        let mut event_seq: u32 = 0;
+                result: None,
+            },
+            parallel_group,
+            Some((&cancel_for_close, aura_job::CancelReason::ParentCancelled)),
+            |span_handle| async move {
+                let mut event_seq: u32 = 0;
 
-        // Approval gate: derive resource accesses from the tool and
-        // check them against the session's cached approvals.
-        let (accesses, call_label) = self
-            .tool_registry
-            .get(tool_name)
-            .map(|tool| (tool.accessed_resources(&params), tool.call_label(&params)))
-            .unwrap_or_default();
+                // Approval gate: derive resource accesses from the tool
+                // and check them against the session's cached approvals.
+                let (accesses, call_label) = self
+                    .tool_registry
+                    .get(&tool_name_owned)
+                    .map(|tool| (tool.accessed_resources(&params), tool.call_label(&params)))
+                    .unwrap_or_default();
 
-        let uncovered: Vec<ResourceAccess> = {
-            let approved = approved_resources.lock();
-            accesses
-                .iter()
-                .filter(|acc| {
-                    if matches!(acc, ResourceAccess::ReadFile { .. }) {
-                        return false;
-                    }
-                    !approved.iter().any(|ar| ar.covers(acc))
-                })
-                .cloned()
-                .collect()
-        };
+                let uncovered: Vec<ResourceAccess> = {
+                    let approved = approved_resources.lock();
+                    accesses
+                        .iter()
+                        .filter(|acc| {
+                            if matches!(acc, ResourceAccess::ReadFile { .. }) {
+                                return false;
+                            }
+                            !approved.iter().any(|ar| ar.covers(acc))
+                        })
+                        .cloned()
+                        .collect()
+                };
 
-        if !uncovered.is_empty() {
-            let gate = self.gate_map.get(&user.channel, session_id.as_str());
-            let decision = gate
-                .request(ApprovalRequest {
-                    call_id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    user_id: user.id.clone(),
-                    tool: tool_name.to_string(),
-                    accesses: uncovered.clone(),
-                    params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
-                    description: call_label.clone(),
-                })
-                .await;
-            for access in &uncovered {
-                let _ = recorder
-                    .emit_event(
-                        span_handle.span_id,
-                        event_seq,
-                        SpanEventKind::Approval {
-                            decision,
-                            resource: access.clone(),
-                        },
-                    )
-                    .await;
-                event_seq += 1;
-            }
-            match decision {
-                ApprovalDecision::Approve => {
-                    info!(tool = tool_name, "tool call approved once");
-                }
-                ApprovalDecision::ApproveAlways => {
-                    info!(tool = tool_name, "tool call approved always");
-                    let mut approved = approved_resources.lock();
+                if !uncovered.is_empty() {
+                    let gate = self.gate_map.get(&user.channel, session_id.as_str());
+                    let decision = gate
+                        .request(ApprovalRequest {
+                            call_id: Uuid::new_v4().to_string(),
+                            session_id: session_id.to_string(),
+                            user_id: user.id.clone(),
+                            tool: tool_name_owned.clone(),
+                            accesses: uncovered.clone(),
+                            params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
+                            description: call_label.clone(),
+                        })
+                        .await;
                     for access in &uncovered {
-                        let entry = access.to_approved();
-                        if !approved.iter().any(|existing| existing == &entry) {
-                            approved.push(entry);
+                        let _ = recorder
+                            .emit_event(
+                                span_handle.span_id,
+                                event_seq,
+                                SpanEventKind::Approval {
+                                    decision,
+                                    resource: access.clone(),
+                                },
+                            )
+                            .await;
+                        event_seq += 1;
+                    }
+                    match decision {
+                        ApprovalDecision::Approve => {
+                            info!(tool = %tool_name_owned, "tool call approved once");
+                        }
+                        ApprovalDecision::ApproveAlways => {
+                            info!(tool = %tool_name_owned, "tool call approved always");
+                            let mut approved = approved_resources.lock();
+                            for access in &uncovered {
+                                let entry = access.to_approved();
+                                if !approved.iter().any(|existing| existing == &entry) {
+                                    approved.push(entry);
+                                }
+                            }
+                        }
+                        ApprovalDecision::Deny => {
+                            return Err(anyhow::Error::new(ToolError::Denied {
+                                tool: tool_name_owned.clone(),
+                                reason: "user denied approval".to_string(),
+                            }));
                         }
                     }
                 }
-                ApprovalDecision::Deny => {
-                    let reason = "user denied approval".to_string();
-                    let _ = recorder
-                        .end_span(
-                            span_handle,
-                            step.job_id,
-                            SpanFinalize::Empty,
-                            LifecycleOutcome::Failed {
-                                reason: reason.clone(),
-                            },
-                        )
-                        .await;
-                    return Err(ToolError::Denied {
-                        tool: tool_name.to_string(),
-                        reason,
-                    }
-                    .into());
-                }
-            }
-        }
 
-        // Build per-call sandbox adapter for tools declaring ExecCommand.
-        let sandbox: Option<Arc<dyn ExecSandbox>> = if let Some(manifest) =
-            self.tool_registry.get_manifest(tool_name)
-            && manifest.capabilities.contains(&ToolCapability::ExecCommand)
-        {
-            self.sandbox_runner.as_ref().map(|runner| {
-                let home = std::env::var_os("HOME").map(PathBuf::from);
-                let aura_state = std::env::var_os("AURA_HOME")
-                    .map(PathBuf::from)
-                    .or_else(|| home.as_ref().map(|h| h.join(".aura")));
-                let extra_root = home.clone().unwrap_or_else(|| self.workspace_root.clone());
-                let denied = default_sensitive_denylist(home.as_deref(), aura_state.as_deref());
-                Arc::new(
-                    SandboxAdapter::new(
-                        Arc::clone(runner),
-                        self.workspace_root.clone(),
-                        NetworkPolicy::All,
-                    )
-                    .with_permissive_filesystem(extra_root, denied),
-                ) as Arc<dyn ExecSandbox>
-            })
-        } else {
-            None
-        };
+                // Build per-call sandbox adapter for tools declaring
+                // ExecCommand.
+                let sandbox: Option<Arc<dyn ExecSandbox>> = if let Some(manifest) =
+                    self.tool_registry.get_manifest(&tool_name_owned)
+                    && manifest.capabilities.contains(&ToolCapability::ExecCommand)
+                {
+                    self.sandbox_runner.as_ref().map(|runner| {
+                        let home = std::env::var_os("HOME").map(PathBuf::from);
+                        let aura_state = std::env::var_os("AURA_HOME")
+                            .map(PathBuf::from)
+                            .or_else(|| home.as_ref().map(|h| h.join(".aura")));
+                        let extra_root =
+                            home.clone().unwrap_or_else(|| self.workspace_root.clone());
+                        let denied =
+                            default_sensitive_denylist(home.as_deref(), aura_state.as_deref());
+                        Arc::new(
+                            SandboxAdapter::new(
+                                Arc::clone(runner),
+                                self.workspace_root.clone(),
+                                NetworkPolicy::All,
+                            )
+                            .with_permissive_filesystem(extra_root, denied),
+                        ) as Arc<dyn ExecSandbox>
+                    })
+                } else {
+                    None
+                };
 
-        // Mid-execution approval handle.
-        let approval_gate = self.gate_map.get(&user.channel, session_id.as_str());
-        let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
+                // Mid-execution approval handle.
+                let approval_gate = self.gate_map.get(&user.channel, session_id.as_str());
+                let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
 
-        // Build tool context. The token comes from the agent loop's
-        // per-job cancel tree — tripping it (via JobLifecycle::cancel
-        // or a parent subagent's cascade) signals the running tool.
-        let ctx = ToolContext {
-            session_id: session_id.to_string(),
-            user: user.clone(),
-            timeout: self.default_timeout,
-            cancellation_token: cancel_token,
-            workspace_root: self.workspace_root.clone(),
-            sandbox,
-            approval: Some(approval),
-        };
+                // Build tool context. The token comes from the agent
+                // loop's per-job cancel tree — tripping it (via
+                // JobLifecycle::cancel or a parent subagent's cascade)
+                // signals the running tool.
+                let ctx = ToolContext {
+                    session_id: session_id.to_string(),
+                    user: user.clone(),
+                    timeout: self.default_timeout,
+                    cancellation_token: cancel_token,
+                    workspace_root: self.workspace_root.clone(),
+                    sandbox,
+                    approval: Some(approval),
+                };
 
-        // Reveal placeholders in the tool's arguments just before
-        // execution. The pre-reveal `params` is what the trace + approval
-        // surfaces saw; the tool itself receives plaintext for its API call.
-        let mut params_revealed = params.clone();
-        if let Err(e) = self
-            .security_gateway
-            .reveal_in_value(&mut params_revealed)
-            .await
-        {
-            // The tool span is already open; close it as Failed before
-            // bubbling the error so it can't sit half-open in storage.
-            let _ = recorder
-                .cancel_span(
-                    span_handle,
-                    step.job_id,
-                    LifecycleOutcome::Failed {
-                        reason: format!("reveal_in_value: {e}"),
-                    },
+                // Reveal placeholders in the tool's arguments just
+                // before execution. The pre-reveal `params` is what the
+                // trace + approval surfaces saw; the tool itself
+                // receives plaintext for its API call.
+                let mut params_revealed = params.clone();
+                self.security_gateway
+                    .reveal_in_value(&mut params_revealed)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
+
+                // Execute with timeout enforcement.
+                let outer_deadline = ctx.timeout + APPROVAL_HEADROOM;
+                let result = tokio::time::timeout(
+                    outer_deadline,
+                    self.tool_registry
+                        .execute(&tool_name_owned, params_revealed, &ctx),
                 )
                 .await;
-            return Err(e.into());
-        }
 
-        // Execute with timeout enforcement.
-        let outer_deadline = ctx.timeout + APPROVAL_HEADROOM;
-        let result = tokio::time::timeout(
-            outer_deadline,
-            self.tool_registry.execute(tool_name, params_revealed, &ctx),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(mut output)) => {
-                // Defensive sanitize before result flows into trace /
-                // memory / next LLM call.
-                if let Err(e) = self
-                    .security_gateway
-                    .sanitize_tool_output(&mut output)
-                    .await
-                {
-                    let _ = recorder
-                        .cancel_span(
-                            span_handle,
-                            step.job_id,
+                match result {
+                    Ok(Ok(mut output)) => {
+                        // Defensive sanitize before result flows into
+                        // trace / memory / next LLM call.
+                        self.security_gateway
+                            .sanitize_tool_output(&mut output)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("sanitize_tool_output: {e}"))?;
+                        let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
+                        let success = !matches!(output, ToolOutput::Error(_));
+                        let outcome = if success {
+                            LifecycleOutcome::Ok
+                        } else {
                             LifecycleOutcome::Failed {
-                                reason: format!("sanitize_tool_output: {e}"),
-                            },
-                        )
-                        .await;
-                    return Err(e.into());
-                }
-                let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
-                let success = !matches!(output, ToolOutput::Error(_));
-                let outcome = if success {
-                    LifecycleOutcome::Ok
-                } else {
-                    LifecycleOutcome::Failed {
-                        reason: "tool returned error output".into(),
+                                reason: "tool returned error output".into(),
+                            }
+                        };
+                        Ok((
+                            SpanFinalize::ToolCall(ToolCallResult {
+                                output: output_value,
+                                success,
+                            }),
+                            outcome,
+                            output,
+                        ))
                     }
-                };
-                if let Err(close_err) = recorder
-                    .end_span(
-                        span_handle,
-                        step.job_id,
-                        SpanFinalize::ToolCall(ToolCallResult {
-                            output: output_value,
-                            success,
-                        }),
-                        outcome,
-                    )
-                    .await
-                {
-                    warn!(error = %close_err, tool = %tool_name, "end_span failed on tool success path");
+                    Ok(Err(e)) => {
+                        // Surface the *sanitized* message: this Err
+                        // bubbles into `with_span_outcome`, which writes
+                        // `e.to_string()` into the span's
+                        // `Failed { reason }` and from there into
+                        // persisted trace storage. Returning the raw
+                        // error would leak any secrets in the original
+                        // text. Downcasts on this path aren't used (the
+                        // `ToolError::Denied` downcast in `agent_loop`
+                        // sees the approval-gate Err, which is built
+                        // separately above).
+                        let raw = e.to_string();
+                        let sanitized = self
+                            .security_gateway
+                            .sanitize_error(&raw)
+                            .await
+                            .unwrap_or(raw);
+                        Err(anyhow::anyhow!(sanitized))
+                    }
+                    Err(_) => Err(anyhow::anyhow!(
+                        "tool '{}' exceeded timeout ({:?})",
+                        tool_name_owned,
+                        ctx.timeout
+                    )),
                 }
-                Ok(output)
-            }
-            Ok(Err(e)) => {
-                let raw = e.to_string();
-                let error_msg = self
-                    .security_gateway
-                    .sanitize_error(&raw)
-                    .await
-                    .unwrap_or(raw);
-                if let Err(close_err) = recorder
-                    .end_span(
-                        span_handle,
-                        step.job_id,
-                        SpanFinalize::Empty,
-                        LifecycleOutcome::Failed {
-                            reason: error_msg.clone(),
-                        },
-                    )
-                    .await
-                {
-                    warn!(error = %close_err, tool = %tool_name, original = %e, "end_span failed on tool error path");
-                }
-                Err(e.into())
-            }
-            Err(_) => {
-                let error_msg =
-                    format!("tool '{}' exceeded timeout ({:?})", tool_name, ctx.timeout);
-                if let Err(close_err) = recorder
-                    .end_span(
-                        span_handle,
-                        step.job_id,
-                        SpanFinalize::Empty,
-                        LifecycleOutcome::Failed {
-                            reason: error_msg.clone(),
-                        },
-                    )
-                    .await
-                {
-                    warn!(error = %close_err, tool = %tool_name, "end_span failed on tool timeout path");
-                }
-                Err(anyhow::anyhow!(
-                    "timeout: tool '{}' exceeded timeout",
-                    tool_name
-                ))
-            }
-        }
+            },
+        )
+        .await
     }
 }

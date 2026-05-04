@@ -610,6 +610,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let local_subagent_runtime: Arc<dyn SubagentRuntime> = Arc::new(LocalSubagentRuntime::new(
         Arc::clone(&graph.session_manager),
         Arc::clone(&spawn_actor_for),
+        Arc::clone(&graph.job_lifecycle),
     ));
     // Sole `set` site in the process — `is_err()` is unreachable barring
     // a programming error in this file.

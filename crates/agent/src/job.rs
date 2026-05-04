@@ -9,11 +9,51 @@ use aura_job::JobStatus;
 use aura_job::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
 use aura_model::{JobId, SessionId, SpanId, TriggerKind};
 use aura_storage::JobStore;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::cancel::{JobCancellationGuard, JobCancellationRegistry};
 
 type Result<T> = std::result::Result<T, JobError>;
+
+/// Process-wide capacity for the terminal-event broadcast bus.
+///
+/// Sized to absorb the burst a multi-job subagent fan-out can produce
+/// without lagging the parent's wait loop. Subscribers that lag still
+/// reconcile against `list_by_session` so dropped events don't cause
+/// lost terminations — capacity is a latency knob, not correctness.
+const JOB_TERMINAL_EVENT_CAPACITY: usize = 256;
+
+/// Terminal-state notification published by `JobLifecycle` whenever a
+/// job transitions to `Completed`, `Failed`, or `Cancelled`. Carries
+/// the minimum identifiers a subscriber needs to filter without going
+/// back to the store: the terminating `JobId`, its session, and the
+/// optional parent for hierarchy-scoped waits (subagent path).
+///
+/// `kind` is always one of the three terminal `JobStatusKind`
+/// discriminants — non-terminal transitions (`start`, `stuck`,
+/// `recover`) are not published.
+#[derive(Debug, Clone)]
+pub struct JobTerminalEvent {
+    pub job_id: JobId,
+    pub session_id: SessionId,
+    pub parent_job_id: Option<JobId>,
+    pub kind: JobStatusKind,
+}
+
+/// Inputs needed to create a new `Job`. Bundled into a struct so
+/// `crate::scope::with_job` can own the full
+/// `start_job → start → body → complete/fail` lifecycle without
+/// ballooning its parameter list — production callers must go through
+/// `with_job`, not `JobLifecycle::start_job` directly, so the cancel
+/// state machine can't be skipped.
+pub(crate) struct JobSpec {
+    pub session_id: SessionId,
+    pub session_trigger_kind: TriggerKind,
+    pub input: JobInput,
+    pub effective_soul_version: String,
+    pub parent_job_id: Option<JobId>,
+}
 
 /// Owns the job state machine + persistence orchestration. Pure
 /// passthrough to `Job`'s internal transition validation —
@@ -24,6 +64,11 @@ pub struct JobLifecycle {
     /// in-flight jobs. `cancel()` trips the matching token (if any)
     /// in addition to flipping the DB row. See `agent::cancel`.
     cancellation: Arc<JobCancellationRegistry>,
+    /// Fire-and-forget bus for terminal transitions. The subagent
+    /// runtime subscribes to this so the parent unblocks on the
+    /// child's `Completed` / `Failed` / `Cancelled` regardless of
+    /// whether the child also produced an `AgentOutput::Message`.
+    terminal_events: broadcast::Sender<JobTerminalEvent>,
 }
 
 impl JobLifecycle {
@@ -35,10 +80,20 @@ impl JobLifecycle {
         store: Arc<dyn JobStore>,
         cancellation: Arc<JobCancellationRegistry>,
     ) -> Self {
+        let (terminal_events, _rx) = broadcast::channel(JOB_TERMINAL_EVENT_CAPACITY);
         Self {
             store,
             cancellation,
+            terminal_events,
         }
+    }
+
+    /// Subscribe to terminal-state events. Subscribers must reconcile
+    /// against the store (e.g. `list_by_session`) on
+    /// `broadcast::error::RecvError::Lagged` — a dropped event is not
+    /// re-published.
+    pub fn subscribe_terminal_events(&self) -> broadcast::Receiver<JobTerminalEvent> {
+        self.terminal_events.subscribe()
     }
 
     /// Register an in-flight job's cancellation token. The returned
@@ -66,6 +121,13 @@ impl JobLifecycle {
     /// documented in `aura_job::kind`. Mismatches return
     /// `JobError::KindMismatch` with a descriptive message (rather than
     /// passing through silently as before).
+    ///
+    /// **Production code does not call this directly** — it goes
+    /// through [`crate::scope::with_job`] (which builds a [`JobSpec`]
+    /// and owns the full create→start→run→complete chain) so the
+    /// cancel state machine can't be skipped. The method is left
+    /// `pub` only for tests in this crate (and downstream test
+    /// fixtures) that need to construct jobs in arbitrary states.
     pub async fn start_job(
         &self,
         session_id: SessionId,
@@ -95,14 +157,14 @@ impl JobLifecycle {
     /// Move `InProgress → Completed` with a final output.
     pub async fn complete(&self, job_id: &JobId, output: aura_job::JobOutput) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
-        self.persist(job, transition).await
+        self.persist_and_publish(job, transition).await
     }
 
     /// Move to `Failed { reason }`.
     pub async fn fail(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
         let (job, transition) = self.apply(job_id, |j| j.fail(&reason)).await?;
-        self.persist(job, transition).await
+        self.persist_and_publish(job, transition).await
     }
 
     /// Move to `Cancelled { reason, partial_artifacts }`.
@@ -128,7 +190,7 @@ impl JobLifecycle {
         let (job, transition) = self
             .apply(job_id, |j| j.cancel(reason, partial_artifacts.clone()))
             .await?;
-        self.persist(job, transition).await
+        self.persist_and_publish(job, transition).await
     }
 
     /// Move to `Stuck { reason }` from `InProgress`.
@@ -199,6 +261,25 @@ impl JobLifecycle {
     async fn persist(&self, job: Job, transition: JobTransition) -> Result<()> {
         self.store.save(&job).await?;
         self.store.record_transition(&transition).await?;
+        Ok(())
+    }
+
+    /// Persist a terminal transition, then fire the matching event on
+    /// the broadcast bus. Publish happens **after** the store write
+    /// succeeds so a subscriber that races back into the lifecycle
+    /// (e.g. to look the job up by id) is guaranteed to see the
+    /// terminal row. Send errors are dropped on the floor — broadcast
+    /// `send` only fails when there are no subscribers, which is the
+    /// normal state for non-subagent jobs.
+    async fn persist_and_publish(&self, job: Job, transition: JobTransition) -> Result<()> {
+        let event = JobTerminalEvent {
+            job_id: job.id,
+            session_id: job.session_id.clone(),
+            parent_job_id: job.parent_job_id,
+            kind: job.status.kind(),
+        };
+        self.persist(job, transition).await?;
+        let _ = self.terminal_events.send(event);
         Ok(())
     }
 

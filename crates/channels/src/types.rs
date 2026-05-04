@@ -1,4 +1,4 @@
-use aura_model::{ChannelType, JobId, SessionId, User};
+use aura_model::{ChannelType, User};
 use aura_model::{ContentBlock, MessageMetadata};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -76,33 +76,6 @@ pub enum AgentOutput {
         level: NoticeLevel,
         text: String,
     },
-    /// Terminal-state notification for a job. Emitted by the agent
-    /// actor once `agent_loop.run` returns (success or failure) so
-    /// downstream observers — notably `LocalSubagentRuntime` — can
-    /// signal completion independently of the user-facing `Message`.
-    /// Required for the multi-job subagent path: the parent waits for
-    /// every child job to terminate, not just the first message.
-    ///
-    /// `job_id` is `None` until the agent loop is reworked to surface
-    /// the produced `JobId` back through `agent_loop.run`'s return —
-    /// today's subscriber (`LocalSubagentRuntime`) only needs terminal
-    /// detection, not job-level matching. A future caller that needs
-    /// per-job dispatch must wait for that plumbing.
-    JobCompleted {
-        session_id: SessionId,
-        job_id: Option<JobId>,
-        outcome: JobOutcome,
-    },
-}
-
-/// Terminal job outcome carried by [`AgentOutput::JobCompleted`].
-/// Mirrors `aura_job::JobStatusKind`'s terminal subset; kept local to
-/// `aura-channels` so this crate stays job-agnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobOutcome {
-    Completed,
-    Failed,
-    Cancelled,
 }
 
 /// Severity attached to an `AgentOutput::Notice`. Used only for

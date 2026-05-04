@@ -11,8 +11,8 @@ use std::sync::Arc;
 use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
 use aura_storage::TraceStore;
 use aura_trace::{
-    LifecycleOutcome, Span, SpanEvent, SpanEventKind, SpanFinalize, SpanHandle, SpanKind, Step,
-    StepHandle, StepKind, TraceError,
+    LifecycleOutcome, LifecycleState, Span, SpanEvent, SpanEventKind, SpanFinalize, SpanHandle,
+    SpanKind, Step, StepHandle, StepKind, TraceError,
 };
 use chrono::Utc;
 use tokio::sync::broadcast;
@@ -160,7 +160,7 @@ impl SpanRecorder {
             kind: kind.clone(),
             started_at,
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
         };
         self.trace_store.save_step(&step).await?;
         self.stream.publish(TraceEvent::StepStarted {
@@ -181,7 +181,7 @@ impl SpanRecorder {
             kind: handle.kind,
             started_at: handle.started_at,
             ended_at: Some(Utc::now()),
-            outcome: outcome.clone(),
+            outcome: LifecycleState::Done(outcome.clone()),
         };
         self.trace_store.save_step(&step).await?;
         self.stream.publish(TraceEvent::StepEnded {
@@ -210,7 +210,7 @@ impl SpanRecorder {
             parallel_group,
             started_at,
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
             events: Vec::new(),
         };
         let kind_tag = kind.tag();
@@ -269,7 +269,7 @@ impl SpanRecorder {
             parallel_group: handle.parallel_group,
             started_at: handle.started_at,
             ended_at: Some(Utc::now()),
-            outcome: outcome.clone(),
+            outcome: LifecycleState::Done(outcome.clone()),
             events: Vec::new(),
         };
         self.trace_store.save_span(&span).await?;

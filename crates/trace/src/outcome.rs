@@ -1,21 +1,30 @@
-//! Lifecycle outcome shared by `Step` and `Span`.
+//! Lifecycle types for `Step` and `Span` rows.
+//!
+//! Two concerns, two types:
+//!
+//! * [`LifecycleOutcome`] — what *happened* once the lifecycle ended.
+//!   Has only the three terminal variants. Closing helpers
+//!   (`Step::close`, `Span::close`, `with_step`, `with_span`,
+//!   `SpanRecorder::end_step`/`end_span`) take this type, so passing a
+//!   non-terminal value is a type error rather than a runtime error.
+//!
+//! * [`LifecycleState`] — the row's state-machine position. Either
+//!   `Pending` (in flight, no outcome yet) or `Done(outcome)`. The
+//!   `outcome` field on persisted [`crate::Step`] / [`crate::Span`]
+//!   rows is `LifecycleState`.
+//!
+//! Wire format: `LifecycleState` (de)serializes to the original flat
+//! 4-state shape (`{"outcome": "pending|ok|failed|cancelled", ...}`)
+//! via [`LifecycleStateRepr`], so on-disk JSON blobs round-trip without
+//! a schema migration.
 
 use aura_job::CancelReason;
 use serde::{Deserialize, Serialize};
 
-/// The state of a `Step` or `Span` w.r.t. completion.
-///
-/// Spans / steps start in `Pending` (i.e. `started_at` set, no outcome
-/// recorded yet). They transition to exactly one of the three terminal
-/// outcomes when they end.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
+/// Terminal outcome of a `Step` or `Span`. Constructed only at
+/// close time; the row's pre-close state lives in [`LifecycleState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleOutcome {
-    /// Started but not yet ended. Persisted on the main `steps` /
-    /// `spans` row with `ended_at = NULL`; the row is rewritten in
-    /// place when the lifecycle ends with one of the terminal variants
-    /// below.
-    Pending,
     /// Completed normally. The kind variant's result fields carry the
     /// actual data (LLM tokens, tool output, etc.).
     Ok,
@@ -27,17 +36,88 @@ pub enum LifecycleOutcome {
 }
 
 impl LifecycleOutcome {
-    /// Whether this outcome represents the end of a step / span.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            LifecycleOutcome::Ok => "ok",
+            LifecycleOutcome::Failed { .. } => "failed",
+            LifecycleOutcome::Cancelled { .. } => "cancelled",
+        }
+    }
+}
+
+/// State-machine position of a `Step` or `Span` row. `Pending` until
+/// the lifecycle ends, then `Done(outcome)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "LifecycleStateRepr", into = "LifecycleStateRepr")]
+pub enum LifecycleState {
+    Pending,
+    Done(LifecycleOutcome),
+}
+
+impl LifecycleState {
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, LifecycleOutcome::Pending)
+        matches!(self, LifecycleState::Done(_))
     }
 
     pub fn tag(&self) -> &'static str {
         match self {
-            LifecycleOutcome::Pending => "pending",
-            LifecycleOutcome::Ok => "ok",
-            LifecycleOutcome::Failed { .. } => "failed",
-            LifecycleOutcome::Cancelled { .. } => "cancelled",
+            LifecycleState::Pending => "pending",
+            LifecycleState::Done(o) => o.tag(),
+        }
+    }
+
+    /// Borrow the terminal outcome if this state is `Done`. `None`
+    /// while the lifecycle is still in flight.
+    pub fn outcome(&self) -> Option<&LifecycleOutcome> {
+        match self {
+            LifecycleState::Pending => None,
+            LifecycleState::Done(o) => Some(o),
+        }
+    }
+}
+
+/// Wire-format proxy for [`LifecycleState`]. Internally tagged by
+/// `outcome` so persisted JSON keeps the original 4-state flat shape:
+///
+/// ```json
+/// {"outcome": "pending"}
+/// {"outcome": "ok"}
+/// {"outcome": "failed", "reason": "..."}
+/// {"outcome": "cancelled", "reason": "..."}
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum LifecycleStateRepr {
+    Pending,
+    Ok,
+    Failed { reason: String },
+    Cancelled { reason: CancelReason },
+}
+
+impl From<LifecycleState> for LifecycleStateRepr {
+    fn from(s: LifecycleState) -> Self {
+        match s {
+            LifecycleState::Pending => Self::Pending,
+            LifecycleState::Done(LifecycleOutcome::Ok) => Self::Ok,
+            LifecycleState::Done(LifecycleOutcome::Failed { reason }) => Self::Failed { reason },
+            LifecycleState::Done(LifecycleOutcome::Cancelled { reason }) => {
+                Self::Cancelled { reason }
+            }
+        }
+    }
+}
+
+impl From<LifecycleStateRepr> for LifecycleState {
+    fn from(r: LifecycleStateRepr) -> Self {
+        match r {
+            LifecycleStateRepr::Pending => Self::Pending,
+            LifecycleStateRepr::Ok => Self::Done(LifecycleOutcome::Ok),
+            LifecycleStateRepr::Failed { reason } => {
+                Self::Done(LifecycleOutcome::Failed { reason })
+            }
+            LifecycleStateRepr::Cancelled { reason } => {
+                Self::Done(LifecycleOutcome::Cancelled { reason })
+            }
         }
     }
 }
@@ -48,36 +128,59 @@ mod tests {
 
     #[test]
     fn pending_is_in_flight() {
-        assert!(!LifecycleOutcome::Pending.is_terminal());
+        assert!(!LifecycleState::Pending.is_terminal());
+        assert!(LifecycleState::Pending.outcome().is_none());
     }
 
     #[test]
-    fn ok_failed_cancelled_are_terminal() {
-        assert!(LifecycleOutcome::Ok.is_terminal());
-        assert!(LifecycleOutcome::Failed { reason: "x".into() }.is_terminal());
-        assert!(
+    fn done_variants_are_terminal() {
+        for o in [
+            LifecycleOutcome::Ok,
+            LifecycleOutcome::Failed { reason: "x".into() },
             LifecycleOutcome::Cancelled {
                 reason: CancelReason::SystemCrash,
-            }
-            .is_terminal()
-        );
+            },
+        ] {
+            let state = LifecycleState::Done(o.clone());
+            assert!(state.is_terminal());
+            assert_eq!(state.outcome(), Some(&o));
+        }
     }
 
     #[test]
-    fn round_trips_through_serde() {
-        for o in [
-            LifecycleOutcome::Pending,
-            LifecycleOutcome::Ok,
-            LifecycleOutcome::Failed {
-                reason: "boom".into(),
-            },
-            LifecycleOutcome::Cancelled {
-                reason: CancelReason::UserPreempt,
-            },
-        ] {
-            let s = serde_json::to_string(&o).unwrap();
-            let back: LifecycleOutcome = serde_json::from_str(&s).unwrap();
-            assert_eq!(back, o);
+    fn round_trips_through_serde_with_legacy_shape() {
+        let cases = [
+            (LifecycleState::Pending, r#"{"outcome":"pending"}"#),
+            (
+                LifecycleState::Done(LifecycleOutcome::Ok),
+                r#"{"outcome":"ok"}"#,
+            ),
+            (
+                LifecycleState::Done(LifecycleOutcome::Failed {
+                    reason: "boom".into(),
+                }),
+                r#"{"outcome":"failed","reason":"boom"}"#,
+            ),
+            (
+                LifecycleState::Done(LifecycleOutcome::Cancelled {
+                    reason: CancelReason::UserPreempt,
+                }),
+                r#"{"outcome":"cancelled","reason":"user_preempt"}"#,
+            ),
+        ];
+        for (state, expected_json) in cases {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, expected_json, "serialize");
+            let back: LifecycleState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state, "round-trip");
         }
+    }
+
+    #[test]
+    fn legacy_pending_json_deserializes() {
+        // On-disk rows from before the split serialized Pending the
+        // same way; this guards the migration-free promise.
+        let v: LifecycleState = serde_json::from_str(r#"{"outcome":"pending"}"#).unwrap();
+        assert_eq!(v, LifecycleState::Pending);
     }
 }

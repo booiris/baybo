@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, IncomingMessage, JobOutcome, OutgoingMessage};
+use aura_channels::{AgentOutput, IncomingMessage, OutgoingMessage};
 use aura_cron::TriggerAction;
 use aura_job::{JobInput, JobOutput};
-use aura_model::{ApprovedResource, ContentBlock, JobId, MessageMetadata, Session};
+use aura_model::{ApprovedResource, ContentBlock, MessageMetadata, Session};
 use aura_tools::ToolOutput;
-use aura_trace::{LifecycleOutcome, StepKind};
+use aura_trace::StepKind;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::AgentLoop;
-use crate::job::JobLifecycle;
+use crate::job::{JobLifecycle, JobSpec};
 use crate::tool_executor::ToolExecutor;
 use crate::trace::SpanRecorder;
 
@@ -159,27 +159,22 @@ impl AgentActor {
         info!(session_id = %self.session.id, "agent actor stopped");
     }
 
-    /// Run the agent loop and guarantee a terminal `JobCompleted`
-    /// emission on both success and failure paths. Used by every
+    /// Run the agent loop. Terminal-state notification is published by
+    /// `JobLifecycle` itself on the broadcast bus
+    /// (`subscribe_terminal_events`); the actor no longer emits a
+    /// piggy-back signal on the response channel. Used by every
     /// handler that delegates job lifecycle to `agent_loop.run`
     /// (UserInput, SubagentSpawned, cron prompt dispatch). Returns
-    /// the loop's response on `Ok`; caller is responsible for
-    /// sending it to the response channel.
-    ///
-    /// A single subscriber waiting on this job's outcome (e.g. a
-    /// parent subagent watcher, gateway WS protocol's job-status
-    /// channel) needs *some* terminal signal or it hangs until its
-    /// own timeout — that's why the emit happens on both arms before
-    /// the result propagates.
-    async fn run_loop_with_terminal_emit(
+    /// the loop's response on `Ok`; caller is responsible for sending
+    /// it to the response channel.
+    async fn run_agent_loop(
         &mut self,
         job_input: JobInput,
         content: Vec<ContentBlock>,
         parent_job_id: Option<aura_model::JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<OutgoingMessage> {
-        let result = self
-            .agent_loop
+        self.agent_loop
             .run(
                 &mut self.session,
                 job_input,
@@ -190,13 +185,7 @@ impl AgentActor {
                 delta_tx,
                 self.actor_token.child_token(),
             )
-            .await;
-        let outcome = match &result {
-            Ok(_) => JobOutcome::Completed,
-            Err(_) => JobOutcome::Failed,
-        };
-        self.emit_job_completed(outcome).await;
-        result
+            .await
     }
 
     /// Dispatch a system-generated prompt (cron or routine) through the
@@ -219,7 +208,7 @@ impl AgentActor {
             "[{source}:{source_id}] {prompt}"
         ))];
         let response = self
-            .run_loop_with_terminal_emit(job_input, content, parent_job_id, None)
+            .run_agent_loop(job_input, content, parent_job_id, None)
             .await?;
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send {source} response to channel");
@@ -227,29 +216,16 @@ impl AgentActor {
         Ok(())
     }
 
-    /// Emit a `JobCompleted` terminal signal on the response channel.
-    /// `job_id` is `None` — current subscribers (subagent runtime) only
-    /// need terminal-state detection, not job-level matching. Plumb the
-    /// real id through `agent_loop.run`'s return when a subscriber starts to.
-    async fn emit_job_completed(&self, outcome: JobOutcome) {
-        let signal = AgentOutput::JobCompleted {
-            session_id: self.session.id.clone(),
-            job_id: None,
-            outcome,
-        };
-        if let Err(e) = self.response_tx.send(signal).await {
-            debug!(error = %e, "failed to send JobCompleted signal");
-        }
-    }
-
-    /// Execute a tool directly for a cron job, falling back to LLM on failure.
+    /// Execute a tool directly for a cron job.
     ///
     /// Wraps the call in its own `Job` + `StepKind::ToolDirect` step (one
     /// tool `Span`, no LLM span — the variant exists specifically so this
     /// "no-LLM iteration" doesn't masquerade as an `LlmIteration` in cost
     /// reports). On a crash this produces a half-open span the recovery
     /// scan will rewrite as `Cancelled { SystemCrash }` and fold into the
-    /// job's `partial_artifacts`.
+    /// job's `partial_artifacts`. Tool-execution failures propagate as
+    /// `Err` to the actor's run loop, which logs them; there is no
+    /// LLM-narrated diagnostic follow-up.
     async fn handle_cron_tool_call(
         &mut self,
         cron_job_id: &str,
@@ -257,32 +233,22 @@ impl AgentActor {
         params: serde_json::Value,
         pre_approved: Vec<ApprovedResource>,
     ) -> anyhow::Result<()> {
-        // 1. Open a Job for this cron action. Caller-side so we keep
-        //    `job.id` available for the diagnostic dispatch on Err.
-        let job = self
-            .job_lifecycle
-            .start_job(
-                self.session.id.clone(),
-                self.session.trigger.kind(),
-                JobInput::Cron {
-                    action_payload: serde_json::json!({
-                        "kind": "tool_call",
-                        "cron_job_id": cron_job_id,
-                        "tool_name": tool_name,
-                        "params": params,
-                    }),
-                },
-                self.session.bound_soul_version.clone(),
-                None,
-            )
-            .await?;
-        let job_id = job.id;
+        let spec = JobSpec {
+            session_id: self.session.id.clone(),
+            session_trigger_kind: self.session.trigger.kind(),
+            input: JobInput::Cron {
+                action_payload: serde_json::json!({
+                    "kind": "tool_call",
+                    "cron_job_id": cron_job_id,
+                    "tool_name": tool_name,
+                    "params": params,
+                }),
+            },
+            effective_soul_version: self.session.bound_soul_version.clone(),
+            parent_job_id: None,
+        };
         let job_token = self.actor_token.child_token();
 
-        // Capture Arcs / values for the body. `&mut self` cannot enter
-        // the closure because the outer `Err` arm needs it for
-        // `dispatch_prompt`; clone the per-field handles it actually
-        // touches instead.
         let span_recorder = Arc::clone(&self.span_recorder);
         let tool_executor = Arc::clone(&self.tool_executor);
         let session_id = self.session.id.clone();
@@ -292,167 +258,81 @@ impl AgentActor {
         let approved = std::sync::Arc::new(parking_lot::Mutex::new(pre_approved));
         let body_token = job_token.clone();
 
-        let result = crate::scope::with_job(
-            &self.job_lifecycle,
-            job_token,
-            job_id,
-            |job_id| async move {
-                let step = span_recorder
-                    .begin_step(job_id, StepKind::ToolDirect)
-                    .await?;
-
-                let tool_result = tool_executor
-                    .execute(
-                        &tool_name_for_body,
-                        params,
-                        &session_id,
-                        &session_user,
-                        &approved,
-                        &span_recorder,
-                        &step,
-                        None,          // no triggering LLM span — direct cron invocation
-                        String::new(), // no tool_use_id — cron tools don't pair back to an LLM tool_use block
-                        None,          // no parallel group
-                        Some(job_id),
-                        body_token,
-                    )
-                    .await;
-
-                let output = match tool_result {
-                    Ok(ToolOutput::Error(e)) => {
-                        let reason = e.to_string();
-                        span_recorder
-                            .end_step(
-                                step,
-                                LifecycleOutcome::Failed {
-                                    reason: reason.clone(),
-                                },
-                            )
-                            .await
-                            .ok();
-                        return Err(anyhow::anyhow!(reason));
-                    }
-                    Err(e) => {
-                        span_recorder
-                            .end_step(
-                                step,
-                                LifecycleOutcome::Failed {
-                                    reason: e.to_string(),
-                                },
-                            )
-                            .await
-                            .ok();
-                        return Err(e);
-                    }
-                    Ok(output) => output,
-                };
-
-                span_recorder
-                    .end_step(step, LifecycleOutcome::Ok)
-                    .await
-                    .ok();
-
-                let (text, attachments) = match &output {
-                    ToolOutput::Text(t) => (t.clone(), Vec::new()),
-                    ToolOutput::Json(v) => (
-                        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
-                        Vec::new(),
-                    ),
-                    ToolOutput::WithAttachments { text, attachments } => {
-                        (text.clone(), attachments.clone())
-                    }
-                    ToolOutput::MultiModalText { text, llm_images } => {
-                        (text.clone(), llm_images.clone())
-                    }
-                    ToolOutput::Error(_) => unreachable!("handled above"),
-                };
-
-                // Carry attachments through so a cron-scheduled SendFile
-                // actually delivers the file.
-                let mut content =
-                    vec![ContentBlock::Text(format!("[cron:{cron_id_for_body}] {text}"))];
-                content.extend(attachments);
-                let response = OutgoingMessage {
-                    session_id: session_id.to_string(),
-                    user_id: session_user.id.clone(),
-                    channel: session_user.channel.clone(),
-                    content: content.clone(),
-                    reply_to: None,
-                    metadata: MessageMetadata::default(),
-                };
-                let job_output = JobOutput::Message {
-                    content: response.content.clone(),
-                };
-                Ok((job_output, response))
-            },
-        )
-        .await;
-
-        match result {
-            Ok(response) => {
-                if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
-                    warn!(error = %e, "failed to send cron tool result to channel");
-                }
-                self.emit_job_completed(JobOutcome::Completed).await;
-                Ok(())
-            }
-            Err(e) => {
-                // `with_job` already marked the row Failed (or Cancelled
-                // on a cancel race). Dispatch a diagnostic LLM job —
-                // its `dispatch_prompt` emits its own JobCompleted,
-                // which is the user-visible terminal for this cron
-                // tick. Emitting one here too would double-signal
-                // single-shot subscribers (subagent watchers, gateway
-                // WS protocol's job-status channel) on the first
-                // signal and hide the diagnostic's actual outcome.
-                self.dispatch_diagnostic_for_failed_cron_tool(
-                    cron_job_id,
-                    tool_name,
-                    &e.to_string(),
+        let cancel_for_step = body_token.clone();
+        let recorder_for_step = Arc::clone(&span_recorder);
+        let response =
+            crate::scope::with_job(&self.job_lifecycle, job_token, spec, |job_id| async move {
+                let (job_output, response) = crate::scope::with_step(
+                    recorder_for_step.as_ref(),
                     job_id,
-                )
-                .await
-            }
-        }
-    }
+                    StepKind::ToolDirect,
+                    Some((&cancel_for_step, aura_job::CancelReason::ParentCancelled)),
+                    |step| async move {
+                        let output = match tool_executor
+                            .execute(
+                                &tool_name_for_body,
+                                params,
+                                &session_id,
+                                &session_user,
+                                &approved,
+                                &span_recorder,
+                                &step,
+                                None,          // no triggering LLM span — direct cron invocation
+                                String::new(), // no tool_use_id — cron tools don't pair back to an LLM tool_use block
+                                None,          // no parallel group
+                                Some(job_id),
+                                body_token,
+                            )
+                            .await?
+                        {
+                            ToolOutput::Error(e) => return Err(anyhow::anyhow!(e.to_string())),
+                            output => output,
+                        };
 
-    /// Dispatch the cron-tool diagnostic LLM job. The failed tool's
-    /// row is already in `Failed` (or `Cancelled`) — `with_job` did
-    /// that. This only handles the user-visible follow-up.
-    async fn dispatch_diagnostic_for_failed_cron_tool(
-        &mut self,
-        cron_job_id: &str,
-        tool_name: &str,
-        reason: &str,
-        failed_tool_job_id: JobId,
-    ) -> anyhow::Result<()> {
-        warn!(
-            cron_job_id = %cron_job_id,
-            tool = %tool_name,
-            error = %reason,
-            "cron tool call failed, falling back to LLM"
-        );
-        let diagnostic = format!(
-            "[cron:{cron_job_id}] Tool '{tool_name}' failed: {reason}\n\
-             Diagnose the issue and report to the user.",
-        );
-        let diag_input = JobInput::Cron {
-            action_payload: serde_json::json!({
-                "kind": "tool_failure_diagnostic",
-                "cron_job_id": cron_job_id,
-                "tool_name": tool_name,
-                "failed_tool_job_id": failed_tool_job_id.to_string(),
-                "error": reason,
-            }),
-        };
-        self.dispatch_prompt(
-            &diagnostic,
-            "cron",
-            cron_job_id,
-            diag_input,
-            Some(failed_tool_job_id),
-        )
-        .await
+                        let (text, attachments) = match &output {
+                            ToolOutput::Text(t) => (t.clone(), Vec::new()),
+                            ToolOutput::Json(v) => (
+                                serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
+                                Vec::new(),
+                            ),
+                            ToolOutput::WithAttachments { text, attachments } => {
+                                (text.clone(), attachments.clone())
+                            }
+                            ToolOutput::MultiModalText { text, llm_images } => {
+                                (text.clone(), llm_images.clone())
+                            }
+                            ToolOutput::Error(_) => unreachable!("handled above"),
+                        };
+
+                        // Carry attachments through so a cron-scheduled
+                        // SendFile actually delivers the file.
+                        let mut content = vec![ContentBlock::Text(format!(
+                            "[cron:{cron_id_for_body}] {text}"
+                        ))];
+                        content.extend(attachments);
+                        let response = OutgoingMessage {
+                            session_id: session_id.to_string(),
+                            user_id: session_user.id.clone(),
+                            channel: session_user.channel.clone(),
+                            content: content.clone(),
+                            reply_to: None,
+                            metadata: MessageMetadata::default(),
+                        };
+                        let job_output = JobOutput::Message {
+                            content: response.content.clone(),
+                        };
+                        Ok((aura_trace::LifecycleOutcome::Ok, (job_output, response)))
+                    },
+                )
+                .await?;
+                Ok((job_output, response))
+            })
+            .await?;
+
+        if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
+            warn!(error = %e, "failed to send cron tool result to channel");
+        }
+        Ok(())
     }
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
@@ -461,7 +341,7 @@ impl AgentActor {
         // text deltas as `AgentOutput::Delta` while the final assembled
         // message still flows through the normal path.
         let response = self
-            .run_loop_with_terminal_emit(
+            .run_agent_loop(
                 JobInput::UserChat {
                     content: content.clone(),
                 },
@@ -487,7 +367,7 @@ impl AgentActor {
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
         let response = self
-            .run_loop_with_terminal_emit(
+            .run_agent_loop(
                 JobInput::Spawned {
                     initial_prompt: content.clone(),
                 },

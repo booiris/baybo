@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::event::SpanEvent;
-use crate::outcome::LifecycleOutcome;
+use crate::outcome::{LifecycleOutcome, LifecycleState};
 
 /// One atomic action recorded in the trace tree.
 ///
@@ -36,7 +36,7 @@ pub struct Span {
     pub ended_at: Option<DateTime<Utc>>,
 
     /// Lifecycle state. `Pending` until the span ends.
-    pub outcome: LifecycleOutcome,
+    pub outcome: LifecycleState,
 
     /// Sub-events (sanitize hits / approvals).
     /// In storage these live in their own `span_events` table keyed by
@@ -50,18 +50,12 @@ pub struct Span {
 impl Span {
     /// Atomically transition this span to a terminal outcome. Sets
     /// both `outcome` and `ended_at` from the single call so the
-    /// lifecycle invariant cannot be violated. Returns an error if
-    /// `outcome` is `LifecycleOutcome::Pending`.
-    pub fn close(&mut self, outcome: LifecycleOutcome, at: DateTime<Utc>) -> crate::Result<()> {
-        if !outcome.is_terminal() {
-            return Err(crate::TraceError::InvalidOperation(format!(
-                "Span::close requires a terminal LifecycleOutcome, got {}",
-                outcome.tag()
-            )));
-        }
-        self.outcome = outcome;
+    /// lifecycle invariant cannot be violated. The terminal-only
+    /// [`LifecycleOutcome`] type makes "close with `Pending`"
+    /// unrepresentable.
+    pub fn close(&mut self, outcome: LifecycleOutcome, at: DateTime<Utc>) {
+        self.outcome = LifecycleState::Done(outcome);
         self.ended_at = Some(at);
-        Ok(())
     }
 }
 
@@ -257,7 +251,7 @@ mod tests {
             parallel_group: None,
             started_at: Utc::now(),
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
             events: vec![],
         }
     }
@@ -266,19 +260,9 @@ mod tests {
     fn close_pairs_outcome_and_ended_at() {
         let mut span = pending_span(dummy_llm());
         let now = Utc::now();
-        span.close(LifecycleOutcome::Ok, now).unwrap();
-        assert_eq!(span.outcome, LifecycleOutcome::Ok);
+        span.close(LifecycleOutcome::Ok, now);
+        assert_eq!(span.outcome, LifecycleState::Done(LifecycleOutcome::Ok));
         assert_eq!(span.ended_at, Some(now));
-    }
-
-    #[test]
-    fn close_rejects_pending() {
-        let mut span = pending_span(dummy_tool());
-        let err = span
-            .close(LifecycleOutcome::Pending, Utc::now())
-            .unwrap_err();
-        assert!(matches!(err, crate::TraceError::InvalidOperation(_)));
-        assert!(span.ended_at.is_none());
     }
 
     #[test]
@@ -290,7 +274,7 @@ mod tests {
             parallel_group: None,
             started_at: Utc::now(),
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
             events: vec![],
         };
         let s = serde_json::to_string(&span).unwrap();
@@ -309,7 +293,7 @@ mod tests {
             parallel_group: Some(pg),
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),
-            outcome: LifecycleOutcome::Ok,
+            outcome: LifecycleState::Done(LifecycleOutcome::Ok),
             events: vec![],
         };
         let s = serde_json::to_string(&span).unwrap();
@@ -329,7 +313,7 @@ mod tests {
             parallel_group: None,
             started_at: Utc::now(),
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
             events: vec![],
         };
         let s = serde_json::to_string(&span).unwrap();

@@ -36,7 +36,7 @@ use aura_trace::{LifecycleOutcome, SpanFinalize, SpanHandle, SpanKind, StepHandl
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::job::JobLifecycle;
+use crate::job::{JobLifecycle, JobSpec};
 use crate::trace::SpanRecorder;
 
 /// Optional cancel context. When the body returns `Err` and the token
@@ -44,28 +44,31 @@ use crate::trace::SpanRecorder;
 /// than `Failed`.
 pub(crate) type CancelContext<'a> = Option<(&'a CancellationToken, CancelReason)>;
 
-fn outcome_for<T, E: std::fmt::Display>(
-    res: Result<&T, &E>,
-    cancel: CancelContext<'_>,
-) -> LifecycleOutcome {
-    match res {
-        Ok(_) => LifecycleOutcome::Ok,
-        Err(e) => match cancel {
-            Some((token, reason)) if token.is_cancelled() => {
-                LifecycleOutcome::Cancelled { reason }
-            }
-            _ => LifecycleOutcome::Failed {
-                reason: e.to_string(),
-            },
+/// Map a body `Err` to its terminal trace outcome: `Cancelled` if the
+/// scope's cancel token has been tripped, `Failed { reason: e.to_string() }`
+/// otherwise. Body `Ok` is handled directly by callers (which now carry
+/// the explicit `LifecycleOutcome`), so this only fires on the error
+/// path.
+fn outcome_on_err<E: std::fmt::Display>(e: &E, cancel: CancelContext<'_>) -> LifecycleOutcome {
+    match cancel {
+        Some((token, reason)) if token.is_cancelled() => LifecycleOutcome::Cancelled { reason },
+        _ => LifecycleOutcome::Failed {
+            reason: e.to_string(),
         },
     }
 }
 
 /// Open a `Step`, run `body`, close the step.
 ///
-/// Closes with `Ok` on body success, `Cancelled { reason }` on body
-/// `Err` when `cancel` is `Some` and the token has been tripped, and
-/// `Failed { reason }` otherwise.
+/// Body returns `(LifecycleOutcome, T)` so the success path can record
+/// a non-`Ok` outcome too — a subagent stub that returned successfully
+/// but with a `Cancelled` status maps that into the step's terminal
+/// state without faking an `Err`. For the common case `(Ok, value)`
+/// just write `Ok((LifecycleOutcome::Ok, value))`.
+///
+/// On body `Err` the helper closes as `Cancelled { reason }` when
+/// `cancel` is `Some` and the token has been tripped, otherwise
+/// `Failed { reason: e.to_string() }`.
 pub(crate) async fn with_step<F, Fut, T>(
     rec: &SpanRecorder,
     job_id: JobId,
@@ -75,34 +78,40 @@ pub(crate) async fn with_step<F, Fut, T>(
 ) -> anyhow::Result<T>
 where
     F: FnOnce(StepHandle) -> Fut,
-    Fut: Future<Output = anyhow::Result<T>>,
+    Fut: Future<Output = anyhow::Result<(LifecycleOutcome, T)>>,
 {
     let step = rec.begin_step(job_id, kind).await?;
     let result = body(step.clone()).await;
-    let outcome = outcome_for(result.as_ref(), cancel);
+    let outcome = match &result {
+        Ok((o, _)) => o.clone(),
+        Err(e) => outcome_on_err(e, cancel),
+    };
     if let Err(close_err) = rec.end_step(step, outcome).await {
         match &result {
             Ok(_) => warn!(error = %close_err, "end_step failed on success path"),
-            Err(orig) => warn!(error = %close_err, original = %orig, "end_step failed on error path"),
+            Err(orig) => {
+                warn!(error = %close_err, original = %orig, "end_step failed on error path")
+            }
         }
     }
-    result
+    result.map(|(_, v)| v)
 }
 
-/// Wrap the in-flight portion of a `Job` lifecycle: registers the
-/// cancellation token, transitions `Pending → InProgress`, runs the
-/// body, then `complete`s on success or `fail`s on error. The caller
-/// owns `start_job` — it returns the `JobId` they pass in here, and
-/// keeping it outside the helper means the caller still has the id
-/// available on the `Err` path (e.g. to dispatch a follow-up
-/// diagnostic job whose `parent_job_id` points at the failed job).
+/// Own a full `Job` lifecycle: create the row via `start_job`,
+/// register the cancellation token, transition `Pending → InProgress`,
+/// run the body, then `complete` on success or `fail` on error.
+///
+/// Production callers must go through this helper rather than calling
+/// `JobLifecycle::start_job` directly, so the cancel state machine
+/// (token registry + InProgress transition + cancel-race windows
+/// below) can't be skipped. Tests inside the agent crate may still
+/// use `start_job` directly to construct fixtures in arbitrary states.
 ///
 /// Body returns `(JobOutput, T)` on success: the helper writes the
-/// output via `complete`, and `T` flows back to the caller. The
-/// terminal `JobCompleted` broadcast is **not** emitted here — that
-/// is per-actor concern and lives at the call site (e.g.
-/// `AgentActor::run_loop_with_terminal_emit`, or the cron path's
-/// success arm).
+/// output via `complete`, and `T` flows back to the caller.
+/// `JobLifecycle::complete` / `fail` / `cancel` themselves publish
+/// terminal events on the broadcast bus; this helper does not need
+/// to fire any extra notification.
 ///
 /// ## Cancel-race handling
 ///
@@ -121,13 +130,23 @@ where
 pub(crate) async fn with_job<F, Fut, T>(
     lifecycle: &JobLifecycle,
     cancel_token: CancellationToken,
-    job_id: JobId,
+    spec: JobSpec,
     body: F,
 ) -> anyhow::Result<T>
 where
     F: FnOnce(JobId) -> Fut,
     Fut: Future<Output = anyhow::Result<(JobOutput, T)>>,
 {
+    let job = lifecycle
+        .start_job(
+            spec.session_id,
+            spec.session_trigger_kind,
+            spec.input,
+            spec.effective_soul_version,
+            spec.parent_job_id,
+        )
+        .await?;
+    let job_id = job.id;
     let _cancel_guard = lifecycle.register_running(job_id, cancel_token.clone());
 
     if let Err(e) = lifecycle.start(&job_id).await {
@@ -172,11 +191,17 @@ where
 
 /// Open a `Span`, run `body`, close the span.
 ///
-/// On `Ok` the body returns `(SpanFinalize, T)`; the helper passes the
-/// finalize payload to `end_span` with `LifecycleOutcome::Ok`. On
-/// `Err` the helper closes via `end_span` with `SpanFinalize::Empty`
-/// (no end-time payload available) and `Cancelled { reason }` /
-/// `Failed { reason }` per the same rules as `with_step`.
+/// Body returns `(SpanFinalize, LifecycleOutcome, T)` so the success
+/// path can record a non-`Ok` outcome too — a tool whose
+/// [`aura_tools::ToolOutput::Error`] arm should land as
+/// `Failed { reason }` in the trace, or a subagent stub that mapped a
+/// `Cancelled` status, both ride this single shape. For the common
+/// case `(Ok, value)` just write `Ok((finalize, LifecycleOutcome::Ok, value))`.
+///
+/// On body `Err` the helper closes via `end_span` with
+/// `SpanFinalize::Empty` (no end-time payload available) and
+/// `Cancelled { reason }` / `Failed { reason: e.to_string() }` per the
+/// same rules as `with_step`.
 pub(crate) async fn with_span<F, Fut, T>(
     rec: &SpanRecorder,
     step: &StepHandle,
@@ -188,19 +213,24 @@ pub(crate) async fn with_span<F, Fut, T>(
 ) -> anyhow::Result<T>
 where
     F: FnOnce(SpanHandle) -> Fut,
-    Fut: Future<Output = anyhow::Result<(SpanFinalize, T)>>,
+    Fut: Future<Output = anyhow::Result<(SpanFinalize, LifecycleOutcome, T)>>,
 {
     let span = rec.begin_span(step, kind, parallel_group).await?;
     let result = body(span.clone()).await;
-    let (finalize, value_result): (SpanFinalize, anyhow::Result<T>) = match result {
-        Ok((f, v)) => (f, Ok(v)),
-        Err(e) => (SpanFinalize::Empty, Err(e)),
-    };
-    let outcome = outcome_for(value_result.as_ref(), cancel);
+    let (finalize, outcome, value_result): (SpanFinalize, LifecycleOutcome, anyhow::Result<T>) =
+        match result {
+            Ok((f, o, v)) => (f, o, Ok(v)),
+            Err(e) => {
+                let outcome = outcome_on_err(&e, cancel);
+                (SpanFinalize::Empty, outcome, Err(e))
+            }
+        };
     if let Err(close_err) = rec.end_span(span, job_id, finalize, outcome).await {
         match &value_result {
             Ok(_) => warn!(error = %close_err, "end_span failed on success path"),
-            Err(orig) => warn!(error = %close_err, original = %orig, "end_span failed on error path"),
+            Err(orig) => {
+                warn!(error = %close_err, original = %orig, "end_span failed on error path")
+            }
         }
     }
     value_result

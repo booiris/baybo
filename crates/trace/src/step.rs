@@ -5,7 +5,7 @@ use aura_model::{JobId, SessionId, StepId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::outcome::LifecycleOutcome;
+use crate::outcome::{LifecycleOutcome, LifecycleState};
 
 /// One step in a job's life. Owns 1+ child `Span`s (in the spans table,
 /// keyed by `step_id`). Steps within a job are strictly serial — there
@@ -24,26 +24,18 @@ pub struct Step {
     /// Set once every child span (including parallel ones) has ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<DateTime<Utc>>,
-    pub outcome: LifecycleOutcome,
+    pub outcome: LifecycleState,
 }
 
 impl Step {
     /// Atomically transition this step to a terminal outcome. Sets
     /// both `outcome` and `ended_at` from the single call so the
-    /// lifecycle invariant cannot be violated. Returns an error if
-    /// `outcome` is `LifecycleOutcome::Pending` (callers are expected
-    /// to construct fresh steps with `Pending` directly and call
-    /// `close` only at end time).
-    pub fn close(&mut self, outcome: LifecycleOutcome, at: DateTime<Utc>) -> crate::Result<()> {
-        if !outcome.is_terminal() {
-            return Err(crate::TraceError::InvalidOperation(format!(
-                "Step::close requires a terminal LifecycleOutcome, got {}",
-                outcome.tag()
-            )));
-        }
-        self.outcome = outcome;
+    /// lifecycle invariant cannot be violated. The terminal-only
+    /// [`LifecycleOutcome`] type makes "close with `Pending`"
+    /// unrepresentable.
+    pub fn close(&mut self, outcome: LifecycleOutcome, at: DateTime<Utc>) {
+        self.outcome = LifecycleState::Done(outcome);
         self.ended_at = Some(at);
-        Ok(())
     }
 }
 
@@ -131,7 +123,7 @@ mod tests {
             kind,
             started_at: Utc::now(),
             ended_at: None,
-            outcome: LifecycleOutcome::Pending,
+            outcome: LifecycleState::Pending,
         }
     }
 
@@ -165,17 +157,9 @@ mod tests {
     fn close_pairs_outcome_and_ended_at() {
         let mut s = fresh_step(StepKind::LlmIteration);
         let now = Utc::now();
-        s.close(LifecycleOutcome::Ok, now).unwrap();
-        assert_eq!(s.outcome, LifecycleOutcome::Ok);
+        s.close(LifecycleOutcome::Ok, now);
+        assert_eq!(s.outcome, LifecycleState::Done(LifecycleOutcome::Ok));
         assert_eq!(s.ended_at, Some(now));
-    }
-
-    #[test]
-    fn close_rejects_pending() {
-        let mut s = fresh_step(StepKind::Compression);
-        let err = s.close(LifecycleOutcome::Pending, Utc::now()).unwrap_err();
-        assert!(matches!(err, crate::TraceError::InvalidOperation(_)));
-        assert!(s.ended_at.is_none());
     }
 
     #[test]
