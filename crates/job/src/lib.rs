@@ -301,7 +301,18 @@ impl Job {
         )
     }
 
+    /// `Stuck → InProgress` only. Reaching `InProgress` from `Pending` is
+    /// the job of `start()`, which records the transition without a recovery
+    /// reason; conflating the two would let `recover()` masquerade as a
+    /// regular start and corrupt the recovery audit trail.
     pub fn recover(&mut self, reason: impl Into<String>) -> Result<JobTransition> {
+        if !matches!(self.status, JobStatus::Stuck { .. }) {
+            return Err(JobError::InvalidTransition(format!(
+                "{} -> InProgress (job {}): recover() requires Stuck",
+                self.status.kind(),
+                self.id
+            )));
+        }
         self.transition(JobStatus::InProgress, None, Some(reason.into()))
     }
 
@@ -520,6 +531,23 @@ mod tests {
         let mut j = fresh_job();
         let err = j.complete(dummy_output()).unwrap_err();
         assert!(matches!(err, JobError::InvalidTransition(_)));
+    }
+
+    #[test]
+    fn recover_rejects_pending() {
+        let mut j = fresh_job();
+        let err = j.recover("oops").unwrap_err();
+        assert!(matches!(err, JobError::InvalidTransition(_)));
+        assert!(matches!(j.status, JobStatus::Pending));
+    }
+
+    #[test]
+    fn recover_rejects_in_progress() {
+        let mut j = fresh_job();
+        j.start().unwrap();
+        let err = j.recover("oops").unwrap_err();
+        assert!(matches!(err, JobError::InvalidTransition(_)));
+        assert!(matches!(j.status, JobStatus::InProgress));
     }
 
     #[test]

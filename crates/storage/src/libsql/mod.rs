@@ -264,7 +264,7 @@ impl LibsqlPool {
                     id              TEXT    PRIMARY KEY,
                     user_id         TEXT    NOT NULL,
                     status          TEXT    NOT NULL,
-                    -- Unix ms; 0 means 'no scheduled fire'
+                    -- Unix µs; 0 means 'no scheduled fire'
                     -- (replaces the empty-string sentinel from the prior
                     -- TEXT/RFC3339 schema).
                     next_trigger_at INTEGER NOT NULL DEFAULT 0,

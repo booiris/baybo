@@ -59,7 +59,7 @@ impl RateLimiter {
 ///
 /// Returns the mailbox sender for communicating with the spawned actor.
 /// The closure captures all dependencies needed to construct an actor
-/// (AgentLoop, HookManager, ObservabilityRecorder, etc.).
+/// (AgentLoop, HookManager, JobLifecycle, SpanRecorder, etc.).
 pub type ActorSpawner =
     Box<dyn Fn(Session, mpsc::Sender<AgentOutput>) -> mpsc::Sender<AgentMessage> + Send + Sync>;
 

@@ -389,7 +389,7 @@ impl CronStore for LibsqlCronStore {
 mod tests {
     use super::*;
 
-    // 2099-01-01T00:00:00Z in Unix ms.
+    // 2099-01-01T00:00:00Z in Unix µs.
     const FUTURE_US: i64 = 4_070_908_800_000_000;
 
     fn test_row(id: &str, user_id: &str, status: &str) -> CronJobRow {
@@ -516,7 +516,7 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlCronStore::new(pool);
 
-        // 2000-01-01T00:00:00Z and 2025-01-01T00:00:00Z in Unix ms.
+        // 2000-01-01T00:00:00Z and 2025-01-01T00:00:00Z in Unix µs.
         const PAST_US: i64 = 946_684_800_000_000;
         const NOW_US: i64 = 1_735_689_600_000_000;
 

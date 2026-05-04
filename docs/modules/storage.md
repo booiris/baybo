@@ -62,22 +62,25 @@ Table schemas are created centrally in `LibsqlPool::init_db()`, but each Store s
 
 ### JSON field strategy
 
-Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) are stored as JSON. Trace tables use a columnar schema: `session_traces` holds only metadata (root, active_leaf, timestamps); `trace_nodes` stores one row per node with queryable columns (`kind`, `started_at`, `parent_id`, etc.) and JSON for complex fields (`provenance`, `input`, `result`); `trace_forks` stores fork records. Children lists are derived from `parent_id` on load. The security requirement still applies: values must already be sanitized.
+Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) are stored as JSON. The trace stack uses a hybrid columnar schema: `steps` and `spans` keep queryable columns (`kind`, `started_at`, `ended_at`, `outcome`, `job_id`, `step_id`, `parallel_group`) plus a JSON `data` blob for full round-trip; `span_events` keeps `step_id`, `span_id`, `kind`, `at` columnar with JSON payload; `trace_events` is the append-only WAL keyed by `(session_id, at)`. The security requirement still applies: values must already be sanitized before persistence.
 
 ### Transaction boundaries
 
-Use transactions for: `TraceStore.save_trace()` writing trace root and nodes atomically.
+Use transactions wherever a check-and-write pair must be atomic — most importantly `SessionStore::soft_delete`, which checks for live forks before stamping the parent's `deleted_at` (a non-transactional implementation admits orphan forks under concurrent `create_fork`).
 
 ### Soft delete (libsql)
 
 All libsql-backed tables that support deletion use **soft delete**, never a hard `DELETE`. This preserves history for audit, replay, and compliance.
 
-- Every deletable table carries a nullable `deleted_at INTEGER` column (Unix seconds; `NULL` = live row).
+- Every deletable table carries a nullable `deleted_at INTEGER` column (**Unix µs**, written via `super::time::now_us()`; `NULL` = live row).
 - Deletion = `UPDATE ... SET deleted_at = ?now WHERE ... AND deleted_at IS NULL`. Do not emit `DELETE FROM` against these tables.
 - Every read (`SELECT`) MUST include `AND deleted_at IS NULL` so soft-deleted rows stay hidden. Every mutation (`UPDATE`) on a live row MUST include the same guard so you never write through a deleted row.
 - Re-insertion semantics: `INSERT OR REPLACE` and `ON CONFLICT ... DO UPDATE` must reset `deleted_at` back to `NULL` so recreating a soft-deleted id revives it (see `skill_risk.rs::upsert_job` for the pattern).
 - Schema changes: add the column to the `CREATE TABLE IF NOT EXISTS` in `crates/storage/src/libsql/mod.rs`.
-- Tables currently covered: `sessions`, `memories`, `session_traces`, `trace_nodes`, `trace_forks`, `secrets`, `jobs`, `job_transitions`, `cron_jobs`, `cron_executions`, `skill_risk_assessments`, `skill_risk_assessment_jobs`. The only append-only table without `deleted_at` is `cost_records` (billing audit trail).
+- Tables currently covered: `sessions`, `memories`, `secrets`, `jobs`, `job_transitions`, `steps`, `spans`, `span_events`, `trace_events`, `cron_jobs`, `cron_executions`, `skill_risk_assessments`, `skill_risk_assessment_jobs`, `channel_sessions`, `channel_bots`, `channel_pairings`, `blobs`, `user_monthly_cost`. The only append-only table without `deleted_at` is `cost_records` (billing audit trail).
+- **Retention exceptions.** Two tables expose hard-delete retention sweeps that bypass the protocol — they keep `deleted_at` for the live-vs-tombstone distinction during normal operation but `aura-janitor` issues `DELETE FROM` on rows older than the retention horizon. Documented exceptions, not bugs:
+  - `cron_executions` — `purge_completed_executions_older_than(cutoff)` hard-deletes non-`pending` rows. Audit trail beyond the horizon is not preserved.
+  - `channel_pairings` — `purge_expired(now)` hard-deletes rows whose `expires_at < now`. Pairing codes are short-lived and intentionally non-recoverable past expiry.
 
 ## Constraints
 

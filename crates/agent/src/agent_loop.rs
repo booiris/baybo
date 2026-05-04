@@ -834,7 +834,6 @@ impl AgentLoop {
                 SpanKind::LlmCall {
                     model_id: model_info.id.clone(),
                     provider: model_info.provider.clone(),
-                    // wired in step-6
                     provider_config_hash: String::new(),
                     input_messages: session.messages.clone(),
                     temperature: None,

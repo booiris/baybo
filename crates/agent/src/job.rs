@@ -32,8 +32,8 @@ impl JobLifecycle {
     /// `session_trigger_kind` is the root trigger kind of the owning
     /// session — used to enforce the `JobKind ↔ TriggerKind` invariant
     /// documented in `aura_job::kind`. Mismatches return
-    /// `JobError::InvalidTransition` with a descriptive message
-    /// (rather than passing through silently as before).
+    /// `JobError::KindMismatch` with a descriptive message (rather than
+    /// passing through silently as before).
     pub async fn start_job(
         &self,
         session_id: SessionId,
@@ -44,7 +44,7 @@ impl JobLifecycle {
     ) -> Result<Job> {
         let job_kind = input.kind();
         if !job_kind.allowed_for(session_trigger_kind) {
-            return Err(JobError::InvalidTransition(format!(
+            return Err(JobError::KindMismatch(format!(
                 "job kind {job_kind:?} not allowed in {session_trigger_kind:?}-trigger session \
                  (see aura_job::kind allowed-for table)"
             )));

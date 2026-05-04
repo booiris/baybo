@@ -106,7 +106,7 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 - Pure types crate — no storage interfaces, no async
 - `input` / `final_result` / `partial_artifacts` store sanitized JSON / span-id lists only — sensitive values must already be placeholders
 - `save()` and `record_transition()` should run in the same transaction (enforced by `JobLifecycle`)
-- `session.trigger.kind() == job.kind()` invariant is enforced at `Job::new`
+- `session.trigger.kind() == job.kind()` invariant is enforced at `JobLifecycle::start_job` (returns `JobError::KindMismatch` on violation); `Job::new` is the type-safe constructor and trusts the caller to have matched kinds upstream
 - Does not depend on `trace`, `llm`, `tools`, or `agent`
 
 ## Collaboration
