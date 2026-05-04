@@ -192,17 +192,23 @@ impl AgentActor {
             )
             .await;
 
-        let outcome = match &result {
-            Ok(_) => JobOutcome::Completed,
-            Err(_) => JobOutcome::Failed,
-        };
-        let response = result?;
-
-        if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
-            warn!(error = %e, "failed to send {source} response to channel");
+        match result {
+            Ok(response) => {
+                if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
+                    warn!(error = %e, "failed to send {source} response to channel");
+                }
+                self.emit_job_completed(JobOutcome::Completed).await;
+                Ok(())
+            }
+            Err(e) => {
+                // Always emit a terminal JobCompleted, even on failure —
+                // a single subscriber waiting on this prompt's outcome
+                // (e.g. a parent subagent watcher) needs *some* terminal
+                // signal or it hangs until its own timeout.
+                self.emit_job_completed(JobOutcome::Failed).await;
+                Err(e)
+            }
         }
-        self.emit_job_completed(outcome).await;
-        Ok(())
     }
 
     /// Emit a `JobCompleted` terminal signal on the response channel.
@@ -365,7 +371,14 @@ impl AgentActor {
             .await
             .ok();
         self.job_lifecycle.fail(&job_id, reason.clone()).await.ok();
-        self.emit_job_completed(JobOutcome::Failed).await;
+        // Intentionally don't `emit_job_completed` here for the failed
+        // tool job. The diagnostic LLM dispatch below is the same cron
+        // tick's continuation; the user-visible terminal state is the
+        // diagnostic's outcome, and `dispatch_prompt` emits its own
+        // JobCompleted on both Ok and Err paths. Emitting twice would
+        // wedge any single-shot subscriber (subagent watchers, the
+        // gateway WS protocol's job-status channel) on the first
+        // signal and hide the diagnostic's actual outcome.
         warn!(
             cron_job_id = %cron_job_id,
             tool = %tool_name,
