@@ -24,8 +24,11 @@ pub trait SessionStore: Send + Sync {
     /// if the row did not exist or was already deleted (idempotent).
     /// Returns `Err(StorageError::HasLiveForks { .. })` if any
     /// non-deleted session has a `LineageKind::UserFork` pointing into
-    /// `session_id`. The check + soft-delete run in one transaction so
-    /// no fork can race in between.
+    /// `session_id`. The live-fork scan, the parent-row update, and the
+    /// `cost_records.originating_session_deleted_at` mirror all run inside
+    /// one `BEGIN IMMEDIATE` write transaction — a fork inserted concurrently
+    /// either lands before the scan (and is reported back) or after the
+    /// commit (and protects a still-live parent on the *next* call).
     ///
     /// Does **not** drain in-flight subagents — that is the
     /// `SessionManager`'s responsibility (cancel propagation through

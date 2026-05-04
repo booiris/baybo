@@ -6,7 +6,7 @@ use aura_model::ChannelType;
 use aura_storage::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::error::CronError;
 use crate::job::{
@@ -19,6 +19,7 @@ use crate::shutdown::Shutdown;
 fn store_err(e: CronStoreError) -> CronError {
     match e {
         CronStoreError::NotFound(id) => CronError::NotFound(id),
+        CronStoreError::AlreadyExists(key) => CronError::AlreadyDispatched(key),
         CronStoreError::Internal(msg) => CronError::Storage(msg),
     }
 }
@@ -470,9 +471,16 @@ impl CronScheduler {
                     continue;
                 }
             };
-            if let Err(e) = self.store.record_execution(&exec_row).await {
-                error!(job_id = %job.id, error = %e, "failed to record cron execution");
-                continue;
+            match self.store.record_execution(&exec_row).await {
+                Ok(()) => {}
+                Err(CronStoreError::AlreadyExists(key)) => {
+                    debug!(job_id = %job.id, slot = %key, "skipping duplicate cron execution slot");
+                    continue;
+                }
+                Err(e) => {
+                    error!(job_id = %job.id, error = %e, "failed to record cron execution");
+                    continue;
+                }
             }
 
             // Phase 2: Advance job schedule (before dispatch, so crash won't re-fire)

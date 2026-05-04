@@ -259,6 +259,8 @@ impl LibsqlPool {
                 );
                 CREATE INDEX IF NOT EXISTS idx_trace_events_session
                     ON trace_events(session_id, at) WHERE deleted_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_trace_events_at
+                    ON trace_events(at) WHERE deleted_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS cron_jobs (
                     id              TEXT    PRIMARY KEY,

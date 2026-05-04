@@ -5,6 +5,12 @@ use async_trait::async_trait;
 pub enum CronStoreError {
     /// The requested record was not found.
     NotFound(String),
+    /// A duplicate of a uniqueness-constrained record. Today this is
+    /// raised by `record_execution` when two scheduler instances race
+    /// on the same `(job_id, scheduled_fire_time)` slot — the loser
+    /// gets this so it can debug-log and continue rather than treating
+    /// it as a backend failure.
+    AlreadyExists(String),
     /// An internal storage error occurred.
     Internal(String),
 }
@@ -13,6 +19,7 @@ impl std::fmt::Display for CronStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound(id) => write!(f, "not found: {id}"),
+            Self::AlreadyExists(key) => write!(f, "already exists: {key}"),
             Self::Internal(msg) => write!(f, "{msg}"),
         }
     }

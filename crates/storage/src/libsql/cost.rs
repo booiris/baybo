@@ -218,7 +218,11 @@ impl CostStore for LibsqlCostStore {
                     user_id,
                     month,
                     cost_usd,
-                    updated_at: time::from_us(updated_at),
+                    updated_at: time::from_us(updated_at).ok_or_else(|| {
+                        CostError::Storage(format!(
+                            "user_monthly_cost.updated_at out of range: {updated_at}"
+                        ))
+                    })?,
                 }))
             }
         }
@@ -275,7 +279,11 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
     let timestamp_us: i64 = row
         .get(8)
         .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
-    let timestamp = time::from_us(timestamp_us);
+    let timestamp = time::from_us(timestamp_us).ok_or_else(|| {
+        CostError::Storage(format!(
+            "cost_records.timestamp out of range: {timestamp_us}"
+        ))
+    })?;
 
     let session_id_str: String = row
         .get(1)
@@ -290,6 +298,14 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
     let originating_deleted_ts: Option<i64> = row
         .get(9)
         .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
+    let originating_session_deleted_at = match originating_deleted_ts {
+        None => None,
+        Some(us) => Some(time::from_us(us).ok_or_else(|| {
+            CostError::Storage(format!(
+                "cost_records.originating_session_deleted_at out of range: {us}"
+            ))
+        })?),
+    };
 
     Ok(CostRecord {
         user_id: row
@@ -317,7 +333,7 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
             .get(7)
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         timestamp,
-        originating_session_deleted_at: originating_deleted_ts.map(time::from_us),
+        originating_session_deleted_at,
     })
 }
 

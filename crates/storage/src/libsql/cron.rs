@@ -225,10 +225,15 @@ impl CronStore for LibsqlCronStore {
     // ── Execution records ──
 
     async fn record_execution(&self, row: &CronExecutionRow) -> crate::cron::Result<()> {
-        self.pool
+        // INSERT OR IGNORE so the (job_id, scheduled_fire_time) unique
+        // index distinguishes "lost the dedup race" from "DB is broken".
+        // 0 affected rows means another scheduler beat us to this slot;
+        // the caller treats that as benign and skips the dispatch.
+        let affected = self
+            .pool
             .conn()
             .execute(
-                "INSERT INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 libsql::params![
                     row.id.clone(),
                     row.job_id.clone(),
@@ -241,6 +246,12 @@ impl CronStore for LibsqlCronStore {
             )
             .await
             .map_err(|e| CronStoreError::Internal(format!("libsql insert: {e}")))?;
+        if affected == 0 {
+            return Err(CronStoreError::AlreadyExists(format!(
+                "{}@{}",
+                row.job_id, row.scheduled_fire_time
+            )));
+        }
         Ok(())
     }
 
@@ -367,10 +378,12 @@ impl CronStore for LibsqlCronStore {
         &self,
         cutoff_us: i64,
     ) -> crate::cron::Result<u64> {
-        // Purge anything past the retention horizon that isn't still
-        // mid-flight. `pending` rows might be in-flight on another
-        // worker; preserving them protects against a long-stalled
-        // dispatch from being silently reaped.
+        // Hard-delete past the retention horizon. Documented retention
+        // exception (see docs/modules/storage.md "Retention exceptions"):
+        // `cron_executions` is audit-ephemera, not recoverable past the
+        // horizon. `pending` rows are preserved because they might still
+        // be in-flight on another worker — reaping them silently would
+        // mask a long-stalled dispatch.
         let affected = self
             .pool
             .conn()
@@ -537,6 +550,31 @@ mod tests {
     }
 
     // ── Execution record tests ──
+
+    #[tokio::test]
+    async fn record_execution_dedup_returns_already_exists() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlCronStore::new(pool);
+
+        let mut row = test_exec_row("ce-dup-a", "cj-dup", "u1");
+        store.record_execution(&row).await.unwrap();
+
+        // Second instance of the same scheduler racing onto the same
+        // (job_id, scheduled_fire_time) slot — different `id`, same dedup key.
+        row.id = "ce-dup-b".into();
+        let err = store.record_execution(&row).await.unwrap_err();
+        match err {
+            CronStoreError::AlreadyExists(key) => {
+                assert!(key.starts_with("cj-dup@"), "key was {key}");
+            }
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+
+        // Original row remains; the loser produced no orphan.
+        let execs = store.list_executions_by_job("cj-dup").await.unwrap();
+        assert_eq!(execs.len(), 1);
+        assert_eq!(execs[0].id, "ce-dup-a");
+    }
 
     #[tokio::test]
     async fn record_and_list_executions_by_job() {

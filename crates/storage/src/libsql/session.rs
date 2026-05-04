@@ -98,18 +98,50 @@ impl SessionStore for LibsqlSessionStore {
     }
 
     async fn soft_delete(&self, session_id: &SessionId) -> Result<bool> {
-        // Atomic check-then-soft-delete: scan for any live `user_fork`
-        // child pointing here; if any exists, return `HasLiveForks`
-        // and do not touch the row.
-        let live_forks = self.list_live_forks(session_id).await?;
+        // BEGIN IMMEDIATE acquires a write lock at start, so any concurrent
+        // INSERT/UPDATE on `sessions` either blocks behind us or fails BUSY.
+        // That's the atomicity contract callers rely on: a fork inserted
+        // *after* the live-fork scan returns empty cannot land while we hold
+        // the lock, and the parent's deletion + cost-records mirror commit
+        // together or not at all.
+        let conn = self.pool.conn();
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql begin soft_delete tx: {e}"))
+            })?;
+
+        let mut rows = tx
+            .query(
+                "SELECT id FROM sessions \
+                 WHERE parent_session_id = ?1 AND lineage_kind = 'user_fork' \
+                   AND deleted_at IS NULL",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql live-forks scan: {e}")))?;
+        let mut live_forks = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            live_forks.push(SessionId::from(id));
+        }
+        drop(rows);
         if !live_forks.is_empty() {
+            let _ = tx.rollback().await;
             return Err(StorageError::HasLiveForks {
                 fork_session_ids: live_forks,
             });
         }
-        let conn = self.pool.conn();
+
         let now = super::time::now_us();
-        let affected = conn
+        let affected = tx
             .execute(
                 "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
                 libsql::params![now, session_id.as_str().to_string()],
@@ -117,17 +149,21 @@ impl SessionStore for LibsqlSessionStore {
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete session: {e}")))?;
         if affected == 0 {
+            let _ = tx.rollback().await;
             return Ok(false);
         }
         // Mirror the deletion onto cost_records.originating_session_deleted_at
         // so cost UIs can render 'source deleted' without join-back.
-        conn.execute(
+        tx.execute(
             "UPDATE cost_records SET originating_session_deleted_at = ?1 \
              WHERE session_id = ?2 AND originating_session_deleted_at IS NULL",
             libsql::params![now, session_id.as_str().to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql cost_records mirror: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql commit: {e}")))?;
         Ok(true)
     }
 

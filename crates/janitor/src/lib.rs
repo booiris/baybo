@@ -468,7 +468,7 @@ mod tests {
         // The MemoryBlobStore stamps `created_at = now` on every put and
         // exposes no clock seam; pass a cutoff well into the future so
         // the live row is unconditionally older than it.
-        let future_cutoff = chrono::Utc::now().timestamp() + 86_400;
+        let future_cutoff = chrono::Utc::now().timestamp_micros() + 86_400_000_000;
         let report = Janitor::new(paths.clone(), Arc::clone(&store))
             .sweep_once_with_blob_cutoff(future_cutoff)
             .await;

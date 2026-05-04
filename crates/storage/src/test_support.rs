@@ -618,7 +618,7 @@ impl BlobStore for MemoryBlobStore {
         let hex = hex_encode(&hasher.finalize());
         let read_token = "fake-token";
         let blob_id = format!("{SHA256_PREFIX}{hex}.{read_token}");
-        let now = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().timestamp_micros();
         let mut guard = self.blobs.lock();
         guard
             .entry(blob_id.clone())
@@ -680,7 +680,7 @@ impl BlobStore for MemoryBlobStore {
 
     async fn stat(&self, blob_id: &str) -> BlobResult<BlobMeta> {
         let (_hex, token) = split_id(blob_id)?;
-        let now = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().timestamp_micros();
         let mut guard = self.blobs.lock();
         match guard.get_mut(blob_id) {
             Some(b) if b.deleted_at.is_none() => {
@@ -707,14 +707,14 @@ impl BlobStore for MemoryBlobStore {
         let _ = split_id(blob_id)?;
         if let Some(b) = self.blobs.lock().get_mut(blob_id) {
             b.deleted_at
-                .get_or_insert_with(|| chrono::Utc::now().timestamp());
+                .get_or_insert_with(|| chrono::Utc::now().timestamp_micros());
         }
         Ok(())
     }
 
     async fn purge_older_than(&self, cutoff_unix: i64) -> BlobResult<u64> {
         let mut guard = self.blobs.lock();
-        let now = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().timestamp_micros();
         let mut purged: u64 = 0;
         for blob in guard.values_mut() {
             if blob.deleted_at.is_none() && blob.last_accessed_at < cutoff_unix {

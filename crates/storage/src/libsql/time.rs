@@ -23,11 +23,14 @@ pub(crate) fn to_us(dt: DateTime<Utc>) -> i64 {
     dt.timestamp_micros()
 }
 
-/// Decode an `INTEGER` µs column back to `DateTime<Utc>`. Falls back
-/// to `Utc::now()` only if a row carries an out-of-range value
-/// (impossible in practice — `to_us` accepts every chrono `DateTime`).
-pub(crate) fn from_us(us: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp_micros(us).unwrap_or_else(Utc::now)
+/// Decode an `INTEGER` µs column back to `DateTime<Utc>`. Returns
+/// `None` only if a row carries an out-of-range value (impossible in
+/// practice — `to_us` accepts every chrono `DateTime`); callers map
+/// that to their store-specific error rather than silently falling back
+/// to `now()`, which would mask DB corruption by extending TTLs and
+/// hiding bugs.
+pub(crate) fn from_us(us: i64) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp_micros(us)
 }
 
 /// `Utc::now()` as Unix µs.

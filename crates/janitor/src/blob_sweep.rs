@@ -9,6 +9,7 @@ pub(crate) async fn purge_old_blobs(
     store: &Arc<dyn BlobStore>,
     ttl: Duration,
 ) -> Result<u64, JanitorError> {
-    let cutoff = chrono::Utc::now().timestamp() - ttl.as_secs() as i64;
-    Ok(store.purge_older_than(cutoff).await?)
+    let ttl_us = i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX);
+    let cutoff_us = chrono::Utc::now().timestamp_micros().saturating_sub(ttl_us);
+    Ok(store.purge_older_than(cutoff_us).await?)
 }

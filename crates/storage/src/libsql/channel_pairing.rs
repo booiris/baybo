@@ -253,6 +253,11 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
     }
 
     async fn purge_expired(&self, now_secs: i64, approved_cutoff_secs: i64) -> Result<u64, String> {
+        // Hard-delete expired pairing codes. Documented retention exception
+        // (see docs/modules/storage.md "Retention exceptions"): pairing
+        // codes are short-lived and intentionally non-recoverable past
+        // expiry — keeping tombstones would let leaked codes resurface
+        // through audit replay.
         let conn = self.pool.conn();
         let affected = conn
             .execute(
