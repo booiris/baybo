@@ -19,8 +19,11 @@ use tokio::sync::mpsc;
 use super::bot_reconciler::ChannelBotReconciler;
 use super::control::ChannelControlRegistry;
 use super::dedup::InboundDedup;
+use super::diagnose::DiagnoseRouter;
 use super::history::TuiHistoryStore;
+use super::mcp_tunnel::McpTunnelRouter;
 use super::session_resolver::ChannelSessionResolver;
+use super::sidecar_mcp::SidecarMcpManager;
 use crate::auth::ChannelTokenTable;
 use crate::log_buffer::LogBuffer;
 
@@ -81,4 +84,24 @@ pub struct WsChannelState {
     /// agent sees each upstream event exactly once. Sidecars that omit
     /// `platform_msg_id` opt out — every frame is admitted.
     pub inbound_dedup: Arc<InboundDedup>,
+    /// Pending diagnose round-trips. The admin endpoint registers a
+    /// waiter here, the inbound loop resolves it when the matching
+    /// `Frame::DiagnoseReply` lands. One router is shared across all
+    /// connected sidecars — request_ids are UUIDs so no collision risk.
+    pub diagnose_router: Arc<DiagnoseRouter>,
+    /// Per-channel-type capability advertisement, captured at register
+    /// time. The admin diagnose endpoint reads this to short-circuit
+    /// requests against sidecars that didn't claim the `"diagnose"`
+    /// capability rather than wait for the round-trip to time out.
+    pub capabilities: Arc<super::diagnose::ChannelCapabilities>,
+    /// MCP tunnel registry. The inbound loop forwards `Frame::Mcp`
+    /// payloads here; the agent-side MCP client adapter (lands in
+    /// slice 2) opens / closes tunnels as needed.
+    pub mcp_tunnel_router: Arc<McpTunnelRouter>,
+    /// Lazy per-session sidecar MCP manager. The disconnect path
+    /// calls `detach(channel_type)` so cached rmcp sessions are
+    /// dropped before the tunnel registry drains. Agent loops hold
+    /// the same `Arc` (threaded via `with_sidecar_mcp` in the
+    /// runtime) so tool discovery sees the same cache.
+    pub sidecar_mcp_manager: Arc<SidecarMcpManager>,
 }

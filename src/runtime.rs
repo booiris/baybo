@@ -479,7 +479,10 @@ pub struct RouterRunHandle {
 /// the graph. The returned handle already has cron triggers attached —
 /// every cron-enqueued session reaches the router regardless of entry
 /// point.
-pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
+pub async fn wire_router(
+    graph: &mut ManagerGraph,
+    sidecar_mcp: Arc<dyn aura_tools::mcp::SidecarMcpProvider>,
+) -> RouterRunHandle {
     let buffer = graph.config.channels.message_buffer_size;
 
     let session_log_dir =
@@ -555,6 +558,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let token_budget = token_budget.clone();
         let policy = policy.clone();
         let system_prompt = system_prompt.clone();
+        let sidecar_mcp = sidecar_mcp;
 
         Arc::new(
             move |session: aura_model::Session,
@@ -576,7 +580,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     Arc::clone(&security_gateway),
                 )
                 .with_skill_assessor(Arc::clone(&skill_assessor))
-                .with_session_log(Arc::clone(&session_logger));
+                .with_session_log(Arc::clone(&session_logger))
+                .with_sidecar_mcp(Arc::clone(&sidecar_mcp));
 
                 if let Some(rt) = subagent_runtime_slot.get() {
                     agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));

@@ -817,6 +817,7 @@ mod tests {
                 id: "user-1".into(),
                 name: Some("Test".into()),
                 channel: ChannelType::tui(),
+                bot_id: None,
             },
             content: vec![ContentBlock::Text(text.into())],
             timestamp: Utc::now(),
@@ -833,6 +834,7 @@ mod tests {
                 id: "user-1".into(),
                 name: Some("Test".into()),
                 channel: ChannelType::tui(),
+                bot_id: None,
             },
             channel: ChannelType::tui(),
             messages: vec![],
@@ -997,6 +999,31 @@ mod tests {
         assert!(auth.contains("AKIAIOSFODNN7EXAMPLE"));
         let first = v["items"][0].as_str().unwrap();
         assert_eq!(first, "AKIAIOSFODNN7EXAMPLE");
+    }
+
+    // --- error sanitization ---
+
+    #[tokio::test]
+    async fn sanitize_error_passes_clean_text_unchanged() {
+        let (gw, _store) = make_gateway();
+        let out = gw.sanitize_error("connection refused").await.unwrap();
+        assert_eq!(out, "connection refused");
+    }
+
+    #[tokio::test]
+    async fn sanitize_error_redacts_leaked_secret() {
+        // Codex review regression: tool errors that echo back a
+        // bearer token / connection string / revealed placeholder
+        // value used to land on the channel wire as plaintext via
+        // `AgentOutput::ToolCallCompleted.error`. The agent loop now
+        // routes Err(e) through `sanitize_error` before emit; this
+        // test pins the contract.
+        let (gw, store) = make_gateway();
+        let raw = "request failed: token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let out = gw.sanitize_error(raw).await.unwrap();
+        assert!(!out.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"));
+        assert!(out.contains("[{REDACTED_SECRET_"));
+        assert_eq!(store.len(), 1);
     }
 
     // --- LLM response sanitization ---

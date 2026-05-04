@@ -1,4 +1,5 @@
 import type {
+  AgentDelta,
   AgentMessage,
   AgentNotice,
   ApprovalDecision,
@@ -154,8 +155,19 @@ export interface BotPlatform<BotHandle, ChatId> {
    */
   stopBot(handle: BotHandle): Promise<void>;
 
-  /** Deliver an outbound text message on a specific bot+chat pair. */
-  sendText(handle: BotHandle, chat: ChatId, text: string): Promise<void>;
+  /**
+   * Deliver an outbound text message on a specific bot+chat pair.
+   * `userId` is the composite aura user id the channel routed by, so a
+   * streaming-aware platform can finalise an in-flight stream for that
+   * user instead of posting a fresh message. Implementations that
+   * don't stream can ignore the parameter.
+   */
+  sendText(
+    handle: BotHandle,
+    chat: ChatId,
+    text: string,
+    userId: string,
+  ): Promise<void>;
 
   /**
    * Deliver an outbound message that carries non-text media. Called by
@@ -165,12 +177,14 @@ export interface BotPlatform<BotHandle, ChatId> {
    * post the combined message. Omit the method to fall through to
    * `sendText` with the text body only — attachments will be dropped
    * with a warning, so platforms that need media support **must**
-   * implement this.
+   * implement this. `userId` mirrors the `sendText` arg so streaming
+   * platforms can close a live card before sending media.
    */
   sendMedia?(
     handle: BotHandle,
     chat: ChatId,
     payload: BotMediaPayload,
+    userId: string,
   ): Promise<void>;
 
   /**
@@ -195,6 +209,78 @@ export interface BotPlatform<BotHandle, ChatId> {
    * …); omit otherwise.
    */
   notifyTyping?(handle: BotHandle, chat: ChatId): Promise<void>;
+
+  /**
+   * Optional streaming sink for in-flight agent deltas. When
+   * implemented, the channel routes `Frame::Delta` here after
+   * resolving the route; the platform decides how to throttle and
+   * render (Lark CardKit `cards.stream`, etc.). The channel cancels
+   * any active typing session for the user before invoking, since the
+   * streaming UI replaces the typing indicator. Sidecars without a
+   * streaming primitive omit this method and deltas are dropped on
+   * the floor (today's behaviour).
+   *
+   * `userId` is the composite aura user id; the platform's
+   * `sendText` / `sendMedia` is still called for the terminal frame,
+   * and platforms that opened a stream are responsible for finalising
+   * it there (e.g. by inspecting the user's session state in
+   * `sendText` and closing the stream instead of posting a fresh
+   * message).
+   */
+  onAgentDelta?(
+    handle: BotHandle,
+    chat: ChatId,
+    userId: string,
+    text: string,
+  ): Promise<void>;
+
+  /**
+   * Optional tool-use telemetry sink. The channel routes
+   * `Frame::ToolCallStarted` / `Frame::ToolCallCompleted` here after
+   * resolving the route, so platforms can render a mid-turn
+   * indicator (Lark CardKit footer line, Slack thread block, …).
+   * Omit if the platform has no streaming surface — frames drop
+   * silently.
+   */
+  onAgentToolCallStarted?(
+    handle: BotHandle,
+    chat: ChatId,
+    userId: string,
+    ev: import("./channel.js").AgentToolCallStarted,
+  ): Promise<void>;
+
+  onAgentToolCallCompleted?(
+    handle: BotHandle,
+    chat: ChatId,
+    userId: string,
+    ev: import("./channel.js").AgentToolCallCompleted,
+  ): Promise<void>;
+
+  /**
+   * Optional sidecar-hosted MCP server. The channel forwards each
+   * inbound `Frame::Mcp` envelope here unchanged; the platform owns
+   * the per-tunnel session lifecycle (one McpServer per `tunnelId`).
+   * Implementing this method is what makes BotChannel advertise the
+   * `"mcp_tunnel"` capability — without it the runner never claims
+   * support and the gateway never forwards Mcp frames to this peer.
+   */
+  onAgentMcpEnvelope?(
+    tunnelId: string,
+    payload: Uint8Array,
+    reply: import("./channel.js").McpReplyHandle,
+  ): Promise<void>;
+
+  /**
+   * Optional self-test hook. The channel forwards a
+   * `Frame::DiagnoseRequest` here and ships the returned checks back
+   * over the wire. Implementing this method is what makes
+   * BotChannel advertise the `"diagnose"` capability — without it
+   * the runner never claims support and admin diagnose calls
+   * short-circuit with `not implemented`.
+   */
+  onAgentDiagnoseRequested?(
+    req: import("./channel.js").DiagnoseRequest,
+  ): Promise<import("./channel.js").DiagnoseCheck[]>;
 
   /**
    * Optional slash-command registrar. Implement when the platform has
@@ -509,7 +595,35 @@ export class BotChannel<BotHandle, ChatId>
     this.typingRefreshMs = opts.typingRefreshMs ?? DEFAULT_TYPING_REFRESH_MS;
     this.typingSafetyMs = opts.typingSafetyMs ?? DEFAULT_TYPING_SAFETY_MS;
     this.slashCommands = opts.slashCommands ?? [];
+
+    // Forward MCP / diagnose round-trip hooks only when the platform
+    // implements them. The SDK runner inspects the channel object
+    // for these methods to decide whether to advertise the matching
+    // capability on `Register`; defining them unconditionally would
+    // claim support a no-op handler can't honour, and the gateway-
+    // side caller would time out waiting for a reply.
+    const mcpHook = opts.platform.onAgentMcpEnvelope;
+    if (mcpHook) {
+      this.onMcpEnvelope = (tunnelId, payload, reply) =>
+        mcpHook.call(opts.platform, tunnelId, payload, reply);
+    }
+    const diagHook = opts.platform.onAgentDiagnoseRequested;
+    if (diagHook) {
+      this.onDiagnoseRequested = (req) => diagHook.call(opts.platform, req);
+    }
   }
+
+  // Installed conditionally in the constructor; declared here so the
+  // type system sees the optional Channel hooks even when the
+  // platform doesn't implement the matching `onAgent*` method.
+  onMcpEnvelope?: (
+    tunnelId: string,
+    payload: Uint8Array,
+    reply: import("./channel.js").McpReplyHandle,
+  ) => Promise<void>;
+  onDiagnoseRequested?: (
+    req: import("./channel.js").DiagnoseRequest,
+  ) => Promise<import("./channel.js").DiagnoseCheck[]>;
 
   inbound(signal: AbortSignal): AsyncIterable<UserInbound> {
     const self = this;
@@ -564,10 +678,15 @@ export class BotChannel<BotHandle, ChatId>
     this.logOutbound(route.botId, route.chat, msg, sendMediaPath);
     try {
       if (sendMediaPath) {
-        await this.platform.sendMedia!(route.handle, route.chat, {
-          text: msg.content,
-          attachments: msg.attachments!,
-        });
+        await this.platform.sendMedia!(
+          route.handle,
+          route.chat,
+          {
+            text: msg.content,
+            attachments: msg.attachments!,
+          },
+          msg.userId,
+        );
       } else {
         if (msg.attachments !== undefined && msg.attachments.length > 0) {
           // Platform doesn't implement sendMedia — surface this loudly
@@ -577,7 +696,12 @@ export class BotChannel<BotHandle, ChatId>
             `dropping ${msg.attachments.length} attachment(s) — platform does not implement sendMedia`,
           );
         }
-        await this.platform.sendText(route.handle, route.chat, msg.content);
+        await this.platform.sendText(
+          route.handle,
+          route.chat,
+          msg.content,
+          msg.userId,
+        );
       }
     } catch (err) {
       this.logger.error(
@@ -586,6 +710,80 @@ export class BotChannel<BotHandle, ChatId>
       );
     }
   }
+
+  async onDelta(delta: AgentDelta): Promise<void> {
+    const handler = this.platform.onAgentDelta;
+    if (!handler) {
+      // No streaming surface — keep the typing indicator alive so the
+      // user sees ongoing activity while the agent produces deltas.
+      this.bumpTypingSafety(delta.userId);
+      return;
+    }
+    const route = this.route(delta.userId);
+    if (!route) {
+      this.logger.debug("delta for unknown user; dropping", delta.userId);
+      return;
+    }
+    // Streaming UI replaces typing — cancel the indicator so we don't
+    // double-up and so a wedged typing session can't outlive the turn.
+    this.cancelTyping(delta.userId);
+    try {
+      await handler.call(
+        this.platform,
+        route.handle,
+        route.chat,
+        delta.userId,
+        delta.text,
+      );
+    } catch (err) {
+      this.logger.debug("onAgentDelta failed", err);
+    }
+  }
+
+  async onToolCallStarted(
+    ev: import("./channel.js").AgentToolCallStarted,
+  ): Promise<void> {
+    const handler = this.platform.onAgentToolCallStarted;
+    if (!handler) return;
+    const route = this.route(ev.userId);
+    if (!route) {
+      this.logger.debug("tool-call started for unknown user; dropping", ev.userId);
+      return;
+    }
+    try {
+      await handler.call(this.platform, route.handle, route.chat, ev.userId, ev);
+    } catch (err) {
+      this.logger.debug("onAgentToolCallStarted failed", err);
+    }
+  }
+
+  async onToolCallCompleted(
+    ev: import("./channel.js").AgentToolCallCompleted,
+  ): Promise<void> {
+    const handler = this.platform.onAgentToolCallCompleted;
+    if (!handler) return;
+    const route = this.route(ev.userId);
+    if (!route) {
+      this.logger.debug("tool-call completed for unknown user; dropping", ev.userId);
+      return;
+    }
+    try {
+      await handler.call(this.platform, route.handle, route.chat, ev.userId, ev);
+    } catch (err) {
+      this.logger.debug("onAgentToolCallCompleted failed", err);
+    }
+  }
+
+  // MCP and diagnose are different from delta/tool-call: the gateway
+  // expects a reply (round-trip semantics) and times out if it
+  // doesn't get one. We therefore can't use the "method always
+  // present, silent no-op when platform doesn't implement" pattern
+  // the streaming hooks use — claiming the capability without an
+  // actual handler would have the agent's MCP client time out.
+  // Instead, the constructor below conditionally installs these
+  // methods only when the platform implements the matching `onAgent*`
+  // hook; the SDK runner's capability auto-advertise then reads them
+  // correctly.
 
   async onNotice(notice: AgentNotice): Promise<void> {
     this.completeTypingTurn(notice.userId);
@@ -603,6 +801,7 @@ export class BotChannel<BotHandle, ChatId>
           route.handle,
           route.chat,
           `${prefix} ${notice.text}`,
+          notice.userId,
         );
       }
     } catch (err) {
@@ -918,6 +1117,17 @@ export class BotChannel<BotHandle, ChatId>
     }
     // Agent is alive — proven by this outbound. Reset the quiet-time
     // cap so the ticker can keep going through the rest of the queue.
+    clearTimeout(session.safety);
+    session.safety = setTimeout(
+      () => this.cancelTyping(userId),
+      this.typingSafetyMs,
+    );
+    session.safety.unref?.();
+  }
+
+  private bumpTypingSafety(userId: string): void {
+    const session = this.typingSessions.get(userId);
+    if (session === undefined) return;
     clearTimeout(session.safety);
     session.safety = setTimeout(
       () => this.cancelTyping(userId),

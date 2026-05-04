@@ -149,6 +149,7 @@ pub struct AgentTestHarnessBuilder {
     mailbox_capacity: usize,
     output_capacity: usize,
     tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
+    sidecar_mcp: Option<Arc<dyn aura_tools::mcp::SidecarMcpProvider>>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -159,6 +160,7 @@ impl Default for AgentTestHarnessBuilder {
             mailbox_capacity: 32,
             output_capacity: 64,
             tools: Vec::new(),
+            sidecar_mcp: None,
         }
     }
 }
@@ -189,6 +191,18 @@ impl AgentTestHarnessBuilder {
     /// callers can keep a clone (e.g. a `RecordingTool`) for assertions.
     pub fn with_tool(mut self, tool: Arc<dyn Tool>, manifest: ToolManifest) -> Self {
         self.tools.push((tool, manifest));
+        self
+    }
+
+    /// Install a sidecar MCP provider so the agent loop's
+    /// channel-scoped dispatch path is exercised. Defaults to
+    /// `NoSidecarMcp`, which makes every dispatch fall through to
+    /// the local `ToolExecutor`.
+    pub fn with_sidecar_mcp(
+        mut self,
+        provider: Arc<dyn aura_tools::mcp::SidecarMcpProvider>,
+    ) -> Self {
+        self.sidecar_mcp = Some(provider);
         self
     }
 
@@ -275,7 +289,7 @@ impl AgentTestHarnessBuilder {
             .unwrap_or_else(|| "You are Aura, a test assistant.".into());
         let soul = Soul::custom(soul_text);
 
-        let agent_loop = AgentLoop::new(
+        let mut agent_loop = AgentLoop::new(
             stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
             tool_registry.clone(),
             skill_registry.clone(),
@@ -286,6 +300,9 @@ impl AgentTestHarnessBuilder {
             soul,
             gateway.clone(),
         );
+        if let Some(provider) = self.sidecar_mcp {
+            agent_loop = agent_loop.with_sidecar_mcp(provider);
+        }
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 

@@ -8,10 +8,16 @@ export type {
   AgentDelta,
   AgentMessage,
   AgentNotice,
+  AgentToolCallCompleted,
+  AgentToolCallStarted,
   ApprovalDecision,
   ApprovalRequest,
   BotStatusReport,
   Channel,
+  DiagnoseCheck,
+  DiagnoseRequest,
+  DiagnoseStatus,
+  McpReplyHandle,
   NoticeLevel,
   ReconnectPolicy,
   RunOptions,
@@ -28,6 +34,7 @@ export type {
 } from "./wire.js";
 export {
   BlobPairingRequiredError,
+  checkPairing,
   fetchBlob,
   fetchBlobStream,
   uploadBlob,
@@ -38,3 +45,10 @@ export type {
   FetchBlobStreamResult,
   UploadBlobResult,
 } from "./blobs.js";
+export {
+  CapabilityMissingError,
+  SecretBotUnknownError,
+  SecretQuotaExceededError,
+  secrets,
+} from "./secrets.js";
+export type { Secrets, SecretsScope } from "./secrets.js";

@@ -19,7 +19,8 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 
 use super::adapter::Sidecar;
-use super::handshake::validate_register;
+use super::handshake::{GATEWAY_CAPABILITIES, validate_register};
+use super::secrets;
 use super::state::WsChannelState;
 use crate::auth::AuthedClient;
 
@@ -64,12 +65,22 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
 
     let channel_type = outcome.channel_type;
     let session_id = outcome.session_id;
+    // Intersection of what the peer claimed and what the gateway can
+    // actually serve. Outbound sends of optional frames check this set
+    // before emitting; inbound rejects optional frames the peer didn't
+    // claim.
+    let negotiated_capabilities: Vec<String> = outcome
+        .peer_capabilities
+        .into_iter()
+        .filter(|cap| GATEWAY_CAPABILITIES.contains(&cap.as_str()))
+        .collect();
 
     let sidecar = Sidecar::build(
         channel_type.clone(),
         session_id.clone(),
         sink,
         std::sync::Arc::clone(&state.blob_store),
+        super::adapter::SidecarCapabilities::from_negotiated(&negotiated_capabilities),
     );
 
     if let Err(err) = state
@@ -87,6 +98,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
             .send_frame(Frame::RegisterAck {
                 ok: false,
                 reason: Some(reason.clone()),
+                capabilities: gateway_capabilities_vec(),
             })
             .await
         {
@@ -100,6 +112,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     tracing::info!(
         channel_type = %channel_type,
         session_id = ?session_id,
+        capabilities = ?negotiated_capabilities,
         "channel-ws client registered"
     );
 
@@ -107,6 +120,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         .send_frame(Frame::RegisterAck {
             ok: true,
             reason: None,
+            capabilities: gateway_capabilities_vec(),
         })
         .await
     {
@@ -156,13 +170,16 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         state
             .control
             .register(channel_type.clone(), sidecar.frame_tx_clone());
+        state
+            .capabilities
+            .record(channel_type.clone(), negotiated_capabilities.clone());
         // Push the slash-command manifest before any StartBot so the
         // sidecar's `BotChannel` already has the gateway-authored list
         // when it publishes commands on bot startup. Best-effort: a
         // failure here just means the sidecar runs without command UI.
         if let Err(e) = sidecar
             .send_frame(Frame::SlashManifest {
-                commands: super::slash::manifest(),
+                commands: super::slash::manifest(&channel_type),
             })
             .await
         {
@@ -170,6 +187,17 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         }
         let sent = push_live_bots(&state, &channel_type, &sidecar).await;
         state.bot_reconciler.seed(channel_type.clone(), sent);
+        // Eagerly attach an rmcp session for this channel if the
+        // sidecar advertised `mcp_tunnel`. The handshake runs in the
+        // background — `run_inbound_loop` below has to be live for
+        // `Frame::Mcp` replies to reach the rmcp client, so we
+        // can't await it here.
+        if negotiated_capabilities
+            .iter()
+            .any(|c| c == super::handshake::CAP_MCP_TUNNEL)
+        {
+            state.sidecar_mcp_manager.attach(channel_type.clone());
+        }
     }
 
     run_inbound_loop(
@@ -178,12 +206,28 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         &channel_type,
         &sidecar,
         session_id.as_deref(),
+        &negotiated_capabilities,
     )
     .await;
 
     if session_id.is_none() {
         state.control.unregister(&channel_type);
         state.bot_reconciler.forget(&channel_type);
+        state.capabilities.forget(&channel_type);
+        // Wake any admin-side diagnose waiters with a "disconnected"
+        // reply rather than letting them block until the per-call
+        // timeout fires.
+        state.diagnose_router.drain_for_disconnect();
+        // Drop the manager's cached rmcp session BEFORE draining
+        // the tunnel registry. `detach` runs `session.shutdown()`
+        // which sends a final `notifications/cancelled` through the
+        // tunnel; if the tunnel were already drained it would just
+        // log a send error. Order matters for clean teardown.
+        state.sidecar_mcp_manager.detach(&channel_type).await;
+        // Drop every MCP tunnel routed through this sidecar so
+        // agent-side awaiters wake immediately with `None` instead
+        // of blocking on a dead pipe.
+        state.mcp_tunnel_router.drain_for_channel(&channel_type);
     }
     unregister_best_effort(&state, &channel_type, session_id.as_deref());
     let _ = sidecar.into_pump().await;
@@ -225,12 +269,23 @@ async fn receive_register(
     }
 }
 
+fn gateway_capabilities_vec() -> Vec<String> {
+    GATEWAY_CAPABILITIES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
 async fn send_ack_and_close(
     sink: &mut SplitSink<WebSocket, AxumWsMessage>,
     ok: bool,
     reason: Option<String>,
 ) {
-    let frame = Frame::RegisterAck { ok, reason };
+    let frame = Frame::RegisterAck {
+        ok,
+        reason,
+        capabilities: gateway_capabilities_vec(),
+    };
     match wire::encode(&frame) {
         Ok(bytes) => {
             if let Err(e) = sink.send(AxumWsMessage::Binary(bytes.into())).await {
@@ -252,8 +307,8 @@ async fn push_live_bots(
     state: &WsChannelState,
     channel_type: &ChannelType,
     sidecar: &Sidecar,
-) -> Vec<String> {
-    let mut sent = Vec::new();
+) -> Vec<(String, i64)> {
+    let mut sent: Vec<(String, i64)> = Vec::new();
     let bots = match state.channel_bot_store.list_live(channel_type).await {
         Ok(list) => list,
         Err(e) => {
@@ -268,7 +323,18 @@ async fn push_live_bots(
     for row in bots {
         let secret_name = bot_secret_name(channel_type, &row.bot_id);
         let token = match state.secret_vault.get_secret(&secret_name).await {
-            Ok(Some(v)) => String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            Ok(Some(v)) => match String::from_utf8(v.as_bytes().to_vec()) {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!(
+                        %channel_type,
+                        bot_id = %row.bot_id,
+                        secret = %secret_name,
+                        "bot token was not valid UTF-8; skipping StartBot",
+                    );
+                    continue;
+                }
+            },
             Ok(None) => {
                 tracing::warn!(
                     %channel_type,
@@ -288,30 +354,36 @@ async fn push_live_bots(
                 continue;
             }
         };
+        let metadata = secrets::load_start_metadata(&state.secret_vault, &row).await;
+        let revision = row.revision;
+        let bot_id = row.bot_id.clone();
         if let Err(e) = sidecar
             .send_frame(Frame::StartBot {
-                bot_id: row.bot_id.clone(),
+                bot_id: bot_id.clone(),
                 token,
+                metadata,
             })
             .await
         {
             tracing::warn!(
                 error = %e,
                 %channel_type,
-                bot_id = %row.bot_id,
+                bot_id = %bot_id,
                 "push StartBot failed; WS pump may be closing",
             );
             return sent;
         }
-        sent.push(row.bot_id);
+        sent.push((bot_id, revision));
     }
     sent
 }
 
-/// Deterministic vault key for a bot token. Kept in one place so the
-/// admin API and the route layer agree on where the token lives.
+/// Deterministic vault key for a bot token. Thin alias over
+/// [`aura_channels::vault_keys::primary_token`] so existing route /
+/// reconciler call sites keep their short name while the canonical
+/// layout lives in `aura-channels`.
 pub(crate) fn bot_secret_name(channel_type: &ChannelType, bot_id: &str) -> String {
-    format!("channel.{}.bot.{}.token", channel_type.as_str(), bot_id)
+    aura_channels::vault_keys::primary_token(channel_type, bot_id)
 }
 
 async fn run_inbound_loop(
@@ -320,7 +392,14 @@ async fn run_inbound_loop(
     channel_type: &ChannelType,
     sidecar: &Sidecar,
     connection_session_id: Option<&str>,
+    negotiated_capabilities: &[String],
 ) {
+    let secrets_enabled = negotiated_capabilities
+        .iter()
+        .any(|c| c == super::handshake::CAP_SECRETS);
+    let mcp_tunnel_enabled = negotiated_capabilities
+        .iter()
+        .any(|c| c == super::handshake::CAP_MCP_TUNNEL);
     while let Some(msg) = source.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -472,6 +551,15 @@ async fn run_inbound_loop(
                             id: wire_msg.user_id.clone(),
                             name: None,
                             channel: channel_type.clone(),
+                            // Sidecars carry the bot tenant on every
+                            // inbound message; thread it through so
+                            // multi-bot MCP routing can disambiguate
+                            // (`_meta.auraBotId` injection downstream).
+                            bot_id: if wire_msg.bot_id.is_empty() {
+                                None
+                            } else {
+                                Some(wire_msg.bot_id.clone())
+                            },
                         };
                         let content =
                             wire_to_content_blocks(wire_msg.content, wire_msg.attachments);
@@ -539,6 +627,90 @@ async fn run_inbound_loop(
                                 %bot_id,
                                 detail = message.as_deref().unwrap_or(""),
                                 "sidecar ack: bot failed",
+                            );
+                        }
+                        // Hand the ack to the reconciler so the
+                        // applied revision advances on success and
+                        // pending clears on failure (so the next
+                        // tick retries instead of the reconciler
+                        // optimistically declaring the rotation
+                        // done).
+                        state.bot_reconciler.record_ack(channel_type, &bot_id, ok);
+                    }
+                    Frame::SecretRequest {
+                        request_id,
+                        bot_id,
+                        op,
+                        key,
+                        value,
+                    } => {
+                        if !secrets_enabled {
+                            // Sidecar didn't claim the capability but
+                            // sent the frame anyway. Reply with a
+                            // typed error so the SDK surfaces the
+                            // mismatch instead of timing out.
+                            let reply = Frame::SecretReply {
+                                request_id,
+                                ok: false,
+                                value: None,
+                                keys: None,
+                                error: Some("capability_disabled".into()),
+                            };
+                            if let Err(e) = sidecar.send_frame(reply).await {
+                                tracing::debug!(error = %e, "secret reply send failed");
+                            }
+                            continue;
+                        }
+                        let reply = secrets::handle_request(
+                            state,
+                            channel_type,
+                            request_id,
+                            bot_id,
+                            op,
+                            key,
+                            value,
+                        )
+                        .await;
+                        if let Err(e) = sidecar.send_frame(reply).await {
+                            tracing::debug!(error = %e, "secret reply send failed");
+                        }
+                    }
+                    Frame::DiagnoseReply {
+                        request_id,
+                        ok,
+                        checks,
+                        error,
+                    } => {
+                        // Resolve the admin-side waiter unconditionally;
+                        // the router silently drops late replies whose
+                        // request_id timed out.
+                        state
+                            .diagnose_router
+                            .resolve(&request_id, ok, checks, error);
+                    }
+                    Frame::Mcp { tunnel_id, payload } => {
+                        if !mcp_tunnel_enabled {
+                            // Sidecar sent the frame without claiming
+                            // the capability — drop it loudly so a
+                            // mismatch is visible in operator logs
+                            // rather than silently broken.
+                            tracing::warn!(
+                                %channel_type,
+                                "Frame::Mcp received without `mcp_tunnel` capability; dropping",
+                            );
+                            continue;
+                        }
+                        if !state
+                            .mcp_tunnel_router
+                            .forward_inbound(&tunnel_id, payload)
+                            .await
+                        {
+                            // Late reply for an unregistered tunnel —
+                            // typical when the agent timed out before
+                            // the sidecar's response arrived.
+                            tracing::debug!(
+                                tunnel = %tunnel_id,
+                                "Frame::Mcp dropped: tunnel not registered",
                             );
                         }
                     }

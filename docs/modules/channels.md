@@ -338,6 +338,94 @@ Design rules:
 - The `agent` Router owns `Arc<ChannelRegistry>` and calls `get_for()`
   for O(1) dispatch by `(ChannelType, session_id)`.
 
+## Wire surface beyond core chat
+
+The core frames (`register`, `register_ack`, `message`, `delta`,
+`notice`, `approval_*`, `start_bot`, `stop_bot`, `bot_status`,
+`slash_manifest`, `history_*`) are always supported by every gateway
+and sidecar. Several optional surfaces ride alongside them, gated by
+**capability negotiation** so old peers stay zero-touch compatible.
+
+### Capability negotiation
+
+`Frame::Register` carries `capabilities: Vec<String>` (sidecar's
+advertised set); `Frame::RegisterAck` carries the gateway's set. The
+effective set is the intersection. Old sidecars that send no
+`capabilities` decode to `vec![]` and are treated as core-only — the
+gateway never sends them an opt-in frame.
+
+The SDK enforces the contract on the sidecar side: helpers gated by a
+capability (`secrets()`, `abortSession()`, `runMcpServer()`,
+`onDiagnoseRequested`) throw `CapabilityMissingError` when the gateway
+didn't advertise the matching string. `runChannel` auto-derives the
+sidecar's capability set from which optional helpers the channel
+imports; `runOptions.capabilities` overrides.
+
+`PROTOCOL_VERSION` is gone — strict-equality version checks made every
+non-core frame an upgrade-coordination event.
+
+### Optional capabilities
+
+| String | Frame(s) | Direction | Use |
+|---|---|---|---|
+| `secrets` | `SecretRequest` / `SecretReply` | bidirectional | Per-bot secret vault scoped by `(channel_type, bot_id)` |
+| `mcp_tunnel` | `Mcp` | bidirectional | JSON-RPC envelope tunnel between the agent's MCP client and a sidecar-hosted MCP server |
+| `tool_telemetry` | `ToolCallStarted` / `ToolCallCompleted` | gateway → sidecar | Mid-turn tool indicators in streaming cards |
+| `diagnose` | `DiagnoseRequest` / `DiagnoseReply` | gateway → sidecar (request) | Admin-API-driven self-checks |
+| `abort` | `AbortSession` | sidecar → gateway | User-driven cancel of in-flight turn |
+
+`StartBot.metadata: HashMap<String, String>` is **not** gated — it's an
+additive field on an existing frame, defaults to `{}` on the wire.
+Lark uses it to carry `(app_secret, encrypt_key, verification_token,
+base_url)` alongside the `app_id` token; any future multi-secret bot
+benefits transparently.
+
+### Per-bot secret vault
+
+The `secrets` capability turns the gateway's `aura_security` vault
+into a sidecar-accessible namespace. Keys are scoped server-side by
+prepending `<channel_type>/<bot_id>/`; `bot_id` is validated against
+`ChannelBotStore` so a sidecar cannot claim a bot it doesn't own.
+Secret lifecycle is bonded to the `bot_row_id` (not the
+`(channel_type, bot_id)` string) — a soft-deleted bot's secrets revive
+together with the row, and a fresh-registered bot starts with an
+empty namespace by default.
+
+Wire body limits: value ≤ 64 KiB, key ≤ 256 bytes, ≤ 10 000 entries
+per scope. SDK-side typed wrapper at `sdks/channel-ts/src/secrets.ts`
+exposes `Secrets.scope(botId).{get,set,delete,list}` plus
+`SecretBotUnknownError` / `SecretQuotaExceededError`. Internally a
+`SecretRouter` correlates request/reply by UUID with a 5s default
+timeout.
+
+### MCP tunnel
+
+The `mcp_tunnel` capability lets a sidecar expose its own MCP server
+to the agent without opening a third transport. JSON-RPC envelopes
+ride `Frame::Mcp { tunnel_id, payload }`; the gateway forwards
+opaquely between (a) the agent-side `ChannelTunnelTransport` Rust
+trait impl and (b) the sidecar's `runMcpServer` consumer. Body cap 1
+MiB per envelope — tools that produce more must paginate or hand the
+agent a `blob_id` and let it fetch via `/v1/blobs/<id>`.
+
+The sidecar's MCP server lives one-per-process (not one-per-bot):
+`tools/list` is the same regardless of bot count, and per-tool
+dispatch routes to the right bot via `_meta.auraSessionId`. When the
+sidecar is unregistered, `tools/list` returns `[]`; the gateway emits
+the standard MCP `notifications/tools/list_changed` on registration so
+the agent's client re-issues `tools/list` and picks up the catalogue.
+
+### Diagnose
+
+`DiagnoseRequest { request_id, bot_id }` → `DiagnoseReply {
+request_id, ok, checks, error }`. The reply carries
+`Vec<DiagnoseCheck { name, status: ok|warn|error, detail }>`. Admin
+API `GET /v1/admin/channels/<type>/diagnose?bot_id=<id>` is the single
+entry point — both the WebUI panel and any future operator CLI route
+through it. SDK exposes `Channel.onDiagnoseRequested` and a wire-shape
+`DiagnoseCheck` mirror; sidecars that don't implement the hook
+auto-reply with `ok: false, error: "diagnose not implemented"`.
+
 ## Constraints
 
 - `channels` stays independent of `agent`, `llm`, `tools`, and all other

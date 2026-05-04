@@ -337,6 +337,14 @@ impl AgentActor {
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
         let content = incoming.message.content;
+        // Sidecars carry `bot_id` on every `Frame::Message`; the session
+        // itself was created without one (the resolver keys by channel +
+        // user, not bot). Treating the latest message as authoritative
+        // for bot context lets multi-bot MCP routing land the right
+        // `_meta.auraBotId` at tool dispatch time without reshaping
+        // `ChannelSessionStore`.
+        self.session.user.bot_id = incoming.message.sender.bot_id.clone();
+
         // Pass a clone of the response channel so the loop can stream
         // text deltas as `AgentOutput::Delta` while the final assembled
         // message still flows through the normal path.

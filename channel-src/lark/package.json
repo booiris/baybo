@@ -1,0 +1,33 @@
+{
+  "name": "@aura/channel-lark",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lark / Feishu channel sidecar for the Aura gateway",
+  "type": "module",
+  "aura": {
+    "domain": "channel"
+  },
+  "bin": {
+    "aura-channel-lark": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "bundle": "bun build src/index.ts --target=bun --minify --outfile=dist/bundle.mjs",
+    "check": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "test": "node --test 'test/**/*.test.mjs'"
+  },
+  "dependencies": {
+    "@aura/channel-sdk": "workspace:*",
+    "@larksuiteoapi/node-sdk": "^1.60.0",
+    "@modelcontextprotocol/sdk": "^1.21.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=21"
+  }
+}

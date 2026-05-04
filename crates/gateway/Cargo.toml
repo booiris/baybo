@@ -89,5 +89,10 @@ serde_json = { workspace = true }
 aura-gateway = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
 chrono = { workspace = true }
+# rmcp here is dev-only: the SidecarTransport tests need to round-trip
+# typed `TxJsonRpcMessage`/`RxJsonRpcMessage` envelopes. Production
+# code in this crate only handles opaque `Vec<u8>`, so the runtime
+# graph stays free of rmcp.
+rmcp = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }

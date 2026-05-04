@@ -19,7 +19,7 @@ import {
   runChannel,
   defaultLogger,
 } from "../dist/index.js";
-import { decodeFrame, encodeFrame, PROTOCOL_VERSION } from "../dist/wire.js";
+import { decodeFrame, encodeFrame } from "../dist/wire.js";
 
 const TOKEN = "fixture-token-abc";
 
@@ -40,7 +40,14 @@ function startFixture() {
         switch (frame.kind) {
           case "register": {
             recorded.register = frame;
-            ws.send(encodeFrame({ kind: "register_ack", ok: true, reason: null }));
+            ws.send(
+              encodeFrame({
+                kind: "register_ack",
+                ok: true,
+                reason: null,
+                capabilities: ["secrets"],
+              }),
+            );
 
             // Stream some server → client frames now that the handshake is done.
             ws.send(
@@ -58,6 +65,42 @@ function startFixture() {
                 user_id: "tg_42",
                 level: "warn",
                 text: "low battery",
+              }),
+            );
+            ws.send(
+              encodeFrame({
+                kind: "tool_call_started",
+                session_id: "sess-1",
+                user_id: "tg_42",
+                call_id: "call-tool-1",
+                tool: "Bash",
+                params_preview: '{"cmd":"ls"}',
+                description: "list files",
+              }),
+            );
+            ws.send(
+              encodeFrame({
+                kind: "tool_call_completed",
+                session_id: "sess-1",
+                user_id: "tg_42",
+                call_id: "call-tool-1",
+                tool: "Bash",
+                result_preview: "a\nb\nc",
+                duration_ms: 12,
+              }),
+            );
+            ws.send(
+              encodeFrame({
+                kind: "diagnose_request",
+                request_id: "diag-1",
+                bot_id: "alpha",
+              }),
+            );
+            ws.send(
+              encodeFrame({
+                kind: "mcp",
+                tunnel_id: "tunnel-7",
+                payload: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
               }),
             );
             ws.send(
@@ -99,6 +142,14 @@ function startFixture() {
             recorded.resolveApproval = frame;
             break;
           }
+          case "diagnose_reply": {
+            recorded.diagnoseReply = frame;
+            break;
+          }
+          case "mcp": {
+            recorded.mcpReply = frame;
+            break;
+          }
           default: {
             // ignore frames we didn't expect for this test
           }
@@ -128,6 +179,8 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   const gotDelta = { count: 0, last: null };
   const gotNotice = { count: 0, last: null };
   const gotMessage = { count: 0, last: null };
+  const gotToolStarted = { count: 0, last: null };
+  const gotToolCompleted = { count: 0, last: null };
   const gotApprovalResolved = { calls: [] };
   let approvalResolver;
   const approvalSeen = new Promise((r) => (approvalResolver = r));
@@ -147,12 +200,35 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
       gotNotice.count += 1;
       gotNotice.last = notice;
     },
+    async onToolCallStarted(ev) {
+      gotToolStarted.count += 1;
+      gotToolStarted.last = ev;
+    },
+    async onToolCallCompleted(ev) {
+      gotToolCompleted.count += 1;
+      gotToolCompleted.last = ev;
+    },
     async onApprovalRequested(req) {
       approvalResolver(req);
       return "approve_always";
     },
     async onApprovalResolved(callId, decision) {
       gotApprovalResolved.calls.push({ callId, decision });
+    },
+    async onDiagnoseRequested(req) {
+      return [
+        { name: "bot_id", status: "ok", detail: req.botId },
+        { name: "ws", status: "ok", detail: "connected" },
+      ];
+    },
+    async onMcpEnvelope(tunnelId, payload, reply) {
+      // Echo every byte back with a sentinel prefix so the test can
+      // confirm both directions of the tunnel and the tunnel_id
+      // round-trip.
+      const echoed = new Uint8Array(payload.length + 1);
+      echoed[0] = 0xff;
+      echoed.set(payload, 1);
+      await reply.send(echoed);
     },
     async *inbound(signal) {
       yield {
@@ -207,7 +283,36 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   assert.equal(fixture.recorded.register.kind, "register");
   assert.equal(fixture.recorded.register.token, TOKEN);
   assert.equal(fixture.recorded.register.channel_type, "fixture");
-  assert.equal(fixture.recorded.register.protocol_version, PROTOCOL_VERSION);
+  // Old `protocol_version` field has been replaced by `capabilities`.
+  // Default sidecars advertise nothing → field omitted on the wire.
+  assert.equal(fixture.recorded.register.protocol_version, undefined);
+  // The fixture's stub channel implements `onDiagnoseRequested`,
+  // `onToolCallStarted`, and `onToolCallCompleted`, so the runner
+  // auto-advertises both gating capabilities. Per-cap assertions
+  // (rather than `deepEqual`) so adding a future capability doesn't
+  // churn this test.
+  assert.ok(
+    fixture.recorded.register.capabilities?.includes("diagnose"),
+    "diagnose should be advertised",
+  );
+  assert.ok(
+    fixture.recorded.register.capabilities?.includes("tool_telemetry"),
+    "tool_telemetry should be advertised",
+  );
+  assert.ok(
+    fixture.recorded.register.capabilities?.includes("mcp_tunnel"),
+    "mcp_tunnel should be advertised when onMcpEnvelope is implemented",
+  );
+
+  // MCP tunnel echoed back with the sentinel prefix; tunnel_id round-trips.
+  assert.ok(fixture.recorded.mcpReply, "server received an Mcp reply");
+  assert.equal(fixture.recorded.mcpReply.tunnel_id, "tunnel-7");
+  const replyBytes = Uint8Array.from(fixture.recorded.mcpReply.payload);
+  assert.deepEqual(
+    Array.from(replyBytes),
+    [0xff, 0x01, 0x02, 0x03, 0x04],
+    "Mcp reply should be the request bytes prefixed by the stub's sentinel",
+  );
 
   // ---- Server → client -------------------------------------------
   assert.equal(gotDelta.count, 1);
@@ -223,6 +328,21 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
     level: "warn",
     text: "low battery",
   });
+  assert.equal(gotToolStarted.count, 1);
+  assert.deepEqual(gotToolStarted.last, {
+    sessionId: "sess-1",
+    userId: "tg_42",
+    callId: "call-tool-1",
+    tool: "Bash",
+    paramsPreview: '{"cmd":"ls"}',
+    description: "list files",
+  });
+  assert.equal(gotToolCompleted.count, 1);
+  // duration_ms rides as bigint on the wire; the SDK normalises to number.
+  assert.equal(gotToolCompleted.last.callId, "call-tool-1");
+  assert.equal(gotToolCompleted.last.resultPreview, "a\nb\nc");
+  assert.equal(gotToolCompleted.last.error, undefined);
+  assert.equal(gotToolCompleted.last.durationMs, 12);
   assert.equal(gotMessage.count, 1);
   assert.equal(gotMessage.last.content, "pong");
   assert.equal(gotMessage.last.sessionId, "sess-1");
@@ -231,6 +351,23 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   assert.deepEqual(gotApprovalResolved.calls, [
     { callId: "call-2", decision: "approve_always" },
   ]);
+
+  // Diagnose round-trip: the runner advertised the capability (the
+  // stub implements onDiagnoseRequested) and emitted a reply matching
+  // the request_id with the hook's checks.
+  assert.ok(
+    fixture.recorded.register.capabilities?.includes("diagnose"),
+    `register frame should advertise diagnose; got ${JSON.stringify(fixture.recorded.register.capabilities)}`,
+  );
+  assert.ok(
+    fixture.recorded.diagnoseReply,
+    "server received the diagnose_reply",
+  );
+  assert.equal(fixture.recorded.diagnoseReply.request_id, "diag-1");
+  assert.equal(fixture.recorded.diagnoseReply.ok, true);
+  assert.equal(fixture.recorded.diagnoseReply.checks.length, 2);
+  assert.equal(fixture.recorded.diagnoseReply.checks[0].name, "bot_id");
+  assert.equal(fixture.recorded.diagnoseReply.checks[0].detail, "alpha");
 
   // ---- Client → server -------------------------------------------
   assert.ok(inboundYielded.fired, "inbound() generator produced a message");

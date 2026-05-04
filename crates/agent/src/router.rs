@@ -207,6 +207,7 @@ impl Router {
             id: event.user_id.clone(),
             name: None,
             channel: event.channel.clone(),
+            bot_id: None,
         };
 
         debug!(
@@ -354,6 +355,16 @@ impl Router {
                 ..
             }
             | AgentOutput::Notice {
+                session_id,
+                channel,
+                ..
+            }
+            | AgentOutput::ToolCallStarted {
+                session_id,
+                channel,
+                ..
+            }
+            | AgentOutput::ToolCallCompleted {
                 session_id,
                 channel,
                 ..

@@ -268,6 +268,19 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
+        // Tool-use telemetry is rendered by streaming-card sidecars;
+        // the TUI keeps its render simple and ignores both frames.
+        // The agent's text deltas already carry visible "running …"
+        // prose when the model narrates, so dropping these doesn't
+        // strand the user.
+        Frame::ToolCallStarted { .. } | Frame::ToolCallCompleted { .. } => None,
+        // Diagnose round-trips happen between the gateway admin
+        // surface and a real sidecar; the TUI is session-scoped and
+        // never participates.
+        Frame::DiagnoseRequest { .. } | Frame::DiagnoseReply { .. } => None,
+        // MCP tunnel frames flow between Aura's MCP layer and a
+        // sidecar's MCP server; the TUI never participates.
+        Frame::Mcp { .. } => None,
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
         | Frame::ResolveApproval { .. }
@@ -276,10 +289,12 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
         | Frame::StartBot { .. }
         | Frame::StopBot { .. }
         | Frame::BotStatus { .. }
-        | Frame::SlashManifest { .. } => {
+        | Frame::SlashManifest { .. }
+        | Frame::SecretRequest { .. }
+        | Frame::SecretReply { .. } => {
             // HistorySnapshot is drained during `connect_tui`; any
             // stray instance post-handshake is a protocol violation.
-            // StartBot / StopBot / BotStatus are sidecar
+            // StartBot / StopBot / BotStatus / Secret* are sidecar
             // control-plane frames — the TUI never participates in
             // that flow. SlashManifest is also sidecar-only: the TUI
             // owns its slash commands client-side via TuiSlashHandler.

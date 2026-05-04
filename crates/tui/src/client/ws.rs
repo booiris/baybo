@@ -12,7 +12,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use aura_channels::wire::{self, Frame, Message, PROTOCOL_VERSION};
+use aura_channels::wire::{self, Frame, Message};
 use aura_model::ChannelType;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -154,14 +154,19 @@ impl WsClient {
         self.send_frame(&Frame::Register {
             token,
             channel_type,
-            protocol_version: PROTOCOL_VERSION,
+            // The TUI doesn't use any optional capability frames yet;
+            // empty advertisement keeps the gateway from pushing any
+            // future non-core frame at us until we explicitly opt in.
+            capabilities: Vec::new(),
             session_id,
         })
         .await?;
 
         match self.recv_frame().await? {
             Frame::RegisterAck { ok: true, .. } => Ok(()),
-            Frame::RegisterAck { ok: false, reason } => Err(WsClientError::RegistrationRejected(
+            Frame::RegisterAck {
+                ok: false, reason, ..
+            } => Err(WsClientError::RegistrationRejected(
                 reason.unwrap_or_else(|| "no reason given".to_string()),
             )),
             _ => Err(WsClientError::ProtocolViolation("expected RegisterAck")),

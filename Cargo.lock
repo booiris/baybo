@@ -424,6 +424,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "rand 0.10.1",
+ "rmcp",
  "serde",
  "serde_json",
  "sha2",

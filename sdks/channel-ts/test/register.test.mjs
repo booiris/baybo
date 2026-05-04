@@ -77,3 +77,60 @@ test("runRegistration bad return value surfaces as error", async () => {
   assert.equal(frames.at(-1).type, "error");
   assert.ok(frames.at(-1).message.includes("botId"));
 });
+
+test("runRegistration round-trips metadata + secrets through the result frame", async () => {
+  // Codex review regression: the metadata path was dead code because
+  // RegistrationResult only carried botId/token. The CLI must receive
+  // both maps verbatim, with empty maps stripped to keep older CLIs
+  // round-tripping.
+  const child = spawnRegistration(`async () => ({
+    botId: "lark-bot",
+    token: "primary",
+    metadata: { base_url: "https://open.feishu.cn" },
+    secrets: { app_secret: "shh-app", encrypt_key: "shh-encrypt" },
+  })`);
+  const { frames, exitCode } = await collect(child);
+  assert.equal(exitCode, 0);
+  const result = frames.at(-1);
+  assert.equal(result.type, "result");
+  assert.equal(result.bot_id, "lark-bot");
+  assert.equal(result.token, "primary");
+  assert.deepEqual(result.metadata, { base_url: "https://open.feishu.cn" });
+  assert.deepEqual(result.secrets, {
+    app_secret: "shh-app",
+    encrypt_key: "shh-encrypt",
+  });
+});
+
+test("runRegistration omits empty metadata/secrets to stay backward-compatible", async () => {
+  const child = spawnRegistration(`async () => ({
+    botId: "tg-bot",
+    token: "tok",
+  })`);
+  const { frames, exitCode } = await collect(child);
+  assert.equal(exitCode, 0);
+  const result = frames.at(-1);
+  assert.deepEqual(result, {
+    type: "result",
+    bot_id: "tg-bot",
+    token: "tok",
+  });
+  assert.equal(result.metadata, undefined);
+  assert.equal(result.secrets, undefined);
+});
+
+test("runRegistration rejects non-string values inside secrets", async () => {
+  const child = spawnRegistration(`async () => ({
+    botId: "b",
+    token: "t",
+    secrets: { app_secret: 123 },
+  })`);
+  const { frames, exitCode } = await collect(child);
+  assert.equal(exitCode, 1);
+  const last = frames.at(-1);
+  assert.equal(last.type, "error");
+  assert.ok(
+    last.message.includes("secrets.app_secret"),
+    `expected error to name the bad key, got: ${last.message}`,
+  );
+});

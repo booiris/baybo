@@ -30,6 +30,35 @@ use tokio::task::JoinHandle;
 
 pub(crate) type WsSink = SplitSink<WebSocket, AxumWsMessage>;
 
+/// Capability flags the agent → frame translator gates on. Built once
+/// per WS connection from the negotiated capability set; the
+/// translator filters each `AgentOutput` against this before emitting
+/// a frame so optional kinds (today: tool_telemetry) never reach
+/// peers that didn't claim support.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SidecarCapabilities {
+    pub tool_telemetry: bool,
+}
+
+impl SidecarCapabilities {
+    pub(crate) fn from_negotiated(caps: &[String]) -> Self {
+        Self {
+            tool_telemetry: caps
+                .iter()
+                .any(|c| c == super::handshake::CAP_TOOL_TELEMETRY),
+        }
+    }
+
+    fn permits(&self, output: &AgentOutput) -> bool {
+        match output {
+            AgentOutput::ToolCallStarted { .. } | AgentOutput::ToolCallCompleted { .. } => {
+                self.tool_telemetry
+            }
+            _ => true,
+        }
+    }
+}
+
 /// Matches the old HTTP adapter so operator muscle memory around
 /// approval timing carries over.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -65,18 +94,27 @@ impl Sidecar {
         session_id: Option<String>,
         sink: WsSink,
         blob_store: Arc<dyn BlobStore>,
+        capabilities: SidecarCapabilities,
     ) -> Self {
         let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(OUTBOUND_BUFFER);
         let (output_tx, mut output_rx) = mpsc::channel::<AgentOutput>(OUTBOUND_BUFFER);
         let approval_queue = ApprovalQueue::new();
 
         // Translator: AgentOutput → Frame. Exits when every Arc<Channel>
-        // drops (which closes `output_tx`).
+        // drops (which closes `output_tx`). Capability-gated outputs
+        // (currently `tool_telemetry`) are filtered here so the
+        // translator never builds a frame for a peer that didn't claim
+        // support — third-party clients with strict frame decoders
+        // can therefore opt out cleanly.
         let translator_tx = frame_tx.clone();
         let translator_ct = channel_type.clone();
         let translator_blobs = Arc::clone(&blob_store);
+        let translator_caps = capabilities;
         tokio::spawn(async move {
             while let Some(output) = output_rx.recv().await {
+                if !translator_caps.permits(&output) {
+                    continue;
+                }
                 let frame =
                     agent_output_to_frame(output, &translator_ct, translator_blobs.as_ref()).await;
                 if translator_tx.send(frame).await.is_err() {
@@ -170,7 +208,8 @@ impl Sidecar {
 
 fn build_approval_gate(queue: ApprovalQueue, frame_tx: mpsc::Sender<Frame>) -> ChannelApprovalGate {
     let waker_queue = queue.clone();
-    let waker_tx = frame_tx;
+    let waker_tx = frame_tx.clone();
+    let timeout_tx = frame_tx;
     ChannelApprovalGate::new(
         queue,
         Arc::new(move || {
@@ -197,6 +236,16 @@ fn build_approval_gate(queue: ApprovalQueue, frame_tx: mpsc::Sender<Frame>) -> C
         }),
         APPROVAL_TIMEOUT,
     )
+    .with_on_timeout_resolve(Arc::new(move |call_id, decision| {
+        // Broadcast the deny so streaming UIs (Lark approval cards,
+        // etc.) edit themselves to a terminal state. Without this the
+        // card stays clickable forever and a tap 6+ minutes later
+        // races against a dropped responder.
+        let tx = timeout_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Frame::ApprovalResolved { call_id, decision }).await;
+        });
+    }))
 }
 
 async fn agent_output_to_frame(
@@ -251,6 +300,40 @@ async fn agent_output_to_frame(
                 text,
             }
         }
+        AgentOutput::ToolCallStarted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            params_preview,
+            description,
+            ..
+        } => Frame::ToolCallStarted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            params_preview,
+            description,
+        },
+        AgentOutput::ToolCallCompleted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            result_preview,
+            error,
+            duration_ms,
+            ..
+        } => Frame::ToolCallCompleted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            result_preview,
+            error,
+            duration_ms,
+        },
     }
 }
 
@@ -365,5 +448,67 @@ async fn stat_attachment(
             tracing::warn!(blob_id, error = %e, "attachment blob stat failed; dropping");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aura_model::ChannelType;
+
+    fn tool_started() -> AgentOutput {
+        AgentOutput::ToolCallStarted {
+            session_id: "s".into(),
+            user_id: "u".into(),
+            channel: ChannelType::tui(),
+            call_id: "c".into(),
+            tool: "Bash".into(),
+            params_preview: "{}".into(),
+            description: None,
+        }
+    }
+
+    fn tool_completed() -> AgentOutput {
+        AgentOutput::ToolCallCompleted {
+            session_id: "s".into(),
+            user_id: "u".into(),
+            channel: ChannelType::tui(),
+            call_id: "c".into(),
+            tool: "Bash".into(),
+            result_preview: "ok".into(),
+            error: None,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn capabilities_from_negotiated_picks_up_tool_telemetry() {
+        let caps = SidecarCapabilities::from_negotiated(&["tool_telemetry".into()]);
+        assert!(caps.tool_telemetry);
+        assert!(caps.permits(&tool_started()));
+        assert!(caps.permits(&tool_completed()));
+    }
+
+    #[test]
+    fn capabilities_default_blocks_tool_telemetry() {
+        // Codex finding: tool telemetry frames must not flow to a peer
+        // that didn't claim support — third-party clients with strict
+        // frame decoders would otherwise disconnect.
+        let caps = SidecarCapabilities::default();
+        assert!(!caps.tool_telemetry);
+        assert!(!caps.permits(&tool_started()));
+        assert!(!caps.permits(&tool_completed()));
+    }
+
+    #[test]
+    fn unrelated_outputs_pass_when_telemetry_is_disabled() {
+        let caps = SidecarCapabilities::default();
+        let delta = AgentOutput::Delta {
+            session_id: "s".into(),
+            user_id: "u".into(),
+            channel: ChannelType::tui(),
+            text: "hi".into(),
+        };
+        assert!(caps.permits(&delta));
     }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aura_security::SecretVault;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
-use rmcp::model::Tool as RmcpTool;
+use rmcp::model::{Annotated, CallToolRequestParams, Meta, RawContent, Tool as RmcpTool};
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::auth::{AuthClient, AuthorizationManager, CredentialStore, OAuthClientConfig};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -14,10 +14,13 @@ use rmcp::transport::streamable_http_client::{
 };
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
+use crate::ToolOutput;
 use crate::mcp::config::{McpServerEntry, McpTransportConfig};
 use crate::mcp::credentials::VaultCredentialStore;
 use crate::mcp::error::{McpError, McpResult};
+use crate::mcp::sidecar::{SidecarSender, SidecarTransport};
 use crate::mcp::vault_keys;
 
 pub struct McpServerSession {
@@ -37,6 +40,139 @@ impl McpServerSession {
     pub async fn shutdown(self) {
         let _ = self.running.cancel().await;
     }
+
+    /// Call a tool on the connected MCP server.
+    ///
+    /// `meta` carries the optional Aura-internal `_meta` keys
+    /// forwarded to the MCP server: `auraSessionId` for traceability,
+    /// `auraBotId` so a sidecar hosting a multi-bot MCP server
+    /// (e.g. Lark) can disambiguate which tenant the call belongs
+    /// to. Both default to `None`; user-configured stdio/http MCP
+    /// servers normally don't care about either.
+    ///
+    /// `params` is the LLM-supplied JSON. An object becomes the
+    /// rmcp `arguments`; null means "no arguments". Anything else
+    /// is rejected with a typed error string the caller can
+    /// surface as the LLM tool result.
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        params: Value,
+        meta: CallToolMeta<'_>,
+    ) -> Result<ToolOutput, String> {
+        call_tool_via_peer(&self.peer(), name, params, meta).await
+    }
+}
+
+/// Aura-internal MCP `_meta` keys passed with each `tools/call`.
+/// All three fields are optional — user-configured MCP servers
+/// (stdio, HTTP) typically don't care, but sidecar-hosted servers
+/// consume them for cross-tenant routing and conversation context.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallToolMeta<'a> {
+    /// Aura session id. Lands at `_meta.auraSessionId`. Useful for
+    /// sidecar-side audit logging and for sidecars that grow their
+    /// own session→bot lookup.
+    pub aura_session_id: Option<&'a str>,
+    /// Sidecar tenant id (e.g. Lark `app_id`). Lands at
+    /// `_meta.auraBotId`. The sidecar's MCP server resolver uses
+    /// this to pick the right bot when multiple are connected,
+    /// instead of falling back to slice 2A's structured "ambiguous"
+    /// error.
+    pub aura_bot_id: Option<&'a str>,
+    /// Composed Aura user id (`<channel>_<bot>_<chatKey>_<userId>`).
+    /// Lands at `_meta.auraUserId`. Sidecar tools that need to
+    /// reach back to the platform conversation (e.g. `feishu_ask_user`)
+    /// look this up against a sidecar-local cache populated from
+    /// inbound messages — the user id encodes which chat + platform
+    /// user the message originated from.
+    pub aura_user_id: Option<&'a str>,
+}
+
+/// Invoke a tool on an already-connected rmcp peer.
+///
+/// Split out from [`McpServerSession::call_tool`] so callers that
+/// hold only a `Peer<RoleClient>` (e.g. the gateway's
+/// `SidecarMcpManager`, which keeps the sidecar's session inside a
+/// channel-keyed cache) can dispatch without exposing the rmcp
+/// types into their own crate.
+pub async fn call_tool_via_peer(
+    peer: &Peer<RoleClient>,
+    name: &str,
+    params: Value,
+    meta: CallToolMeta<'_>,
+) -> Result<ToolOutput, String> {
+    let arguments = match params {
+        Value::Object(map) => Some(map),
+        Value::Null => None,
+        other => {
+            return Err(format!(
+                "MCP tool arguments must be a JSON object; got {}",
+                type_name(&other)
+            ));
+        }
+    };
+    let mut request = CallToolRequestParams::new(name.to_string());
+    if let Some(args) = arguments {
+        request = request.with_arguments(args);
+    }
+    if meta.aura_session_id.is_some() || meta.aura_bot_id.is_some() || meta.aura_user_id.is_some() {
+        let mut rmcp_meta = Meta::new();
+        if let Some(id) = meta.aura_session_id {
+            rmcp_meta
+                .0
+                .insert("auraSessionId".into(), Value::String(id.to_string()));
+        }
+        if let Some(id) = meta.aura_bot_id {
+            rmcp_meta
+                .0
+                .insert("auraBotId".into(), Value::String(id.to_string()));
+        }
+        if let Some(id) = meta.aura_user_id {
+            rmcp_meta
+                .0
+                .insert("auraUserId".into(), Value::String(id.to_string()));
+        }
+        request.meta = Some(rmcp_meta);
+    }
+    let result = peer
+        .call_tool(request)
+        .await
+        .map_err(|e| format!("call_tool {name}: {e}"))?;
+    let text = format_call_result_content(&result.content);
+    if result.is_error.unwrap_or(false) {
+        Ok(ToolOutput::Error(text))
+    } else {
+        Ok(ToolOutput::Text(text))
+    }
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn format_call_result_content(parts: &[Annotated<RawContent>]) -> String {
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match &part.raw {
+            RawContent::Text(t) => out.push_str(&t.text),
+            RawContent::Image(_) => out.push_str("[image content elided]"),
+            RawContent::Audio(_) => out.push_str("[audio content elided]"),
+            RawContent::Resource(_) => out.push_str("[resource content elided]"),
+            RawContent::ResourceLink(_) => out.push_str("[resource link elided]"),
+        }
+    }
+    out
 }
 
 pub async fn connect(
@@ -65,12 +201,35 @@ pub async fn connect_with_extra_env(
         McpTransportConfig::Http { url } => connect_http(&entry.name, url, vault).await?,
     };
 
+    finalize_session(running).await
+}
+
+/// Run the rmcp handshake against a sidecar-hosted MCP server.
+///
+/// Callers provide the byte-pipe halves directly — a cloneable
+/// outbound [`SidecarSender`] plus an inbound `mpsc::Receiver`. This
+/// keeps the whole rmcp surface inside `aura-tools` so callers (e.g.
+/// the gateway's channel layer) don't need an rmcp dependency to
+/// stand up a session.
+///
+/// On success: the returned [`McpServerSession`] holds the running
+/// rmcp service and a snapshot of tools advertised at handshake
+/// time. Drop it via `shutdown()` to tear the session down cleanly.
+pub async fn connect_sidecar(
+    sender: Arc<dyn SidecarSender>,
+    inbound: mpsc::Receiver<Vec<u8>>,
+) -> McpResult<McpServerSession> {
+    let transport = SidecarTransport::new(sender, inbound);
+    let running = ().serve(transport).await.map_err(|e| McpError::Connection(e.to_string()))?;
+    finalize_session(running).await
+}
+
+async fn finalize_session(running: RunningService<RoleClient, ()>) -> McpResult<McpServerSession> {
     let tools = running
         .peer()
         .list_all_tools()
         .await
         .map_err(|e| McpError::Protocol(format!("list_all_tools: {e}")))?;
-
     Ok(McpServerSession { running, tools })
 }
 

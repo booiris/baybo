@@ -198,6 +198,7 @@ impl LocalSubagentRuntime {
             id: parent_user.id.clone(),
             name: parent_user.name.clone(),
             channel: ChannelType::from("subagent"),
+            bot_id: parent_user.bot_id.clone(),
         }
     }
 

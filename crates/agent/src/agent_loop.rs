@@ -14,9 +14,11 @@ use crate::memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
-use aura_tools::{ToolOutput, ToolRegistry};
+use aura_tools::mcp::{NoSidecarMcp, SidecarMcpProvider};
+use aura_tools::{ToolOutput, ToolRegistry, preview_params};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, StepHandle, StepKind,
+    ToolCallBegin, ToolCallResult,
 };
 use tracing::{debug, info, warn};
 
@@ -53,6 +55,43 @@ const STREAM_BUFFER_HIGH_WATER: usize = 128;
 /// screenshots from earlier iterations are typically stale anyway
 /// (page state has moved on).
 const MAX_ATTACHMENTS_PER_TURN: usize = 16;
+
+/// Hard timeout on sidecar MCP `tools/call` round-trips. Bounds how
+/// long a hung rmcp peer (sidecar process stuck, network partition,
+/// server-side deadlock) can pin the per-session actor.
+///
+/// **Contract with sidecar-hosted MCP tools**: this MUST be strictly
+/// greater than the maximum self-timeout any sidecar tool advertises.
+/// `feishu_ask_user` caps at 600s, so the agent waits 660s here —
+/// the sidecar's own timer always fires first, returns a `timeout`
+/// result, and removes its pending waiter. If the agent timed out
+/// before the sidecar did, a late user reply could be consumed by
+/// an orphan waiter on the sidecar side and silently dropped (Codex
+/// review). The 60s buffer absorbs rmcp round-trip latency + clock
+/// skew so the race is effectively impossible.
+const SIDECAR_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(660);
+
+/// Cap on the byte length of `params_preview` / `result_preview` carried
+/// in `AgentOutput::ToolCall*` telemetry. The agent's own context-side
+/// `cap_tool_output` is megabytes — way too much to fan out per-frame
+/// to every connected sidecar. Streaming sidecars only render a one-
+/// line indicator, so a tighter bound is fine.
+const TOOL_TELEMETRY_PREVIEW_LEN: usize = 256;
+
+/// Truncate `text` to at most `max_len` bytes, appending `…` when the
+/// content was clipped. Mirrors `aura_tools::preview_params`'s
+/// behavior on plain strings; we don't go through `preview_params` for
+/// results because they're already strings (not JSON values).
+fn truncate_preview(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    let mut end = max_len;
+    while !text.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
 
 /// Compute the byte index at which it is safe to flush `pending` to the
 /// output stream. Anything after that index is withheld because it might
@@ -152,6 +191,12 @@ pub struct AgentLoop {
     /// error, latency, model metadata) to
     /// `<state>/sessions/<session_id>.jsonl`.
     session_log: Option<Arc<SessionLlmLogger>>,
+    /// Lazy per-session sidecar MCP provider. Defaults to a no-op so
+    /// gateways without any `mcp_tunnel`-capable sidecar (and
+    /// standalone TUI builds) need no extra wiring. The gateway
+    /// substitutes its `SidecarMcpManager` here when a sidecar
+    /// connects.
+    sidecar_mcp: Arc<dyn SidecarMcpProvider>,
 }
 
 impl AgentLoop {
@@ -181,7 +226,13 @@ impl AgentLoop {
             subagent_runtime: None,
             skill_assessor: None,
             session_log: None,
+            sidecar_mcp: Arc::new(NoSidecarMcp),
         }
+    }
+
+    pub fn with_sidecar_mcp(mut self, provider: Arc<dyn SidecarMcpProvider>) -> Self {
+        self.sidecar_mcp = provider;
+        self
     }
 
     /// Attach the subagent runtime so LLM-emitted `spawn_subagent`
@@ -618,23 +669,95 @@ impl AgentLoop {
                 continue;
             }
 
-            let tool_result = self
-                .tool_executor
-                .execute(
+            if let Some(tx) = delta_tx {
+                let _ = tx
+                    .send(AgentOutput::ToolCallStarted {
+                        session_id: session.id.to_string(),
+                        user_id: session.user.id.clone(),
+                        channel: session.channel.clone(),
+                        call_id: tool_call.id.clone(),
+                        tool: tool_call.name.clone(),
+                        params_preview: preview_params(
+                            &tool_call.arguments,
+                            TOOL_TELEMETRY_PREVIEW_LEN,
+                        ),
+                        description: None,
+                    })
+                    .await;
+            }
+            let tool_call_started = std::time::Instant::now();
+
+            // Sidecar MCP tools (e.g. `lark/feishu_get_chat_info`) are
+            // not in the local `ToolRegistry` — they live behind the
+            // channel sidecar's MCP server. Approval gate + local
+            // sandbox don't apply (the call is a remote query against
+            // an already-trusted tenant API, not a local resource
+            // access), but we still need the rest of the security
+            // pipeline: `reveal_in_value`, hard timeout,
+            // `sanitize_tool_output`, and a trace span.
+            let claims = self.sidecar_mcp.claims_tool(session, &tool_call.name).await;
+            let tool_result: anyhow::Result<ToolOutput> = if claims {
+                self.dispatch_sidecar_tool(
+                    session,
                     &tool_call.name,
                     tool_call.arguments.clone(),
-                    &session.id,
-                    &session.user,
-                    &approved,
                     span_recorder,
                     &step,
                     Some(llm_span_id),
                     tool_call.id.clone(),
-                    None,
-                    Some(job_id),
-                    cancel_token.child_token(),
+                    job_id,
                 )
-                .await;
+                .await
+            } else {
+                self.tool_executor
+                    .execute(
+                        &tool_call.name,
+                        tool_call.arguments.clone(),
+                        &session.id,
+                        &session.user,
+                        &approved,
+                        span_recorder,
+                        &step,
+                        Some(llm_span_id),
+                        tool_call.id.clone(),
+                        None,
+                        Some(job_id),
+                        cancel_token.child_token(),
+                    )
+                    .await
+            };
+
+            // Classify the outcome for telemetry before consuming the
+            // result for the LLM context. Errors / denials feed the
+            // `error` field on the Completed event so streaming
+            // sidecars can switch the indicator's color/icon.
+            //
+            // Telemetry rides the channel wire and lands in the
+            // sidecar's logs / cards — sanitize through the security
+            // gateway before emit so a tool error containing a bearer
+            // token, connection string, or revealed secret placeholder
+            // does not leak. `Ok(ToolOutput::Error)` already passed
+            // `sanitize_tool_output` inside the executor; the raw
+            // `Err(e)` path did not.
+            let telemetry_error: Option<String> = match &tool_result {
+                Ok(ToolOutput::Error(msg)) => Some(msg.clone()),
+                Err(e) => {
+                    if let Some(aura_tools::ToolError::Denied { .. }) =
+                        e.downcast_ref::<aura_tools::ToolError>()
+                    {
+                        Some("denied by user".to_string())
+                    } else {
+                        let raw = e.to_string();
+                        Some(
+                            self.security_gateway
+                                .sanitize_error(&raw)
+                                .await
+                                .unwrap_or(raw),
+                        )
+                    }
+                }
+                _ => None,
+            };
 
             let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
             let raw_result_text = match &tool_result {
@@ -672,6 +795,27 @@ impl AgentLoop {
                     }
                 }
             };
+
+            if let Some(tx) = delta_tx {
+                let result_preview = if telemetry_error.is_some() {
+                    String::new()
+                } else {
+                    truncate_preview(&raw_result_text, TOOL_TELEMETRY_PREVIEW_LEN)
+                };
+                let _ = tx
+                    .send(AgentOutput::ToolCallCompleted {
+                        session_id: session.id.to_string(),
+                        user_id: session.user.id.clone(),
+                        channel: session.channel.clone(),
+                        call_id: tool_call.id.clone(),
+                        tool: tool_call.name.clone(),
+                        result_preview,
+                        error: telemetry_error,
+                        duration_ms: u64::try_from(tool_call_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                    })
+                    .await;
+            }
 
             // Cap size before wrapping so the truncation notice lands
             // inside the `<tool_output>` envelope, then wrap so the LLM
@@ -721,6 +865,131 @@ impl AgentLoop {
         Ok(IterationOutcome::Continue { deferred_subagents })
     }
 
+    /// Dispatch a tool call the sidecar MCP provider has claimed.
+    ///
+    /// Mirrors the security pipeline `ToolExecutor::execute` applies to
+    /// local tools — minus approval gate / sandbox / trust gate (sidecar
+    /// tools are remote tenant-API queries, not local resource accesses):
+    /// `reveal_in_value` on params before the rmcp wire, `with_span`
+    /// `SpanKind::ToolCall` for trace parity with local tool calls, a
+    /// hard `SIDECAR_MCP_TIMEOUT` so a hung peer can't pin the actor,
+    /// and `sanitize_tool_output` on the result before it reaches
+    /// context / session log / telemetry.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_sidecar_tool(
+        &self,
+        session: &Session,
+        tool_name: &str,
+        params: serde_json::Value,
+        span_recorder: &Arc<SpanRecorder>,
+        step: &StepHandle,
+        triggering_llm_span: Option<aura_model::SpanId>,
+        tool_use_id: String,
+        job_id: JobId,
+    ) -> anyhow::Result<ToolOutput> {
+        let tool_name_owned = tool_name.to_string();
+        crate::scope::with_span(
+            span_recorder.as_ref(),
+            step,
+            job_id,
+            SpanKind::ToolCall {
+                begin: ToolCallBegin {
+                    tool_name: tool_name_owned.clone(),
+                    tool_artifact_hash: String::new(),
+                    triggered_by: triggering_llm_span.map(|llm_span_id| {
+                        aura_trace::ToolCallOrigin {
+                            llm_span_id,
+                            tool_use_id: tool_use_id.clone(),
+                        }
+                    }),
+                    params: params.clone(),
+                },
+                result: None,
+            },
+            None,
+            None,
+            |_span_handle| async move {
+                // Reveal placeholders so the remote API receives plaintext.
+                let mut params_revealed = params;
+                if let Err(e) = self
+                    .security_gateway
+                    .reveal_in_value(&mut params_revealed)
+                    .await
+                {
+                    return Err(anyhow::anyhow!("reveal_in_value: {e}"));
+                }
+
+                let dispatch_fut =
+                    self.sidecar_mcp
+                        .execute_for_session(session, &tool_name_owned, params_revealed);
+
+                let dispatch_result =
+                    match tokio::time::timeout(SIDECAR_MCP_TIMEOUT, dispatch_fut).await {
+                        Ok(outcome) => outcome,
+                        Err(_elapsed) => {
+                            let msg = format!(
+                                "sidecar mcp call timed out after {SIDECAR_MCP_TIMEOUT:?}"
+                            );
+                            let output = ToolOutput::Error(msg);
+                            let output_value =
+                                serde_json::to_value(&output).unwrap_or(serde_json::Value::Null);
+                            return Ok((
+                                SpanFinalize::ToolCall(ToolCallResult {
+                                    output: output_value,
+                                    success: false,
+                                }),
+                                LifecycleOutcome::Failed {
+                                    reason: "sidecar mcp timeout".into(),
+                                },
+                                output,
+                            ));
+                        }
+                    };
+
+                // claims_tool returned true, so dispatch returning None is
+                // a race (sidecar disconnected mid-call). Surface as an
+                // error rather than falling through to local — the tool
+                // doesn't exist locally either.
+                let mut output = match dispatch_result {
+                    Some(Ok(out)) => out,
+                    Some(Err(reason)) => ToolOutput::Error(reason),
+                    None => ToolOutput::Error(
+                        "sidecar mcp: tool was claimed at preflight but unavailable at dispatch \
+                         (sidecar likely disconnected); retry on next turn"
+                            .to_string(),
+                    ),
+                };
+
+                if let Err(e) = self
+                    .security_gateway
+                    .sanitize_tool_output(&mut output)
+                    .await
+                {
+                    warn!(error = %e, tool = %tool_name_owned, "sidecar mcp: sanitize_tool_output failed");
+                }
+
+                let output_value = serde_json::to_value(&output).unwrap_or(serde_json::Value::Null);
+                let success = !matches!(output, ToolOutput::Error(_));
+                let outcome = if success {
+                    LifecycleOutcome::Ok
+                } else {
+                    LifecycleOutcome::Failed {
+                        reason: "sidecar tool returned error output".into(),
+                    }
+                };
+                Ok((
+                    SpanFinalize::ToolCall(ToolCallResult {
+                        output: output_value,
+                        success,
+                    }),
+                    outcome,
+                    output,
+                ))
+            },
+        )
+        .await
+    }
+
     /// Call the LLM with retry on transient errors using `ErrorHandler`.
     /// Returns the response paired with the `SpanId` of the
     /// **last attempt's** `LlmCall` span — that's the span tools spawned
@@ -768,7 +1037,7 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
-        let tool_defs: Vec<ToolDefinitionForLlm> = self
+        let mut tool_defs: Vec<ToolDefinitionForLlm> = self
             .tool_registry
             .tool_definitions()
             .into_iter()
@@ -778,6 +1047,16 @@ impl AgentLoop {
                 parameters_schema: td.parameters_schema,
             })
             .collect();
+        // Sidecar MCP tools are session-scoped: discovered on demand
+        // for the current session so multi-bot deployments don't leak
+        // tool surfaces between tenants. Most builds run the no-op
+        // provider and pay no cost.
+        let sidecar_tools = self.sidecar_mcp.tool_definitions_for_session(session).await;
+        tool_defs.extend(sidecar_tools.into_iter().map(|td| ToolDefinitionForLlm {
+            name: td.name,
+            description: td.description,
+            parameters_schema: td.parameters_schema,
+        }));
 
         let request = ChatRequest {
             messages: session.messages.clone(),

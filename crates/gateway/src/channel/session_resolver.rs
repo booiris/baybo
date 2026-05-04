@@ -63,6 +63,7 @@ impl ChannelSessionResolver {
             id: user_id.to_owned(),
             name: None,
             channel: channel_type.clone(),
+            bot_id: None,
         };
         let session = self
             .sessions
@@ -112,6 +113,7 @@ impl ChannelSessionResolver {
             id: user_id.to_owned(),
             name: None,
             channel: channel_type.clone(),
+            bot_id: None,
         };
         let session = self
             .sessions

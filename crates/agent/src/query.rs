@@ -573,6 +573,7 @@ mod tests {
                 id: "u1".into(),
                 name: None,
                 channel: ChannelType::tui(),
+                bot_id: None,
             },
             channel: ChannelType::tui(),
             messages: vec![],

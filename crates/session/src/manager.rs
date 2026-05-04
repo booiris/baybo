@@ -285,6 +285,7 @@ mod tests {
             id: "user-1".to_string(),
             name: Some("Alice".to_string()),
             channel: ChannelType::tui(),
+            bot_id: None,
         }
     }
 

@@ -88,6 +88,14 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let tool_registry = Arc::new(ToolRegistry::new());
     let channel_registry = Arc::new(ChannelRegistry::new());
     let channel_control = Arc::new(crate::channel::ChannelControlRegistry::new());
+    let diagnose_router = Arc::new(crate::channel::DiagnoseRouter::new());
+    let channel_capabilities = Arc::new(crate::channel::ChannelCapabilities::new());
+    let mcp_tunnel_router = Arc::new(crate::channel::McpTunnelRouter::new(Arc::clone(
+        &channel_control,
+    )));
+    let sidecar_mcp_manager = Arc::new(crate::channel::SidecarMcpManager::new(Arc::clone(
+        &mcp_tunnel_router,
+    )));
     let bot_reconciler = Arc::new(crate::channel::ChannelBotReconciler::new(
         Arc::clone(&channel_control),
         stores.channel_bot.clone(),
@@ -141,6 +149,10 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         stores,
         channel_control,
         bot_reconciler,
+        diagnose_router,
+        channel_capabilities,
+        mcp_tunnel_router,
+        sidecar_mcp_manager,
     };
 
     TestGateway {

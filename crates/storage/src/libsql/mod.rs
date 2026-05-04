@@ -322,6 +322,8 @@ impl LibsqlPool {
                     channel_type TEXT    NOT NULL,
                     bot_id       TEXT    NOT NULL,
                     created_at   INTEGER NOT NULL,
+                    metadata     TEXT    NOT NULL DEFAULT '{}',
+                    revision     INTEGER NOT NULL DEFAULT 0,
                     deleted_at   INTEGER,
                     PRIMARY KEY (channel_type, bot_id)
                 );
@@ -360,6 +362,71 @@ impl LibsqlPool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
+
+        // Live databases predating the column need an ALTER on top of
+        // the IF NOT EXISTS table creation above. The column has a
+        // default so existing rows fill in `'{}'` automatically; the
+        // duplicate-column error sqlite raises on a rerun is the
+        // expected idempotent path.
+        let alter = self
+            .conn
+            .execute(
+                "ALTER TABLE channel_bots ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
+                (),
+            )
+            .await;
+        if let Err(e) = alter {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(anyhow::anyhow!(
+                    "failed to migrate channel_bots.metadata: {e}"
+                ));
+            }
+        }
+
+        // Same idempotent ALTER pattern for the rotation revision
+        // column. Existing rows default to 0 from the initial ALTER;
+        // the follow-up UPDATE migrates them to 1 so the reconciler
+        // sees a real "running at revision 1" state instead of
+        // mistaking 0 for the "not yet started" sentinel and looping
+        // StartBot on every tick.
+        let alter_rev = self
+            .conn
+            .execute(
+                "ALTER TABLE channel_bots ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await;
+        if let Err(e) = alter_rev {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(anyhow::anyhow!(
+                    "failed to migrate channel_bots.revision: {e}"
+                ));
+            }
+        }
+        // Idempotent: no-op when every row already has a positive
+        // revision (fresh DBs always insert at 1; rotation always
+        // bumps strictly upward).
+        self.conn
+            .execute(
+                "UPDATE channel_bots SET revision = 1 WHERE revision = 0",
+                (),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to migrate channel_bots.revision rows from 0 to 1: {e}")
+            })?;
+
         Ok(())
+    }
+
+    /// Test-only re-entry for `init_db`. Lets the channel_bot
+    /// migration test simulate an upgrade-after-restart sequence
+    /// without standing up a fresh process. Marked `cfg(test)` so
+    /// it's stripped from release builds.
+    #[cfg(test)]
+    pub(crate) async fn reinit_db_for_test(pool: &LibsqlPool) -> anyhow::Result<()> {
+        pool.init_db().await
     }
 }

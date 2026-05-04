@@ -21,17 +21,30 @@ use aura_model::ChannelType;
 use super::session_resolver::ChannelSessionResolver;
 
 /// Authoritative manifest of slash commands the gateway dispatcher
-/// recognises for sidecar channels. Pushed to every freshly-registered
+/// recognises for `channel_type`. Pushed to the freshly-registered
 /// sidecar via [`aura_channels::wire::Frame::SlashManifest`] so each
 /// platform's native command surface (Telegram `setMyCommands`,
-/// Discord application commands, …) stays in sync without sidecars
-/// keeping their own hardcoded copy. Adding a new command here is the
-/// single edit needed for the dispatcher + every sidecar to learn it.
-pub(crate) fn manifest() -> Vec<SlashCommandSpec> {
-    vec![SlashCommandSpec {
+/// Discord application commands, Lark `command/list`, …) stays in
+/// sync without sidecars keeping their own hardcoded copy.
+///
+/// `/new` is universal — every sidecar gets it. Per-channel additions
+/// branch off `channel_type.as_str()`; the rule of thumb is that the
+/// gateway-side dispatcher in [`try_handle`] also needs an arm for
+/// the new command, otherwise it falls through to the agent as plain
+/// text. Today only Lark layers on `/help` because its richer
+/// chat-card surface benefits from a one-shot capability summary.
+pub(crate) fn manifest(channel_type: &ChannelType) -> Vec<SlashCommandSpec> {
+    let mut out = vec![SlashCommandSpec {
         command: "new".to_string(),
         description: "Start a fresh session".to_string(),
-    }]
+    }];
+    if channel_type.as_str() == "lark" {
+        out.push(SlashCommandSpec {
+            command: "help".to_string(),
+            description: "Show what Aura can do in this Lark chat".to_string(),
+        });
+    }
+    out
 }
 
 pub(crate) enum SlashOutcome {
@@ -84,8 +97,27 @@ pub(crate) async fn try_handle(
 
     match cmd.to_ascii_lowercase().as_str() {
         "new" => SlashOutcome::Handled(handle_new(resolver, channel_type, user_id).await),
+        "help" if channel_type.as_str() == "lark" => {
+            SlashOutcome::Handled(handle_lark_help(channel_type, user_id))
+        }
         _ => SlashOutcome::PassThrough,
     }
+}
+
+/// Lark-only `/help` reply. Renders without a session because the
+/// answer is a static capability summary; we leave `session_id` empty
+/// and the sidecar posts as a one-off message rather than into the
+/// session's conversation thread.
+fn handle_lark_help(channel_type: &ChannelType, user_id: &str) -> WireMessage {
+    let body = concat!(
+        "**Aura — Lark integration**\n\n",
+        "- Streaming responses render in a CardKit card.\n",
+        "- `/new` starts a fresh session.\n",
+        "- Tool calls show inline indicators (🔧 → ✓ / ✗).\n",
+        "- Operators can run a self-test via the admin endpoint ",
+        "`GET /v1/admin/channels/lark/diagnose?bot_id=<id>`.",
+    );
+    reply(channel_type, user_id, "", body)
 }
 
 async fn handle_new(
@@ -165,11 +197,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn manifest_returns_new_for_every_channel() {
+        for ct in [
+            ChannelType::telegram(),
+            ChannelType::from("weixin"),
+            ChannelType::from("lark"),
+            ChannelType::tui(),
+        ] {
+            let cmds = manifest(&ct);
+            assert!(
+                cmds.iter().any(|c| c.command == "new"),
+                "channel '{ct}' must include /new",
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_layers_help_only_on_lark() {
+        let lark = manifest(&ChannelType::from("lark"));
+        assert!(lark.iter().any(|c| c.command == "help"));
+        let telegram = manifest(&ChannelType::telegram());
+        assert!(!telegram.iter().any(|c| c.command == "help"));
+    }
+
     #[tokio::test]
     async fn plain_text_passes_through() {
         let resolver = build().await;
         let ct = ChannelType::telegram();
         assert_passthrough(try_handle(&resolver, "hello world", &ct, "tg_1").await);
+    }
+
+    #[tokio::test]
+    async fn lark_help_returns_capability_summary() {
+        let resolver = build().await;
+        let ct = ChannelType::from("lark");
+        let reply = assert_handled(try_handle(&resolver, "/help", &ct, "lark_user").await);
+        assert_eq!(reply.user_id, "lark_user");
+        assert_eq!(reply.channel_type, ct);
+        assert!(
+            reply.session_id.is_empty(),
+            "static help reply has no session"
+        );
+        assert!(reply.content.contains("Streaming responses"));
+        assert!(reply.content.contains("/new"));
+    }
+
+    #[tokio::test]
+    async fn telegram_help_passes_through_to_agent() {
+        // /help is lark-only at the dispatcher; telegram falls
+        // through to the agent so a custom skill could still answer.
+        let resolver = build().await;
+        let ct = ChannelType::telegram();
+        assert_passthrough(try_handle(&resolver, "/help", &ct, "tg_1").await);
     }
 
     #[tokio::test]

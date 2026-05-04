@@ -59,6 +59,9 @@ async fn admin_router() -> axum::Router {
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
         channel_control: std::sync::Arc::clone(&tg.deps.channel_control),
         secret_vault: std::sync::Arc::clone(&tg.deps.secret_vault),
+        diagnose_router: std::sync::Arc::clone(&tg.deps.diagnose_router),
+        channel_capabilities: std::sync::Arc::clone(&tg.deps.channel_capabilities),
+        mcp_tunnel_router: std::sync::Arc::clone(&tg.deps.mcp_tunnel_router),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
     let (admin_router, _spec) = aura_gateway::api::admin::v1_router_and_spec();

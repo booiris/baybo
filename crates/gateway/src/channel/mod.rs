@@ -21,19 +21,26 @@ pub(crate) mod blobs;
 pub mod bot_reconciler;
 pub mod control;
 pub(crate) mod dedup;
+pub mod diagnose;
 pub(crate) mod handshake;
 pub(crate) mod history;
+pub mod mcp_tunnel;
 pub mod route;
+pub(crate) mod secrets;
 pub(crate) mod session_resolver;
+pub mod sidecar_mcp;
 pub(crate) mod slash;
 pub mod state;
 
 pub use bot_reconciler::ChannelBotReconciler;
 pub use control::{ChannelControlError, ChannelControlRegistry};
 pub use dedup::InboundDedup;
+pub use diagnose::{ChannelCapabilities, DiagnoseError, DiagnoseReport, DiagnoseRouter};
 pub use history::TuiHistoryStore;
+pub use mcp_tunnel::{McpTunnel, McpTunnelError, McpTunnelGuard, McpTunnelRouter, McpTunnelSender};
 pub use route::routes;
 pub use session_resolver::ChannelSessionResolver;
+pub use sidecar_mcp::SidecarMcpManager;
 pub use state::WsChannelState;
 
 /// Deterministic short hash of an identifier for log attribution.

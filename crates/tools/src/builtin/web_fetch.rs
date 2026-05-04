@@ -429,6 +429,7 @@ mod tests {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
+                bot_id: None,
             },
             timeout,
             cancellation_token: CancellationToken::new(),

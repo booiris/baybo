@@ -153,8 +153,18 @@ async fn pump(
                     .await
                     .map_err(|e| CliError::Io(format!("flush prompt reply: {e}")))?;
             }
-            RegisterOut::Result { bot_id, token } => {
-                return Ok(RegistrationResult { bot_id, token });
+            RegisterOut::Result {
+                bot_id,
+                token,
+                metadata,
+                secrets,
+            } => {
+                return Ok(RegistrationResult {
+                    bot_id,
+                    token,
+                    metadata,
+                    secrets,
+                });
             }
             RegisterOut::Error { message } => {
                 return Err(CliError::Config(format!(

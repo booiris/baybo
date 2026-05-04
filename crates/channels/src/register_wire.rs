@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Maximum size of a single line-delimited JSON frame on the
@@ -35,6 +37,22 @@ pub enum RegisterOut {
     Result {
         bot_id: String,
         token: String,
+        /// Non-secret auxiliary configuration persisted as plaintext
+        /// JSON on the `channel_bots.metadata` row (Lark `base_url`,
+        /// Discord intents bitmask, …). Empty for single-secret
+        /// sidecars; older sidecars that don't emit the field decode
+        /// it as `{}`. See [`crate::registration::RegistrationResult`]
+        /// for the full split-storage contract.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        metadata: HashMap<String, String>,
+        /// Secret-valued auxiliary credentials beyond the primary
+        /// `token` (Lark `app_secret` / `encrypt_key` /
+        /// `verification_token`, Slack signing-secret). Routed by the
+        /// CLI into [`aura_security::SecretVault`] under per-bot keys
+        /// so they're encrypted at rest and redacted in logs the same
+        /// way `token` is. Empty for single-secret sidecars.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        secrets: HashMap<String, String>,
     },
     Error {
         message: String,
@@ -76,10 +94,57 @@ mod tests {
         let frame = RegisterOut::Result {
             bot_id: "123456789".into(),
             token: "123456789:hunter2".into(),
+            metadata: HashMap::new(),
+            secrets: HashMap::new(),
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert!(json.contains("\"type\":\"result\""));
+        // Empty maps stay off the wire so older CLIs that predate the
+        // fields round-trip cleanly.
+        assert!(!json.contains("metadata"));
+        assert!(!json.contains("secrets"));
         assert_eq!(frame, serde_json::from_str(&json).unwrap());
+    }
+
+    #[test]
+    fn roundtrip_result_with_metadata_and_secrets() {
+        let mut metadata = HashMap::new();
+        metadata.insert("base_url".into(), "https://open.feishu.cn".into());
+        let mut secrets = HashMap::new();
+        secrets.insert("app_secret".into(), "deadbeef".into());
+        secrets.insert("encrypt_key".into(), "cafebabe".into());
+        let frame = RegisterOut::Result {
+            bot_id: "lark-bot".into(),
+            token: "app-id-token".into(),
+            metadata,
+            secrets,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"app_secret\""));
+        assert!(json.contains("\"base_url\""));
+        // Both maps round-trip with content preserved.
+        assert_eq!(frame, serde_json::from_str(&json).unwrap());
+    }
+
+    #[test]
+    fn legacy_result_without_metadata_decodes_empty() {
+        // Old sidecars predating the new fields write only the two
+        // original keys. The new CLI must still parse it.
+        let json = r#"{"type":"result","bot_id":"123","token":"tok"}"#;
+        let frame: RegisterOut = serde_json::from_str(json).unwrap();
+        let RegisterOut::Result {
+            bot_id,
+            token,
+            metadata,
+            secrets,
+        } = frame
+        else {
+            panic!("expected Result variant");
+        };
+        assert_eq!(bot_id, "123");
+        assert_eq!(token, "tok");
+        assert!(metadata.is_empty());
+        assert!(secrets.is_empty());
     }
 
     #[test]

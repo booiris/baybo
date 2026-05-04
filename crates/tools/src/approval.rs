@@ -345,6 +345,7 @@ impl Default for ApprovalQueue {
 pub struct ChannelApprovalGate {
     queue: ApprovalQueue,
     waker: Arc<dyn Fn() + Send + Sync>,
+    on_timeout_resolve: Arc<dyn Fn(String, ApprovalDecision) + Send + Sync>,
     timeout: Duration,
 }
 
@@ -357,8 +358,24 @@ impl ChannelApprovalGate {
         Self {
             queue,
             waker,
+            on_timeout_resolve: Arc::new(|_, _| {}),
             timeout,
         }
+    }
+
+    /// Install a callback fired with `(call_id, Deny)` whenever the
+    /// gate's own timeout elapses. The channel server uses this to
+    /// broadcast `Frame::ApprovalResolved` so streaming UIs (Lark
+    /// approval cards, etc.) can edit themselves to a terminal state
+    /// instead of staying clickable indefinitely. The callback is
+    /// fire-and-forget; it runs in the spawned cleanup task and any
+    /// failure is the channel's problem to log.
+    pub fn with_on_timeout_resolve(
+        mut self,
+        on_timeout: Arc<dyn Fn(String, ApprovalDecision) + Send + Sync>,
+    ) -> Self {
+        self.on_timeout_resolve = on_timeout;
+        self
     }
 
     /// Access the underlying queue so the channel can peek/resolve entries.
@@ -392,7 +409,18 @@ impl ApprovalGate for ChannelApprovalGate {
 
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(decision)) => decision,
-            _ => ApprovalDecision::Deny,
+            Err(_) => {
+                // Timeout fired. Notify the channel so it can
+                // broadcast `Frame::ApprovalResolved(Deny)` and let
+                // the per-channel UI edit its prompt to a terminal
+                // state. The dropped-oneshot path (`Ok(Err(_))`)
+                // does NOT trigger this callback — that case is the
+                // channel itself tearing down, where the broadcast
+                // would just chase a dead WS pump.
+                (self.on_timeout_resolve)(_cleanup.call_id.clone(), ApprovalDecision::Deny);
+                ApprovalDecision::Deny
+            }
+            Ok(Err(_)) => ApprovalDecision::Deny,
         }
     }
 }
@@ -581,5 +609,69 @@ mod tests {
         assert!(q.resolve_head(ApprovalDecision::Approve));
         assert_eq!(task.await.unwrap(), ApprovalDecision::Approve);
         assert!(queue.is_empty());
+    }
+
+    /// Codex review regression: when the gate's own timeout fires the
+    /// configured `on_timeout_resolve` callback runs with the pending
+    /// `call_id` and `Deny`. The channel server uses this to broadcast
+    /// `Frame::ApprovalResolved` so streaming UIs can edit themselves
+    /// to a terminal state instead of staying clickable indefinitely.
+    #[tokio::test]
+    async fn timeout_invokes_on_timeout_resolve() {
+        let queue = ApprovalQueue::new();
+        let captured: Arc<std::sync::Mutex<Option<(String, ApprovalDecision)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let gate =
+            ChannelApprovalGate::new(queue.clone(), Arc::new(|| {}), Duration::from_millis(20))
+                .with_on_timeout_resolve(Arc::new(move |call_id, decision| {
+                    *captured_clone.lock().unwrap() = Some((call_id, decision));
+                }));
+        let req = ApprovalRequest {
+            call_id: "to-time-out".into(),
+            session_id: "s".into(),
+            user_id: "u".into(),
+            tool: "t".into(),
+            accesses: vec![],
+            params_preview: String::new(),
+            description: None,
+        };
+        let decision = gate.request(req).await;
+        assert_eq!(decision, ApprovalDecision::Deny);
+        let payload = captured.lock().unwrap().clone();
+        assert_eq!(
+            payload,
+            Some(("to-time-out".to_string(), ApprovalDecision::Deny))
+        );
+    }
+
+    /// The dropped-future path (outer caller cancels before timeout)
+    /// must NOT fire `on_timeout_resolve` — that path's broadcast
+    /// would race a tearing-down channel.
+    #[tokio::test]
+    async fn drop_before_timeout_skips_on_timeout_resolve() {
+        let queue = ApprovalQueue::new();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = Arc::clone(&fired);
+        let gate =
+            ChannelApprovalGate::new(queue.clone(), Arc::new(|| {}), Duration::from_secs(60))
+                .with_on_timeout_resolve(Arc::new(move |_, _| {
+                    fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                }));
+        let req = ApprovalRequest {
+            call_id: "outer-cancel".into(),
+            session_id: "s".into(),
+            user_id: "u".into(),
+            tool: "t".into(),
+            accesses: vec![],
+            params_preview: String::new(),
+            description: None,
+        };
+        let res = tokio::time::timeout(Duration::from_millis(10), gate.request(req)).await;
+        assert!(res.is_err(), "outer timeout fires");
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "on_timeout_resolve must not fire on outer drop",
+        );
     }
 }

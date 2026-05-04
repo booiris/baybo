@@ -55,6 +55,7 @@ Bottom-up along the dependency graph:
 ## Cross-Cutting Guides
 
 - [testing.md](../testing.md) — Test pyramid (unit / crate-level / cross-crate), `test-support` gating, fixture inventory, and the six conventions every new test should follow.
+- [lark-sidecar.md](../lark-sidecar.md) — Architecture of the in-tree Lark / Feishu channel sidecar: bot credential layout, per-bot UAT pipeline (RFC 8628 device flow + auto-auth + scope-aware refresh), in-chat write-approval framework, MCP tool surface, and diagnose checks. The wire-level pieces (capability negotiation, `secrets`, `mcp_tunnel`, `tool_telemetry`, `diagnose`) are documented in [`channels.md`](channels.md).
 
 ## Dependency Overview
 

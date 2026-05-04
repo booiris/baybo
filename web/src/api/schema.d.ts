@@ -20,6 +20,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/channels/{channel_type}/diagnose": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Round-trip a diagnose self-test against the sidecar serving
+         *     `:channel_type`. The request is gated by the sidecar's advertised
+         *     `"diagnose"` capability — sidecars that don't claim it return
+         *     HTTP 501 instead of timing out.
+         */
+        get: operations["diagnose_channel"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/config": {
         parameters: {
             query?: never;
@@ -337,6 +359,15 @@ export interface components {
          * @enum {string}
          */
         CronStatus: "enabled" | "disabled";
+        DiagnoseCheckEntry: {
+            detail: string;
+            name: string;
+            /**
+             * @description `"ok"` / `"warn"` / `"error"` — string-typed so third-party
+             *     clients can render without a typed enum.
+             */
+            status: string;
+        };
         /**
          * @description Uniform error envelope for every non-2xx admin response.
          *
@@ -547,6 +578,63 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    diagnose_channel: {
+        parameters: {
+            query: {
+                /** @description Per-tenant bot id */
+                bot_id: string;
+            };
+            header?: never;
+            path: {
+                /** @description Sidecar channel type (e.g. `lark`) */
+                channel_type: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Diagnose report */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        bot_id: string;
+                        channel_type: string;
+                        checks: components["schemas"]["DiagnoseCheckEntry"][];
+                    };
+                };
+            };
+            /** @description No sidecar connected */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Sidecar lacks `diagnose` capability */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Sidecar did not reply in time */
+            504: {
                 headers: {
                     [name: string]: unknown;
                 };

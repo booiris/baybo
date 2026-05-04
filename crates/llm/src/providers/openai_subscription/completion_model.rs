@@ -1650,6 +1650,18 @@ mod tests {
         async fn list(&self) -> std::result::Result<Vec<String>, aura_storage::StorageError> {
             self.inner.list().await
         }
+        async fn list_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, aura_storage::StorageError> {
+            self.inner.list_with_prefix(prefix).await
+        }
+        async fn delete_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<usize, aura_storage::StorageError> {
+            self.inner.delete_with_prefix(prefix).await
+        }
     }
 
     fn vault_with_failing_store(

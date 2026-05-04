@@ -41,6 +41,64 @@ export interface AgentNotice {
   text: string;
 }
 
+/**
+ * Telemetry surfaced when the agent dispatches a tool call. Streaming
+ * channels render an indicator in the in-flight card; everyone else
+ * drops it. `paramsPreview` is a pre-truncated, vault-redacted JSON
+ * snippet (≤256 chars) — sidecars never see raw tool arguments.
+ * `description` is the tool's optional `call_label` hook (Bash's
+ * `description`, etc.) when present.
+ */
+export interface AgentToolCallStarted {
+  sessionId: string;
+  userId: string;
+  callId: string;
+  tool: string;
+  paramsPreview: string;
+  description?: string;
+}
+
+/**
+ * Pair to {@link AgentToolCallStarted}. `error` is set when the tool
+ * errored or was denied; `resultPreview` is empty / a short fallback
+ * in that case. Match against the `callId` you saw on `onToolCallStarted`
+ * to pair the indicator with its terminal state.
+ */
+export interface AgentToolCallCompleted {
+  sessionId: string;
+  userId: string;
+  callId: string;
+  tool: string;
+  resultPreview: string;
+  error?: string;
+  durationMs: number;
+}
+
+export type DiagnoseStatus = "ok" | "warn" | "error";
+
+/**
+ * One row in a diagnose report. `status` distinguishes a hard failure
+ * an operator should act on (`error`) from a soft warning (`warn`)
+ * from a healthy probe (`ok`). `detail` is free-form context.
+ */
+export interface DiagnoseCheck {
+  name: string;
+  status: DiagnoseStatus;
+  detail: string;
+}
+
+/**
+ * Inputs passed to {@link Channel.onDiagnoseRequested}. The sidecar
+ * runs whatever self-tests fit its platform (Lark: bot identity
+ * fetch, WSS connectivity, send-roundtrip) and returns a list of
+ * checks. Whole-pipeline failures (the report couldn't even be
+ * assembled) raise an exception from the hook; the SDK runner
+ * translates that into `ok: false` on the wire.
+ */
+export interface DiagnoseRequest {
+  botId: string;
+}
+
 export interface UserInbound {
   sessionId: string;
   userId: string;
@@ -110,10 +168,19 @@ export type NoticeLevel = "warn" | "error";
  * operator-chosen label and `token` is the @BotFather token; other
  * sidecars can repurpose the same shape for whatever per-tenant
  * identity they multiplex.
+ *
+ * `metadata` carries any auxiliary key/value configuration the
+ * gateway has stored for this bot beyond the primary token (Lark's
+ * `app_secret` / `encrypt_key` / `verification_token` / `base_url`,
+ * Discord intents bitmask, etc.). The map is always present but is
+ * empty for single-secret channels (Telegram, Weixin); the runner
+ * supplies a frozen object so a sidecar can't accidentally mutate
+ * the wire payload.
  */
 export interface StartBotCommand {
   botId: string;
   token: string;
+  metadata: Readonly<Record<string, string>>;
 }
 
 /** Control-plane: aura is telling the sidecar to detach a tenant. */
@@ -148,6 +215,68 @@ export interface Channel {
 
   onNotice?(notice: AgentNotice): Promise<void>;
 
+  /**
+   * Optional tool-use telemetry. The gateway emits
+   * `Frame::ToolCallStarted` immediately before invoking each tool
+   * call on the agent's turn and `Frame::ToolCallCompleted` once the
+   * tool returns (or errors / is denied). Streaming sidecars use
+   * these to render mid-turn "🔧 running …" indicators in their
+   * in-flight card; sidecars without a streaming surface omit the
+   * methods and the SDK runner drops the frames silently.
+   */
+  onToolCallStarted?(ev: AgentToolCallStarted): Promise<void>;
+
+  onToolCallCompleted?(ev: AgentToolCallCompleted): Promise<void>;
+
+  /**
+   * Self-test hook. Aura's admin endpoint
+   * `GET /v1/admin/channels/<type>/diagnose?bot_id=<id>` round-trips
+   * a request through the WS to this hook; the operator sees the
+   * returned checks rendered in the dashboard. Implement when the
+   * sidecar can run useful probes (auth status, transport
+   * connectivity, send-roundtrip); omit otherwise. Sidecars that
+   * implement the hook MUST advertise the `"diagnose"` capability so
+   * the gateway only routes diagnose requests to peers that can
+   * answer them.
+   */
+  onDiagnoseRequested?(req: DiagnoseRequest): Promise<DiagnoseCheck[]>;
+
+  /**
+   * MCP tunnel hook. Per Decision #9 of the Lark report, the
+   * sidecar hosts an MCP server (today: `feishu_*` OAPI tools,
+   * Phase 3.3 work) and JSON-RPC envelopes ride the existing channel
+   * WS as opaque [`Frame::Mcp`] payloads. The runtime delivers each
+   * inbound envelope here with the originating `tunnelId` (a UUID
+   * per agent-side MCP session); the sidecar processes the envelope
+   * and replies via [`McpReplyHandle.send`].
+   *
+   * Implementing this hook auto-claims the `"mcp_tunnel"` capability
+   * on `Register`; the gateway only forwards `Frame::Mcp` to peers
+   * that claimed it.
+   */
+  onMcpEnvelope?(
+    tunnelId: string,
+    payload: Uint8Array,
+    reply: McpReplyHandle,
+  ): Promise<void>;
+}
+
+/**
+ * Lifeline an `onMcpEnvelope` handler uses to ship a JSON-RPC reply
+ * (or notification) back through the gateway tunnel. Decoupled from
+ * the request so a sidecar's MCP server can produce streamed
+ * notifications independent of the request/reply pairing.
+ */
+export interface McpReplyHandle {
+  send(payload: Uint8Array): Promise<void>;
+}
+
+// Re-extend the Channel interface — TS interface declarations merge,
+// so the approval / slash / start-stop / inbound members below all
+// land on the same `Channel` exported above. Keeping them separate
+// from the MCP hook lets the doc strings stay near the interface
+// they describe without nesting `McpReplyHandle` inside `Channel`.
+export interface Channel {
   /**
    * Return value is encoded into a `ResolveApproval` frame by the runner.
    * The runner invokes this handler in a detached task so concurrent
@@ -243,6 +372,15 @@ export interface RunOptions {
    * `protocol_violation`, `decode`) always propagate.
    */
   reconnect?: boolean | ReconnectPolicy;
+
+  /**
+   * Optional capability strings advertised on the `Register` frame so
+   * the gateway only sends frames the sidecar speaks. Available
+   * strings: `"secrets"` (gates {@link secrets} client). Forward-
+   * compatible: a sidecar that doesn't claim a capability simply
+   * doesn't get the matching frame.
+   */
+  capabilities?: ReadonlyArray<string>;
 }
 
 export interface ReconnectPolicy {
