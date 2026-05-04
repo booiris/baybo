@@ -43,13 +43,8 @@ async fn get_trace(
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let typed_session = aura_model::SessionId::from(session_id.as_str());
-    let api = aura_agent::QueryApi::new(
-        state.session_manager.store(),
-        std::sync::Arc::clone(&state.job_lifecycle),
-        std::sync::Arc::clone(&state.trace_store),
-        std::sync::Arc::clone(&state.cost_store),
-    );
-    let replay = api
+    let replay = state
+        .query_api
         .replay(&typed_session, None)
         .await
         .map_err(|e| GatewayError::Trace(e.to_string()))?;

@@ -45,6 +45,12 @@ async fn admin_router() -> axum::Router {
         memory_manager: std::sync::Arc::clone(&tg.deps.memory_manager),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
+        query_api: std::sync::Arc::new(aura_agent::QueryApi::new(
+            tg.deps.session_manager.store(),
+            std::sync::Arc::clone(&tg.deps.job_lifecycle),
+            tg.deps.stores.trace.clone(),
+            tg.deps.stores.cost.clone(),
+        )),
         skill_registry: std::sync::Arc::clone(&tg.deps.skill_registry),
         tool_registry: std::sync::Arc::clone(&tg.deps.tool_registry),
         channel_registry: std::sync::Arc::clone(&tg.deps.channel_registry),

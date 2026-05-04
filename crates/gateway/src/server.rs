@@ -121,6 +121,9 @@ pub struct AdminState {
     pub memory_manager: Arc<MemoryManager>,
     pub trace_store: Arc<dyn TraceStore>,
     pub cost_store: Arc<dyn aura_storage::CostStore>,
+    /// Pre-built `QueryApi` so `/v1/traces/{id}` and any future
+    /// query-shaped endpoint don't allocate one per request.
+    pub query_api: Arc<aura_agent::QueryApi>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
@@ -149,6 +152,12 @@ pub struct ChannelState {
 
 impl AdminState {
     fn from_deps(deps: &GatewayDeps) -> Self {
+        let query_api = Arc::new(aura_agent::QueryApi::new(
+            deps.session_manager.store(),
+            Arc::clone(&deps.job_lifecycle),
+            deps.stores.trace.clone(),
+            deps.stores.cost.clone(),
+        ));
         Self {
             config: Arc::clone(&deps.config),
             config_path: deps.config_path.clone(),
@@ -158,6 +167,7 @@ impl AdminState {
             memory_manager: Arc::clone(&deps.memory_manager),
             trace_store: deps.stores.trace.clone(),
             cost_store: deps.stores.cost.clone(),
+            query_api,
             skill_registry: Arc::clone(&deps.skill_registry),
             tool_registry: Arc::clone(&deps.tool_registry),
             channel_registry: Arc::clone(&deps.channel_registry),

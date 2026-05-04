@@ -1,9 +1,7 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use aura_agent::{JobFilter, QueryApi};
 use aura_model::SessionId;
-use aura_storage::TraceStore;
 use serde_json::json;
 use tokio::fs;
 
@@ -20,34 +18,18 @@ pub async fn handle(ctx: &CommandContext, cmd: TraceCmd) -> Result<CommandOutput
     }
 }
 
-fn store(ctx: &CommandContext) -> Result<&Arc<dyn TraceStore>> {
-    ctx.trace
-        .as_ref()
-        .ok_or_else(|| CliError::Manager("trace store is not available in this invocation".into()))
-}
-
 fn jobs(ctx: &CommandContext) -> Result<&aura_agent::JobLifecycle> {
     ctx.job
         .as_deref()
         .ok_or_else(|| CliError::Manager("job manager is not available in this invocation".into()))
 }
 
-/// Build a `QueryApi` against the CLI's session / job / trace stores.
-/// Trace commands don't read cost data, so the cost store is omitted
-/// (`cost_summary` would return `Unsupported` if anyone called it).
-fn query_api(ctx: &CommandContext) -> Result<QueryApi> {
-    let session_mgr = ctx.session.as_ref().ok_or_else(|| {
-        CliError::Manager("session manager is not available in this invocation".into())
-    })?;
-    let job_lifecycle = ctx.job.as_ref().ok_or_else(|| {
-        CliError::Manager("job manager is not available in this invocation".into())
-    })?;
-    let trace_store = store(ctx)?;
-    Ok(QueryApi::without_costs(
-        session_mgr.store(),
-        Arc::clone(job_lifecycle),
-        Arc::clone(trace_store),
-    ))
+/// Cached `QueryApi` from the context. Built once at context-build
+/// time, shared across every trace command in the same invocation.
+fn query_api(ctx: &CommandContext) -> Result<&QueryApi> {
+    ctx.query_api
+        .as_deref()
+        .ok_or_else(|| CliError::Manager("query api is not available in this invocation".into()))
 }
 
 /// Pull the (job_count, step_count, span_count) tuple for one session

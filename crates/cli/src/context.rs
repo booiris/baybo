@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, JobLifecycle, MemoryManager, SecurityGateway, SessionManager};
+use aura_agent::{
+    CronScheduler, JobLifecycle, MemoryManager, QueryApi, SecurityGateway, SessionManager,
+};
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_llm::LlmClient;
@@ -40,6 +42,11 @@ pub struct CommandContext {
     pub cron: Option<Arc<CronScheduler>>,
     pub memory: Option<Arc<MemoryManager>>,
     pub trace: Option<Arc<dyn TraceStore>>,
+    /// Pre-built `QueryApi` so trace / job / session commands don't
+    /// allocate one per invocation. `None` when the context lacks any
+    /// of session / job / trace (e.g. argv commands that don't touch
+    /// the trace surface — `aura skills info`).
+    pub query_api: Option<Arc<QueryApi>>,
     pub security: Option<Arc<SecurityGateway>>,
     pub leak_detector: Option<Arc<LeakDetector>>,
     pub skill_assessor: Option<Arc<SkillAssessor>>,
@@ -213,6 +220,14 @@ impl ContextBuilder {
     }
 
     pub fn build(self) -> CommandContext {
+        let query_api = match (&self.session, &self.job, &self.trace) {
+            (Some(s), Some(j), Some(t)) => Some(Arc::new(QueryApi::without_costs(
+                s.store(),
+                Arc::clone(j),
+                Arc::clone(t),
+            ))),
+            _ => None,
+        };
         CommandContext {
             config: self.config,
             config_path: self.config_path,
@@ -232,6 +247,7 @@ impl ContextBuilder {
             cron: self.cron,
             memory: self.memory,
             trace: self.trace,
+            query_api,
             security: self.security,
             leak_detector: self.leak_detector,
             skill_assessor: self.skill_assessor,
