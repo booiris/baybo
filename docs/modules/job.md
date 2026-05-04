@@ -4,7 +4,7 @@
 
 The `job` crate defines domain types for job lifecycle management (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`) and the `JobError` error type. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself.
 
-Business logic (`JobLifecycle` — persistence orchestration and hook invocation) lives in `agent::job`. The `JobStore` trait is defined in `storage::job`.
+Business logic (`JobLifecycle` — persistence orchestration) lives in `agent::job`. The `JobStore` trait is defined in `storage::job`.
 
 Job answers **"what step is this operation at"**, not "what exactly did it do." Detailed input/output is recorded by `trace`. Each job carries its own `final_result` for the final contractual value, but progress messages emitted mid-job live in the trace tree — `Job.emitted_span_ids` is an index, not a copy.
 
@@ -66,9 +66,9 @@ Timestamp rules are enforced inside `transition()`:
 
 This keeps the state machine invariants co-located with the type and makes them testable without any storage dependency.
 
-### JobLifecycle is a thin persistence + hook orchestrator
+### JobLifecycle is a thin persistence orchestrator
 
-`JobLifecycle` in `agent::job` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()` → fire `PreStep` / `PostStep` hooks at step boundaries (with the timeout / degraded protocol — see `agent.md`). No state machine logic in the orchestrator.
+`JobLifecycle` in `agent::job` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator.
 
 Additionally, `JobLifecycle::recover_interrupted()` handles startup recovery — scan non-terminal jobs and apply `mark_interrupted()` to each. Called once at system startup before accepting messages.
 
@@ -113,8 +113,7 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 
 | Module    | Role                                                                                                      |
 | --------- | --------------------------------------------------------------------------------------------------------- |
-| `agent`   | `agent::job::JobLifecycle` owns persistence + hook invocation; replaces the legacy `ObservabilityRecorder` |
+| `agent`   | `agent::job::JobLifecycle` owns persistence; replaces the legacy `ObservabilityRecorder`                  |
 | `trace`   | Provides `SpanId`; `partial_artifacts` references trace spans; recovery coordinates with the trace scan    |
-| `hook`    | `JobStatusChanged`, `PreStep`, `PostStep` fire from `JobLifecycle`                                         |
 | `storage` | Defines `JobStore` trait using job types; provides libsql implementation                                   |
 | `session` | `Session.trigger.kind() == Job.kind()` invariant; `Lineage` consumes `parent_job_id`                       |

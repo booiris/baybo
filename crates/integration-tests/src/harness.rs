@@ -18,7 +18,6 @@ use aura_agent::{
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_context::{ContextManager, TiktokenTokenizer, Truncate, budget::TokenBudget};
-use aura_hook::HookManager;
 use aura_llm::test_support::StubLlm;
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
@@ -269,7 +268,6 @@ impl AgentTestHarnessBuilder {
             .unwrap_or_else(|| "You are Aura, a test assistant.".into());
         let soul = Soul::custom(soul_text);
 
-        let hooks = Arc::new(HookManager::new());
         let agent_loop = AgentLoop::new(
             stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
             tool_registry.clone(),
@@ -280,8 +278,7 @@ impl AgentTestHarnessBuilder {
             ExecutionPolicy::default(),
             soul,
             gateway.clone(),
-        )
-        .with_hooks(Arc::clone(&hooks));
+        );
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
@@ -290,7 +287,6 @@ impl AgentTestHarnessBuilder {
             agent_loop,
             tool_executor,
             output_tx,
-            hooks,
             job_lifecycle,
             span_recorder,
         );

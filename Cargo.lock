@@ -191,7 +191,6 @@ dependencies = [
  "aura-context",
  "aura-cron",
  "aura-gateway",
- "aura-hook",
  "aura-janitor",
  "aura-job",
  "aura-llm",
@@ -229,7 +228,6 @@ dependencies = [
  "aura-channels",
  "aura-context",
  "aura-cron",
- "aura-hook",
  "aura-job",
  "aura-llm",
  "aura-model",
@@ -447,21 +445,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-hook"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-channels",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "aura-integration-tests"
 version = "0.1.0"
 dependencies = [
@@ -472,7 +455,6 @@ dependencies = [
  "aura-cli",
  "aura-context",
  "aura-gateway",
- "aura-hook",
  "aura-job",
  "aura-llm",
  "aura-model",

@@ -24,7 +24,6 @@ path = "tests/all.rs"
 aura-agent = { workspace = true }
 aura-channels = { workspace = true }
 aura-context = { workspace = true }
-aura-hook = { workspace = true }
 aura-job = { workspace = true }
 aura-llm = { workspace = true, features = ["test-support"] }
 aura-model = { workspace = true }

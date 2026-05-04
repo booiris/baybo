@@ -5,7 +5,7 @@
 //! starts at 0 for the first event on a given span. Cross-span queries
 //! join by `event_kind` when needed.
 
-use aura_model::{ApprovalDecision, HookPhase, PlaceholderId, ResourceAccess, SecretKind, SpanId};
+use aura_model::{ApprovalDecision, PlaceholderId, ResourceAccess, SecretKind, SpanId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -41,14 +41,6 @@ pub enum SpanEventKind {
         decision: ApprovalDecision,
         resource: ResourceAccess,
     },
-    /// A `PreStep` / `PostStep` hook overran its declared timeout.
-    /// The main path proceeded without it (the hook continues running
-    /// detached).
-    HookDegraded {
-        hook_name: String,
-        timeout_ms: u64,
-        phase: HookPhase,
-    },
 }
 
 impl SpanEventKind {
@@ -56,7 +48,6 @@ impl SpanEventKind {
         match self {
             SpanEventKind::SanitizeHit { .. } => "sanitize_hit",
             SpanEventKind::Approval { .. } => "approval",
-            SpanEventKind::HookDegraded { .. } => "hook_degraded",
         }
     }
 }
@@ -105,23 +96,6 @@ mod tests {
                 resource: ResourceAccess::ReadFile {
                     path: PathBuf::from("/tmp/foo"),
                 },
-            },
-        );
-        let s = serde_json::to_string(&e).unwrap();
-        let back: SpanEvent = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, e);
-    }
-
-    #[test]
-    fn hook_degraded_round_trips() {
-        let span = SpanId::new();
-        let e = SpanEvent::new(
-            span,
-            2,
-            SpanEventKind::HookDegraded {
-                hook_name: "audit_hook".into(),
-                timeout_ms: 500,
-                phase: HookPhase::PostStep,
             },
         );
         let s = serde_json::to_string(&e).unwrap();

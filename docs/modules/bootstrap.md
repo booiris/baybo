@@ -62,7 +62,7 @@ boot::load_encryption_key  →  SecretVault    ── dev-only fallback gated on
 ToolRegistry / ToolExecutor / MemoryManager / LlmClient
   │
   ▼
-WorkspaceManager / Soul / ExecutionPolicy / HookManager / LeakDetector / SecurityGateway
+WorkspaceManager / Soul / ExecutionPolicy / LeakDetector / SecurityGateway
   │
   ▼
 ChannelRegistry::new()            ── empty at boot; populated by WS sidecars
@@ -74,7 +74,7 @@ Router::new(…).with_actor_spawner(closure).with_cron_triggers(…)
 tokio::select! { router.run(…), shutdown.wait() }
 ```
 
-The closure passed to `with_actor_spawner` captures clones of all `Arc`-shared state (llm client, tool registry, skill registry, hook manager, recorder, policy, tokenizer, token budget, keep-recent, system prompt, mailbox buffer size). Any new actor-level dependency must be added to the capture list.
+The closure passed to `with_actor_spawner` captures clones of all `Arc`-shared state (llm client, tool registry, skill registry, recorder, policy, tokenizer, token budget, keep-recent, system prompt, mailbox buffer size). Any new actor-level dependency must be added to the capture list.
 
 ## Error handling at boot
 

@@ -37,7 +37,6 @@ use aura_agent::{
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
-use aura_hook::HookManager;
 use aura_llm::LlmClient;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -170,7 +169,6 @@ pub struct ManagerGraph {
     /// `CostStore` retained on the graph so external subscribers can
     /// open their own `TraceEventStream` listeners (e.g. the gateway).
     pub cost_store: Arc<dyn aura_storage::CostStore>,
-    pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
     /// Cloneable bundle of every libsql-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
@@ -393,7 +391,6 @@ pub async fn build_managers(
     ));
 
     let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
-    let hook_manager = Arc::new(HookManager::new());
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
     // dynamically registers/unregisters MCP-discovered tools. Bridge the
@@ -439,7 +436,6 @@ pub async fn build_managers(
         workspace,
         channels_registry,
         cost_store: cost_store_for_subscriber,
-        hook_manager,
         secret_vault,
         stores,
         cron_trigger_rx: Some(cron_trigger_rx),
@@ -537,7 +533,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let skill_registry = Arc::clone(&graph.skill_registry);
         let tool_executor = Arc::clone(&graph.tool_executor);
         let memory_manager = Arc::clone(&graph.memory_manager);
-        let hooks = Arc::clone(&graph.hook_manager);
         let trace_store = graph.stores.trace.clone();
         let job_lifecycle = Arc::clone(&graph.job_lifecycle);
         let skill_assessor = Arc::clone(&graph.skill_assessor);
@@ -568,8 +563,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     Arc::clone(&security_gateway),
                 )
                 .with_skill_assessor(Arc::clone(&skill_assessor))
-                .with_session_log(Arc::clone(&session_logger))
-                .with_hooks(Arc::clone(&hooks));
+                .with_session_log(Arc::clone(&session_logger));
 
                 if let Some(rt) = subagent_runtime_slot.get() {
                     agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
@@ -589,7 +583,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     agent_loop,
                     Arc::clone(&tool_executor),
                     response_tx,
-                    Arc::clone(&hooks),
                     Arc::clone(&job_lifecycle),
                     span_recorder,
                 );

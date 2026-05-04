@@ -306,7 +306,6 @@ impl SpanRecorder {
             SpanKind::SubagentStub { child_session_id } => SpanResult::SubagentStub {
                 child_session_id: child_session_id.clone(),
             },
-            SpanKind::StepHost => SpanResult::StepHost,
         };
         self.end_span(handle, job_id, result, outcome).await
     }
@@ -388,7 +387,6 @@ fn merge_span_kind(begin: SpanKind, result: SpanResult, span_id: &SpanId) -> Res
         (SpanKind::SubagentStub { .. }, SpanResult::SubagentStub { child_session_id }) => {
             Ok(SpanKind::SubagentStub { child_session_id })
         }
-        (SpanKind::StepHost, SpanResult::StepHost) => Ok(SpanKind::StepHost),
         _ => Err(TraceError::Internal(anyhow::anyhow!(
             "span {} end_span result variant does not match begin-time kind",
             span_id
@@ -557,10 +555,11 @@ mod tests {
         rec.emit_event(
             span,
             0,
-            SpanEventKind::HookDegraded {
-                hook_name: "h".into(),
-                timeout_ms: 100,
-                phase: aura_model::HookPhase::PreStep,
+            SpanEventKind::Approval {
+                decision: aura_model::ApprovalDecision::Approve,
+                resource: aura_model::ResourceAccess::ReadFile {
+                    path: std::path::PathBuf::from("/tmp/foo"),
+                },
             },
         )
         .await

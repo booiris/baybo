@@ -116,12 +116,6 @@ pub enum SpanKind {
     SubagentStub {
         child_session_id: aura_model::SessionId,
     },
-    /// Empty host span opened at step start to anchor cross-cutting
-    /// `SpanEvent`s that aren't tied to a real LLM/tool span — namely
-    /// `HookDegraded` for PreStep/PostStep timeouts. The host span
-    /// lives the full lifetime of the surrounding step and runs as a
-    /// sibling alongside the LLM/tool spans.
-    StepHost,
 }
 
 impl SpanKind {
@@ -130,7 +124,6 @@ impl SpanKind {
             SpanKind::LlmCall { .. } => "llm_call",
             SpanKind::ToolCall { .. } => "tool_call",
             SpanKind::SubagentStub { .. } => "subagent_stub",
-            SpanKind::StepHost => "step_host",
         }
     }
 }
@@ -205,7 +198,6 @@ pub enum SpanResult {
     SubagentStub {
         child_session_id: aura_model::SessionId,
     },
-    StepHost,
 }
 
 #[cfg(test)]

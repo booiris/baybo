@@ -77,4 +77,3 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 | `model`   | Owns `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `SystemReason`  |
 | `storage` | Defines `SessionStore` trait and provides `LibsqlSessionStore`                                     |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
-| `hook`    | `SessionCreated` / `SessionDestroyed` hook points for welcome messages, audit, cleanup             |

@@ -113,4 +113,3 @@ Before a message enters an actor, Router completes: session identification/creat
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |
 | `storage` | Provides all Store traits and libsql implementations; injected into managers |
-| `hook` | `AgentActor` triggers `PreMessage` and `PreResponse` hooks at lifecycle points |

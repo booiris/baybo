@@ -460,10 +460,11 @@ mod tests {
         let event = SpanEvent::new(
             span_id,
             0,
-            SpanEventKind::HookDegraded {
-                hook_name: "h".into(),
-                timeout_ms: 100,
-                phase: aura_model::HookPhase::PreStep,
+            SpanEventKind::Approval {
+                decision: aura_model::ApprovalDecision::Approve,
+                resource: aura_model::ResourceAccess::ReadFile {
+                    path: std::path::PathBuf::from("/tmp/foo"),
+                },
             },
         );
         store.append_span_event(&event).await.unwrap();

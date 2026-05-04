@@ -78,25 +78,6 @@ impl fmt::Display for SecretKind {
     }
 }
 
-/// Which lifecycle hook phase fired — used by `SpanEvent::HookDegraded`
-/// to record which side of the step boundary the timeout happened on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HookPhase {
-    PreStep,
-    PostStep,
-}
-
-impl fmt::Display for HookPhase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            HookPhase::PreStep => "pre_step",
-            HookPhase::PostStep => "post_step",
-        };
-        f.write_str(s)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,15 +105,6 @@ mod tests {
             let s = serde_json::to_string(&kind).unwrap();
             let back: SecretKind = serde_json::from_str(&s).unwrap();
             assert_eq!(back, kind);
-        }
-    }
-
-    #[test]
-    fn hook_phase_round_trips() {
-        for p in [HookPhase::PreStep, HookPhase::PostStep] {
-            let s = serde_json::to_string(&p).unwrap();
-            let back: HookPhase = serde_json::from_str(&s).unwrap();
-            assert_eq!(back, p);
         }
     }
 }

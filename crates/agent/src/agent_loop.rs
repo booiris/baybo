@@ -1,9 +1,7 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use aura_channels::{AgentOutput, NoticeLevel, OutgoingMessage};
 use aura_context::ContextManager;
-use aura_hook::{HookAction, HookContext, HookEventData, HookManager, HookPoint};
 use aura_job::{JobInput, JobOutput};
 use aura_llm::{
     ChatRequest, LlmCompletion, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
@@ -14,11 +12,10 @@ use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
 use aura_model::Session;
-use aura_model::{HookPhase, SpanId};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::{RiskLevel, SkillAssessor};
 use aura_tools::{ToolOutput, ToolRegistry};
-use aura_trace::{LifecycleOutcome, SpanEventKind, SpanKind, SpanResult, StepHandle, StepKind};
+use aura_trace::{LifecycleOutcome, SpanKind, SpanResult, StepHandle, StepKind};
 use tracing::{debug, info, warn};
 
 use crate::error_recovery::ErrorHandler;
@@ -42,15 +39,6 @@ use tokio_util::sync::CancellationToken;
 /// closing `}]` arrives within this many bytes, we flush anyway — no real
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
-
-/// Step-boundary chain budget for the entire `PreStep` / `PostStep`
-/// hook list. A chain that overruns this is treated as `Continue` and
-/// a `HookDegraded` SpanEvent is emitted. Sized larger than
-/// `DEFAULT_HOOK_TIMEOUT` so individual hooks hit their per-call
-/// timeout first (and bump the per-hook degrade counter) — the chain
-/// timeout is only a fail-safe in case multiple hooks each consume
-/// most of their per-call budget.
-const STEP_HOOK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Cap on attachments carried into the final `OutgoingMessage`. Tools
 /// like `browser_screenshot` and `send_local_file` push into a
@@ -93,76 +81,6 @@ fn safe_flush_boundary(pending: &str) -> usize {
     pending.len()
 }
 
-/// Lazy `SpanKind::StepHost` anchor — `begin_span` is deferred to the
-/// first `record_hook_degraded` so the no-degradation path (the common
-/// case) doesn't pay two extra DB writes per iteration.
-struct StepHostSpan<'a> {
-    span_recorder: &'a Arc<SpanRecorder>,
-    step: &'a StepHandle,
-    handle: Option<aura_trace::SpanHandle>,
-    seq: u32,
-}
-
-impl<'a> StepHostSpan<'a> {
-    fn new(span_recorder: &'a Arc<SpanRecorder>, step: &'a StepHandle) -> Self {
-        Self {
-            span_recorder,
-            step,
-            handle: None,
-            seq: 0,
-        }
-    }
-
-    async fn record_hook_degraded(&mut self, hook_name: &str, phase: HookPhase) {
-        let span_id = match self.ensure_open().await {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(error = %e, "failed to open host span for HookDegraded SpanEvent");
-                return;
-            }
-        };
-        let next = self.seq;
-        match self
-            .span_recorder
-            .emit_event(
-                span_id,
-                next,
-                SpanEventKind::HookDegraded {
-                    hook_name: hook_name.to_string(),
-                    timeout_ms: STEP_HOOK_TIMEOUT.as_millis() as u64,
-                    phase,
-                },
-            )
-            .await
-        {
-            Ok(()) => self.seq = next.wrapping_add(1),
-            Err(e) => warn!(error = %e, "failed to persist HookDegraded SpanEvent"),
-        }
-    }
-
-    async fn ensure_open(&mut self) -> Result<SpanId, aura_trace::TraceError> {
-        if let Some(h) = &self.handle {
-            return Ok(h.span_id);
-        }
-        let h = self
-            .span_recorder
-            .begin_span(self.step, SpanKind::StepHost, None)
-            .await?;
-        let id = h.span_id;
-        self.handle = Some(h);
-        Ok(id)
-    }
-
-    async fn close(self, job_id: JobId, outcome: LifecycleOutcome) {
-        if let Some(h) = self.handle {
-            self.span_recorder
-                .end_span(h, job_id, SpanResult::StepHost, outcome)
-                .await
-                .ok();
-        }
-    }
-}
-
 /// Append `items` into `dst` while keeping `dst.len() <=
 /// MAX_ATTACHMENTS_PER_TURN` via FIFO eviction. Used for the
 /// per-turn `accumulated_attachments` vec so a runaway loop can't
@@ -201,10 +119,6 @@ pub struct AgentLoop {
     soul: Soul,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
-    /// Step boundary hook manager. Drives `PreStep` / `PostStep` with
-    /// the timeout / degraded protocol. Optional so test harnesses
-    /// that don't care about hooks can leave it unset.
-    hooks: Option<Arc<HookManager>>,
     /// Optional subagent runtime. When set, LLM `tool_use` calls
     /// targeting `spawn_subagent` short-circuit the regular
     /// tool_executor path and route through here. Unset →
@@ -246,17 +160,10 @@ impl AgentLoop {
             soul,
             security_gateway,
             error_handler: ErrorHandler::default(),
-            hooks: None,
             subagent_runtime: None,
             skill_assessor: None,
             session_log: None,
         }
-    }
-
-    /// Attach the step-boundary hook manager.
-    pub fn with_hooks(mut self, hooks: Arc<HookManager>) -> Self {
-        self.hooks = Some(hooks);
-        self
     }
 
     /// Attach the subagent runtime so LLM-emitted `spawn_subagent`
@@ -483,20 +390,6 @@ impl AgentLoop {
             let step = span_recorder
                 .begin_step(job_id, StepKind::LlmIteration)
                 .await?;
-            let mut host = StepHostSpan::new(span_recorder, &step);
-
-            if self
-                .fire_pre_step(session, job_id, &StepKind::LlmIteration, &mut host)
-                .await
-                .is_err()
-            {
-                let aborted = LifecycleOutcome::Cancelled {
-                    reason: aura_job::CancelReason::HookAborted,
-                };
-                host.close(job_id, aborted.clone()).await;
-                span_recorder.end_step(step, aborted).await.ok();
-                return Err(anyhow::anyhow!("step aborted by PreStep hook"));
-            }
 
             // Call LLM with retry on transient errors. Deltas are only
             // streamed on the first iteration of the loop.
@@ -514,7 +407,6 @@ impl AgentLoop {
                     let failed = LifecycleOutcome::Failed {
                         reason: e.to_string(),
                     };
-                    host.close(job_id, failed.clone()).await;
                     span_recorder.end_step(step, failed).await.ok();
                     return Err(e);
                 }
@@ -522,17 +414,6 @@ impl AgentLoop {
 
             // If no tool calls, we have the final response
             if response.tool_calls.is_empty() {
-                let step_id_for_hook = step.step_id;
-                self.fire_post_step(
-                    session,
-                    job_id,
-                    step_id_for_hook,
-                    &StepKind::LlmIteration,
-                    &LifecycleOutcome::Ok,
-                    &mut host,
-                )
-                .await;
-                host.close(job_id, LifecycleOutcome::Ok).await;
                 span_recorder
                     .end_step(step, LifecycleOutcome::Ok)
                     .await
@@ -743,17 +624,6 @@ impl AgentLoop {
             // Flush accumulated approvals back into session state.
             session.state.approved_resources = approved.lock().clone();
 
-            let step_id_for_hook = step.step_id;
-            self.fire_post_step(
-                session,
-                job_id,
-                step_id_for_hook,
-                &StepKind::LlmIteration,
-                &LifecycleOutcome::Ok,
-                &mut host,
-            )
-            .await;
-            host.close(job_id, LifecycleOutcome::Ok).await;
             span_recorder
                 .end_step(step, LifecycleOutcome::Ok)
                 .await
@@ -1397,107 +1267,6 @@ impl AgentLoop {
                 span_recorder.end_step(step, failed).await.ok();
                 Err(e.into())
             }
-        }
-    }
-
-    /// Returns `Err(())` only when the hook chain returns
-    /// `HookAction::Abort` (the surrounding job is then cancelled by
-    /// the caller). On `Block` or timeout we proceed (default-allow);
-    /// a `tracing::warn` is emitted on timeout and a `HookDegraded`
-    /// `SpanEvent` is recorded against the step's host span.
-    async fn fire_pre_step(
-        &self,
-        session: &Session,
-        job_id: JobId,
-        step_kind: &StepKind,
-        host: &mut StepHostSpan<'_>,
-    ) -> std::result::Result<(), ()> {
-        let Some(hooks) = self.hooks.as_ref() else {
-            return Ok(());
-        };
-        let mut ctx = HookContext {
-            session_id: session.id.to_string(),
-            user_id: Some(session.user.id.clone()),
-            event_data: HookEventData::PreStep {
-                job_id: job_id.to_string(),
-                step_kind: step_kind.tag().to_string(),
-            },
-            message: None,
-            response: None,
-            job_id: Some(job_id.to_string()),
-            trace_span_id: None,
-            extra: Default::default(),
-        };
-        match tokio::time::timeout(
-            STEP_HOOK_TIMEOUT,
-            hooks.trigger(HookPoint::PreStep, &mut ctx),
-        )
-        .await
-        {
-            Err(_elapsed) => {
-                warn!(
-                    timeout_ms = STEP_HOOK_TIMEOUT.as_millis() as u64,
-                    "PreStep hook exceeded timeout, proceeding (default-allow)"
-                );
-                host.record_hook_degraded("pre_step_chain", HookPhase::PreStep)
-                    .await;
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, "PreStep hook chain failed, proceeding");
-                Ok(())
-            }
-            Ok(Ok(HookAction::Abort(reason))) => {
-                warn!(reason = %reason, "PreStep hook aborted step");
-                Err(())
-            }
-            Ok(Ok(_)) => Ok(()),
-        }
-    }
-
-    async fn fire_post_step(
-        &self,
-        session: &Session,
-        job_id: JobId,
-        step_id: aura_model::StepId,
-        step_kind: &StepKind,
-        outcome: &LifecycleOutcome,
-        host: &mut StepHostSpan<'_>,
-    ) {
-        let Some(hooks) = self.hooks.as_ref() else {
-            return;
-        };
-        let mut ctx = HookContext {
-            session_id: session.id.to_string(),
-            user_id: Some(session.user.id.clone()),
-            event_data: HookEventData::PostStep {
-                job_id: job_id.to_string(),
-                step_id: step_id.to_string(),
-                step_kind: step_kind.tag().to_string(),
-                outcome: outcome.tag().to_string(),
-            },
-            message: None,
-            response: None,
-            job_id: Some(job_id.to_string()),
-            trace_span_id: None,
-            extra: Default::default(),
-        };
-        match tokio::time::timeout(
-            STEP_HOOK_TIMEOUT,
-            hooks.trigger(HookPoint::PostStep, &mut ctx),
-        )
-        .await
-        {
-            Err(_elapsed) => {
-                warn!(
-                    timeout_ms = STEP_HOOK_TIMEOUT.as_millis() as u64,
-                    "PostStep hook exceeded timeout"
-                );
-                host.record_hook_degraded("post_step_chain", HookPhase::PostStep)
-                    .await;
-            }
-            Ok(Err(e)) => warn!(error = %e, "PostStep hook chain failed"),
-            Ok(Ok(_)) => {}
         }
     }
 

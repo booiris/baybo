@@ -11,7 +11,7 @@ pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLeve
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId};
 pub use memory::{MemoryCategory, MemoryEntry};
 pub use message::{BlobRef, ChatMessage, ContentBlock, MessageMetadata, Role, ThinkingContent};
-pub use security_types::{HookPhase, PlaceholderId, SecretKind};
+pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     ChannelType, Lineage, LineageKind, Session, SessionState, SystemReason, TriggerKind,
     TriggerSource, User,

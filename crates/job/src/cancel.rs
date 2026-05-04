@@ -31,9 +31,6 @@ pub enum CancelReason {
     /// in-flight. Cancellation propagates first, then the soft-delete
     /// is finalised.
     ParentDeleted,
-    /// A `PreStep` hook returned `Abort` for this step's surrounding
-    /// job. See the hook-router protocol in `agent.md`.
-    HookAborted,
     /// Human operator initiated the cancel via the admin API or CLI.
     /// Distinct from hook / system-driven cancels so cost-attribution
     /// and replay UIs can split user-initiated work.
@@ -49,7 +46,6 @@ impl CancelReason {
             CancelReason::SubagentTimeout => "subagent_timeout",
             CancelReason::ParentCancelled => "parent_cancelled",
             CancelReason::ParentDeleted => "parent_deleted",
-            CancelReason::HookAborted => "hook_aborted",
             CancelReason::OperatorCancel => "operator_cancel",
         }
     }

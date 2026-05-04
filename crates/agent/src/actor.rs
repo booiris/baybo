@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use aura_channels::{AgentOutput, IncomingMessage, JobOutcome, OutgoingMessage};
 use aura_cron::TriggerAction;
-use aura_hook::{HookContext, HookEventData, HookManager, HookPoint};
 use aura_job::{JobInput, JobOutput};
 use aura_model::{ApprovedResource, ContentBlock, JobId, MessageMetadata, Session};
 use aura_tools::ToolOutput;
@@ -47,7 +46,6 @@ pub struct AgentActor {
     agent_loop: AgentLoop,
     tool_executor: Arc<ToolExecutor>,
     response_tx: mpsc::Sender<AgentOutput>,
-    hooks: Arc<HookManager>,
     job_lifecycle: Arc<JobLifecycle>,
     span_recorder: Arc<SpanRecorder>,
     /// Lifetime token for this actor. Each per-job execution derives a
@@ -62,7 +60,6 @@ impl AgentActor {
         agent_loop: AgentLoop,
         tool_executor: Arc<ToolExecutor>,
         response_tx: mpsc::Sender<AgentOutput>,
-        hooks: Arc<HookManager>,
         job_lifecycle: Arc<JobLifecycle>,
         span_recorder: Arc<SpanRecorder>,
     ) -> Self {
@@ -71,7 +68,6 @@ impl AgentActor {
             agent_loop,
             tool_executor,
             response_tx,
-            hooks,
             job_lifecycle,
             span_recorder,
             actor_token: CancellationToken::new(),
@@ -403,23 +399,7 @@ impl AgentActor {
     }
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
-        let message_clone = incoming.message.clone();
         let content = incoming.message.content;
-
-        // PreMessage hook
-        let mut hook_ctx = HookContext {
-            session_id: self.session.id.to_string(),
-            user_id: Some(self.session.user.id.clone()),
-            event_data: HookEventData::PreMessage,
-            message: Some(message_clone),
-            response: None,
-            job_id: None,
-            trace_span_id: None,
-            extra: Default::default(),
-        };
-        self.hooks
-            .trigger(HookPoint::PreMessage, &mut hook_ctx)
-            .await?;
 
         // Run the agent loop. Pass a clone of the response channel so the
         // loop can stream text deltas as `AgentOutput::Delta` while the
@@ -444,21 +424,6 @@ impl AgentActor {
             Err(_) => JobOutcome::Failed,
         };
         let response = result?;
-
-        // PreResponse hook
-        let mut hook_ctx = HookContext {
-            session_id: self.session.id.to_string(),
-            user_id: Some(self.session.user.id.clone()),
-            event_data: HookEventData::PreResponse,
-            message: None,
-            response: Some(response.clone()),
-            job_id: None,
-            trace_span_id: None,
-            extra: Default::default(),
-        };
-        self.hooks
-            .trigger(HookPoint::PreResponse, &mut hook_ctx)
-            .await?;
 
         // Send response
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {

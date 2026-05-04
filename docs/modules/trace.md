@@ -14,7 +14,7 @@ The hierarchy is `Session > Job > Step > Span (+ SpanEvent)` — see `session.md
 
 ### Step is the agent-loop iteration unit; Span is an OTel-compatible atomic action
 
-A `Step` is one iteration of the agent loop. A `Span` is one atomic action with a start/end window — naming aligns with OpenTelemetry so this trace can export to standard collectors without a translation layer. A `SpanEvent` is a zero-duration marker on a Span (sanitize hit, approval decision, hook degradation).
+A `Step` is one iteration of the agent loop. A `Span` is one atomic action with a start/end window — naming aligns with OpenTelemetry so this trace can export to standard collectors without a translation layer. A `SpanEvent` is a zero-duration marker on a Span (sanitize hit, approval decision).
 
 Steps cannot nest. Spans within a Step can be parallel (siblings sharing a `parallel_group: GroupId`) but do not nest either. This is a fixed three-layer fan-out — not a free-form tree.
 
@@ -51,21 +51,17 @@ pub enum SpanKind {
 
 Each `SpanKind` variant carries the provenance fields that apply to it (`model_id` and `provider` on `LlmCall`, `tool_artifact_hash` on `ToolCall`). Step is a pure container with no provenance. Soul-version drift between session bind time and job effective time is recorded on `Job.provenance_drift` (see `job.md`).
 
-### SpanEvent is sanitize / approval / hook audit, not control flow
+### SpanEvent is sanitize / approval audit, not control flow
 
 ```rust
 pub enum SpanEventKind {
     SanitizeHit { hits_count, kinds: Vec<SecretKind>, placeholder_ids: Vec<PlaceholderId> },
     Approval { decision: ApprovalDecision, resource: ResourceAccess },
-    HookDegraded { hook_name, timeout_ms, phase: HookPhase },
 }
 ```
 
 - `SanitizeHit` is emitted **only when sanitize actually modified content**. Misses are not recorded — the trace records what happened, not what ran.
 - `Approval` records **every** decision (including `ApproveOnce`). The audit trail of "what did the user approve and when" is complete.
-- `HookDegraded` is emitted when a `PreStep` / `PostStep` hook overran its timeout (see `agent.md` for the protocol).
-
-SpanEvents never fire hooks themselves — they are observation, not control.
 
 ### Sanitization constraints
 
@@ -108,4 +104,3 @@ When listing jobs / steps / spans for a session whose `Lineage` is `UserFork { f
 | `agent`   | `agent::trace::SpanRecorder` owns span lifecycle + `TraceEvent` emission; `JobLifecycle` and `SpanRecorder` are sibling facades |
 | `storage` | Defines the `TraceStore` trait; provides the libsql implementation                                                              |
 | `model`   | Provides `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, `PlaceholderId`, `ApprovalDecision`, `ResourceAccess`       |
-| `hook`    | `SpanEvent::HookDegraded` records hook timeout / disabling decisions made by the hook router                                  |
