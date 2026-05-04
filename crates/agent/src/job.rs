@@ -152,6 +152,14 @@ impl JobLifecycle {
         Ok(jobs)
     }
 
+    /// List every non-terminal job (`Pending` / `InProgress` / `Stuck`)
+    /// in one query. One trip to the store instead of three —
+    /// `QueryApi::find_recoverable_jobs` used to call `list(Some(k))`
+    /// for each kind serially.
+    pub async fn list_recoverable(&self) -> Result<Vec<Job>> {
+        self.store.list_recoverable().await
+    }
+
     /// List jobs scoped to one session. Hits the `idx_jobs_session`
     /// index instead of scanning the full table. Newest first.
     pub async fn list_by_session(

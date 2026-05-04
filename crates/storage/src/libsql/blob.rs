@@ -409,7 +409,7 @@ impl BlobStore for LibsqlBlobStore {
         Ok(())
     }
 
-    async fn purge_older_than(&self, cutoff_unix: i64) -> Result<u64> {
+    async fn purge_older_than(&self, cutoff_us: i64) -> Result<u64> {
         let conn = self.pool.conn();
 
         // LRU semantics: a blob whose `last_accessed_at` is older than
@@ -417,11 +417,17 @@ impl BlobStore for LibsqlBlobStore {
         // timestamp on every successful read, so any blob the system
         // is still pulling stays out of the sweep regardless of how
         // long ago it was first written.
+        //
+        // Three DB calls total — independent of the victim count:
+        // (1) snapshot victims, (2) one UPDATE that flips them all,
+        // (3) snapshot the surviving live set so per-payload unlink
+        // checks come from an in-memory hashmap instead of an
+        // unindexed `LIKE` per victim.
         let mut rows = conn
             .query(
                 "SELECT blob_id, mime_type FROM blobs \
                  WHERE last_accessed_at < ?1 AND deleted_at IS NULL",
-                libsql::params![cutoff_unix],
+                libsql::params![cutoff_us],
             )
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob purge query: {e}")))?;
@@ -440,24 +446,55 @@ impl BlobStore for LibsqlBlobStore {
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?;
             victims.push((blob_id, mime_type));
         }
+        drop(rows);
+
+        if victims.is_empty() {
+            return Ok(0);
+        }
 
         let now = now_unix();
-        let mut purged: u64 = 0;
-        for (blob_id, _) in &victims {
-            let n = conn
-                .execute(
-                    "UPDATE blobs SET deleted_at = ?2 \
-                     WHERE blob_id = ?1 AND deleted_at IS NULL",
-                    libsql::params![blob_id.clone(), now],
-                )
-                .await
-                .map_err(|e| {
-                    StorageError::Internal(anyhow::anyhow!("libsql blob purge update: {e}"))
-                })?;
-            if n > 0 {
-                purged += 1;
+        let purged = conn
+            .execute(
+                "UPDATE blobs SET deleted_at = ?1 \
+                 WHERE last_accessed_at < ?2 AND deleted_at IS NULL",
+                libsql::params![now, cutoff_us],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql blob purge update: {e}"))
+            })?;
+
+        // Snapshot the surviving live set so we can answer "is anyone
+        // else pointing at this on-disk file?" with a HashSet lookup
+        // instead of a per-victim `LIKE` scan. The set is keyed by
+        // `(hex, mime_extension)` because that pair determines the
+        // on-disk path — different MIMEs of the same content live at
+        // different paths.
+        let mut live_rows = conn
+            .query(
+                "SELECT blob_id, mime_type FROM blobs WHERE deleted_at IS NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live query: {e}")))?;
+        let mut live_paths: std::collections::HashSet<(String, &'static str)> =
+            std::collections::HashSet::new();
+        while let Some(row) = live_rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live row: {e}")))?
+        {
+            let other_id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get blob_id: {e}")))?;
+            let other_mime: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?;
+            if let Ok((hex, _token)) = split_id(&other_id) {
+                live_paths.insert((hex.to_string(), mime_extension(&other_mime)));
             }
         }
+        drop(live_rows);
 
         // Unlink each unique on-disk payload exactly once, but only when
         // no remaining live row would resolve to the same path. Two puts
@@ -474,32 +511,7 @@ impl BlobStore for LibsqlBlobStore {
             if !handled.insert(path.clone()) {
                 continue;
             }
-            let live_pattern = format!("{SHA256_PREFIX}{hex}.%");
-            let mut live = conn
-                .query(
-                    "SELECT mime_type FROM blobs \
-                     WHERE blob_id LIKE ?1 AND deleted_at IS NULL",
-                    libsql::params![live_pattern],
-                )
-                .await
-                .map_err(|e| {
-                    StorageError::Internal(anyhow::anyhow!("libsql blob live query: {e}"))
-                })?;
-            let mut still_referenced = false;
-            while let Some(row) = live
-                .next()
-                .await
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live row: {e}")))?
-            {
-                let other_mime: String = row
-                    .get(0)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?;
-                if mime_extension(&other_mime) == ext {
-                    still_referenced = true;
-                    break;
-                }
-            }
-            if still_referenced {
+            if live_paths.contains(&(hex.to_string(), ext)) {
                 continue;
             }
             match tokio::fs::remove_file(&path).await {

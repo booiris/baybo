@@ -90,6 +90,12 @@ pub struct CronTriggerEvent {
     pub user_id: String,
     pub channel: ChannelType,
     pub action: TriggerAction,
+    /// The session that originally registered the cron job (if any).
+    /// Symmetric to `create_spawned_session` lineage: lets the
+    /// downstream actor stamp `TriggerSource::Cron { origin_session_id }`
+    /// on the produced session so trace queries can walk back to
+    /// "what user action created this cron job."
+    pub origin_session_id: Option<String>,
 }
 
 /// Manages cron job lifecycle and runs a background tick loop
@@ -282,6 +288,7 @@ impl CronScheduler {
             scheduled_fire_time: now,
             triggered_at: now,
             status: ExecutionStatus::Pending,
+            origin_session_id: job.origin_session_id.clone(),
         };
 
         let exec_row = execution_to_row(&execution)?;
@@ -295,6 +302,7 @@ impl CronScheduler {
             user_id: execution.user_id.clone(),
             channel: execution.channel.clone(),
             action: execution.action.clone(),
+            origin_session_id: execution.origin_session_id.clone(),
         };
 
         self.trigger_tx
@@ -385,6 +393,7 @@ impl CronScheduler {
                 user_id: exec.user_id.clone(),
                 channel: exec.channel,
                 action: exec.action.clone(),
+                origin_session_id: exec.origin_session_id.clone(),
             };
 
             if let Err(e) = self.trigger_tx.send(event).await {
@@ -462,6 +471,7 @@ impl CronScheduler {
                 action: job.action.clone(),
                 scheduled_fire_time,
                 triggered_at: now,
+                origin_session_id: job.origin_session_id.clone(),
                 status: ExecutionStatus::Pending,
             };
             let exec_row = match execution_to_row(&execution) {
@@ -506,6 +516,7 @@ impl CronScheduler {
                 user_id: execution.user_id.clone(),
                 channel: execution.channel,
                 action: execution.action.clone(),
+                origin_session_id: execution.origin_session_id.clone(),
             };
 
             if let Err(e) = self.trigger_tx.send(event).await {
@@ -1075,6 +1086,7 @@ mod tests {
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,
+            origin_session_id: None,
         };
         let exec_row = execution_to_row(&exec).unwrap();
         store.record_execution(&exec_row).await.unwrap();
@@ -1200,6 +1212,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trigger_carries_origin_session_id_through_event() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let job = scheduler
+            .create_job(
+                "u1",
+                ChannelType::tui(),
+                CronSchedule::at(future),
+                TriggerAction::Prompt {
+                    prompt: "lineage carries".into(),
+                },
+                Some("sess-creator".into()),
+            )
+            .await
+            .unwrap();
+        scheduler.trigger_now(&job.id).await.unwrap();
+        let event = rx.try_recv().expect("trigger event must land");
+        assert_eq!(event.origin_session_id.as_deref(), Some("sess-creator"));
+    }
+
+    #[tokio::test]
     async fn execution_row_conversion_round_trip() {
         let exec = CronExecution {
             id: "ce-rt".to_string(),
@@ -1213,6 +1246,7 @@ mod tests {
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,
+            origin_session_id: None,
         };
         let row = execution_to_row(&exec).unwrap();
         assert_eq!(row.status, "pending");

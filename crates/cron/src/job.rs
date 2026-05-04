@@ -134,6 +134,13 @@ pub struct CronExecution {
     pub scheduled_fire_time: DateTime<Utc>,
     pub triggered_at: DateTime<Utc>,
     pub status: ExecutionStatus,
+    /// The session that originally registered the cron job (if any).
+    /// Carried through to the dispatched `CronTriggerEvent` so the
+    /// router can set `Lineage` / `TriggerSource` on the resulting
+    /// turn — the symmetric counterpart to `create_spawned_session`'s
+    /// lineage plumbing for subagents and forks.
+    #[serde(default)]
+    pub origin_session_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -260,6 +267,7 @@ mod tests {
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,
+            origin_session_id: Some("sess-cron".into()),
         };
         let json = serde_json::to_string(&exec).unwrap();
         let restored: CronExecution = serde_json::from_str(&json).unwrap();

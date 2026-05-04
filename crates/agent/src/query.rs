@@ -273,14 +273,18 @@ impl QueryApi {
                 .into_iter()
                 .filter(|j| filter_matches(j, &filter))
                 .collect();
+            // Tie-break by JobId after `created_at` so two jobs minted in
+            // the same microsecond on the source session don't both pass
+            // the cutoff (or both get dropped). `created_at` resolution
+            // is µs; ULID JobIds give a deterministic secondary order.
             let cutoff = source_jobs
                 .iter()
                 .find(|j| j.id == fork_at_job_id)
-                .map(|j| j.created_at);
+                .map(|j| (j.created_at, j.id));
             let prefix: Vec<JobSummary> = source_jobs
                 .into_iter()
                 .filter(|j| match cutoff {
-                    Some(c) => j.created_at <= c,
+                    Some((c_at, c_id)) => (j.created_at, j.id) <= (c_at, c_id),
                     None => true,
                 })
                 .map(|j| JobSummary::from_inherited(&j, parent_session_id.clone()))
@@ -330,15 +334,7 @@ impl QueryApi {
     // ── 5. find_recoverable_jobs ───────────────────────────────
 
     pub async fn find_recoverable_jobs(&self) -> Result<Vec<Job>> {
-        let mut out = Vec::new();
-        for k in [
-            JobStatusKind::Pending,
-            JobStatusKind::InProgress,
-            JobStatusKind::Stuck,
-        ] {
-            out.extend(self.jobs.list(Some(k)).await?);
-        }
-        Ok(out)
+        Ok(self.jobs.list_recoverable().await?)
     }
 
     // ── 6. list_active_subagents ───────────────────────────────

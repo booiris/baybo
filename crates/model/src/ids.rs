@@ -61,7 +61,22 @@ impl From<String> for SessionId {
 macro_rules! ulid_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        // Ord/PartialOrd come from the inner Ulid: ULIDs sort by
+        // generation time first, then random tail — so a tuple key like
+        // `(created_at, JobId)` gives a deterministic tie-break when
+        // two ids share a microsecond `created_at`.
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
+        )]
         #[serde(transparent)]
         pub struct $name(Ulid);
 

@@ -36,6 +36,22 @@ impl LibsqlTraceEventStore {
 
 #[async_trait]
 impl TraceStore for LibsqlTraceStore {
+    /// Steps and spans are written in a hybrid columnar shape: queryable
+    /// fields (`kind`, `started_at`, `ended_at`, `outcome`,
+    /// `parallel_group`) live in their own columns so partial indices
+    /// (`WHERE ended_at IS NULL`, etc.) work, and the full struct is
+    /// serialized to a `data` JSON blob for round-trip on load.
+    ///
+    /// **Contract:** every write that touches a row MUST update both
+    /// the columnar fields and `data` atomically. Bugs that update one
+    /// side and not the other put queries (which read columnar) and
+    /// loads (which read JSON) out of sync. The only writers in this
+    /// module are `save_step` / `save_span` (full row replace, derived
+    /// from the same `&Step` / `&Span` so they can't drift) and
+    /// `recover_half_open_spans` (which goes through `Span::close` +
+    /// `serde_json::to_string` to keep the two sides synchronized).
+    /// Any future partial UPDATE must do the same — tested in debug
+    /// builds via the load-side assertion below.
     async fn save_step(&self, step: &Step) -> aura_trace::Result<()> {
         let conn = self.pool.conn();
         let data = serde_json::to_string(step)
@@ -63,7 +79,7 @@ impl TraceStore for LibsqlTraceStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM steps WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT data, kind, outcome FROM steps WHERE id = ?1 AND deleted_at IS NULL",
                 libsql::params![step_id.to_string()],
             )
             .await
@@ -79,6 +95,21 @@ impl TraceStore for LibsqlTraceStore {
                     .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let s: Step = serde_json::from_str(&data)
                     .map_err(|e| TraceError::Storage(format!("deserialize step: {e}")))?;
+                #[cfg(debug_assertions)]
+                {
+                    let col_kind: String = row.get(1).unwrap_or_default();
+                    let col_outcome: String = row.get(2).unwrap_or_default();
+                    debug_assert_eq!(
+                        col_kind,
+                        s.kind.tag(),
+                        "step {step_id} columnar kind drifted from JSON",
+                    );
+                    debug_assert_eq!(
+                        col_outcome,
+                        s.outcome.tag(),
+                        "step {step_id} columnar outcome drifted from JSON",
+                    );
+                }
                 Ok(Some(s))
             }
             None => Ok(None),
@@ -140,7 +171,7 @@ impl TraceStore for LibsqlTraceStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM spans WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT data, kind, outcome FROM spans WHERE id = ?1 AND deleted_at IS NULL",
                 libsql::params![span_id.to_string()],
             )
             .await
@@ -156,6 +187,21 @@ impl TraceStore for LibsqlTraceStore {
                     .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let s: Span = serde_json::from_str(&data)
                     .map_err(|e| TraceError::Storage(format!("deserialize span: {e}")))?;
+                #[cfg(debug_assertions)]
+                {
+                    let col_kind: String = row.get(1).unwrap_or_default();
+                    let col_outcome: String = row.get(2).unwrap_or_default();
+                    debug_assert_eq!(
+                        col_kind,
+                        s.kind.tag(),
+                        "span {span_id} columnar kind drifted from JSON",
+                    );
+                    debug_assert_eq!(
+                        col_outcome,
+                        s.outcome.tag(),
+                        "span {span_id} columnar outcome drifted from JSON",
+                    );
+                }
                 Ok(Some(s))
             }
             None => Ok(None),

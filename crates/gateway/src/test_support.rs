@@ -58,7 +58,9 @@ pub struct TestGateway {
 pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let db_path = tempdir.path().join("gateway-test.db");
-    let stores = Store::open(&db_path).await.expect("open in-memory store");
+    let stores = Store::open(&db_path)
+        .await
+        .expect("open tempdir-backed test store");
 
     let config = Arc::new(AuraConfig::default());
     let session_manager = Arc::new(SessionManager::new(
