@@ -16,6 +16,13 @@
 //! * If the DTO should stay fixed (back-compat), the conversion
 //!   absorbs the rename/removal here, keeping clients stable.
 //!
+//! **v1 stability:** the v1 surface is in active development and has
+//! no published external consumers yet. Breaking shape changes
+//! (e.g. the `JobStatus` `kind`/`reason`/`cancel_reason` envelope
+//! introduced with the trace redesign) land directly on `/v1/*`
+//! without a parallel `/v2/*`. Once an external consumer is on the
+//! record we'll switch to additive-only changes here.
+//!
 //! Channel-side routes reuse [`ListResponse`] too; the generic
 //! `ToSchema` impl only applies when `T: ToSchema`, so a channel route
 //! using `ListResponse<Session>` still compiles even though `Session`
