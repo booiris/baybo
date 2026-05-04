@@ -26,9 +26,10 @@ impl From<JobStatusArg> for JobStatusKind {
         match v {
             JobStatusArg::Pending => JobStatusKind::Pending,
             JobStatusArg::InProgress => JobStatusKind::InProgress,
-            JobStatusArg::Completed => JobStatusKind::Completed,
-            JobStatusArg::Failed => JobStatusKind::Failed,
             JobStatusArg::Stuck => JobStatusKind::Stuck,
+            JobStatusArg::Cancelled => JobStatusKind::Cancelled,
+            JobStatusArg::Failed => JobStatusKind::Failed,
+            JobStatusArg::Completed => JobStatusKind::Completed,
         }
     }
 }
