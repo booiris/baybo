@@ -1,10 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aura_model::SessionId;
 use aura_storage::TraceStore;
-use aura_trace::{SessionTrace, TraceFilter};
-use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::fs;
 
 use crate::cli::TraceCmd;
@@ -26,56 +25,89 @@ fn store(ctx: &CommandContext) -> Result<&Arc<dyn TraceStore>> {
         .ok_or_else(|| CliError::Manager("trace store is not available in this invocation".into()))
 }
 
-fn latest_started_at(trace: &SessionTrace) -> Option<DateTime<Utc>> {
-    trace.nodes.values().map(|n| n.span.started_at).max()
+fn jobs(ctx: &CommandContext) -> Result<&aura_agent::JobLifecycle> {
+    ctx.job
+        .as_deref()
+        .ok_or_else(|| CliError::Manager("job manager is not available in this invocation".into()))
 }
 
-fn trace_summary(trace: &SessionTrace) -> Value {
-    json!({
-        "session": trace.session_id,
-        "nodes": trace.nodes.len(),
-        "forks": trace.forks.len(),
-        "active_leaf": trace.active_leaf,
-        "latest_started_at": latest_started_at(trace).map(|t| t.to_rfc3339()),
-    })
+/// Pull the (job_count, step_count, span_count) tuple for one session
+/// — handy for both list and show summaries.
+async fn session_summary_counts(
+    ctx: &CommandContext,
+    session_id: &SessionId,
+) -> Result<(usize, usize, usize)> {
+    let st = store(ctx)?;
+    let job_mgr = jobs(ctx)?;
+    let session_jobs: Vec<_> = job_mgr
+        .list(None)
+        .await
+        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?
+        .into_iter()
+        .filter(|j| &j.session_id == session_id)
+        .collect();
+    let mut step_count = 0;
+    let mut span_count = 0;
+    for j in &session_jobs {
+        let steps = st
+            .list_steps_by_job(&j.id)
+            .await
+            .map_err(|e: aura_trace::TraceError| CliError::Manager(format!("list steps: {e}")))?;
+        for step in &steps {
+            let spans =
+                st.list_spans_by_step(&step.id)
+                    .await
+                    .map_err(|e: aura_trace::TraceError| {
+                        CliError::Manager(format!("list spans: {e}"))
+                    })?;
+            span_count += spans.len();
+        }
+        step_count += steps.len();
+    }
+    Ok((session_jobs.len(), step_count, span_count))
 }
 
 async fn list(ctx: &CommandContext, session: Option<&str>, limit: usize) -> Result<CommandOutput> {
-    let st = store(ctx)?;
-    let filter = TraceFilter {
-        session_id: session.map(str::to_string),
-        from: None,
-        to: None,
+    let job_mgr = jobs(ctx)?;
+    let mut sessions: Vec<SessionId> = match session {
+        Some(s) => vec![SessionId::from(s)],
+        None => {
+            let mut seen = std::collections::BTreeSet::new();
+            for j in job_mgr
+                .list(None)
+                .await
+                .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?
+            {
+                seen.insert(j.session_id);
+            }
+            seen.into_iter().collect()
+        }
     };
-    let mut traces = st
-        .query_traces(filter)
-        .await
-        .map_err(|e| CliError::Manager(format!("list traces: {e}")))?;
-    traces.sort_by_key(|t| std::cmp::Reverse(latest_started_at(t)));
-    traces.truncate(limit);
+    sessions.truncate(limit);
 
-    if traces.is_empty() {
+    if sessions.is_empty() {
         return Ok(CommandOutput {
-            human: match session {
-                Some(s) => format!("no trace recorded for session {s}"),
-                None => "no session traces recorded".into(),
-            },
+            human: "no session traces recorded".into(),
             data: Some(json!({ "traces": [] })),
         });
     }
 
-    let rows: Vec<Value> = traces.iter().map(trace_summary).collect();
-    let mut human =
-        String::from("session                               nodes  forks  latest_started_at\n");
-    for t in &traces {
+    let mut rows = Vec::with_capacity(sessions.len());
+    let mut human = String::from("session                                 jobs   steps  spans\n");
+    for sid in &sessions {
+        let (jobs, steps, spans) = session_summary_counts(ctx, sid).await?;
+        rows.push(json!({
+            "session": sid.to_string(),
+            "jobs": jobs,
+            "steps": steps,
+            "spans": spans,
+        }));
         human.push_str(&format!(
-            "{:<37}  {:<5}  {:<5}  {}\n",
-            t.session_id,
-            t.nodes.len(),
-            t.forks.len(),
-            latest_started_at(t)
-                .map(|d| d.to_rfc3339())
-                .unwrap_or_else(|| "(empty)".into()),
+            "{:<38}  {:<5}  {:<5}  {}\n",
+            sid.to_string(),
+            jobs,
+            steps,
+            spans,
         ));
     }
 
@@ -86,57 +118,25 @@ async fn list(ctx: &CommandContext, session: Option<&str>, limit: usize) -> Resu
 }
 
 async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
-    let st = store(ctx)?;
-    let trace = st
-        .load_trace(id)
-        .await
-        .map_err(|e| CliError::Manager(format!("load trace: {e}")))?
-        .ok_or_else(|| CliError::Manager(format!("no trace recorded for session {id}")))?;
-
-    let kinds: std::collections::BTreeMap<String, usize> =
-        trace
-            .nodes
-            .values()
-            .fold(std::collections::BTreeMap::new(), |mut acc, n| {
-                let key = format!("{:?}", n.span.kind);
-                *acc.entry(key).or_insert(0) += 1;
-                acc
-            });
-
-    let kinds_json: Value = Value::Object(
-        kinds
-            .iter()
-            .map(|(k, v)| (k.clone(), json!(v)))
-            .collect::<serde_json::Map<_, _>>(),
-    );
+    let session_id = SessionId::from(id);
+    let (jobs_n, steps_n, spans_n) = session_summary_counts(ctx, &session_id).await?;
+    if jobs_n == 0 {
+        return Err(CliError::Manager(format!(
+            "no trace recorded for session {id}"
+        )));
+    }
 
     let value = json!({
-        "session": trace.session_id,
-        "root": trace.root,
-        "active_leaf": trace.active_leaf,
-        "nodes": trace.nodes.len(),
-        "forks": trace.forks.len(),
-        "latest_started_at": latest_started_at(&trace).map(|t| t.to_rfc3339()),
-        "span_kinds": kinds_json,
+        "session": id,
+        "jobs": jobs_n,
+        "steps": steps_n,
+        "spans": spans_n,
     });
 
-    let mut human = format!(
-        "session:      {}\nroot:         {}\nactive_leaf:  {}\nnodes:        {}\nforks:        {}\nlatest:       {}",
-        trace.session_id,
-        trace.root,
-        trace.active_leaf,
-        trace.nodes.len(),
-        trace.forks.len(),
-        latest_started_at(&trace)
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_else(|| "(empty)".into()),
+    let human = format!(
+        "session:      {}\njobs:         {}\nsteps:        {}\nspans:        {}",
+        id, jobs_n, steps_n, spans_n,
     );
-    if !kinds.is_empty() {
-        human.push_str("\nspan kinds:");
-        for (k, v) in &kinds {
-            human.push_str(&format!("\n  {k:<40}  {v}"));
-        }
-    }
 
     Ok(CommandOutput {
         human,
@@ -157,13 +157,41 @@ async fn export(
         )));
     }
     let st = store(ctx)?;
-    let trace = st
-        .load_trace(id)
+    let job_mgr = jobs(ctx)?;
+    let session_id = SessionId::from(id);
+    let session_jobs: Vec<_> = job_mgr
+        .list(None)
         .await
-        .map_err(|e| CliError::Manager(format!("load trace: {e}")))?
-        .ok_or_else(|| CliError::Manager(format!("no trace recorded for session {id}")))?;
+        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?
+        .into_iter()
+        .filter(|j| j.session_id == session_id)
+        .collect();
+    if session_jobs.is_empty() {
+        return Err(CliError::Manager(format!(
+            "no trace recorded for session {id}"
+        )));
+    }
 
-    let json_text = serde_json::to_string_pretty(&trace)
+    let mut tree = Vec::with_capacity(session_jobs.len());
+    for job in session_jobs {
+        let steps = st
+            .list_steps_by_job(&job.id)
+            .await
+            .map_err(|e: aura_trace::TraceError| CliError::Manager(format!("list steps: {e}")))?;
+        let mut step_blocks = Vec::with_capacity(steps.len());
+        for step in steps {
+            let spans =
+                st.list_spans_by_step(&step.id)
+                    .await
+                    .map_err(|e: aura_trace::TraceError| {
+                        CliError::Manager(format!("list spans: {e}"))
+                    })?;
+            step_blocks.push(json!({ "step": step, "spans": spans }));
+        }
+        tree.push(json!({ "job": job, "steps": step_blocks }));
+    }
+    let exported = json!({ "session": id, "jobs": tree });
+    let json_text = serde_json::to_string_pretty(&exported)
         .map_err(|e| CliError::Manager(format!("serialize trace: {e}")))?;
 
     if let Some(path_str) = out {
@@ -181,7 +209,7 @@ async fn export(
         return Ok(CommandOutput {
             human: format!("wrote trace for session {id} to {path_str}"),
             data: Some(json!({
-                "session": trace.session_id,
+                "session": id,
                 "path": path_str,
                 "bytes": json_text.len(),
             })),
@@ -190,6 +218,6 @@ async fn export(
 
     Ok(CommandOutput {
         human: json_text.clone(),
-        data: Some(serde_json::to_value(&trace).unwrap_or(Value::Null)),
+        data: Some(exported),
     })
 }

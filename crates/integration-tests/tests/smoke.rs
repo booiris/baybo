@@ -19,7 +19,7 @@ async fn fixtures_compose() {
         .id("smoke")
         .channel(ChannelType::tui())
         .build();
-    assert_eq!(session.id, "smoke");
+    assert_eq!(session.id.as_str(), "smoke");
     assert_eq!(session.channel, ChannelType::tui());
 }
 

@@ -262,106 +262,153 @@ impl From<aura_model::MemoryEntry> for MemoryEntry {
 
 // ── Job ──────────────────────────────────────────────────────────────
 
-/// Mirror of [`aura_job::JobStatus`].
+/// Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
+/// the domain enum carries (cancel reason, partial-artifact span IDs,
+/// verification substate); the wire shape collapses inner-variant
+/// content into `Option`-typed fields so HTTP clients can decode
+/// without needing the full Rust enum machinery.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum JobStatus {
+pub struct JobStatus {
+    pub kind: JobStatusKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub partial_artifacts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatusKind {
     Pending,
     InProgress,
-    Completed,
-    Submitted,
-    Accepted,
-    Failed,
     Stuck,
+    Cancelled,
+    Failed,
+    Completed,
+}
+
+impl From<aura_job::JobStatusKind> for JobStatusKind {
+    fn from(v: aura_job::JobStatusKind) -> Self {
+        match v {
+            aura_job::JobStatusKind::Pending => Self::Pending,
+            aura_job::JobStatusKind::InProgress => Self::InProgress,
+            aura_job::JobStatusKind::Stuck => Self::Stuck,
+            aura_job::JobStatusKind::Cancelled => Self::Cancelled,
+            aura_job::JobStatusKind::Failed => Self::Failed,
+            aura_job::JobStatusKind::Completed => Self::Completed,
+        }
+    }
 }
 
 impl From<aura_job::JobStatus> for JobStatus {
     fn from(v: aura_job::JobStatus) -> Self {
+        let kind = JobStatusKind::from(v.kind());
         match v {
-            aura_job::JobStatus::Pending => Self::Pending,
-            aura_job::JobStatus::InProgress => Self::InProgress,
-            aura_job::JobStatus::Completed => Self::Completed,
-            aura_job::JobStatus::Submitted => Self::Submitted,
-            aura_job::JobStatus::Accepted => Self::Accepted,
-            aura_job::JobStatus::Failed => Self::Failed,
-            aura_job::JobStatus::Stuck => Self::Stuck,
+            aura_job::JobStatus::Pending | aura_job::JobStatus::InProgress => Self {
+                kind,
+                reason: None,
+                cancel_reason: None,
+                partial_artifacts: Vec::new(),
+                verification: None,
+            },
+            aura_job::JobStatus::Stuck { reason } | aura_job::JobStatus::Failed { reason } => {
+                Self {
+                    kind,
+                    reason: Some(reason),
+                    cancel_reason: None,
+                    partial_artifacts: Vec::new(),
+                    verification: None,
+                }
+            }
+            aura_job::JobStatus::Cancelled {
+                reason,
+                partial_artifacts,
+            } => Self {
+                kind,
+                reason: None,
+                cancel_reason: Some(format!("{reason:?}")),
+                partial_artifacts: partial_artifacts
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                verification: None,
+            },
+            aura_job::JobStatus::Completed { verification } => Self {
+                kind,
+                reason: None,
+                cancel_reason: None,
+                partial_artifacts: Vec::new(),
+                verification: Some(format!("{verification:?}")),
+            },
         }
     }
 }
 
-/// Mirror of [`aura_job::OperationKind`].
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum OperationKind {
-    LlmCall { model: String },
-    ToolExecution { tool_name: String },
-    SkillExecution { skill_name: String },
-    CronExecution { cron_job_id: String },
-    ContextCompression { strategy: String },
-    MemoryOperation { operation: String },
-    UserMessageHandling { session_id: String },
+/// Wire mirror of [`aura_job::JobKind`].
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    UserChat,
+    Cron,
+    System,
+    Spawned,
 }
 
-impl From<aura_job::OperationKind> for OperationKind {
-    fn from(v: aura_job::OperationKind) -> Self {
+impl From<aura_job::JobKind> for JobKind {
+    fn from(v: aura_job::JobKind) -> Self {
         match v {
-            aura_job::OperationKind::LlmCall { model } => Self::LlmCall { model },
-            aura_job::OperationKind::ToolExecution { tool_name } => {
-                Self::ToolExecution { tool_name }
-            }
-            aura_job::OperationKind::SkillExecution { skill_name } => {
-                Self::SkillExecution { skill_name }
-            }
-            aura_job::OperationKind::CronExecution { cron_job_id } => {
-                Self::CronExecution { cron_job_id }
-            }
-            aura_job::OperationKind::ContextCompression { strategy } => {
-                Self::ContextCompression { strategy }
-            }
-            aura_job::OperationKind::MemoryOperation { operation } => {
-                Self::MemoryOperation { operation }
-            }
-            aura_job::OperationKind::UserMessageHandling { session_id } => {
-                Self::UserMessageHandling { session_id }
-            }
+            aura_job::JobKind::UserChat => Self::UserChat,
+            aura_job::JobKind::Cron => Self::Cron,
+            aura_job::JobKind::System => Self::System,
+            aura_job::JobKind::Spawned => Self::Spawned,
         }
     }
 }
 
-/// Mirror of [`aura_job::Job`].
+/// Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
+/// state machine (Q6) — `final_result` replaces `output`/`error`,
+/// `emitted_span_ids` replaces `trace_span_id`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Job {
     pub id: String,
     pub session_id: String,
     pub parent_job_id: Option<String>,
-    pub kind: OperationKind,
+    pub kind: JobKind,
     pub status: JobStatus,
     #[schema(value_type = Option<Object>)]
-    pub input: Option<serde_json::Value>,
-    #[schema(value_type = Option<Object>)]
-    pub output: Option<serde_json::Value>,
-    pub error: Option<String>,
-    pub trace_span_id: Option<String>,
+    pub final_result: Option<serde_json::Value>,
+    pub emitted_span_ids: Vec<String>,
+    pub effective_soul_version: String,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 impl From<aura_job::Job> for Job {
     fn from(v: aura_job::Job) -> Self {
         Self {
-            id: v.id,
-            session_id: v.session_id,
-            parent_job_id: v.parent_job_id,
+            id: v.id.to_string(),
+            session_id: v.session_id.to_string(),
+            parent_job_id: v.parent_job_id.map(|p| p.to_string()),
             kind: v.kind.into(),
             status: v.status.into(),
-            input: v.input,
-            output: v.output,
-            error: v.error,
-            trace_span_id: v.trace_span_id,
+            final_result: v
+                .final_result
+                .map(|o| serde_json::to_value(&o).unwrap_or(serde_json::Value::Null)),
+            emitted_span_ids: v
+                .emitted_span_ids
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+            effective_soul_version: v.effective_soul_version,
             created_at: v.created_at,
             started_at: v.started_at,
-            completed_at: v.completed_at,
+            ended_at: v.ended_at,
         }
     }
 }

@@ -11,10 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::{
-    AgentLoop, ExecutionPolicy, JobManager, MemoryManager, ObservabilityRecorder, SecurityGateway,
-    TraceCollector,
+    AgentLoop, ExecutionPolicy, JobLifecycle, MemoryManager, SecurityGateway, SpanRecorder,
     actor::{AgentActor, AgentMessage},
-    cost::CostTracker,
     soul::Soul,
     tool_executor::ToolExecutor,
 };
@@ -26,11 +24,11 @@ use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_storage::test_support::{
-    MemoryCostStore, MemoryJobStore, MemoryMemoryStore, MemorySecretStore, MemoryTraceStore,
+    MemoryCostStore, MemoryJobStore, MemoryMemoryStore, MemorySecretStore, MemoryTraceEventStore,
+    MemoryTraceStore,
 };
 use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use chrono::Utc;
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -81,7 +79,7 @@ impl AgentTestHarness {
     pub async fn send_text(&mut self, text: impl Into<String>) -> anyhow::Result<()> {
         let message = Message {
             id: format!("msg-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
-            session_id: self.session.id.clone(),
+            session_id: self.session.id.to_string(),
             channel: self.session.channel.clone(),
             sender: self.session.user.clone(),
             content: vec![ContentBlock::Text(text.into())],
@@ -225,17 +223,21 @@ impl AgentTestHarnessBuilder {
         let trace_store = Arc::new(MemoryTraceStore::new());
         let memory_store = Arc::new(MemoryMemoryStore::new());
 
-        let job_manager = Arc::new(JobManager::new(share_job_store(&job_store)));
-        let cost_tracker = Arc::new(CostTracker::new(share_cost_store(&cost_store)));
-        let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
-            &session.id,
+        let job_lifecycle = Arc::new(JobLifecycle::new(share_job_store(&job_store)));
+        let trace_event_store: Arc<dyn aura_storage::TraceEventStore> =
+            Arc::new(MemoryTraceEventStore::new());
+        let span_recorder = Arc::new(SpanRecorder::new(
+            session.id.clone(),
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
-        )));
-        let recorder = Arc::new(ObservabilityRecorder::new(
-            job_manager,
-            trace_collector,
-            cost_tracker,
+            trace_event_store,
         ));
+        // Cost subscriber: pricing left empty for tests — token
+        // counts still land in cost_records, cost_usd reads as 0.
+        let _cost_handle = aura_agent::cost::CostSubscriber::new(
+            share_cost_store(&cost_store),
+            std::collections::HashMap::new(),
+        )
+        .spawn(span_recorder.stream());
 
         // Agent loop dependencies.
         let stub_llm = Arc::new(StubLlm::new());
@@ -270,6 +272,7 @@ impl AgentTestHarnessBuilder {
             .unwrap_or_else(|| "You are Aura, a test assistant.".into());
         let soul = Soul::custom(soul_text);
 
+        let hooks = Arc::new(HookManager::new());
         let agent_loop = AgentLoop::new(
             stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
             tool_registry.clone(),
@@ -280,9 +283,8 @@ impl AgentTestHarnessBuilder {
             ExecutionPolicy::default(),
             soul,
             gateway.clone(),
-        );
-
-        let hooks = Arc::new(HookManager::new());
+        )
+        .with_hooks(Arc::clone(&hooks));
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
@@ -292,7 +294,8 @@ impl AgentTestHarnessBuilder {
             tool_executor,
             output_tx,
             hooks,
-            recorder,
+            job_lifecycle,
+            span_recorder,
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));
 

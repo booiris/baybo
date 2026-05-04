@@ -23,8 +23,6 @@ use std::sync::Arc;
 
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::AgentLoop;
-use aura_agent::cost::CostTracker;
-use aura_agent::observability::ObservabilityRecorder;
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::session_log::SessionLlmLogger;
@@ -32,8 +30,8 @@ use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
-    CronScheduler, CronTriggerEvent, JobManager, MemoryManager, SecretVault, SecurityGateway,
-    SessionManager, TraceCollector,
+    CronScheduler, CronTriggerEvent, JobLifecycle, MemoryManager, SecretVault, SecurityGateway,
+    SessionManager, SpanRecorder,
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
@@ -47,7 +45,6 @@ use aura_storage::Store;
 use aura_tools::ToolRegistry;
 use aura_tools::mcp::{EmbeddedMcpServer, McpReconciler};
 use aura_workspace::WorkspaceManager;
-use parking_lot::Mutex;
 use regex::Regex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -158,7 +155,7 @@ pub async fn build_bot_registry_deps(
 pub struct ManagerGraph {
     pub config: Arc<AuraConfig>,
     pub session_manager: Arc<SessionManager>,
-    pub job_manager: Arc<JobManager>,
+    pub job_lifecycle: Arc<JobLifecycle>,
     pub memory_manager: Arc<MemoryManager>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub security_gateway: Arc<SecurityGateway>,
@@ -169,7 +166,9 @@ pub struct ManagerGraph {
     pub llm_client: Arc<LlmClient>,
     pub workspace: Arc<WorkspaceManager>,
     pub channels_registry: Arc<ChannelRegistry>,
-    pub cost_tracker: Arc<CostTracker>,
+    /// `CostStore` retained on the graph so external subscribers can
+    /// open their own `TraceEventStream` listeners (e.g. the gateway).
+    pub cost_store: Arc<dyn aura_storage::CostStore>,
     pub hook_manager: Arc<HookManager>,
     pub secret_vault: Arc<SecretVault>,
     /// Cloneable bundle of every libsql-backed store handle. Keeping the
@@ -284,15 +283,17 @@ pub async fn build_managers(
         boot::to_session_timeout(&config.session),
     ));
 
-    let job_manager = JobManager::new(stores.job.clone());
-    match job_manager.recover_interrupted().await {
+    let job_lifecycle = JobLifecycle::new(stores.job.clone());
+    match job_lifecycle.recover_interrupted().await {
         Ok(0) => {}
         Ok(n) => info!(count = n, "recovered interrupted jobs from prior run"),
         Err(e) => tracing::warn!(error = %e, "failed to recover interrupted jobs"),
     }
-    let job_manager = Arc::new(job_manager);
-
-    let cost_tracker = Arc::new(CostTracker::new(stores.cost.clone()));
+    let job_lifecycle = Arc::new(job_lifecycle);
+    // CostTracker has been retired in favour of a TraceEventStream
+    // subscriber. The bootstrap below wires it once `SpanRecorder`s
+    // exist (per-actor); see `spawn_actor` below for the subscription.
+    let cost_store_for_subscriber = stores.cost.clone();
 
     // --- cron scheduler (built before ToolExecutor so its tools register
     // while `tool_registry` still has a single Arc owner)
@@ -425,7 +426,7 @@ pub async fn build_managers(
     Ok(ManagerGraph {
         config,
         session_manager,
-        job_manager,
+        job_lifecycle,
         memory_manager,
         cron_scheduler,
         security_gateway,
@@ -436,7 +437,7 @@ pub async fn build_managers(
         llm_client,
         workspace,
         channels_registry,
-        cost_tracker,
+        cost_store: cost_store_for_subscriber,
         hook_manager,
         secret_vault,
         stores,
@@ -496,11 +497,20 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let actor_tokenizer = Arc::clone(&tokenizer);
     let actor_hooks = Arc::clone(&graph.hook_manager);
     let actor_trace_store = graph.stores.trace.clone();
-    let actor_job_manager = Arc::clone(&graph.job_manager);
-    let actor_cost_tracker = Arc::clone(&graph.cost_tracker);
+    let actor_trace_event_store = graph.stores.trace_events.clone();
+    let actor_job_lifecycle = Arc::clone(&graph.job_lifecycle);
+    let actor_cost_store = graph.cost_store.clone();
     let actor_skill_assessor = Arc::clone(&graph.skill_assessor);
     let actor_security_gateway = Arc::clone(&graph.security_gateway);
     let actor_session_logger = Arc::clone(&session_logger);
+    // Snapshot the live model's pricing for the cost subscriber. The
+    // bootstrap uses a single shared LLM client, so a single-entry
+    // map is enough for now; multi-model bootstraps will populate
+    // the map from the provider registry.
+    let actor_pricing: std::collections::HashMap<String, aura_llm::ModelPricing> = {
+        let info = graph.llm_client.model_info();
+        std::iter::once((info.id.clone(), info.pricing.clone())).collect()
+    };
 
     let router = Router::new(
         Arc::clone(&graph.session_manager),
@@ -525,17 +535,26 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             Arc::clone(&actor_security_gateway),
         )
         .with_skill_assessor(Arc::clone(&actor_skill_assessor))
-        .with_session_log(Arc::clone(&actor_session_logger));
+        .with_session_log(Arc::clone(&actor_session_logger))
+        .with_hooks(Arc::clone(&actor_hooks));
 
-        let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
-            &session.id,
+        // Per-session `SpanRecorder` writes through to the libsql
+        // columnar tables and the WAL event log. The bus drives the
+        // cost subscriber below; events flow as
+        // `TraceEvent::LlmSpanEnded` → `cost_records`.
+        let span_recorder = Arc::new(SpanRecorder::new(
+            session.id.clone(),
             Arc::clone(&actor_trace_store),
-        )));
-        let recorder = Arc::new(ObservabilityRecorder::new(
-            Arc::clone(&actor_job_manager),
-            trace_collector,
-            Arc::clone(&actor_cost_tracker),
+            Arc::clone(&actor_trace_event_store),
         ));
+        // Cost subscriber (per-session). Shutdown when the session
+        // closes by following `tokio::sync::broadcast` semantics: the
+        // task exits when the recorder Arc is dropped.
+        let subscriber = aura_agent::cost::CostSubscriber::new(
+            Arc::clone(&actor_cost_store),
+            actor_pricing.clone(),
+        );
+        let _cost_handle = subscriber.spawn(span_recorder.stream());
 
         let actor = AgentActor::new(
             session,
@@ -543,7 +562,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             Arc::clone(&actor_tool_executor),
             response_tx,
             Arc::clone(&actor_hooks),
-            recorder,
+            Arc::clone(&actor_job_lifecycle),
+            span_recorder,
         );
         let (sender, mailbox) = mpsc::channel(buffer);
         tokio::spawn(async move {

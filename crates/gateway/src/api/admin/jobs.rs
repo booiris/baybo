@@ -28,10 +28,10 @@ pub fn routes() -> OpenApiRouter<AdminState> {
 )]
 async fn list_jobs(State(state): State<AdminState>) -> Result<Json<ListResponse<Job>>> {
     let items = state
-        .job_manager
+        .job_lifecycle
         .list(None)
         .await
-        .map_err(|e| GatewayError::Job(e.to_string()))?
+        .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?
         .into_iter()
         .map(Job::from)
         .collect();
@@ -52,11 +52,14 @@ async fn list_jobs(State(state): State<AdminState>) -> Result<Json<ListResponse<
     )
 )]
 async fn get_job(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Job>> {
+    let job_id: aura_model::JobId = id
+        .parse()
+        .map_err(|e| GatewayError::Job(format!("invalid job id: {e}")))?;
     let job = state
-        .job_manager
-        .get(&id)
+        .job_lifecycle
+        .get(&job_id)
         .await
-        .map_err(|e| GatewayError::Job(e.to_string()))?
+        .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?
         .ok_or_else(|| GatewayError::NotFound(format!("job {id}")))?;
     Ok(Json(Job::from(job)))
 }
@@ -75,10 +78,21 @@ async fn get_job(State(state): State<AdminState>, Path(id): Path<String>) -> Res
     )
 )]
 async fn cancel_job(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Job>> {
-    let job = state
-        .job_manager
-        .cancel(&id)
+    let job_id: aura_model::JobId = id
+        .parse()
+        .map_err(|e| GatewayError::Job(format!("invalid job id: {e}")))?;
+    // Operator-initiated cancel; partial-artifact rollup belongs on the
+    // recovery scan, not the admin endpoint.
+    state
+        .job_lifecycle
+        .cancel(&job_id, aura_job::CancelReason::HookAborted, vec![])
         .await
-        .map_err(|e| GatewayError::Job(e.to_string()))?;
+        .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?;
+    let job = state
+        .job_lifecycle
+        .get(&job_id)
+        .await
+        .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?
+        .ok_or_else(|| GatewayError::NotFound(format!("job {id}")))?;
     Ok(Json(Job::from(job)))
 }

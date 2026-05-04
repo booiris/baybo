@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aura_agent::{
-    CronScheduler, JobManager, MemoryManager, SessionManager, service::ShutdownSignal,
+    CronScheduler, JobLifecycle, MemoryManager, SessionManager, service::ShutdownSignal,
 };
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
@@ -68,7 +68,7 @@ pub struct GatewayDeps {
     pub config_path: Option<PathBuf>,
     pub runtime_config: RuntimeGatewayConfig,
     pub session_manager: Arc<SessionManager>,
-    pub job_manager: Arc<JobManager>,
+    pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub memory_manager: Arc<MemoryManager>,
     pub skill_registry: Arc<SkillRegistry>,
@@ -116,7 +116,7 @@ pub struct AdminState {
     pub config: Arc<AuraConfig>,
     pub config_path: Option<PathBuf>,
     pub session_manager: Arc<SessionManager>,
-    pub job_manager: Arc<JobManager>,
+    pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub memory_manager: Arc<MemoryManager>,
     pub trace_store: Arc<dyn TraceStore>,
@@ -152,7 +152,7 @@ impl AdminState {
             config: Arc::clone(&deps.config),
             config_path: deps.config_path.clone(),
             session_manager: Arc::clone(&deps.session_manager),
-            job_manager: Arc::clone(&deps.job_manager),
+            job_lifecycle: Arc::clone(&deps.job_lifecycle),
             cron_scheduler: Arc::clone(&deps.cron_scheduler),
             memory_manager: Arc::clone(&deps.memory_manager),
             trace_store: deps.stores.trace.clone(),

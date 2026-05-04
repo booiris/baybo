@@ -40,7 +40,7 @@ async fn admin_router() -> axum::Router {
         config: std::sync::Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: std::sync::Arc::clone(&tg.deps.session_manager),
-        job_manager: std::sync::Arc::clone(&tg.deps.job_manager),
+        job_lifecycle: std::sync::Arc::clone(&tg.deps.job_lifecycle),
         cron_scheduler: std::sync::Arc::clone(&tg.deps.cron_scheduler),
         memory_manager: std::sync::Arc::clone(&tg.deps.memory_manager),
         trace_store: tg.deps.stores.trace.clone(),
