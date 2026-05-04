@@ -52,6 +52,18 @@ impl VerificationOutcome {
         )
     }
 
+    /// Snake-case wire tag matching the `#[serde(tag = "outcome", ...)]`
+    /// annotation. Strips the variant data — for the full payload, use
+    /// `serde_json::to_value`.
+    pub fn outcome_tag(&self) -> &'static str {
+        match self {
+            VerificationOutcome::Unverified => "unverified",
+            VerificationOutcome::Submitted { .. } => "submitted",
+            VerificationOutcome::Accepted { .. } => "accepted",
+            VerificationOutcome::Rejected { .. } => "rejected",
+        }
+    }
+
     /// Whether transitioning from `self` to `target` is a permitted
     /// verification advance. `Unverified` cannot advance — only jobs
     /// constructed with a declared `verifier` start in a state that

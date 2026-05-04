@@ -545,8 +545,6 @@ pub enum JobStatusArg {
     Pending,
     InProgress,
     Completed,
-    Submitted,
-    Accepted,
     Failed,
     Stuck,
 }

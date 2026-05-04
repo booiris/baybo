@@ -133,22 +133,23 @@ impl CostGuard {
 
 /// Subscribes to a session's `TraceEventStream` and writes
 /// `cost_records` + lazily updates the `user_monthly_cost` cache for
-/// every `TraceEvent::LlmSpanEnded` it sees.
-///
-/// Replaces the legacy direct-write `CostTracker` per design Q11/W3
-/// — the agent loop never blocks on cost writes; everything flows
-/// through the broadcast bus. One subscriber per session (spawned by
-/// the runtime alongside the actor).
-///
-/// Pricing comes from a `HashMap<model_id, ModelPricing>` snapshot
-/// passed in at construction. The bootstrap layer is responsible for
-/// keeping the snapshot fresh; price-book updates take effect on the
-/// next session start (a per-session subscriber sees a fixed price
-/// table). For replay against historical data, raw `cost_records`
-/// carry token counts + model_id, so re-derivation is always possible.
+/// every `TraceEvent::LlmSpanEnded` it sees. One subscriber per session.
 pub struct CostSubscriber {
     store: Arc<dyn CostStore>,
     pricing: HashMap<String, ModelPricing>,
+}
+
+fn compute_cost_usd(
+    pricing: &HashMap<String, ModelPricing>,
+    model_id: &str,
+    input_tokens: usize,
+    output_tokens: usize,
+) -> f64 {
+    let Some(p) = pricing.get(model_id) else {
+        return 0.0;
+    };
+    (input_tokens as f64 / 1_000_000.0) * p.input_per_1m_tokens
+        + (output_tokens as f64 / 1_000_000.0) * p.output_per_1m_tokens
 }
 
 impl CostSubscriber {
@@ -160,11 +161,7 @@ impl CostSubscriber {
     /// model is unknown — the raw record still records token counts
     /// so the missing rate can be backfilled later.
     pub fn cost_usd_for(&self, model_id: &str, input_tokens: usize, output_tokens: usize) -> f64 {
-        let Some(p) = self.pricing.get(model_id) else {
-            return 0.0;
-        };
-        (input_tokens as f64 / 1_000_000.0) * p.input_per_1m_tokens
-            + (output_tokens as f64 / 1_000_000.0) * p.output_per_1m_tokens
+        compute_cost_usd(&self.pricing, model_id, input_tokens, output_tokens)
     }
 
     /// Spawn a tokio task that subscribes to the given stream and
@@ -186,16 +183,12 @@ impl CostSubscriber {
                         output_tokens,
                         ..
                     }) => {
-                        let cost_usd = pricing
-                            .get(&model_id)
-                            .map(|p| {
-                                (input_tokens as f64 / 1_000_000.0) * p.input_per_1m_tokens
-                                    + (output_tokens as f64 / 1_000_000.0) * p.output_per_1m_tokens
-                            })
-                            .unwrap_or(0.0);
+                        let cost_usd =
+                            compute_cost_usd(&pricing, &model_id, input_tokens, output_tokens);
                         let now = Utc::now();
                         let record = CostRecord {
-                            user_id: String::new(), // unknown at subscriber level — TODO: thread user_id through TraceEvent
+                            // user_id is not yet plumbed through TraceEvent.
+                            user_id: String::new(),
                             session_id,
                             job_id,
                             span_id,
@@ -210,11 +203,13 @@ impl CostSubscriber {
                             warn!(error = %e, "failed to write cost_record");
                             continue;
                         }
-                        // Bump the monthly cache. user_id is empty
-                        // for now (no plumbing); the cache row keys
-                        // on (user_id, month) so an empty user_id
-                        // still works as a global per-month total
-                        // until per-user wiring lands.
+                        // Skip the monthly cache bump until user_id is
+                        // plumbed through; otherwise every event lands
+                        // on a single ("", month) row that conflates
+                        // every user.
+                        if record.user_id.is_empty() {
+                            continue;
+                        }
                         let month = format!("{:04}-{:02}", now.year(), now.month());
                         if let Err(e) = store
                             .bump_user_monthly_cost(&record.user_id, &month, cost_usd)
@@ -223,9 +218,7 @@ impl CostSubscriber {
                             warn!(error = %e, "failed to bump user_monthly_cost cache");
                         }
                     }
-                    Ok(_) => {
-                        // Other TraceEvents are not cost-relevant.
-                    }
+                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(missed = n, "cost subscriber lagged on TraceEventStream");
                         continue;
@@ -271,49 +264,5 @@ mod tests {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let sub = CostSubscriber::new(store, pricing("m1", 3.0, 15.0));
         assert_eq!(sub.cost_usd_for("unknown", 1_000_000, 1_000_000), 0.0);
-    }
-
-    #[tokio::test]
-    async fn subscriber_writes_record_and_bumps_cache_on_llm_span_ended() {
-        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        let stream = TraceEventStream::new();
-        let sub = CostSubscriber::new(Arc::clone(&store), pricing("m1", 1.0, 5.0));
-        let _handle = sub.spawn(&stream);
-
-        // Publish two LLM-span-ended events.
-        let session_id = aura_model::SessionId::from("s1");
-        for _ in 0..2 {
-            stream.subscribe(); // ensure publisher succeeds — subscribe before send
-        }
-        // Re-subscribe pattern not needed — we already had the
-        // subscriber's internal rx via spawn(). Send directly.
-        let pub_event = TraceEvent::LlmSpanEnded {
-            span_id: aura_model::SpanId::new(),
-            job_id: aura_model::JobId::new(),
-            session_id: session_id.clone(),
-            model_id: "m1".into(),
-            provider: "p1".into(),
-            input_tokens: 1_000,
-            output_tokens: 2_000,
-        };
-        // Emulate by publishing through SpanRecorder is overkill;
-        // expose stream sender via subscribe + reflection-style send
-        // is awkward. Use the public broadcast::send via TraceEventStream
-        // helper if any; otherwise this test asserts subscriber wiring.
-        // We bypass by constructing a fresh stream + driving manually:
-        let driver = TraceEventStream::new();
-        let mut rx_drain = driver.subscribe();
-        // Drive: a second subscriber confirms broadcast ordering
-        let sub2 = CostSubscriber::new(Arc::clone(&store), pricing("m1", 1.0, 5.0));
-        let _h2 = sub2.spawn(&driver);
-        // Best we can do without a `publish` accessor: ensure the
-        // event-shape compiles and the subscriber loops exit cleanly
-        // when streams drop. Real end-to-end happens through SpanRecorder.
-        drop(driver);
-        let _ = rx_drain.recv().await; // expect Closed
-        // To avoid a hang on the prior closure stream, drop it too:
-        drop(stream);
-        // Acknowledge unused
-        let _ = pub_event;
     }
 }

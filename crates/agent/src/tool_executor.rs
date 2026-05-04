@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use aura_model::{
-    HookPhase, JobId, ParallelGroup, SecretKind, SessionId, SpanId, TrustLevel, User,
-};
+use aura_model::{JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
 
 use aura_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use aura_tools::{
@@ -141,9 +139,6 @@ impl ToolExecutor {
             llm_span_id,
             tool_use_id: String::new(),
         });
-        // ToolManifest does not (yet) carry an artifact hash; record an
-        // empty string for now so the trace schema stays consistent.
-        // Wired in as part of step-6 provenance work per design doc Q11.
         let tool_artifact_hash = String::new();
         let span_handle = recorder
             .begin_span(
@@ -196,7 +191,6 @@ impl ToolExecutor {
                     description: call_label.clone(),
                 })
                 .await;
-            // Audit: every approval decision is recorded (Q18 B1).
             for access in &uncovered {
                 let _ = recorder
                     .emit_event(
@@ -406,8 +400,3 @@ impl ToolExecutor {
         }
     }
 }
-
-// silence unused-import lint until SecretKind / HookPhase are
-// referenced from event-emitting helpers landed in step 6.
-#[allow(dead_code)]
-fn _doc_anchors(_s: SecretKind, _p: HookPhase) {}

@@ -25,31 +25,13 @@
 //! Cancellation is via [`tokio_util::sync::CancellationToken`] — the
 //! request carries the parent's token; the runtime constructs a
 //! child token from it so propagation is automatic on cancel.
-//!
-//! Outstanding from the design (deferred to follow-up passes):
-//!  - `task_description` is currently passed as the child's first
-//!    user message verbatim. The design's "background summary"
-//!    Compression step (Q10 A3) needs an extra summarizer LLM call
-//!    threaded in.
-//!  - `must_include_context: Vec<SpanId | String>` is captured but
-//!    not yet rendered into the child prompt — needs the trace-tree
-//!    walker plus a renderer for span content.
-//!  - Multi-job child support: today the runtime returns on the
-//!    first `AgentOutput::Message` from the child. Q10 D2 calls for
-//!    "multi-job until terminal"; needs a richer completion signal
-//!    from the actor (currently ad-hoc).
-//!  - Tool-registry registration of `SpawnSubagentTool` so the LLM
-//!    sees it in the tool catalogue. AgentLoop currently special-cases
-//!    the tool name; once a real `Tool` impl is registered, this
-//!    becomes the standard tool catalogue entry.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, JobId, Lineage, LineageKind, MessageMetadata,
-    SessionId, User,
+    ChannelType, ContentBlock, JobId, Lineage, LineageKind, MessageMetadata, SessionId, User,
 };
 use aura_session::SessionManager;
 use chrono::Utc;
@@ -364,11 +346,6 @@ pub fn parse_spawn_request(value: &serde_json::Value) -> Result<SubagentSpawnReq
         timeout,
     })
 }
-
-// Suppress the unused `ChatMessage` import lint until the compression
-// step that takes parent's recent messages is added.
-#[allow(dead_code)]
-fn _doc_anchors(_m: ChatMessage) {}
 
 #[cfg(test)]
 mod tests {

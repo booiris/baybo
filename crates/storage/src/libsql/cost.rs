@@ -141,39 +141,12 @@ impl CostStore for LibsqlCostStore {
         month: &str,
         delta_usd: f64,
     ) -> CostResult<()> {
-        self.bump_user_monthly_cost_inner(user_id, month, delta_usd)
-            .await
-    }
-
-    async fn get_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-    ) -> CostResult<Option<UserMonthlyCost>> {
-        self.get_user_monthly_cost_inner(user_id, month).await
-    }
-
-    async fn purge_user_monthly_cost_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64> {
-        self.purge_user_monthly_cost_older_than_inner(cutoff).await
-    }
-}
-
-// Cache-related methods are appended into the main `impl CostStore`
-// block above via the merge below — kept grouped here for diff clarity.
-impl LibsqlCostStore {
-    async fn bump_user_monthly_cost_inner(
-        &self,
-        user_id: &str,
-        month: &str,
-        delta_usd: f64,
-    ) -> CostResult<()> {
         let conn = self.pool.conn();
         let now = time::now_us();
-        // Upsert: increment cost_usd if a live row exists, otherwise
-        // insert a new row. `INSERT OR REPLACE` would clobber the
-        // existing total, so we use `ON CONFLICT DO UPDATE` and reset
-        // `deleted_at` to NULL so re-bumping a soft-deleted row revives
-        // it (matches the storage-wide soft-delete protocol).
+        // ON CONFLICT DO UPDATE so a re-bump increments the running
+        // total instead of clobbering it; resetting deleted_at to NULL
+        // revives a soft-deleted row (matches the storage-wide
+        // soft-delete protocol).
         conn.execute(
             "INSERT INTO user_monthly_cost (user_id, month, cost_usd, updated_at, deleted_at) \
              VALUES (?1, ?2, ?3, ?4, NULL) \
@@ -188,7 +161,7 @@ impl LibsqlCostStore {
         Ok(())
     }
 
-    async fn get_user_monthly_cost_inner(
+    async fn get_user_monthly_cost(
         &self,
         user_id: &str,
         month: &str,
@@ -231,10 +204,7 @@ impl LibsqlCostStore {
         }
     }
 
-    async fn purge_user_monthly_cost_older_than_inner(
-        &self,
-        cutoff: DateTime<Utc>,
-    ) -> CostResult<u64> {
+    async fn purge_user_monthly_cost_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64> {
         let conn = self.pool.conn();
         let now = time::now_us();
         let affected = conn

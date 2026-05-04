@@ -35,3 +35,17 @@ pub enum CancelReason {
     /// job. See the hook-router protocol in `agent.md`.
     HookAborted,
 }
+
+impl CancelReason {
+    /// Snake-case wire tag matching the serde `rename_all` annotation.
+    pub fn as_snake_case(self) -> &'static str {
+        match self {
+            CancelReason::UserPreempt => "user_preempt",
+            CancelReason::SystemCrash => "system_crash",
+            CancelReason::SubagentTimeout => "subagent_timeout",
+            CancelReason::ParentCancelled => "parent_cancelled",
+            CancelReason::ParentDeleted => "parent_deleted",
+            CancelReason::HookAborted => "hook_aborted",
+        }
+    }
+}

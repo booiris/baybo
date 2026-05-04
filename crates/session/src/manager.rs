@@ -159,16 +159,15 @@ impl SessionManager {
         }
     }
 
-    /// Soft-delete a session by id. Errors with `SessionError::NotFound` if
-    /// the session did not exist at the time of the call so the operator
-    /// sees feedback instead of a silent no-op. Surfaces
+    /// Soft-delete a session by id. Errors with `SessionError::NotFound`
+    /// if the session did not exist at the time of the call. Surfaces
     /// `StorageError::HasLiveForks` (wrapped) when the session has live
     /// forks pointing at it.
     pub async fn delete(&self, session_id: &SessionId) -> Result<()> {
-        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+        let deleted = self.store.soft_delete(session_id).await.map_err(wrap)?;
+        if !deleted {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
-        self.store.soft_delete(session_id).await.map_err(wrap)?;
         debug!(session_id = %session_id, "deleted session");
         Ok(())
     }
@@ -195,9 +194,8 @@ impl SessionManager {
         let cutoff = Utc::now() - self.session_timeout;
         let expired_ids = self.store.list_expired(cutoff).await.map_err(wrap)?;
         let count = expired_ids.len();
-        for id in &expired_ids {
-            self.store.soft_delete(id).await.map_err(wrap)?;
-        }
+        let deletes = expired_ids.iter().map(|id| self.store.soft_delete(id));
+        futures::future::try_join_all(deletes).await.map_err(wrap)?;
         if count > 0 {
             debug!(count, "cleaned up expired sessions");
         }
@@ -241,9 +239,8 @@ mod tests {
             Ok(())
         }
 
-        async fn soft_delete(&self, session_id: &SessionId) -> StoreResult<()> {
-            self.data.lock().remove(session_id);
-            Ok(())
+        async fn soft_delete(&self, session_id: &SessionId) -> StoreResult<bool> {
+            Ok(self.data.lock().remove(session_id).is_some())
         }
 
         async fn list_expired(&self, before: DateTime<Utc>) -> StoreResult<Vec<SessionId>> {

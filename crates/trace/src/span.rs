@@ -95,6 +95,16 @@ pub enum SpanKind {
     },
 }
 
+impl SpanKind {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SpanKind::LlmCall { .. } => "llm_call",
+            SpanKind::ToolCall { .. } => "tool_call",
+            SpanKind::SubagentStub { .. } => "subagent_stub",
+        }
+    }
+}
+
 /// One tool_use block emitted by an LLM. Recorded inside the LLM
 /// span's `tool_calls` so the next iteration's tool spans can pair
 /// back via `ToolCallOrigin`.

@@ -97,7 +97,7 @@ impl SessionStore for LibsqlSessionStore {
         Ok(())
     }
 
-    async fn soft_delete(&self, session_id: &SessionId) -> Result<()> {
+    async fn soft_delete(&self, session_id: &SessionId) -> Result<bool> {
         // Atomic check-then-soft-delete: scan for any live `user_fork`
         // child pointing here; if any exists, return `HasLiveForks`
         // and do not touch the row.
@@ -109,12 +109,16 @@ impl SessionStore for LibsqlSessionStore {
         }
         let conn = self.pool.conn();
         let now = super::time::now_us();
-        conn.execute(
-            "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-            libsql::params![now, session_id.as_str().to_string()],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete session: {e}")))?;
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                libsql::params![now, session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete session: {e}")))?;
+        if affected == 0 {
+            return Ok(false);
+        }
         // Mirror the deletion onto cost_records.originating_session_deleted_at
         // so cost UIs can render 'source deleted' without join-back.
         conn.execute(
@@ -124,7 +128,7 @@ impl SessionStore for LibsqlSessionStore {
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql cost_records mirror: {e}")))?;
-        Ok(())
+        Ok(true)
     }
 
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>> {

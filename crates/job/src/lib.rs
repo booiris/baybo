@@ -125,6 +125,19 @@ impl JobStatusKind {
             JobStatusKind::Pending | JobStatusKind::InProgress | JobStatusKind::Stuck
         )
     }
+
+    /// Snake-case wire tag, matching the serde `rename_all` on
+    /// `JobStatus`. The `Display` impl uses PascalCase for human output.
+    pub fn as_snake_case(self) -> &'static str {
+        match self {
+            JobStatusKind::Pending => "pending",
+            JobStatusKind::InProgress => "in_progress",
+            JobStatusKind::Stuck => "stuck",
+            JobStatusKind::Cancelled => "cancelled",
+            JobStatusKind::Failed => "failed",
+            JobStatusKind::Completed => "completed",
+        }
+    }
 }
 
 impl std::fmt::Display for JobStatusKind {

@@ -51,6 +51,16 @@ pub enum SpanEventKind {
     },
 }
 
+impl SpanEventKind {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SpanEventKind::SanitizeHit { .. } => "sanitize_hit",
+            SpanEventKind::Approval { .. } => "approval",
+            SpanEventKind::HookDegraded { .. } => "hook_degraded",
+        }
+    }
+}
+
 impl SpanEvent {
     pub fn new(span_id: SpanId, seq: u32, kind: SpanEventKind) -> Self {
         Self {

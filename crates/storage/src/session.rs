@@ -20,6 +20,8 @@ pub trait SessionStore: Send + Sync {
     async fn save(&self, session: &Session) -> Result<()>;
     /// Soft-delete the session.
     ///
+    /// Returns `Ok(true)` if a live row was flipped to deleted, `Ok(false)`
+    /// if the row did not exist or was already deleted (idempotent).
     /// Returns `Err(StorageError::HasLiveForks { .. })` if any
     /// non-deleted session has a `LineageKind::UserFork` pointing into
     /// `session_id`. The check + soft-delete run in one transaction so
@@ -28,7 +30,7 @@ pub trait SessionStore: Send + Sync {
     /// Does **not** drain in-flight subagents — that is the
     /// `SessionManager`'s responsibility (cancel propagation through
     /// the actor token tree happens before this call).
-    async fn soft_delete(&self, session_id: &SessionId) -> Result<()>;
+    async fn soft_delete(&self, session_id: &SessionId) -> Result<bool>;
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>>;
     /// Return every live session, ordered by `last_active` descending.
     /// Operator-facing: drives `aura session list`.

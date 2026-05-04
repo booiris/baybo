@@ -42,33 +42,8 @@ use tokio_util::sync::CancellationToken;
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
 
-fn step_kind_tag(k: &StepKind) -> &'static str {
-    match k {
-        StepKind::LlmIteration => "llm_iteration",
-        StepKind::ToolDirect => "tool_direct",
-        StepKind::Compression => "compression",
-        StepKind::MemoryRecall => "memory_recall",
-        StepKind::MemoryWrite => "memory_write",
-        StepKind::SkillSelection => "skill_selection",
-        StepKind::Subagent { .. } => "subagent",
-    }
-}
-
-fn outcome_tag(o: &LifecycleOutcome) -> &'static str {
-    match o {
-        LifecycleOutcome::Pending => "pending",
-        LifecycleOutcome::Ok => "ok",
-        LifecycleOutcome::Failed { .. } => "failed",
-        LifecycleOutcome::Cancelled { .. } => "cancelled",
-    }
-}
-
 /// Per-call timeout for `PreStep` / `PostStep` hooks. A hook that
-/// overruns is treated as `Continue` (PreStep timeout = pass per
-/// design Patch 3) and a `tracing::warn` is emitted. Persisting a
-/// `SpanEvent::HookDegraded` for the audit trail is a step-6
-/// follow-up — `SpanEvent`s require a `span_id`, which the step
-/// boundary itself does not have, so a host-marker span needs design.
+/// overruns is treated as `Continue` and a `tracing::warn` is emitted.
 const STEP_HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Cap on attachments carried into the final `OutgoingMessage`. Tools
@@ -1137,10 +1112,6 @@ impl AgentLoop {
             .begin_step(
                 job_id,
                 StepKind::Subagent {
-                    // child_session_id / child_root_job_id are filled
-                    // in *after* the runtime returns — we record the
-                    // step's kind here with placeholders. The columnar
-                    // row will be re-saved when end_step lands.
                     child_session_id: aura_model::SessionId::from(""),
                     child_root_job_id: aura_model::JobId::new(),
                 },
@@ -1156,11 +1127,6 @@ impl AgentLoop {
             )
             .await?;
 
-        // Drive the runtime. Parent token isn't threaded down from
-        // the actor yet (TODO: wire `AgentActor.cancel_token` through
-        // `run`), so for the moment we mint a fresh token per spawn
-        // and the child cancellation tree dangles off it. Multi-level
-        // cancel cascade lands when the actor token plumbing arrives.
         let parent_token = CancellationToken::new();
         let result = runtime.spawn(session, job_id, request, parent_token).await;
 
@@ -1189,12 +1155,10 @@ impl AgentLoop {
         Ok(result.to_tool_result_text())
     }
 
-    /// Fire `PreStep` synchronously with a per-call timeout.
-    ///
     /// Returns `Err(())` only when the hook chain returns
     /// `HookAction::Abort` (the surrounding job is then cancelled by
-    /// the caller). On `Block` or timeout we proceed (default-allow
-    /// per design Patch 3); a `tracing::warn` is emitted on timeout.
+    /// the caller). On `Block` or timeout we proceed (default-allow);
+    /// a `tracing::warn` is emitted on timeout.
     async fn fire_pre_step(
         &self,
         session: &Session,
@@ -1209,7 +1173,7 @@ impl AgentLoop {
             user_id: Some(session.user.id.clone()),
             event_data: HookEventData::PreStep {
                 job_id: job_id.to_string(),
-                step_kind: step_kind_tag(step_kind).to_string(),
+                step_kind: step_kind.tag().to_string(),
             },
             message: None,
             response: None,
@@ -1261,8 +1225,8 @@ impl AgentLoop {
             event_data: HookEventData::PostStep {
                 job_id: job_id.to_string(),
                 step_id: step_id.to_string(),
-                step_kind: step_kind_tag(step_kind).to_string(),
-                outcome: outcome_tag(outcome).to_string(),
+                step_kind: step_kind.tag().to_string(),
+                outcome: outcome.tag().to_string(),
             },
             message: None,
             response: None,

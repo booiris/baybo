@@ -31,6 +31,15 @@ impl LifecycleOutcome {
     pub fn is_terminal(&self) -> bool {
         !matches!(self, LifecycleOutcome::Pending)
     }
+
+    pub fn tag(&self) -> &'static str {
+        match self {
+            LifecycleOutcome::Pending => "pending",
+            LifecycleOutcome::Ok => "ok",
+            LifecycleOutcome::Failed { .. } => "failed",
+            LifecycleOutcome::Cancelled { .. } => "cancelled",
+        }
+    }
 }
 
 #[cfg(test)]

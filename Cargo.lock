@@ -621,6 +621,7 @@ dependencies = [
  "aura-model",
  "aura-storage",
  "chrono",
+ "futures",
  "parking_lot",
  "thiserror 2.0.18",
  "tokio",

@@ -11,8 +11,7 @@ use super::LibsqlPool;
 use crate::trace::{TraceEventStore, TraceLogEvent, TraceStore};
 use aura_model::{JobId, SessionId, SpanId, StepId};
 use aura_trace::{
-    LifecycleOutcome, RecoveredSpan, RecoveryReport, Span, SpanEvent, SpanEventKind, SpanKind,
-    Step, StepKind, TraceError,
+    LifecycleOutcome, RecoveredSpan, RecoveryReport, Span, SpanEvent, Step, TraceError,
 };
 
 pub struct LibsqlTraceStore {
@@ -35,43 +34,6 @@ impl LibsqlTraceEventStore {
     }
 }
 
-fn step_kind_str(k: &StepKind) -> &'static str {
-    match k {
-        StepKind::LlmIteration => "llm_iteration",
-        StepKind::ToolDirect => "tool_direct",
-        StepKind::Compression => "compression",
-        StepKind::MemoryRecall => "memory_recall",
-        StepKind::MemoryWrite => "memory_write",
-        StepKind::SkillSelection => "skill_selection",
-        StepKind::Subagent { .. } => "subagent",
-    }
-}
-
-fn span_kind_str(k: &SpanKind) -> &'static str {
-    match k {
-        SpanKind::LlmCall { .. } => "llm_call",
-        SpanKind::ToolCall { .. } => "tool_call",
-        SpanKind::SubagentStub { .. } => "subagent_stub",
-    }
-}
-
-fn span_event_kind_str(k: &SpanEventKind) -> &'static str {
-    match k {
-        SpanEventKind::SanitizeHit { .. } => "sanitize_hit",
-        SpanEventKind::Approval { .. } => "approval",
-        SpanEventKind::HookDegraded { .. } => "hook_degraded",
-    }
-}
-
-fn outcome_str(o: &LifecycleOutcome) -> &'static str {
-    match o {
-        LifecycleOutcome::Pending => "pending",
-        LifecycleOutcome::Ok => "ok",
-        LifecycleOutcome::Failed { .. } => "failed",
-        LifecycleOutcome::Cancelled { .. } => "cancelled",
-    }
-}
-
 #[async_trait]
 impl TraceStore for LibsqlTraceStore {
     async fn save_step(&self, step: &Step) -> aura_trace::Result<()> {
@@ -85,10 +47,10 @@ impl TraceStore for LibsqlTraceStore {
             libsql::params![
                 step.id.to_string(),
                 step.job_id.to_string(),
-                step_kind_str(&step.kind).to_string(),
+                step.kind.tag().to_string(),
                 super::time::to_us(step.started_at),
                 step.ended_at.map(super::time::to_us),
-                outcome_str(&step.outcome).to_string(),
+                step.outcome.tag().to_string(),
                 data,
             ],
         )
@@ -161,11 +123,11 @@ impl TraceStore for LibsqlTraceStore {
             libsql::params![
                 span.id.to_string(),
                 span.step_id.to_string(),
-                span_kind_str(&span.kind).to_string(),
+                span.kind.tag().to_string(),
                 span.parallel_group.map(|g| g.to_string()),
                 super::time::to_us(span.started_at),
                 span.ended_at.map(super::time::to_us),
-                outcome_str(&span.outcome).to_string(),
+                span.outcome.tag().to_string(),
                 data,
             ],
         )
@@ -238,7 +200,7 @@ impl TraceStore for LibsqlTraceStore {
                 event.span_id.to_string(),
                 event.seq as i64,
                 super::time::to_us(event.at),
-                span_event_kind_str(&event.kind).to_string(),
+                event.kind.tag().to_string(),
                 data,
             ],
         )
@@ -405,7 +367,7 @@ impl TraceEventStore for LibsqlTraceEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_trace::ToolCallOrigin;
+    use aura_trace::{SpanEventKind, SpanKind, StepKind, ToolCallOrigin};
 
     fn make_step(job_id: JobId) -> Step {
         Step {

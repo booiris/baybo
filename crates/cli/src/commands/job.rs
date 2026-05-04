@@ -27,11 +27,6 @@ impl From<JobStatusArg> for JobStatusKind {
             JobStatusArg::Pending => JobStatusKind::Pending,
             JobStatusArg::InProgress => JobStatusKind::InProgress,
             JobStatusArg::Completed => JobStatusKind::Completed,
-            // Submitted/Accepted no longer exist as top-level statuses;
-            // they are verification substates of Completed. Map to
-            // Completed so the CLI filter still surfaces them.
-            JobStatusArg::Submitted => JobStatusKind::Completed,
-            JobStatusArg::Accepted => JobStatusKind::Completed,
             JobStatusArg::Failed => JobStatusKind::Failed,
             JobStatusArg::Stuck => JobStatusKind::Stuck,
         }

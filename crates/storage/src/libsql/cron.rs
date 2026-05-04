@@ -13,41 +13,35 @@ impl LibsqlCronStore {
     }
 }
 
+fn col_string(row: &libsql::Row, i: i32) -> crate::cron::Result<String> {
+    row.get::<String>(i)
+        .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
+}
+
+fn col_i64(row: &libsql::Row, i: i32) -> crate::cron::Result<i64> {
+    row.get::<i64>(i)
+        .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
+}
+
 fn read_job_row(row: &libsql::Row) -> crate::cron::Result<CronJobRow> {
-    let s = |i| {
-        row.get::<String>(i)
-            .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
-    };
-    let n = |i| {
-        row.get::<i64>(i)
-            .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
-    };
     Ok(CronJobRow {
-        id: s(0)?,
-        user_id: s(1)?,
-        status: s(2)?,
-        next_trigger_at: n(3)?,
-        data: s(4)?,
+        id: col_string(row, 0)?,
+        user_id: col_string(row, 1)?,
+        status: col_string(row, 2)?,
+        next_trigger_at: col_i64(row, 3)?,
+        data: col_string(row, 4)?,
     })
 }
 
 fn read_execution_row(row: &libsql::Row) -> crate::cron::Result<CronExecutionRow> {
-    let s = |i| {
-        row.get::<String>(i)
-            .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
-    };
-    let n = |i| {
-        row.get::<i64>(i)
-            .map_err(|e| CronStoreError::Internal(format!("libsql get column {i}: {e}")))
-    };
     Ok(CronExecutionRow {
-        id: s(0)?,
-        job_id: s(1)?,
-        user_id: s(2)?,
-        scheduled_fire_time: n(3)?,
-        triggered_at: n(4)?,
-        status: s(5)?,
-        data: s(6)?,
+        id: col_string(row, 0)?,
+        job_id: col_string(row, 1)?,
+        user_id: col_string(row, 2)?,
+        scheduled_fire_time: col_i64(row, 3)?,
+        triggered_at: col_i64(row, 4)?,
+        status: col_string(row, 5)?,
+        data: col_string(row, 6)?,
     })
 }
 

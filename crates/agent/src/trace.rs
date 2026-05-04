@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use aura_job::CancelReason;
 use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
 use aura_storage::{TraceEventStore, TraceLogEvent, TraceLogEventKind, TraceStore};
 use aura_trace::{
@@ -168,7 +167,7 @@ impl SpanRecorder {
             job_id,
             TraceLogEventKind::StepBegin {
                 step_id: step.id,
-                payload: serde_json::json!({ "kind": kind_step_tag(&kind) }),
+                payload: serde_json::json!({ "kind": kind.tag() }),
             },
         )
         .await;
@@ -200,7 +199,7 @@ impl SpanRecorder {
             TraceLogEventKind::StepEnd {
                 step_id: handle.step_id,
                 payload: serde_json::json!({
-                    "outcome": outcome_tag(&outcome),
+                    "outcome": outcome.tag(),
                 }),
             },
         )
@@ -234,7 +233,7 @@ impl SpanRecorder {
             events: Vec::new(),
         };
         let handle = SpanHandle::new(span.id, span.step_id);
-        let kind_tag = span_kind_tag(&kind);
+        let kind_tag = kind.tag();
         self.trace_store.save_span(&span).await?;
         self.append_log_event(
             step.job_id,
@@ -297,7 +296,7 @@ impl SpanRecorder {
                 output_tokens: *output_tokens,
             });
         }
-        let kind_tag = span_kind_tag(&final_kind);
+        let kind_tag = final_kind.tag();
         span.kind = final_kind;
         self.trace_store.save_span(&span).await?;
         self.append_log_event(
@@ -306,7 +305,7 @@ impl SpanRecorder {
                 span_id: handle.span_id,
                 step_id: handle.step_id,
                 payload: serde_json::json!({
-                    "outcome": outcome_tag(&outcome),
+                    "outcome": outcome.tag(),
                     "kind": kind_tag,
                 }),
             },
@@ -357,92 +356,16 @@ impl SpanRecorder {
     }
 }
 
-fn kind_step_tag(k: &StepKind) -> &'static str {
-    match k {
-        StepKind::LlmIteration => "llm_iteration",
-        StepKind::ToolDirect => "tool_direct",
-        StepKind::Compression => "compression",
-        StepKind::MemoryRecall => "memory_recall",
-        StepKind::MemoryWrite => "memory_write",
-        StepKind::SkillSelection => "skill_selection",
-        StepKind::Subagent { .. } => "subagent",
-    }
-}
-
-fn span_kind_tag(k: &SpanKind) -> &'static str {
-    match k {
-        SpanKind::LlmCall { .. } => "llm_call",
-        SpanKind::ToolCall { .. } => "tool_call",
-        SpanKind::SubagentStub { .. } => "subagent_stub",
-    }
-}
-
-fn outcome_tag(o: &LifecycleOutcome) -> &'static str {
-    match o {
-        LifecycleOutcome::Pending => "pending",
-        LifecycleOutcome::Ok => "ok",
-        LifecycleOutcome::Failed { .. } => "failed",
-        LifecycleOutcome::Cancelled { .. } => "cancelled",
-    }
-}
-
-// Silence unused-import if `CancelReason` is referenced only through
-// `LifecycleOutcome::Cancelled` payload from downstream — keeps the
-// import explicit so future maintainers can grep.
-#[allow(dead_code)]
-fn _cancel_anchor(r: CancelReason) -> CancelReason {
-    r
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_storage::test_support::MemoryTraceStore;
-    use parking_lot::Mutex;
-    use std::collections::HashMap;
-
-    /// Trivial in-memory `TraceEventStore` for tests.
-    #[derive(Default)]
-    struct MemoryEventStore {
-        by_session: Mutex<HashMap<SessionId, Vec<TraceLogEvent>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl TraceEventStore for MemoryEventStore {
-        async fn append(&self, event: &TraceLogEvent) -> aura_trace::Result<()> {
-            self.by_session
-                .lock()
-                .entry(event.session_id.clone())
-                .or_default()
-                .push(event.clone());
-            Ok(())
-        }
-
-        async fn replay_session(
-            &self,
-            session_id: &SessionId,
-        ) -> aura_trace::Result<Vec<TraceLogEvent>> {
-            Ok(self
-                .by_session
-                .lock()
-                .get(session_id)
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        async fn compact_before(
-            &self,
-            _cutoff: chrono::DateTime<chrono::Utc>,
-        ) -> aura_trace::Result<u64> {
-            Ok(0)
-        }
-    }
+    use aura_storage::test_support::{MemoryTraceEventStore, MemoryTraceStore};
 
     fn make_recorder() -> SpanRecorder {
         SpanRecorder::new(
             SessionId::from("cli-test"),
             Arc::new(MemoryTraceStore::new()),
-            Arc::new(MemoryEventStore::default()),
+            Arc::new(MemoryTraceEventStore::default()),
         )
     }
 

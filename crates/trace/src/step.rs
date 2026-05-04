@@ -55,6 +55,20 @@ pub enum StepKind {
     },
 }
 
+impl StepKind {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            StepKind::LlmIteration => "llm_iteration",
+            StepKind::ToolDirect => "tool_direct",
+            StepKind::Compression => "compression",
+            StepKind::MemoryRecall => "memory_recall",
+            StepKind::MemoryWrite => "memory_write",
+            StepKind::SkillSelection => "skill_selection",
+            StepKind::Subagent { .. } => "subagent",
+        }
+    }
+}
+
 /// Opaque handle returned by `SpanRecorder::begin_step`. Carries
 /// enough context to call `end_step(handle, outcome)` later.
 #[derive(Debug, Clone, PartialEq, Eq)]

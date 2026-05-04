@@ -75,7 +75,7 @@ async fn get_trace(
         }
         job_blocks.push(json!({
             "job_id": job.id.to_string(),
-            "job_status_kind": format!("{:?}", job.status.kind()),
+            "job_status_kind": job.status.kind().as_snake_case(),
             "steps": step_blocks,
         }));
     }

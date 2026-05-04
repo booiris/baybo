@@ -331,7 +331,7 @@ impl From<aura_job::JobStatus> for JobStatus {
             } => Self {
                 kind,
                 reason: None,
-                cancel_reason: Some(format!("{reason:?}")),
+                cancel_reason: Some(reason.as_snake_case().to_string()),
                 partial_artifacts: partial_artifacts
                     .into_iter()
                     .map(|s| s.to_string())
@@ -343,7 +343,7 @@ impl From<aura_job::JobStatus> for JobStatus {
                 reason: None,
                 cancel_reason: None,
                 partial_artifacts: Vec::new(),
-                verification: Some(format!("{verification:?}")),
+                verification: Some(verification.outcome_tag().to_string()),
             },
         }
     }

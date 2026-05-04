@@ -43,6 +43,8 @@ pub enum QueryError {
     Cost(#[from] CostError),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
@@ -134,6 +136,26 @@ pub struct LineageNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via_kind: Option<LineageKind>,
     pub children: Vec<LineageNode>,
+}
+
+fn build_lineage_node(
+    id: SessionId,
+    via_kind: Option<LineageKind>,
+    edges: &HashMap<SessionId, Vec<(SessionId, LineageKind)>>,
+) -> LineageNode {
+    let children = edges
+        .get(&id)
+        .map(|kids| {
+            kids.iter()
+                .map(|(cid, kind)| build_lineage_node(cid.clone(), Some(kind.clone()), edges))
+                .collect()
+        })
+        .unwrap_or_default();
+    LineageNode {
+        session_id: id,
+        via_kind,
+        children,
+    }
 }
 
 /// Scope for `cost_summary`.
@@ -331,37 +353,25 @@ impl QueryApi {
     /// indicates a bug and we'd rather truncate than stack overflow.
     pub async fn lineage_tree(&self, root_session_id: &SessionId) -> Result<LineageNode> {
         const MAX_DEPTH: usize = 32;
-        // Manual iteration with a queue: avoids recursive async fn
-        // boxing (would otherwise need `BoxFuture`).
-        let mut node = LineageNode {
-            session_id: root_session_id.clone(),
-            via_kind: None,
-            children: Vec::new(),
-        };
-        let mut stack: Vec<(*mut LineageNode, SessionId, usize)> =
-            vec![(&mut node as *mut _, root_session_id.clone(), 0)];
-        while let Some((parent_ptr, parent_id, depth)) = stack.pop() {
+        // BFS to fetch every parent → children edge, then assemble the
+        // tree in safe code. Two passes so the async fetch loop owns no
+        // node references that could be invalidated by a later push.
+        let mut edges: HashMap<SessionId, Vec<(SessionId, LineageKind)>> = HashMap::new();
+        let mut frontier: Vec<(SessionId, usize)> = vec![(root_session_id.clone(), 0)];
+        while let Some((parent_id, depth)) = frontier.pop() {
             if depth >= MAX_DEPTH {
                 continue;
             }
             let kids = self.sessions.list_lineage_children(&parent_id).await?;
             for (cid, kind) in kids {
-                let child = LineageNode {
-                    session_id: cid.clone(),
-                    via_kind: Some(kind),
-                    children: Vec::new(),
-                };
-                // Safety: we hold the parent_ptr exclusively in this
-                // single-threaded loop; nothing else mutates the node
-                // tree during the walk.
-                unsafe {
-                    (*parent_ptr).children.push(child);
-                    let last = (*parent_ptr).children.last_mut().unwrap();
-                    stack.push((last as *mut _, cid, depth + 1));
-                }
+                edges
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push((cid.clone(), kind));
+                frontier.push((cid, depth + 1));
             }
         }
-        Ok(node)
+        Ok(build_lineage_node(root_session_id.clone(), None, &edges))
     }
 
     // ── 8. cost_summary ────────────────────────────────────────
@@ -380,59 +390,14 @@ impl QueryApi {
                 }
                 Ok(summary)
             }
-            CostScope::Session(session_id) => {
-                let range = TimeRange {
-                    from: DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now),
-                    to: Utc::now() + chrono::Duration::days(1),
-                };
-                // No CostStore method filters by session today; do the
-                // walk manually. This is fine for a v1 admin endpoint
-                // — heavy aggregation would belong on a dedicated
-                // index.
-                let summary = self
-                    .cost_summary_for(|r| r.session_id == session_id, range)
-                    .await?;
-                Ok(summary)
-            }
-            CostScope::Job(job_id) => {
-                let range = TimeRange {
-                    from: DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now),
-                    to: Utc::now() + chrono::Duration::days(1),
-                };
-                let summary = self.cost_summary_for(|r| r.job_id == job_id, range).await?;
-                Ok(summary)
-            }
+            CostScope::Session(_) => Err(QueryError::Unsupported(
+                "cost_summary by session requires CostStore::query_session — not implemented yet"
+                    .into(),
+            )),
+            CostScope::Job(_) => Err(QueryError::Unsupported(
+                "cost_summary by job requires CostStore::query_job — not implemented yet".into(),
+            )),
         }
-    }
-
-    async fn cost_summary_for<F>(&self, predicate: F, range: TimeRange) -> Result<CostSummary>
-    where
-        F: Fn(&aura_storage::CostRecord) -> bool,
-    {
-        // Walk every user touched by the time range. The CostStore
-        // exposes `query_user` and `query_global`, but no
-        // `query_session` / `query_job` — so we walk through global
-        // records and filter in-process. Acceptable for the v1
-        // admin surface; a dedicated index would replace this path
-        // when traffic warrants.
-        let global_records = {
-            // No global-records-with-rows method exists; query for
-            // every user encountered. Cheap shortcut: derive user
-            // list from the session+job we care about by looking up
-            // their owning user. Not threaded yet — fall back to
-            // empty for now and document.
-            let _ = predicate;
-            let _ = range;
-            Vec::<aura_storage::CostRecord>::new()
-        };
-        let mut summary = CostSummary::default();
-        for r in global_records {
-            summary.total_cost_usd += r.cost_usd;
-            summary.total_input_tokens += r.input_tokens;
-            summary.total_output_tokens += r.output_tokens;
-            summary.record_count += 1;
-        }
-        Ok(summary)
     }
 
     // ── 9. replay ──────────────────────────────────────────────
@@ -550,8 +515,8 @@ mod tests {
                 .insert(session.id.clone(), session.clone());
             Ok(())
         }
-        async fn soft_delete(&self, _id: &SessionId) -> std::result::Result<(), StorageError> {
-            Ok(())
+        async fn soft_delete(&self, _id: &SessionId) -> std::result::Result<bool, StorageError> {
+            Ok(true)
         }
         async fn list_expired(
             &self,
