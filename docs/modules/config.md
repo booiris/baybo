@@ -2,11 +2,11 @@
 
 ## Overview
 
-The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `validate()` method. It centralizes settings that were previously scattered across individual crates or hardcoded in `main.rs` (session timeout, token budget, channel buffer sizes, trace snapshot interval, rate limits, etc.).
+The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `validate()` method. It centralizes settings that were previously scattered across individual crates or hardcoded in `main.rs` (session timeout, token budget, channel buffer sizes, rate limits, etc.).
 
 A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consumers (`main.rs` and `aura-agent`) map each section into the corresponding domain type.
 
-Top-level sections: `llm`, `agent`, `session`, `channels`, `security`, `skills`, `tools`, `trace`, `cost`, `workspace`.
+Top-level sections: `llm`, `agent`, `session`, `channels`, `security`, `skills`, `tools`, `cost`, `workspace`.
 
 > **MCP status note.** MCP server records do **not** live in `aura.json`.
 > They live in `<workspace>/.mcp.json`, owned by `aura-tools::mcp` (config
@@ -19,7 +19,7 @@ There is no `storage` section. Storage paths are **derived** from the project ro
 
 ## Current status
 
-`AuraConfig` is implemented and unit-tested, but bootstrap does not yet consume it. `src/main.rs` still builds `LlmClient` directly from environment variables (`AURA_LLM_PROVIDER`, `OPENAI_API_KEY`, …) and hardcodes session timeout, tool timeout, mpsc buffer sizes, context budget, trace snapshot cadence, and the dev master key. The remaining wiring work:
+`AuraConfig` is implemented and unit-tested, but bootstrap does not yet consume it. `src/main.rs` still builds `LlmClient` directly from environment variables (`AURA_LLM_PROVIDER`, `OPENAI_API_KEY`, …) and hardcodes session timeout, tool timeout, mpsc buffer sizes, context budget, and the dev master key. The remaining wiring work:
 
 - Load `AuraConfig` in `main.rs` and map each section to its domain type.
 - Replace `build_llm_client_from_env()` with a `LlmConfig → LlmProviderConfig` mapping (see §"Section boundaries" for `fallback_model` orchestration).
@@ -67,7 +67,7 @@ Required-ness beyond serde (non-empty strings, numeric ranges, URL schemes) is e
 
 ### JSON format (not TOML or YAML)
 
-JSON is the sole supported format. It has the widest tooling support, round-trips through `serde_json`, and matches the project's existing use of JSON for hook I/O and trace payloads.
+JSON is the sole supported format. It has the widest tooling support, round-trips through `serde_json`, and matches the project's existing use of JSON for trace payloads.
 
 ### Unknown fields
 
@@ -95,7 +95,6 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
 | `skills`   | `aura_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
 | `tools`    | `ToolExecutor` default timeout (MCP server list returns with reintroduction) |                                                                                                                                                                                      |
-| `trace`    | `TraceCollector` auto-snapshot and interval                 |                                                                                                                                                                                                      |
 | `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
 | `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/storage.db`).                                                                      |
 
@@ -125,17 +124,14 @@ Principle: a module earns a config section when operators need to tune it in pro
 
 ## Reload semantics
 
-`aura-config` has **no reload API today**. Configuration is loaded once at startup; live changes require a process restart. The `ConfigChange` hook in `aura-hook` exists for future hot-reload support and for startup-time provenance, not for current runtime mutation.
+`aura-config` has **no reload API today**. Configuration is loaded once at startup; live changes require a process restart.
 
 When hot reload is implemented, the following contract must be in place **before** reload code lands:
 
-- **Hot-updatable fields** — an explicit whitelist. Plausible candidates: `cost.rate_limit.*`, `cost.spending_limits.*`, `trace.snapshot_interval`, `security.leak_detection_enabled`. Clearly not hot-updatable: `channels.http.port`, `channels.http.bind_address`, anything influencing `llm` client identity.
+- **Hot-updatable fields** — an explicit whitelist. Plausible candidates: `cost.rate_limit.*`, `cost.spending_limits.*`, `security.leak_detection_enabled`. Clearly not hot-updatable: `channels.http.port`, `channels.http.bind_address`, anything influencing `llm` client identity.
 - **Atomic swap** — a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden.
 - **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError::Validation` to the caller; no partial state is exposed.
 - **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config.
-- **Provenance** — every successful reload emits a `ConfigChange` hook event with the old/new config hashes, and `trace` records the transition in `ExecutionProvenance`.
-
-Until reload is implemented, `ConfigChange` fires exactly once at startup (for provenance) and any "reload" is restart-mediated.
 
 ## Validation Rules
 
@@ -163,7 +159,6 @@ Until reload is implemented, `ConfigChange` fires exactly once at startup (for p
 | `cost.spending_limits.*_usd`          | if set, strictly positive, finite                    |
 | `cost.spending_limits.user_*`         | cross-field: `daily_usd ≤ monthly_usd` when both set |
 | `cost.rate_limit.*`                   | `max_requests ≥ 1`, `window_secs ≥ 1`                |
-| `trace.snapshot_interval`             | ≥ 1 when `auto_snapshot` is true                     |
 
 ### Cross-section rules
 
@@ -193,7 +188,7 @@ Cross-section rules are part of the default `validate()` pass. A future strict-l
 | Module     | Role                                                                                                                                                                                   |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main.rs`  | Loads the config at startup, maps each section into domain types, passes them down                                                                                                     |
-| `agent`    | Consumes `AgentConfig`, `SessionConfig`, `TraceConfig`, `CostConfig`                                                                                                                   |
+| `agent`    | Consumes `AgentConfig`, `SessionConfig`, `CostConfig`                                                                                                                                  |
 | `llm`      | Receives `LlmProviderConfig` built from `LlmConfig`                                                                                                                                    |
 | `tools`    | Receives `ToolsConfig::default_timeout_ms`. (Once MCP lands again, it will also receive `McpServerConfig` list built from `ToolsConfig::mcp_servers`.)                                 |
 | `channels` | Channel adapters are registered based on `ChannelsConfig` section enablement                                                                                                           |

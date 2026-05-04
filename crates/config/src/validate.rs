@@ -1,12 +1,13 @@
+use std::collections::HashSet;
+
 use crate::AuraConfig;
 use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
 use crate::error::{ConfigError, ValidationError};
 use crate::gateway::GatewayConfig;
-use crate::llm::LlmConfig;
+use crate::llm::LlmEntry;
 use crate::session::SessionConfig;
 use crate::tools::ToolsConfig;
-use crate::trace::TraceConfig;
 use crate::workspace::WorkspaceConfig;
 
 impl AuraConfig {
@@ -15,12 +16,11 @@ impl AuraConfig {
     /// of problems otherwise.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
-        validate_llm(&self.llm, &mut errors);
+        validate_llm_entries(&self.llm, &mut errors);
         validate_agent(self, &mut errors);
         validate_session(&self.session, &mut errors);
         validate_channels(&self.channels, &mut errors);
         validate_tools(&self.tools, &mut errors);
-        validate_trace(&self.trace, &mut errors);
         validate_cost(&self.cost, &mut errors);
         validate_workspace(&self.workspace, &mut errors);
         validate_gateway(&self.gateway, &mut errors);
@@ -33,28 +33,46 @@ impl AuraConfig {
     }
 }
 
-fn validate_llm(llm: &LlmConfig, errors: &mut Vec<ValidationError>) {
-    if llm.provider.trim().is_empty() {
-        errors.push(ValidationError::new("llm.provider", "must be non-empty"));
-    }
-    if llm.model.trim().is_empty() {
-        errors.push(ValidationError::new("llm.model", "must be non-empty"));
-    }
-    if let Some(url) = &llm.base_url
-        && !is_http_url(url)
-    {
-        errors.push(ValidationError::new(
-            "llm.base_url",
-            "must start with http:// or https://",
-        ));
-    }
-    if let Some(fallback) = &llm.fallback_model
-        && fallback.trim().is_empty()
-    {
-        errors.push(ValidationError::new(
-            "llm.fallback_model",
-            "must be non-empty when set",
-        ));
+fn validate_llm_entries(entries: &[LlmEntry], errors: &mut Vec<ValidationError>) {
+    // An empty list is valid: a fresh install has no LLM configured
+    // until `aura llm add` runs. Runtime paths that actually need an
+    // LLM (boot's build_llm_client, agent loop) error there with a
+    // pointer to `aura llm add`.
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let prefix = format!("llm[{i}]");
+        if entry.name.trim().is_empty() {
+            errors.push(ValidationError::new(
+                format!("{prefix}.name"),
+                "must be non-empty",
+            ));
+        } else if !seen.insert(entry.name.as_str()) {
+            errors.push(ValidationError::new(
+                format!("{prefix}.name"),
+                format!("duplicate entry name {:?} in llm list", entry.name),
+            ));
+        }
+        if entry.provider.trim().is_empty() {
+            errors.push(ValidationError::new(
+                format!("{prefix}.provider"),
+                "must be non-empty",
+            ));
+        }
+        if entry.model.trim().is_empty() {
+            errors.push(ValidationError::new(
+                format!("{prefix}.model"),
+                "must be non-empty",
+            ));
+        }
+        if let Some(url) = &entry.base_url
+            && !is_http_url(url)
+        {
+            errors.push(ValidationError::new(
+                format!("{prefix}.base_url"),
+                "must start with http:// or https://",
+            ));
+        }
+        validate_llm_secret_source(entry, &prefix, errors);
     }
 }
 
@@ -175,15 +193,6 @@ fn validate_tools(tools: &ToolsConfig, errors: &mut Vec<ValidationError>) {
     }
 }
 
-fn validate_trace(trace: &TraceConfig, errors: &mut Vec<ValidationError>) {
-    if trace.auto_snapshot && trace.snapshot_interval == 0 {
-        errors.push(ValidationError::new(
-            "trace.snapshot_interval",
-            "must be >= 1 when auto_snapshot is true",
-        ));
-    }
-}
-
 fn validate_cost(cost: &CostConfig, errors: &mut Vec<ValidationError>) {
     let limits = &cost.spending_limits;
     check_positive(
@@ -261,7 +270,46 @@ fn validate_gateway(gateway: &GatewayConfig, errors: &mut Vec<ValidationError>) 
 /// section is internally coherent.
 fn validate_cross_section(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
     validate_encryption_key_source(&config.security, errors);
-    validate_llm_secret_source(&config.llm, errors);
+    validate_default_llm(config, errors);
+}
+
+fn validate_default_llm(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+    // Empty `default-llm` is fine when `llm` is empty too — a fresh
+    // install has nothing to point at. Once any entry exists,
+    // `default-llm` must name one of them.
+    if config.llm.is_empty() {
+        return;
+    }
+    if config.default_llm.trim().is_empty() {
+        errors.push(ValidationError::new(
+            "default-llm",
+            format!(
+                "must name one of the entries in `llm`: [{}]",
+                config
+                    .llm
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        ));
+        return;
+    }
+    if !config.llm.iter().any(|e| e.name == config.default_llm) {
+        errors.push(ValidationError::new(
+            "default-llm",
+            format!(
+                "no entry named {:?} in `llm`; existing names: [{}]",
+                config.default_llm,
+                config
+                    .llm
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        ));
+    }
 }
 
 fn validate_encryption_key_source(
@@ -278,20 +326,21 @@ fn validate_encryption_key_source(
     }
 }
 
-/// If `llm.api_key` is explicitly present it must be non-empty. When absent,
-/// runtime falls back to provider-specific env vars (resolved outside of
-/// `validate()`), so we do not demand anything here.
-fn validate_llm_secret_source(llm: &LlmConfig, errors: &mut Vec<ValidationError>) {
-    if let Some(name) = &llm.api_key_env {
+/// If `entry.api_key_env` is explicitly present it must name a valid
+/// environment variable. When absent, runtime falls back to
+/// provider-specific env vars (resolved outside of `validate()`), so we
+/// do not demand anything here.
+fn validate_llm_secret_source(entry: &LlmEntry, prefix: &str, errors: &mut Vec<ValidationError>) {
+    if let Some(name) = &entry.api_key_env {
         let trimmed = name.trim();
         if trimmed.is_empty() {
             errors.push(ValidationError::new(
-                "llm.api_key_env",
+                format!("{prefix}.api_key_env"),
                 "must be non-empty when set (omit the field to fall back to env vars)",
             ));
         } else if !is_env_var_name(trimmed) {
             errors.push(ValidationError::new(
-                "llm.api_key_env",
+                format!("{prefix}.api_key_env"),
                 "must be a valid environment variable name (letters, digits, underscores; \
                  not starting with a digit). Store the secret in the environment, not here.",
             ));

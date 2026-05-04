@@ -102,7 +102,7 @@ Listed so future contributors see the gap explicitly. Each one waits for its sub
 - **IDE / external bridges**: `acp`, `mcp serve`, `dashboard` — out of scope until the corresponding subsystems exist. The MCP **client** ships as `aura mcp {add,list,get,remove}` (see the row above); only the *server-side* `mcp serve` family remains deferred. (`tui` has landed as the built-in `TuiAdapter`; see [`channels.md`](./channels.md) and [`tui.md`](./tui.md).)
 - **Rich media**: `browser`, inference over image/audio/video/tts — no Aura counterpart.
 - **Plugin distribution & installer**: `plugins`, `backup`, `update`, `uninstall`, `setup`, `onboard`, `reset` — release-engineering concerns, not runtime.
-- **Auxiliary directories**: `directory`, `wiki`, `webhooks`, `dns`, `hooks install/update` — deferred until each subsystem lands.
+- **Auxiliary directories**: `directory`, `wiki`, `webhooks`, `dns` — deferred until each subsystem lands.
 
 Each family is added under the same naming scheme when its subsystem ships.
 
@@ -134,7 +134,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 - `aura-cli` holds no mutable state; all managers are `Arc`. The crate is `Send + Sync + 'static`.
 - Slash input **must not** be forwarded to the agent when it parses as a known CLI command. Unknown `/` input (parse error `UnknownCommand`) falls back to `PassThrough` only if the dispatcher explicitly says so — never by default. The skill shortcut is the one sanctioned `PassThrough` path: a `/<token>` whose first token matches a user-invocable skill is forwarded to the agent as a normal chat message.
-- Commands that mutate must route their effect through the manager (never touching a store directly), so traces and hooks fire naturally.
+- Commands that mutate must route their effect through the manager (never touching a store directly), so traces fire naturally.
 - The `SecretVault` value of any secret is never rendered; `security` and `config` commands redact to `********`.
 - No `unwrap` / `expect` in command handlers. Parser-level `expect` on derive macros is acceptable.
 - Every **shipped** command family has at least one parser test and one dispatch test. Deferred families do not appear in the clap tree at all until their subsystem lands, so there is nothing to test yet.

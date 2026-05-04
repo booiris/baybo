@@ -24,7 +24,10 @@
 //! the "same-UID attacker has already won" threat model is the boundary;
 //! we don't need kernel-level peer-credential checks on top.
 
-use super::token::{CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TUI_CLIENT_LABEL};
+use super::token::{
+    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
+    TUI_CLIENT_LABEL,
+};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode, Uri};
@@ -36,6 +39,17 @@ use axum::response::Response;
 #[derive(Debug, Clone)]
 pub enum AuthedClient {
     Tui,
+    /// Embedded tool-sidecar (browser MCP server today; future
+    /// code_exec, db_query, …). Session-scoped like [`Self::Tui`],
+    /// not per-bot/per-user, so it bypasses the per-channel pairing
+    /// gate. Rejected from the channel-WS handshake — tool sidecars
+    /// don't register as channels.
+    Tool {
+        /// Full label string starting with [`TOOL_CLIENT_LABEL_PREFIX`]
+        /// (e.g. `"tool/browser"`). The suffix names the specific
+        /// sidecar; future per-tool gating can match on it.
+        label: String,
+    },
     Subprocess {
         pid: u32,
         label: String,
@@ -52,6 +66,10 @@ impl AuthedClient {
     fn from_identity(identity: ClientIdentity) -> Self {
         if identity.label == TUI_CLIENT_LABEL {
             AuthedClient::Tui
+        } else if identity.label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
+            AuthedClient::Tool {
+                label: identity.label,
+            }
         } else {
             AuthedClient::Subprocess {
                 pid: identity.pid,
@@ -105,6 +123,12 @@ pub async fn require_channel_auth(
                 AuthedClient::Tui => {
                     tracing::debug!(%path, "channel auth: accepted via TUI token");
                 }
+                AuthedClient::Tool { label } => {
+                    tracing::debug!(
+                        %path, label = %label,
+                        "channel auth: accepted via tool-sidecar token",
+                    );
+                }
                 AuthedClient::Subprocess { pid, label, .. } => {
                     tracing::debug!(
                         %path, pid, label = %label,
@@ -149,7 +173,7 @@ fn check_channel_token(
 ) -> std::result::Result<Option<AuthedClient>, StatusCode> {
     // Header first, then `?token=` query. The query form lets sidecar
     // runtimes whose WebSocket client can't set custom HTTP headers
-    // (bun's native WHATWG WebSocket, any browser-style client) still
+    // (any WHATWG `WebSocket`, browser-style clients) still
     // authenticate — a loopback-only listener's access logs stay
     // same-UID-local, so the usual "don't put secrets in URLs"
     // warning doesn't bite here.

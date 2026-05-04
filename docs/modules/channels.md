@@ -115,11 +115,16 @@ transport, `Register`/`Ack` handshake, loopback-TCP dial, frame
 dispatch, concurrent approval spawning, and auto-reconnect with
 exponential backoff + jitter on transient drops (disable with
 `reconnect: false`).
-The SDK-provided default logger also forwards its own output as
-`Frame::SidecarLog` frames while the WS is open — the gateway pushes
-them into the same `LogBuffer` that backs `/v1/logs`, so sidecar lines
-surface in the dashboard alongside gateway-internal tracing. Custom
-loggers (pino / winston) stay local; attribution uses
+The SDK-provided default logger emits one NDJSON record per call
+(`{"level": "...", "msg": "..."}`) to `process.stdout` (debug/info)
+or `process.stderr` (warn/error). When the sidecar runs under
+[`SidecarSupervisor`] (the in-tree path), the gateway's per-channel
+pipe drain parses each line back into structured records and pushes
+them into the same `LogBuffer` that backs `/v1/logs` plus the
+per-channel file at `<channel_log_dir>/<channel_type>.log.<date>` —
+single write path, no parallel WS sink. A non-JSON line (third-party
+logger, console.log) falls back to a plain text record at info
+(stdout) or warn (stderr). Attribution uses
 `sidecar::<channel_type>[::<target>]`.
 The channel WebSocket URL + token are read from `AURA_CHANNEL_URL`
 / `AURA_CHANNEL_TOKEN` env vars. `ChannelSpawner`
@@ -129,37 +134,67 @@ builds is `ws://127.0.0.1:<port>/v1/channel-ws` where `<port>` comes
 from [`ChannelServer::port`] after it binds on `127.0.0.1:0`.
 [`SidecarSupervisor`] (`crates/gateway/src/sidecar/supervisor.rs`)
 drives it: at gateway boot, [`SidecarRuntime::install`]
-materialises the pinned `bun` runtime and each sidecar's JS bundle
-to `$XDG_CACHE_HOME/aura/{runtime, sidecars}/`, then one supervised
-task per embedded channel type `Command::new(bun).arg(bundle).spawn()`s
+materialises each sidecar's JS bundle to
+`$XDG_CACHE_HOME/aura/sidecars/<channel>-<hash>/bundle.mjs` (plus any
+declared aux assets next to it), then one supervised task per embedded
+channel type runs `Command::new("bun").arg(bundle).spawn()`
 through `ChannelSpawner` and restarts on exit with exponential
-backoff (500ms → 30s, reset after ≥60s of stable uptime). Shutdown
-fans out via the shared `ShutdownSignal` — children are SIGKILLed
-and awaited. Bringing up a custom sidecar out-of-tree is still
-possible: export the two env vars yourself (or pass `wsUrl` /
-`token` to `runChannel`) and run the process however you like.
+backoff (500ms → 30s, reset after ≥60s of stable uptime). The `bun`
+executable is resolved from `PATH`; set `AURA_BUN_BIN` to point at a
+specific install. Shutdown fans out via the shared `ShutdownSignal` —
+children are SIGKILLed and awaited. Bringing up a custom sidecar
+out-of-tree is still possible: export the two env vars yourself (or
+pass `wsUrl` / `token` to `runChannel`) and run the process however
+you like.
 
-**Embedded sidecar toolchain.** `crates/gateway/build.rs` fetches the
-bun release pinned in `.bun-version` at the repo root into
-`target/bun-cache/` (one-time, cached across rebuilds), verifies the
-downloaded zip's sha256 against `.bun-shasums` (mismatch = hard-fail
-panic; missing entry for the current target = loud cargo:warning +
-unverified download with the line to paste in), runs
-`bun build --target=bun --minify` over each
-`channel-src/*/src/index.ts`, and zstd-compresses both the runtime
-and every bundle before `include_bytes!`. Sidecar packaging is keyed by
-the relevant sidecar inputs (workspace lockfiles, `channel-src/*`
-sources/configs, and `sdks/channel-ts/dist`): if those inputs are
-unchanged, a later `cargo build` reuses the cached compressed bundles
-instead of re-running bun. `--target=bun` lets bun
-substitute its own WS polyfill for the `ws` npm package — the
-channel SDK stays within the WHATWG `WebSocket` API (auth token
-rides in a `?token=…` query-string rather than a custom HTTP
-header, since the standard constructor can't set headers). Other
-failures (no network,
-missing `node_modules`, bun error) degrade to `cargo:warning=…` +
-empty assets — `cargo build` still succeeds, the supervisor just
-logs "embedded sidecar runtime unavailable" and skips the spawn loop.
+**Out-of-tree sidecars and observability.** A sidecar started by an
+external process manager (systemd, docker, foreman, …) speaks the
+same `/v1/channel-ws` protocol — the WS frame stream, blob HTTP
+side-channel, and `Register`/`Ack` handshake all work unchanged —
+but the gateway is **not** the parent process and therefore does
+not drain its stdout/stderr. The default logger's NDJSON records
+land wherever that process manager captures them (`journalctl`,
+`docker logs`, the wrapping shell), **not** in `LogBuffer` or the
+per-channel file. The gateway's `/v1/logs` view will show only
+gateway-internal tracing for that channel; the sidecar's runtime
+errors are visible only through whatever sink the operator
+configured for the child process.
+This is an intentional simplification of the previous design — a
+parallel `Frame::SidecarLog` sink mirrored every log line over the
+WS so out-of-tree sidecars also surfaced in `LogBuffer`, but it
+created two write paths that drifted (one bug let the file logger
+silently miss every post-handshake line) and added a synchronisation
+invariant (`if sink != null skip console`) that was easy to
+violate. If you need gateway-side log visibility for an externally
+managed sidecar today, route its stdout/stderr into the gateway by
+adopting one of the supervisor patterns: run it as a child of the
+gateway via [`SidecarSupervisor`], or pipe its stdout into a small
+forwarder that connects to `/v1/logs`'s admin endpoint. There is no
+SDK-level shortcut.
+
+**Embedded sidecar toolchain.** `crates/gateway/build.rs` runs
+`pnpm --filter <pkg> bundle` for each `channel-src/*` package; the
+`bundle` script in each `package.json` invokes
+`bun build --target=bun --minify` to emit a single self-contained
+`dist/bundle.mjs`. The output, plus any `aura.auxAssets` declared in
+the package (e.g. weixin's `silk.wasm`), is zstd-compressed into
+`target/sidecar-cache/<fingerprint>/` and embedded via
+`include_bytes!`. Sidecar packaging is keyed by the relevant sidecar
+inputs (workspace lockfiles, `channel-src/*` sources/configs, and
+`sdks/channel-ts/dist`): if those inputs are unchanged, a later
+`cargo build` reuses the cached compressed bundles instead of
+re-running bun. `--target=bun` substitutes bun's own polyfills for
+`ws` (WHATWG `WebSocket`) and `node-fetch` (bun's native fetch); the
+channel SDK is careful to stay within WHATWG `WebSocket` (auth token
+rides in a `?token=…` query-string rather than a custom HTTP header)
+so the same bundle would also run on node, but bun is what we ship
+against because the bun-substituted output dodges several runtime
+landmines in node-fetch@2 / whatwg-url@5 / dual-package CJS deps.
+Failures (missing `node_modules`, bun bundle error, missing `pnpm`)
+degrade to `cargo:warning=…` + empty assets — `cargo build` still
+succeeds, the supervisor just logs "embedded sidecar runtime
+unavailable" and skips the spawn loop. Set `AURA_REQUIRE_SIDECARS=1`
+to flip those degrades into hard build failures for release CI.
 Raw wire types are re-exported under the `./wire` subpath for advanced
 callers. There is no Rust SDK — the TUI
 has its own private WS client, and the server is authoritative on the

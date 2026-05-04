@@ -1,0 +1,19 @@
+[package]
+name = "aura-janitor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-storage = { workspace = true }
+aura-workspace = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+aura-model = { workspace = true }
+aura-storage = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "fs"] }

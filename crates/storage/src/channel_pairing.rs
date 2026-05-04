@@ -111,4 +111,13 @@ pub trait ChannelPairingStore: Send + Sync {
 
     /// Soft-delete the row for the triple. No-op if already tombstoned.
     async fn delete(&self, channel_type: &ChannelType, bot_id: &str, user_id: &str) -> Result<()>;
+
+    /// Hard-delete pairing rows that the retention sweep should reap:
+    ///   * `Pending` rows whose `expires_at <= now_secs`, and
+    ///   * `Approved` rows whose `approved_at < cutoff_secs`.
+    /// Both classes are auth-flow ephemera — pending codes are
+    /// short-lived by nature, and an old approval is just a record of
+    /// a one-time grant, kept in `channel_bot` instead. Returns the
+    /// number of rows removed.
+    async fn purge_expired(&self, now_secs: i64, approved_cutoff_secs: i64) -> Result<u64>;
 }

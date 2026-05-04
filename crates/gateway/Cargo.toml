@@ -2,6 +2,14 @@
 name = "aura-gateway"
 version.workspace = true
 edition.workspace = true
+# See `crates/integration-tests/Cargo.toml` for the rationale: aggregating
+# tests/*.rs into one binary saves the per-binary link of the gateway
+# graph (200s+ each on debug).
+autotests = false
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 [features]
 default = ["linux", "macos"]
@@ -54,7 +62,6 @@ rand = { workspace = true }
 hex = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
-rmp-serde = { workspace = true }
 libc = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -71,13 +78,12 @@ zstd = { workspace = true }
 tempfile = { workspace = true }
 
 [build-dependencies]
-# build.rs fetches the pinned bun release (version in `.bun-version` at
-# the repo root) and bundles each `channel-src/*` sidecar into a JS
-# payload. Both are zstd-compressed before `include_bytes!`.
-ureq = { workspace = true }
+# build.rs runs `pnpm --filter <sidecar> bundle` (which invokes esbuild)
+# to produce a single ESM file per channel-src/* package, hashes the
+# inputs, and zstd-compresses each bundle before `include_bytes!`.
 sha2 = { workspace = true }
-zip = { workspace = true }
 zstd = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 aura-gateway = { workspace = true, features = ["test-support"] }

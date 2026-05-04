@@ -1,34 +1,49 @@
-//! Embedded-asset extraction: turns the zstd-compressed byte slices
-//! baked in by `build.rs` into on-disk files the OS can actually
-//! `execve` (for bun) or pass to an interpreter (for each sidecar's
-//! JS bundle).
+//! Embedded-asset extraction: turns the zstd-compressed sidecar
+//! bundles baked in by `build.rs` into on-disk JS files the host's
+//! `node` binary can run.
 //!
-//! Safety note: the bun binary is written to disk with mode `0700`
-//! so only the invoking user can exec it. The sidecar JS files are
-//! left at the default umask — they're plain data, not executable.
+//! Sidecars are spawned at runtime with the local `node` resolved
+//! from `PATH` — no JS runtime is shipped inside the gateway binary.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use aura_workspace::paths::{CACHE_RUNTIME_SUBDIR, aura_cache_root};
+use aura_workspace::paths::aura_cache_root;
 use thiserror::Error;
 
 mod generated {
     // Populated by `crates/gateway/build.rs` — see that file for
-    // the emitted shape. When the sidecar pipeline degrades (no
-    // `.bun-version`, bun download failed, etc.) the generated file
-    // still compiles, just with `BUN_RUNTIME_ZST = &[]` and
-    // `SIDECARS = &[]`.
+    // the emitted shape. When the sidecar pipeline degrades (pnpm
+    // missing, esbuild bundling failed, etc.) the generated file
+    // still compiles, just with `SIDECARS = &[]`.
     include!(concat!(env!("OUT_DIR"), "/sidecar_assets.rs"));
 }
 
-pub(crate) use generated::BUN_VERSION;
-use generated::{BUN_RUNTIME_ZST, BUN_TARGET, SIDECARS, SidecarAsset};
+use generated::{SIDECARS, SidecarAsset, SidecarAuxAsset};
+
+/// Well-known domain identifiers. New domains are added by appending
+/// here AND by setting `"aura": { "domain": "<name>" }` in the new
+/// sidecar's `package.json`. The runtime is otherwise agnostic — a
+/// build-time domain string that doesn't appear here is still
+/// accepted, callers just won't have a constant to refer to it by.
+pub mod domains {
+    /// Channel-protocol sidecars (telegram, weixin, …). Each registers
+    /// itself with the channel registry on connect and pumps platform
+    /// messages onto the gateway's WebSocket.
+    pub const CHANNEL: &str = "channel";
+    /// Tool-domain sidecars — embedded MCP servers exposing one or
+    /// more `<server>/<tool>` calls to the agent loop. Today the only
+    /// tool sidecar is `browser`; future families (code_exec,
+    /// db_query, …) sit under the same domain and ship their own
+    /// MCP server name.
+    pub const TOOL: &str = "tool";
+}
 
 #[derive(Debug, Error)]
 pub enum SidecarError {
-    #[error("no embedded bun runtime in this build (build.rs degraded); sidecars disabled")]
+    #[error("no embedded sidecars in this build (build.rs degraded); sidecars disabled")]
     RuntimeMissing,
     #[error("cannot locate cache directory: set $XDG_CACHE_HOME or $HOME")]
     NoCacheDir,
@@ -46,53 +61,120 @@ pub enum SidecarError {
     },
 }
 
-/// Materialised runtime: bun on disk + one JS path per embedded sidecar.
-/// Cheap to hold (two paths + a small Vec); clone via `Arc` at the
-/// call site if shared across tasks.
+struct SidecarEntry {
+    name: String,
+    domain: String,
+    bundle_path: PathBuf,
+}
+
+/// Materialised runtime: one JS path per embedded sidecar. Cheap to
+/// hold (a small Vec); clone via `Arc` at the call site if shared
+/// across tasks.
+///
+/// Each sidecar is tagged with its **domain** — the business family
+/// it participates in (`channel`, `tool`, …) — declared in the
+/// sidecar's own `package.json` (`aura.domain`). Callers iterate
+/// per domain so the channel list, the embedded-MCP profiles, and
+/// any future family stay decoupled. New domains add by appending to
+/// the sidecar's package.json + (optionally) adding a constant in
+/// [`domains`]; no Rust API changes required.
 pub struct SidecarRuntime {
-    bun_path: PathBuf,
-    sidecars: Vec<(String, PathBuf)>,
+    sidecars: Vec<SidecarEntry>,
 }
 
 impl SidecarRuntime {
-    /// Materialise bun + every embedded sidecar bundle under the user
-    /// cache dir. Idempotent: repeated calls notice the existing files
-    /// and skip the zstd decode. If the build has no embedded bun this
+    /// Materialise every embedded sidecar bundle under the user cache
+    /// dir. Idempotent: repeated calls notice the existing files and
+    /// skip the zstd decode. If the build embeds no sidecars this
     /// returns [`SidecarError::RuntimeMissing`] — the caller is
     /// expected to log-and-skip rather than crash the gateway.
     pub fn install() -> Result<Self, SidecarError> {
-        if BUN_RUNTIME_ZST.is_empty() {
+        if SIDECARS.is_empty() {
             return Err(SidecarError::RuntimeMissing);
         }
         let cache_root = cache_root()?;
-        let bun_path = install_bun(&cache_root)?;
         let mut sidecars = Vec::with_capacity(SIDECARS.len());
         for asset in SIDECARS {
             let js_path = install_sidecar(&cache_root, asset)?;
-            sidecars.push((asset.channel_type.to_string(), js_path));
+            sidecars.push(SidecarEntry {
+                name: asset.name.to_string(),
+                domain: asset.domain.to_string(),
+                bundle_path: js_path,
+            });
         }
-        Ok(Self { bun_path, sidecars })
+        Ok(Self { sidecars })
     }
 
-    pub fn bun_path(&self) -> &Path {
-        &self.bun_path
-    }
-
-    pub fn bun_target(&self) -> &'static str {
-        BUN_TARGET
-    }
-
-    pub fn channel_types(&self) -> impl Iterator<Item = &str> {
-        self.sidecars.iter().map(|(c, _)| c.as_str())
-    }
-
-    /// Path to the JS bundle for `channel_type`, or `None` if this
-    /// build doesn't ship a sidecar for it.
-    pub fn bundle_for(&self, channel_type: &str) -> Option<&Path> {
+    /// Names of every embedded sidecar in `domain`. Empty iter when
+    /// no sidecar declares that domain. Use the constants in
+    /// [`domains`] to avoid typos for the well-known ones; the
+    /// argument is a free string so a new domain works without
+    /// touching this file.
+    pub fn names_in_domain<'a>(&'a self, domain: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.sidecars
             .iter()
-            .find(|(c, _)| c == channel_type)
-            .map(|(_, p)| p.as_path())
+            .filter(move |s| s.domain == domain)
+            .map(|s| s.name.as_str())
+    }
+
+    /// Every distinct domain present in the embedded asset table,
+    /// alphabetically sorted. Sorted (rather than iteration-order
+    /// of the asset table) so the boot log lines stay deterministic
+    /// build-to-build even when a new sidecar's name shifts the
+    /// underlying table order.
+    pub fn domains(&self) -> impl Iterator<Item = &str> {
+        let mut domains: Vec<&str> = self.sidecars.iter().map(|s| s.domain.as_str()).collect();
+        domains.sort_unstable();
+        domains.dedup();
+        domains.into_iter()
+    }
+
+    /// Domain of the sidecar named `name`. `None` if no sidecar by
+    /// that name is in this build.
+    pub fn domain_of(&self, name: &str) -> Option<&str> {
+        self.sidecars
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.domain.as_str())
+    }
+
+    /// Path to the JS bundle for `name`, or `None` if this build
+    /// doesn't ship a sidecar by that name. Names are globally
+    /// unique across all domains (asserted at build time).
+    pub fn bundle_for(&self, name: &str) -> Option<&Path> {
+        self.sidecars
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.bundle_path.as_path())
+    }
+
+    /// Cache root that holds every materialised `<name>-<hash>/` dir
+    /// (`$XDG_CACHE_HOME/aura/sidecars/`). Returned only when the
+    /// runtime contains at least one sidecar — an empty runtime has no
+    /// path to point at. Consumed by the janitor's sidecar-cache sweep
+    /// to know which root directory to walk.
+    pub fn sidecars_cache_root(&self) -> Option<PathBuf> {
+        self.sidecars
+            .first()
+            .and_then(|s| s.bundle_path.parent()?.parent().map(Path::to_path_buf))
+    }
+
+    /// `<name>-<hash>` directory names for every currently-live
+    /// sidecar in this build. Consumed by the janitor's sidecar-cache
+    /// sweep as the "do not delete" allowlist — anything else under
+    /// `sidecars_cache_root()` whose mtime is older than the TTL is
+    /// stale cruft from a prior Aura version.
+    pub fn live_dir_names(&self) -> HashSet<String> {
+        self.sidecars
+            .iter()
+            .filter_map(|s| {
+                s.bundle_path
+                    .parent()?
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_owned)
+            })
+            .collect()
     }
 }
 
@@ -100,66 +182,69 @@ fn cache_root() -> Result<PathBuf, SidecarError> {
     aura_cache_root().ok_or(SidecarError::NoCacheDir)
 }
 
-fn install_bun(cache_root: &Path) -> Result<PathBuf, SidecarError> {
-    let dir = cache_root.join(CACHE_RUNTIME_SUBDIR);
-    mkdir_all(&dir)?;
-    // Version AND target are in the filename so a sibling install on
-    // a different target (bind-mounted home dir, etc.) doesn't trip
-    // over ours.
-    let dest = dir.join(format!("bun-{BUN_VERSION}-{BUN_TARGET}"));
-    if dest.exists() {
-        // Defensive repair: a previous install that crashed between
-        // persist and chmod (older code path), or any other reason
-        // the cached binary lost +x, would otherwise wedge the
-        // supervisor in a permanent spawn-failure loop. Force the
-        // mode back to 0o700 every boot — it's idempotent and cheap.
-        ensure_mode(&dest, 0o700)?;
-        return Ok(dest);
-    }
-    decompress_to(BUN_RUNTIME_ZST, &dest, "bun runtime", Some(0o700))?;
-    Ok(dest)
-}
-
 fn install_sidecar(cache_root: &Path, asset: &SidecarAsset) -> Result<PathBuf, SidecarError> {
-    let dir = cache_root.join("sidecars");
+    let dir = cache_root
+        .join("sidecars")
+        .join(format!("{}-{}", asset.name, asset.content_hash));
     mkdir_all(&dir)?;
     // Hash-keyed: a bundle content change lands at a fresh filename
-    // without ever rewriting a live one. Old hashes linger on disk by
-    // design (see the module comment's "don't delete old" note).
-    let dest = dir.join(format!("{}-{}.js", asset.channel_type, asset.content_hash));
-    if dest.exists() {
-        return Ok(dest);
+    // without ever rewriting a live one. Auxiliary files live next to
+    // bundle.mjs so packages that resolve assets from import.meta.url
+    // can find them.
+    let dest = dir.join("bundle.mjs");
+    if !dest.exists() {
+        decompress_to(asset.bundle_zst, &dest, "sidecar bundle")?;
     }
-    decompress_to(asset.bundle_zst, &dest, "sidecar bundle", None)?;
+    for aux in asset.aux_assets {
+        install_aux_asset(&dir, aux)?;
+    }
     Ok(dest)
 }
 
-fn decompress_to(
-    zst: &[u8],
-    dest: &Path,
-    what: &'static str,
-    mode: Option<u32>,
-) -> Result<(), SidecarError> {
+fn install_aux_asset(dir: &Path, asset: &SidecarAuxAsset) -> Result<(), SidecarError> {
+    let rel = safe_relative_path(asset.name)?;
+    let dest = dir.join(rel);
+    if let Some(parent) = dest.parent() {
+        mkdir_all(parent)?;
+    }
+    if dest.exists() {
+        return Ok(());
+    }
+    decompress_to(asset.content_zst, &dest, "sidecar aux asset")
+}
+
+fn safe_relative_path(raw: &str) -> Result<&Path, SidecarError> {
+    let path = Path::new(raw);
+    if raw.is_empty() || path.is_absolute() {
+        return Err(SidecarError::Io {
+            path: PathBuf::from(raw),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "unsafe aux asset path"),
+        });
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => {
+                return Err(SidecarError::Io {
+                    path: PathBuf::from(raw),
+                    source: io::Error::new(io::ErrorKind::InvalidInput, "unsafe aux asset path"),
+                });
+            }
+        }
+    }
+    Ok(path)
+}
+
+fn decompress_to(zst: &[u8], dest: &Path, what: &'static str) -> Result<(), SidecarError> {
     // Per-process tempfile under the same dir as `dest`, atomically
-    // persisted. Two concerns this addresses, both from
-    // `$XDG_CACHE_HOME/aura/` being user-level shared across every
-    // workspace the same UID runs:
-    //
-    //   1. Two gateways first-installing concurrently would both
-    //      write a fixed `<dest>.part` and race on the rename. With
-    //      NamedTempFile they each write a unique `.tmp<rand>` and
-    //      the second `persist` atomically replaces the first's
-    //      target (contents are identical — bytes come from the same
-    //      embedded compressed blob — so either "winner" is fine).
-    //   2. A crash mid-write leaves the NamedTempFile's `Drop`
-    //      unlinking the partial, instead of a stale `<dest>.part`
-    //      that a later run might mistake for something.
-    //
-    // `mode`, when set, is applied to the **tempfile** before persist
-    // so the published path is always either nonexistent or fully
-    // permission — a crash between `persist` and a later chmod
-    // can't leave a stale non-executable bun on disk that we'd
-    // happily reuse forever.
+    // persisted. `$XDG_CACHE_HOME/aura/` is user-level shared across
+    // every workspace the same UID runs, so two gateways
+    // first-installing concurrently would otherwise race on a fixed
+    // `<dest>.part`. NamedTempFile gives each a unique `.tmp<rand>`
+    // and the second `persist` atomically replaces the first's target
+    // (contents are byte-identical — same embedded blob — so either
+    // winner is fine). A crash mid-write also leaves the
+    // NamedTempFile's `Drop` unlinking the partial.
     let parent = dest.parent().ok_or_else(|| SidecarError::Io {
         path: dest.to_path_buf(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "dest has no parent dir"),
@@ -178,13 +263,6 @@ fn decompress_to(
             path: tmp.path().to_path_buf(),
             source,
         })?;
-    if let Some(mode) = mode {
-        set_mode(tmp.path(), mode)?;
-    }
-    // `persist` does `rename(tmp, dest)` — atomic-replace on Unix.
-    // If another gateway won the race and already published `dest`,
-    // we still overwrite with byte-identical content and drop the
-    // race-loser's tmp harmlessly.
     tmp.persist(dest).map_err(|e| SidecarError::Io {
         path: dest.to_path_buf(),
         source: e.error,
@@ -199,88 +277,63 @@ fn mkdir_all(dir: &Path) -> Result<(), SidecarError> {
     })
 }
 
-fn set_mode(path: &Path, mode: u32) -> Result<(), SidecarError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| SidecarError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Ensure `path`'s permission bits already match `mode` and, if not,
-/// repair them. Used on the cached-runtime path so a partial install
-/// from an older binary (or any out-of-band tampering) gets fixed up
-/// the moment the gateway notices, instead of wedging the supervisor.
-fn ensure_mode(path: &Path, mode: u32) -> Result<(), SidecarError> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = fs::metadata(path).map_err(|source| SidecarError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if meta.permissions().mode() & 0o777 == mode {
-        return Ok(());
-    }
-    set_mode(path, mode)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn ensure_mode_repairs_non_executable_cached_bun() {
-        // Simulates the partial-install crash path: a previous build
-        // wrote the file but died before chmod, leaving it at 0o600.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bun");
-        fs::write(&path, b"placeholder").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-
-        ensure_mode(&path, 0o700).unwrap();
-
-        let got = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(got, 0o700, "ensure_mode should restore 0o700");
+    fn zst(bytes: &[u8]) -> &'static [u8] {
+        Box::leak(zstd::bulk::compress(bytes, 1).unwrap().into_boxed_slice())
     }
 
     #[test]
-    fn ensure_mode_is_idempotent_on_already_correct_file() {
+    fn install_sidecar_places_aux_assets_next_to_bundle() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bun");
-        fs::write(&path, b"placeholder").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        ensure_mode(&path, 0o700).unwrap();
-        let got = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(got, 0o700);
+        let aux_assets: &'static [SidecarAuxAsset] = Box::leak(
+            vec![SidecarAuxAsset {
+                name: "silk.wasm",
+                content_zst: zst(b"wasm bytes"),
+            }]
+            .into_boxed_slice(),
+        );
+        let asset = SidecarAsset {
+            name: "weixin",
+            domain: "channel",
+            bundle_zst: zst(b"console.log('weixin');"),
+            content_hash: "fixture",
+            aux_assets,
+        };
+
+        let bundle = install_sidecar(dir.path(), &asset).unwrap();
+
+        assert_eq!(
+            bundle.file_name().and_then(|s| s.to_str()),
+            Some("bundle.mjs")
+        );
+        assert_eq!(fs::read(&bundle).unwrap(), b"console.log('weixin');");
+        assert_eq!(
+            fs::read(bundle.parent().unwrap().join("silk.wasm")).unwrap(),
+            b"wasm bytes"
+        );
     }
 
     #[test]
-    fn decompress_to_with_mode_publishes_file_already_executable() {
-        // The fix for F2: the chmod must happen on the tempfile before
-        // persist, so the published path is never observed without +x.
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("bun");
-        let payload = b"#!/bin/sh\necho hi\n";
-        let zst = zstd::bulk::compress(payload, 3).unwrap();
-
-        decompress_to(&zst, &dest, "test runtime", Some(0o700)).unwrap();
-
-        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "published file must already be executable");
-        assert_eq!(fs::read(&dest).unwrap(), payload);
+    fn safe_relative_path_rejects_escape_paths() {
+        assert!(safe_relative_path("").is_err());
+        assert!(safe_relative_path("../silk.wasm").is_err());
+        assert!(safe_relative_path("/tmp/silk.wasm").is_err());
+        assert!(safe_relative_path("silk.wasm").is_ok());
     }
 
     #[test]
-    fn decompress_to_without_mode_uses_umask_default() {
+    fn decompress_to_uses_umask_default() {
         let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("bundle.js");
+        let dest = dir.path().join("bundle.mjs");
         let payload = b"console.log('hi');";
         let zst = zstd::bulk::compress(payload, 3).unwrap();
 
-        decompress_to(&zst, &dest, "test bundle", None).unwrap();
+        decompress_to(&zst, &dest, "test bundle").unwrap();
 
-        // Whatever the umask is, no exec bit was forced — the JS
-        // bundles aren't executable on disk.
         let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o111;
         assert_eq!(mode, 0, "data files should not get the exec bit");
         assert_eq!(fs::read(&dest).unwrap(), payload);

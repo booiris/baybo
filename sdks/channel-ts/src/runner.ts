@@ -9,12 +9,7 @@ import {
   type ApprovalDecision,
   type NoticeLevel,
 } from "./channel.js";
-import {
-  defaultLogger,
-  hasWireSink,
-  type Logger,
-  type WireLogLevel,
-} from "./logger.js";
+import { defaultLogger, type Logger } from "./logger.js";
 import {
   PROTOCOL_VERSION,
   decodeFrame,
@@ -145,41 +140,14 @@ async function runOnce(
       once: true,
     });
 
-    if (hasWireSink(logger)) {
-      logger.setWireSink(makeWireSink(ws));
-    }
-
-    try {
-      const outbound = pumpOutbound(channel, ws, connAbort.signal, logger);
-      const inbound = pumpInbound(channel, ws, frames, connAbort, logger);
-      await Promise.all([outbound, inbound]);
-    } finally {
-      if (hasWireSink(logger)) logger.setWireSink(null);
-    }
+    const outbound = pumpOutbound(channel, ws, connAbort.signal, logger);
+    const inbound = pumpInbound(channel, ws, frames, connAbort, logger);
+    await Promise.all([outbound, inbound]);
   } finally {
     connAbort.abort();
     safeClose(ws);
     rootSignal.removeEventListener("abort", onRootAbort);
   }
-}
-
-function makeWireSink(ws: WebSocket) {
-  return (level: WireLogLevel, text: string): void => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    try {
-      ws.send(
-        encodeFrame({
-          kind: "sidecar_log",
-          level,
-          text,
-        }),
-      );
-    } catch {
-      // A WS send failure here is surfaced through the main inbound /
-      // outbound pumps — no need to double-report it from the logger
-      // path (and throwing would make the logger unsafe to call).
-    }
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +422,9 @@ async function pumpOutbound(
           user_id: msg.userId,
           channel_type: channel.channelType,
           ...(msg.botId ? { bot_id: msg.botId } : {}),
+          ...(msg.platformMsgId
+            ? { platform_msg_id: msg.platformMsgId }
+            : {}),
           ...(msg.attachments && msg.attachments.length > 0
             ? { attachments: msg.attachments }
             : {}),
@@ -591,6 +562,15 @@ function dispatchFrame(
       );
       return;
     }
+    case "slash_manifest": {
+      if (!channel.onSlashManifest) return;
+      void safeInvoke(
+        () => channel.onSlashManifest!(frame.commands),
+        "onSlashManifest",
+        logger,
+      );
+      return;
+    }
     // History frames are TUI-only; sidecars silently drop them.
     case "history_append":
     case "history_snapshot":
@@ -599,7 +579,6 @@ function dispatchFrame(
     case "register":
     case "register_ack":
     case "resolve_approval":
-    case "sidecar_log":
     case "bot_status":
       logger.warn("unexpected server->client frame", frame.kind);
       return;
@@ -669,6 +648,7 @@ async function handleApproval(
       sessionId: frame.session_id,
       userId: frame.user_id ?? "",
       tool: frame.tool,
+      accesses: frame.accesses,
       paramsPreview: frame.params_preview,
       ...(frame.description != null ? { description: frame.description } : {}),
     });

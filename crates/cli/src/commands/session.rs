@@ -67,14 +67,15 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
 
 async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     let mgr = sessions(ctx)?;
+    let typed = aura_model::SessionId::from(id);
     let session = mgr
-        .get(id)
+        .get(&typed)
         .await
         .map_err(|e| CliError::Manager(format!("get session: {e}")))?
         .ok_or_else(|| CliError::Manager(format!("session {id} not found")))?;
 
     let value = json!({
-        "id": session.id,
+        "id": session.id.to_string(),
         "user": {
             "id": session.user.id,
             "name": session.user.name,
@@ -113,8 +114,9 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
 
 async fn history(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     let mgr = sessions(ctx)?;
+    let typed = aura_model::SessionId::from(id);
     let messages = mgr
-        .history(id)
+        .history(&typed)
         .await
         .map_err(|e| CliError::Manager(format!("session history: {e}")))?;
 
@@ -150,7 +152,8 @@ async fn kill(ctx: &CommandContext, id: &str, yes: bool) -> Result<CommandOutput
     }
 
     let mgr = sessions(ctx)?;
-    mgr.delete(id)
+    let typed = aura_model::SessionId::from(id);
+    mgr.delete(&typed)
         .await
         .map_err(|e| CliError::Manager(format!("delete session: {e}")))?;
 

@@ -66,3 +66,18 @@ test("encodeFrame accepts a Message without attachments key", () => {
   assert.equal(decoded.kind, "message");
   assert.equal(decoded.content, "hi");
 });
+
+test("encodeFrame round-trips a Message with platform_msg_id", () => {
+  const frame = {
+    kind: "message",
+    content: "hi",
+    session_id: "",
+    user_id: "u-1",
+    channel_type: "weixin",
+    bot_id: "prod-bot",
+    platform_msg_id: "msg-42",
+  };
+  const decoded = decodeFrame(encodeFrame(frame));
+  assert.equal(decoded.kind, "message");
+  assert.equal(decoded.platform_msg_id, "msg-42");
+});

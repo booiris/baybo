@@ -40,12 +40,16 @@ pub const ENV_CHANNEL_TOKEN: &str = "AURA_CHANNEL_TOKEN";
 /// the gateway. Anything else (`OPENAI_API_KEY`, every `AURA_*` from
 /// the operator's shell, cloud / proxy creds, …) is scrubbed before
 /// `execve` so a compromised JS bundle can't read the gateway's
-/// secret env. Mirrors the registration-mode allowlist used by
-/// `cli::commands::channel::register::scrubbed_env`; both call sites
-/// import this constant so they can't drift apart.
+/// secret env. Mirrors the registration-mode allowlist in
+/// `cli::commands::channel::register::scrubbed_env`. Tool-domain
+/// sidecars (the embedded browser MCP server today) flow through
+/// `aura_tools::mcp::transport::connect_with_extra_env`, which
+/// applies its own scrubbing list — keep these two in mind together
+/// when adding a new env var that needs to reach a child.
 pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",
+    "USER",
     "TERM",
     "LANG",
     "LC_ALL",
@@ -57,6 +61,10 @@ pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
     "LC_MONETARY",
     "TZ",
     "TMPDIR",
+    // Browser tool sidecar resolves its profile dir under
+    // `$XDG_CACHE_HOME/aura/browser/...`. Channel sidecars don't
+    // need it but inheriting it costs nothing.
+    "XDG_CACHE_HOME",
 ];
 
 /// Spawns channel-plugin subprocesses and mints their tokens. Cheap

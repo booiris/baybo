@@ -12,7 +12,6 @@ members = [
     "crates/trace",
     "crates/security",
     "crates/sandbox",
-    "crates/hook",
     "crates/agent",
     "crates/storage",
     "crates/skills",
@@ -25,6 +24,7 @@ members = [
     "crates/tui",
     "crates/pairing",
     "crates/integration-tests",
+    "crates/janitor",
 ]
 exclude = ["crates/security/fuzz"]
 
@@ -46,7 +46,6 @@ aura-job = { path = "crates/job" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
 aura-sandbox = { path = "crates/sandbox" }
-aura-hook = { path = "crates/hook" }
 aura-agent = { path = "crates/agent" }
 aura-storage = { path = "crates/storage" }
 aura-skills = { path = "crates/skills" }
@@ -59,6 +58,7 @@ aura-gateway = { path = "crates/gateway" }
 aura-tui = { path = "crates/tui" }
 aura-pairing = { path = "crates/pairing" }
 aura-integration-tests = { path = "crates/integration-tests" }
+aura-janitor = { path = "crates/janitor" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -76,6 +76,7 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
+ulid = { version = "1", features = ["serde"] }
 regex = "1"
 aho-corasick = "1"
 tokio-util = "0.7"
@@ -87,7 +88,10 @@ hmac = "0.12"
 hkdf = "0.12"
 aes-gcm = "0.10"
 rand = "0.10"
-libsql = "0.9"
+# Local-only — never connects to a remote turso/libsql server, so we
+# drop default features (`replication`, `remote`, `sync`, `tls`) that
+# would pull in hyper-rustls + an old rustls/webpki tree.
+libsql = { version = "0.9", default-features = false, features = ["core"] }
 axum = "0.8"
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = [
@@ -130,12 +134,10 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = [
 ] }
 rmp-serde = "1"
 ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
-# Sidecar embedding: zstd decompresses bun + JS bundles at runtime; ureq
-# + zip run only in `crates/gateway/build.rs` to fetch the pinned bun
-# release at compile time.
+# Sidecar embedding: zstd decompresses each esbuild-produced JS bundle
+# at runtime. Bundles themselves are produced by `pnpm bundle` in
+# `crates/gateway/build.rs`.
 zstd = "0.13"
-ureq = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
 # MCP client: rmcp for the protocol + transports, oauth2 for the
 # authorization-code-with-PKCE flow, `open` to launch the user's browser
 # during `aura mcp add` against an OAuth-protected HTTP server, base64 for
@@ -168,9 +170,9 @@ aura-job = { workspace = true }
 aura-trace = { workspace = true }
 aura-security = { workspace = true }
 aura-sandbox = { workspace = true }
-aura-hook = { workspace = true }
 aura-agent = { workspace = true }
 aura-cron = { workspace = true }
+aura-janitor = { workspace = true }
 aura-code-builder = { workspace = true }
 aura-storage = { workspace = true }
 aura-skills = { workspace = true }
@@ -200,3 +202,14 @@ lto = true
 codegen-units = 1
 strip = "debuginfo"
 panic = "abort"
+
+# Each test target re-links the whole upper dep graph; full DWARF dominates
+# link time. `line-tables-only` keeps usable backtraces, `unpacked` skips
+# bundling `.dwo`s back into the executable after link.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"

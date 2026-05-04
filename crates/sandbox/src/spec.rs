@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,69 @@ pub struct SandboxSpec {
     pub timeout: Duration,
     #[serde(default)]
     pub resource_limits: ResourceLimits,
+    #[serde(default)]
+    pub filesystem_policy: FilesystemPolicy,
+}
+
+/// Sensitive host subpaths the permissive sandbox masks with a per-call
+/// empty `tmpfs`. Targets credential vaults (SSH/GPG keys, cloud-CLI
+/// tokens, Docker / kube auth) and the agent's own state directory
+/// (libsql, identity files, secrets) — paths the agent has zero
+/// legitimate need to read or write through a shell. Filesystem
+/// permission bits already block most of these for an unprivileged
+/// agent process; the tmpfs adds defence-in-depth so a misbehaving
+/// command cannot even *enumerate* the directory contents.
+///
+/// `home` is the user's `$HOME` (caller resolves `HOME` / falls back
+/// as appropriate); `aura_state` is `$AURA_HOME` or `~/.aura`.
+/// Non-existent entries are filtered later at adapter-build time, so
+/// it's safe to return paths that may not exist on every host.
+pub fn default_sensitive_denylist(home: Option<&Path>, aura_state: Option<&Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(h) = home {
+        out.push(h.join(".ssh"));
+        out.push(h.join(".aws"));
+        out.push(h.join(".gnupg"));
+        out.push(h.join(".gpg"));
+        out.push(h.join(".config").join("gh"));
+        out.push(h.join(".config").join("gcloud"));
+        out.push(h.join(".docker"));
+        out.push(h.join(".kube"));
+    }
+    if let Some(s) = aura_state {
+        out.push(s.to_path_buf());
+    }
+    out
+}
+
+/// Selects the filesystem-visibility model for a sandboxed call.
+///
+/// `Workspace` (default) is the historical "deny by default" model:
+/// only `workspace_root`, `readable_paths`, and `writable_paths` are
+/// visible. CodeBuilder uses this to keep LLM-generated scripts
+/// blast-radius-zero.
+///
+/// `Permissive` widens that scope by *one extra RW root* — typically
+/// the user's `$HOME` — alongside `workspace_root`. FHS roots
+/// (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`,
+/// `/run/systemd/resolve`) remain RO-bound so installed binaries and
+/// resolv.conf still work. Anything outside `workspace_root +
+/// extra_root + FHS-RO` stays invisible — there is no full host-root
+/// bind. Each entry in `denied_paths` is then masked with a per-call
+/// empty `tmpfs` so credential vaults (`~/.ssh`, `~/.aws`, …) stay
+/// unreadable even though they sit inside `extra_root`. The OS user's
+/// own permission bits remain in effect on top.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FilesystemPolicy {
+    #[default]
+    Workspace,
+    Permissive {
+        /// Extra RW host root bound alongside `workspace_root`. The
+        /// agent layer defaults this to `$HOME`.
+        extra_root: PathBuf,
+        denied_paths: Vec<PathBuf>,
+    },
 }
 
 /// Per-invocation resource caps applied by whichever isolation backend

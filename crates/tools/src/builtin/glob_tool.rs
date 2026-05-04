@@ -1,14 +1,33 @@
 //! `Glob` — file pattern matching, results sorted by mtime (newest first).
 
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_RESULTS: usize = 1000;
+const SCAN_CAP: usize = MAX_RESULTS * 2;
+
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Find files by glob pattern (e.g. `**/*.rs`). Always use this \
+         instead of Bash commands like find or ls for file searching. \
+         Results are sorted by modification time, newest first, and \
+         capped at {MAX_RESULTS} entries.\n\n\
+         PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
+         Relative paths and omission are rejected. `pattern` MUST be \
+         relative — absolute patterns (e.g. `/etc/**/*`) are rejected so \
+         the search root is always the declared `path`.\n\n\
+         BEFORE BROAD PATTERNS: When pointing at an unfamiliar directory, \
+         start with a narrow pattern (e.g. top-level `*` or `*/*.rs`) to \
+         gauge the file count before issuing recursive `**/*` walks."
+    )
+});
 
 pub struct GlobTool;
 
@@ -25,15 +44,7 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "Find files by glob pattern (e.g. `**/*.rs`). Always use this \
-         instead of Bash commands like find or ls for file searching. \
-         Results are sorted by modification time, newest first, and \
-         capped at 1000 entries.\n\n\
-         PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
-         Relative paths and omission are rejected.\n\n\
-         BEFORE BROAD PATTERNS: When pointing at an unfamiliar directory, \
-         start with a narrow pattern (e.g. top-level `*` or `*/*.rs`) to \
-         gauge the file count before issuing recursive `**/*` walks."
+        &DESCRIPTION
     }
 
     fn parameters_schema(&self) -> Value {
@@ -65,10 +76,12 @@ impl Tool for GlobTool {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        if !p.path.is_absolute() {
+        require_absolute(&p.path, "Glob", "path")?;
+
+        if std::path::Path::new(&p.pattern).is_absolute() {
             return Err(ToolError::InvalidParams(format!(
-                "Glob `path` must be an absolute path, got `{}`",
-                p.path.display()
+                "Glob `pattern` must be relative to `path`, got absolute `{}`",
+                p.pattern
             )));
         }
 
@@ -80,16 +93,13 @@ impl Tool for GlobTool {
 }
 
 fn run_glob(base: &std::path::Path, pattern: &str) -> crate::Result<ToolOutput> {
-    let full_pattern = if std::path::Path::new(pattern).is_absolute() {
-        pattern.to_string()
-    } else {
-        base.join(pattern).to_string_lossy().into_owned()
-    };
+    let full_pattern = base.join(pattern).to_string_lossy().into_owned();
 
     let paths = glob::glob(&full_pattern)
         .map_err(|e| ToolError::InvalidParams(format!("glob pattern: {e}")))?;
 
     let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    let mut truncated = false;
     for entry in paths {
         let path = match entry {
             Ok(p) => p,
@@ -101,10 +111,16 @@ fn run_glob(base: &std::path::Path, pattern: &str) -> crate::Result<ToolOutput> 
         }
         let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         entries.push((path, mtime));
+        if entries.len() >= SCAN_CAP {
+            truncated = true;
+            break;
+        }
     }
 
     entries.sort_by(|a, b| b.1.cmp(&a.1));
-    let truncated = entries.len() > MAX_RESULTS;
+    if entries.len() > MAX_RESULTS {
+        truncated = true;
+    }
     entries.truncate(MAX_RESULTS);
 
     let mut lines: Vec<String> = entries
@@ -162,6 +178,22 @@ mod tests {
         assert!(
             matches!(err, ToolError::InvalidParams(_)),
             "expected InvalidParams, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = GlobTool
+            .execute(
+                json!({ "pattern": "/etc/**/*", "path": dir.path() }),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("relative")),
+            "got: {err:?}"
         );
     }
 

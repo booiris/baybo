@@ -40,6 +40,7 @@ async fn echo_through_sandbox_exec() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: ResourceLimits::default(),
+            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("sandboxed run");
@@ -76,6 +77,7 @@ async fn host_tmp_writes_are_denied() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: ResourceLimits::default(),
+            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("sandboxed run");

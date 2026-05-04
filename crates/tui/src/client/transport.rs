@@ -122,6 +122,8 @@ impl WsTransport {
             // arrive via the agent and are rendered by the chat view's
             // own placeholder logic.
             attachments: Vec::new(),
+            // TUI is session-scoped — dedup is not relevant.
+            platform_msg_id: String::new(),
         };
 
         self.client
@@ -271,15 +273,16 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
         | Frame::ResolveApproval { .. }
         | Frame::HistoryAppend { .. }
         | Frame::HistorySnapshot { .. }
-        | Frame::SidecarLog { .. }
         | Frame::StartBot { .. }
         | Frame::StopBot { .. }
-        | Frame::BotStatus { .. } => {
+        | Frame::BotStatus { .. }
+        | Frame::SlashManifest { .. } => {
             // HistorySnapshot is drained during `connect_tui`; any
             // stray instance post-handshake is a protocol violation.
-            // SidecarLog / StartBot / StopBot / BotStatus are sidecar
+            // StartBot / StopBot / BotStatus are sidecar
             // control-plane frames — the TUI never participates in
-            // that flow.
+            // that flow. SlashManifest is also sidecar-only: the TUI
+            // owns its slash commands client-side via TuiSlashHandler.
             warn!("unexpected frame from gateway; dropping");
             None
         }

@@ -91,7 +91,7 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
 
     async fn forget(&self, skill_name: &str) -> Result<()> {
         let conn = self.pool.conn();
-        let now = chrono::Utc::now().timestamp();
+        let now = super::time::now_us();
         conn.execute(
             "UPDATE skill_risk_assessments SET deleted_at = ?1 \
              WHERE skill_name = ?2 AND deleted_at IS NULL",
@@ -148,7 +148,7 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
         last_error: Option<&str>,
     ) -> Result<()> {
         let conn = self.pool.conn();
-        let now = chrono::Utc::now().timestamp();
+        let now = super::time::now_us();
         conn.execute(
             "UPDATE skill_risk_assessment_jobs \
              SET status = ?1, attempts = ?2, last_error = ?3, updated_at = ?4 \
@@ -171,7 +171,7 @@ impl SkillRiskStore for LibsqlSkillRiskStore {
 
     async fn delete_job(&self, skill_name: &str, content_hash: &str) -> Result<()> {
         let conn = self.pool.conn();
-        let now = chrono::Utc::now().timestamp();
+        let now = super::time::now_us();
         conn.execute(
             "UPDATE skill_risk_assessment_jobs SET deleted_at = ?1 \
              WHERE skill_name = ?2 AND content_hash = ?3 AND deleted_at IS NULL",
@@ -261,7 +261,7 @@ mod tests {
             level,
             rationale: "looks fine".to_string(),
             model: "test-model".to_string(),
-            assessed_at: 1_700_000_000,
+            assessed_at: 1_700_000_000_000_000,
         }
     }
 
@@ -273,8 +273,8 @@ mod tests {
             status,
             attempts: 0,
             last_error: None,
-            created_at: 1_700_000_000,
-            updated_at: 1_700_000_000,
+            created_at: 1_700_000_000_000_000,
+            updated_at: 1_700_000_000_000_000,
         }
     }
 

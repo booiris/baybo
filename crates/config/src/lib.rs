@@ -14,6 +14,7 @@
 //! ```
 
 pub mod agent;
+pub mod browser;
 pub mod channels;
 pub mod cost;
 pub mod error;
@@ -23,7 +24,6 @@ pub mod security;
 pub mod session;
 pub mod skills;
 pub mod tools;
-pub mod trace;
 mod validate;
 pub mod workspace;
 
@@ -32,6 +32,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 pub use crate::agent::{AgentConfig, ContextConfig};
+pub use crate::browser::{BrowserConfig, BrowserDockerConfig};
 pub use crate::channels::{
     ChannelsConfig, CliChannelConfig, DiscordChannelConfig, HttpChannelConfig,
     TelegramChannelConfig,
@@ -39,12 +40,11 @@ pub use crate::channels::{
 pub use crate::cost::{CostConfig, RateLimitConfig, SpendingLimitsConfig};
 pub use crate::error::{ConfigError, Result, ValidationError};
 pub use crate::gateway::GatewayConfig;
-pub use crate::llm::LlmConfig;
+pub use crate::llm::LlmEntry;
 pub use crate::security::SecurityConfig;
 pub use crate::session::SessionConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
 pub use crate::tools::{ToolsConfig, TrustLevelConfig};
-pub use crate::trace::TraceConfig;
 pub use crate::workspace::WorkspaceConfig;
 
 /// Root configuration object for Aura.
@@ -54,17 +54,37 @@ pub use crate::workspace::WorkspaceConfig;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct AuraConfig {
-    pub llm: LlmConfig,
+    /// List of registered LLM entries. Multiple entries can target the
+    /// same provider; each entry is keyed by its unique `name`.
+    pub llm: Vec<LlmEntry>,
+    /// Name of the entry in `llm` that the agent loop uses by default.
+    /// Must reference an existing `name`.
+    #[serde(rename = "default-llm")]
+    pub default_llm: String,
     pub agent: AgentConfig,
     pub session: SessionConfig,
     pub channels: ChannelsConfig,
     pub security: SecurityConfig,
     pub skills: SkillsConfig,
     pub tools: ToolsConfig,
-    pub trace: TraceConfig,
     pub cost: CostConfig,
     pub workspace: WorkspaceConfig,
     pub gateway: GatewayConfig,
+    pub browser: BrowserConfig,
+}
+
+impl AuraConfig {
+    /// Look up an LLM entry by name. Returns the first match or `None`.
+    pub fn llm_entry(&self, name: &str) -> Option<&LlmEntry> {
+        self.llm.iter().find(|e| e.name == name)
+    }
+
+    /// Convenience: resolve the `default-llm` entry. Validation
+    /// guarantees this is `Some` for any config that has been through
+    /// `validate()`.
+    pub fn default_llm_entry(&self) -> Option<&LlmEntry> {
+        self.llm_entry(&self.default_llm)
+    }
 }
 
 impl AuraConfig {

@@ -1,0 +1,17 @@
+// Aggregator: each sibling file is mounted as a module so the harness
+// links once. See the Cargo.toml `autotests = false` rationale.
+
+#[path = "agent_loop_e2e.rs"]
+mod agent_loop_e2e;
+#[path = "channel_registration.rs"]
+mod channel_registration;
+#[path = "multimodal_tool_output.rs"]
+mod multimodal_tool_output;
+#[path = "security_pipeline.rs"]
+mod security_pipeline;
+#[path = "smoke.rs"]
+mod smoke;
+#[path = "streaming_safety.rs"]
+mod streaming_safety;
+#[path = "tool_boundary.rs"]
+mod tool_boundary;

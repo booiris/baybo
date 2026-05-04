@@ -19,17 +19,22 @@ export type {
   StopBotCommand,
   UserInbound,
 } from "./channel.js";
-export { defaultLogger, hasWireSink } from "./logger.js";
+export { defaultLogger } from "./logger.js";
+export type { Logger, LogLevel } from "./logger.js";
 export type {
-  Logger,
-  WireCapableLogger,
-  WireLogLevel,
-  WireLogSink,
-} from "./logger.js";
-export type { AttachmentKind, WireAttachment } from "./wire.js";
-export { BlobPairingRequiredError, fetchBlob, uploadBlob } from "./blobs.js";
+  AttachmentKind,
+  ResourceAccess,
+  WireAttachment,
+} from "./wire.js";
+export {
+  BlobPairingRequiredError,
+  fetchBlob,
+  fetchBlobStream,
+  uploadBlob,
+} from "./blobs.js";
 export type {
   BlobClientOptions,
   FetchBlobResult,
+  FetchBlobStreamResult,
   UploadBlobResult,
 } from "./blobs.js";

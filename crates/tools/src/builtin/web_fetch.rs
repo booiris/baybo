@@ -21,12 +21,13 @@
 //!     Each redirect hop triggers a fresh resolution, so DNS rebinding inside
 //!     a single redirect chain is also caught.
 //!
-//! Approval boundary: redirects are restricted to the same host as the
-//! original request. Cross-host redirects are surfaced to the caller as a
-//! `ToolOutput::Error` so the LLM must re-issue WebFetch on the new URL,
-//! re-running the per-host approval gate.
+//! Redirect host pinning: redirects are restricted to the same host as
+//! the original request. Cross-host redirects are surfaced as a
+//! `ToolOutput::Error` so the LLM has to re-issue WebFetch on the new
+//! URL — it makes the host change visible in the call trace instead of
+//! letting it happen silently inside reqwest.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +45,72 @@ const ERROR_BODY_PREVIEW_BYTES: usize = 8 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIRECT_LIMIT: usize = 5;
 const CALL_LABEL_MAX: usize = 120;
+
+fn host_to_literal_ip(host: &str) -> Option<IpAddr> {
+    if let Ok(addr) = host.parse::<IpAddr>() {
+        return Some(addr);
+    }
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .and_then(|s| s.parse::<IpAddr>().ok())
+}
+
+fn validate_url_with(s: &str, allow_loopback: bool) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(s).map_err(|e| format!("invalid url `{s}`: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!("scheme `{other}` not allowed (use http or https)"));
+        }
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "url has no host".to_string())?;
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc.is_empty() {
+        return Err("empty host".to_string());
+    }
+    if !allow_loopback
+        && (host_lc == "localhost"
+            || host_lc == "localhost.localdomain"
+            || host_lc.ends_with(".localhost"))
+    {
+        return Err(format!("host `{host}` blocked"));
+    }
+    if let Some(addr) = host_to_literal_ip(&host_lc)
+        && aura_security::is_blocked_ip(&addr, allow_loopback)
+    {
+        return Err(format!("ip `{addr}` blocked"));
+    }
+    Ok(parsed)
+}
+
+struct SafeResolver {
+    allow_loopback: bool,
+}
+
+impl Resolve for SafeResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let allow_loopback = self.allow_loopback;
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let lookup = format!("{host}:0");
+            let resolved: Vec<SocketAddr> = tokio::net::lookup_host(lookup)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect();
+            let safe: Vec<SocketAddr> = resolved
+                .into_iter()
+                .filter(|sa| !aura_security::is_blocked_ip(&sa.ip(), allow_loopback))
+                .collect();
+            if safe.is_empty() {
+                return Err(format!("host `{host}` resolved only to blocked IP ranges").into());
+            }
+            let iter: Addrs = Box::new(safe.into_iter());
+            Ok(iter)
+        })
+    }
+}
 
 pub struct WebFetchTool {
     client: reqwest::Client,
@@ -76,8 +143,8 @@ impl WebFetchTool {
                     let target_url = attempt.url().to_string();
                     return attempt.error(format!(
                         "WebFetch: cross-host redirect to `{target_url}` blocked; \
-                         re-issue WebFetch on the new URL so the per-host \
-                         approval gate runs again"
+                         re-issue WebFetch on the new URL so the host change \
+                         is visible in the call trace"
                     ));
                 }
                 attempt.follow()
@@ -148,11 +215,29 @@ impl Tool for WebFetchTool {
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
+        // Three buckets, only the third actually prompts:
+        //   1. hostname URL → []. The SSRF resolver is the sole guard;
+        //      prompting per fetch is friction without a real win.
+        //   2. literal IP that `is_blocked_ip` would reject → []. The
+        //      tool will fail at `validate_url_with` before any request
+        //      goes out, so prompting is pure noise — the user clicks
+        //      approve and still sees an error. The SSRF floor stays
+        //      load-bearing; it just doesn't need a UI prompt on top.
+        //   3. literal *public* IP → declare `Http`. RFC-range checks
+        //      can't tell a routable IP that belongs to internal
+        //      infrastructure from a real public service, so put a
+        //      human in the loop.
         params
             .get("url")
             .and_then(|v| v.as_str())
             .and_then(|s| url::Url::parse(s).ok())
             .and_then(|u| u.host_str().map(str::to_lowercase))
+            .filter(|host| {
+                let Some(addr) = host_to_literal_ip(host) else {
+                    return false;
+                };
+                !aura_security::is_blocked_ip(&addr, self.validator_allow_loopback)
+            })
             .map(|host| vec![ResourceAccess::Http { host }])
             .unwrap_or_default()
     }
@@ -176,7 +261,7 @@ impl Tool for WebFetchTool {
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
         let parsed = validate_url_with(&p.url, self.validator_allow_loopback)
-            .map_err(ToolError::InvalidParams)?;
+            .map_err(|e| ToolError::InvalidParams(format!("WebFetch: {e}")))?;
         let host = parsed.host_str().unwrap_or_default().to_string();
 
         tracing::info!(host = %host, "WebFetch start");
@@ -302,73 +387,6 @@ fn reqwest_error_chain(e: &reqwest::Error) -> String {
         cursor = inner.source();
     }
     s
-}
-
-fn validate_url_with(s: &str, allow_loopback: bool) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(s).map_err(|e| format!("invalid url `{s}`: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(format!(
-                "WebFetch: scheme `{other}` not allowed (use http or https)"
-            ));
-        }
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "WebFetch: url has no host".to_string())?;
-    let host_lc = host.to_ascii_lowercase();
-    if host_lc.is_empty() {
-        return Err("WebFetch: empty host".to_string());
-    }
-    if !allow_loopback
-        && (host_lc == "localhost"
-            || host_lc == "localhost.localdomain"
-            || host_lc.ends_with(".localhost"))
-    {
-        return Err(format!("WebFetch: host `{host}` blocked"));
-    }
-    let parsed_ip = host_lc.parse::<std::net::IpAddr>().ok().or_else(|| {
-        host_lc
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-    });
-    if let Some(addr) = parsed_ip
-        && aura_security::is_blocked_ip(&addr, allow_loopback)
-    {
-        return Err(format!("WebFetch: ip `{addr}` blocked"));
-    }
-    Ok(parsed)
-}
-
-struct SafeResolver {
-    allow_loopback: bool,
-}
-
-impl Resolve for SafeResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let allow_loopback = self.allow_loopback;
-        Box::pin(async move {
-            let host = name.as_str().to_string();
-            let lookup = format!("{host}:0");
-            let resolved: Vec<SocketAddr> = tokio::net::lookup_host(lookup)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-                .collect();
-            let safe: Vec<SocketAddr> = resolved
-                .into_iter()
-                .filter(|sa| !aura_security::is_blocked_ip(&sa.ip(), allow_loopback))
-                .collect();
-            if safe.is_empty() {
-                return Err(
-                    format!("WebFetch: host `{host}` resolved only to blocked IP ranges").into(),
-                );
-            }
-            let iter: Addrs = Box::new(safe.into_iter());
-            Ok(iter)
-        })
-    }
 }
 
 fn truncate_utf8(bytes: &[u8], max: usize) -> String {
@@ -499,13 +517,73 @@ mod tests {
     }
 
     #[test]
-    fn accessed_resources_lists_host() {
+    fn accessed_resources_skips_hostnames() {
+        // Hostname URLs declare no access so the executor's approval
+        // gate has nothing to prompt on — the SSRF resolver is the
+        // sole guard at runtime.
         let tool = WebFetchTool::default();
         let acc = tool.accessed_resources(&json!({ "url": "https://Example.COM/path" }));
+        assert!(acc.is_empty(), "got: {acc:?}");
+    }
+
+    #[test]
+    fn accessed_resources_declares_http_for_literal_ipv4() {
+        let tool = WebFetchTool::default();
+        let acc = tool.accessed_resources(&json!({ "url": "https://1.2.3.4/path" }));
         assert!(matches!(
             acc.first(),
-            Some(ResourceAccess::Http { host }) if host == "example.com"
+            Some(ResourceAccess::Http { host }) if host == "1.2.3.4"
         ));
+    }
+
+    #[test]
+    fn accessed_resources_declares_http_for_literal_ipv6() {
+        let tool = WebFetchTool::default();
+        let acc = tool.accessed_resources(&json!({ "url": "https://[2001:db8::1]/" }));
+        assert!(
+            matches!(acc.first(), Some(ResourceAccess::Http { .. })),
+            "got: {acc:?}"
+        );
+    }
+
+    #[test]
+    fn host_to_literal_ip_classifies_correctly() {
+        assert!(host_to_literal_ip("1.2.3.4").is_some());
+        assert!(host_to_literal_ip("::1").is_some());
+        assert!(host_to_literal_ip("[2001:db8::1]").is_some());
+        assert!(host_to_literal_ip("example.com").is_none());
+        assert!(host_to_literal_ip("1.2.3").is_none());
+    }
+
+    /// IPs the SSRF floor would reject must NOT trigger approval —
+    /// the tool fails at `validate_url_with` before any request goes
+    /// out, so prompting is pure noise. Covers literal RFC1918,
+    /// loopback (default `WebFetchTool::default()` runs strict), and
+    /// the unusual encodings that `url::Url` canonicalizes into
+    /// reserved ranges (`http://2130706433/` → `127.0.0.1` etc.).
+    #[test]
+    fn accessed_resources_skips_blocked_literal_ips() {
+        let tool = WebFetchTool::default();
+        for url in [
+            "http://10.0.0.1/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://169.254.169.254/",
+            "http://127.0.0.1/",
+            "http://2130706433/", // → 127.0.0.1
+            "http://0x7f000001/", // → 127.0.0.1
+            "http://0177.0.0.1/", // → 127.0.0.1
+            "http://127.1/",      // → 127.0.0.1
+            "http://[::1]/",
+            "http://[fe80::1]/",
+            "http://[fc00::1]/",
+        ] {
+            let acc = tool.accessed_resources(&json!({ "url": url }));
+            assert!(
+                acc.is_empty(),
+                "{url} resolves into a blocked range; must not prompt approval, got {acc:?}"
+            );
+        }
     }
 
     #[test]
@@ -789,12 +867,12 @@ mod tests {
         );
     }
 
-    /// Finding 2 (per-host approval): a redirect to a different host that
+    /// Finding 2 (cross-host redirect): a redirect to a different host that
     /// would otherwise pass SSRF validation must still be rejected so the
-    /// LLM has to re-issue WebFetch and trigger a fresh per-host approval.
-    /// Uses 127.0.0.1 → localhost (different host strings, same loopback
-    /// IP, both lax-allowed) to isolate the cross-host check from the
-    /// SSRF resolver.
+    /// LLM has to re-issue WebFetch with the new host visible in the call
+    /// trace. Uses 127.0.0.1 → localhost (different host strings, same
+    /// loopback IP, both lax-allowed) to isolate the cross-host check
+    /// from the SSRF resolver.
     #[tokio::test]
     async fn cross_host_redirect_is_blocked_even_when_target_is_safe() {
         #[derive(Clone)]

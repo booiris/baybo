@@ -23,30 +23,28 @@ use std::sync::Arc;
 
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::AgentLoop;
-use aura_agent::cost::CostTracker;
-use aura_agent::observability::ObservabilityRecorder;
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
+use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::soul::Soul;
+use aura_agent::subagent::{LocalSubagentRuntime, SubagentRuntime};
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
-    CronScheduler, CronTriggerEvent, JobManager, MemoryManager, SecretVault, SecurityGateway,
-    SessionManager, TraceCollector,
+    CronScheduler, CronTriggerEvent, JobLifecycle, MemoryManager, SecretVault, SecurityGateway,
+    SessionManager, SpanRecorder, TraceEventStream,
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
-use aura_hook::HookManager;
 use aura_llm::LlmClient;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
-use aura_tools::mcp::McpReconciler;
+use aura_tools::mcp::{EmbeddedMcpServer, McpReconciler};
 use aura_workspace::WorkspaceManager;
-use parking_lot::Mutex;
 use regex::Regex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -157,7 +155,7 @@ pub async fn build_bot_registry_deps(
 pub struct ManagerGraph {
     pub config: Arc<AuraConfig>,
     pub session_manager: Arc<SessionManager>,
-    pub job_manager: Arc<JobManager>,
+    pub job_lifecycle: Arc<JobLifecycle>,
     pub memory_manager: Arc<MemoryManager>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub security_gateway: Arc<SecurityGateway>,
@@ -168,8 +166,9 @@ pub struct ManagerGraph {
     pub llm_client: Arc<LlmClient>,
     pub workspace: Arc<WorkspaceManager>,
     pub channels_registry: Arc<ChannelRegistry>,
-    pub cost_tracker: Arc<CostTracker>,
-    pub hook_manager: Arc<HookManager>,
+    /// `CostStore` retained on the graph so external subscribers can
+    /// open their own `TraceEventStream` listeners (e.g. the gateway).
+    pub cost_store: Arc<dyn aura_storage::CostStore>,
     pub secret_vault: Arc<SecretVault>,
     /// Cloneable bundle of every libsql-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
@@ -184,6 +183,11 @@ pub struct ManagerGraph {
     /// `wire_router` twice panics loudly instead of silently handing
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+
+    /// Process-wide parent token for `AgentActor`s. Bridged to the
+    /// shared `ShutdownSignal` in [`build_managers`]; cancelling it
+    /// cascades down through every actor's per-job cancel tree.
+    pub actor_parent_token: CancellationToken,
 }
 
 /// Resolve every domain manager, tying them together with the shared
@@ -194,6 +198,12 @@ pub async fn build_managers(
     config: Arc<AuraConfig>,
     shutdown: ShutdownSignal,
     leak_detector: Arc<LeakDetector>,
+    // Pre-assembled embedded MCP server entries the reconciler should
+    // spawn alongside any user-configured `.mcp.json` entries. Built
+    // by the boot-path caller (`gateway_cmd::start` for the gateway,
+    // empty `Vec` for non-gateway paths) so the manager-graph layer
+    // stays free of per-tool-domain wiring (browser blob upload, etc).
+    embedded_mcp_servers: Vec<EmbeddedMcpServer>,
 ) -> anyhow::Result<ManagerGraph> {
     // --- minimal services shared by every mode
     let workspace_paths =
@@ -212,25 +222,55 @@ pub async fn build_managers(
         }
         reg
     };
-    let mut tool_registry = Arc::new(ToolRegistry::with_defaults());
     let workspace = Arc::new(WorkspaceManager::new(workspace_root.clone()));
     let channels_registry = Arc::new(ChannelRegistry::new());
-
-    let llm_client = {
-        let client = boot::build_llm_client(&config.llm)?;
-        let client = Arc::new(client);
-        info!(
-            provider = %client.model_info().provider,
-            model = %client.model_id(),
-            "configured LLM client"
-        );
-        client
-    };
 
     // --- storage + domain managers. `stores` is kept whole: every Arc
     // handed to a manager is a cheap `stores.xxx.clone()` so the bundle
     // itself stays intact for the graph + downstream consumers.
     let stores = Store::open(boot::storage_db_path(&config.workspace)).await?;
+
+    // Browser tools are not registered as builtins — they arrive
+    // dynamically when the embedded browser MCP server connects via
+    // the reconciler below. Until that connect completes (or if the
+    // child crashes), the LLM does not see `browser/*` tools at all.
+    //
+    // Built as a plain mutable up front so the registration steps
+    // below (cron, code-builder) can `register` directly. Wrapped in
+    // `Arc` once all registrations are done — that way the "single
+    // owner" invariant the registrations relied on is enforced by the
+    // type system, not by an `Arc::get_mut().expect()` runtime check.
+    let mut tool_registry = ToolRegistry::with_defaults(stores.blob.clone());
+
+    // Vault is constructed up here (before `build_llm_client`) so the
+    // openai-subscription provider can read its OAuth bundle straight away.
+    // Other providers ignore the vault. Comment from the original site:
+    // can't route through `build_secret_vault` (it would re-open libsql);
+    // share the master-key policy via `load_master_key`.
+    let master_key = load_master_key(&config.security)?;
+    let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
+
+    // Built after `stores` so `build_llm_client` can wire the blob
+    // store in as a `BlobFetcher` — without it, multimodal user
+    // content would degrade to a `[image: …]` text stub even on
+    // vision-capable models.
+    let llm_client = {
+        let client = Arc::new(
+            boot::build_llm_client(
+                config.as_ref(),
+                Some(stores.blob.clone()),
+                Some(Arc::clone(&secret_vault)),
+            )
+            .await?,
+        );
+        info!(
+            provider = %client.model_info().provider,
+            model = %client.model_id(),
+            supports_vision = client.model_info().supports_vision,
+            "configured LLM client"
+        );
+        client
+    };
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
     let skill_assessor = Arc::new(SkillAssessor::with_background_worker(
@@ -253,22 +293,11 @@ pub async fn build_managers(
         boot::to_session_timeout(&config.session),
     ));
 
-    let job_manager = JobManager::new(stores.job.clone());
-    match job_manager.recover_interrupted().await {
-        Ok(0) => {}
-        Ok(n) => info!(count = n, "recovered interrupted jobs from prior run"),
-        Err(e) => tracing::warn!(error = %e, "failed to recover interrupted jobs"),
-    }
-    let job_manager = Arc::new(job_manager);
-
-    let cost_tracker = Arc::new(CostTracker::new(stores.cost.clone()));
-
-    // --- secret vault (master key optionally substituted with a dev key).
-    // The store is already open here, so we can't route through
-    // `build_secret_vault` (it would re-open libsql); share the
-    // master-key policy via `load_master_key`.
-    let master_key = load_master_key(&config.security)?;
-    let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
+    let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
+    // CostTracker has been retired in favour of a TraceEventStream
+    // subscriber. The bootstrap below wires it once `SpanRecorder`s
+    // exist (per-actor); see `spawn_actor` below for the subscription.
+    let cost_store_for_subscriber = stores.cost.clone();
 
     // --- cron scheduler (built before ToolExecutor so its tools register
     // while `tool_registry` still has a single Arc owner)
@@ -278,19 +307,17 @@ pub async fn build_managers(
         cron_trigger_tx,
         Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
     ));
-    {
-        let reg = Arc::get_mut(&mut tool_registry)
-            .expect("tool_registry has no other owners at this point");
-        for (tool, manifest) in aura_cron::agent_tools(Arc::clone(&cron_scheduler)) {
-            reg.register(tool, manifest);
-        }
+    for (tool, manifest) in aura_cron::agent_tools(Arc::clone(&cron_scheduler)) {
+        tool_registry.register(tool, manifest);
     }
 
     // --- security gateway + tool executor
-    let security_gateway = Arc::new(SecurityGateway::new(
-        Arc::clone(&leak_detector),
-        Arc::clone(&secret_vault),
-    ));
+    let tool_spill_dir =
+        aura_workspace::WorkspacePaths::new(workspace_root.clone()).tool_spills_dir();
+    let security_gateway = Arc::new(
+        SecurityGateway::new(Arc::clone(&leak_detector), Arc::clone(&secret_vault))
+            .with_spill_dir(tool_spill_dir),
+    );
     let gate_map = channels_registry.approval_gates();
     let sandbox_runner = match aura_sandbox::current_platform_runner() {
         Ok(r) => match r.warm().await {
@@ -327,8 +354,6 @@ pub async fn build_managers(
     // registration if the sandbox is unavailable — CodeBuilder would
     // refuse every call without it.
     if let Some(runner) = sandbox_runner.as_ref() {
-        let reg = Arc::get_mut(&mut tool_registry)
-            .expect("tool_registry has no other owners at this point");
         let llm: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&llm_client) as _;
         let (tool, manifest) = aura_code_builder::agent_tool(
             llm,
@@ -336,10 +361,15 @@ pub async fn build_managers(
             Arc::clone(&leak_detector),
             Arc::clone(&secret_vault),
         );
-        reg.register(tool, manifest);
+        tool_registry.register(tool, manifest);
     } else {
         tracing::warn!("CodeBuilder tool not registered: OS sandbox unavailable");
     }
+
+    // Freeze the registry now that mutation is done; downstream
+    // consumers (`tool_executor`, `McpReconciler`, the actor spawner)
+    // need an `Arc<ToolRegistry>` for sharing across tasks.
+    let tool_registry = Arc::new(tool_registry);
 
     // Sandbox FS scope is the workspace `work/` directory — the gitignored
     // scratch root for tool-generated files. `ensure_layout` creates this
@@ -365,7 +395,6 @@ pub async fn build_managers(
     ));
 
     let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
-    let hook_manager = Arc::new(HookManager::new());
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
     // dynamically registers/unregisters MCP-discovered tools. Bridge the
@@ -381,10 +410,30 @@ pub async fn build_managers(
             cancel_on_shutdown.cancel();
         });
     }
+
+    // --- per-actor parent token. Each `AgentActor::new` derives a child
+    // from this; tripping it on shutdown cascades cancel through every
+    // in-flight tool / subagent across every session.
+    let actor_parent_token = CancellationToken::new();
+    {
+        let signal = shutdown.clone();
+        let cancel_on_shutdown = actor_parent_token.clone();
+        tokio::spawn(async move {
+            signal.wait().await;
+            cancel_on_shutdown.cancel();
+        });
+    }
+    // Browser MCP server: shipped as a zstd-embedded JS bundle, run
+    // by the gateway as a stdio MCP child. The reconciler spawns it
+    // alongside any user-configured `.mcp.json` entries; if the bundle
+    // failed to materialise (`SidecarRuntime::install` Err), the
+    // embedded list is empty and only user entries get connected.
     let mcp_reconciler = McpReconciler::new(
         workspace_root.clone(),
         Arc::clone(&tool_registry),
         Arc::clone(&secret_vault),
+        Some(stores.blob.clone()),
+        embedded_mcp_servers,
         mcp_cancel,
     );
     mcp_reconciler.spawn();
@@ -392,7 +441,7 @@ pub async fn build_managers(
     Ok(ManagerGraph {
         config,
         session_manager,
-        job_manager,
+        job_lifecycle,
         memory_manager,
         cron_scheduler,
         security_gateway,
@@ -403,11 +452,11 @@ pub async fn build_managers(
         llm_client,
         workspace,
         channels_registry,
-        cost_tracker,
-        hook_manager,
+        cost_store: cost_store_for_subscriber,
         secret_vault,
         stores,
         cron_trigger_rx: Some(cron_trigger_rx),
+        actor_parent_token,
     })
 }
 
@@ -433,6 +482,11 @@ pub struct RouterRunHandle {
 pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let buffer = graph.config.channels.message_buffer_size;
 
+    let session_log_dir =
+        aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&graph.config.workspace.path))
+            .sessions_log_dir();
+    let session_logger = Arc::new(SessionLlmLogger::new(session_log_dir));
+
     let tokenizer: Arc<dyn Tokenizer> =
         Arc::new(TiktokenTokenizer::for_model(graph.llm_client.model_id()));
 
@@ -444,26 +498,124 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let policy = boot::to_execution_policy(&graph.config.agent);
     let token_budget = boot::to_token_budget(&graph.config.agent.context);
     let keep_recent = graph.config.agent.context.keep_recent;
-    let auto_snapshot = graph.config.trace.auto_snapshot;
-    let snapshot_interval = graph.config.trace.snapshot_interval;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
     let supervisor = AgentSupervisor::new(response_tx);
 
-    let actor_llm_client: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&graph.llm_client) as _;
-    let actor_tool_registry = Arc::clone(&graph.tool_registry);
-    let actor_skill_registry = Arc::clone(&graph.skill_registry);
-    let actor_tool_executor = Arc::clone(&graph.tool_executor);
-    let actor_memory_manager = Arc::clone(&graph.memory_manager);
-    let actor_tokenizer = Arc::clone(&tokenizer);
-    let actor_hooks = Arc::clone(&graph.hook_manager);
-    let actor_trace_store = graph.stores.trace.clone();
-    let actor_job_manager = Arc::clone(&graph.job_manager);
-    let actor_cost_tracker = Arc::clone(&graph.cost_tracker);
-    let actor_skill_assessor = Arc::clone(&graph.skill_assessor);
-    let actor_security_gateway = Arc::clone(&graph.security_gateway);
+    // Process-wide trace event bus. Every `SpanRecorder` publishes
+    // through it, and a single `CostSubscriber` task drains it for
+    // the entire process — no per-session subscriber and no per-session
+    // pricing clones.
+    let trace_event_stream = TraceEventStream::new();
+    let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> = {
+        // Seed with every provider's `known_pricings()`, then layer the
+        // active model's pricing on top so a config-flip mid-flight
+        // doesn't drop spans of the previous model to $0. Providers
+        // that haven't published `known_pricings` yet contribute
+        // nothing — the active-model fallback still covers their case.
+        //
+        // Per-model accuracy caveat: today's publishers report one
+        // flat rate per provider, so e.g. gpt-5-mini attributes at the
+        // same rate as gpt-5. Tracked as a follow-up in
+        // `docs/todo/trace-redesign.md` ("CostSubscriber per-model
+        // pricing accuracy").
+        let registry = aura_llm::LlmProviderRegistry::with_default_providers();
+        let mut map = registry.all_known_pricings();
+        let info = graph.llm_client.model_info();
+        map.insert(info.id.clone(), info.pricing.clone());
+        Arc::new(map)
+    };
+    let _cost_subscriber_handle =
+        aura_agent::cost::CostSubscriber::new(graph.cost_store.clone(), pricing)
+            .spawn(&trace_event_stream);
+
+    // Spawner-vs-runtime build cycle: closure captures the slot and is
+    // built first, then `LocalSubagentRuntime` patches itself in.
+    let subagent_runtime_slot: Arc<std::sync::OnceLock<Arc<dyn SubagentRuntime>>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    // Single Arc-shared factory: router's `ActorSpawner` and
+    // `LocalSubagentRuntime` both spawn the same fully-wired actor.
+    let spawn_actor_for: aura_agent::subagent::SubagentActorSpawner = {
+        let llm_client: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&graph.llm_client) as _;
+        let tool_registry = Arc::clone(&graph.tool_registry);
+        let skill_registry = Arc::clone(&graph.skill_registry);
+        let tool_executor = Arc::clone(&graph.tool_executor);
+        let memory_manager = Arc::clone(&graph.memory_manager);
+        let trace_store = graph.stores.trace.clone();
+        let job_lifecycle = Arc::clone(&graph.job_lifecycle);
+        let skill_assessor = Arc::clone(&graph.skill_assessor);
+        let security_gateway = Arc::clone(&graph.security_gateway);
+        let session_logger = Arc::clone(&session_logger);
+        let tokenizer = Arc::clone(&tokenizer);
+        let trace_event_stream = trace_event_stream.clone();
+        let subagent_runtime_slot = Arc::clone(&subagent_runtime_slot);
+        let token_budget = token_budget.clone();
+        let policy = policy.clone();
+        let system_prompt = system_prompt.clone();
+
+        Arc::new(
+            move |session: aura_model::Session,
+                  response_tx: mpsc::Sender<AgentOutput>,
+                  parent_token: &CancellationToken| {
+                let mut agent_loop = AgentLoop::new(
+                    Arc::clone(&llm_client),
+                    Arc::clone(&tool_registry),
+                    Arc::clone(&skill_registry),
+                    Arc::clone(&tool_executor),
+                    ContextManager::new(
+                        Arc::clone(&tokenizer),
+                        Box::new(Truncate::new(keep_recent)),
+                        token_budget.clone(),
+                    ),
+                    Arc::clone(&memory_manager),
+                    policy.clone(),
+                    Soul::custom(system_prompt.clone()),
+                    Arc::clone(&security_gateway),
+                )
+                .with_skill_assessor(Arc::clone(&skill_assessor))
+                .with_session_log(Arc::clone(&session_logger));
+
+                if let Some(rt) = subagent_runtime_slot.get() {
+                    agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
+                }
+
+                let span_recorder = Arc::new(SpanRecorder::new(
+                    session.id.clone(),
+                    session.user.id.clone(),
+                    Arc::clone(&trace_store),
+                    trace_event_stream.clone(),
+                ));
+
+                let actor = AgentActor::new(
+                    session,
+                    agent_loop,
+                    Arc::clone(&tool_executor),
+                    response_tx,
+                    Arc::clone(&job_lifecycle),
+                    span_recorder,
+                    parent_token,
+                );
+                let (sender, mailbox) = mpsc::channel(buffer);
+                tokio::spawn(async move {
+                    actor.run(mailbox).await;
+                });
+                sender
+            },
+        )
+    };
+
+    let local_subagent_runtime: Arc<dyn SubagentRuntime> = Arc::new(LocalSubagentRuntime::new(
+        Arc::clone(&graph.session_manager),
+        Arc::clone(&spawn_actor_for),
+        Arc::clone(&graph.job_lifecycle),
+    ));
+    // Sole `set` site in the process — `is_err()` is unreachable barring
+    // a programming error in this file.
+    let set_ok = subagent_runtime_slot.set(local_subagent_runtime).is_ok();
+    debug_assert!(set_ok);
 
     let router = Router::new(
         Arc::clone(&graph.session_manager),
@@ -471,49 +623,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         Arc::clone(&graph.channels_registry),
         Arc::clone(&graph.security_gateway),
     )
-    .with_actor_spawner(Box::new(move |session, response_tx| {
-        let agent_loop = AgentLoop::new(
-            Arc::clone(&actor_llm_client),
-            Arc::clone(&actor_tool_registry),
-            Arc::clone(&actor_skill_registry),
-            Arc::clone(&actor_tool_executor),
-            ContextManager::new(
-                Arc::clone(&actor_tokenizer),
-                Box::new(Truncate::new(keep_recent)),
-                token_budget.clone(),
-            ),
-            Arc::clone(&actor_memory_manager),
-            policy.clone(),
-            Soul::custom(system_prompt.clone()),
-            Arc::clone(&actor_security_gateway),
-        )
-        .with_skill_assessor(Arc::clone(&actor_skill_assessor));
-
-        let trace_collector = Arc::new(Mutex::new(TraceCollector::new(
-            &session.id,
-            Arc::clone(&actor_trace_store),
-            auto_snapshot,
-            snapshot_interval,
-        )));
-        let recorder = Arc::new(ObservabilityRecorder::new(
-            Arc::clone(&actor_job_manager),
-            trace_collector,
-            Arc::clone(&actor_cost_tracker),
-        ));
-
-        let actor = AgentActor::new(
-            session,
-            agent_loop,
-            Arc::clone(&actor_tool_executor),
-            response_tx,
-            Arc::clone(&actor_hooks),
-            recorder,
-        );
-        let (sender, mailbox) = mpsc::channel(buffer);
-        tokio::spawn(async move {
-            actor.run(mailbox).await;
-        });
-        sender
+    .with_actor_parent_token(graph.actor_parent_token.clone())
+    .with_actor_spawner(Box::new(move |session, response_tx, parent_token| {
+        spawn_actor_for(session, response_tx, parent_token)
     }));
 
     // Attach cron triggers eagerly — a caller who forgot to plumb the

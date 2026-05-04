@@ -3,6 +3,9 @@ pub mod bootstrap;
 pub mod error;
 pub mod spec;
 
+mod symlink_mount;
+pub use symlink_mount::{WorkspaceSymlinkMount, workspace_symlink_mount_for};
+
 #[cfg(all(target_os = "linux", feature = "linux"))]
 pub mod bwrap;
 #[cfg(feature = "docker")]
@@ -17,7 +20,8 @@ use async_trait::async_trait;
 pub use bootstrap::SandboxAvailability;
 pub use error::SandboxError;
 pub use spec::{
-    Backend, EnvPolicy, NetworkPolicy, ResourceLimits, SandboxOutput, SandboxSpec, StdinSource,
+    Backend, EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, SandboxOutput,
+    SandboxSpec, StdinSource, default_sensitive_denylist,
 };
 
 #[async_trait]

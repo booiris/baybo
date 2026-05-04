@@ -18,11 +18,13 @@
 //! | `Glob`     | implemented   |
 //! | `Grep`     | implemented   |
 //! | `WebFetch` | implemented   |
+//! | `SendFile` | implemented   |
 //! | everything else listed in `todo.rs` | stubbed  |
 
 use std::sync::Arc;
 
 use aura_model::TrustLevel;
+use aura_storage::BlobStore;
 
 use crate::{Tool, ToolCapability, ToolManifest};
 
@@ -31,7 +33,9 @@ pub mod edit;
 pub mod glob_tool;
 pub mod grep;
 pub mod now;
+pub(crate) mod paths;
 pub mod read;
+pub mod send_local_file;
 pub mod todo;
 pub mod web_fetch;
 pub mod write;
@@ -50,12 +54,15 @@ pub use read::ReadTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
 
-/// The set of builtin tools registered by [`crate::ToolRegistry::with_defaults`].
+/// The builtin tools registered by [`crate::ToolRegistry::with_defaults`].
 ///
 /// Each entry pairs an [`Arc<dyn Tool>`] with the [`ToolManifest`] describing
 /// its governance ceiling. `ToolExecutor::validate_trust` compares this
 /// manifest against the runtime trust policy before executing.
-pub fn default_tools() -> Vec<(Arc<dyn Tool>, ToolManifest)> {
+///
+/// Browser tools are not listed here — they arrive dynamically when
+/// the embedded browser MCP server connects through the reconciler.
+pub fn default_tools(blob_store: Arc<dyn BlobStore>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
         trusted(ReadTool, vec![ToolCapability::ReadFile]),
@@ -71,6 +78,7 @@ pub fn default_tools() -> Vec<(Arc<dyn Tool>, ToolManifest)> {
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
         trusted(WebFetchTool::default(), vec![ToolCapability::Http]),
+        send_local_file::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
     ];
     #[cfg(debug_assertions)]

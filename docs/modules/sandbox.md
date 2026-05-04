@@ -13,9 +13,10 @@ What the crate provides:
 
 - A `SandboxRunner` trait and a `current_platform_runner()` factory that
   returns the right backend for the current `target_os`.
-- A `SandboxSpec` describing the program, workspace root (the only
-  filesystem path the child can write to), readable paths, network policy,
-  environment policy, stdin source, and timeout.
+- A `SandboxSpec` describing the program, workspace root, readable
+  paths, network policy, environment policy, stdin source, timeout, and
+  the `FilesystemPolicy` selecting between strict workspace-only writes
+  and the permissive "host RW + denylist" model used by `BashTool`.
 - `cfg`-free `args.rs` that renders the bwrap argv and the SBPL profile,
   so spec → invocation is unit-testable on any developer host.
 - A `bootstrap::probe()` entry point so callers (the gateway) can detect a
@@ -82,6 +83,13 @@ There is no shared "policy" type beyond `SandboxSpec` itself.
   inside and outside the container so absolute paths line up for the
   `cwd` validation in `SandboxAdapter` and for any path the tool
   emits.
+- **Symlinked cwd spelling**: when a caller supplies an explicit `cwd`
+  whose canonical target is inside `SandboxSpec.workspace_root`, the
+  backend also exposes that requested spelling inside the sandbox
+  (`source = cwd.canonicalize()`, `destination = cwd`). This is a
+  convenience mount only; the security decision stays anchored on the
+  canonical workspace root. The sandbox does not parse arbitrary shell
+  command strings to discover path spellings.
 - **Network**: `--network none` for `NetworkPolicy::None`, `--network
   bridge` for `All`. We avoid `--network host` because Docker Desktop
   on macOS does not expose host networking — `bridge` works
@@ -161,9 +169,19 @@ or gets a clear error telling them which backend can deliver.
 The `ToolExecutor` decides whether a tool needs the sandbox by checking
 its manifest:
 
-- `ToolCapability::ExecCommand` ⇒ wrap.
-- `ToolCapability::Http` (paired with `ExecCommand`) ⇒
-  `NetworkPolicy::All`; otherwise `NetworkPolicy::None`.
+- `ToolCapability::ExecCommand` ⇒ wrap. The adapter is built with
+  `FilesystemPolicy::Permissive` (see "Filesystem policy" below) and
+  `NetworkPolicy::All`. Today only `BashTool` declares `ExecCommand`;
+  shells almost always need git/cargo/npm reachable, so the policy is
+  baked in rather than gated on a separate capability.
+- Tools without `ExecCommand` get no sandbox (their syscalls happen
+  in-process inside the gateway and there is nothing for the runner
+  to enforce).
+
+CodeBuilder is **not** an `ExecCommand` tool — it constructs its own
+`SandboxSpec` directly with `FilesystemPolicy::Workspace` and
+`NetworkPolicy` driven by the plan, so the LLM-generated Python it
+runs stays workspace-bound regardless of the Bash policy here.
 
 `Http` is broad-allow when `SandboxSpec.allowed_hosts` is empty: the
 tool gets `--share-net` (Linux) / `--network bridge` (Docker) /
@@ -204,18 +222,73 @@ reach. When `allowed_hosts` is non-empty the runners diverge sharply:
 - A future netns + nftables enforcer (or a kernel-level Linux
   alternative) can plug into the same field without an API change.
 
-### Curated read-only mounts (vs. a full host-root bind)
+### Filesystem policy: `Workspace` vs. `Permissive`
 
-The original design proposal said "RO bind of the host root (or a minimal
-`/usr`)". The implementation chose the minimal-curated approach: only
-`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, and
-`/run/systemd/resolve` are RO-bound, all via `--ro-bind-try` so missing
-paths don't fail the call. A literal `--ro-bind / /` would expose `/home`,
-`/root`, and `/var`, defeating the workspace-only write scope.
+`SandboxSpec.filesystem_policy` selects between two models. Callers
+that don't set it inherit `FilesystemPolicy::Workspace` (backward
+compatible default).
 
-Trade-off: on non-FHS distros (NixOS, GoboLinux) the curated list won't
-cover `/nix/store`, so most binaries won't actually run. A future
-configurable extra-readable-paths field is on the deferred list.
+**`Workspace`** — the historical strict model used by CodeBuilder.
+Only `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, and
+`/run/systemd/resolve` are RO-bound (via `--ro-bind-try` so missing
+entries don't fail the call). `workspace_root` is the only RW host
+path. Anything outside is invisible; the bwrap tmpfs `/tmp` is the
+only other writable surface. macOS SBPL mirrors this: deny default,
+allow read on a curated FHS-mac equivalent + workspace, allow write
+only on workspace + writable_paths.
+
+**`Permissive { extra_root, denied_paths }`** — the model used for
+`BashTool`. The agent's RW surface is exactly `workspace_root +
+extra_root` (the agent layer defaults `extra_root` to `$HOME`).
+`extra_root` is mounted with `--bind-try` so a missing `$HOME` (e.g.
+on minimal containers) downgrades silently instead of failing the
+call. FHS roots (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`,
+`/run/systemd/resolve`) stay RO-bound so installed binaries and
+resolv.conf still work. Anything outside that union is *not* visible
+inside the sandbox — there is **no full host-root bind**. `--proc`,
+`--dev`, and `--tmpfs /tmp` overlay a fresh PID namespace, a minimal
+devtmpfs (no host raw devices like `/dev/sda`), and a per-call temp
+dir. Each entry in `denied_paths` is then masked with an empty
+per-call `tmpfs`, so credential vaults that physically sit inside
+`extra_root` look empty inside the sandbox regardless of what was on
+the host. The OS user's own permission bits stay in effect on top.
+macOS SBPL emits a read-allow block over the FHS-mac equivalent +
+`workspace_root` + `extra_root`, a write-allow block over
+`workspace_root` + `extra_root`, then `(deny file-read*/file-write*
+(subpath …))` per denied path; SBPL's last-match-wins evaluation
+produces the same observable shape as the bwrap policy.
+
+`SandboxAdapter::with_permissive_filesystem(extra_root, denied_paths)`
+is the agent-side opt-in. It also relaxes the "cwd must be inside
+workspace_root" check, since the writable surface is now wider than
+`workspace_root`. Non-existent denied paths are filtered at adapter
+build time so bwrap never sees a `--tmpfs <missing>` line.
+
+Default Bash denylist (built by
+`crate::tool_executor::default_sensitive_denylist`):
+
+- `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg` — credentials and keys
+- `~/.config/gh`, `~/.config/gcloud` — cloud CLI tokens
+- `~/.docker`, `~/.kube` — registry / cluster auth
+- `$AURA_HOME` (or `~/.aura` if unset) — Aura's own state, secrets,
+  identity files
+
+Trade-offs:
+
+- `Permissive`'s blast radius is "everything under `workspace_root +
+  $HOME` the OS user can write to, minus the masked credential
+  vaults". `/etc/sudoers`, `/var/log`, `/srv`, `/data` (when not the
+  workspace), … stay invisible. Pair with the per-command approval
+  gate (which already fires on `rm`/destructive `git`) and the
+  `aura_security` content filters for defence in depth.
+- On non-FHS distros (NixOS, GoboLinux) the FHS-RO bind list still
+  leaves `/nix/store` uncovered; if the agent needs binaries from
+  there, prefer launching aura with the workspace inside `$HOME` so
+  the home bind covers it, or extend `BWRAP_RO_ROOTS`.
+- Docker is unaffected: the Docker runner currently ignores the
+  filesystem policy and continues to bind only `workspace_root` —
+  reaching `$HOME` from inside a container would need an explicit
+  bind that defeats the container model.
 
 ### Sandbox FS root vs. Aura state directory
 

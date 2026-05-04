@@ -9,8 +9,11 @@ import type {
   StopBotCommand,
   UserInbound,
 } from "./channel.js";
+import type { SlashCommandSpec } from "./generated/SlashCommandSpec.js";
 import type { Logger } from "./logger.js";
 import type { WireAttachment } from "./wire.js";
+
+export type { SlashCommandSpec };
 
 /**
  * One native-platform inbound event flowing from the transport into
@@ -27,6 +30,15 @@ export interface BotInboundEvent<ChatId> {
   chat: ChatId;
   platformUserId: string;
   content: string;
+  /**
+   * Platform-native message id (Telegram `update_id`, Weixin `msg_id`,
+   * …). Forwarded to the gateway as `Message.platform_msg_id` so the
+   * gateway can dedup if the sidecar replays the same upstream event
+   * (long-poll buffer replay after restart, transient retries).
+   * Sidecars without a stable id can omit it; dedup is then disabled
+   * for that frame.
+   */
+  platformMsgId?: string;
   attachments?: WireAttachment[];
 }
 
@@ -183,6 +195,22 @@ export interface BotPlatform<BotHandle, ChatId> {
    * …); omit otherwise.
    */
   notifyTyping?(handle: BotHandle, chat: ChatId): Promise<void>;
+
+  /**
+   * Optional slash-command registrar. Implement when the platform has
+   * a server-side command list the client UI surfaces (Telegram
+   * `setMyCommands`, Discord application commands, Slack
+   * `commands.list`, …); omit otherwise. Called once per successful
+   * {@link startBot} with the gateway-authored manifest published via
+   * `Frame::SlashManifest` (and re-published on every reconnect).
+   * Best-effort: a thrown error is logged but does not fail bot
+   * startup, since the bot still functions without the client-side
+   * autocomplete affordance.
+   */
+  registerSlashCommands?(
+    handle: BotHandle,
+    commands: ReadonlyArray<SlashCommandSpec>,
+  ): Promise<void>;
 }
 
 /**
@@ -262,6 +290,18 @@ export interface BotChannelOptions<
    * while the user keeps typing. Default: 60_000 ms.
    */
   typingSafetyMs?: number;
+  /**
+   * Slash commands to publish on every successful StartBot via
+   * {@link BotPlatform.registerSlashCommands}. Empty / omitted means
+   * "do not register". Platforms that don't implement
+   * `registerSlashCommands` log a warning the first time the channel
+   * tries to register and otherwise no-op.
+   *
+   * The list is the channel's static manifest, not a per-bot one:
+   * registering the same set on every bot is the intended behaviour
+   * since aura's gateway-side dispatcher is bot-agnostic.
+   */
+  slashCommands?: ReadonlyArray<SlashCommandSpec>;
 }
 
 const DEFAULT_QUEUE_CAPACITY = 1024;
@@ -288,14 +328,74 @@ interface TypingSession {
  * which is exactly the discrimination we want: `{chatId: 42}` and
  * `{chatId: 42, threadId: 7}` produce different keys → different
  * sessions.
+ *
+ * Exported so platform code can compute the same chat key the
+ * `BotChannel` does — e.g. when constructing the aura user id for an
+ * out-of-band action (blob upload) before `hooks.emit` has fired.
  */
-function defaultChatKey(chat: unknown): string {
+export function defaultChatKey(chat: unknown): string {
   if (chat === null || typeof chat !== "object") {
     return String(chat);
   }
   const obj = chat as Record<string, unknown>;
   const keys = Object.keys(obj).sort();
-  return keys.map((k) => `${k}=${String(obj[k])}`).join("&");
+  return keys.map((k) => `${k}=${chatValueToString(obj[k])}`).join("&");
+}
+
+// `String(v)` on a nested object yields `[object Object]`, which would
+// silently collide every chat into one routing bucket. The contract
+// (see BotPlatform docs) is "primitives or plain objects of
+// primitives" — but no runtime check enforces it, so a future
+// platform passing a nested object would otherwise produce a
+// platform-wide session collision before anyone noticed. Fall back
+// to JSON.stringify so each distinct nested value at least gets a
+// distinct key. Note: JSON.stringify isn't key-order-stable for
+// nested objects, so off-contract shapes still risk discriminating
+// `{a:{x:1,y:2}}` vs `{a:{y:2,x:1}}` — that's strictly better than
+// silent total collision and the contract still says "don't do that."
+function chatValueToString(v: unknown): string {
+  if (v === null || typeof v !== "object") return String(v);
+  return JSON.stringify(v);
+}
+
+/** Render an attachment list as `count=N size=B mime=X` (singular when
+ * `count==1`) / `mimes=X,Y` (plural with dedup) — the SDK's per-event
+ * inbound/outbound logs use this so the operator sees the high-level
+ * shape without each attachment getting its own line. */
+function formatAttachments(atts: ReadonlyArray<WireAttachment>): string {
+  const totalSize = atts.reduce((s, a) => s + a.size, 0);
+  const mimes = [...new Set(atts.map((a) => a.mime_type))];
+  const mimeStr =
+    mimes.length === 1 ? `mime=${mimes[0]}` : `mimes=${mimes.join(",")}`;
+  return `count=${atts.length} size=${totalSize} ${mimeStr}`;
+}
+
+/**
+ * Compose the canonical aura user id `<channelType>_<botId>_<chatKey>_<platformUserId>`.
+ *
+ * This is the identity the gateway pairs against — both the
+ * `Frame::Message.user_id` it stores and the `x-aura-user-id` header
+ * the blob `POST /v1/blobs` endpoint expects. `BotChannel.ingest`
+ * uses this when emitting inbound events; platform code that needs
+ * to act on the user before the event reaches the channel (chiefly
+ * uploading inbound media to the gateway, which has its own pairing
+ * gate) MUST compose the same id, otherwise the upload pairs against
+ * a different identity and lands in `pending` even when the user has
+ * already approved their text-message pairing.
+ *
+ * Pass `chatKey` only if the platform overrides
+ * {@link BotPlatform.chatKey}; the same default we apply in
+ * `ingest` is used otherwise.
+ */
+export function composeAuraUserId<ChatId>(
+  channelType: string,
+  botId: string,
+  chat: ChatId,
+  platformUserId: string,
+  chatKey?: (chat: ChatId) => string,
+): string {
+  const k = chatKey ? chatKey(chat) : defaultChatKey(chat);
+  return `${channelType}_${botId}_${k}_${platformUserId}`;
 }
 
 /**
@@ -367,6 +467,16 @@ export class BotChannel<BotHandle, ChatId>
   private readonly typingRefreshMs: number;
   private readonly typingSafetyMs: number;
   private readonly typingSessions = new Map<string, TypingSession>();
+  // Mutable: starts as the constructor-supplied seed (defaults to empty)
+  // and is replaced wholesale every time the gateway pushes a fresh
+  // `Frame::SlashManifest`. The gateway is the single source of truth
+  // once connected; the seed only matters for offline / pre-connect
+  // tests where there's no SlashManifest at all.
+  private slashCommands: ReadonlyArray<SlashCommandSpec>;
+  // Latched the first time we notice the platform configured
+  // `slashCommands` but does not implement `registerSlashCommands` —
+  // keeps the warning to one line per process even if many bots start.
+  private slashCapabilityWarned = false;
 
   // Slot per botId holds the live handle and a SDK-internal generation
   // counter. `BotHandle` itself is an opaque platform value (grammy
@@ -398,6 +508,7 @@ export class BotChannel<BotHandle, ChatId>
     this.capacity = opts.inboundQueueCapacity ?? DEFAULT_QUEUE_CAPACITY;
     this.typingRefreshMs = opts.typingRefreshMs ?? DEFAULT_TYPING_REFRESH_MS;
     this.typingSafetyMs = opts.typingSafetyMs ?? DEFAULT_TYPING_SAFETY_MS;
+    this.slashCommands = opts.slashCommands ?? [];
   }
 
   inbound(signal: AbortSignal): AsyncIterable<UserInbound> {
@@ -446,26 +557,33 @@ export class BotChannel<BotHandle, ChatId>
       );
       return;
     }
-    const hasMedia = msg.attachments !== undefined && msg.attachments.length > 0;
+    const sendMediaPath =
+      msg.attachments !== undefined
+      && msg.attachments.length > 0
+      && this.platform.sendMedia !== undefined;
+    this.logOutbound(route.botId, route.chat, msg, sendMediaPath);
     try {
-      if (hasMedia && this.platform.sendMedia) {
-        await this.platform.sendMedia(route.handle, route.chat, {
+      if (sendMediaPath) {
+        await this.platform.sendMedia!(route.handle, route.chat, {
           text: msg.content,
           attachments: msg.attachments!,
         });
       } else {
-        if (hasMedia) {
+        if (msg.attachments !== undefined && msg.attachments.length > 0) {
           // Platform doesn't implement sendMedia — surface this loudly
           // because the user's reply just lost its non-text payload.
           // The text part still ships so the conversation isn't broken.
           this.logger.warn(
-            `dropping ${msg.attachments!.length} attachment(s) — platform does not implement sendMedia`,
+            `dropping ${msg.attachments.length} attachment(s) — platform does not implement sendMedia`,
           );
         }
         await this.platform.sendText(route.handle, route.chat, msg.content);
       }
     } catch (err) {
-      this.logger.error(hasMedia ? "sendMedia failed" : "sendText failed", err);
+      this.logger.error(
+        sendMediaPath ? "sendMedia failed" : "sendText failed",
+        err,
+      );
     }
   }
 
@@ -556,11 +674,54 @@ export class BotChannel<BotHandle, ChatId>
         (err: unknown) => this.onPollingExit(cmd.botId, gen, err),
       );
     }
+    await this.publishSlashCommands(cmd.botId, out.handle);
+    this.logger.info(
+      `bot started channel=${this.channelType} bot=${cmd.botId}` +
+        (out.username ? ` username=${out.username}` : ""),
+    );
     return {
       botId: cmd.botId,
       ok: true,
       message: out.username ? `running as @${out.username}` : "running",
     };
+  }
+
+  async onSlashManifest(
+    commands: ReadonlyArray<SlashCommandSpec>,
+  ): Promise<void> {
+    // Snapshot the field synchronously before the first await so any
+    // concurrent `onStartBot` reads the new manifest, not the old one.
+    this.slashCommands = [...commands];
+    if (this.slashCommands.length === 0) return;
+    const live = [...this.bots.entries()];
+    for (const [botId, entry] of live) {
+      await this.publishSlashCommands(botId, entry.handle);
+    }
+  }
+
+  private async publishSlashCommands(
+    botId: string,
+    handle: BotHandle,
+  ): Promise<void> {
+    if (this.slashCommands.length === 0) return;
+    const register = this.platform.registerSlashCommands;
+    if (!register) {
+      if (!this.slashCapabilityWarned) {
+        this.slashCapabilityWarned = true;
+        this.logger.warn(
+          `slashCommands configured but platform does not implement registerSlashCommands; skipping (bot=${botId})`,
+        );
+      }
+      return;
+    }
+    try {
+      await register.call(this.platform, handle, this.slashCommands);
+    } catch (err) {
+      this.logger.warn(
+        `registerSlashCommands failed for bot=${botId}; bot remains live without command UI`,
+        err,
+      );
+    }
   }
 
   async onStopBot(cmd: StopBotCommand): Promise<BotStatusReport> {
@@ -584,6 +745,9 @@ export class BotChannel<BotHandle, ChatId>
         message: `stop failed: ${message}`,
       };
     }
+    this.logger.info(
+      `bot stopped channel=${this.channelType} bot=${cmd.botId}`,
+    );
     return { botId: cmd.botId, ok: true };
   }
 
@@ -636,24 +800,70 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   private ingest(botId: string, ev: BotInboundEvent<ChatId>): void {
-    // Canonical userId format, owned by the SDK so every platform
-    // shares the same shape: <channelType>_<botId>_<chatKey>_<user>.
-    const chatKey = this.platform.chatKey
-      ? this.platform.chatKey(ev.chat)
-      : defaultChatKey(ev.chat);
-    const userId = `${this.channelType}_${botId}_${chatKey}_${ev.platformUserId}`;
+    const userId = composeAuraUserId(
+      this.channelType,
+      botId,
+      ev.chat,
+      ev.platformUserId,
+      this.platform.chatKey?.bind(this.platform),
+    );
     this.chatByUser.set(userId, ev.chat);
     this.botByUser.set(userId, botId);
+    this.logInbound(botId, ev);
     this.startOrRefreshTyping(userId, botId, ev.chat);
     this.pushInbound({
       sessionId: "",
       userId,
       content: ev.content,
       botId,
+      ...(ev.platformMsgId ? { platformMsgId: ev.platformMsgId } : {}),
       ...(ev.attachments && ev.attachments.length > 0
         ? { attachments: ev.attachments }
         : {}),
     });
+  }
+
+  /** Render a chat using the platform's `chatKey` if defined,
+   * otherwise fall through to {@link defaultChatKey}. Same identity
+   * `composeAuraUserId` keys on, so a log line's `chat=` token matches
+   * the chat-portion of the `user=` (Aura user id) it appears with. */
+  private renderChat(chat: ChatId): string {
+    return this.platform.chatKey
+      ? this.platform.chatKey.call(this.platform, chat)
+      : defaultChatKey(chat);
+  }
+
+  private logInbound(botId: string, ev: BotInboundEvent<ChatId>): void {
+    const base =
+      `channel=${this.channelType} bot=${botId}` +
+      ` chat=${this.renderChat(ev.chat)} user=${ev.platformUserId}`;
+    if (ev.attachments && ev.attachments.length > 0) {
+      const textPart = ev.content ? ` text_len=${ev.content.length}` : "";
+      this.logger.info(
+        `inbound media ${base} ${formatAttachments(ev.attachments)}${textPart}`,
+      );
+    } else {
+      this.logger.info(`inbound text ${base} len=${ev.content.length}`);
+    }
+  }
+
+  private logOutbound(
+    botId: string,
+    chat: ChatId,
+    msg: AgentMessage,
+    sendMediaPath: boolean,
+  ): void {
+    const base =
+      `channel=${this.channelType} bot=${botId}` +
+      ` chat=${this.renderChat(chat)}`;
+    if (sendMediaPath && msg.attachments) {
+      const textPart = msg.content ? ` text_len=${msg.content.length}` : "";
+      this.logger.info(
+        `outbound media ${base} ${formatAttachments(msg.attachments)}${textPart}`,
+      );
+    } else {
+      this.logger.info(`outbound text ${base} len=${msg.content.length}`);
+    }
   }
 
   private startOrRefreshTyping(

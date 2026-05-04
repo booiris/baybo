@@ -1,12 +1,17 @@
 use rig::client::CompletionClient;
 use rig::providers::anthropic;
+use serde::Deserialize;
 
-use crate::registry::{LlmProviderConfig, LlmProviderFactory};
+use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
+
+pub(crate) const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 /// Factory that creates `LlmClient` instances configured for Anthropic Claude models.
 pub struct AnthropicProviderFactory;
 
+#[async_trait::async_trait]
 impl LlmProviderFactory for AnthropicProviderFactory {
     fn provider_name(&self) -> &str {
         "anthropic"
@@ -20,6 +25,21 @@ impl LlmProviderFactory for AnthropicProviderFactory {
             "claude-opus-4",
             "claude-sonnet-4",
         ]
+    }
+
+    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
+        self.known_models()
+            .iter()
+            .map(|m| {
+                (
+                    (*m).to_string(),
+                    ModelPricing {
+                        input_per_1m_tokens: 3.0,
+                        output_per_1m_tokens: 15.0,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
@@ -56,6 +76,67 @@ impl LlmProviderFactory for AnthropicProviderFactory {
             AnyCompletionModel::Anthropic(model),
         ))
     }
+
+    async fn live_models(&self, config: &LlmProviderConfig) -> crate::Result<Vec<LiveModelInfo>> {
+        let api_key = config.api_key.as_deref().ok_or_else(|| {
+            crate::LlmError::Config("Anthropic live discovery requires an API key".into())
+        })?;
+        let base = config
+            .base_url
+            .as_deref()
+            .unwrap_or(ANTHROPIC_DEFAULT_BASE_URL)
+            .trim_end_matches('/');
+        let url = format!("{base}/v1/models");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", ANTHROPIC_API_VERSION)
+            .send()
+            .await
+            .map_err(|e| crate::LlmError::Provider(format!("anthropic GET /v1/models: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::LlmError::Provider(format!(
+                "anthropic GET /v1/models returned {status}: {body}"
+            )));
+        }
+        let payload: ModelListResponse = resp.json().await.map_err(|e| {
+            crate::LlmError::Provider(format!("anthropic /v1/models: parse response: {e}"))
+        })?;
+        Ok(payload
+            .data
+            .into_iter()
+            .map(|m| {
+                let extras = serde_json::json!({
+                    "type": m.kind,
+                    "created_at": m.created_at,
+                });
+                LiveModelInfo {
+                    id: m.id,
+                    display_name: m.display_name,
+                    extras,
+                    ..Default::default()
+                }
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelListResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[cfg(test)]

@@ -21,7 +21,9 @@ pub use blob::{BlobMeta, BlobStore, SHA256_PREFIX};
 pub use channel_bot::{ChannelBotRow, ChannelBotStore};
 pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 pub use channel_session::ChannelSessionStore;
-pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+pub use cost::{
+    CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange, UserMonthlyCost,
+};
 pub use cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 pub use error::StorageError;
 pub use job::JobStore;

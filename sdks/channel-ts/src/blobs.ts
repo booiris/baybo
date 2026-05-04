@@ -61,6 +61,18 @@ export interface FetchBlobResult {
   mimeType: string;
 }
 
+export interface FetchBlobStreamResult {
+  /** Web ReadableStream of file bytes. Pipe directly into the platform
+   * SDK's streaming upload (e.g. grammy's `new InputFile(stream)`) so
+   * the sidecar never buffers the full payload. */
+  stream: ReadableStream<Uint8Array>;
+  mimeType: string;
+  /** From the response's `Content-Length` header when available. `null`
+   * when the gateway didn't set the header (chunked transfer with no
+   * known length). */
+  size: number | null;
+}
+
 /** Upload `bytes` and return the content-addressed `blob_id`. */
 export async function uploadBlob(
   bytes: Uint8Array,
@@ -113,7 +125,9 @@ export async function uploadBlob(
   return { blobId: json.blob_id };
 }
 
-/** Fetch a blob's bytes by id. Throws on 404 / any non-2xx. */
+/** Fetch a blob's bytes by id. Throws on 404 / any non-2xx. Buffers the
+ * entire body in memory — prefer `fetchBlobStream` for large attachments
+ * so the bytes can flow straight into the platform SDK's streaming upload. */
 export async function fetchBlob(
   blobId: string,
   opts: BlobClientOptions = {},
@@ -131,6 +145,42 @@ export async function fetchBlob(
   const buf = new Uint8Array(await res.arrayBuffer());
   const mimeType = res.headers.get("content-type") ?? "application/octet-stream";
   return { bytes: buf, mimeType };
+}
+
+/**
+ * Streaming variant of `fetchBlob`. The returned `ReadableStream` is the
+ * raw response body; piping it into a platform SDK that accepts an async
+ * iterable / web stream (grammy's `InputFile`, native `fetch` request
+ * bodies, …) keeps peak memory at one chunk regardless of file size.
+ *
+ * The caller owns the stream — read it to completion or call `.cancel()`,
+ * otherwise the underlying connection stays open.
+ */
+export async function fetchBlobStream(
+  blobId: string,
+  opts: BlobClientOptions = {},
+): Promise<FetchBlobStreamResult> {
+  const { baseUrl, token } = resolveAuth(opts);
+  const url = `${baseUrl}${BLOB_PREFIX}/${encodeURIComponent(blobId)}`;
+  const res = await fetchWithSignal(url, {
+    method: "GET",
+    headers: { "x-aura-channel-token": token },
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  });
+  if (!res.ok) {
+    throw new Error(`fetchBlobStream: ${res.status} ${res.statusText} (${url})`);
+  }
+  if (!res.body) {
+    throw new Error(`fetchBlobStream: response has no body (${url})`);
+  }
+  const mimeType = res.headers.get("content-type") ?? "application/octet-stream";
+  const lenHeader = res.headers.get("content-length");
+  const size = lenHeader !== null ? Number.parseInt(lenHeader, 10) : NaN;
+  return {
+    stream: res.body,
+    mimeType,
+    size: Number.isFinite(size) ? size : null,
+  };
 }
 
 function resolveAuth(opts: BlobClientOptions): { baseUrl: string; token: string } {

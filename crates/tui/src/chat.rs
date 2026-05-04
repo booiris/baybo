@@ -327,10 +327,7 @@ fn render_approval_inline(entry: &crate::app::ApprovalChatEntry, out: &mut Vec<L
                 for param_line in entry.params_preview.lines() {
                     out.push(Line::from(vec![
                         Span::raw("      "),
-                        Span::styled(
-                            param_line.to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled(param_line.to_string(), Style::default().fg(Color::DarkGray)),
                     ]));
                 }
             }
@@ -412,9 +409,7 @@ fn access_summary(accesses: &[ResourceAccess]) -> String {
 fn format_access(acc: &ResourceAccess) -> Vec<Span<'static>> {
     let (verb, target) = match acc {
         ResourceAccess::ReadFile { path } => ("needs read access to", path.display().to_string()),
-        ResourceAccess::WriteFile { path } => {
-            ("needs write access to", path.display().to_string())
-        }
+        ResourceAccess::WriteFile { path } => ("needs write access to", path.display().to_string()),
         ResourceAccess::Http { host } => {
             if host == "*" {
                 ("needs network access", String::new())

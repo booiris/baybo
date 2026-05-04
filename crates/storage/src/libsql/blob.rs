@@ -47,10 +47,16 @@ impl LibsqlBlobStore {
         Ok(Self { pool, root })
     }
 
-    fn blob_path(&self, hex: &str) -> PathBuf {
+    fn blob_path(&self, hex: &str, ext: &str) -> PathBuf {
         // 2-char shard prefix to keep one directory from accumulating
-        // every blob — same shape git uses for its objects.
-        self.root.join(&hex[..2]).join(hex)
+        // every blob — same shape git uses for its objects. The
+        // extension is purely cosmetic: the canonical id is the hash,
+        // but `image.jpg` is more useful than a 64-hex string when
+        // someone is poking around the state directory by hand.
+        let mut name = String::with_capacity(hex.len() + ext.len());
+        name.push_str(hex);
+        name.push_str(ext);
+        self.root.join(&hex[..2]).join(name)
     }
 
     /// Top-level scratch directory for in-flight streaming uploads.
@@ -74,11 +80,13 @@ impl LibsqlBlobStore {
     ) -> Result<BlobRef> {
         let blob_id = format!("{SHA256_PREFIX}{hex}.{read_token}");
         let conn = self.pool.conn();
+        let now = now_unix();
         conn.execute(
-            "INSERT INTO blobs (blob_id, mime_type, size, uploader_identity, read_token, created_at, deleted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL) \
+            "INSERT INTO blobs (blob_id, mime_type, size, uploader_identity, read_token, created_at, last_accessed_at, deleted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, NULL) \
              ON CONFLICT(blob_id) DO UPDATE SET \
                 mime_type = excluded.mime_type, \
+                last_accessed_at = excluded.last_accessed_at, \
                 deleted_at = NULL",
             libsql::params![
                 blob_id.clone(),
@@ -86,17 +94,80 @@ impl LibsqlBlobStore {
                 size as i64,
                 uploader_identity.map(|s| s.to_string()),
                 read_token.to_string(),
-                now_unix(),
+                now,
             ],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob upsert: {e}")))?;
         Ok(BlobRef { blob_id })
     }
+
+    /// Bump the LRU timestamp on read. Best-effort: a touch failure
+    /// must never bubble up to the caller — the read path needs to keep
+    /// returning bytes even when the DB is briefly unwritable.
+    async fn touch(&self, blob_id: &str) {
+        let conn = self.pool.conn();
+        if let Err(e) = conn
+            .execute(
+                "UPDATE blobs SET last_accessed_at = ?2 \
+                 WHERE blob_id = ?1 AND deleted_at IS NULL",
+                libsql::params![blob_id.to_string(), now_unix()],
+            )
+            .await
+        {
+            tracing::warn!(blob_id, error = %e, "blob touch failed");
+        }
+    }
 }
 
 fn now_unix() -> i64 {
-    chrono::Utc::now().timestamp()
+    super::time::now_us()
+}
+
+/// Cosmetic file extension to append to a blob's on-disk filename so a
+/// human poking around `<state>/blobs/` can recognise an image vs a
+/// PDF without consulting the libsql metadata. Returns `""` when the
+/// MIME type isn't in the table — anything we don't recognise lands
+/// without a suffix rather than guessing wrong.
+fn mime_extension(mime: &str) -> &'static str {
+    // Strip parameters (`image/jpeg; charset=utf-8`) and lowercase
+    // before lookup so casing / params don't change the on-disk path.
+    let bare = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    match bare.as_str() {
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/heic" => ".heic",
+        "image/heif" => ".heif",
+        "image/svg+xml" => ".svg",
+        "image/bmp" => ".bmp",
+        "audio/ogg" | "audio/opus" => ".ogg",
+        "audio/mpeg" => ".mp3",
+        "audio/mp4" | "audio/m4a" => ".m4a",
+        "audio/wav" | "audio/x-wav" => ".wav",
+        "audio/flac" => ".flac",
+        "audio/silk" => ".silk",
+        "video/mp4" => ".mp4",
+        "video/webm" => ".webm",
+        "video/quicktime" => ".mov",
+        "video/x-matroska" => ".mkv",
+        "application/pdf" => ".pdf",
+        "application/zip" => ".zip",
+        "application/json" => ".json",
+        "application/x-tar" => ".tar",
+        "application/gzip" | "application/x-gzip" => ".gz",
+        "text/plain" => ".txt",
+        "text/html" => ".html",
+        "text/csv" => ".csv",
+        "text/markdown" => ".md",
+        _ => "",
+    }
 }
 
 #[async_trait]
@@ -203,7 +274,7 @@ impl BlobStore for LibsqlBlobStore {
 
         let hex = hex_encode(&hasher.finalize());
         let read_token = unique_read_token();
-        let final_path = self.blob_path(&hex);
+        let final_path = self.blob_path(&hex, mime_extension(mime_type));
         // Skip the rename when the canonical path already exists —
         // some other put or a previous attempt got there first. Either
         // way the bytes match (content-addressed) so we just clean
@@ -240,9 +311,11 @@ impl BlobStore for LibsqlBlobStore {
     async fn get(&self, blob_id: &str) -> Result<Vec<u8>> {
         let (hex, _token) = split_id(blob_id)?;
         // stat first so a soft-deleted blob whose bytes are still on
-        // disk surfaces as NotFound rather than reading them anyway.
-        let _ = self.stat(blob_id).await?;
-        let path = self.blob_path(hex);
+        // disk surfaces as NotFound rather than reading them anyway —
+        // and so we have the recorded mime to reconstruct the on-disk
+        // extension the put path appended.
+        let meta = self.stat(blob_id).await?;
+        let path = self.blob_path(hex, mime_extension(&meta.mime_type));
         tokio::fs::read(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound(format!("blob bytes missing for {blob_id}"))
@@ -254,8 +327,8 @@ impl BlobStore for LibsqlBlobStore {
 
     async fn open(&self, blob_id: &str) -> Result<BlobReader> {
         let (hex, _token) = split_id(blob_id)?;
-        let _ = self.stat(blob_id).await?;
-        let path = self.blob_path(hex);
+        let meta = self.stat(blob_id).await?;
+        let path = self.blob_path(hex, mime_extension(&meta.mime_type));
         let file = tokio::fs::File::open(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound(format!("blob bytes missing for {blob_id}"))
@@ -308,6 +381,12 @@ impl BlobStore for LibsqlBlobStore {
             return Err(StorageError::NotFound(format!("blob {blob_id}")));
         }
 
+        // LRU touch: refresh the access timestamp so the janitor's
+        // sweep treats this blob as alive. Done only after the token
+        // check passes so a probe with a wrong token doesn't extend
+        // the victim's TTL.
+        self.touch(blob_id).await;
+
         Ok(BlobMeta {
             blob_id: id,
             mime_type,
@@ -328,6 +407,127 @@ impl BlobStore for LibsqlBlobStore {
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob delete: {e}")))?;
         Ok(())
+    }
+
+    async fn purge_older_than(&self, cutoff_us: i64) -> Result<u64> {
+        let conn = self.pool.conn();
+
+        // LRU semantics: a blob whose `last_accessed_at` is older than
+        // the cutoff is the victim. `stat`/`get`/`open` bump that
+        // timestamp on every successful read, so any blob the system
+        // is still pulling stays out of the sweep regardless of how
+        // long ago it was first written.
+        //
+        // Three DB calls total — independent of the victim count:
+        // (1) snapshot victims, (2) one UPDATE that flips them all,
+        // (3) snapshot the surviving live set so per-payload unlink
+        // checks come from an in-memory hashmap instead of an
+        // unindexed `LIKE` per victim.
+        let mut rows = conn
+            .query(
+                "SELECT blob_id, mime_type FROM blobs \
+                 WHERE last_accessed_at < ?1 AND deleted_at IS NULL",
+                libsql::params![cutoff_us],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob purge query: {e}")))?;
+
+        let mut victims: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob purge row: {e}")))?
+        {
+            let blob_id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get blob_id: {e}")))?;
+            let mime_type: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?;
+            victims.push((blob_id, mime_type));
+        }
+        drop(rows);
+
+        if victims.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_unix();
+        let purged = conn
+            .execute(
+                "UPDATE blobs SET deleted_at = ?1 \
+                 WHERE last_accessed_at < ?2 AND deleted_at IS NULL",
+                libsql::params![now, cutoff_us],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql blob purge update: {e}"))
+            })?;
+
+        // Snapshot the surviving live set so we can answer "is anyone
+        // else pointing at this on-disk file?" with a HashSet lookup
+        // instead of a per-victim `LIKE` scan. The set is keyed by
+        // `(hex, mime_extension)` because that pair determines the
+        // on-disk path — different MIMEs of the same content live at
+        // different paths.
+        let mut live_rows = conn
+            .query(
+                "SELECT blob_id, mime_type FROM blobs WHERE deleted_at IS NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live query: {e}")))?;
+        let mut live_paths: std::collections::HashSet<(String, &'static str)> =
+            std::collections::HashSet::new();
+        while let Some(row) = live_rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live row: {e}")))?
+        {
+            let other_id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get blob_id: {e}")))?;
+            let other_mime: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?;
+            if let Ok((hex, _token)) = split_id(&other_id) {
+                live_paths.insert((hex.to_string(), mime_extension(&other_mime)));
+            }
+        }
+        drop(live_rows);
+
+        // Unlink each unique on-disk payload exactly once, but only when
+        // no remaining live row would resolve to the same path. Two puts
+        // of the same content (and same mime) share one on-disk file via
+        // content addressing; deleting one capability must not yank the
+        // file out from under the other.
+        let mut handled: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for (blob_id, mime_type) in &victims {
+            let Ok((hex, _token)) = split_id(blob_id) else {
+                continue;
+            };
+            let ext = mime_extension(mime_type);
+            let path = self.blob_path(hex, ext);
+            if !handled.insert(path.clone()) {
+                continue;
+            }
+            if live_paths.contains(&(hex.to_string(), ext)) {
+                continue;
+            }
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "blob payload unlink failed",
+                    );
+                }
+            }
+        }
+
+        Ok(purged)
     }
 }
 
@@ -454,6 +654,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn id_without_token_or_with_wrong_token_is_not_found() {
+        // Pins the capability model the codex review flagged: holding
+        // the SHA-256 alone (or a wrong token) is not enough to read
+        // the blob. Every code path that surfaces bytes — `get`,
+        // `stat`, `open` — must reject a doctored id that strips or
+        // mutates the token suffix.
+        let (store, _dir) = build().await;
+        let real = store.put(b"private", "text/plain", None).await.unwrap();
+
+        // Sanity: legitimate id round-trips.
+        assert_eq!(store.get(&real.blob_id).await.unwrap(), b"private");
+
+        let hex_with_token = real.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let (hex, token) = hex_with_token.split_once('.').unwrap();
+        assert_eq!(token.len(), 32, "token should be 32 hex chars (16 bytes)");
+
+        // Variants an attacker could plausibly construct.
+        let bad_ids = [
+            // Hex only — no token.
+            format!("{SHA256_PREFIX}{hex}"),
+            // Hex + empty token.
+            format!("{SHA256_PREFIX}{hex}."),
+            // Hex + a different (well-formed-looking) token. Same
+            // shape as a real id, different bits — must not unlock
+            // the file.
+            format!("{SHA256_PREFIX}{hex}.{}", "f".repeat(32)),
+            // Hex + a one-bit-flipped token (off-by-one).
+            format!(
+                "{SHA256_PREFIX}{hex}.{}{}",
+                if token.starts_with('0') { "1" } else { "0" },
+                &token[1..],
+            ),
+        ];
+        for bad in &bad_ids {
+            match store.get(bad).await {
+                Err(StorageError::NotFound(_)) => {}
+                other => panic!("get({bad}) leaked: {other:?}"),
+            }
+            match store.stat(bad).await {
+                Err(StorageError::NotFound(_)) => {}
+                other => panic!("stat({bad}) leaked: {other:?}"),
+            }
+            match store.open(bad).await {
+                Err(StorageError::NotFound(_)) => {}
+                Err(other) => panic!("open({bad}) leaked: {other:?}"),
+                Ok(_) => panic!("open({bad}) leaked Ok"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn delete_then_get_is_not_found() {
         let (store, _dir) = build().await;
         let blob = store.put(b"bye", "text/plain", None).await.unwrap();
@@ -517,8 +768,9 @@ mod tests {
         assert_eq!(mode, 0o700, "blob root mode {mode:o}");
 
         // Shard dir 0o700. The blob id is `sha256:<hex>.<token>`; the
-        // on-disk path is content-addressed by `<hex>` only — the
-        // token is metadata, not part of the filename.
+        // on-disk path is content-addressed by `<hex>` plus a cosmetic
+        // mime-derived extension (`.txt` here) — the token never
+        // appears on disk.
         let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
         let hex = hex_with_token
             .split_once('.')
@@ -528,8 +780,8 @@ mod tests {
         let mode = std::fs::metadata(&shard).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "shard mode {mode:o}");
 
-        // Final file 0o600.
-        let file = shard.join(hex);
+        // Final file 0o600 — name is `<hex>.txt` for `text/plain`.
+        let file = shard.join(format!("{hex}.txt"));
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "blob file mode {mode:o}");
 
@@ -539,6 +791,62 @@ mod tests {
             let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "scratch mode {mode:o}");
         }
+    }
+
+    #[tokio::test]
+    async fn on_disk_filename_carries_mime_derived_extension() {
+        // The `blob_id` stays content-addressed, but the on-disk
+        // filename gets a cosmetic suffix so a human can identify the
+        // file at a glance. Round-trips must still work because the
+        // read path reconstructs the same suffix from the recorded
+        // mime in the metadata row.
+        let (store, dir) = build().await;
+        let blob = store
+            .put(b"\xFF\xD8\xFF\xE0", "image/jpeg", None)
+            .await
+            .unwrap();
+        let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let hex = hex_with_token.split_once('.').map(|(h, _)| h).unwrap();
+        let path = dir
+            .path()
+            .join("blobs")
+            .join(&hex[..2])
+            .join(format!("{hex}.jpg"));
+        assert!(path.exists(), "expected {} to exist", path.display());
+        // Read back through the public api — proves the get path
+        // reconstructs the same filename from the stored mime.
+        let got = store.get(&blob.blob_id).await.unwrap();
+        assert_eq!(got, b"\xFF\xD8\xFF\xE0");
+    }
+
+    #[tokio::test]
+    async fn unknown_mime_lands_without_extension() {
+        // Unrecognized mimes (e.g. `application/x-aura-foo`) must not
+        // synthesis a fake suffix — the disk filename falls back to
+        // the bare hash. Both put and get round-trip.
+        let (store, dir) = build().await;
+        let blob = store
+            .put(b"opaque", "application/x-aura-foo", None)
+            .await
+            .unwrap();
+        let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let hex = hex_with_token.split_once('.').map(|(h, _)| h).unwrap();
+        let path = dir.path().join("blobs").join(&hex[..2]).join(hex);
+        assert!(path.exists(), "expected {} to exist", path.display());
+        let got = store.get(&blob.blob_id).await.unwrap();
+        assert_eq!(got, b"opaque");
+    }
+
+    #[test]
+    fn mime_extension_table_is_case_and_param_tolerant() {
+        // Lookup must ignore casing and `;`-suffixed parameters.
+        assert_eq!(mime_extension("image/jpeg"), ".jpg");
+        assert_eq!(mime_extension("IMAGE/JPEG"), ".jpg");
+        assert_eq!(mime_extension("image/jpeg; charset=binary"), ".jpg");
+        assert_eq!(mime_extension("audio/ogg"), ".ogg");
+        assert_eq!(mime_extension("application/pdf"), ".pdf");
+        assert_eq!(mime_extension("video/mp4"), ".mp4");
+        assert_eq!(mime_extension("application/x-not-known"), "");
     }
 
     #[tokio::test]
@@ -669,5 +977,151 @@ mod tests {
         for id in &ids {
             assert_eq!(store.get(id).await.unwrap(), bytes);
         }
+    }
+
+    async fn antedate_last_accessed(store: &LibsqlBlobStore, blob_id: &str, last_accessed_at: i64) {
+        store
+            .pool
+            .conn()
+            .execute(
+                "UPDATE blobs SET last_accessed_at = ?2 WHERE blob_id = ?1",
+                libsql::params![blob_id.to_string(), last_accessed_at],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_soft_deletes_row_and_unlinks_payload() {
+        let (store, dir) = build().await;
+        let stale = store.put(b"stale", "text/plain", None).await.unwrap();
+        let fresh = store.put(b"fresh", "text/plain", None).await.unwrap();
+        let now = now_unix();
+        antedate_last_accessed(&store, &stale.blob_id, now - 10 * 86_400_000_000).await;
+
+        let purged = store
+            .purge_older_than(now - 3 * 86_400_000_000)
+            .await
+            .unwrap();
+        assert_eq!(purged, 1);
+
+        // Stale row is soft-deleted.
+        match store.get(&stale.blob_id).await {
+            Err(StorageError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        // Fresh row + bytes still accessible.
+        assert_eq!(store.get(&fresh.blob_id).await.unwrap(), b"fresh");
+
+        // On-disk payload of the stale (distinct content) is gone.
+        let stale_hex = stale
+            .blob_id
+            .strip_prefix(SHA256_PREFIX)
+            .unwrap()
+            .split_once('.')
+            .map(|(h, _)| h)
+            .unwrap();
+        let stale_path = dir
+            .path()
+            .join("blobs")
+            .join(&stale_hex[..2])
+            .join(format!("{stale_hex}.txt"));
+        assert!(
+            !stale_path.exists(),
+            "stale on-disk payload should be unlinked"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_keeps_payload_when_live_row_still_references_it() {
+        // Two puts of identical (content, mime) share one on-disk file
+        // by content addressing. Soft-deleting the stale capability
+        // must NOT yank the file out from under the live capability.
+        let (store, dir) = build().await;
+        let stale = store.put(b"shared", "text/plain", None).await.unwrap();
+        let live = store.put(b"shared", "text/plain", None).await.unwrap();
+        let now = now_unix();
+        antedate_last_accessed(&store, &stale.blob_id, now - 10 * 86_400_000_000).await;
+
+        let purged = store
+            .purge_older_than(now - 3 * 86_400_000_000)
+            .await
+            .unwrap();
+        assert_eq!(purged, 1);
+
+        // Stale row is soft-deleted...
+        assert!(matches!(
+            store.get(&stale.blob_id).await,
+            Err(StorageError::NotFound(_)),
+        ));
+        // ...but the on-disk file survives so the live capability still reads.
+        assert_eq!(store.get(&live.blob_id).await.unwrap(), b"shared");
+
+        let hex = live
+            .blob_id
+            .strip_prefix(SHA256_PREFIX)
+            .unwrap()
+            .split_once('.')
+            .map(|(h, _)| h)
+            .unwrap();
+        let path = dir
+            .path()
+            .join("blobs")
+            .join(&hex[..2])
+            .join(format!("{hex}.txt"));
+        assert!(
+            path.exists(),
+            "shared payload must outlive a single capability purge"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_is_idempotent_and_returns_zero_on_empty_match() {
+        let (store, _dir) = build().await;
+        let _ = store.put(b"recent", "text/plain", None).await.unwrap();
+        let cutoff = now_unix() - 30 * 86_400_000_000;
+        assert_eq!(store.purge_older_than(cutoff).await.unwrap(), 0);
+        // Second call with the same cutoff still finds nothing.
+        assert_eq!(store.purge_older_than(cutoff).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recent_access_keeps_old_blob_alive_through_lru_sweep() {
+        // Pin the LRU contract: a blob whose `last_accessed_at` was
+        // ancient gets reaped, but a `get` (or any read path that
+        // funnels through `stat`) refreshes the timestamp and saves
+        // it from the next sweep.
+        let (store, dir) = build().await;
+        let blob = store.put(b"hot", "text/plain", None).await.unwrap();
+        let now = now_unix();
+
+        // Backdate so the blob would be a victim if untouched.
+        antedate_last_accessed(&store, &blob.blob_id, now - 10 * 86_400_000_000).await;
+
+        // A read fires the touch — bumps last_accessed_at to ~now.
+        assert_eq!(store.get(&blob.blob_id).await.unwrap(), b"hot");
+
+        // Sweep with a 7-day cutoff finds nothing, because the touch
+        // pushed the timestamp inside the window.
+        let purged = store
+            .purge_older_than(now - 7 * 86_400_000_000)
+            .await
+            .unwrap();
+        assert_eq!(purged, 0, "freshly-accessed blob must survive sweep");
+        assert_eq!(store.get(&blob.blob_id).await.unwrap(), b"hot");
+
+        let hex = blob
+            .blob_id
+            .strip_prefix(SHA256_PREFIX)
+            .unwrap()
+            .split_once('.')
+            .map(|(h, _)| h)
+            .unwrap();
+        let path = dir
+            .path()
+            .join("blobs")
+            .join(&hex[..2])
+            .join(format!("{hex}.txt"));
+        assert!(path.exists(), "live blob's payload must stay on disk");
     }
 }

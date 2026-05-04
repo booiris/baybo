@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_sandbox::{
-    EnvPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec, StdinSource,
+    EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec,
+    StdinSource,
 };
 use aura_tools::{ExecSandbox, SandboxedOutput, ToolError};
 
@@ -15,6 +16,8 @@ pub struct SandboxAdapter {
     network_policy: NetworkPolicy,
     resource_limits: ResourceLimits,
     allowed_hosts: BTreeSet<String>,
+    filesystem_policy: FilesystemPolicy,
+    cwd_must_be_in_workspace: bool,
 }
 
 impl SandboxAdapter {
@@ -38,6 +41,8 @@ impl SandboxAdapter {
             network_policy,
             resource_limits,
             allowed_hosts: BTreeSet::new(),
+            filesystem_policy: FilesystemPolicy::Workspace,
+            cwd_must_be_in_workspace: true,
         }
     }
 
@@ -48,6 +53,32 @@ impl SandboxAdapter {
 
     pub fn with_allowed_hosts(mut self, hosts: BTreeSet<String>) -> Self {
         self.allowed_hosts = hosts;
+        self
+    }
+
+    /// Switch to permissive filesystem mode. `extra_root` is bound RW
+    /// alongside `workspace_root` (typically `$HOME`); FHS roots stay
+    /// RO; everything outside that union remains invisible. Each
+    /// `denied_paths` entry is then masked with a per-call empty tmpfs
+    /// so credential vaults sitting inside `extra_root` still can't be
+    /// read or written. Non-existent denied paths are silently dropped
+    /// (bwrap's `--tmpfs` would otherwise fail). The cwd-must-be-in-
+    /// workspace check is relaxed because the agent's writable surface
+    /// is now wider than `workspace_root`.
+    pub fn with_permissive_filesystem(
+        mut self,
+        extra_root: PathBuf,
+        denied_paths: Vec<PathBuf>,
+    ) -> Self {
+        let denied_paths = denied_paths
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect::<Vec<_>>();
+        self.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root,
+            denied_paths,
+        };
+        self.cwd_must_be_in_workspace = false;
         self
     }
 }
@@ -62,7 +93,9 @@ impl ExecSandbox for SandboxAdapter {
         stdin: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<SandboxedOutput, ToolError> {
-        if let Some(requested) = cwd {
+        if let Some(requested) = cwd
+            && self.cwd_must_be_in_workspace
+        {
             // Resolve symlinks on both sides before comparing — on macOS
             // `/tmp` resolves to `/private/tmp`, which would otherwise
             // make a perfectly-valid cwd look like an escape attempt.
@@ -102,6 +135,7 @@ impl ExecSandbox for SandboxAdapter {
             },
             timeout,
             resource_limits: self.resource_limits,
+            filesystem_policy: self.filesystem_policy.clone(),
         };
 
         match self.runner.run(spec).await {

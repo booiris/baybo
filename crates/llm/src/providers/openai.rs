@@ -1,12 +1,16 @@
 use rig::client::CompletionClient;
 use rig::providers::openai;
+use serde::Deserialize;
 
-use crate::registry::{LlmProviderConfig, LlmProviderFactory};
+use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
+
+pub(crate) const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Factory that creates `LlmClient` instances configured for OpenAI models.
 pub struct OpenAIProviderFactory;
 
+#[async_trait::async_trait]
 impl LlmProviderFactory for OpenAIProviderFactory {
     fn provider_name(&self) -> &str {
         "openai"
@@ -21,6 +25,24 @@ impl LlmProviderFactory for OpenAIProviderFactory {
             "gpt-4o",
             "gpt-4o-mini",
         ]
+    }
+
+    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
+        // Mirrors `create()`'s flat-per-provider pricing. Per-model
+        // pricing differentiation is a follow-up; today every OpenAI
+        // model attributes spend at the same rate.
+        self.known_models()
+            .iter()
+            .map(|m| {
+                (
+                    (*m).to_string(),
+                    ModelPricing {
+                        input_per_1m_tokens: 2.50,
+                        output_per_1m_tokens: 10.0,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
@@ -57,6 +79,66 @@ impl LlmProviderFactory for OpenAIProviderFactory {
             AnyCompletionModel::OpenAI(model),
         ))
     }
+
+    async fn live_models(&self, config: &LlmProviderConfig) -> crate::Result<Vec<LiveModelInfo>> {
+        let api_key = config.api_key.as_deref().ok_or_else(|| {
+            crate::LlmError::Config("OpenAI live discovery requires an API key".into())
+        })?;
+        let base = config
+            .base_url
+            .as_deref()
+            .unwrap_or(OPENAI_DEFAULT_BASE_URL)
+            .trim_end_matches('/');
+        let url = format!("{base}/models");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .map_err(|e| crate::LlmError::Provider(format!("openai GET /models: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::LlmError::Provider(format!(
+                "openai GET /models returned {status}: {body}"
+            )));
+        }
+        let payload: ModelListResponse = resp.json().await.map_err(|e| {
+            crate::LlmError::Provider(format!("openai /models: parse response: {e}"))
+        })?;
+        let mut out: Vec<LiveModelInfo> = payload
+            .data
+            .into_iter()
+            .map(|m| {
+                let extras = serde_json::json!({
+                    "owned_by": m.owned_by,
+                    "created": m.created,
+                });
+                LiveModelInfo {
+                    id: m.id,
+                    extras,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        // Stable order so the picker doesn't shuffle on each call.
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelListResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+    #[serde(default)]
+    owned_by: Option<String>,
+    #[serde(default)]
+    created: Option<i64>,
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use aura_model::{ChatMessage, Role};
 
-use super::{CompressOutput, CompressionStrategy};
+use super::{CompressOutput, CompressionStrategy, pair_preserving_cut};
 use crate::tokenizer::Tokenizer;
 
 /// Truncation compression: keeps system messages and the most recent
@@ -42,10 +42,17 @@ impl CompressionStrategy for Truncate {
         if non_system.len() <= self.keep_recent {
             return Ok(CompressOutput {
                 messages: messages.to_vec(),
+                llm_call: None,
             });
         }
 
-        let kept_start = non_system.len().saturating_sub(self.keep_recent);
+        // Initial cut by `keep_recent`, then pull the cut leftward as
+        // needed so every kept `ToolResult` still has its originating
+        // `ToolUse` in the tail. Without this, a cut between
+        // `assistant { tool_use }` and the next `user { tool_result }`
+        // produces an LLM payload providers reject.
+        let initial_cut = non_system.len().saturating_sub(self.keep_recent);
+        let kept_start = pair_preserving_cut(&non_system, initial_cut);
         let kept: Vec<ChatMessage> = non_system[kept_start..].to_vec();
 
         let mut new_messages = system_msgs;
@@ -53,6 +60,7 @@ impl CompressionStrategy for Truncate {
 
         Ok(CompressOutput {
             messages: new_messages,
+            llm_call: None,
         })
     }
 }

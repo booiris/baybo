@@ -3,6 +3,15 @@ name = "aura-integration-tests"
 version.workspace = true
 edition.workspace = true
 publish = false
+# Suppress per-file test discovery — every `tests/*.rs` would otherwise
+# become its own binary and re-link the whole upper dep graph (200s+
+# each on a debug build). `tests/all.rs` aggregates them via `#[path]`
+# so the link cost is paid once.
+autotests = false
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 # This crate is a pure dev-only fixture library. It owns no production
 # code — `src/lib.rs` exposes builders and helpers that compose multiple
@@ -15,7 +24,6 @@ publish = false
 aura-agent = { workspace = true }
 aura-channels = { workspace = true }
 aura-context = { workspace = true }
-aura-hook = { workspace = true }
 aura-job = { workspace = true }
 aura-llm = { workspace = true, features = ["test-support"] }
 aura-model = { workspace = true }
@@ -23,12 +31,14 @@ aura-security = { workspace = true }
 aura-skills = { workspace = true }
 aura-storage = { workspace = true, features = ["test-support"] }
 aura-tools = { workspace = true, features = ["test-support"] }
+aura-trace = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

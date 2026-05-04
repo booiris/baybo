@@ -1,18 +1,21 @@
+pub mod credentials;
 mod error;
 pub mod multimodal;
-mod providers;
+pub mod providers;
 pub mod registry;
-mod think_tags;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::stream::{Stream, StreamExt};
 use rig::OneOrMany;
+use rig::completion::message::{
+    Audio, AudioMediaType, Document, DocumentMediaType, DocumentSourceKind, Image, ImageDetail,
+    ImageMediaType,
+};
 use rig::completion::{
     self, AssistantContent, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
     ToolDefinition,
@@ -24,7 +27,88 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 pub use crate::error::LlmError;
-pub use crate::registry::{LlmProviderConfig, LlmProviderRegistry, ProviderModels};
+pub use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, ProviderModels};
+
+/// Default chat-completion base URL for each built-in provider id.
+/// `None` for unknown providers — the operator must supply one.
+pub fn default_base_url_for_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some(crate::providers::openai::OPENAI_DEFAULT_BASE_URL),
+        "anthropic" => Some(crate::providers::anthropic::ANTHROPIC_DEFAULT_BASE_URL),
+        "gemini" => Some(crate::providers::gemini::GEMINI_DEFAULT_BASE_URL),
+        "minimax" => Some(crate::providers::minimax::MINIMAX_DEFAULT_BASE_URL),
+        crate::providers::openai_subscription::PROVIDER_NAME => {
+            Some(crate::providers::openai_subscription::DEFAULT_BASE_URL)
+        }
+        _ => None,
+    }
+}
+
+/// Strip `; charset=…` and lowercase, then map common MIME strings to
+/// rig's `ImageMediaType` enum. `None` means the model can't natively
+/// consume this image kind — the caller falls back to a text stub.
+fn parse_image_media_type(mime: &str) -> Option<ImageMediaType> {
+    let bare = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    match bare.as_str() {
+        "image/jpeg" | "image/jpg" => Some(ImageMediaType::JPEG),
+        "image/png" => Some(ImageMediaType::PNG),
+        "image/gif" => Some(ImageMediaType::GIF),
+        "image/webp" => Some(ImageMediaType::WEBP),
+        "image/heic" => Some(ImageMediaType::HEIC),
+        "image/heif" => Some(ImageMediaType::HEIF),
+        "image/svg+xml" => Some(ImageMediaType::SVG),
+        _ => None,
+    }
+}
+
+fn parse_audio_media_type(mime: &str) -> Option<AudioMediaType> {
+    let bare = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    match bare.as_str() {
+        "audio/wav" | "audio/x-wav" => Some(AudioMediaType::WAV),
+        "audio/mpeg" => Some(AudioMediaType::MP3),
+        "audio/aac" => Some(AudioMediaType::AAC),
+        "audio/ogg" | "audio/opus" => Some(AudioMediaType::OGG),
+        "audio/flac" => Some(AudioMediaType::FLAC),
+        "audio/mp4" | "audio/m4a" => Some(AudioMediaType::M4A),
+        _ => None,
+    }
+}
+
+fn parse_document_media_type(mime: &str) -> Option<DocumentMediaType> {
+    let bare = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    match bare.as_str() {
+        "application/pdf" => Some(DocumentMediaType::PDF),
+        "text/plain" => Some(DocumentMediaType::TXT),
+        "text/html" => Some(DocumentMediaType::HTML),
+        "text/css" => Some(DocumentMediaType::CSS),
+        "text/markdown" => Some(DocumentMediaType::MARKDOWN),
+        "text/csv" => Some(DocumentMediaType::CSV),
+        "application/xml" | "text/xml" => Some(DocumentMediaType::XML),
+        "application/javascript" | "text/javascript" => Some(DocumentMediaType::Javascript),
+        "text/x-python" | "application/x-python" => Some(DocumentMediaType::Python),
+        _ => None,
+    }
+}
+
+fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
 
 pub type Result<T> = std::result::Result<T, LlmError>;
 
@@ -157,44 +241,6 @@ impl LlmStream {
             inner: Box::pin(mapped),
         }
     }
-
-    /// Wrap this stream so inline `<think>...</think>` content in
-    /// `StreamEvent::Text` is rerouted through `Reasoning` /
-    /// `ThinkingBlock` events. Used by providers (e.g. MiniMax M2)
-    /// that bake reasoning into the regular text channel rather than
-    /// emitting a separate `reasoning_content` field.
-    fn with_inline_think_filter(self) -> Self {
-        let filter = think_tags::ThinkTagFilter::default();
-        let queue: VecDeque<crate::Result<StreamEvent>> = VecDeque::new();
-        let stream =
-            futures::stream::unfold((self, filter, queue), |(mut s, mut f, mut q)| async move {
-                loop {
-                    if let Some(event) = q.pop_front() {
-                        return Some((event, (s, f, q)));
-                    }
-                    match s.next().await {
-                        None => {
-                            for ev in f.flush() {
-                                q.push_back(Ok(ev));
-                            }
-                            if q.is_empty() {
-                                return None;
-                            }
-                        }
-                        Some(Err(e)) => return Some((Err(e), (s, f, q))),
-                        Some(Ok(StreamEvent::Text(t))) => {
-                            for ev in f.push_text(&t) {
-                                q.push_back(Ok(ev));
-                            }
-                        }
-                        Some(Ok(other)) => return Some((Ok(other), (s, f, q))),
-                    }
-                }
-            });
-        Self {
-            inner: Box::pin(stream),
-        }
-    }
 }
 
 fn convert_stream_event<R: GetTokenUsage>(
@@ -233,6 +279,10 @@ pub(crate) enum AnyCompletionModel {
     OpenAI(openai::completion::CompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
+    /// ChatGPT/Codex OAuth subscription path. Doesn't go through rig — the
+    /// Codex Responses API uses a different request shape and needs custom
+    /// auth + 401-refresh handling. See `providers::openai_subscription`.
+    OpenAiSubscription(crate::providers::openai_subscription::OpenAiSubscriptionCompletionModel),
 }
 
 impl AnyCompletionModel {
@@ -268,6 +318,7 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
+            Self::OpenAiSubscription(m) => m.completion(request).await,
         }
     }
 
@@ -288,6 +339,7 @@ impl AnyCompletionModel {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_rig_stream(stream))
             }
+            Self::OpenAiSubscription(m) => m.stream(request).await,
         }
     }
 }
@@ -317,15 +369,26 @@ impl LlmCompletion for LlmClient {
     }
 }
 
+/// Capability the LLM client uses to materialise blob bytes for
+/// multimodal user content. Decoupled from `aura-storage::BlobStore`
+/// so the LLM crate stays storage-agnostic — the agent runtime wraps
+/// its `BlobStore` in an adapter that implements this trait.
+#[async_trait::async_trait]
+pub trait BlobFetcher: Send + Sync {
+    async fn fetch(&self, blob_id: &str) -> Result<Vec<u8>>;
+}
+
 /// The main LLM client type wrapping a rig completion model.
 pub struct LlmClient {
-    model_info: ModelInfo,
+    pub(crate) model_info: ModelInfo,
     model: AnyCompletionModel,
-    /// Strip inline `<think>...</think>` content out of assistant text
-    /// and route it through the reasoning channel. Set by providers
-    /// (e.g. MiniMax M2) whose models bake CoT into the regular text
-    /// stream instead of using a dedicated reasoning field.
-    parse_inline_think_tags: bool,
+    /// Optional blob fetcher. When set AND `model_info.supports_vision`
+    /// is true, `ContentBlock::Image` / `Audio` / `File` user-content
+    /// blocks are materialised into proper rig `Image` / `Audio` /
+    /// `Document` content (base64-encoded bytes). Without it, every
+    /// non-text block degrades to a `[image: …]`-style text stub —
+    /// the model never sees the actual payload.
+    blob_fetcher: Option<std::sync::Arc<dyn BlobFetcher>>,
 }
 
 impl LlmClient {
@@ -334,14 +397,16 @@ impl LlmClient {
         Self {
             model_info,
             model,
-            parse_inline_think_tags: false,
+            blob_fetcher: None,
         }
     }
 
-    /// Opt in to stripping inline `<think>...</think>` blocks. See the
-    /// field doc on `parse_inline_think_tags` for rationale.
-    pub(crate) fn with_parse_inline_think_tags(mut self, enabled: bool) -> Self {
-        self.parse_inline_think_tags = enabled;
+    /// Attach a blob fetcher so the client can materialise multimodal
+    /// content. Required for `supports_vision: true` to actually mean
+    /// "image bytes flow through" — without it, the build path falls
+    /// back to a text stub even on vision-capable models.
+    pub fn with_blob_fetcher(mut self, fetcher: std::sync::Arc<dyn BlobFetcher>) -> Self {
+        self.blob_fetcher = Some(fetcher);
         self
     }
 
@@ -353,7 +418,7 @@ impl LlmClient {
             "sending chat request"
         );
 
-        let rig_request = self.build_completion_request(request);
+        let rig_request = self.build_completion_request(request).await;
 
         let response = self
             .model
@@ -382,7 +447,7 @@ impl LlmClient {
             "sending streaming chat request"
         );
 
-        let rig_request = self.build_completion_request(request);
+        let rig_request = self.build_completion_request(request).await;
 
         let stream = self
             .model
@@ -390,15 +455,17 @@ impl LlmClient {
             .await
             .map_err(|e| LlmError::Provider(e.to_string()))?;
 
-        Ok(if self.parse_inline_think_tags {
-            stream.with_inline_think_filter()
-        } else {
-            stream
-        })
+        Ok(stream)
     }
 
     /// Build a rig `CompletionRequest` from our `ChatRequest`.
-    fn build_completion_request(&self, request: &ChatRequest) -> CompletionRequest {
+    ///
+    /// Async because vision-capable models need their `Image` /
+    /// `Audio` / `File` content blocks materialised from the blob
+    /// store — the LLM call is the async boundary closest to the
+    /// API hop, and base64-encoding a 100 MiB blob inline would
+    /// stall the runtime if we did it synchronously.
+    async fn build_completion_request(&self, request: &ChatRequest) -> CompletionRequest {
         let mut system_parts = Vec::new();
         let mut chat_messages: Vec<Message> = Vec::new();
 
@@ -408,18 +475,10 @@ impl LlmClient {
                     system_parts.push(multimodal::extract_text(&msg.content));
                 }
                 aura_model::Role::User => {
-                    let mut parts: Vec<UserContent> = msg
-                        .content
-                        .iter()
-                        .map(|block| match block {
-                            aura_model::ContentBlock::Text(t) => {
-                                UserContent::Text(Text { text: t.clone() })
-                            }
-                            other => UserContent::Text(Text {
-                                text: multimodal::content_block_to_text(other),
-                            }),
-                        })
-                        .collect();
+                    let mut parts: Vec<UserContent> = Vec::with_capacity(msg.content.len());
+                    for block in &msg.content {
+                        parts.push(self.user_content_for_block(block).await);
+                    }
                     if !parts.is_empty() {
                         let first = parts.remove(0);
                         let mut content = OneOrMany::one(first);
@@ -554,34 +613,136 @@ impl LlmClient {
         }
     }
 
+    /// Convert one user-side `ContentBlock` into a rig `UserContent`.
+    /// Multimodal blocks become real `Image` / `Audio` / `Document`
+    /// content when (1) the model claims vision support and (2) a
+    /// blob fetcher is wired in. Otherwise — including when blob
+    /// fetch fails — the block degrades to a `[image: …]`-style text
+    /// stub so the conversation can keep going even if the bytes
+    /// aren't deliverable.
+    async fn user_content_for_block(&self, block: &aura_model::ContentBlock) -> UserContent {
+        match block {
+            aura_model::ContentBlock::Text(t) => UserContent::Text(Text { text: t.clone() }),
+            aura_model::ContentBlock::Image { blob, mime_type }
+                if self.model_info.supports_vision =>
+            {
+                if let (Some(fetcher), Some(media_type)) = (
+                    self.blob_fetcher.as_ref(),
+                    parse_image_media_type(mime_type),
+                ) {
+                    match fetcher.fetch(&blob.blob_id).await {
+                        Ok(bytes) => UserContent::Image(Image {
+                            data: DocumentSourceKind::Base64(b64_encode(&bytes)),
+                            media_type: Some(media_type),
+                            // Required by the OpenAI-compat converter when
+                            // the source is a Base64 data URL — without
+                            // it rig errors with "image URI must have
+                            // image detail" before the request leaves
+                            // the client. `Auto` is OpenAI's default
+                            // when the field is absent on text-only id
+                            // URLs anyway, so it's the lossless choice.
+                            detail: Some(ImageDetail::Auto),
+                            additional_params: None,
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                blob_id = %blob.blob_id,
+                                error = %e,
+                                "blob fetch failed; falling back to text stub for image",
+                            );
+                            UserContent::Text(Text {
+                                text: multimodal::content_block_to_text(block),
+                            })
+                        }
+                    }
+                } else {
+                    UserContent::Text(Text {
+                        text: multimodal::content_block_to_text(block),
+                    })
+                }
+            }
+            aura_model::ContentBlock::Audio { blob, mime_type }
+                if self.model_info.supports_vision =>
+            {
+                if let (Some(fetcher), Some(media_type)) = (
+                    self.blob_fetcher.as_ref(),
+                    parse_audio_media_type(mime_type),
+                ) {
+                    match fetcher.fetch(&blob.blob_id).await {
+                        Ok(bytes) => UserContent::Audio(Audio {
+                            data: DocumentSourceKind::Base64(b64_encode(&bytes)),
+                            media_type: Some(media_type),
+                            additional_params: None,
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                blob_id = %blob.blob_id,
+                                error = %e,
+                                "blob fetch failed; falling back to text stub for audio",
+                            );
+                            UserContent::Text(Text {
+                                text: multimodal::content_block_to_text(block),
+                            })
+                        }
+                    }
+                } else {
+                    UserContent::Text(Text {
+                        text: multimodal::content_block_to_text(block),
+                    })
+                }
+            }
+            aura_model::ContentBlock::File {
+                blob, mime_type, ..
+            } if self.model_info.supports_vision => {
+                if let (Some(fetcher), Some(media_type)) = (
+                    self.blob_fetcher.as_ref(),
+                    parse_document_media_type(mime_type),
+                ) {
+                    match fetcher.fetch(&blob.blob_id).await {
+                        Ok(bytes) => UserContent::Document(Document {
+                            data: DocumentSourceKind::Base64(b64_encode(&bytes)),
+                            media_type: Some(media_type),
+                            additional_params: None,
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                blob_id = %blob.blob_id,
+                                error = %e,
+                                "blob fetch failed; falling back to text stub for document",
+                            );
+                            UserContent::Text(Text {
+                                text: multimodal::content_block_to_text(block),
+                            })
+                        }
+                    }
+                } else {
+                    UserContent::Text(Text {
+                        text: multimodal::content_block_to_text(block),
+                    })
+                }
+            }
+            other => UserContent::Text(Text {
+                text: multimodal::content_block_to_text(other),
+            }),
+        }
+    }
+
     /// Convert a rig `CompletionResponse` into our `LlmResponse`.
     fn convert_response(&self, response: completion::CompletionResponse<()>) -> LlmResponse {
         let mut content = String::new();
         let mut content_blocks = Vec::new();
         let mut tool_calls = Vec::new();
         let mut thinking: Option<String> = None;
-        let mut inline_thinking = String::new();
 
         for item in response.choice.into_iter() {
             match item {
                 AssistantContent::Text(text) => {
-                    let (clean, extracted) = if self.parse_inline_think_tags {
-                        think_tags::extract_inline_thinking(&text.text)
-                    } else {
-                        (text.text.clone(), None)
-                    };
-                    if let Some(t) = extracted {
-                        if !inline_thinking.is_empty() {
-                            inline_thinking.push('\n');
-                        }
-                        inline_thinking.push_str(&t);
-                    }
-                    if !clean.is_empty() {
+                    if !text.text.is_empty() {
                         if !content.is_empty() {
                             content.push('\n');
                         }
-                        content.push_str(&clean);
-                        content_blocks.push(aura_model::ContentBlock::Text(clean));
+                        content.push_str(&text.text);
+                        content_blocks.push(aura_model::ContentBlock::Text(text.text));
                     }
                 }
                 AssistantContent::ToolCall(tc) => {
@@ -610,25 +771,10 @@ impl LlmClient {
                     if !reasoning_text.is_empty() {
                         thinking = Some(reasoning_text);
                     }
-                    // Also preserve the full structured block for round-trip.
                     content_blocks.push(convert_reasoning_to_block(r));
                 }
                 AssistantContent::Image(_) => {}
             }
-        }
-
-        if !inline_thinking.is_empty() {
-            thinking = Some(match thinking.take() {
-                Some(existing) => format!("{existing}\n{inline_thinking}"),
-                None => inline_thinking.clone(),
-            });
-            content_blocks.push(aura_model::ContentBlock::Thinking {
-                id: None,
-                content: vec![aura_model::ThinkingContent::Text {
-                    text: inline_thinking,
-                    signature: None,
-                }],
-            });
         }
 
         let usage = TokenUsage {
@@ -675,6 +821,11 @@ impl LlmClient {
             model: self.model_info.id.clone(),
             latency_ms: start.elapsed().as_millis() as u64,
             tokens: response.usage,
+            thinking_chars: response.thinking.as_ref().map(|s| s.chars().count()),
+            thinking_preview: response
+                .thinking
+                .as_ref()
+                .map(|s| s.lines().next().unwrap_or("").chars().take(120).collect()),
         })
     }
 }
@@ -686,6 +837,17 @@ pub struct ProbeReport {
     pub model: String,
     pub latency_ms: u64,
     pub tokens: TokenUsage,
+    /// Number of UTF-8 characters of reasoning summary the provider
+    /// returned. `None` when the model didn't emit any reasoning —
+    /// either because reasoning is disabled or because the provider
+    /// doesn't support it. Useful for `aura llm probe` to confirm
+    /// reasoning is actually flowing end-to-end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_chars: Option<usize>,
+    /// First line of the reasoning summary, truncated to 120 chars,
+    /// for human-readable verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_preview: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -751,4 +913,183 @@ fn convert_thinking_to_reasoning(
     let mut reasoning = Reasoning::new("").optional_id(id.clone());
     reasoning.content = blocks;
     AssistantContent::Reasoning(reasoning)
+}
+
+#[cfg(test)]
+mod multimodal_dispatch_tests {
+    //! Coverage for `user_content_for_block` — the place where
+    //! `ContentBlock::Image` either becomes a real `UserContent::Image`
+    //! (bytes the model can actually see) or degrades to a text stub.
+    //! The image-delivery bug we're fixing here was exactly the second
+    //! branch firing on a vision-capable model because no `BlobFetcher`
+    //! was wired in.
+
+    use std::sync::Arc;
+
+    use aura_model::{BlobRef, ContentBlock};
+    use rig::completion::message::{DocumentSourceKind, ImageMediaType};
+    use rig::message::UserContent;
+
+    use super::*;
+    use crate::registry::LlmProviderRegistry;
+
+    struct StaticFetcher(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl BlobFetcher for StaticFetcher {
+        async fn fetch(&self, _blob_id: &str) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct FailingFetcher;
+
+    #[async_trait::async_trait]
+    impl BlobFetcher for FailingFetcher {
+        async fn fetch(&self, blob_id: &str) -> Result<Vec<u8>> {
+            Err(LlmError::Provider(format!("nope: {blob_id}")))
+        }
+    }
+
+    fn vision_client() -> LlmClient {
+        // Factory route: any provider produces an `LlmClient` shape we
+        // can mutate. MiniMax's factory default is `supports_vision:
+        // false` (the M2 family is text-first), so we use the config
+        // override path to force vision on for the test fixture —
+        // exactly the same way an operator on MiniMax-VL-01 would.
+        let registry = LlmProviderRegistry::with_default_providers();
+        registry
+            .create_client(&LlmProviderConfig {
+                provider: "minimax".into(),
+                api_key: Some("test".into()),
+                base_url: None,
+                model: "MiniMax-VL-01".into(),
+                supports_vision: Some(true),
+                reasoning_effort: None,
+                vault: None,
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn image_block_with_fetcher_emits_real_image_content() {
+        let bytes = b"\xFF\xD8\xFFhello-jpeg-bytes".to_vec();
+        let client = vision_client().with_blob_fetcher(Arc::new(StaticFetcher(bytes.clone())));
+        let block = ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:deadbeef.tok".into(),
+            },
+            mime_type: "image/jpeg".into(),
+        };
+        let out = client.user_content_for_block(&block).await;
+        match out {
+            UserContent::Image(img) => {
+                assert_eq!(img.media_type, Some(ImageMediaType::JPEG));
+                // Required by rig's OpenAI converter — Base64 source
+                // without an image detail errors at message-build time.
+                assert_eq!(
+                    img.detail,
+                    Some(rig::completion::message::ImageDetail::Auto)
+                );
+                let DocumentSourceKind::Base64(b64) = img.data else {
+                    panic!("expected base64 data");
+                };
+                use base64::Engine;
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .unwrap();
+                assert_eq!(decoded, bytes);
+            }
+            other => panic!("expected Image variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_block_without_fetcher_falls_back_to_text_stub() {
+        // Same vision-capable model, but no blob fetcher attached →
+        // the model would have to invent the bytes, which is exactly
+        // the bug; assert we degrade explicitly to a text stub.
+        let client = vision_client();
+        let block = ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:abc.tok".into(),
+            },
+            mime_type: "image/jpeg".into(),
+        };
+        let out = client.user_content_for_block(&block).await;
+        match out {
+            UserContent::Text(t) => {
+                assert!(t.text.contains("[image:"), "stub form, got {}", t.text);
+                assert!(t.text.contains("sha256:abc.tok"));
+            }
+            other => panic!("expected Text fallback, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetcher_error_falls_back_to_text_stub_not_panic() {
+        // A blob the gateway can't read (soft-deleted, missing, etc.)
+        // must not blow up the LLM call — drop to the same text stub
+        // an unconfigured fetcher would emit, with a tracing warn so
+        // operators can find it.
+        let client = vision_client().with_blob_fetcher(Arc::new(FailingFetcher));
+        let block = ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:gone.tok".into(),
+            },
+            mime_type: "image/png".into(),
+        };
+        let out = client.user_content_for_block(&block).await;
+        assert!(matches!(out, UserContent::Text(_)));
+    }
+
+    #[tokio::test]
+    async fn image_block_on_text_only_model_skips_fetcher_and_stubs() {
+        // Even with a fetcher attached, a model that doesn't claim
+        // vision must NOT pull bytes — otherwise we'd waste 100 MiB
+        // of base64 work just to send something the API will reject.
+        let bytes = b"unused".to_vec();
+        let registry = LlmProviderRegistry::with_default_providers();
+        let mut client = registry
+            .create_client(&LlmProviderConfig {
+                provider: "openai".into(),
+                api_key: Some("test".into()),
+                base_url: None,
+                model: "gpt-3.5-turbo".into(),
+                supports_vision: None,
+                reasoning_effort: None,
+                vault: None,
+            })
+            .unwrap();
+        // OpenAI factory may set vision=true on some models; force
+        // false here so the test pins the dispatch rule, not the
+        // model_info defaults.
+        client.model_info.supports_vision = false;
+        let client = client.with_blob_fetcher(Arc::new(StaticFetcher(bytes)));
+        let block = ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:never-fetched.tok".into(),
+            },
+            mime_type: "image/jpeg".into(),
+        };
+        let out = client.user_content_for_block(&block).await;
+        assert!(matches!(out, UserContent::Text(_)));
+    }
+
+    #[test]
+    fn parse_image_media_type_recognises_common_mimes() {
+        assert_eq!(
+            parse_image_media_type("image/jpeg"),
+            Some(ImageMediaType::JPEG)
+        );
+        assert_eq!(
+            parse_image_media_type("IMAGE/PNG"),
+            Some(ImageMediaType::PNG)
+        );
+        assert_eq!(
+            parse_image_media_type("image/jpeg; charset=binary"),
+            Some(ImageMediaType::JPEG),
+        );
+        assert_eq!(parse_image_media_type("image/x-fancy"), None);
+    }
 }

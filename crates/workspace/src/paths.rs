@@ -82,13 +82,53 @@ pub const SINGLETON_LOCK_FILE: &str = "aura.lock";
 /// Channel TCP listener publishes its ephemeral port here.
 pub const CHANNEL_PORT_FILE: &str = "channel.port";
 
+/// Per-session LLM call logs land under [`STATE_DIR`]`/`[`SESSIONS_LOG_SUBDIR`]
+/// as `<session_id>.jsonl`. One line per LLM call: input messages,
+/// parameters, and the response (or error) plus latency / model metadata.
+pub const SESSIONS_LOG_SUBDIR: &str = "sessions";
+
+/// Per-session JSONL files inside [`SESSIONS_LOG_SUBDIR`] are named
+/// `<session_id>.<SESSION_LOG_EXTENSION>`.
+pub const SESSION_LOG_EXTENSION: &str = "jsonl";
+
 // ---------------------------------------------------------------------------
 // Files inside `work/` (gitignored)
 // ---------------------------------------------------------------------------
 
 /// Code-builder scratch parent inside [`WORK_DIR`]. Per-call scratch dirs
-/// sit directly under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`.
-pub const CODE_BUILDER_SUBDIR: &str = "code-builder";
+/// sit directly under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`. Hidden
+/// (leading dot) so the agent's working directory stays uncluttered.
+pub const CODE_BUILDER_SUBDIR: &str = ".code-builder";
+
+/// Per-call code-builder run dir layout, all relative to
+/// `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`. The `*.txt` overflow
+/// files are only written when stdout/stderr exceed the inline cap.
+pub const CODE_BUILDER_SCRIPT_FILE: &str = "script.py";
+pub const CODE_BUILDER_STDOUT_FILE: &str = "stdout.txt";
+pub const CODE_BUILDER_STDERR_FILE: &str = "stderr.txt";
+pub const CODE_BUILDER_TOOL_CALL_FILE: &str = "tool_call.json";
+pub const CODE_BUILDER_UV_CACHE_SUBDIR: &str = "uv-cache";
+pub const CODE_BUILDER_WORKDIR_SUBDIR: &str = "workdir";
+
+/// Browser sidecar font drop-in dir inside [`WORK_DIR`]. Pinned as a
+/// Chrome fontconfig `<dir>` at boot — drop a font here and the next
+/// gateway restart picks it up without touching system fontconfig.
+pub const BROWSER_FONTS_SUBDIR: &str = ".fonts";
+
+/// Browser sidecar Chrome user-data-dir inside [`WORK_DIR`]. Persistent
+/// across Aura restarts (cookies / localStorage retained); in docker
+/// mode this gets bind-mounted at `/data/profile` inside the container.
+/// Lives under `work/` so it sits next to other workspace-scoped state
+/// (and inherits the same gitignore + lifecycle as the rest of `work/`).
+/// Hidden (leading dot) so the agent's working directory stays
+/// uncluttered.
+pub const BROWSER_PROFILE_SUBDIR: &str = ".browser/profile";
+
+/// Tool-output spill dir inside [`WORK_DIR`]. The security gateway
+/// drops oversize tool results here as content-addressed `.txt` files
+/// so the LLM can `Read` the rest. Hidden (leading dot) to keep
+/// glob/grep noise down on the agent's working directory.
+pub const TOOL_SPILLS_SUBDIR: &str = ".aura-tool-spills";
 
 // ---------------------------------------------------------------------------
 // Files inside `logs/` (gitignored)
@@ -107,9 +147,6 @@ pub const CHANNEL_LOGS_SUBDIR: &str = "channel";
 
 /// Aura subdirectory under `$XDG_CACHE_HOME` (or `$HOME/.cache`).
 pub const CACHE_SUBDIR: &str = "aura";
-
-/// Subdirectory holding extracted bun runtimes inside the cache.
-pub const CACHE_RUNTIME_SUBDIR: &str = "runtime";
 
 // ---------------------------------------------------------------------------
 // Environment variables tied to path resolution
@@ -276,10 +313,29 @@ impl WorkspacePaths {
         self.state_dir().join(CHANNEL_PORT_FILE)
     }
 
+    /// Per-session LLM call log directory:
+    /// `<root>/state/sessions/`. Each session writes one
+    /// `<session_id>.jsonl` file inside this directory.
+    pub fn sessions_log_dir(&self) -> PathBuf {
+        self.state_dir().join(SESSIONS_LOG_SUBDIR)
+    }
+
     // -- work/ contents --
 
     pub fn code_builder_dir(&self) -> PathBuf {
         self.work_dir().join(CODE_BUILDER_SUBDIR)
+    }
+
+    pub fn browser_fonts_dir(&self) -> PathBuf {
+        self.work_dir().join(BROWSER_FONTS_SUBDIR)
+    }
+
+    pub fn browser_profile_dir(&self) -> PathBuf {
+        self.work_dir().join(BROWSER_PROFILE_SUBDIR)
+    }
+
+    pub fn tool_spills_dir(&self) -> PathBuf {
+        self.work_dir().join(TOOL_SPILLS_SUBDIR)
     }
 }
 
@@ -308,6 +364,10 @@ mod tests {
             p.channel_port(),
             PathBuf::from("/var/aura/state/channel.port"),
         );
+        assert_eq!(
+            p.sessions_log_dir(),
+            PathBuf::from("/var/aura/state/sessions"),
+        );
         assert_eq!(p.logs_dir(), PathBuf::from("/var/aura/logs"));
         assert_eq!(
             p.channel_logs_dir(),
@@ -316,7 +376,19 @@ mod tests {
         assert_eq!(p.skills_dir(), PathBuf::from("/var/aura/skills"));
         assert_eq!(
             p.code_builder_dir(),
-            PathBuf::from("/var/aura/work/code-builder"),
+            PathBuf::from("/var/aura/work/.code-builder"),
+        );
+        assert_eq!(
+            p.browser_fonts_dir(),
+            PathBuf::from("/var/aura/work/.fonts"),
+        );
+        assert_eq!(
+            p.browser_profile_dir(),
+            PathBuf::from("/var/aura/work/.browser/profile"),
+        );
+        assert_eq!(
+            p.tool_spills_dir(),
+            PathBuf::from("/var/aura/work/.aura-tool-spills"),
         );
         assert_eq!(p.gitignore_file(), PathBuf::from("/var/aura/.gitignore"));
     }

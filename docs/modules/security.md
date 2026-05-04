@@ -73,6 +73,17 @@ Injection markers (`ignore previous`, fake turn prefixes, ChatML/LLaMA control t
 
 Because `ResourceAccess::ReadFile` bypasses the approval gate (see `ToolExecutor::execute`), file reads have no per-call user confirmation. `ReadTool` instead rejects the call outright when `aura_security::is_sensitive_path` matches, returning a `ToolError::Execution` with a message the LLM can relay to the user. Any future file-reading tool must apply the same check at its entry point.
 
+### SSRF floor
+
+`WebFetch` mostly bypasses the approval gate too — hostname URLs and literal IPs in reserved ranges declare no `ResourceAccess` (see *WebFetch host-shape policy* in `docs/modules/tools.md`), so the per-call SSRF check inside the tool is the load-bearing guard rather than the gate. Two layers cover this:
+
+1. **Parse-time literal-IP filter** in `validate_url_with`. Rejects non-`http(s)` schemes, `localhost` family hostnames, and any literal IP that `aura_security::is_blocked_ip` flags (loopback, RFC1918, link-local 169.254/16 — covers AWS metadata, CGNAT 100.64/10, IPv6 ULA fc00::/7, link-local v6 fe80::/10 — covers metadata, unspecified, IPv4-mapped-v6 forms of any of the above). WHATWG IPv4 canonicalisation by `url::Url` means alternate encodings (`2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1`) reach this check in dotted form and get rejected normally.
+2. **DNS-time resolved-IP filter** in `SafeResolver` (custom `reqwest::dns::Resolve`). Resolves the hostname via `tokio::net::lookup_host`, then drops every address `is_blocked_ip` flags before handing the survivors to the connector. If every resolved address is blocked the connection fails with `host ... resolved only to blocked IP ranges`. This closes DNS-rebinding-into-LAN attacks: an attacker-controlled hostname that resolves to `10.0.0.1` never becomes a connect target. Each redirect hop runs a fresh resolution, so rebinding inside a single redirect chain is also caught. There is no TOCTOU window between the check and `connect()` — the connector receives a `Vec<SocketAddr>` of pre-vetted IPs and connects to one of those, never re-resolving.
+
+Out of scope: the SSRF floor is an RFC-level deny list, not topology-aware. A literal *public* IP that happens to point at internal infrastructure (cloud VPC, professional-line backend, public-IP admin port) is the one shape neither layer can decide on its own — that case routes to the approval gate via `ResourceAccess::Http { host }` so a human catches it. Public hostnames that resolve to public IPs which are actually internal still slip through; egress-firewall / network-segmentation is the only real fix and lives outside the tools layer.
+
+Any future HTTP-emitting builtin must apply the same two layers (`validate_url_with` + a `SafeResolver`-equivalent custom DNS resolver) at its entry point — the approval gate alone is not a substitute for the SSRF floor.
+
 ### SecretVault encryption
 
 Secrets are encrypted with AES-256-GCM (random nonce + ciphertext + tag). The master key exists only in process memory and is never persisted. `SecretValue` should not support plaintext `Debug`.
@@ -123,6 +134,7 @@ Security only decides allow/deny. It does not execute network access. The chain 
 - The only code path permitted to hold plaintext at egress is the tool executor's post-reveal `params_revealed` on its way into `tool_registry.execute`; stream deltas, outgoing messages, trace, memory, and persistence all carry placeholder form
 - Injection detection is log-only at inbound and log-plus-wrap at tool output; never auto-block user input on injection markers alone
 - Any tool that reads filesystem paths MUST apply `is_sensitive_path` at its entry point, regardless of approval-gate status
+- Any tool that emits HTTP MUST apply both layers of the SSRF floor (`validate_url_with`-equivalent literal-IP rejection + a `SafeResolver`-equivalent DNS-time resolved-IP filter using `is_blocked_ip`) at its entry point, regardless of approval-gate status
 
 ## Collaboration
 

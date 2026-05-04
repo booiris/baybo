@@ -1,5 +1,6 @@
 use aura_config::{
-    AuraConfig, ConfigError, DiscordChannelConfig, HttpChannelConfig, TelegramChannelConfig,
+    AuraConfig, ConfigError, DiscordChannelConfig, HttpChannelConfig, LlmEntry,
+    TelegramChannelConfig,
 };
 
 fn has_field(errors: &[aura_config::ValidationError], field: &str) -> bool {
@@ -31,28 +32,89 @@ fn invalid_json_returns_parse_error() {
     assert!(matches!(err, ConfigError::Parse(_)));
 }
 
+fn entry(name: &str) -> LlmEntry {
+    LlmEntry {
+        name: name.into(),
+        provider: "openai".into(),
+        model: "gpt-4o-mini".into(),
+        api_key_env: None,
+        base_url: None,
+        supports_vision: None,
+        reasoning_effort: None,
+    }
+}
+
+fn config_with_default_entry() -> AuraConfig {
+    AuraConfig {
+        llm: vec![entry("openai")],
+        default_llm: "openai".into(),
+        ..AuraConfig::default()
+    }
+}
+
 #[test]
 fn empty_provider_fails_validation() {
-    let json = r#"{"llm":{"provider":"","model":"m"}}"#;
-    let err = AuraConfig::load_from_str(json).unwrap_err();
-    let errors = unwrap_validation(err);
-    assert!(has_field(&errors, "llm.provider"));
+    let mut c = config_with_default_entry();
+    c.llm[0].provider = String::new();
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "llm[0].provider"));
 }
 
 #[test]
 fn empty_model_fails_validation() {
-    let json = r#"{"llm":{"provider":"openai","model":""}}"#;
-    let err = AuraConfig::load_from_str(json).unwrap_err();
-    let errors = unwrap_validation(err);
-    assert!(has_field(&errors, "llm.model"));
+    let mut c = config_with_default_entry();
+    c.llm[0].model = String::new();
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "llm[0].model"));
 }
 
 #[test]
 fn bad_base_url_fails_validation() {
-    let json = r#"{"llm":{"provider":"openai","model":"m","base_url":"ftp://x"}}"#;
-    let err = AuraConfig::load_from_str(json).unwrap_err();
-    let errors = unwrap_validation(err);
-    assert!(has_field(&errors, "llm.base_url"));
+    let mut c = config_with_default_entry();
+    c.llm[0].base_url = Some("ftp://x".into());
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "llm[0].base_url"));
+}
+
+#[test]
+fn duplicate_entry_names_fail_validation() {
+    let mut c = config_with_default_entry();
+    c.llm.push(entry("openai"));
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "llm[1].name"));
+}
+
+#[test]
+fn empty_llm_list_is_valid() {
+    // Fresh-install state: no entries, default-llm empty, runtime
+    // surfaces a useful error only when something actually needs the
+    // LLM.
+    let c = AuraConfig::default();
+    assert!(c.llm.is_empty());
+    assert!(c.default_llm.is_empty());
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn default_llm_required_when_entries_exist() {
+    let c = AuraConfig {
+        llm: vec![entry("openai")],
+        default_llm: String::new(),
+        ..AuraConfig::default()
+    };
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "default-llm"));
+}
+
+#[test]
+fn default_llm_must_reference_existing_entry() {
+    let c = AuraConfig {
+        llm: vec![entry("openai")],
+        default_llm: "missing".into(),
+        ..AuraConfig::default()
+    };
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "default-llm"));
 }
 
 #[test]
@@ -158,21 +220,6 @@ fn rate_limit_fields_must_be_positive() {
 }
 
 #[test]
-fn trace_snapshot_interval_required_when_enabled() {
-    let mut c = AuraConfig::default();
-    c.trace.auto_snapshot = true;
-    c.trace.snapshot_interval = 0;
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "trace.snapshot_interval"));
-
-    // disabled snapshot allows zero interval
-    let mut c = AuraConfig::default();
-    c.trace.auto_snapshot = false;
-    c.trace.snapshot_interval = 0;
-    assert!(c.validate().is_ok());
-}
-
-#[test]
 fn full_roundtrip_via_json() {
     let config = AuraConfig::default();
     let json = serde_json::to_string(&config).expect("serialize");
@@ -185,14 +232,21 @@ fn load_from_file_reads_and_parses() -> std::result::Result<(), Box<dyn std::err
     let tmp = std::env::temp_dir().join("aura-config-test.json");
     std::fs::write(
         &tmp,
-        r#"{"llm":{"provider":"anthropic","model":"claude-sonnet-4-6"}}"#,
+        r#"{
+            "llm": [
+                {"name":"anthropic","provider":"anthropic","model":"claude-sonnet-4-6"}
+            ],
+            "default-llm": "anthropic"
+        }"#,
     )?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let config = rt.block_on(AuraConfig::load_from_file(&tmp))?;
-    assert_eq!(config.llm.provider, "anthropic");
-    assert_eq!(config.llm.model, "claude-sonnet-4-6");
+    assert_eq!(config.llm.len(), 1);
+    assert_eq!(config.llm[0].provider, "anthropic");
+    assert_eq!(config.llm[0].model, "claude-sonnet-4-6");
+    assert_eq!(config.default_llm, "anthropic");
     std::fs::remove_file(&tmp).ok();
     Ok(())
 }
@@ -268,43 +322,43 @@ fn encryption_key_requires_a_source() {
 
 #[test]
 fn llm_api_key_env_rejects_empty_string() {
-    let mut c = AuraConfig::default();
-    c.llm.api_key_env = Some(String::new());
+    let mut c = config_with_default_entry();
+    c.llm[0].api_key_env = Some(String::new());
     let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "llm.api_key_env"));
+    assert!(has_field(&errors, "llm[0].api_key_env"));
 }
 
 #[test]
 fn llm_api_key_env_rejects_non_env_var_syntax() {
     // a literal-looking key must be refused — config stores references, not values
-    let mut c = AuraConfig::default();
-    c.llm.api_key_env = Some("sk-abcd1234".into());
+    let mut c = config_with_default_entry();
+    c.llm[0].api_key_env = Some("sk-abcd1234".into());
     let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "llm.api_key_env"));
+    assert!(has_field(&errors, "llm[0].api_key_env"));
 }
 
 #[test]
 fn llm_api_key_env_accepts_env_var_name() {
-    let mut c = AuraConfig::default();
-    c.llm.api_key_env = Some("OPENAI_API_KEY".into());
+    let mut c = config_with_default_entry();
+    c.llm[0].api_key_env = Some("OPENAI_API_KEY".into());
     assert!(c.validate().is_ok());
 
-    // missing is fine (runtime falls back to provider-specific env vars)
-    let mut c = AuraConfig::default();
-    c.llm.api_key_env = None;
+    // missing is fine (runtime falls back to vault / provider-specific env vars)
+    let mut c = config_with_default_entry();
+    c.llm[0].api_key_env = None;
     assert!(c.validate().is_ok());
 }
 
 #[test]
 fn aggregates_multiple_errors() {
-    let mut c = AuraConfig::default();
-    c.llm.provider = String::new();
-    c.llm.model = String::new();
+    let mut c = config_with_default_entry();
+    c.llm[0].provider = String::new();
+    c.llm[0].model = String::new();
     c.session.timeout_minutes = 0;
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(errors.len() >= 3);
-    assert!(has_field(&errors, "llm.provider"));
-    assert!(has_field(&errors, "llm.model"));
+    assert!(has_field(&errors, "llm[0].provider"));
+    assert!(has_field(&errors, "llm[0].model"));
     assert!(has_field(&errors, "session.timeout_minutes"));
 }
 
@@ -312,18 +366,18 @@ fn aggregates_multiple_errors() {
 fn set_at_path_updates_primitive() {
     let cfg = AuraConfig::default();
     let new = cfg
-        .set_at_path("llm.model", serde_json::json!("gpt-5"))
+        .set_at_path("agent.max_iterations", serde_json::json!(7))
         .expect("set");
-    assert_eq!(new.llm.model, "gpt-5");
+    assert_eq!(new.agent.max_iterations, 7);
 }
 
 #[test]
 fn set_at_path_accepts_slash_pointer() {
     let cfg = AuraConfig::default();
     let new = cfg
-        .set_at_path("/llm/model", serde_json::json!("gpt-5"))
+        .set_at_path("/agent/max_iterations", serde_json::json!(7))
         .expect("set");
-    assert_eq!(new.llm.model, "gpt-5");
+    assert_eq!(new.agent.max_iterations, 7);
 }
 
 #[test]
@@ -339,18 +393,21 @@ fn set_at_path_rejects_empty_path() {
 fn set_at_path_rejects_value_that_fails_validation() {
     let cfg = AuraConfig::default();
     let err = cfg
-        .set_at_path("llm.provider", serde_json::json!(""))
-        .expect_err("empty provider invalid");
+        .set_at_path("agent.max_iterations", serde_json::json!(0))
+        .expect_err("zero iterations invalid");
     assert!(matches!(err, ConfigError::Validation(_)));
 }
 
 #[test]
 fn unset_at_path_resets_to_default() {
     let cfg = AuraConfig::default()
-        .set_at_path("llm.model", serde_json::json!("gpt-5"))
+        .set_at_path("agent.max_iterations", serde_json::json!(7))
         .expect("seed");
-    let reset = cfg.unset_at_path("llm.model").expect("unset");
-    assert_eq!(reset.llm.model, AuraConfig::default().llm.model);
+    let reset = cfg.unset_at_path("agent.max_iterations").expect("unset");
+    assert_eq!(
+        reset.agent.max_iterations,
+        AuraConfig::default().agent.max_iterations
+    );
 }
 
 #[test]
@@ -374,10 +431,10 @@ fn write_to_file_round_trips_through_load() {
             .as_nanos()
     ));
     let cfg = AuraConfig::default()
-        .set_at_path("llm.model", serde_json::json!("gpt-5"))
+        .set_at_path("agent.max_iterations", serde_json::json!(7))
         .expect("seed");
     rt.block_on(cfg.write_to_file(&tmp)).expect("write");
     let loaded = rt.block_on(AuraConfig::load_from_file(&tmp)).expect("load");
-    assert_eq!(loaded.llm.model, "gpt-5");
+    assert_eq!(loaded.agent.max_iterations, 7);
     std::fs::remove_file(&tmp).ok();
 }

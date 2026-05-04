@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   Logger,
+  ResourceAccess,
 } from "@aura/channel-sdk";
 import type { BotRoute, PlatformApprovals } from "@aura/channel-sdk/bot";
 import type { Bot, Context } from "grammy";
@@ -197,7 +198,46 @@ function decisionIcon(decision: ApprovalDecision): string {
 }
 
 function formatPrompt(req: ApprovalRequest): string {
+  const lines = [`🔐 Aura wants to run \`${req.tool}\`.`];
+  const body = formatBody(req);
+  if (body.length > 0) {
+    lines.push("", ...body);
+  }
+  return lines.join("\n");
+}
+
+// Render the "what is being approved" section. Accesses are the
+// security-relevant primary surface (one bullet per controlled
+// resource). `description` is the tool's optional human-readable
+// label. We fall back to `paramsPreview` only when neither was
+// supplied — many tools (snapshot / get_images / …) declare no
+// resources and no label, in which case the JSON shape is the only
+// signal we have.
+function formatBody(req: ApprovalRequest): string[] {
+  const out: string[] = [];
+  for (const acc of req.accesses) {
+    out.push(`  • ${formatAccess(acc)}`);
+  }
+  const desc = req.description?.trim();
+  if (desc !== undefined && desc.length > 0) {
+    out.push(`  ${desc}`);
+  }
+  if (out.length > 0) return out;
   const preview = req.paramsPreview.trim();
-  const suffix = preview.length > 0 ? `\n\n${preview}` : "";
-  return `🔐 Aura wants to run \`${req.tool}\`.${suffix}`;
+  return preview.length > 0 ? [preview] : [];
+}
+
+function formatAccess(acc: ResourceAccess): string {
+  switch (acc.kind) {
+    case "read_file":
+      return `will read ${acc.path}`;
+    case "write_file":
+      return `will write ${acc.path}`;
+    case "http":
+      return acc.host === "*"
+        ? "needs network access"
+        : `will reach ${acc.host}`;
+    case "exec_command":
+      return `will run: ${acc.command}`;
+  }
 }

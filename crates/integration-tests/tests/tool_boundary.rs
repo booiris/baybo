@@ -108,7 +108,7 @@ async fn wrap_tool_output_clean_content_omits_banner() {
 async fn cap_tool_output_truncates_oversize_payload() {
     let (gw, _store, _vault) = gateway_with_memory_vault();
     let big = "x".repeat(64 * 1024);
-    let capped = gw.cap_tool_output(big.clone());
+    let capped = gw.cap_tool_output(big.clone()).await;
     assert!(capped.len() < big.len());
     assert!(capped.contains("[... truncated"));
 }

@@ -9,7 +9,6 @@ Core responsibilities:
 - **Context appending with auto-compression**: append messages and automatically compress when the token budget threshold is exceeded
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`
 - **Pluggable compression strategies**: swap compression algorithms without changing management logic
-- **Snapshots and rollback**: create context snapshots for session replay and branch rollback with the Trace system
 
 **Goal**: ensure the context sent to the LLM never exceeds the model's context window while preserving the most valuable information.
 
@@ -25,7 +24,7 @@ ContextManager (struct)
     └── Summarize             — truncate + LLM summarization
 ```
 
-**Key design choice**: `ContextManager` is a **concrete struct**, not a trait. The management logic (append, budget check, snapshot) is invariant — only the compression algorithm varies. Polymorphism lives at the `CompressionStrategy` trait level, not at the manager level.
+**Key design choice**: `ContextManager` is a **concrete struct**, not a trait. The management logic (append, budget check) is invariant — only the compression algorithm varies. Polymorphism lives at the `CompressionStrategy` trait level, not at the manager level.
 
 ### Auto-compression in `append`
 
@@ -49,7 +48,6 @@ self.context_manager.append(session, &user_msg).await?;
 | When to compress                     | `ContextManager::append` | Auto-triggered on threshold; impossible to forget                      |
 | How to compress                      | `CompressionStrategy`    | Only variation point; swapped via constructor injection                |
 | Token counting                       | `Tokenizer` trait        | Trait and `TiktokenTokenizer` impl both live here; no LLM-SDK coupling |
-| Snapshots                            | `ContextManager`         | Needs token count and budget state for consistency                     |
 
 ### Two compression strategies
 
@@ -70,12 +68,11 @@ The context sent to the LLM is organized in descending priority:
 
 - Does **not** depend on `llm` (SummarizeCallback trait defined locally; `TiktokenTokenizer` depends only on `tiktoken-rs`, a pure BPE algorithm crate — not an LLM provider SDK)
 - Does **not** depend on `memory` (memory context injected by `agent`)
-- Does **not** depend on `trace` (snapshots are consumed by `trace`, not the reverse)
+- Does **not** depend on `trace`
 
 ## Constraints
 
 - Keep `max_tokens` slightly below the real model limit to reserve output space
-- `ContextSnapshot` stores only logical messages and blob references, never raw media bytes
 - Compression threshold around 0.7–0.85 is usually reasonable
 - Tool-heavy conversations often need a larger `keep_recent`
 
@@ -87,6 +84,5 @@ The context sent to the LLM is organized in descending priority:
 
 | Module   | Role                                                                                   |
 | -------- | -------------------------------------------------------------------------------------- |
-| `agent`  | `AgentLoop` owns a `ContextManager` instance and calls `append` / `snapshot`           |
-| `trace`  | Uses `ContextSnapshot` for rollback and replay                                         |
+| `agent`  | `AgentLoop` owns a `ContextManager` instance and calls `append` / `maybe_compress`     |
 | `memory` | Memory context is injected into the context window by `agent`, not by `context` itself |

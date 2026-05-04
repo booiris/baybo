@@ -102,10 +102,10 @@ async fn main() -> anyhow::Result<()> {
     // ---------------- argv dispatch (one-shot command + exit) ----------------
     //
     // Everything reaching this point is a one-shot argv command (Tui,
-    // Completion, Gateway, None are all handled above). Argv mode needs
+    // Completion, Gateway, None are all handled above). Argv mode builds
     // only the lightweight inspection set (skills, tools, channels,
-    // workspace, optional LLM) — building the whole manager graph for
-    // `aura status` would needlessly open libsql and recover jobs.
+    // workspace, optional LLM). It opens storage for BlobStore-backed
+    // tool metadata, but avoids the full manager graph and job recovery.
     init_tracing(TracingMode::Stdout);
 
     let cmd = cli.command.expect("non-command branches handled above");
@@ -123,7 +123,8 @@ async fn main() -> anyhow::Result<()> {
         }
         reg
     };
-    let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults());
+    let stores = aura_storage::Store::open(boot::storage_db_path(&config.workspace)).await?;
+    let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults(stores.blob.clone()));
     let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
         workspace_root.clone(),
     ));
@@ -134,7 +135,14 @@ async fn main() -> anyhow::Result<()> {
     // "LLM client unavailable" message when no API key was configured,
     // which users reasonably interpreted as a hard error.
     let llm_client = if needs_llm(&cmd) {
-        match boot::build_llm_client(&config.llm) {
+        // `llm` / `doctor` / `status` never send multimodal content,
+        // so it's fine to skip the BlobStore wiring here — opening
+        // libsql for a status probe would be wasteful.
+        // No vault here either: argv-mode `llm` / `doctor` / `status` are
+        // probes that don't need OAuth tokens; the openai-subscription
+        // provider's create() returns a clear error if it's selected
+        // without a vault.
+        match boot::build_llm_client(&config, None, None).await {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 tracing::warn!(error = %e, "LLM client unavailable for this command");
@@ -184,11 +192,14 @@ async fn main() -> anyhow::Result<()> {
 /// else (channel/config/memory/session/skills/…) can boot without an
 /// LLM provider configured — they must not trip the bootstrap warning
 /// just by running.
+///
+/// `aura llm` subcommands intentionally aren't here: their handlers
+/// construct their own provider client with the vault wired in (see
+/// `cli/src/commands/llm.rs::probe`). Pre-building here would also
+/// fail for the openai-subscription default-llm because argv mode
+/// passes `None` for the vault.
 fn needs_llm(cmd: &Commands) -> bool {
-    matches!(
-        cmd,
-        Commands::Llm { .. } | Commands::Doctor | Commands::Status
-    )
+    matches!(cmd, Commands::Doctor | Commands::Status)
 }
 
 fn pick_format(cli: &Cli) -> OutputFormat {

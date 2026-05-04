@@ -1,7 +1,8 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use crate::spec::{EnvPolicy, NetworkPolicy, SandboxSpec};
+use crate::WorkspaceSymlinkMount;
+use crate::spec::{EnvPolicy, FilesystemPolicy, NetworkPolicy, SandboxSpec};
 
 const BWRAP_RO_ROOTS: &[&str] = &[
     "/usr",
@@ -13,7 +14,10 @@ const BWRAP_RO_ROOTS: &[&str] = &[
     "/run/systemd/resolve",
 ];
 
-pub fn build_bwrap_argv(spec: &SandboxSpec) -> Vec<OsString> {
+pub fn build_bwrap_argv(
+    spec: &SandboxSpec,
+    workspace_symlink_mount: Option<&WorkspaceSymlinkMount>,
+) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::with_capacity(64);
 
     let push = |a: &mut Vec<OsString>, s: &str| a.push(OsString::from(s));
@@ -30,33 +34,92 @@ pub fn build_bwrap_argv(spec: &SandboxSpec) -> Vec<OsString> {
         NetworkPolicy::None => push(&mut argv, "--unshare-net"),
         NetworkPolicy::All => push(&mut argv, "--share-net"),
     }
-    push(&mut argv, "--proc");
-    push(&mut argv, "/proc");
-    push(&mut argv, "--dev");
-    push(&mut argv, "/dev");
-    push(&mut argv, "--tmpfs");
-    push(&mut argv, "/tmp");
 
-    for root in BWRAP_RO_ROOTS {
-        argv.push(OsString::from("--ro-bind-try"));
-        argv.push(OsString::from(*root));
-        argv.push(OsString::from(*root));
-    }
+    match &spec.filesystem_policy {
+        FilesystemPolicy::Workspace => {
+            push(&mut argv, "--proc");
+            push(&mut argv, "/proc");
+            push(&mut argv, "--dev");
+            push(&mut argv, "/dev");
+            push(&mut argv, "--tmpfs");
+            push(&mut argv, "/tmp");
 
-    argv.push(OsString::from("--bind"));
-    argv.push(spec.workspace_root.as_os_str().to_owned());
-    argv.push(spec.workspace_root.as_os_str().to_owned());
+            for root in BWRAP_RO_ROOTS {
+                argv.push(OsString::from("--ro-bind-try"));
+                argv.push(OsString::from(*root));
+                argv.push(OsString::from(*root));
+            }
 
-    for path in &spec.readable_paths {
-        argv.push(OsString::from("--ro-bind-try"));
-        argv.push(path.as_os_str().to_owned());
-        argv.push(path.as_os_str().to_owned());
-    }
+            argv.push(OsString::from("--bind"));
+            argv.push(spec.workspace_root.as_os_str().to_owned());
+            argv.push(spec.workspace_root.as_os_str().to_owned());
 
-    for path in &spec.writable_paths {
-        argv.push(OsString::from("--bind"));
-        argv.push(path.as_os_str().to_owned());
-        argv.push(path.as_os_str().to_owned());
+            // Mount a validated symlink spelling of the requested cwd
+            // so the sandbox can chdir to the path the caller supplied.
+            // bwrap creates the intermediate directories on the tmpfs
+            // root automatically.
+            if let Some(mount) = workspace_symlink_mount {
+                argv.push(OsString::from("--bind"));
+                argv.push(mount.source().as_os_str().to_owned());
+                argv.push(mount.destination().as_os_str().to_owned());
+            }
+
+            for path in &spec.readable_paths {
+                argv.push(OsString::from("--ro-bind-try"));
+                argv.push(path.as_os_str().to_owned());
+                argv.push(path.as_os_str().to_owned());
+            }
+
+            for path in &spec.writable_paths {
+                argv.push(OsString::from("--bind"));
+                argv.push(path.as_os_str().to_owned());
+                argv.push(path.as_os_str().to_owned());
+            }
+        }
+        FilesystemPolicy::Permissive {
+            extra_root,
+            denied_paths,
+        } => {
+            push(&mut argv, "--proc");
+            push(&mut argv, "/proc");
+            push(&mut argv, "--dev");
+            push(&mut argv, "/dev");
+            push(&mut argv, "--tmpfs");
+            push(&mut argv, "/tmp");
+
+            // FHS roots stay RO so installed binaries and resolver
+            // config still work. `--ro-bind-try` is forgiving on hosts
+            // where one of these doesn't exist (e.g. `/lib64` on some
+            // Debian flavours).
+            for root in BWRAP_RO_ROOTS {
+                argv.push(OsString::from("--ro-bind-try"));
+                argv.push(OsString::from(*root));
+                argv.push(OsString::from(*root));
+            }
+
+            // workspace_root is always RW so the project the agent was
+            // launched in stays writable even when it lives outside
+            // `extra_root` (e.g. `/data/proj` while $HOME is
+            // `/home/u`). bwrap accepts overlapping binds; if the
+            // workspace already sits inside extra_root, the second
+            // bind is a redundant no-op.
+            argv.push(OsString::from("--bind"));
+            argv.push(spec.workspace_root.as_os_str().to_owned());
+            argv.push(spec.workspace_root.as_os_str().to_owned());
+
+            argv.push(OsString::from("--bind-try"));
+            argv.push(extra_root.as_os_str().to_owned());
+            argv.push(extra_root.as_os_str().to_owned());
+
+            // Each denied path becomes an empty per-call tmpfs that
+            // hides the host directory underneath. Non-existent paths
+            // are silently skipped at the SandboxAdapter layer so
+            // bwrap never sees a `--tmpfs <missing>` line.
+            for path in denied_paths {
+                argv.push(OsString::from("--tmpfs"));
+                argv.push(path.as_os_str().to_owned());
+            }
+        }
     }
 
     for (k, v) in resolve_env(spec) {
@@ -101,7 +164,16 @@ pub(crate) fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
             }
         }
     }
+    out.push(("PWD".into(), effective_pwd(spec)));
     out
+}
+
+pub(crate) fn effective_pwd(spec: &SandboxSpec) -> String {
+    spec.cwd
+        .as_deref()
+        .unwrap_or(spec.workspace_root.as_path())
+        .display()
+        .to_string()
 }
 
 /// Build the `docker run …` argv for the cross-platform fallback runner.
@@ -127,7 +199,12 @@ pub(crate) fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
 ///   loudly instead of silently swapping the trusted execution base
 ///   between calls — `DockerRunner::warm()` is responsible for
 ///   pulling and pinning the image up front.
-pub fn build_docker_argv(spec: &SandboxSpec, image: &str, container_name: &str) -> Vec<OsString> {
+pub fn build_docker_argv(
+    spec: &SandboxSpec,
+    workspace_symlink_mount: Option<&WorkspaceSymlinkMount>,
+    image: &str,
+    container_name: &str,
+) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::with_capacity(64);
     argv.push(OsString::from("run"));
     argv.push(OsString::from("--rm"));
@@ -171,6 +248,16 @@ pub fn build_docker_argv(spec: &SandboxSpec, image: &str, container_name: &str) 
     bind.push(":");
     bind.push(&ws);
     argv.push(bind);
+
+    // Same as bwrap: mount a validated symlink spelling of the
+    // requested cwd so Docker can chdir to the path the caller supplied.
+    if let Some(mount) = workspace_symlink_mount {
+        argv.push(OsString::from("-v"));
+        let mut symlink_bind = mount.source().as_os_str().to_owned();
+        symlink_bind.push(":");
+        symlink_bind.push(mount.destination().as_os_str());
+        argv.push(symlink_bind);
+    }
 
     for path in &spec.readable_paths {
         let p = path.as_os_str().to_owned();
@@ -221,7 +308,10 @@ fn current_uid_gid() -> (u32, u32) {
     unsafe { (libc::getuid(), libc::getgid()) }
 }
 
-pub fn render_sbpl_profile(spec: &SandboxSpec) -> String {
+pub fn render_sbpl_profile(
+    spec: &SandboxSpec,
+    workspace_symlink_mount: Option<&WorkspaceSymlinkMount>,
+) -> String {
     let mut s = String::new();
     s.push_str("(version 1)\n");
     s.push_str("(deny default)\n");
@@ -231,45 +321,123 @@ pub fn render_sbpl_profile(spec: &SandboxSpec) -> String {
     s.push_str("(allow process-exec)\n");
     s.push_str("(allow signal (target self))\n\n");
 
-    s.push_str("(allow file-read*\n");
-    for p in [
-        "/usr",
-        "/System",
-        "/Library",
-        "/private/var/db/dyld",
-        "/private/etc",
-        "/bin",
-        "/sbin",
-        "/private/tmp",
-    ] {
-        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(Path::new(p))));
-    }
-    s.push_str(&format!(
-        "  (subpath \"{}\")\n",
-        sbpl_quote(&spec.workspace_root)
-    ));
-    for p in &spec.readable_paths {
-        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
-    }
-    for p in &spec.writable_paths {
-        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
-    }
-    s.push_str(")\n\n");
+    match &spec.filesystem_policy {
+        FilesystemPolicy::Workspace => {
+            s.push_str("(allow file-read*\n");
+            for p in [
+                "/usr",
+                "/System",
+                "/Library",
+                "/private/var/db/dyld",
+                "/private/etc",
+                "/bin",
+                "/sbin",
+                "/private/tmp",
+            ] {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(Path::new(p))));
+            }
+            s.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "  (subpath \"{}\")\n",
+                    sbpl_quote(mount.destination())
+                ));
+            }
+            for p in &spec.readable_paths {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            }
+            for p in &spec.writable_paths {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            }
+            s.push_str(")\n\n");
 
-    // Workspace is the only host path the child may write to. Host temp
-    // directories (`/private/tmp`, `/private/var/folders`) are deliberately
-    // excluded — the macOS runner sets `TMPDIR` to a per-invocation
-    // scratch dir under the workspace so anything respecting `$TMPDIR`
-    // lands in the workspace bind instead of leaking onto the host.
-    s.push_str("(allow file-write*\n");
-    s.push_str(&format!(
-        "  (subpath \"{}\")\n",
-        sbpl_quote(&spec.workspace_root)
-    ));
-    for p in &spec.writable_paths {
-        s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            // Workspace is the only host path the child may write to.
+            // Host temp directories (`/private/tmp`,
+            // `/private/var/folders`) are deliberately excluded — the
+            // macOS runner sets `TMPDIR` to a per-invocation scratch
+            // dir under the workspace so anything respecting `$TMPDIR`
+            // lands in the workspace bind instead of leaking onto the
+            // host.
+            s.push_str("(allow file-write*\n");
+            s.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "  (subpath \"{}\")\n",
+                    sbpl_quote(mount.destination())
+                ));
+            }
+            for p in &spec.writable_paths {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(p)));
+            }
+            s.push_str(")\n\n");
+        }
+        FilesystemPolicy::Permissive {
+            extra_root,
+            denied_paths,
+        } => {
+            // Allow read on the FHS-mac equivalent + workspace +
+            // extra_root; allow write on workspace + extra_root only.
+            // Then deny read+write on each sensitive subpath via
+            // last-match-wins so credential vaults stay opaque even
+            // though they sit under `extra_root`.
+            s.push_str("(allow file-read*\n");
+            for p in [
+                "/usr",
+                "/System",
+                "/Library",
+                "/private/var/db/dyld",
+                "/private/etc",
+                "/bin",
+                "/sbin",
+            ] {
+                s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(Path::new(p))));
+            }
+            s.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(extra_root)));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "  (subpath \"{}\")\n",
+                    sbpl_quote(mount.destination())
+                ));
+            }
+            s.push_str(")\n\n");
+
+            s.push_str("(allow file-write*\n");
+            s.push_str(&format!(
+                "  (subpath \"{}\")\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            s.push_str(&format!("  (subpath \"{}\")\n", sbpl_quote(extra_root)));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "  (subpath \"{}\")\n",
+                    sbpl_quote(mount.destination())
+                ));
+            }
+            s.push_str(")\n\n");
+
+            for p in denied_paths {
+                s.push_str(&format!(
+                    "(deny file-read* (subpath \"{}\"))\n",
+                    sbpl_quote(p)
+                ));
+                s.push_str(&format!(
+                    "(deny file-write* (subpath \"{}\"))\n",
+                    sbpl_quote(p)
+                ));
+            }
+            s.push('\n');
+        }
     }
-    s.push_str(")\n\n");
 
     s.push_str("(allow mach-lookup)\n");
     s.push_str("(allow ipc-posix-shm)\n");
@@ -344,6 +512,7 @@ mod tests {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: crate::spec::ResourceLimits::default(),
+            filesystem_policy: FilesystemPolicy::default(),
         }
     }
 
@@ -353,7 +522,7 @@ mod tests {
 
     #[test]
     fn bwrap_argv_unshares_net_when_no_http() {
-        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"));
+        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
         let strs = argv_strs(&argv);
         assert!(strs.contains(&"--unshare-net".to_string()));
         assert!(!strs.contains(&"--share-net".to_string()));
@@ -361,15 +530,171 @@ mod tests {
 
     #[test]
     fn bwrap_argv_shares_net_for_http() {
-        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::All, "/tmp/ws"));
+        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::All, "/tmp/ws"), None);
         let strs = argv_strs(&argv);
         assert!(strs.contains(&"--share-net".to_string()));
         assert!(!strs.contains(&"--unshare-net".to_string()));
     }
 
     #[test]
+    fn bwrap_argv_binds_requested_symlink_path_to_canonical_source() {
+        let spec = spec_for(NetworkPolicy::None, "/data/proj/.aura/work");
+        let symlink_mount = WorkspaceSymlinkMount::new(
+            PathBuf::from("/data/proj/.aura/work"),
+            PathBuf::from("/home/u/proj/.aura/work"),
+        );
+        let argv = build_bwrap_argv(&spec, Some(&symlink_mount));
+        let strs = argv_strs(&argv);
+        assert!(
+            strs.windows(3).any(|w| w[0] == "--bind"
+                && w[1] == "/data/proj/.aura/work"
+                && w[2] == "/data/proj/.aura/work"),
+            "primary workspace bind must be present: {strs:?}"
+        );
+        assert!(
+            strs.windows(3).any(|w| w[0] == "--bind"
+                && w[1] == "/data/proj/.aura/work"
+                && w[2] == "/home/u/proj/.aura/work"),
+            "expected --bind /data/proj/.aura/work /home/u/proj/.aura/work in argv: {strs:?}"
+        );
+    }
+
+    #[test]
+    fn docker_argv_binds_requested_symlink_path_to_canonical_source() {
+        let spec = spec_for(NetworkPolicy::None, "/data/proj/.aura/work");
+        let symlink_mount = WorkspaceSymlinkMount::new(
+            PathBuf::from("/data/proj/.aura/work"),
+            PathBuf::from("/home/u/proj/.aura/work"),
+        );
+        let argv = build_docker_argv(
+            &spec,
+            Some(&symlink_mount),
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        assert!(
+            strs.iter()
+                .any(|a| a == "/data/proj/.aura/work:/data/proj/.aura/work"),
+            "primary -v bind missing: {strs:?}"
+        );
+        assert!(
+            strs.iter()
+                .any(|a| a == "/data/proj/.aura/work:/home/u/proj/.aura/work"),
+            "symlink path -v bind missing: {strs:?}"
+        );
+    }
+
+    #[test]
+    fn sbpl_profile_grants_requested_symlink_path_read_and_write() {
+        let spec = spec_for(NetworkPolicy::None, "/data/proj/.aura/work");
+        let symlink_mount = WorkspaceSymlinkMount::new(
+            PathBuf::from("/data/proj/.aura/work"),
+            PathBuf::from("/home/u/proj/.aura/work"),
+        );
+        let s = render_sbpl_profile(&spec, Some(&symlink_mount));
+        let read_start = s
+            .find("(allow file-read*")
+            .expect("file-read* block must exist");
+        let read_end_rel = s[read_start..]
+            .find(")\n\n")
+            .expect("file-read* terminator");
+        let read_block = &s[read_start..read_start + read_end_rel];
+        assert!(
+            read_block.contains("(subpath \"/home/u/proj/.aura/work\")"),
+            "requested symlink path must be readable: {read_block}"
+        );
+        let write_start = s
+            .find("(allow file-write*")
+            .expect("file-write* block must exist");
+        let write_end_rel = s[write_start..]
+            .find(")\n\n")
+            .expect("file-write* terminator");
+        let write_block = &s[write_start..write_start + write_end_rel];
+        assert!(
+            write_block.contains("(subpath \"/home/u/proj/.aura/work\")"),
+            "requested symlink path must be writable: {write_block}"
+        );
+    }
+
+    #[test]
+    fn bwrap_argv_permissive_binds_workspace_and_extra_root_rw_and_masks_denied_paths() {
+        // Pick workspace_root OUTSIDE extra_root so we exercise the
+        // case where the project lives outside $HOME (e.g.
+        // `/data/proj` while $HOME is `/home/agent`).
+        let mut spec = spec_for(NetworkPolicy::All, "/data/proj");
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/agent"),
+            denied_paths: vec![
+                PathBuf::from("/home/agent/.ssh"),
+                PathBuf::from("/home/agent/.aws"),
+            ],
+        };
+        let argv = build_bwrap_argv(&spec, None);
+        let strs = argv_strs(&argv);
+
+        // No host-root bind. Workspace and extra_root each get an
+        // explicit RW bind; extra_root uses --bind-try because $HOME
+        // can be missing on minimal containers / CI environments.
+        assert!(
+            !strs
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/" && w[2] == "/"),
+            "permissive mode must NOT bind host root: {strs:?}"
+        );
+        assert!(
+            strs.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/data/proj" && w[2] == "/data/proj"),
+            "workspace must be RW-bound: {strs:?}"
+        );
+        assert!(
+            strs.windows(3)
+                .any(|w| w[0] == "--bind-try" && w[1] == "/home/agent" && w[2] == "/home/agent"),
+            "extra_root ($HOME) must be RW-bound (try): {strs:?}"
+        );
+
+        for denied in ["/home/agent/.ssh", "/home/agent/.aws"] {
+            assert!(
+                strs.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == denied),
+                "denied path {denied} must be masked by tmpfs: {strs:?}"
+            );
+        }
+
+        // FHS roots stay RO-bound so binaries / resolver config work.
+        for ro in ["/usr", "/bin", "/etc"] {
+            assert!(
+                strs.windows(2)
+                    .any(|w| w[0] == "--ro-bind-try" && w[1] == ro),
+                "permissive mode must keep {ro} RO-bound: {strs:?}"
+            );
+        }
+
+        // --share-net still respected via NetworkPolicy.
+        assert!(strs.contains(&"--share-net".to_string()));
+    }
+
+    #[test]
+    fn bwrap_argv_workspace_default_path_unchanged_when_permissive_off() {
+        // Sanity: the existing strict-workspace argv shape is preserved
+        // when filesystem_policy stays at its default Workspace variant.
+        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
+        let strs = argv_strs(&argv);
+        assert!(
+            strs.windows(2)
+                .any(|w| w[0] == "--ro-bind-try" && w[1] == "/usr"),
+            "workspace mode must keep /usr RO bind: {strs:?}"
+        );
+        assert!(
+            !strs
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/" && w[2] == "/"),
+            "workspace mode must NOT bind host root: {strs:?}"
+        );
+    }
+
+    #[test]
     fn bwrap_argv_workspace_is_rw_bind() {
-        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/myws"));
+        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/myws"), None);
         let strs = argv_strs(&argv);
         let mut iter = strs.iter().enumerate();
         let bind_idx = iter
@@ -389,7 +714,7 @@ mod tests {
         spec.env = EnvPolicy::Allowlist {
             vars: vec!["PATH".into()],
         };
-        let argv = build_bwrap_argv(&spec);
+        let argv = build_bwrap_argv(&spec, None);
         let strs = argv_strs(&argv);
         let clearenv = strs.iter().position(|a| a == "--clearenv");
         let setenv = strs.iter().position(|a| a == "--setenv");
@@ -400,7 +725,7 @@ mod tests {
 
     #[test]
     fn bwrap_argv_routes_tmpdir_to_internal_tmpfs() {
-        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"));
+        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
         let strs = argv_strs(&argv);
         let positions: Vec<usize> = strs
             .iter()
@@ -419,8 +744,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_env_sets_pwd_to_workspace_when_cwd_missing() {
+        let spec = spec_for(NetworkPolicy::None, "/tmp/ws");
+        let env = resolve_env(&spec);
+        assert_eq!(
+            env.iter()
+                .find_map(|(k, v)| (k == "PWD").then_some(v.as_str())),
+            Some("/tmp/ws")
+        );
+    }
+
+    #[test]
+    fn resolve_env_sets_pwd_to_explicit_cwd() {
+        let mut spec = spec_for(NetworkPolicy::None, "/tmp/ws");
+        spec.cwd = Some(PathBuf::from("/tmp/ws/subdir"));
+        let env = resolve_env(&spec);
+        assert_eq!(
+            env.iter()
+                .find_map(|(k, v)| (k == "PWD").then_some(v.as_str())),
+            Some("/tmp/ws/subdir")
+        );
+    }
+
+    #[test]
     fn bwrap_argv_terminates_args_with_double_dash() {
-        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"));
+        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
         let strs = argv_strs(&argv);
         let dd = strs.iter().position(|a| a == "--").expect("`--` separator");
         assert_eq!(strs[dd + 1], "sh");
@@ -430,7 +778,7 @@ mod tests {
 
     #[test]
     fn sbpl_profile_starts_with_default_deny() {
-        let s = render_sbpl_profile(&spec_for(NetworkPolicy::None, "/tmp/ws"));
+        let s = render_sbpl_profile(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
         let mut lines = s.lines();
         assert_eq!(lines.next(), Some("(version 1)"));
         assert_eq!(lines.next(), Some("(deny default)"));
@@ -438,21 +786,21 @@ mod tests {
 
     #[test]
     fn sbpl_profile_network_off_for_no_http() {
-        let s = render_sbpl_profile(&spec_for(NetworkPolicy::None, "/tmp/ws"));
+        let s = render_sbpl_profile(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
         assert!(s.contains("(deny network*)"));
         assert!(!s.contains("(allow network*)"));
     }
 
     #[test]
     fn sbpl_profile_network_on_for_http() {
-        let s = render_sbpl_profile(&spec_for(NetworkPolicy::All, "/tmp/ws"));
+        let s = render_sbpl_profile(&spec_for(NetworkPolicy::All, "/tmp/ws"), None);
         assert!(s.contains("(allow network*)"));
         assert!(!s.contains("(deny network*)"));
     }
 
     #[test]
     fn sbpl_profile_writes_only_to_workspace() {
-        let s = render_sbpl_profile(&spec_for(NetworkPolicy::None, "/tmp/myws"));
+        let s = render_sbpl_profile(&spec_for(NetworkPolicy::None, "/tmp/myws"), None);
         // Find the `(allow file-write*` block and confirm it lists only
         // the workspace path, no host temp directories.
         let write_block_start = s
@@ -479,6 +827,7 @@ mod tests {
     fn docker_argv_starts_with_run_rm_init() {
         let argv = build_docker_argv(
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            None,
             "debian:stable-slim",
             "aura-sandbox-test",
         );
@@ -492,6 +841,7 @@ mod tests {
     fn docker_argv_disables_network_when_no_http() {
         let argv = build_docker_argv(
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            None,
             "debian:stable-slim",
             "aura-sandbox-test",
         );
@@ -507,6 +857,7 @@ mod tests {
     fn docker_argv_uses_bridge_network_for_http() {
         let argv = build_docker_argv(
             &spec_for(NetworkPolicy::All, "/tmp/myws"),
+            None,
             "debian:stable-slim",
             "aura-sandbox-test",
         );
@@ -522,6 +873,7 @@ mod tests {
     fn docker_argv_binds_workspace_with_matching_paths() {
         let argv = build_docker_argv(
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            None,
             "debian:stable-slim",
             "aura-sandbox-test",
         );
@@ -531,9 +883,26 @@ mod tests {
     }
 
     #[test]
+    fn docker_argv_exports_pwd_to_workspace() {
+        let argv = build_docker_argv(
+            &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            None,
+            "debian:stable-slim",
+            "aura-sandbox-test",
+        );
+        let strs = argv_strs(&argv);
+        assert!(
+            strs.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "PWD=/tmp/myws"),
+            "expected docker env PWD=/tmp/myws in argv: {strs:?}"
+        );
+    }
+
+    #[test]
     fn docker_argv_drops_capabilities_and_pins_user() {
         let argv = build_docker_argv(
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            None,
             "debian:stable-slim",
             "aura-sandbox-test",
         );
@@ -560,7 +929,7 @@ mod tests {
             memory_max_bytes: Some(256 * 1024 * 1024),
             pids_max: Some(64),
         };
-        let argv = build_docker_argv(&spec, "debian:stable-slim", "aura-sandbox-test");
+        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "aura-sandbox-test");
         let strs = argv_strs(&argv);
         let mem = strs
             .iter()
@@ -578,7 +947,7 @@ mod tests {
     fn docker_argv_omits_caps_when_unlimited() {
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
         spec.resource_limits = crate::spec::ResourceLimits::unlimited();
-        let argv = build_docker_argv(&spec, "debian:stable-slim", "aura-sandbox-test");
+        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "aura-sandbox-test");
         let strs = argv_strs(&argv);
         assert!(
             !strs.iter().any(|a| a == "--memory"),
@@ -594,6 +963,7 @@ mod tests {
     fn docker_argv_image_precedes_program_and_args() {
         let argv = build_docker_argv(
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
+            None,
             "debian:stable-slim",
             "aura-sandbox-test",
         );
@@ -616,7 +986,7 @@ mod tests {
     fn sbpl_profile_per_host_scopes_replace_broad_allow() {
         let mut spec = spec_for(NetworkPolicy::All, "/tmp/myws");
         spec.allowed_hosts = BTreeSet::from(["api.openai.com:443".into(), "github.com".into()]);
-        let s = render_sbpl_profile(&spec);
+        let s = render_sbpl_profile(&spec, None);
         assert!(
             !s.contains("(allow network*)"),
             "broad allow must be dropped when allowed_hosts is non-empty: {s}"
@@ -640,7 +1010,7 @@ mod tests {
     fn sbpl_profile_allowed_hosts_ignored_under_network_none() {
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
         spec.allowed_hosts = BTreeSet::from(["github.com".into()]);
-        let s = render_sbpl_profile(&spec);
+        let s = render_sbpl_profile(&spec, None);
         assert!(s.contains("(deny network*)"));
         assert!(
             !s.contains("(allow network-outbound"),
@@ -652,7 +1022,7 @@ mod tests {
     fn bwrap_argv_writable_paths_are_rw_bound_not_ro_bound() {
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/ws");
         spec.writable_paths = vec![PathBuf::from("/data/out"), PathBuf::from("/var/out2")];
-        let argv = build_bwrap_argv(&spec);
+        let argv = build_bwrap_argv(&spec, None);
         let strs = argv_strs(&argv);
         // Each entry must appear as `--bind <p> <p>` (RW), not as
         // `--ro-bind-try` (which is what readable_paths uses).
@@ -685,7 +1055,7 @@ mod tests {
     fn docker_argv_writable_paths_omit_ro_suffix() {
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
         spec.writable_paths = vec![PathBuf::from("/data/out")];
-        let argv = build_docker_argv(&spec, "debian:stable-slim", "aura-sandbox-test");
+        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "aura-sandbox-test");
         let strs = argv_strs(&argv);
         // `-v <path>:<path>` for writable; `-v <path>:<path>:ro` for
         // readable. Confirm the writable entry uses the bare form.
@@ -709,7 +1079,7 @@ mod tests {
     fn sbpl_writable_paths_extend_file_write_block() {
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
         spec.writable_paths = vec![PathBuf::from("/data/out"), PathBuf::from("/var/log/app")];
-        let s = render_sbpl_profile(&spec);
+        let s = render_sbpl_profile(&spec, None);
         // Locate the file-write* block boundaries.
         let start = s
             .find("(allow file-write*")
@@ -738,7 +1108,7 @@ mod tests {
         // write but not read the path it just wrote.
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
         spec.writable_paths = vec![PathBuf::from("/data/out")];
-        let s = render_sbpl_profile(&spec);
+        let s = render_sbpl_profile(&spec, None);
         // Read block starts before the write block; verify the
         // writable path is listed in `(allow file-read* …)` too.
         let read_start = s

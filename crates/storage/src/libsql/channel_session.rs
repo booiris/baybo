@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use aura_model::ChannelType;
-use chrono::Utc;
 
 use super::LibsqlPool;
 use crate::StorageError;
@@ -44,7 +43,7 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
     }
 
     async fn put(&self, channel_type: &ChannelType, user_id: &str, session_id: &str) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now = super::time::now_us();
         let conn = self.pool.conn();
         // Soft-delete aware upsert: clear `deleted_at` so a previously
         // tombstone mapping is revived, and keep the existing
@@ -76,7 +75,7 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
     }
 
     async fn delete(&self, channel_type: &ChannelType, user_id: &str) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
             "UPDATE channel_sessions

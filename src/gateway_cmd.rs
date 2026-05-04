@@ -25,8 +25,7 @@ use aura_config::AuraConfig;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
 use aura_gateway::{
     AdminToken, ChannelServer, ChannelSpawner, ChannelTokenTable, ClientIdentity, GatewayDeps,
-    GatewayServer, RuntimeGatewayConfig, SidecarRuntime, SidecarSupervisor, TUI_CLIENT_LABEL,
-    TUI_TOKEN_VAULT_KEY,
+    GatewayServer, RuntimeGatewayConfig, SidecarSupervisor, TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY,
 };
 
 use crate::boot;
@@ -252,11 +251,12 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         (admin_token, tui_token)
     };
 
-    // Build the leak detector (with both gateway tokens registered as
-    // `LeakAction::Replace` rules) BEFORE initialising tracing so log
-    // lines that accidentally echo either credential are masked on
-    // disk. Pass the same `Arc<LeakDetector>` into `build_managers` so
-    // the runtime graph's SecurityGateway uses the same rule set.
+    // Build the leak detector (with every gateway-minted token
+    // registered as a `LeakAction::Replace` rule) BEFORE initialising
+    // tracing so log lines that accidentally echo any credential are
+    // masked on disk. Pass the same `Arc<LeakDetector>` into
+    // `build_managers` so the runtime graph's SecurityGateway uses
+    // the same rule set.
     let leak_detector = runtime::build_leak_detector(
         &config.security,
         &[
@@ -281,11 +281,62 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let runtime_cfg = RuntimeGatewayConfig::from_config(&config.gateway)
         .map_err(|e| anyhow::anyhow!("invalid gateway config: {e}"))?;
 
+    // Channel-token table for the TUI handshake. The browser MCP
+    // sidecar (chrome-devtools-mcp wrapper) does not use the blob
+    // upload backchannel — its screenshots flow through the standard
+    // MCP `attachImage` content type and are decoded by Aura's
+    // gateway-side `content_adapter`. So no tool/* token registration
+    // is needed here.
+    let channel_tokens = ChannelTokenTable::new();
+    let _tui_token_handle = channel_tokens.register(
+        tui_token.clone(),
+        ClientIdentity {
+            pid: std::process::id(),
+            label: TUI_CLIENT_LABEL.to_string(),
+            // None: TUI's channel-type binding is enforced via
+            // `TUI_CLIENT_LABEL` in the handshake, not via this
+            // field. Subprocess sidecars get `Some(channel_type)`
+            // from `ChannelSpawner::spawn`.
+            bound_channel_type: None,
+        },
+    );
+
+    // Workspace channel-port file — the channel listener writes its
+    // bound port here at start.
+    let port_file = workspace_paths.channel_port();
+
+    // Install the embedded sidecar runtime once and reuse it for both
+    // the MCP-profile collection (browser MCP server) below and the
+    // channel-sidecar supervisor further down. Idempotent install but
+    // keeping a single Arc avoids the second filesystem walk.
+    let sidecar_runtime: Option<Arc<aura_gateway::SidecarRuntime>> =
+        match aura_gateway::SidecarRuntime::install() {
+            Ok(rt) => Some(Arc::new(rt)),
+            Err(e) => {
+                tracing::info!(
+                    error = %e,
+                    "embedded sidecar runtime unavailable; no embedded sidecars will be spawned",
+                );
+                None
+            }
+        };
+    let embedded_mcp_servers: Vec<aura_tools::mcp::EmbeddedMcpServer> = sidecar_runtime
+        .as_deref()
+        .map(|rt| {
+            aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(
+                rt,
+                &config,
+                &workspace_paths,
+            ))
+        })
+        .unwrap_or_default();
+
     let shutdown = ShutdownSignal::new();
     let mut graph = runtime::build_managers(
         Arc::clone(&config),
         shutdown.clone(),
         Arc::clone(&leak_detector),
+        embedded_mcp_servers,
     )
     .await?;
     let run_handle = runtime::wire_router(&mut graph).await;
@@ -302,27 +353,29 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         cron_handle.run().await;
     }));
 
-    // Shared capability table — the channel TCP listener consumes it
-    // for auth, and the WS channel server re-reads it in the
-    // Register-frame handshake via `GatewayDeps`.
-    let channel_tokens = ChannelTokenTable::new();
-
-    // Register the TUI token with the freshly-published value. The
-    // returned handle is held for the rest of `start`, so the TUI
-    // entry stays live until shutdown drops it (which revokes the
-    // in-memory entry — the vault row is overwritten on next start).
-    let _tui_token_handle = channel_tokens.register(
-        tui_token.clone(),
-        ClientIdentity {
-            pid: std::process::id(),
-            label: TUI_CLIENT_LABEL.to_string(),
-            // None: TUI's channel-type binding is enforced via
-            // `TUI_CLIENT_LABEL` in the handshake, not via this
-            // field. Subprocess sidecars get `Some(channel_type)`
-            // from `ChannelSpawner::spawn`.
-            bound_channel_type: None,
-        },
-    );
+    {
+        let mut janitor =
+            aura_janitor::Janitor::new(workspace_paths.clone(), graph.stores.blob.clone())
+                .with_retention_stores(
+                    graph.stores.cost.clone(),
+                    graph.stores.cron.clone(),
+                    graph.stores.channel_pairing.clone(),
+                );
+        if let Some(runtime) = sidecar_runtime.as_ref()
+            && let Some(cache_root) = runtime.sidecars_cache_root()
+        {
+            janitor = janitor.with_sidecar_cache(aura_janitor::SidecarCache {
+                cache_root,
+                live_dirs: runtime.live_dir_names(),
+            });
+        }
+        let janitor_shutdown = shutdown.clone();
+        task_tracker.track(tokio::spawn(async move {
+            janitor
+                .run(async move { janitor_shutdown.wait().await })
+                .await;
+        }));
+    }
 
     let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
 
@@ -350,7 +403,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         config_path: boot::resolve_config_path(),
         runtime_config: runtime_cfg.clone(),
         session_manager: Arc::clone(&graph.session_manager),
-        job_manager: Arc::clone(&graph.job_manager),
+        job_lifecycle: Arc::clone(&graph.job_lifecycle),
         cron_scheduler: Arc::clone(&graph.cron_scheduler),
         memory_manager: Arc::clone(&graph.memory_manager),
         skill_registry: Arc::clone(&graph.skill_registry),
@@ -370,55 +423,53 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Channel loopback-TCP listener — publishes its ephemeral port to
     // `<workspace>/channel.port` (same workspace identity dir as the
     // singleton lockfile) so TUI and sidecars can discover it without
-    // a config roundtrip. The TUI authenticates with the per-start
-    // token published above; sidecars use the per-spawn capability
-    // tokens minted by `ChannelSpawner`. Both arrive through the same
-    // `ChannelTokenTable`, so the listener doesn't need any extra
-    // auth material at bind time.
-    let port_file = workspace_paths.channel_port();
-    let channel_server = ChannelServer::bind(&deps, port_file.clone(), channel_tokens.clone())
+    // a config roundtrip.
+    let channel_server = ChannelServer::bind(&deps, port_file, channel_tokens.clone())
         .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();
     let channel_url = format!("ws://127.0.0.1:{channel_port}/v1/channel-ws");
 
-    // Embedded-sidecar supervisor. The channel TCP listener is already
-    // bound above so the kernel's listen queue absorbs child
-    // connection attempts even before `channel_server.run()` starts
-    // accepting inside the select! below. Each channel type gets its
-    // own restart loop driven by the shared shutdown signal.
-    match SidecarRuntime::install() {
-        Ok(runtime) => {
-            let channel_types: Vec<String> = runtime.channel_types().map(String::from).collect();
-            if channel_types.is_empty() {
-                tracing::info!("no embedded sidecars in this build");
-            } else {
+    // Channel-sidecar supervisor (telegram / weixin / …). The channel
+    // TCP listener is already bound above so the kernel's listen queue
+    // absorbs child connection attempts even before
+    // `channel_server.run()` starts accepting inside the select! below.
+    // The browser MCP server lives on a separate path: it is spawned
+    // by the MCP reconciler set up inside `runtime::build_managers`,
+    // not by this supervisor.
+    if let Some(runtime) = sidecar_runtime.as_ref() {
+        let domains: Vec<&str> = runtime.domains().collect();
+        if domains.is_empty() {
+            tracing::info!("no embedded sidecars in this build");
+        } else {
+            for domain in &domains {
+                let names: Vec<&str> = runtime.names_in_domain(domain).collect();
                 tracing::info!(
-                    channel_types = ?channel_types,
-                    bun_version = aura_gateway::sidecar::bun_version(),
-                    bun_target = runtime.bun_target(),
+                    domain = %domain,
+                    sidecars = ?names,
                     channel_port,
-                    "sidecar supervisor active; channels start on first registered bot",
+                    "sidecar runtime materialised",
                 );
-                let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
-                let supervisor = SidecarSupervisor::new(
-                    Arc::new(runtime),
-                    spawner,
-                    Arc::clone(&log_buffer),
-                    workspace_paths.channel_logs_dir(),
-                    Arc::clone(&leak_detector),
-                    graph.stores.channel_bot.clone(),
-                );
-                let sv_shutdown = shutdown.clone();
-                task_tracker.track(tokio::spawn(async move {
-                    supervisor.run(sv_shutdown).await;
-                }));
             }
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "embedded sidecar runtime unavailable; no sidecars will be spawned",
+
+        let channel_only: Vec<String> = runtime
+            .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
+            .map(String::from)
+            .collect();
+        if !channel_only.is_empty() {
+            let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
+            let supervisor = SidecarSupervisor::new(
+                Arc::clone(runtime),
+                spawner,
+                Arc::clone(&log_buffer),
+                workspace_paths.channel_logs_dir(),
+                Arc::clone(&leak_detector),
+                graph.stores.channel_bot.clone(),
             );
+            let sv_shutdown = shutdown.clone();
+            task_tracker.track(tokio::spawn(async move {
+                supervisor.run(sv_shutdown).await;
+            }));
         }
     }
 

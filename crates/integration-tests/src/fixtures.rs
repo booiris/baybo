@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aura_agent::SecurityGateway;
-use aura_model::{ChannelType, ChatMessage, Session, SessionState, User};
+use aura_model::{ChannelType, ChatMessage, Session, SessionId, SessionState, TriggerSource, User};
 use aura_security::{EncryptionKey, LeakDetector, SecretVault};
 use aura_storage::test_support::MemorySecretStore;
 use chrono::Utc;
@@ -29,7 +29,11 @@ pub fn gateway_with_memory_vault() -> (
         master_key_for_tests(),
         store.clone() as Arc<dyn aura_storage::SecretStore>,
     ));
-    let gateway = Arc::new(SecurityGateway::new(detector, vault.clone()));
+    let spill_dir = std::env::temp_dir().join(format!(
+        "aura-it-tool-spills-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    let gateway = Arc::new(SecurityGateway::new(detector, vault.clone()).with_spill_dir(spill_dir));
     (gateway, store, vault)
 }
 
@@ -86,8 +90,9 @@ impl SessionBuilder {
 
     pub fn build(self) -> Session {
         let now = Utc::now();
+        let id = SessionId::from(self.id);
         Session {
-            id: self.id,
+            id: id.clone(),
             user: User {
                 id: self.user_id,
                 name: self.user_name,
@@ -98,6 +103,10 @@ impl SessionBuilder {
             created_at: now,
             last_active: now,
             state: SessionState::default(),
+            root_session_id: id,
+            trigger: TriggerSource::User,
+            lineage: None,
+            bound_soul_version: "soul-it".into(),
         }
     }
 }

@@ -124,6 +124,169 @@ test("polling exit still notifies approvals so pending calls don't leak", async 
   assert.deepEqual(events, ["botStopped:b1"]);
 });
 
+function captureLogger() {
+  const log = { debug: [], info: [], warn: [], error: [] };
+  return {
+    log,
+    logger: {
+      debug: (...a) => log.debug.push(a),
+      info: (...a) => log.info.push(a),
+      warn: (...a) => log.warn.push(a),
+      error: (...a) => log.error.push(a),
+    },
+  };
+}
+
+test("slashCommands configured + platform supports it: registers once with the manifest", async () => {
+  const fake = makePlatform();
+  const calls = [];
+  fake.platform.registerSlashCommands = async (handle, commands) => {
+    calls.push({ handleId: handle.id, commands: [...commands] });
+  };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    slashCommands: [{ command: "new", description: "fresh session" }],
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].handleId, 0);
+  assert.deepEqual(calls[0].commands, [
+    { command: "new", description: "fresh session" },
+  ]);
+});
+
+test("slashCommands configured but platform does not implement registerSlashCommands: warns once", async () => {
+  const fake = makePlatform();
+  // platform intentionally has no registerSlashCommands method
+  const { log, logger } = captureLogger();
+  const channel = new BotChannel({
+    channelType: "test",
+    logger,
+    platform: fake.platform,
+    slashCommands: [{ command: "new", description: "fresh session" }],
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  await channel.onStartBot({ botId: "b2", token: "t" });
+  // Single warn even across multiple StartBot calls.
+  assert.equal(log.warn.length, 1);
+  assert.match(String(log.warn[0][0]), /registerSlashCommands/);
+});
+
+test("slashCommands unset: registerSlashCommands is never called", async () => {
+  const fake = makePlatform();
+  let called = 0;
+  fake.platform.registerSlashCommands = async () => {
+    called++;
+  };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  assert.equal(called, 0);
+});
+
+test("onSlashManifest replaces seed list and re-publishes to every live bot", async () => {
+  const fake = makePlatform();
+  const calls = [];
+  fake.platform.registerSlashCommands = async (handle, commands) => {
+    calls.push({ handleId: handle.id, commands: [...commands] });
+  };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    slashCommands: [{ command: "old", description: "legacy" }],
+  });
+  await channel.onStartBot({ botId: "b1", token: "t1" });
+  await channel.onStartBot({ botId: "b2", token: "t2" });
+  // Seed list was published once per StartBot.
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].commands, [{ command: "old", description: "legacy" }]);
+
+  await channel.onSlashManifest([
+    { command: "new", description: "fresh" },
+  ]);
+  // Each live bot got re-registered with the new manifest.
+  assert.equal(calls.length, 4);
+  const re = calls.slice(2);
+  assert.deepEqual(
+    re.map((c) => c.handleId).sort(),
+    [0, 1],
+  );
+  for (const c of re) {
+    assert.deepEqual(c.commands, [{ command: "new", description: "fresh" }]);
+  }
+});
+
+test("onSlashManifest before StartBot is honoured at bot startup", async () => {
+  const fake = makePlatform();
+  const calls = [];
+  fake.platform.registerSlashCommands = async (handle, commands) => {
+    calls.push({ handleId: handle.id, commands: [...commands] });
+  };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+  });
+  await channel.onSlashManifest([
+    { command: "new", description: "fresh" },
+  ]);
+  // No bots yet -> no publishes.
+  assert.equal(calls.length, 0);
+
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].commands, [
+    { command: "new", description: "fresh" },
+  ]);
+});
+
+test("onSlashManifest with an empty list publishes nothing", async () => {
+  const fake = makePlatform();
+  let called = 0;
+  fake.platform.registerSlashCommands = async () => {
+    called++;
+  };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    slashCommands: [{ command: "old", description: "legacy" }],
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  assert.equal(called, 1);
+
+  await channel.onSlashManifest([]);
+  // The manifest was cleared; no further calls.
+  assert.equal(called, 1);
+  // And future StartBot also publishes nothing.
+  await channel.onStartBot({ botId: "b2", token: "t" });
+  assert.equal(called, 1);
+});
+
+test("registerSlashCommands throwing does not fail bot startup", async () => {
+  const fake = makePlatform();
+  fake.platform.registerSlashCommands = async () => {
+    throw new Error("api blew up");
+  };
+  const { log, logger } = captureLogger();
+  const channel = new BotChannel({
+    channelType: "test",
+    logger,
+    platform: fake.platform,
+    slashCommands: [{ command: "new", description: "fresh session" }],
+  });
+  const report = await channel.onStartBot({ botId: "b1", token: "t" });
+  assert.equal(report.ok, true);
+  assert.equal(log.warn.length, 1);
+  assert.match(String(log.warn[0][0]), /registerSlashCommands failed/);
+});
+
 test("a stale polling-exit from a prior generation cannot delete the fresh handle", async () => {
   const fake = makePlatform();
   const channel = new BotChannel({

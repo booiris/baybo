@@ -109,6 +109,35 @@ pub struct Message {
     pub bot_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<WireAttachment>,
+    /// Platform-native message id (Telegram `update_id`, Weixin
+    /// `msg_id`, …). When non-empty the gateway dedups inbound traffic
+    /// per `(channel_type, bot_id, platform_msg_id)` so a sidecar that
+    /// replays its long-poll buffer after a restart doesn't double-fire
+    /// the agent. Sidecars without a stable platform id (or that don't
+    /// care to dedup) leave it empty. Additive; default empty keeps old
+    /// sidecars wire-compatible.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform_msg_id: String,
+}
+
+/// One slash command published to a sidecar's native command surface
+/// (Telegram `setMyCommands`, Discord application commands, …). The
+/// gateway is the single source of truth for the command list and
+/// pushes it via [`Frame::SlashManifest`] after RegisterAck so the
+/// sidecar doesn't have to keep its own copy in sync.
+///
+/// `command` is the bare command name (no leading `/`). Telegram's
+/// rule (`[a-z0-9_]{1,32}`) is the most restrictive — keep entries
+/// inside it for portability across platforms.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub struct SlashCommandSpec {
+    pub command: String,
+    pub description: String,
 }
 
 /// Frame envelope. Tagged on the `kind` field so the receive side
@@ -189,7 +218,6 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         user_id: String,
         tool: String,
-        #[cfg_attr(feature = "ts-export", ts(type = "unknown[]"))]
         accesses: Vec<ResourceAccess>,
         params_preview: String,
         /// Optional human-readable label the tool produced via
@@ -229,23 +257,6 @@ pub enum Frame {
         session_id: String,
         entries: Vec<String>,
     },
-    /// Client -> server: a log line emitted by the sidecar itself,
-    /// forwarded so aura operators see sidecar output in the dashboard
-    /// alongside gateway-internal tracing. The server attributes the
-    /// record to the sidecar's `ChannelType` before handing it to the
-    /// `LogBuffer`.
-    ///
-    /// `level` mirrors lower-cased tracing levels (`"error"`, `"warn"`,
-    /// `"info"`, `"debug"`). Unknown values degrade to `info`. `target`
-    /// is an optional module/category the sidecar tags. Additive frame —
-    /// no `PROTOCOL_VERSION` bump.
-    SidecarLog {
-        level: String,
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        target: Option<String>,
-    },
     /// Server -> client: attach a new bot (or other per-tenant
     /// credential) to a sidecar that multiplexes many tenants over
     /// one WS. For the Telegram channel `bot_id` is an operator-chosen
@@ -268,6 +279,14 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(optional))]
         message: Option<String>,
     },
+    /// Server -> client: gateway-authored list of slash commands the
+    /// sidecar should publish on its native command surface (e.g.
+    /// Telegram's `setMyCommands`). Sent once right after a successful
+    /// `RegisterAck` for sidecar-flavoured connections (not session-
+    /// scoped TUIs); the manifest replaces any prior list. Sidecars
+    /// that don't surface client-side autocomplete may ignore this.
+    /// Additive; older sidecars decode the unknown tag as a no-op.
+    SlashManifest { commands: Vec<SlashCommandSpec> },
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -344,6 +363,32 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_slash_manifest() {
+        let frame = Frame::SlashManifest {
+            commands: vec![
+                SlashCommandSpec {
+                    command: "new".into(),
+                    description: "Start a fresh session".into(),
+                },
+                SlashCommandSpec {
+                    command: "help".into(),
+                    description: "Show help".into(),
+                },
+            ],
+        };
+        let bytes = encode(&frame).unwrap();
+        assert_eq!(frame, decode(&bytes).unwrap());
+    }
+
+    #[test]
+    fn round_trip_slash_manifest_empty() {
+        let frame = Frame::SlashManifest {
+            commands: Vec::new(),
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
     fn round_trip_message() {
         let frame = Frame::Message(Message {
             content: "hi".into(),
@@ -352,6 +397,7 @@ mod tests {
             channel_type: ChannelType::from("slack"),
             bot_id: "prod-bot".into(),
             attachments: Vec::new(),
+            platform_msg_id: String::new(),
         });
         let bytes = encode(&frame).unwrap();
         assert_eq!(frame, decode(&bytes).unwrap());
@@ -369,6 +415,7 @@ mod tests {
             channel_type: ChannelType::from("slack"),
             bot_id: String::new(),
             attachments: Vec::new(),
+            platform_msg_id: String::new(),
         });
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
@@ -397,6 +444,7 @@ mod tests {
                     filename: Some("report.pdf".into()),
                 },
             ],
+            platform_msg_id: String::new(),
         });
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
@@ -414,6 +462,7 @@ mod tests {
             channel_type: ChannelType::from("slack"),
             bot_id: String::new(),
             attachments: Vec::new(),
+            platform_msg_id: String::new(),
         });
         let encoded = encode(&frame).unwrap();
         // MessagePack with `to_vec_named` writes field names as bare
@@ -526,16 +575,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_sidecar_log_with_target() {
-        let frame = Frame::SidecarLog {
-            level: "warn".into(),
-            text: "retry exhausted".into(),
-            target: Some("telegram::poll".into()),
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
     fn round_trip_start_bot() {
         let frame = Frame::StartBot {
             bot_id: "prod-bot".into(),
@@ -570,18 +609,5 @@ mod tests {
             message: Some("401 Unauthorized".into()),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_sidecar_log_without_target() {
-        let frame = Frame::SidecarLog {
-            level: "info".into(),
-            text: "startup".into(),
-            target: None,
-        };
-        let bytes = encode(&frame).unwrap();
-        // `target: None` is omitted on the wire — old peers that don't
-        // send the field must still decode into the None variant.
-        assert_eq!(frame, decode(&bytes).unwrap());
     }
 }

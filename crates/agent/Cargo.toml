@@ -18,7 +18,6 @@ aura-job = { workspace = true }
 aura-security = { workspace = true }
 aura-sandbox = { workspace = true }
 aura-storage = { workspace = true }
-aura-hook = { workspace = true }
 aura-channels = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }

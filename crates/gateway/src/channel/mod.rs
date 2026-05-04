@@ -20,15 +20,29 @@ pub(crate) mod adapter;
 pub(crate) mod blobs;
 pub mod bot_reconciler;
 pub mod control;
+pub(crate) mod dedup;
 pub(crate) mod handshake;
 pub(crate) mod history;
 pub mod route;
 pub(crate) mod session_resolver;
+pub(crate) mod slash;
 pub mod state;
 
 pub use bot_reconciler::ChannelBotReconciler;
 pub use control::{ChannelControlError, ChannelControlRegistry};
+pub use dedup::InboundDedup;
 pub use history::TuiHistoryStore;
 pub use route::routes;
 pub use session_resolver::ChannelSessionResolver;
 pub use state::WsChannelState;
+
+/// Deterministic short hash of an identifier for log attribution.
+/// Four hex chars distinguish concurrent pendings in a tracing log
+/// without leaking the raw id.
+pub(crate) fn short_hash(raw: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    raw.hash(&mut h);
+    format!("{:04x}", (h.finish() & 0xFFFF) as u16)
+}

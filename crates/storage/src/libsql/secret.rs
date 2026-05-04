@@ -75,7 +75,7 @@ impl SecretStore for LibsqlSecretStore {
     }
 
     async fn delete(&self, name: &str) -> crate::secret::Result<()> {
-        let now = chrono::Utc::now().timestamp();
+        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
             "UPDATE secrets SET deleted_at = ?2 \

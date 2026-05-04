@@ -1,5 +1,5 @@
 import type { Logger } from "./logger.js";
-import type { WireAttachment } from "./wire.js";
+import type { ResourceAccess, WireAttachment } from "./wire.js";
 
 export interface AgentMessage {
   sessionId: string;
@@ -53,6 +53,15 @@ export interface UserInbound {
    */
   botId?: string;
   /**
+   * Platform-native message id (Telegram `update_id`, Weixin `msg_id`,
+   * …). When set, the gateway dedups inbound traffic per
+   * `(channelType, botId, platformMsgId)` — protects against the
+   * sidecar replaying its long-poll buffer after a restart, or any
+   * other path that surfaces the same upstream event twice. Channels
+   * without a stable platform id can omit it.
+   */
+  platformMsgId?: string;
+  /**
    * Non-text payloads attached to the user's message. Each entry
    * references a blob the sidecar already uploaded via
    * `POST /v1/blobs`; the gateway's wire-side conversion turns them
@@ -72,13 +81,21 @@ export interface ApprovalRequest {
    */
   userId: string;
   tool: string;
+  /**
+   * Resources the tool will touch on this call (filesystem paths,
+   * hosts, shell commands). Sidecars should render these to the user
+   * as the primary "what is being approved?" surface — they describe
+   * the security-relevant action, not the JSON shape of the call.
+   * Empty array when the tool declares no controlled resources
+   * (auto-approve path, no prompt would have fired).
+   */
+  accesses: ResourceAccess[];
   paramsPreview: string;
   /**
    * Optional human-readable label produced by the tool's
    * `Tool::call_label` hook (e.g. Bash's `description` parameter).
-   * Sidecars should prefer this in the approval UI when present and
-   * fall back to `paramsPreview` otherwise. `undefined` when the tool
-   * did not supply one.
+   * Sidecars may show this alongside `accesses`. `undefined` when the
+   * tool did not supply one.
    */
   description?: string;
 }
@@ -139,6 +156,20 @@ export interface Channel {
   onApprovalRequested?(req: ApprovalRequest): Promise<ApprovalDecision>;
 
   onApprovalResolved?(callId: string, decision: ApprovalDecision): Promise<void>;
+
+  /**
+   * Control-plane: gateway-authored slash-command manifest. Pushed
+   * once after a successful Register handshake (and on every
+   * reconnect) so each sidecar's native command surface — Telegram
+   * `setMyCommands`, Discord application commands, … — stays in sync
+   * with the gateway dispatcher without each sidecar maintaining its
+   * own copy. Sidecars without a command UI may ignore this hook;
+   * `BotChannel` honours it by re-publishing the new list to every
+   * live bot.
+   */
+  onSlashManifest?(
+    commands: ReadonlyArray<import("./generated/SlashCommandSpec.js").SlashCommandSpec>,
+  ): Promise<void>;
 
   /**
    * Control-plane: aura is attaching a new per-tenant credential (bot

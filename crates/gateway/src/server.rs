@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aura_agent::{
-    CronScheduler, JobManager, MemoryManager, SessionManager, service::ShutdownSignal,
+    CronScheduler, JobLifecycle, MemoryManager, SessionManager, service::ShutdownSignal,
 };
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
@@ -68,7 +68,7 @@ pub struct GatewayDeps {
     pub config_path: Option<PathBuf>,
     pub runtime_config: RuntimeGatewayConfig,
     pub session_manager: Arc<SessionManager>,
-    pub job_manager: Arc<JobManager>,
+    pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub memory_manager: Arc<MemoryManager>,
     pub skill_registry: Arc<SkillRegistry>,
@@ -116,10 +116,14 @@ pub struct AdminState {
     pub config: Arc<AuraConfig>,
     pub config_path: Option<PathBuf>,
     pub session_manager: Arc<SessionManager>,
-    pub job_manager: Arc<JobManager>,
+    pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub memory_manager: Arc<MemoryManager>,
     pub trace_store: Arc<dyn TraceStore>,
+    pub cost_store: Arc<dyn aura_storage::CostStore>,
+    /// Pre-built `QueryApi` so `/v1/traces/{id}` and any future
+    /// query-shaped endpoint don't allocate one per request.
+    pub query_api: Arc<aura_agent::QueryApi>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
@@ -148,14 +152,22 @@ pub struct ChannelState {
 
 impl AdminState {
     fn from_deps(deps: &GatewayDeps) -> Self {
+        let query_api = Arc::new(aura_agent::QueryApi::new(
+            deps.session_manager.store(),
+            Arc::clone(&deps.job_lifecycle),
+            deps.stores.trace.clone(),
+            deps.stores.cost.clone(),
+        ));
         Self {
             config: Arc::clone(&deps.config),
             config_path: deps.config_path.clone(),
             session_manager: Arc::clone(&deps.session_manager),
-            job_manager: Arc::clone(&deps.job_manager),
+            job_lifecycle: Arc::clone(&deps.job_lifecycle),
             cron_scheduler: Arc::clone(&deps.cron_scheduler),
             memory_manager: Arc::clone(&deps.memory_manager),
             trace_store: deps.stores.trace.clone(),
+            cost_store: deps.stores.cost.clone(),
+            query_api,
             skill_registry: Arc::clone(&deps.skill_registry),
             tool_registry: Arc::clone(&deps.tool_registry),
             channel_registry: Arc::clone(&deps.channel_registry),
@@ -290,15 +302,16 @@ pub fn build_channel_router(
         bot_reconciler: Arc::clone(&deps.bot_reconciler),
         pairing,
         blob_store: deps.stores.blob.clone(),
+        inbound_dedup: Arc::new(crate::channel::InboundDedup::new()),
     };
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_channel_auth` has stripped `?token=…`.
     // Outer-to-inner layer application means "outer" = "first to
     // observe the request", so an outer TraceLayer would log the
     // raw token-bearing URI before auth rewrites it.
-    let v1_inner = crate::channel::routes()
-        .with_state(ws_state)
-        .layer(TraceLayer::new_for_http());
+    let channel_router: Router<()> = crate::channel::routes().with_state(ws_state);
+
+    let v1_inner = channel_router.layer(TraceLayer::new_for_http());
     let v1 = channel_auth::attach(v1_inner, auth_state);
     Router::new()
         .merge(api::health::routes().layer(TraceLayer::new_for_http()))

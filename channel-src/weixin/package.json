@@ -8,15 +8,26 @@
     "aura-channel-weixin": "./dist/index.js"
   },
   "ilink_appid": "bot",
+  "aura": {
+    "domain": "channel",
+    "auxAssets": [
+      {
+        "src": "node_modules/silk-wasm/lib/silk.wasm",
+        "name": "silk.wasm"
+      }
+    ]
+  },
   "scripts": {
     "build": "tsc",
+    "bundle": "bun build src/index.ts --target=bun --minify --outfile=dist/bundle.mjs",
     "check": "tsc --noEmit",
     "start": "node dist/index.js",
     "test": "node --test 'test/**/*.test.mjs'"
   },
   "dependencies": {
     "@aura/channel-sdk": "workspace:*",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "silk-wasm": "^3.7.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

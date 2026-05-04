@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::SandboxRunner;
-use crate::args::render_sbpl_profile;
+use crate::args::{effective_pwd, render_sbpl_profile};
 use crate::bootstrap::{SandboxAvailability, locate_binary, parse_version};
 use crate::error::SandboxError;
 use crate::spec::{Backend, EnvPolicy, SandboxOutput, SandboxSpec, StdinSource};
@@ -60,7 +60,11 @@ pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
 impl SandboxRunner for SandboxExecRunner {
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
         validate_spec(&spec)?;
-        let profile = render_sbpl_profile(&spec);
+        let workspace_symlink_mount = spec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
+        let profile = render_sbpl_profile(&spec, workspace_symlink_mount.as_ref());
         // SBPL allows writes only inside the workspace. Carve out a
         // per-invocation scratch dir under the workspace and route
         // `$TMPDIR` / `$TMP` / `$TEMP` there so callers respecting those
@@ -76,6 +80,7 @@ impl SandboxRunner for SandboxExecRunner {
         cmd.arg("env").arg("-i");
         cmd.arg("PATH=/usr/bin:/bin:/usr/sbin:/sbin");
         cmd.arg(format!("HOME={}", spec.workspace_root.display()));
+        cmd.arg(format!("PWD={}", effective_pwd(&spec)));
         cmd.arg(format!("TMPDIR={}", scratch_path.display()));
         cmd.arg(format!("TMP={}", scratch_path.display()));
         cmd.arg(format!("TEMP={}", scratch_path.display()));
@@ -168,6 +173,7 @@ mod tests {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: ResourceLimits::unlimited(),
+            filesystem_policy: crate::spec::FilesystemPolicy::default(),
         }
     }
 

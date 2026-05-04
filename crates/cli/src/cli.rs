@@ -423,13 +423,48 @@ pub enum PairCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum LlmCmd {
-    /// Show the configured LLM provider, model id, and capabilities.
+    /// List every registered LLM entry — name, provider, model, and
+    /// the env var the api key is read from. Includes a `*` marker
+    /// on the entry currently selected as `default-llm`.
     Status,
-    /// List the model catalog each registered provider advertises.
-    Models,
-    /// Send a one-token chat request to the configured provider to verify
-    /// connectivity and auth. Feeds `aura doctor`.
-    Probe,
+    /// Probe a configured LLM entry by chatting against its model and
+    /// timing the round-trip.
+    ///
+    /// Without `name`, an interactive picker opens; pass an entry name
+    /// to skip the picker.
+    Probe {
+        /// Optional entry name. Omit for an interactive picker.
+        name: Option<String>,
+    },
+    /// List the live catalog reported by an LLM entry's provider —
+    /// useful before running `aura llm add` to see which model ids the
+    /// account has access to.
+    ///
+    /// Without `name`, an interactive picker opens; pass an entry name
+    /// to skip the picker.
+    LiveModel {
+        /// Optional entry name. Omit for an interactive picker.
+        name: Option<String>,
+    },
+    /// Interactive flow that registers a new LLM entry: pick a built-in
+    /// provider, supply a name + base URL + credentials (api-key
+    /// stored in the vault, OAuth flow for subscription providers),
+    /// then choose the model from the live catalog. Persists the
+    /// resulting entry to the active config file.
+    Add,
+    /// Interactive editor that lets you change individual fields of
+    /// an existing LLM entry — model, base URL, API key, reasoning
+    /// effort, vision override. Each field shows the current value as
+    /// a placeholder; press enter to keep it.
+    Edit,
+    /// Interactive picker that deletes an LLM entry, clears its
+    /// vault-stored api key (and OAuth bundle for subscription
+    /// providers), and persists the config. Refuses to remove the
+    /// entry currently named in `default-llm`.
+    Remove,
+    /// Interactive picker that updates `default-llm` to the chosen
+    /// entry and persists the change to the active config file.
+    Default,
 }
 
 #[derive(Debug, Subcommand)]
@@ -483,8 +518,8 @@ pub enum SessionCmd {
 pub enum JobCmd {
     /// List tracked jobs, optionally filtered by status.
     List {
-        /// Filter by status: pending, in-progress, completed, submitted,
-        /// accepted, failed, stuck.
+        /// Filter by status: pending, in-progress, stuck, cancelled,
+        /// failed, completed.
         #[arg(long)]
         status: Option<JobStatusArg>,
     },
@@ -503,17 +538,18 @@ pub enum JobCmd {
     },
 }
 
-/// Status filter accepted by `aura job list --status`.
+/// Status filter accepted by `aura job list --status`. Mirrors
+/// `aura_job::JobStatusKind` 1:1 — adding a new kind here without
+/// the matching `From` arm in `commands/job.rs` is a compile error.
 #[derive(Debug, Copy, Clone, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum JobStatusArg {
     Pending,
     InProgress,
-    Completed,
-    Submitted,
-    Accepted,
-    Failed,
     Stuck,
+    Cancelled,
+    Failed,
+    Completed,
 }
 
 #[derive(Debug, Subcommand)]
@@ -589,24 +625,6 @@ pub enum TraceCmd {
     Show {
         /// Session id whose trace to inspect.
         id: String,
-    },
-    /// Print the nearest stored context snapshot for a trace node. Walks
-    /// the ancestor chain from `--node` (defaults to `active_leaf`) and
-    /// returns the first node carrying a `context_snapshot`. Read-only:
-    /// this does **not** take a new live snapshot (live-snapshot capture
-    /// still requires the session context the CLI does not hold).
-    Snapshot {
-        /// Session id whose trace to inspect.
-        id: String,
-        /// Trace node id to start the lookup from. Defaults to the
-        /// session's `active_leaf`.
-        #[arg(long)]
-        node: Option<String>,
-        /// Include the full message bodies in the response. Off by
-        /// default — a summary (role + token count + message count) is
-        /// usually enough for operators.
-        #[arg(long)]
-        full: bool,
     },
     /// Export a session's trace as pretty JSON. Prints to stdout unless
     /// `--out <path>` is given, which writes the file in argv mode. Requires

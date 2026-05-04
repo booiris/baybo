@@ -43,9 +43,24 @@ pub async fn connect(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
 ) -> McpResult<McpServerSession> {
+    connect_with_extra_env(entry, vault, &HashMap::new()).await
+}
+
+/// Like [`connect`] but merges `extra_env` onto the stdio child's env
+/// after the vault load. Used by the reconciler for embedded servers
+/// to inject boot-config env vars (`AURA_BROWSER_PROFILE_DIR`, …)
+/// without polluting the user's secret vault. Vault entries retain
+/// precedence — `extra_env` is applied first, then vault entries, so
+/// an operator who really wants to override a boot value can stash
+/// it under `mcp.<name>.env`.
+pub async fn connect_with_extra_env(
+    entry: &McpServerEntry,
+    vault: &Arc<SecretVault>,
+    extra_env: &HashMap<String, String>,
+) -> McpResult<McpServerSession> {
     let running = match &entry.transport {
         McpTransportConfig::Stdio { command, args } => {
-            connect_stdio(&entry.name, command, args, vault).await?
+            connect_stdio(&entry.name, command, args, vault, extra_env).await?
         }
         McpTransportConfig::Http { url } => connect_http(&entry.name, url, vault).await?,
     };
@@ -64,6 +79,7 @@ async fn connect_stdio(
     command: &str,
     args: &[String],
     vault: &Arc<SecretVault>,
+    extra_env: &HashMap<String, String>,
 ) -> McpResult<RunningService<RoleClient, ()>> {
     let env = load_string_map(vault, &vault_keys::env_bag(server_name)).await?;
 
@@ -83,6 +99,10 @@ async fn connect_stdio(
         if k.starts_with("LC_") {
             tokio_cmd.env(k, v);
         }
+    }
+    // Embedded boot-config env first; vault overrides if both present.
+    for (k, v) in extra_env {
+        tokio_cmd.env(k, v);
     }
     for (k, v) in env {
         tokio_cmd.env(k, v);

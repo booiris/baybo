@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use aura_channels::register_wire::{MAX_FRAME_BYTES, PromptKind, RegisterIn, RegisterOut};
 use aura_channels::registration::{Prompter, RegistrationResult};
-use aura_gateway::{SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
+use std::path::PathBuf;
+
+use aura_gateway::{BUN_BINARY_ENV, SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
 use aura_model::ChannelType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
@@ -28,7 +30,6 @@ pub async fn run_registration(
     prompter: &mut dyn Prompter,
     timeout: Duration,
 ) -> Result<RegistrationResult> {
-    let bun = runtime.bun_path();
     let bundle = runtime.bundle_for(channel_type.as_str()).ok_or_else(|| {
         CliError::Config(format!(
             "no embedded sidecar bundle for '{}' in this build",
@@ -36,10 +37,16 @@ pub async fn run_registration(
         ))
     })?;
 
-    let mut cmd = Command::new(bun);
+    let mut cmd = Command::new(bun_binary());
     cmd.arg(bundle);
     scrubbed_env(&mut cmd);
     drive(cmd, prompter, timeout).await
+}
+
+fn bun_binary() -> PathBuf {
+    std::env::var_os(BUN_BINARY_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("bun"))
 }
 
 async fn drive(

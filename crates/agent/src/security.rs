@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aura_security::{
@@ -30,6 +31,7 @@ pub struct SecurityGateway {
     secret_vault: Arc<SecretVault>,
     minter: PlaceholderMinter,
     injection_detector: InjectionDetector,
+    spill_dir: Option<PathBuf>,
 }
 
 impl SecurityGateway {
@@ -40,7 +42,18 @@ impl SecurityGateway {
             secret_vault,
             minter,
             injection_detector: InjectionDetector::with_default_rules(),
+            spill_dir: None,
         }
+    }
+
+    /// Wire in a directory where `cap_tool_output` should spill the full
+    /// pre-truncation payload as a content-addressed `.txt` file. The
+    /// truncation notice then carries the absolute path so the LLM can
+    /// fetch the rest with the `Read` tool. Without it, oversize output
+    /// is still truncated — just without a recoverable handle.
+    pub fn with_spill_dir(mut self, dir: PathBuf) -> Self {
+        self.spill_dir = Some(dir);
+        self
     }
 
     /// Return a handle to the underlying leak detector.
@@ -227,6 +240,11 @@ impl SecurityGateway {
                 self.log_injection_warnings_in_value("tool_output", v);
                 sanitize_value(v, &self.leak_detector, &self.minter, &mut mints);
             }
+            aura_tools::ToolOutput::WithAttachments { text, .. }
+            | aura_tools::ToolOutput::MultiModalText { text, .. } => {
+                self.log_injection_warnings("tool_output", text);
+                sanitize_string(text, &self.leak_detector, &self.minter, &mut mints);
+            }
         }
         for mint in &mints {
             self.secret_vault
@@ -262,9 +280,21 @@ impl SecurityGateway {
     }
 
     /// Truncate `content` to at most `MAX_TOOL_OUTPUT_BYTES` at a char
-    /// boundary and append a notice if truncation happened.
-    pub fn cap_tool_output(&self, content: String) -> String {
-        cap_tool_output(content, MAX_TOOL_OUTPUT_BYTES)
+    /// boundary and append a notice if truncation happened. When a spill
+    /// directory is wired in (`with_spill_dir`), the full pre-truncation
+    /// payload is also written there as a content-addressed `.txt` file
+    /// and the absolute path goes into the notice so the LLM can pull
+    /// the rest with the `Read` tool. Best-effort: a write failure
+    /// degrades silently to the plain truncation notice.
+    pub async fn cap_tool_output(&self, content: String) -> String {
+        if content.len() <= MAX_TOOL_OUTPUT_BYTES {
+            return content;
+        }
+        let spill_path = match self.spill_dir.as_ref() {
+            Some(dir) => spill_to_file(dir, content.as_bytes()).await,
+            None => None,
+        };
+        cap_tool_output(content, MAX_TOOL_OUTPUT_BYTES, spill_path.as_deref())
     }
 
     fn log_injection_warnings(&self, source: &'static str, text: &str) {
@@ -635,8 +665,10 @@ fn escape_close_tool_output(s: &str) -> String {
 }
 
 /// Cap `content` at `limit` bytes, cutting on a UTF-8 char boundary, and
-/// append a short notice if truncation occurred.
-fn cap_tool_output(content: String, limit: usize) -> String {
+/// append a short notice if truncation occurred. When `spill_path` is
+/// set, the notice also tells the LLM where to find the full payload
+/// (read it back with the `Read` tool).
+fn cap_tool_output(content: String, limit: usize, spill_path: Option<&Path>) -> String {
     if content.len() <= limit {
         return content;
     }
@@ -644,15 +676,64 @@ fn cap_tool_output(content: String, limit: usize) -> String {
     while cut > 0 && !content.is_char_boundary(cut) {
         cut -= 1;
     }
-    let notice = format!(
-        "\n\n[... truncated: {}/{} bytes shown; re-run the tool with a narrower scope for the rest.]",
-        cut,
-        content.len()
-    );
+    let limit_kib = limit / 1024;
+    let notice = match spill_path {
+        Some(path) => format!(
+            "\n\n[... truncated: {shown}/{total} bytes shown (per-tool-result cap is {kib} KiB / {limit} bytes). Full output written to {path} — call the `Read` tool with that absolute path (use `offset`/`limit` for ranges) to fetch the rest, or re-run the original tool with a narrower scope.]",
+            shown = cut,
+            total = content.len(),
+            kib = limit_kib,
+            limit = limit,
+            path = path.display(),
+        ),
+        None => format!(
+            "\n\n[... truncated: {shown}/{total} bytes shown (per-tool-result cap is {kib} KiB / {limit} bytes). Re-run the tool with a narrower scope for the rest.]",
+            shown = cut,
+            total = content.len(),
+            kib = limit_kib,
+            limit = limit,
+        ),
+    };
     let mut out = String::with_capacity(cut + notice.len());
     out.push_str(&content[..cut]);
     out.push_str(&notice);
     out
+}
+
+/// Write `bytes` to `<dir>/<sha256-hex>.txt`, creating `dir` if missing.
+/// Content-addressed so identical spills dedupe automatically. Returns
+/// the absolute path on success; errors are logged and turn into `None`
+/// so the caller falls back to the plain truncation notice.
+async fn spill_to_file(dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hex = hex::encode(hasher.finalize());
+    let path = dir.join(format!("{hex}.txt"));
+
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        tracing::warn!(
+            error = %e,
+            dir = %dir.display(),
+            "failed to create tool-spill directory; truncation notice will omit the path"
+        );
+        return None;
+    }
+    // Idempotent write: if the same content has already been spilled
+    // (same sha256), we can skip the write and reuse the existing file.
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.is_file() => return Some(path),
+        _ => {}
+    }
+    if let Err(e) = tokio::fs::write(&path, bytes).await {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "failed to write tool-spill file; truncation notice will omit the path"
+        );
+        return None;
+    }
+    Some(path)
 }
 
 /// Return a short fingerprint of a placeholder string, safe to log — 6 hex
@@ -704,6 +785,7 @@ mod tests {
     use aura_storage::test_support::MemorySecretStore;
     use chrono::Utc;
     use regex::Regex;
+    use tempfile::TempDir;
 
     fn make_vault_with_store(store: Arc<MemorySecretStore>) -> SecretVault {
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
@@ -715,6 +797,15 @@ mod tests {
         let store = Arc::new(MemorySecretStore::new());
         let vault = Arc::new(make_vault_with_store(store.clone()));
         (SecurityGateway::new(detector, vault), store)
+    }
+
+    fn make_gateway_with_spill_dir() -> (SecurityGateway, TempDir) {
+        let detector = Arc::new(LeakDetector::with_default_rules());
+        let secret_store = Arc::new(MemorySecretStore::new());
+        let vault = Arc::new(make_vault_with_store(secret_store));
+        let dir = tempfile::tempdir().expect("tempdir for spill");
+        let gw = SecurityGateway::new(detector, vault).with_spill_dir(dir.path().to_path_buf());
+        (gw, dir)
     }
 
     fn make_message(text: &str) -> Message {
@@ -735,8 +826,9 @@ mod tests {
     }
 
     fn make_session() -> Session {
+        let id = aura_model::SessionId::from("sess-1");
         Session {
-            id: "sess-1".into(),
+            id: id.clone(),
             user: aura_model::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
@@ -747,6 +839,10 @@ mod tests {
             created_at: Utc::now(),
             last_active: Utc::now(),
             state: Default::default(),
+            root_session_id: id,
+            trigger: aura_model::TriggerSource::User,
+            lineage: None,
+            bound_soul_version: "soul-test".into(),
         }
     }
 
@@ -1031,27 +1127,92 @@ mod tests {
         assert!(out.contains("name=\"weird&quot;tool\""));
     }
 
-    #[test]
-    fn cap_tool_output_preserves_short_content() {
+    #[tokio::test]
+    async fn cap_tool_output_preserves_short_content() {
         let (gw, _) = make_gateway();
         let s = "hello".to_string();
-        assert_eq!(gw.cap_tool_output(s.clone()), s);
+        assert_eq!(gw.cap_tool_output(s.clone()).await, s);
     }
 
-    #[test]
-    fn cap_tool_output_truncates_long_content() {
+    #[tokio::test]
+    async fn cap_tool_output_truncates_long_content() {
         let (gw, _) = make_gateway();
         let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1024);
-        let out = gw.cap_tool_output(big.clone());
+        let out = gw.cap_tool_output(big.clone()).await;
         assert!(out.len() < big.len());
         assert!(out.contains("[... truncated"));
+    }
+
+    #[tokio::test]
+    async fn cap_tool_output_spills_to_file_when_dir_wired() {
+        let (gw, dir) = make_gateway_with_spill_dir();
+        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1024);
+        let out = gw.cap_tool_output(big.clone()).await;
+
+        assert!(out.len() < big.len());
+        assert!(out.contains("[... truncated"));
+        assert!(
+            out.contains("Full output written to "),
+            "notice should reference the spill path: {out}"
+        );
+        assert!(out.contains("`Read` tool"));
+        assert!(
+            out.contains(&format!("{} bytes", MAX_TOOL_OUTPUT_BYTES)),
+            "notice should expose the cap: {out}"
+        );
+
+        let mut entries = tokio::fs::read_dir(dir.path())
+            .await
+            .expect("read spill dir");
+        let mut count = 0;
+        while let Some(e) = entries.next_entry().await.expect("entry") {
+            count += 1;
+            let path = e.path();
+            assert!(out.contains(path.to_string_lossy().as_ref()));
+            let bytes = tokio::fs::read(&path).await.expect("read spill file");
+            assert_eq!(bytes.len(), big.len(), "spill must hold the full payload");
+        }
+        assert_eq!(count, 1, "exactly one spill file should land");
+    }
+
+    #[tokio::test]
+    async fn cap_tool_output_dedups_identical_spills() {
+        let (gw, dir) = make_gateway_with_spill_dir();
+        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1024);
+
+        let _ = gw.cap_tool_output(big.clone()).await;
+        let _ = gw.cap_tool_output(big.clone()).await;
+
+        let mut entries = tokio::fs::read_dir(dir.path())
+            .await
+            .expect("read spill dir");
+        let mut count = 0;
+        while entries.next_entry().await.expect("entry").is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 1, "identical content should produce one spill file");
+    }
+
+    #[tokio::test]
+    async fn cap_tool_output_skips_spill_when_under_limit() {
+        let (gw, dir) = make_gateway_with_spill_dir();
+        let small = "tiny output".to_string();
+        let out = gw.cap_tool_output(small.clone()).await;
+        assert_eq!(out, small);
+        let mut entries = tokio::fs::read_dir(dir.path())
+            .await
+            .expect("read spill dir");
+        assert!(
+            entries.next_entry().await.expect("entry").is_none(),
+            "no spill should land when content is under the cap"
+        );
     }
 
     #[test]
     fn cap_tool_output_respects_char_boundary() {
         // Fill with 4-byte chars so most byte indices are non-boundaries.
         let big = "🐙".repeat(MAX_TOOL_OUTPUT_BYTES); // 4 bytes each
-        let out = cap_tool_output(big.clone(), MAX_TOOL_OUTPUT_BYTES);
+        let out = cap_tool_output(big.clone(), MAX_TOOL_OUTPUT_BYTES, None);
         // The truncated prefix must itself be valid UTF-8.
         assert!(out.len() >= MAX_TOOL_OUTPUT_BYTES - 4);
         assert!(out.contains("[... truncated"));

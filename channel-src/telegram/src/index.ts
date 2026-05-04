@@ -14,6 +14,10 @@ void runSidecar({
       logger,
       platform: new TelegramPlatform(logger),
       approvals: new TelegramApprovals(logger),
+      // Slash commands flow in via Frame::SlashManifest from the
+      // gateway (single source of truth in
+      // `crates/gateway/src/channel/slash.rs::manifest`). No local
+      // list is maintained.
     }),
   register: async (ctx) => {
     const token = await ctx.password("bot token: ", { required: true });

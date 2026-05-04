@@ -1,10 +1,11 @@
-//! End-to-end registration test that drives the actual Telegram bun
-//! bundle (built and embedded by `crates/gateway/build.rs`) through the
-//! production registration driver.
+//! End-to-end registration test that drives the actual Telegram
+//! sidecar bundle (built and embedded by `crates/gateway/build.rs`)
+//! through the production registration driver. Sidecars run on the
+//! host's `node` binary at runtime.
 //!
-//! Skipped when this build doesn't ship an embedded sidecar runtime —
+//! Skipped when this build doesn't ship an embedded sidecar bundle —
 //! that path is the only safe escape hatch in degraded CI environments
-//! where bun couldn't be downloaded or `pnpm install` didn't run.
+//! where esbuild couldn't run or `pnpm install` wasn't done.
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -17,10 +18,9 @@ use aura_model::ChannelType;
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Materialize bun + the telegram bundle exactly once per `cargo test`
+/// Materialize the telegram bundle exactly once per `cargo test`
 /// run. The three tests below race on `SidecarRuntime::install()`
-/// otherwise, leaving one process trying to `execve` the bun binary
-/// while another's `chmod +x` is mid-flight.
+/// otherwise, decompressing into the same cache dir concurrently.
 static SHARED_RUNTIME: OnceLock<Option<SidecarRuntime>> = OnceLock::new();
 
 struct ScriptedPrompter {
@@ -63,7 +63,7 @@ fn telegram_runtime() -> Option<&'static SidecarRuntime> {
                 Some(runtime)
             }
             Err(SidecarError::RuntimeMissing) => {
-                eprintln!("skipping: degraded build with no embedded bun runtime");
+                eprintln!("skipping: degraded build with no embedded sidecars");
                 None
             }
             Err(e) => panic!("install sidecar runtime: {e}"),
