@@ -618,47 +618,23 @@ impl AgentLoop {
                 session.state.approved_resources.clone(),
             ));
 
+            // `spawn_subagent` requests are deferred until *after* the
+            // enclosing LlmIteration step closes. Per `trace.md`, steps
+            // cannot nest — the subagent's own `StepKind::Subagent` step
+            // must run as a peer of this iteration's, not inside it.
+            // The deferred dispatch order matches the LLM's tool_use
+            // order, so the next iteration sees results in the same
+            // sequence the model produced.
+            let mut deferred_subagents: Vec<(String, serde_json::Value)> = Vec::new();
+
             for tool_call in &response.tool_calls {
                 debug!(
                     tool = %tool_call.name,
                     "executing tool call"
                 );
 
-                // Subagent special-case (Q10 + Q5).
-                //
-                // `spawn_subagent` short-circuits the regular tool
-                // path: the parent's current step is closed, a
-                // dedicated `StepKind::Subagent` step is opened, the
-                // subagent runtime drives the child to completion,
-                // and the result is folded back as the tool_result
-                // for the parent's next iteration. The current LLM
-                // iteration then ends and the loop continues.
                 if tool_call.name == SPAWN_SUBAGENT_TOOL_NAME {
-                    let raw = match self
-                        .dispatch_subagent(
-                            session,
-                            job_id,
-                            span_recorder,
-                            &step,
-                            tool_call.arguments.clone(),
-                            cancel_token.clone(),
-                        )
-                        .await
-                    {
-                        Ok(text) => text,
-                        Err(e) => format!("[spawn_subagent error: {e}]"),
-                    };
-                    let wrapped = self
-                        .security_gateway
-                        .wrap_tool_output_for_llm(&tool_call.name, &raw);
-                    let tool_msg = ChatMessage {
-                        role: Role::Tool,
-                        content: vec![ContentBlock::ToolResult {
-                            tool_use_id: tool_call.id.clone(),
-                            content: wrapped,
-                        }],
-                    };
-                    self.append_context_message(session, &tool_msg).await?;
+                    deferred_subagents.push((tool_call.id.clone(), tool_call.arguments.clone()));
                     continue;
                 }
 
@@ -776,6 +752,37 @@ impl AgentLoop {
                 .end_step(step, LifecycleOutcome::Ok)
                 .await
                 .ok();
+
+            // Now that the iteration step is closed, dispatch any
+            // deferred subagent calls as peer steps. Each invocation
+            // appends a tool_result message into context so the next
+            // iteration's LLM call sees the outcome.
+            for (tool_use_id, arguments) in deferred_subagents {
+                let raw = match self
+                    .dispatch_subagent(
+                        session,
+                        job_id,
+                        span_recorder,
+                        arguments,
+                        cancel_token.clone(),
+                    )
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(e) => format!("[spawn_subagent error: {e}]"),
+                };
+                let wrapped = self
+                    .security_gateway
+                    .wrap_tool_output_for_llm(SPAWN_SUBAGENT_TOOL_NAME, &raw);
+                let tool_msg = ChatMessage {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: wrapped,
+                    }],
+                };
+                self.append_context_message(session, &tool_msg).await?;
+            }
         }
 
         // If we exhausted iterations, return what we have. Tail-append any
@@ -1156,7 +1163,6 @@ impl AgentLoop {
         session: &Session,
         job_id: JobId,
         span_recorder: &Arc<SpanRecorder>,
-        _enclosing_llm_step: &StepHandle,
         arguments: serde_json::Value,
         parent_cancel: CancellationToken,
     ) -> anyhow::Result<String> {
