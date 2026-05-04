@@ -292,9 +292,25 @@ impl ToolExecutor {
         // execution. The pre-reveal `params` is what the trace + approval
         // surfaces saw; the tool itself receives plaintext for its API call.
         let mut params_revealed = params.clone();
-        self.security_gateway
+        if let Err(e) = self
+            .security_gateway
             .reveal_in_value(&mut params_revealed)
-            .await?;
+            .await
+        {
+            // The tool span is already open; close it as Failed before
+            // bubbling the error so it can't sit half-open until the
+            // recovery scan rewrites it as Cancelled { SystemCrash }.
+            let _ = recorder
+                .cancel_span(
+                    span_handle,
+                    step.job_id,
+                    LifecycleOutcome::Failed {
+                        reason: format!("reveal_in_value: {e}"),
+                    },
+                )
+                .await;
+            return Err(e.into());
+        }
 
         // Execute with timeout enforcement.
         let outer_deadline = ctx.timeout + APPROVAL_HEADROOM;
@@ -308,9 +324,22 @@ impl ToolExecutor {
             Ok(Ok(mut output)) => {
                 // Defensive sanitize before result flows into trace /
                 // memory / next LLM call.
-                self.security_gateway
+                if let Err(e) = self
+                    .security_gateway
                     .sanitize_tool_output(&mut output)
-                    .await?;
+                    .await
+                {
+                    let _ = recorder
+                        .cancel_span(
+                            span_handle,
+                            step.job_id,
+                            LifecycleOutcome::Failed {
+                                reason: format!("sanitize_tool_output: {e}"),
+                            },
+                        )
+                        .await;
+                    return Err(e.into());
+                }
                 let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
                 let success = !matches!(output, ToolOutput::Error(_));
                 let outcome = if success {

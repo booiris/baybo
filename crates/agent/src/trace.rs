@@ -333,6 +333,37 @@ impl SpanRecorder {
 
     // ── SpanEvent ────────────────────────────────────────────────
 
+    /// Close a half-open span without supplying a fresh `SpanResult`.
+    /// Builds a default-shaped result matching the begin-time kind on
+    /// the handle and routes through `end_span`. Used by `?`-error
+    /// paths that need to release a half-open span quickly without
+    /// constructing a meaningful result.
+    pub async fn cancel_span(
+        &self,
+        handle: SpanHandle,
+        job_id: JobId,
+        outcome: LifecycleOutcome,
+    ) -> Result<()> {
+        let result = match &handle.kind {
+            SpanKind::LlmCall { .. } => SpanResult::LlmCall {
+                output_content: String::new(),
+                thinking: None,
+                tool_calls: vec![],
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+            SpanKind::ToolCall { .. } => SpanResult::ToolCall {
+                output: serde_json::Value::Null,
+                success: false,
+            },
+            SpanKind::SubagentStub { child_session_id } => SpanResult::SubagentStub {
+                child_session_id: child_session_id.clone(),
+            },
+            SpanKind::StepHost => SpanResult::StepHost,
+        };
+        self.end_span(handle, job_id, result, outcome).await
+    }
+
     /// Emit a SpanEvent (sanitize hit / approval / hook degradation).
     /// `seq` is caller-supplied because the recorder does not own
     /// per-span sequence counters — each call site that emits
@@ -482,6 +513,37 @@ mod tests {
         assert!(matches!(started, TraceEvent::StepStarted { .. }));
         let ended = rx.recv().await.unwrap();
         assert!(matches!(ended, TraceEvent::StepEnded { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancel_span_releases_half_open_without_caller_span_result() {
+        // Regression: tool_executor and compress_if_needed used to leak
+        // half-open spans on early `?` return paths. cancel_span lets
+        // those paths release the span without constructing a fresh
+        // SpanResult — the begin-time kind on the handle drives a
+        // default-shaped result automatically.
+        let rec = make_recorder();
+        let mut rx = rec.stream().subscribe();
+        let job = JobId::new();
+        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
+        rec.cancel_span(
+            span,
+            job,
+            LifecycleOutcome::Failed {
+                reason: "sanitize failed".into(),
+            },
+        )
+        .await
+        .unwrap();
+        // The cancel publishes the same SpanEnded + LlmSpanEnded
+        // events the normal end_span path would.
+        let mut tags = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            tags.push(format!("{ev:?}"));
+        }
+        assert!(tags.iter().any(|t| t.contains("LlmSpanEnded")));
+        assert!(tags.iter().any(|t| t.contains("SpanEnded")));
     }
 
     #[tokio::test]

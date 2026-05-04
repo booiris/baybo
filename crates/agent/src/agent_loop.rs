@@ -1529,7 +1529,7 @@ impl AgentLoop {
             let step = span_recorder
                 .begin_step(job_id, StepKind::Compression)
                 .await?;
-            let span = span_recorder
+            let span = match span_recorder
                 .begin_span(
                     &step,
                     SpanKind::LlmCall {
@@ -1546,7 +1546,25 @@ impl AgentLoop {
                     },
                     None,
                 )
-                .await?;
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    // begin_span failed — release the half-open
+                    // Compression step so it doesn't leak past the
+                    // recovery horizon.
+                    span_recorder
+                        .end_step(
+                            step,
+                            LifecycleOutcome::Failed {
+                                reason: format!("begin_span failed: {e}"),
+                            },
+                        )
+                        .await
+                        .ok();
+                    return Err(e.into());
+                }
+            };
             span_recorder
                 .end_span(
                     span,
