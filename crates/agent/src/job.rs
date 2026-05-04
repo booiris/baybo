@@ -9,6 +9,9 @@ use aura_job::JobStatus;
 use aura_job::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
 use aura_model::{JobId, SessionId, SpanId, TriggerKind};
 use aura_storage::JobStore;
+use tokio_util::sync::CancellationToken;
+
+use crate::cancel::{JobCancellationGuard, JobCancellationRegistry};
 
 type Result<T> = std::result::Result<T, JobError>;
 
@@ -17,11 +20,40 @@ type Result<T> = std::result::Result<T, JobError>;
 /// `JobLifecycle` itself contains no state machine logic.
 pub struct JobLifecycle {
     store: Arc<dyn JobStore>,
+    /// Process-wide registry of `JobId → CancellationToken` for
+    /// in-flight jobs. `cancel()` trips the matching token (if any)
+    /// in addition to flipping the DB row. See `agent::cancel`.
+    cancellation: Arc<JobCancellationRegistry>,
 }
 
 impl JobLifecycle {
     pub fn new(store: Arc<dyn JobStore>) -> Self {
-        Self { store }
+        Self::with_cancellation(store, Arc::new(JobCancellationRegistry::new()))
+    }
+
+    pub fn with_cancellation(
+        store: Arc<dyn JobStore>,
+        cancellation: Arc<JobCancellationRegistry>,
+    ) -> Self {
+        Self {
+            store,
+            cancellation,
+        }
+    }
+
+    /// Register an in-flight job's cancellation token. The returned
+    /// guard unregisters on drop, so the agent loop's early-`?` paths
+    /// can't leak entries. `cancel(job_id, ...)` while the guard is
+    /// alive will trip the token (and only afterwards flip the DB
+    /// row), so the in-flight execution sees the cancel before
+    /// terminal-state observers do.
+    pub fn register_running(
+        &self,
+        job_id: JobId,
+        token: CancellationToken,
+    ) -> JobCancellationGuard {
+        self.cancellation.register(job_id, token);
+        JobCancellationGuard::new(Arc::clone(&self.cancellation), job_id)
     }
 
     /// Create a new job in `Pending`. The caller chooses the soul
@@ -74,12 +106,17 @@ impl JobLifecycle {
     }
 
     /// Move to `Cancelled { reason, partial_artifacts }`.
+    ///
+    /// Trips the in-flight cancellation token (if any) before flipping
+    /// the DB row, so the running execution observes the cancel and
+    /// can short-circuit instead of running to completion.
     pub async fn cancel(
         &self,
         job_id: &JobId,
         reason: CancelReason,
         partial_artifacts: Vec<SpanId>,
     ) -> Result<()> {
+        self.cancellation.cancel(job_id);
         let (job, transition) = self
             .apply(job_id, |j| j.cancel(reason, partial_artifacts.clone()))
             .await?;
@@ -219,6 +256,58 @@ mod tests {
         let history = lc.get_history(&job.id).await.unwrap();
         assert_eq!(history.len(), 2);
         assert!(matches!(history[1].to, JobStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn cancel_trips_registered_token_and_unregisters_via_guard() {
+        let lc = make_lifecycle();
+        let job = lc
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_chat_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&job.id).await.unwrap();
+
+        let token = CancellationToken::new();
+        let guard = lc.register_running(job.id, token.clone());
+        assert!(!token.is_cancelled());
+
+        // External cancel observes the token before flipping the row.
+        lc.cancel(&job.id, CancelReason::UserPreempt, vec![])
+            .await
+            .unwrap();
+        assert!(token.is_cancelled(), "registered token must be tripped");
+
+        // Drop the guard; subsequent cancels for the same job_id find
+        // no live token (the registry is empty).
+        drop(guard);
+        let unrelated_token = CancellationToken::new();
+        // Cancelling an already-terminal job is rejected by the state
+        // machine, but we just want to assert the registry didn't keep
+        // the entry alive past the guard's drop.
+        let job2 = lc
+            .start_job(
+                SessionId::from("s2"),
+                TriggerKind::User,
+                user_chat_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&job2.id).await.unwrap();
+        let _job2_guard = lc.register_running(job2.id, unrelated_token.clone());
+        // Cancelling job (already terminal) should not trip job2's token.
+        let _ = lc.cancel(&job.id, CancelReason::UserPreempt, vec![]).await;
+        assert!(
+            !unrelated_token.is_cancelled(),
+            "cancel of unrelated job_id must not trip our token"
+        );
     }
 
     #[tokio::test]

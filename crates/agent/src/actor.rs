@@ -8,6 +8,7 @@ use aura_model::{ApprovedResource, ContentBlock, JobId, MessageMetadata, Session
 use aura_tools::ToolOutput;
 use aura_trace::{LifecycleOutcome, StepHandle, StepKind};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_loop::AgentLoop;
@@ -38,6 +39,10 @@ pub struct AgentActor {
     hooks: Arc<HookManager>,
     job_lifecycle: Arc<JobLifecycle>,
     span_recorder: Arc<SpanRecorder>,
+    /// Lifetime token for this actor. Each per-job execution derives a
+    /// child token from this; `Shutdown` on the mailbox trips it,
+    /// cascading cancel down through every in-flight tool / subagent.
+    actor_token: CancellationToken,
 }
 
 impl AgentActor {
@@ -58,6 +63,7 @@ impl AgentActor {
             hooks,
             job_lifecycle,
             span_recorder,
+            actor_token: CancellationToken::new(),
         }
     }
 
@@ -115,6 +121,10 @@ impl AgentActor {
                 }
                 AgentMessage::Shutdown => {
                     debug!(session_id = %self.session.id, "actor shutting down");
+                    // Trip the actor's lifetime token so any in-flight
+                    // tool / subagent observes the cancel even if the
+                    // mailbox-drain happens while a job is running.
+                    self.actor_token.cancel();
                     break;
                 }
             }
@@ -152,6 +162,7 @@ impl AgentActor {
                 &self.span_recorder,
                 parent_job_id,
                 None,
+                self.actor_token.child_token(),
             )
             .await;
 
@@ -239,6 +250,7 @@ impl AgentActor {
                 None, // no triggering LLM span — direct cron invocation
                 None, // no parallel group
                 Some(job.id),
+                self.actor_token.child_token(),
             )
             .await;
 
@@ -384,6 +396,7 @@ impl AgentActor {
                 &self.span_recorder,
                 None,
                 Some(self.response_tx.clone()),
+                self.actor_token.child_token(),
             )
             .await;
         let outcome = match &result {

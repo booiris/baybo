@@ -294,6 +294,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         parent_job_id: Option<JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         // `job_input` records why this job exists (provenance: which
         // trigger kicked it off — User / Cron / System / Spawned).
@@ -311,6 +312,11 @@ impl AgentLoop {
             )
             .await?;
         let job_id = job.id;
+        // Register the in-flight token before transitioning to
+        // InProgress so `JobLifecycle::cancel` can find us. The
+        // guard's Drop runs after `run_inner` returns / panics /
+        // unwinds, so the registry stays consistent on every path.
+        let _cancel_guard = job_lifecycle.register_running(job_id, cancel_token.clone());
         job_lifecycle.start(&job_id).await?;
 
         match self
@@ -321,6 +327,7 @@ impl AgentLoop {
                 span_recorder,
                 job_id,
                 delta_tx,
+                cancel_token.clone(),
             )
             .await
         {
@@ -347,6 +354,7 @@ impl AgentLoop {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &mut self,
         session: &mut Session,
@@ -355,6 +363,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
         self.ensure_system_prompt(session).await;
@@ -632,6 +641,7 @@ impl AgentLoop {
                             span_recorder,
                             &step,
                             tool_call.arguments.clone(),
+                            cancel_token.clone(),
                         )
                         .await
                     {
@@ -665,6 +675,7 @@ impl AgentLoop {
                         None,
                         None,
                         Some(job_id),
+                        cancel_token.child_token(),
                     )
                     .await;
 
@@ -1147,6 +1158,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         _enclosing_llm_step: &StepHandle,
         arguments: serde_json::Value,
+        parent_cancel: CancellationToken,
     ) -> anyhow::Result<String> {
         let runtime = match self.subagent_runtime.as_ref() {
             Some(rt) => Arc::clone(rt),
@@ -1199,8 +1211,11 @@ impl AgentLoop {
             )
             .await?;
 
-        let parent_token = CancellationToken::new();
-        let result = runtime.spawn(session, job_id, request, parent_token).await;
+        // Real parent token from the agent loop's cancel tree, not a
+        // throwaway. The runtime derives a child_token() from this for
+        // its own bookkeeping; tripping our parent (via JobLifecycle::cancel)
+        // cascades into every nested subagent.
+        let result = runtime.spawn(session, job_id, request, parent_cancel).await;
 
         // Close stub span + subagent step.
         let outcome = match &result.status {

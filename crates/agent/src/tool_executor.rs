@@ -128,6 +128,7 @@ impl ToolExecutor {
         triggering_llm_span: Option<SpanId>,
         parallel_group: Option<ParallelGroup>,
         _parent_job_for_log: Option<JobId>,
+        cancel_token: CancellationToken,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
@@ -273,12 +274,14 @@ impl ToolExecutor {
         let approval_gate = self.gate_map.get(&user.channel, session_id.as_str());
         let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
 
-        // Build tool context
+        // Build tool context. The token comes from the agent loop's
+        // per-job cancel tree — tripping it (via JobLifecycle::cancel
+        // or a parent subagent's cascade) signals the running tool.
         let ctx = ToolContext {
             session_id: session_id.to_string(),
             user: user.clone(),
             timeout: self.default_timeout,
-            cancellation_token: CancellationToken::new(),
+            cancellation_token: cancel_token,
             workspace_root: self.workspace_root.clone(),
             sandbox,
             approval: Some(approval),
