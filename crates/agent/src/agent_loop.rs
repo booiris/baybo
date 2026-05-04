@@ -503,8 +503,8 @@ impl AgentLoop {
             let llm_result = self
                 .call_llm_with_retry(session, span_recorder, &step, iter_delta_tx)
                 .await;
-            let response = match llm_result {
-                Ok(r) => r,
+            let (response, llm_span_id) = match llm_result {
+                Ok(pair) => pair,
                 Err(e) => {
                     let failed = LifecycleOutcome::Failed {
                         reason: e.to_string(),
@@ -648,7 +648,8 @@ impl AgentLoop {
                         &approved,
                         span_recorder,
                         &step,
-                        None,
+                        Some(llm_span_id),
+                        tool_call.id.clone(),
                         None,
                         Some(job_id),
                         cancel_token.child_token(),
@@ -803,17 +804,20 @@ impl AgentLoop {
     }
 
     /// Call the LLM with retry on transient errors using `ErrorHandler`.
+    /// Returns the response paired with the `SpanId` of the
+    /// **last attempt's** `LlmCall` span — that's the span tools spawned
+    /// from this response should pair back to via `ToolCallOrigin`.
     async fn call_llm_with_retry(
         &self,
         session: &Session,
         span_recorder: &Arc<SpanRecorder>,
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-    ) -> anyhow::Result<LlmResponse> {
+    ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
             match self.call_llm(session, span_recorder, step, delta_tx).await {
-                Ok(response) => return Ok(response),
+                Ok(pair) => return Ok(pair),
                 Err(e) => {
                     if !self.error_handler.should_retry(attempt, &e) {
                         return Err(e);
@@ -843,7 +847,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-    ) -> anyhow::Result<LlmResponse> {
+    ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
         let span = span_recorder
@@ -918,6 +922,7 @@ impl AgentLoop {
                     })
                     .collect();
 
+                let span_id = span.span_id;
                 span_recorder
                     .end_span(
                         span,
@@ -933,7 +938,7 @@ impl AgentLoop {
                     )
                     .await?;
 
-                Ok(response)
+                Ok((response, span_id))
             }
             Err(e) => {
                 let raw = e.to_string();

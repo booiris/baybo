@@ -126,6 +126,7 @@ impl ToolExecutor {
         recorder: &Arc<SpanRecorder>,
         step: &StepHandle,
         triggering_llm_span: Option<SpanId>,
+        tool_use_id: String,
         parallel_group: Option<ParallelGroup>,
         _parent_job_for_log: Option<JobId>,
         cancel_token: CancellationToken,
@@ -148,7 +149,7 @@ impl ToolExecutor {
                     tool_artifact_hash: String::new(),
                     triggered_by: triggering_llm_span.map(|llm_span_id| ToolCallOrigin {
                         llm_span_id,
-                        tool_use_id: String::new(),
+                        tool_use_id: tool_use_id.clone(),
                     }),
                     params: params.clone(),
                     output: Value::Null,

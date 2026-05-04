@@ -273,8 +273,9 @@ impl AgentActor {
                 &approved,
                 &self.span_recorder,
                 &step,
-                None, // no triggering LLM span — direct cron invocation
-                None, // no parallel group
+                None,          // no triggering LLM span — direct cron invocation
+                String::new(), // no tool_use_id — cron tools don't pair back to an LLM tool_use block
+                None,          // no parallel group
                 Some(job.id),
                 self.actor_token.child_token(),
             )
