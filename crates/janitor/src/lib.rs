@@ -457,7 +457,7 @@ mod tests {
             .sweep_once_with_blob_cutoff(future_cutoff)
             .await;
         assert_eq!(report.blobs_purged, 1);
-        assert_eq!(memory.len(), 0, "row should be soft-deleted");
+        assert_eq!(memory.len(), 0, "row should be deleted");
 
         // A second run is idempotent.
         let report2 = Janitor::new(paths, Arc::clone(&store)).sweep_once().await;
@@ -571,7 +571,6 @@ mod tests {
             cost_usd: 0.0,
             timestamp: chrono::Utc::now()
                 - chrono::Duration::seconds((COST_RECORDS_TTL.as_secs() + 86_400) as i64),
-            originating_session_deleted_at: None,
         };
         let fresh = CostRecord {
             timestamp: chrono::Utc::now(),

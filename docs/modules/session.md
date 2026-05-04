@@ -38,11 +38,11 @@ Aura uses one Actor per session. All messages targeting the same session (user i
 
 ### Source deletion is rejected when live forks exist
 
-`SessionStore::soft_delete(source_id)` returns `Err(SessionError::HasLiveForks { fork_session_ids })` when any non-deleted session has a `Lineage::UserFork` pointing into the source. Callers must delete the forks first or accept the error. There is no materialize-on-delete escape hatch — the case is rare enough to surface as an error rather than silently rewrite snapshots.
+`SessionStore::delete(source_id)` returns `Err(SessionError::HasLiveForks { fork_session_ids })` when any session has a `Lineage::UserFork` pointing into the source. Callers must delete the forks first or accept the error. There is no materialize-on-delete escape hatch — the case is rare enough to surface as an error rather than silently rewrite snapshots.
 
 ### Subagent parent deletion cascades cancel
 
-When a session with an in-flight subagent is deleted, the subagent's cancellation token is tripped first (`Cancelled { ParentDeleted }`), then the session is marked deleted. This drains the entire descendant subtree before the soft-delete completes.
+When a session with an in-flight subagent is deleted, the subagent's cancellation token is tripped first (`Cancelled { ParentDeleted }`), then the parent row is removed. This drains the entire descendant subtree before the delete completes.
 
 ### Soul-version drift
 
@@ -68,7 +68,7 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 - `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`, `LineageKind` live in `aura-model`; `SessionStore` lives in `aura-storage`.
 - `SessionManager` owns lifecycle logic; `StorageError` is wrapped into `SessionError::Storage` at the manager boundary; `agent` re-exports the manager for convenience.
 - A spawned session's `trigger` must equal its root session's `trigger`. Enforced at `create_session` time.
-- `soft_delete` must reject when live forks reference the session, and must drain in-flight subagents before completing.
+- `delete` must reject when live forks reference the session, and must drain in-flight subagents before completing.
 
 ## Collaboration
 

@@ -59,14 +59,12 @@ status       TEXT    NOT NULL  -- 'pending' | 'approved'
 created_at   INTEGER NOT NULL
 expires_at   INTEGER           -- NULL once approved; Unix seconds
 approved_at  INTEGER
-deleted_at   INTEGER           -- soft-delete (revoke)
 PRIMARY KEY (channel_type, bot_id, user_id)
 UNIQUE INDEX idx_channel_pairings_code
-  ON channel_pairings(code) WHERE deleted_at IS NULL
+  ON channel_pairings(code)
 ```
 
-Soft-delete matches the rest of the libsql tables (see
-`CLAUDE.md` §"Soft Delete").
+Revocation is a plain `DELETE` — there is no tombstone column.
 
 ### Expiry
 
@@ -80,7 +78,7 @@ doesn't linger in libsql for days.
 Expiry only applies to `pending` rows. On approval, `status` flips
 to `approved` and `expires_at` is cleared (`NULL`) — approved
 pairings don't auto-expire; they stay live until `aura pair revoke`
-soft-deletes them.
+deletes them.
 
 Behavior on an expired row:
 

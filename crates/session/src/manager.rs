@@ -133,7 +133,7 @@ impl SessionManager {
             let cutoff = Utc::now() - self.session_timeout;
             if session.last_active < cutoff {
                 debug!(session_id = %session_id, "session expired, replacing with new session");
-                self.store.soft_delete(session_id).await.map_err(wrap)?;
+                self.store.delete(session_id).await.map_err(wrap)?;
                 return self
                     .create_session_with_id(session_id.clone(), user, channel)
                     .await;
@@ -166,12 +166,12 @@ impl SessionManager {
         }
     }
 
-    /// Soft-delete a session by id. Errors with `SessionError::NotFound`
+    /// Hard-delete a session by id. Errors with `SessionError::NotFound`
     /// if the session did not exist at the time of the call. Surfaces
     /// `StorageError::HasLiveForks` (wrapped) when the session has live
     /// forks pointing at it.
     pub async fn delete(&self, session_id: &SessionId) -> Result<()> {
-        let deleted = self.store.soft_delete(session_id).await.map_err(wrap)?;
+        let deleted = self.store.delete(session_id).await.map_err(wrap)?;
         if !deleted {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
@@ -201,7 +201,7 @@ impl SessionManager {
         let cutoff = Utc::now() - self.session_timeout;
         let expired_ids = self.store.list_expired(cutoff).await.map_err(wrap)?;
         let count = expired_ids.len();
-        let deletes = expired_ids.iter().map(|id| self.store.soft_delete(id));
+        let deletes = expired_ids.iter().map(|id| self.store.delete(id));
         futures::future::try_join_all(deletes).await.map_err(wrap)?;
         if count > 0 {
             debug!(count, "cleaned up expired sessions");
@@ -246,7 +246,7 @@ mod tests {
             Ok(())
         }
 
-        async fn soft_delete(&self, session_id: &SessionId) -> StoreResult<bool> {
+        async fn delete(&self, session_id: &SessionId) -> StoreResult<bool> {
             Ok(self.data.lock().remove(session_id).is_some())
         }
 

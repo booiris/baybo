@@ -228,7 +228,7 @@ async fn upload(
 }
 
 async fn download(State(state): State<WsChannelState>, Path(blob_id): Path<String>) -> Response {
-    // `stat` first so soft-deleted rows surface as 404 before we hold a
+    // `stat` first so missing rows surface as 404 before we hold a
     // file handle; the open path itself also re-verifies, but ordering
     // here lets us send Content-Length up front.
     let meta = match state.blob_store.stat(&blob_id).await {

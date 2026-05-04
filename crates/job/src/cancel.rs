@@ -30,9 +30,9 @@ pub enum CancelReason {
     /// A parent session / job was cancelled and the cancel propagated
     /// down via the cancellation-token tree.
     ParentCancelled,
-    /// The parent session was soft-deleted while a subagent was
-    /// in-flight. Cancellation propagates first, then the soft-delete
-    /// is finalised.
+    /// The parent session was deleted while a subagent was
+    /// in-flight. Cancellation propagates first, then the delete is
+    /// finalised.
     ParentDeleted,
     /// Human operator initiated the cancel via the admin API or CLI.
     /// Distinct from hook / system-driven cancels so cost-attribution

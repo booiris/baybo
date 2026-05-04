@@ -18,10 +18,7 @@ pub type CostResult<T> = std::result::Result<T, CostError>;
 ///
 /// Every record is associated with both a `job_id` and a `span_id`
 /// (the LLM span that drove the spend), so the system never knows a
-/// cost without knowing which call caused it. `originating_session_deleted_at`
-/// mirrors `sessions.deleted_at` of the originating session — populated
-/// by `SessionStore::soft_delete` so cost UIs can render
-/// "source session deleted" without joining back.
+/// cost without knowing which call caused it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {
     pub user_id: String,
@@ -33,8 +30,6 @@ pub struct CostRecord {
     pub output_tokens: usize,
     pub cost_usd: f64,
     pub timestamp: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub originating_session_deleted_at: Option<DateTime<Utc>>,
 }
 
 /// A half-open time range `[from, to)` used for cost queries.
@@ -55,9 +50,9 @@ pub struct CostSummary {
 
 /// Cached per-user-per-month total. Populated lazily by
 /// `CostSubscriber` after each `cost_records` write; read by
-/// `CostGuard` for monthly-quota checks. Carries `deleted_at` so the
-/// retention sweep can purge stale entries (raw `cost_records` is
-/// the audit-truth and never deleted).
+/// `CostGuard` for monthly-quota checks. The retention sweep purges
+/// stale rows past the horizon — raw `cost_records` is the audit
+/// truth and the durable rollup is this cache.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserMonthlyCost {
     pub user_id: String,
@@ -90,12 +85,10 @@ pub trait CostStore: Send + Sync {
     /// Return the sum of `cost_usd` for a user within the given time range.
     async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64>;
 
-    // ── Cached user-monthly aggregate (lazy materialisation, with
-    //    soft-delete + retention) ────────────────────────────────
+    // ── Cached user-monthly aggregate (lazy materialisation) ──
 
     /// Add `delta_usd` to the (`user_id`, `month`) cache row,
-    /// inserting if absent. Resets `deleted_at` so re-incrementing a
-    /// soft-deleted row revives it.
+    /// inserting if absent.
     async fn bump_user_monthly_cost(
         &self,
         user_id: &str,
@@ -104,16 +97,16 @@ pub trait CostStore: Send + Sync {
     ) -> CostResult<()>;
 
     /// Read the cached monthly total. Returns `None` when the row is
-    /// missing or soft-deleted (caller should recompute from raw
-    /// `cost_records` and re-bump).
+    /// missing (caller should recompute from raw `cost_records` and
+    /// re-bump).
     async fn get_user_monthly_cost(
         &self,
         user_id: &str,
         month: &str,
     ) -> CostResult<Option<UserMonthlyCost>>;
 
-    /// Soft-delete every cached row whose `updated_at` is strictly
-    /// before `cutoff`. Returns the number of rows touched. Periodic
+    /// Hard-delete every cached row whose `updated_at` is strictly
+    /// before `cutoff`. Returns the number of rows removed. Periodic
     /// invocation lives in `aura-janitor` (see retention policy).
     async fn purge_user_monthly_cost_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64>;
 

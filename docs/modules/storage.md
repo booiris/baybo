@@ -66,21 +66,11 @@ Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) a
 
 ### Transaction boundaries
 
-Use transactions wherever a check-and-write pair must be atomic — most importantly `SessionStore::soft_delete`, which checks for live forks before stamping the parent's `deleted_at` (a non-transactional implementation admits orphan forks under concurrent `create_fork`).
+Use transactions wherever a check-and-write pair must be atomic — most importantly `SessionStore::delete`, which scans for live forks before removing the parent row (a non-transactional implementation admits orphan forks under concurrent `create_fork`).
 
-### Soft delete (libsql)
+### Hard delete
 
-All libsql-backed tables that support deletion use **soft delete**, never a hard `DELETE`. This preserves history for audit, replay, and compliance.
-
-- Every deletable table carries a nullable `deleted_at INTEGER` column (**Unix µs**, written via `super::time::now_us()`; `NULL` = live row).
-- Deletion = `UPDATE ... SET deleted_at = ?now WHERE ... AND deleted_at IS NULL`. Do not emit `DELETE FROM` against these tables.
-- Every read (`SELECT`) MUST include `AND deleted_at IS NULL` so soft-deleted rows stay hidden. Every mutation (`UPDATE`) on a live row MUST include the same guard so you never write through a deleted row.
-- Re-insertion semantics: `INSERT OR REPLACE` and `ON CONFLICT ... DO UPDATE` must reset `deleted_at` back to `NULL` so recreating a soft-deleted id revives it (see `skill_risk.rs::upsert_job` for the pattern).
-- Schema changes: add the column to the `CREATE TABLE IF NOT EXISTS` in `crates/storage/src/libsql/mod.rs`.
-- Tables currently covered: `sessions`, `memories`, `secrets`, `jobs`, `job_transitions`, `steps`, `spans`, `span_events`, `cron_jobs`, `cron_executions`, `skill_risk_assessments`, `skill_risk_assessment_jobs`, `channel_sessions`, `channel_bots`, `channel_pairings`, `blobs`, `user_monthly_cost`. The only append-only table without `deleted_at` is `cost_records` (billing audit trail).
-- **Retention exceptions.** Two tables expose hard-delete retention sweeps that bypass the protocol — they keep `deleted_at` for the live-vs-tombstone distinction during normal operation but `aura-janitor` issues `DELETE FROM` on rows older than the retention horizon. Documented exceptions, not bugs:
-  - `cron_executions` — `purge_completed_executions_older_than(cutoff)` hard-deletes non-`pending` rows. Audit trail beyond the horizon is not preserved.
-  - `channel_pairings` — `purge_expired(now)` hard-deletes rows whose `expires_at < now`. Pairing codes are short-lived and intentionally non-recoverable past expiry.
+All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tombstone column, no soft-delete protocol, and no revival semantics — once a row is gone it is gone. Retention sweeps in `aura-janitor` (`cron_executions`, `cost_records`, `user_monthly_cost`, `channel_pairings`, `blobs`) issue the same `DELETE FROM` against rows past their retention horizon.
 
 ## Constraints
 

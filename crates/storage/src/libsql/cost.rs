@@ -25,8 +25,8 @@ impl CostStore for LibsqlCostStore {
         conn.execute(
             "INSERT INTO cost_records \
              (user_id, session_id, job_id, span_id, model, input_tokens, output_tokens, \
-              cost_usd, timestamp, originating_session_deleted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              cost_usd, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             libsql::params![
                 record.user_id.clone(),
                 record.session_id.as_str().to_string(),
@@ -37,7 +37,6 @@ impl CostStore for LibsqlCostStore {
                 record.output_tokens as i64,
                 record.cost_usd,
                 time::to_us(record.timestamp),
-                record.originating_session_deleted_at.map(time::to_us),
             ],
         )
         .await
@@ -50,7 +49,7 @@ impl CostStore for LibsqlCostStore {
         let mut rows = conn
             .query(
                 "SELECT user_id, session_id, job_id, span_id, model, input_tokens, \
-                        output_tokens, cost_usd, timestamp, originating_session_deleted_at \
+                        output_tokens, cost_usd, timestamp \
                  FROM cost_records \
                  WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
                 libsql::params![
@@ -164,16 +163,13 @@ impl CostStore for LibsqlCostStore {
         let conn = self.pool.conn();
         let now = time::now_us();
         // ON CONFLICT DO UPDATE so a re-bump increments the running
-        // total instead of clobbering it; resetting deleted_at to NULL
-        // revives a soft-deleted row (matches the storage-wide
-        // soft-delete protocol).
+        // total instead of clobbering it.
         conn.execute(
-            "INSERT INTO user_monthly_cost (user_id, month, cost_usd, updated_at, deleted_at) \
-             VALUES (?1, ?2, ?3, ?4, NULL) \
+            "INSERT INTO user_monthly_cost (user_id, month, cost_usd, updated_at) \
+             VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(user_id, month) DO UPDATE SET \
                cost_usd = cost_usd + excluded.cost_usd, \
-               updated_at = excluded.updated_at, \
-               deleted_at = NULL",
+               updated_at = excluded.updated_at",
             libsql::params![user_id.to_string(), month.to_string(), delta_usd, now],
         )
         .await
@@ -190,7 +186,7 @@ impl CostStore for LibsqlCostStore {
         let mut rows = conn
             .query(
                 "SELECT user_id, month, cost_usd, updated_at FROM user_monthly_cost \
-                 WHERE user_id = ?1 AND month = ?2 AND deleted_at IS NULL",
+                 WHERE user_id = ?1 AND month = ?2",
                 libsql::params![user_id.to_string(), month.to_string()],
             )
             .await
@@ -230,15 +226,13 @@ impl CostStore for LibsqlCostStore {
 
     async fn purge_user_monthly_cost_older_than(&self, cutoff: DateTime<Utc>) -> CostResult<u64> {
         let conn = self.pool.conn();
-        let now = time::now_us();
         let affected = conn
             .execute(
-                "UPDATE user_monthly_cost SET deleted_at = ?1 \
-                 WHERE updated_at < ?2 AND deleted_at IS NULL",
-                libsql::params![now, time::to_us(cutoff)],
+                "DELETE FROM user_monthly_cost WHERE updated_at < ?1",
+                libsql::params![time::to_us(cutoff)],
             )
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql update: {e}")))?;
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
         Ok(affected)
     }
 
@@ -295,18 +289,6 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
         .get(3)
         .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
 
-    let originating_deleted_ts: Option<i64> = row
-        .get(9)
-        .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
-    let originating_session_deleted_at = match originating_deleted_ts {
-        None => None,
-        Some(us) => Some(time::from_us(us).ok_or_else(|| {
-            CostError::Storage(format!(
-                "cost_records.originating_session_deleted_at out of range: {us}"
-            ))
-        })?),
-    };
-
     Ok(CostRecord {
         user_id: row
             .get(0)
@@ -333,7 +315,6 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
             .get(7)
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         timestamp,
-        originating_session_deleted_at,
     })
 }
 
@@ -353,7 +334,6 @@ mod tests {
             output_tokens: 50,
             cost_usd: cost,
             timestamp: Utc::now(),
-            originating_session_deleted_at: None,
         }
     }
 

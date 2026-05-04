@@ -1028,7 +1028,7 @@ mod multimodal_dispatch_tests {
 
     #[tokio::test]
     async fn fetcher_error_falls_back_to_text_stub_not_panic() {
-        // A blob the gateway can't read (soft-deleted, missing, etc.)
+        // A blob the gateway can't read (missing, deleted, etc.)
         // must not blow up the LLM call — drop to the same text stub
         // an unconfigured fetcher would emit, with a tracing warn so
         // operators can find it.
