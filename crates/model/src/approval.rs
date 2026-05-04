@@ -11,6 +11,29 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Decision returned by an approval gate.
+///
+/// Lives in `aura-model` so trace `SpanEvent`s can record approval
+/// outcomes without `aura-trace` having to depend on `aura-tools`.
+/// `aura-tools` re-exports this type so existing call sites keep
+/// working unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum ApprovalDecision {
+    /// Allow this call only.
+    Approve,
+    /// Allow this call and remember every resource it touches for the rest of
+    /// the session (persisted via `SessionState::approved_resources`).
+    ApproveAlways,
+    /// Reject the call. The executor surfaces this as `ToolError::Denied`.
+    Deny,
+}
+
 /// Concrete resource a single tool call touches, derived from its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]

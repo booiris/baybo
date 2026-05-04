@@ -78,6 +78,7 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
+ulid = { version = "1", features = ["serde"] }
 regex = "1"
 aho-corasick = "1"
 tokio-util = "0.7"
