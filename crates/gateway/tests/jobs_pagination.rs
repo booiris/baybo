@@ -148,9 +148,9 @@ async fn list_jobs_filters_by_session() {
 async fn list_jobs_invalid_status_returns_400() {
     let router = build_router_with_seeded_jobs(&[("s-x", TriggerKind::User, 1)]).await;
     let (st, _body) = list_jobs(&router, "?status=submitted").await;
-    // Pre-redesign wire used `submitted`/`accepted`; reject loudly so
-    // operators don't silently get an empty list.
-    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    // Pre-redesign wire used `submitted`/`accepted`; reject as a client
+    // error so operators don't silently get an empty list.
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

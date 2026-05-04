@@ -3,7 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aura_model::{ChatMessage, ContentBlock, Role};
 
-use super::{CompressOutput, CompressionStrategy, SummarizeCallback, SummarizeOutput};
+use super::{
+    CompressOutput, CompressionStrategy, SummarizeCallback, SummarizeOutput, pair_preserving_cut,
+};
 use crate::tokenizer::Tokenizer;
 
 /// Summarize compression: summarizes old non-system messages via an LLM
@@ -51,8 +53,14 @@ impl CompressionStrategy for Summarize {
             });
         }
 
-        // Split non-system messages into old (to summarize) and recent (to keep).
-        let split = non_system.len().saturating_sub(self.keep_recent);
+        // Split non-system messages into old (to summarize) and recent
+        // (to keep). The initial split by `keep_recent` may land between
+        // an `assistant { tool_use }` and the following
+        // `user { tool_result }`; pull the boundary left until every
+        // kept `ToolResult` has its `ToolUse` in the recent half so the
+        // LLM payload remains well-formed.
+        let initial_split = non_system.len().saturating_sub(self.keep_recent);
+        let split = pair_preserving_cut(&non_system, initial_split);
         let old = &non_system[..split];
         let recent = &non_system[split..];
 

@@ -74,6 +74,33 @@ impl JobLifecycle {
         effective_soul_version: impl Into<String>,
         parent_job_id: Option<JobId>,
     ) -> Result<Job> {
+        self.start_job_with_id(
+            None,
+            session_id,
+            session_trigger_kind,
+            input,
+            effective_soul_version,
+            parent_job_id,
+        )
+        .await
+    }
+
+    /// Create a new job, optionally using a caller-supplied `JobId`.
+    ///
+    /// The subagent dispatch path uses this so the planned root job id
+    /// recorded on the parent's `StepKind::Subagent` step matches the
+    /// id of the row eventually inserted by the child actor — keeping
+    /// the lineage edge resolvable. All other callers should use
+    /// [`start_job`](Self::start_job) and let the id be minted fresh.
+    pub async fn start_job_with_id(
+        &self,
+        planned_id: Option<JobId>,
+        session_id: SessionId,
+        session_trigger_kind: TriggerKind,
+        input: JobInput,
+        effective_soul_version: impl Into<String>,
+        parent_job_id: Option<JobId>,
+    ) -> Result<Job> {
         let job_kind = input.kind();
         if !job_kind.allowed_for(session_trigger_kind) {
             return Err(JobError::KindMismatch(format!(
@@ -81,7 +108,12 @@ impl JobLifecycle {
                  (see aura_job::kind allowed-for table)"
             )));
         }
-        let job = Job::new(session_id, input, effective_soul_version, parent_job_id);
+        let job = match planned_id {
+            Some(id) => {
+                Job::new_with_id(id, session_id, input, effective_soul_version, parent_job_id)
+            }
+            None => Job::new(session_id, input, effective_soul_version, parent_job_id),
+        };
         self.store.create(&job).await?;
         Ok(job)
     }
@@ -110,6 +142,10 @@ impl JobLifecycle {
     /// Trips the in-flight cancellation token (if any) before flipping
     /// the DB row, so the running execution observes the cancel and
     /// can short-circuit instead of running to completion.
+    ///
+    /// Idempotent on terminal jobs: a cancel that races against natural
+    /// completion returns `Ok(())` without touching the row, so admin
+    /// callers don't see a 500 for a job that finished a moment earlier.
     pub async fn cancel(
         &self,
         job_id: &JobId,
@@ -117,6 +153,10 @@ impl JobLifecycle {
         partial_artifacts: Vec<SpanId>,
     ) -> Result<()> {
         self.cancellation.cancel(job_id);
+        let job = self.load_job(job_id).await?;
+        if job.is_terminal() {
+            return Ok(());
+        }
         let (job, transition) = self
             .apply(job_id, |j| j.cancel(reason, partial_artifacts.clone()))
             .await?;
@@ -367,6 +407,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, JobError::KindMismatch(_)));
+    }
+
+    #[tokio::test]
+    async fn cancel_on_terminal_job_is_noop() {
+        let lc = make_lifecycle();
+        let job = lc
+            .start_job(
+                SessionId::from("s1"),
+                TriggerKind::User,
+                user_chat_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&job.id).await.unwrap();
+        lc.complete(&job.id, dummy_output()).await.unwrap();
+        // Race: an admin cancel arriving after natural completion must
+        // not return InvalidTransition — it's a benign "already done".
+        lc.cancel(&job.id, CancelReason::OperatorCancel, vec![])
+            .await
+            .expect("cancel of terminal job is no-op");
+        let loaded = lc.get(&job.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.status, JobStatus::Completed));
     }
 
     #[tokio::test]

@@ -401,15 +401,13 @@ impl TraceEventStore for LibsqlTraceEventStore {
 
     async fn compact_before(&self, cutoff: DateTime<Utc>) -> aura_trace::Result<u64> {
         let conn = self.pool.conn();
-        let now = super::time::now_us();
         let affected = conn
             .execute(
-                "UPDATE trace_events SET deleted_at = ?1 \
-                 WHERE at < ?2 AND deleted_at IS NULL",
-                libsql::params![now, super::time::to_us(cutoff)],
+                "DELETE FROM trace_events WHERE at < ?1",
+                libsql::params![super::time::to_us(cutoff)],
             )
             .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql update: {e}")))?;
+            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
         Ok(affected)
     }
 }

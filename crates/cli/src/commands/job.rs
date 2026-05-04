@@ -145,7 +145,7 @@ async fn cancel(ctx: &CommandContext, id: &str, yes: bool) -> Result<CommandOutp
 
     let mgr = jobs(ctx)?;
     let job_id = parse_id(id)?;
-    mgr.cancel(&job_id, CancelReason::HookAborted, vec![])
+    mgr.cancel(&job_id, CancelReason::OperatorCancel, vec![])
         .await
         .map_err(|e: aura_job::JobError| CliError::Manager(format!("cancel job: {e}")))?;
     let job = mgr

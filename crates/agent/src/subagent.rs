@@ -267,6 +267,7 @@ impl SubagentRuntime for LocalSubagentRuntime {
             .send(AgentMessage::SubagentSpawned {
                 initial_message: Box::new(incoming),
                 parent_job_id,
+                planned_root_job_id: prepared.planned_root_job_id,
             })
             .await
         {

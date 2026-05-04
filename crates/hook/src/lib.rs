@@ -166,9 +166,13 @@ impl HookContext {
     }
 }
 
-/// Default per-call timeout for in-process trait hooks. Matches the
-/// `Trait` row in the `Hook timeout` table of `docs/modules/hook.md`.
-pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default per-call timeout for in-process trait hooks. Tight enough
+/// that the per-hook degrade counter (`HookManager`) can fire before
+/// the step-boundary chain timeout in `agent_loop` masks it. Hooks
+/// that genuinely need longer (external webhooks, expensive lookups)
+/// should override `Hook::timeout`. Matches the `Trait` row in the
+/// `Hook timeout` table of `docs/modules/hook.md`.
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Number of consecutive timeouts after which `HookManager` auto-disables
 /// a hook. A hook that consistently misses its deadline is unhealthy

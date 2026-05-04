@@ -43,9 +43,14 @@ use tokio_util::sync::CancellationToken;
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
 
-/// Per-call timeout for `PreStep` / `PostStep` hooks. A hook that
-/// overruns is treated as `Continue` and a `tracing::warn` is emitted.
-const STEP_HOOK_TIMEOUT: Duration = Duration::from_millis(500);
+/// Step-boundary chain budget for the entire `PreStep` / `PostStep`
+/// hook list. A chain that overruns this is treated as `Continue` and
+/// a `HookDegraded` SpanEvent is emitted. Sized larger than
+/// `DEFAULT_HOOK_TIMEOUT` so individual hooks hit their per-call
+/// timeout first (and bump the per-hook degrade counter) — the chain
+/// timeout is only a fail-safe in case multiple hooks each consume
+/// most of their per-call budget.
+const STEP_HOOK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Cap on attachments carried into the final `OutgoingMessage`. Tools
 /// like `browser_screenshot` and `send_local_file` push into a
@@ -296,6 +301,37 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
+        self.run_with_planned_id(
+            session,
+            None,
+            job_input,
+            user_content,
+            job_lifecycle,
+            span_recorder,
+            parent_job_id,
+            delta_tx,
+            cancel_token,
+        )
+        .await
+    }
+
+    /// Variant of [`run`](Self::run) that lets the caller pre-mint the
+    /// root `JobId` for this invocation. Used by the subagent dispatch
+    /// path so the parent's `StepKind::Subagent { child_root_job_id }`
+    /// edge points at the row the child actor actually creates.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_with_planned_id(
+        &mut self,
+        session: &mut Session,
+        planned_job_id: Option<JobId>,
+        job_input: JobInput,
+        user_content: Vec<ContentBlock>,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        parent_job_id: Option<JobId>,
+        delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<OutgoingMessage> {
         // `job_input` records why this job exists (provenance: which
         // trigger kicked it off — User / Cron / System / Spawned).
         // `user_content` is what we feed the LLM as the first user
@@ -303,7 +339,8 @@ impl AgentLoop {
         // `Cron` / `System` where the input is a synthesized prompt
         // rather than the raw trigger payload.
         let job = job_lifecycle
-            .start_job(
+            .start_job_with_id(
+                planned_job_id,
                 session.id.clone(),
                 session.trigger.kind(),
                 job_input,
@@ -1257,8 +1294,8 @@ impl AgentLoop {
             SubagentExitStatus::Failed(reason) => LifecycleOutcome::Failed {
                 reason: reason.clone(),
             },
-            SubagentExitStatus::Timeout => LifecycleOutcome::Failed {
-                reason: "subagent timeout".to_string(),
+            SubagentExitStatus::Timeout => LifecycleOutcome::Cancelled {
+                reason: aura_job::CancelReason::SubagentTimeout,
             },
         };
         span_recorder

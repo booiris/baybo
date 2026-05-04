@@ -317,11 +317,13 @@ Every hook handler has a configurable timeout:
 
 | Handler Type | Default Timeout |
 |-------------|----------------|
-| Trait | 10 seconds |
+| Trait | 500 ms |
 | Command | 30 seconds |
 | HTTP | 30 seconds |
 
 Timeout triggers the failure path — non-critical hooks log a warning and continue; critical hooks abort the flow.
+
+Trait hooks default tight (500 ms) so the per-hook degrade counter (3 consecutive timeouts → auto-disable) can fire before the agent-loop step-boundary chain timeout (3 s) masks it. Hooks that genuinely need longer should override `Hook::timeout()`.
 
 ### Hook configuration sources
 

@@ -233,7 +233,13 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
         bot_id: &str,
         user_id: &str,
     ) -> Result<(), String> {
-        let now = super::time::now_us();
+        // The other timestamp columns on this row (`created_at`,
+        // `expires_at`, `approved_at`) are written by `aura-pairing` as
+        // Unix seconds; `purge_expired` also takes seconds. Keep
+        // `deleted_at` in the same unit so the row stays internally
+        // consistent and any future janitor sweep can compare across
+        // columns without unit drift.
+        let now_secs = chrono::Utc::now().timestamp();
         let conn = self.pool.conn();
         conn.execute(
             "UPDATE channel_pairings
@@ -244,7 +250,7 @@ impl ChannelPairingStore for LibsqlChannelPairingStore {
                 channel_type.as_str().to_string(),
                 bot_id.to_string(),
                 user_id.to_string(),
-                now,
+                now_secs,
             ],
         )
         .await

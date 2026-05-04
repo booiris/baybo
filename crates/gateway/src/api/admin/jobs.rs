@@ -51,7 +51,7 @@ fn parse_status(s: &str) -> Result<aura_job::JobStatusKind> {
         "cancelled" => Ok(JobStatusKind::Cancelled),
         "failed" => Ok(JobStatusKind::Failed),
         "completed" => Ok(JobStatusKind::Completed),
-        other => Err(GatewayError::Job(format!(
+        other => Err(GatewayError::BadRequest(format!(
             "invalid status filter: {other:?}"
         ))),
     }
@@ -81,7 +81,7 @@ async fn list_jobs(
     let offset: usize = match params.cursor.as_deref() {
         Some(c) => c
             .parse()
-            .map_err(|_| GatewayError::Job(format!("invalid cursor: {c:?}")))?,
+            .map_err(|_| GatewayError::BadRequest(format!("invalid cursor: {c:?}")))?,
         None => 0,
     };
 
@@ -116,6 +116,7 @@ async fn list_jobs(
     ),
     responses(
         (status = 200, description = "Job record", body = Job),
+        (status = 400, description = "Invalid job id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
     )
@@ -123,7 +124,7 @@ async fn list_jobs(
 async fn get_job(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Job>> {
     let job_id: aura_model::JobId = id
         .parse()
-        .map_err(|e| GatewayError::Job(format!("invalid job id: {e}")))?;
+        .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
     let job = state
         .job_lifecycle
         .get(&job_id)
@@ -142,19 +143,21 @@ async fn get_job(State(state): State<AdminState>, Path(id): Path<String>) -> Res
     ),
     responses(
         (status = 200, description = "Cancelled job record", body = Job),
+        (status = 400, description = "Invalid job id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
         (status = 500, description = "Cancel failed", body = ErrorBody),
     )
 )]
 async fn cancel_job(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Job>> {
     let job_id: aura_model::JobId = id
         .parse()
-        .map_err(|e| GatewayError::Job(format!("invalid job id: {e}")))?;
+        .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
     // Operator-initiated cancel; partial-artifact rollup belongs on the
     // recovery scan, not the admin endpoint.
     state
         .job_lifecycle
-        .cancel(&job_id, aura_job::CancelReason::HookAborted, vec![])
+        .cancel(&job_id, aura_job::CancelReason::OperatorCancel, vec![])
         .await
         .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?;
     let job = state

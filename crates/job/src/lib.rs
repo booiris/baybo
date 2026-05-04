@@ -182,9 +182,30 @@ impl Job {
         effective_soul_version: impl Into<String>,
         parent_job_id: Option<JobId>,
     ) -> Self {
+        Self::new_with_id(
+            JobId::new(),
+            session_id,
+            input,
+            effective_soul_version,
+            parent_job_id,
+        )
+    }
+
+    /// Construct a fresh job in `Pending` status with a caller-supplied
+    /// id. Used by the subagent dispatch path where the parent records
+    /// the child's planned root job id in its `StepKind::Subagent` step
+    /// before the child actor starts; reusing the id here keeps the
+    /// parent's lineage edge pointing at the actual child job row.
+    pub fn new_with_id(
+        id: JobId,
+        session_id: SessionId,
+        input: JobInput,
+        effective_soul_version: impl Into<String>,
+        parent_job_id: Option<JobId>,
+    ) -> Self {
         let kind = input.kind();
         Self {
-            id: JobId::new(),
+            id,
             session_id,
             parent_job_id,
             kind,

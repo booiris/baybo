@@ -58,8 +58,11 @@ pub trait TraceEventStore: Send + Sync {
     /// Replay events for one session in chronological order. Used by
     /// recovery and by `replay(session_id, until_step_id)` queries.
     async fn replay_session(&self, session_id: &SessionId) -> Result<Vec<TraceLogEvent>>;
-    /// Compact events older than `cutoff`. Soft-delete on the row;
-    /// the actual purge is governed by retention policy.
+    /// Hard-delete events older than `cutoff`. The WAL is recovery-only
+    /// — once an event is past the retention horizon there's no caller
+    /// that will ever read it again, so keeping a tombstone row would
+    /// only let the table grow unboundedly. Returns the number of rows
+    /// removed.
     async fn compact_before(&self, cutoff: DateTime<Utc>) -> Result<u64>;
 }
 
