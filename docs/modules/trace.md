@@ -71,7 +71,9 @@ pub enum SpanEventKind {
 
 ### Single-table persistence
 
-Step and Span lifecycle writes go directly to the columnar main tables (`steps`, `spans`, `span_events`). Each row carries queryable columns (`kind`, `started_at`, `ended_at`, `outcome`, `parallel_group`) plus a JSON `data` blob for full-fidelity round-trip. The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was removed once it became clear no reader consumed it: recovery scans the columnar `spans` table directly, and there is no replay / OTel-export path yet that would benefit from the append-only log. If one is added later, the WAL can come back together with its consumer.
+Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`). Each row stores the entity as a single JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `aura-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
+
+The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was removed once it became clear no reader consumed it: recovery scans `spans` directly, and there is no replay / OTel-export path yet that would benefit from the append-only log. If one lands later, the WAL can come back together with its consumer.
 
 ### Async writes with LLM/tool fences
 

@@ -205,42 +205,48 @@ impl LibsqlPool {
                 );
                 CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);
 
-                CREATE TABLE IF NOT EXISTS steps (
-                    id          TEXT PRIMARY KEY,
-                    job_id      TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    started_at  INTEGER NOT NULL,
-                    ended_at    INTEGER,
-                    outcome     TEXT NOT NULL,
-                    data        TEXT NOT NULL,
-                    deleted_at  INTEGER
+                -- Trace tables: a single canonical JSON `data` blob per
+                -- row plus VIRTUAL generated columns extracted by
+                -- `json_extract` for the indexed lookups. SQLite keeps
+                -- the virtual columns in lockstep with `data`, so there
+                -- is no two-side write contract for the storage layer
+                -- to enforce — adding a new field is a serde change in
+                -- `aura-trace`, no schema migration. Old data is not
+                -- preserved across this cutover (an explicit decision
+                -- documented in `docs/modules/trace.md`).
+                DROP TABLE IF EXISTS steps;
+                CREATE TABLE steps (
+                    id         TEXT PRIMARY KEY,
+                    data       TEXT NOT NULL,
+                    deleted_at INTEGER,
+                    job_id     TEXT GENERATED ALWAYS AS (json_extract(data, '$.job_id')) VIRTUAL,
+                    started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
+                    ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_steps_job
                     ON steps(job_id, started_at) WHERE deleted_at IS NULL;
 
-                CREATE TABLE IF NOT EXISTS spans (
-                    id              TEXT PRIMARY KEY,
-                    step_id         TEXT NOT NULL,
-                    kind            TEXT NOT NULL,
-                    parallel_group  TEXT,
-                    started_at      INTEGER NOT NULL,
-                    ended_at        INTEGER,
-                    outcome         TEXT NOT NULL,
-                    data            TEXT NOT NULL,
-                    deleted_at      INTEGER
+                DROP TABLE IF EXISTS spans;
+                CREATE TABLE spans (
+                    id         TEXT PRIMARY KEY,
+                    data       TEXT NOT NULL,
+                    deleted_at INTEGER,
+                    step_id    TEXT GENERATED ALWAYS AS (json_extract(data, '$.step_id')) VIRTUAL,
+                    started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
+                    ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_spans_step
                     ON spans(step_id, started_at) WHERE deleted_at IS NULL;
-                -- Used by recover_half_open_spans at startup.
+                -- Used by recover_half_open_spans at startup. `ended_at`
+                -- is the json_extract result; absent JSON field → NULL.
                 CREATE INDEX IF NOT EXISTS idx_spans_half_open
                     ON spans(ended_at)
                     WHERE ended_at IS NULL AND deleted_at IS NULL;
 
-                CREATE TABLE IF NOT EXISTS span_events (
+                DROP TABLE IF EXISTS span_events;
+                CREATE TABLE span_events (
                     span_id    TEXT    NOT NULL,
                     seq        INTEGER NOT NULL,
-                    at         INTEGER NOT NULL,
-                    kind       TEXT    NOT NULL,
                     data       TEXT    NOT NULL,
                     deleted_at INTEGER,
                     PRIMARY KEY (span_id, seq)

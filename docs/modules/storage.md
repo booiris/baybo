@@ -62,7 +62,7 @@ Table schemas are created centrally in `LibsqlPool::init_db()`, but each Store s
 
 ### JSON field strategy
 
-Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) are stored as JSON. The trace stack uses a hybrid columnar schema: `steps` and `spans` keep queryable columns (`kind`, `started_at`, `ended_at`, `outcome`, `job_id`, `step_id`, `parallel_group`) plus a JSON `data` blob for full round-trip; `span_events` keeps `step_id`, `span_id`, `kind`, `at` columnar with JSON payload. The security requirement still applies: values must already be sanitized before persistence.
+Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) are stored as JSON. The trace stack stores the entire entity as a JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns SQLite keeps in lockstep with `data` automatically — no two-side write contract for the storage layer to enforce. The security requirement still applies: values must already be sanitized before persistence.
 
 ### Transaction boundaries
 
