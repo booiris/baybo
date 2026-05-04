@@ -19,6 +19,31 @@ protocol to the TUI for live progress display requires a new frame
 variant (`Frame::TraceEvent` or similar) plus a TUI render layer. Scoped
 to whichever PR adds the live-progress view.
 
+### CostSubscriber per-model pricing accuracy
+
+`LlmProviderFactory::known_pricings()` (added so `CostSubscriber` can
+attribute spend to non-active models) currently reports one flat rate
+per provider — every model in `OpenAIProviderFactory::known_models()`
+returns `2.50 / 10.0`, every Anthropic model returns `3.0 / 15.0`,
+etc. This mirrors what `create()` always did; the goal of `known_pricings`
+itself was just "non-active models attribute at *some* non-zero rate"
+rather than "exactly correct per-model rate."
+
+The next step is per-model accurate pricing — `gpt-5-mini` should
+not attribute at `gpt-5`'s rate. Two viable shapes:
+
+- A static `HashMap<&'static str, ModelPricing>` per provider, replacing
+  the flat `2.50 / 10.0` block in `create()` and the flat block in
+  `known_pricings()`. Cheap and self-documenting; the cost subscriber
+  benefits automatically.
+- Pull from a provider catalog endpoint at boot (extending
+  `LiveModelInfo` with a pricing field where the provider exposes
+  one). More accurate but credential- / network-bound.
+
+The `CostSubscriberMetrics.lagged_events` counter (also added in this
+PR) is the canary for "we're undercounting" — when per-model pricing
+lands, the same metric will track it.
+
 ### Rewrite `cli/tests/dispatch_smoke.rs`
 
 The original `dispatch_smoke.rs` was deleted in this PR — its 2k lines

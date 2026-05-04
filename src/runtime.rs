@@ -513,9 +513,15 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> = {
         // Seed with every provider's `known_pricings()`, then layer the
         // active model's pricing on top so a config-flip mid-flight
-        // doesn't drop spans of the previous model to $0. Providers that
-        // haven't published `known_pricings` yet contribute nothing —
-        // the active-model fallback still covers their case.
+        // doesn't drop spans of the previous model to $0. Providers
+        // that haven't published `known_pricings` yet contribute
+        // nothing — the active-model fallback still covers their case.
+        //
+        // Per-model accuracy caveat: today's publishers report one
+        // flat rate per provider, so e.g. gpt-5-mini attributes at the
+        // same rate as gpt-5. Tracked as a follow-up in
+        // `docs/todo/trace-redesign.md` ("CostSubscriber per-model
+        // pricing accuracy").
         let registry = aura_llm::LlmProviderRegistry::with_default_providers();
         let mut map = registry.all_known_pricings();
         let info = graph.llm_client.model_info();

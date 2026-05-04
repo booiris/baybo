@@ -77,6 +77,14 @@ pub trait LlmProviderFactory: Send + Sync {
     /// flipped mid-flight). Default: empty map — providers that
     /// haven't been ported to publish pricing fall back to the
     /// active-model-only path. `(input_per_1m, output_per_1m)` USD.
+    ///
+    /// **Caveat (tracked in `docs/todo/trace-redesign.md`):** today's
+    /// publishing providers report a single flat rate for every
+    /// `known_models` entry — same shape as `create()` always did, just
+    /// mirrored into a map. So `gpt-5-mini` reports the same rate as
+    /// `gpt-5`, etc. Per-model accurate pricing is a follow-up; the
+    /// goal of `known_pricings` itself is "non-active models attribute
+    /// at *some* non-zero rate," not "exactly correct per-model rate."
     fn known_pricings(&self) -> HashMap<String, crate::ModelPricing> {
         HashMap::new()
     }
@@ -180,6 +188,9 @@ impl LlmProviderRegistry {
     /// resolve to real USD instead of 0.0. Conflicting model-id entries
     /// across providers are last-wins; in practice the model-id space
     /// is provider-disjoint so this doesn't matter.
+    ///
+    /// See `LlmProviderFactory::known_pricings` for the per-model
+    /// pricing accuracy caveat.
     pub fn all_known_pricings(&self) -> HashMap<String, crate::ModelPricing> {
         let mut all = HashMap::new();
         for factory in self.factories.values() {

@@ -173,6 +173,7 @@
         "PKCE",
         "precheck",
         "prefilter",
+        "pricings",
         "psks",
         "psql",
         "pypirc",
