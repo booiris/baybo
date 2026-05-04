@@ -1,46 +1,239 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { RiLoader4Line } from 'react-icons/ri';
+import { RiLoader4Line, RiRefreshLine } from 'react-icons/ri';
 import { Button } from '../components/Button';
+import { SearchBox } from '../components/SearchBox';
 import { SelectBox } from '../components/SelectBox';
-import { useMockMode, MOCK_TRACES, type TraceSession } from '../api/mock';
+import { useAdminClient, useAuth } from '../api/auth';
+import type { components } from '../api/schema';
+import { useMockMode, MOCK_TRACE_SUMMARIES } from '../api/mock';
+
+type TraceSessionSummary = components['schemas']['TraceSessionSummary'];
+type JobStatusKind = components['schemas']['JobStatusKind'];
 
 const PAGE_SIZE_OPTIONS = [20, 50, 100];
+const DEFAULT_PAGE_SIZE = 20;
+
+// Smart-poll cadence: only re-fetch when the visible page contains an
+// in-flight session. Static pages (everything terminal) just sit.
+const ACTIVE_POLL_MS = 5_000;
+
+const STATUS_OPTIONS: { value: 'all' | JobStatusKind; label: string }[] = [
+  { value: 'all', label: 'All Statuses' },
+  { value: 'in_progress', label: 'In Progress' },
+  { value: 'pending', label: 'Pending' },
+  { value: 'stuck', label: 'Stuck' },
+  { value: 'completed', label: 'Completed' },
+  { value: 'failed', label: 'Failed' },
+  { value: 'cancelled', label: 'Cancelled' },
+];
+
+const STATUS_BADGE_CLASS: Record<JobStatusKind, string> = {
+  pending: 'bg-gray-200 text-ink border-ink',
+  in_progress: 'bg-info text-white',
+  stuck: 'bg-warn text-white',
+  completed: 'bg-ok text-white',
+  failed: 'bg-err text-white',
+  cancelled: 'bg-gray-300 text-ink border-ink-soft',
+};
+
+const ACTIVE_KINDS: JobStatusKind[] = ['pending', 'in_progress', 'stuck'];
+
 const thCell =
   'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black sticky top-0 z-10 bg-white';
 
 function splitTimestamp(iso: string): { date: string; time: string } {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return { date: iso, time: '' };
-  const date = d.toLocaleDateString('sv-SE');
-  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-  return { date, time };
+  return {
+    date: d.toLocaleDateString('sv-SE'),
+    time: d.toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }),
+  };
+}
+
+function formatNumber(n: number): string {
+  if (n < 1_000) return n.toString();
+  if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(2)}M`;
+}
+
+function applyMockFilters(
+  rows: TraceSessionSummary[],
+  status: 'all' | JobStatusKind,
+  query: string,
+  since?: string,
+  until?: string,
+): TraceSessionSummary[] {
+  let out = rows;
+  if (status !== 'all') {
+    out = out.filter((r) => r.latest_job_status?.kind === status);
+  }
+  if (query) {
+    const needle = query.toLowerCase();
+    out = out.filter((r) => r.session_id.toLowerCase().includes(needle));
+  }
+  if (since) {
+    const t = new Date(since).getTime();
+    out = out.filter((r) => new Date(r.last_active).getTime() >= t);
+  }
+  if (until) {
+    const t = new Date(until).getTime();
+    out = out.filter((r) => new Date(r.last_active).getTime() < t);
+  }
+  return out;
+}
+
+function StatusBadge({ status }: { status?: components['schemas']['JobStatus'] | null }) {
+  if (!status) {
+    return (
+      <span className="inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs bg-gray-100 text-ink-soft">
+        no jobs
+      </span>
+    );
+  }
+  const cls = STATUS_BADGE_CLASS[status.kind] ?? 'bg-gray-100 text-ink';
+  return (
+    <span
+      className={`inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${cls}`}
+      title={status.reason ?? status.cancel_reason ?? undefined}
+    >
+      {status.kind.replace('_', ' ')}
+    </span>
+  );
 }
 
 export function TracesPage() {
   const isMock = useMockMode();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
+  const client = useAdminClient();
+  const { logout } = useAuth();
+
+  const [filter, setFilter] = useState('');
+  const [debouncedFilter, setDebouncedFilter] = useState('');
+  const [status, setStatus] = useState<'all' | JobStatusKind>('all');
+  const [since, setSince] = useState<string>('');
+  const [until, setUntil] = useState<string>('');
 
   const [offset, setOffset] = useState(0);
-  const [pageSize, setPageSize] = useState(20);
-  const [loading] = useState(false);
-  const [items, setItems] = useState<TraceSession[]>([]);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [items, setItems] = useState<TraceSessionSummary[]>([]);
   const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
 
+  // Debounce the session-id filter.
   useEffect(() => {
-    if (isMock) {
-      setTotal(MOCK_TRACES.length);
-      setItems(MOCK_TRACES.slice(offset, offset + pageSize));
-    } else {
-      setItems([]);
-      setTotal(0);
+    const handle = window.setTimeout(() => setDebouncedFilter(filter), 250);
+    return () => window.clearTimeout(handle);
+  }, [filter]);
+
+  // Filter changes reset to page 1.
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
     }
-  }, [isMock, offset, pageSize]);
+    setOffset(0);
+  }, [debouncedFilter, status, pageSize, since, until]);
 
   useEffect(() => {
-    setOffset(0);
-  }, [pageSize]);
+    let canceled = false;
+    async function fetchData() {
+      if (isMock) {
+        const filtered = applyMockFilters(
+          MOCK_TRACE_SUMMARIES,
+          status,
+          debouncedFilter.trim(),
+          since || undefined,
+          until || undefined,
+        );
+        setItems(filtered.slice(offset, offset + pageSize));
+        setTotal(filtered.length);
+        setLoading(false);
+        setError(null);
+        return;
+      }
+
+      setLoading(true);
+      setError(null);
+      const query: Record<string, string | number> = {
+        limit: pageSize,
+        offset,
+      };
+      if (status !== 'all') query.status = status;
+      if (debouncedFilter.trim()) query.q = debouncedFilter.trim();
+      if (since) query.since = new Date(since).toISOString();
+      if (until) query.until = new Date(until).toISOString();
+
+      try {
+        const { data, error: apiError, response } = await client.GET('/v1/traces', {
+          params: { query },
+        });
+        if (canceled) return;
+        if (response.status === 401) {
+          logout();
+          return;
+        }
+        if (apiError || !response.ok) {
+          setError(apiError?.error || `HTTP Error ${response.status}`);
+          return;
+        }
+        setItems(data?.items ?? []);
+        setTotal(data?.total ?? 0);
+      } catch (e) {
+        if (canceled) return;
+        setError(
+          e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway',
+        );
+      } finally {
+        if (!canceled) setLoading(false);
+      }
+    }
+    void fetchData();
+    return () => {
+      canceled = true;
+    };
+  }, [client, debouncedFilter, status, since, until, logout, offset, pageSize, refreshKey, isMock]);
+
+  // Smart polling: tick every ACTIVE_POLL_MS only when at least one
+  // visible row is in a non-terminal state, and only while the tab is
+  // visible.
+  const hasActive = useMemo(
+    () =>
+      items.some(
+        (it) =>
+          it.latest_job_status &&
+          ACTIVE_KINDS.includes(it.latest_job_status.kind),
+      ),
+    [items],
+  );
+
+  useEffect(() => {
+    if (isMock || !hasActive) return;
+    let timer: number | undefined;
+    const tick = () => {
+      if (document.visibilityState === 'visible') {
+        setRefreshKey((k) => k + 1);
+      }
+    };
+    timer = window.setInterval(tick, ACTIVE_POLL_MS);
+    return () => {
+      if (timer !== undefined) window.clearInterval(timer);
+    };
+  }, [hasActive, isMock]);
+
+  const pageStart = items.length === 0 ? 0 : offset + 1;
+  const pageEnd = offset + items.length;
+  const hasPrev = offset > 0;
+  const hasNext = pageEnd < total;
 
   const toggleMock = () => {
     const newParams = new URLSearchParams(searchParams);
@@ -53,33 +246,16 @@ export function TracesPage() {
     setOffset(0);
   };
 
-  const pageStart = items.length === 0 ? 0 : offset + 1;
-  const pageEnd = offset + items.length;
-  const hasPrev = offset > 0;
-  const hasNext = pageEnd < total;
-
-  const statusBadge = (status: TraceSession['status']) => {
-    const map = {
-      active: 'bg-info text-white',
-      completed: 'bg-ok text-white',
-      error: 'bg-err text-white',
-    };
-    return (
-      <span
-        className={`inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${map[status]}`}
-      >
-        <span>{status}</span>
-      </span>
-    );
+  const buildDetailHref = (id: string) => {
+    const next = new URLSearchParams(searchParams);
+    return `/traces/${encodeURIComponent(id)}${next.toString() ? `?${next}` : ''}`;
   };
 
   return (
     <div className="p-5 h-full flex flex-col overflow-hidden">
       <div className="flex justify-between items-start mb-3">
         <div>
-          <h2 className="text-[1.7rem] font-bold uppercase -tracking-[0.05em] mb-1">
-            TRACES
-          </h2>
+          <h2 className="text-[1.7rem] font-bold uppercase -tracking-[0.05em] mb-1">TRACES</h2>
         </div>
         <div className="flex gap-3">
           {import.meta.env.DEV && (
@@ -91,72 +267,140 @@ export function TracesPage() {
               {isMock ? 'Mock: ON' : 'Mock: OFF'}
             </Button>
           )}
+          <Button
+            onClick={() => setRefreshKey((k) => k + 1)}
+            disabled={loading || isMock}
+            className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
+          >
+            <RiRefreshLine className="text-lg shrink-0" /> Refresh
+          </Button>
         </div>
       </div>
+
+      <div className="flex items-center gap-3 mb-4 flex-wrap">
+        <SearchBox
+          placeholder="Filter by session id..."
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          className="h-10"
+        />
+        <SelectBox
+          value={status}
+          onChange={(e) => setStatus(e.target.value as 'all' | JobStatusKind)}
+          className="h-10 px-3"
+        >
+          {STATUS_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </SelectBox>
+        <label className="flex items-center gap-2 text-[0.85rem] uppercase font-bold tracking-wider text-ink-soft">
+          From
+          <input
+            type="datetime-local"
+            value={since}
+            onChange={(e) => setSince(e.target.value)}
+            className="border-2 border-black rounded-md px-2 h-10 font-mono text-[0.85rem] bg-white"
+          />
+        </label>
+        <label className="flex items-center gap-2 text-[0.85rem] uppercase font-bold tracking-wider text-ink-soft">
+          To
+          <input
+            type="datetime-local"
+            value={until}
+            onChange={(e) => setUntil(e.target.value)}
+            className="border-2 border-black rounded-md px-2 h-10 font-mono text-[0.85rem] bg-white"
+          />
+        </label>
+        {(since || until) && (
+          <Button
+            onClick={() => {
+              setSince('');
+              setUntil('');
+            }}
+            className="!py-1 !px-3 !text-[0.8rem] h-10"
+          >
+            Clear range
+          </Button>
+        )}
+      </div>
+
+      {error && (
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+          {error}
+        </div>
+      )}
 
       <div className="flex-1 flex flex-col min-h-0 bg-white border-[3px] border-black rounded-md shadow-brutal">
         <div className="flex-1 overflow-auto overscroll-none">
           <table className="w-full border-separate border-spacing-0 table-fixed">
             <thead>
               <tr>
-                <th className={`${thCell} w-[160px]`}>Create Time</th>
-                <th className={`${thCell} w-[160px]`}>Active Time</th>
-                <th className={`${thCell} w-[240px]`}>Session ID</th>
-                <th className={`${thCell} w-[200px]`}>Trigger</th>
-                <th className={`${thCell}`}>Last Message</th>
+                <th className={`${thCell} w-[160px]`}>Created</th>
+                <th className={`${thCell} w-[160px]`}>Last Active</th>
+                <th className={`${thCell}`}>Session ID</th>
                 <th className={`${thCell} w-[140px]`}>Status</th>
-                <th className={`${thCell} w-[80px]`}>Spans</th>
+                <th className={`${thCell} w-[110px] !px-3 text-right`}>Spans</th>
+                <th className={`${thCell} w-[130px] !px-3 text-right whitespace-nowrap`}>Tok In</th>
+                <th className={`${thCell} w-[130px] !px-3 text-right whitespace-nowrap`}>Tok Out</th>
               </tr>
             </thead>
             <tbody>
               {items.length === 0 && !loading && (
                 <tr>
-                  <td
-                    colSpan={7}
-                    className="px-6 py-10 text-center text-ink-soft text-[0.9rem]"
-                  >
-                    No sessions found. {!isMock && 'Enable Mock mode to see generated sessions.'}
+                  <td colSpan={7} className="px-6 py-10 text-center text-ink-soft text-[0.9rem]">
+                    No sessions found.
                   </td>
                 </tr>
               )}
-              {items.map((session) => {
-                const createTs = splitTimestamp(session.createTime);
-                const activeTs = splitTimestamp(session.activeTime);
+              {items.map((row) => {
+                const created = splitTimestamp(row.created_at);
+                const active = splitTimestamp(row.last_active);
                 const cell = `px-6 py-4 align-middle border-b border-black`;
                 return (
-                  <tr 
-                    key={session.id} 
+                  <tr
+                    key={row.session_id}
                     className="hover:bg-gray-50 cursor-pointer group"
-                    onClick={() => navigate(`/traces/${encodeURIComponent(session.id)}${searchParams.toString() ? '?' + searchParams.toString() : ''}`)}
+                    onClick={() => navigate(buildDetailHref(row.session_id))}
                   >
                     <td className={cell}>
                       <div className="text-ink-soft text-[0.85rem] leading-snug whitespace-nowrap">
-                        {createTs.date}
+                        {created.date}
                         <br />
-                        {createTs.time}
+                        {created.time}
                       </div>
                     </td>
                     <td className={cell}>
                       <div className="text-ink-soft text-[0.85rem] leading-snug whitespace-nowrap">
-                        {activeTs.date}
+                        {active.date}
                         <br />
-                        {activeTs.time}
+                        {active.time}
                       </div>
                     </td>
                     <td className={cell}>
-                      <code className="font-mono text-[0.9rem] break-all group-hover:text-brand">{session.id}</code>
-                    </td>
-                    <td className={cell}>
-                      <span className="text-[0.9rem] break-words font-bold">{session.trigger}</span>
-                    </td>
-                    <td className={cell}>
-                      <div className="text-[0.9rem] text-ink-soft truncate" title={session.lastMessage}>
-                        {session.lastMessage}
+                      <code className="font-mono text-[0.9rem] break-all group-hover:text-brand">
+                        {row.session_id}
+                      </code>
+                      <div className="text-ink-soft text-[0.75rem] mt-1">
+                        {row.job_count} {row.job_count === 1 ? 'job' : 'jobs'}
                       </div>
                     </td>
-                    <td className={cell}>{statusBadge(session.status)}</td>
                     <td className={cell}>
-                      <span className="text-[0.9rem]">{session.spanCount}</span>
+                      <StatusBadge status={row.latest_job_status} />
+                    </td>
+                    <td className={`${cell} !px-3 text-right`}>
+                      <span className="text-[0.9rem] font-mono">{row.span_count}</span>
+                    </td>
+                    <td className={`${cell} !px-3 text-right`}>
+                      <span className="text-[0.9rem] font-mono text-ink-soft">
+                        {formatNumber(row.input_tokens)}
+                      </span>
+                    </td>
+                    <td className={`${cell} !px-3 text-right`}>
+                      <span className="text-[0.9rem] font-mono text-ink-soft">
+                        {formatNumber(row.output_tokens)}
+                      </span>
                     </td>
                   </tr>
                 );
@@ -174,7 +418,12 @@ export function TracesPage() {
             ) : total === 0 ? (
               'No sessions'
             ) : (
-              `Showing ${pageStart} to ${pageEnd} of ${total.toLocaleString()} sessions`
+              <>
+                Showing {pageStart} to {pageEnd} of {total.toLocaleString()} sessions
+                {hasActive && !isMock && (
+                  <span className="ml-2 text-info font-bold">• live</span>
+                )}
+              </>
             )}
           </span>
           <div className="flex items-center gap-4">

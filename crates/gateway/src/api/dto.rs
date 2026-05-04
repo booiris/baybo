@@ -297,7 +297,7 @@ pub struct JobStatus {
     pub partial_artifacts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatusKind {
     Pending,
@@ -317,6 +317,19 @@ impl From<aura_job::JobStatusKind> for JobStatusKind {
             aura_job::JobStatusKind::Cancelled => Self::Cancelled,
             aura_job::JobStatusKind::Failed => Self::Failed,
             aura_job::JobStatusKind::Completed => Self::Completed,
+        }
+    }
+}
+
+impl From<JobStatusKind> for aura_job::JobStatusKind {
+    fn from(v: JobStatusKind) -> Self {
+        match v {
+            JobStatusKind::Pending => Self::Pending,
+            JobStatusKind::InProgress => Self::InProgress,
+            JobStatusKind::Stuck => Self::Stuck,
+            JobStatusKind::Cancelled => Self::Cancelled,
+            JobStatusKind::Failed => Self::Failed,
+            JobStatusKind::Completed => Self::Completed,
         }
     }
 }
@@ -677,6 +690,72 @@ pub struct LogsResponse {
     /// Total number of records matching the filters — independent of
     /// `limit`/`offset`, so clients can size the pager without asking
     /// for the full list.
+    pub total: usize,
+}
+
+// ── Trace session summary (list view) ───────────────────────────────
+
+/// `GET /v1/traces` query params. All fields are optional; `None`
+/// removes that constraint.
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TracesListQuery {
+    /// Filter on the latest job's status (snake_case enum).
+    #[serde(default)]
+    pub status: Option<JobStatusKind>,
+    /// Inclusive lower bound on `last_active`.
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `last_active`.
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    /// Case-insensitive substring on session id.
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// One row of the trace browser list view. Mirrors
+/// [`aura_agent::SessionSummary`] for the wire.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TraceSessionSummary {
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+    /// `None` when the session has no jobs (those rows are filtered
+    /// out, but the type stays Option to keep the wire shape stable
+    /// if the policy ever flips).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_job_status: Option<JobStatus>,
+    pub job_count: usize,
+    pub span_count: usize,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+}
+
+impl From<aura_agent::SessionSummary> for TraceSessionSummary {
+    fn from(v: aura_agent::SessionSummary) -> Self {
+        Self {
+            session_id: v.session_id.to_string(),
+            created_at: v.created_at,
+            last_active: v.last_active,
+            latest_job_status: v.latest_job_status.map(Into::into),
+            job_count: v.job_count,
+            span_count: v.span_count,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+        }
+    }
+}
+
+/// Envelope for `GET /v1/traces`. Carries `total` for "Showing X of N"
+/// pagers, matching the shape of [`LogsResponse`].
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TracesListResponse {
+    pub items: Vec<TraceSessionSummary>,
     pub total: usize,
 }
 

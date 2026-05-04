@@ -278,7 +278,7 @@ export function LogsPage() {
             disabled={items.length === 0}
             className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
           >
-            <RiDownloadLine className="text-base" /> Export
+            <RiDownloadLine className="text-lg shrink-0" /> Export
           </Button>
         </div>
       </div>
@@ -318,20 +318,20 @@ export function LogsPage() {
           }
         >
           {live && !liveConnected && !isMock ? (
-            <RiLoader4Line className="animate-spin text-base" />
+            <RiLoader4Line className="animate-spin text-lg shrink-0" />
           ) : (
             <RiBroadcastLine
-              className={`text-base ${live && liveConnected ? 'animate-pulse' : ''}`}
+              className={`text-lg shrink-0 ${live && liveConnected ? 'animate-pulse' : ''}`}
             />
           )}
           Live
         </Button>
-        <Button 
-          onClick={() => setRefreshKey((k) => k + 1)} 
+        <Button
+          onClick={() => setRefreshKey((k) => k + 1)}
           disabled={loading || isMock}
           className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
         >
-          <RiRefreshLine className="text-base" /> Refresh
+          <RiRefreshLine className="text-lg shrink-0" /> Refresh
         </Button>
       </div>
 

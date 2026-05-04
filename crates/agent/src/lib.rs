@@ -30,7 +30,8 @@ pub use memory::MemoryManager;
 pub use policy::ExecutionPolicy;
 pub use query::{
     CostScope, JobDetail, JobFilter, JobSummary, LineageNode, QueryApi, QueryError, ReplayJob,
-    ReplayStep, ReplayedConversation, StepDetail,
+    ReplayStep, ReplayedConversation, SessionSummary, SessionSummaryFilter, SessionSummaryListing,
+    SessionSummaryPage, StepDetail,
 };
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};

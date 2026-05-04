@@ -244,6 +244,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/traces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_traces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/traces/{session_id}": {
         parameters: {
             query?: never;
@@ -495,6 +511,30 @@ export interface components {
             /** Format: float */
             importance?: number | null;
             user_id?: string | null;
+        };
+        /**
+         * @description One row of the trace browser list view. Mirrors
+         *     [`aura_agent::SessionSummary`] for the wire.
+         */
+        TraceSessionSummary: {
+            /** Format: date-time */
+            created_at: string;
+            input_tokens: number;
+            job_count: number;
+            /** Format: date-time */
+            last_active: string;
+            latest_job_status?: null | components["schemas"]["JobStatus"];
+            output_tokens: number;
+            session_id: string;
+            span_count: number;
+        };
+        /**
+         * @description Envelope for `GET /v1/traces`. Carries `total` for "Showing X of N"
+         *     pagers, matching the shape of [`LogsResponse`].
+         */
+        TracesListResponse: {
+            items: components["schemas"]["TraceSessionSummary"][];
+            total: number;
         };
         /** @description Mirror of [`aura_cron::TriggerAction`]. */
         TriggerAction: {
@@ -1400,6 +1440,46 @@ export interface operations {
                         }[];
                         next_cursor?: string | null;
                     };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_traces: {
+        parameters: {
+            query?: {
+                /** @description Filter on the latest job's status (snake_case enum). */
+                status?: components["schemas"]["JobStatusKind"];
+                /** @description Inclusive lower bound on `last_active`. */
+                since?: string;
+                /** @description Exclusive upper bound on `last_active`. */
+                until?: string;
+                /** @description Case-insensitive substring on session id. */
+                q?: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Paginated session summaries (newest active first) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TracesListResponse"];
                 };
             };
             /** @description Unauthorized */

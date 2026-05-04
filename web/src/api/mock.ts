@@ -1,17 +1,15 @@
 import { useSearchParams } from 'react-router-dom';
 import type { components } from './schema';
+import type {
+  SessionReplay,
+  Span,
+  Step,
+  StepKind,
+  ChatMessage,
+} from '../types/trace';
 
 type LogEntry = components['schemas']['LogEntry'];
-
-export interface TraceSession {
-  id: string;
-  trigger: string;
-  status: 'active' | 'completed' | 'error';
-  spanCount: number;
-  activeTime: string;
-  createTime: string;
-  lastMessage: string;
-}
+type TraceSessionSummary = components['schemas']['TraceSessionSummary'];
 
 /**
  * Hook to check if mock mode is enabled via URL parameters.
@@ -66,39 +64,55 @@ export const MOCK_LOGS = import.meta.env.DEV ? generateMockLogs(200) : [];
 
 // --- Traces Mock Data ---
 
-function generateMockSessions(count: number): TraceSession[] {
-  const sessions: TraceSession[] = [];
-  const now = Date.now();
-  const statuses: TraceSession['status'][] = ['active', 'completed', 'error', 'completed', 'completed'];
-  const triggers = ['GET /api/v1/users', 'POST /api/v1/login', 'GET /api/v1/status', 'PUT /api/v1/settings', 'DELETE /api/v1/cache'];
-  const messages = [
-    'Successfully fetched 50 users from the primary database shard.',
-    'Authentication failed: Invalid credentials provided for user admin@aura.io',
-    'Health check passed: all downstream services are reachable and healthy.',
-    'Settings updated: modified default timeout from 30s to 45s.',
-    'Cache cleared: invalidated 1,240 entries across the regional cluster.',
-    'Processing trace data for high-priority background worker task #9421.',
-    'Internal Server Error: Connection reset by peer during database migration script execution.',
-  ];
-  
-  for (let i = 0; i < count; i++) {
-    const activeTimeDate = new Date(now - i * 1000 * 60 * 15 - Math.random() * 10000000);
-    const createTimeDate = new Date(activeTimeDate.getTime() - Math.random() * 1000 * 60 * 60);
-    
-    sessions.push({
-      id: `trace-session-${Math.random().toString(36).substring(2, 12)}-${Math.random().toString(36).substring(2, 8)}`,
-      trigger: triggers[Math.floor(Math.random() * triggers.length)],
-      status: statuses[Math.floor(Math.random() * statuses.length)],
-      spanCount: Math.floor(Math.random() * 500) + 1,
-      activeTime: activeTimeDate.toISOString(),
-      createTime: createTimeDate.toISOString(),
-      lastMessage: messages[Math.floor(Math.random() * messages.length)],
-    });
+function makeJobStatus(
+  kind: components['schemas']['JobStatusKind'],
+): components['schemas']['JobStatus'] {
+  if (kind === 'cancelled') {
+    return { kind, cancel_reason: 'user_preempt', partial_artifacts: [] };
   }
-  return sessions.sort((a, b) => new Date(b.activeTime).getTime() - new Date(a.activeTime).getTime());
+  if (kind === 'failed' || kind === 'stuck') {
+    return { kind, reason: 'simulated failure', partial_artifacts: [] };
+  }
+  return { kind, partial_artifacts: [] };
 }
 
-export const MOCK_TRACES = import.meta.env.DEV ? generateMockSessions(150) : [];
+function generateMockSummaries(count: number): TraceSessionSummary[] {
+  const out: TraceSessionSummary[] = [];
+  const now = Date.now();
+  const statuses: components['schemas']['JobStatusKind'][] = [
+    'in_progress',
+    'completed',
+    'failed',
+    'completed',
+    'cancelled',
+    'completed',
+  ];
+
+  for (let i = 0; i < count; i++) {
+    const lastActive = new Date(now - i * 1000 * 60 * 15 - Math.random() * 10_000_000);
+    const created = new Date(lastActive.getTime() - Math.random() * 1000 * 60 * 60);
+    const kind = statuses[Math.floor(Math.random() * statuses.length)];
+    out.push({
+      session_id: `sess-${Math.random().toString(36).substring(2, 12)}-${Math.random()
+        .toString(36)
+        .substring(2, 8)}`,
+      created_at: created.toISOString(),
+      last_active: lastActive.toISOString(),
+      latest_job_status: makeJobStatus(kind),
+      job_count: Math.floor(Math.random() * 4) + 1,
+      span_count: Math.floor(Math.random() * 60) + 1,
+      input_tokens: Math.floor(Math.random() * 80_000),
+      output_tokens: Math.floor(Math.random() * 40_000),
+    });
+  }
+  return out.sort(
+    (a, b) => new Date(b.last_active).getTime() - new Date(a.last_active).getTime(),
+  );
+}
+
+export const MOCK_TRACE_SUMMARIES: TraceSessionSummary[] = import.meta.env.DEV
+  ? generateMockSummaries(80)
+  : [];
 
 // --- Cron Mock Data ---
 
@@ -230,176 +244,232 @@ function generateMockAnalytics(): AnalyticsData {
 
 export const MOCK_ANALYTICS = import.meta.env.DEV ? generateMockAnalytics() : null;
 
-export interface TraceSpan {
-  id: string;
-  type: 'llm_call' | 'tool_call';
-  name: string;
-  input: any;
-  output: any;
-  status: 'success' | 'error';
-  durationMs: number;
-  meta?: Record<string, any>;
-  children?: TraceSpan[];
+// --- Session detail (full Job→Step→Span tree) ---
+
+let mockIdCounter = 0;
+function mid(prefix: string): string {
+  mockIdCounter += 1;
+  return `${prefix}-${mockIdCounter.toString(36).padStart(6, '0')}`;
 }
 
-export interface TraceTurn {
-  id: string;
-  userMessage: string;
-  aiResponse: string;
-  spans: TraceSpan[];
-  timestamp: string;
-}
-
-export interface TraceSessionDetail {
-  sessionId: string;
-  turns: TraceTurn[];
-}
-
-export function getMockSessionDetail(sessionId: string): TraceSessionDetail {
-  const now = Date.now();
+function step(jobId: string, kind: StepKind, started: Date, ended: Date | null): Step {
   return {
-    sessionId,
-    turns: [
-      {
-        id: 'turn-1',
-        userMessage: 'List all files in the current directory',
-        aiResponse: 'I have listed the files in the directory. You have 5 files including README.md and src folder.',
-        timestamp: new Date(now - 150000).toISOString(),
-        spans: [
-          {
-            id: 'span-1',
-            type: 'llm_call',
-            name: 'gpt-4o',
-            input: { prompt: 'System: You are an assistant.\nUser: List all files in the current directory' },
-            output: { response: '', tool_calls: [{ name: 'list_directory', arguments: { path: '.' } }] },
-            status: 'success',
-            durationMs: 1450,
-            meta: { temperature: 0.7, max_tokens: 1024, prompt_tokens: 45, completion_tokens: 18, total_tokens: 63 },
-            children: [
-              {
-                id: 'span-1-1',
-                type: 'tool_call',
-                name: 'list_directory',
-                input: { path: '.' },
-                output: { files: ['README.md', 'src', 'package.json', 'tsconfig.json', '.gitignore'] },
-                status: 'success',
-                durationMs: 120,
-                meta: { internal_retries: 0 }
-              }
-            ]
-          },
-          {
-            id: 'span-2',
-            type: 'llm_call',
-            name: 'gpt-4o',
-            input: { prompt: 'System: You are an assistant.\nUser: List all files in the current directory\nTool list_directory Output: {"files":["README.md","src","package.json","tsconfig.json",".gitignore"]}' },
-            output: { response: 'I have listed the files in the directory. You have 5 files including README.md and src folder.' },
-            status: 'success',
-            durationMs: 1200,
-            meta: { temperature: 0.7, max_tokens: 1024, prompt_tokens: 72, completion_tokens: 24, total_tokens: 96 }
-          }
-        ]
-      },
-      {
-        id: 'turn-2',
-        userMessage: 'Read the README.md file and modify it to add a new section',
-        aiResponse: 'I have read the file and modified it to include the "Getting Started" section.',
-        timestamp: new Date(now - 80000).toISOString(),
-        spans: [
-          {
-            id: 'span-3',
-            type: 'llm_call',
-            name: 'gpt-4o',
-            input: { prompt: 'System: You are an assistant.\nUser: Read the README.md file and modify it to add a new section' },
-            output: { response: '', tool_calls: [{ name: 'read_file', arguments: { path: 'README.md' } }] },
-            status: 'success',
-            durationMs: 850,
-            meta: { temperature: 0.7, max_tokens: 1024, prompt_tokens: 50, completion_tokens: 15, total_tokens: 65 },
-            children: [
-              {
-                id: 'span-3-1',
-                type: 'tool_call',
-                name: 'read_file',
-                input: { path: 'README.md' },
-                output: { content: '# My Project\n\nThis is a cool project.' },
-                status: 'success',
-                durationMs: 45
-              }
-            ]
-          },
-          {
-            id: 'span-4',
-            type: 'llm_call',
-            name: 'gpt-4o',
-            input: { prompt: '... \nTool read_file Output: {"content":"# My Project\\n\\nThis is a cool project."}' },
-            output: { response: '', tool_calls: [{ name: 'replace_file', arguments: { path: 'README.md', content: '# My Project\n\nThis is a cool project.\n\n## Getting Started\nRun `npm install`.' } }] },
-            status: 'success',
-            durationMs: 2100,
-            meta: { temperature: 0.7, max_tokens: 1024, prompt_tokens: 80, completion_tokens: 40, total_tokens: 120 },
-            children: [
-              {
-                id: 'span-4-1',
-                type: 'tool_call',
-                name: 'replace_file',
-                input: { path: 'README.md', content: '# My Project\n\nThis is a cool project.\n\n## Getting Started\nRun `npm install`.' },
-                output: { success: true },
-                status: 'success',
-                durationMs: 150
-              }
-            ]
-          },
-          {
-            id: 'span-5',
-            type: 'llm_call',
-            name: 'gpt-4o',
-            input: { prompt: '... \nTool replace_file Output: {"success":true}' },
-            output: { response: 'I have read the file and modified it to include the "Getting Started" section.' },
-            status: 'success',
-            durationMs: 950,
-            meta: { temperature: 0.7, max_tokens: 1024, prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 }
-          }
-        ]
-      },
-      {
-        id: 'turn-3',
-        userMessage: 'Test if the project compiles',
-        aiResponse: 'The project compiles successfully without any errors.',
-        timestamp: new Date(now - 20000).toISOString(),
-        spans: [
-          {
-            id: 'span-6',
-            type: 'llm_call',
-            name: 'gpt-4-turbo',
-            input: { prompt: 'System: You are an assistant.\nUser: Test if the project compiles' },
-            output: { response: '', tool_calls: [{ name: 'run_shell_command', arguments: { command: 'npm run build' } }] },
-            status: 'success',
-            durationMs: 1300,
-            meta: { temperature: 0.2, max_tokens: 2048, prompt_tokens: 35, completion_tokens: 15, total_tokens: 50 },
-            children: [
-              {
-                id: 'span-6-1',
-                type: 'tool_call',
-                name: 'run_shell_command',
-                input: { command: 'npm run build' },
-                output: { stdout: '> build\n> tsc\n\nBuild completed.', stderr: '', exitCode: 0 },
-                status: 'success',
-                durationMs: 3400,
-                meta: { working_dir: '/data/aura-web/web', exit_code: 0 }
-              }
-            ]
-          },
-          {
-            id: 'span-7',
-            type: 'llm_call',
-            name: 'gpt-4-turbo',
-            input: { prompt: '... \nTool run_shell_command Output: {"stdout":"> build\\n> tsc\\n\\nBuild completed.", "stderr":"", "exitCode":0}' },
-            output: { response: 'The project compiles successfully without any errors.' },
-            status: 'success',
-            durationMs: 800,
-            meta: { temperature: 0.2, max_tokens: 2048, prompt_tokens: 85, completion_tokens: 12, total_tokens: 97 }
-          }
-        ]
-      }
-    ]
+    id: mid('step'),
+    job_id: jobId,
+    kind,
+    started_at: started.toISOString(),
+    ended_at: ended?.toISOString() ?? null,
+    outcome: ended ? { outcome: 'ok' } : { outcome: 'pending' },
   };
 }
+
+function llmSpan(
+  stepId: string,
+  model: string,
+  messages: ChatMessage[],
+  output: string,
+  toolCalls: { id: string; name: string; arguments: unknown }[],
+  inTok: number,
+  outTok: number,
+  startedAt: Date,
+  endedAt: Date,
+): Span {
+  return {
+    id: mid('span'),
+    step_id: stepId,
+    kind: {
+      kind: 'llm_call',
+      begin: {
+        model_id: model,
+        provider: 'anthropic',
+        provider_config_hash: 'mock-hash',
+        input_messages: messages,
+        temperature: 0.7,
+      },
+      result: {
+        output_content: output,
+        thinking: null,
+        tool_calls: toolCalls,
+        input_tokens: inTok,
+        output_tokens: outTok,
+      },
+    },
+    parallel_group: null,
+    started_at: startedAt.toISOString(),
+    ended_at: endedAt.toISOString(),
+    outcome: { outcome: 'ok' },
+    events: [],
+  };
+}
+
+function toolSpan(
+  stepId: string,
+  toolName: string,
+  llmSpanId: string,
+  toolUseId: string,
+  params: unknown,
+  output: unknown,
+  startedAt: Date,
+  endedAt: Date,
+  parallelGroup: string | null = null,
+): Span {
+  return {
+    id: mid('span'),
+    step_id: stepId,
+    kind: {
+      kind: 'tool_call',
+      begin: {
+        tool_name: toolName,
+        tool_artifact_hash: 'mock-tool-hash',
+        triggered_by: { llm_span_id: llmSpanId, tool_use_id: toolUseId },
+        params,
+      },
+      result: { output, success: true },
+    },
+    parallel_group: parallelGroup,
+    started_at: startedAt.toISOString(),
+    ended_at: endedAt.toISOString(),
+    outcome: { outcome: 'ok' },
+    events: [],
+  };
+}
+
+function userMsg(text: string): ChatMessage {
+  return { role: 'user', content: [{ Text: text }] };
+}
+
+function systemMsg(text: string): ChatMessage {
+  return { role: 'system', content: [{ Text: text }] };
+}
+
+export function getMockSessionReplay(sessionId: string): SessionReplay {
+  const t0 = Date.now() - 5 * 60 * 1000;
+  const job1 = mid('job');
+
+  // Step 1: skill selection
+  const skillStarted = new Date(t0);
+  const skillEnded = new Date(t0 + 80);
+  const skillStep = step(job1, { kind: 'skill_selection' }, skillStarted, skillEnded);
+  const skillLlm = llmSpan(
+    skillStep.id,
+    'claude-sonnet-4-6',
+    [systemMsg('Pick a skill.'), userMsg('Help me list files.')],
+    JSON.stringify({ skill: 'codebase_investigator' }),
+    [],
+    40,
+    8,
+    skillStarted,
+    skillEnded,
+  );
+
+  // Step 2: LLM iteration with parallel tool calls
+  const it1Start = new Date(t0 + 100);
+  const it1End = new Date(t0 + 1600);
+  const it1Step = step(job1, { kind: 'llm_iteration' }, it1Start, it1End);
+  const it1Llm = llmSpan(
+    it1Step.id,
+    'claude-sonnet-4-6',
+    [
+      systemMsg('You are a helpful assistant.'),
+      userMsg('List files and read README.md'),
+    ],
+    '',
+    [
+      { id: 'tu_1', name: 'list_directory', arguments: { path: '.' } },
+      { id: 'tu_2', name: 'read_file', arguments: { path: 'README.md' } },
+    ],
+    120,
+    36,
+    it1Start,
+    new Date(t0 + 850),
+  );
+  const parallelGroup = mid('pg');
+  const tool1 = toolSpan(
+    it1Step.id,
+    'list_directory',
+    it1Llm.id,
+    'tu_1',
+    { path: '.' },
+    { files: ['README.md', 'src', 'package.json'] },
+    new Date(t0 + 870),
+    new Date(t0 + 1000),
+    parallelGroup,
+  );
+  const tool2 = toolSpan(
+    it1Step.id,
+    'read_file',
+    it1Llm.id,
+    'tu_2',
+    { path: 'README.md' },
+    { content: 'Aura — intelligent assistant framework. <api key: [{REDACTED_SECRET_a1b2}]>' },
+    new Date(t0 + 880),
+    new Date(t0 + 1450),
+    parallelGroup,
+  );
+  // Sanitize event on tool2 (mock placeholder hit)
+  tool2.events = [
+    {
+      span_id: tool2.id,
+      seq: 0,
+      at: new Date(t0 + 1450).toISOString(),
+      kind: {
+        kind: 'sanitize_hit',
+        hits_count: 1,
+        kinds: ['api_key'],
+        placeholder_ids: ['[{REDACTED_SECRET_a1b2}]'],
+      },
+    },
+  ];
+
+  // Step 3: final LLM iteration (response)
+  const it2Start = new Date(t0 + 1700);
+  const it2End = new Date(t0 + 2400);
+  const it2Step = step(job1, { kind: 'llm_iteration' }, it2Start, it2End);
+  const it2Llm = llmSpan(
+    it2Step.id,
+    'claude-sonnet-4-6',
+    [
+      systemMsg('You are a helpful assistant.'),
+      userMsg('List files and read README.md'),
+      {
+        role: 'assistant',
+        content: [
+          { Text: 'Listing and reading.' },
+          {
+            ToolUse: { id: 'tu_1', name: 'list_directory', input: { path: '.' } },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        content: [
+          { ToolResult: { tool_use_id: 'tu_1', content: '{"files":["README.md","src","package.json"]}' } },
+          { ToolResult: { tool_use_id: 'tu_2', content: '{"content":"..."}' } },
+        ],
+      },
+    ],
+    'There are 3 entries: README.md, src/, package.json. README documents Aura.',
+    [],
+    220,
+    52,
+    it2Start,
+    it2End,
+  );
+
+  return {
+    session_id: sessionId,
+    jobs: [
+      {
+        job_id: job1,
+        job_status_kind: 'completed',
+        steps: [
+          { step: skillStep, spans: [skillLlm] },
+          { step: it1Step, spans: [it1Llm, tool1, tool2] },
+          { step: it2Step, spans: [it2Llm] },
+        ],
+      },
+    ],
+  };
+}
+
+

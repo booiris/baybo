@@ -1379,6 +1379,94 @@
         }
       }
     },
+    "/v1/traces": {
+      "get": {
+        "tags": [
+          "traces"
+        ],
+        "operationId": "list_traces",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter on the latest job's status (snake_case enum).",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/JobStatusKind"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Inclusive lower bound on `last_active`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "description": "Exclusive upper bound on `last_active`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Case-insensitive substring on session id.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated session summaries (newest active first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TracesListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/traces/{session_id}": {
       "get": {
         "tags": [
@@ -2095,6 +2183,79 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "TraceSessionSummary": {
+        "type": "object",
+        "description": "One row of the trace browser list view. Mirrors\n[`aura_agent::SessionSummary`] for the wire.",
+        "required": [
+          "session_id",
+          "created_at",
+          "last_active",
+          "job_count",
+          "span_count",
+          "input_tokens",
+          "output_tokens"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "job_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "last_active": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "latest_job_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobStatus",
+                "description": "`None` when the session has no jobs (those rows are filtered\nout, but the type stays Option to keep the wire shape stable\nif the policy ever flips)."
+              }
+            ]
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "span_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "TracesListResponse": {
+        "type": "object",
+        "description": "Envelope for `GET /v1/traces`. Carries `total` for \"Showing X of N\"\npagers, matching the shape of [`LogsResponse`].",
+        "required": [
+          "items",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TraceSessionSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },

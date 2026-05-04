@@ -174,6 +174,51 @@ pub struct ReplayedConversation {
     pub jobs: Vec<ReplayJob>,
 }
 
+/// Filter for [`QueryApi::list_session_summaries`]. All fields are
+/// AND-combined; `None` means no constraint. `status_kind` matches
+/// against the *latest* job's `JobStatusKind` (not any historical job).
+#[derive(Debug, Clone, Default)]
+pub struct SessionSummaryFilter {
+    pub status_kind: Option<JobStatusKind>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub session_id_prefix: Option<String>,
+}
+
+/// Offset/limit pagination for [`QueryApi::list_session_summaries`].
+/// `limit == 0` is treated as "no limit" — the full filtered list is
+/// returned. `offset` past the end yields an empty page.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionSummaryPage {
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// One row of the trace browser list view. Carries the cheap
+/// per-session aggregates the UI needs to render the table — full
+/// drill-in still goes through [`QueryApi::replay`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+    /// `None` when the session has no jobs (filtered out by default).
+    pub latest_job_status: Option<JobStatus>,
+    pub job_count: usize,
+    pub span_count: usize,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+}
+
+/// Result of [`QueryApi::list_session_summaries`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummaryListing {
+    pub items: Vec<SessionSummary>,
+    /// Total rows matching the filter, before pagination — drives the
+    /// `Showing X to Y of N` pager.
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayJob {
     pub job: Job,
@@ -411,6 +456,98 @@ impl QueryApi {
             CostScope::Session(sid) => Ok(costs.query_session(&sid).await?),
             CostScope::Job(jid) => Ok(costs.query_job(&jid).await?),
         }
+    }
+
+    // ── 10. list_session_summaries ─────────────────────────────
+
+    /// List session summaries for the trace browser. Filters apply
+    /// against `last_active` (time range), session id prefix, and the
+    /// **latest** job's status kind. Sessions with zero jobs are
+    /// dropped (a session with no trace is invisible to the browser).
+    ///
+    /// Cardinality: this iterates every live session and loads its
+    /// jobs/steps/spans to compute aggregates. Acceptable for the
+    /// admin surface (low request rate, modest session counts) and
+    /// avoids new storage methods. If session counts grow, the
+    /// natural follow-up is a denormalised per-session counter table.
+    pub async fn list_session_summaries(
+        &self,
+        filter: SessionSummaryFilter,
+        page: SessionSummaryPage,
+    ) -> Result<SessionSummaryListing> {
+        let mut sessions = self.sessions.list_all().await?;
+
+        // Cheap filters first so we don't pay per-session aggregate
+        // costs for rows about to be dropped.
+        if let Some(prefix) = filter.session_id_prefix.as_deref() {
+            let needle = prefix.to_ascii_lowercase();
+            sessions.retain(|s| s.id.as_str().to_ascii_lowercase().contains(&needle));
+        }
+        if let Some(since) = filter.since {
+            sessions.retain(|s| s.last_active >= since);
+        }
+        if let Some(until) = filter.until {
+            sessions.retain(|s| s.last_active < until);
+        }
+
+        // Now compute aggregates + apply latest-status filter +
+        // drop sessions with no jobs.
+        let mut summaries: Vec<SessionSummary> = Vec::new();
+        for session in &sessions {
+            let mut jobs = self.jobs.list_by_session(&session.id, None).await?;
+            if jobs.is_empty() {
+                continue;
+            }
+            // `list_by_session` returns newest-first, so the head is
+            // the latest job by `created_at`.
+            jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            let latest = jobs.first();
+            if let Some(want) = filter.status_kind
+                && latest.is_none_or(|j| j.status.kind() != want)
+            {
+                continue;
+            }
+
+            let mut span_count = 0usize;
+            for job in &jobs {
+                let steps = self.trace.list_steps_by_job(&job.id).await?;
+                for step in &steps {
+                    let spans = self.trace.list_spans_by_step(&step.id).await?;
+                    span_count += spans.len();
+                }
+            }
+
+            let (input_tokens, output_tokens) = match self.costs.as_ref() {
+                Some(c) => match c.query_session(&session.id).await {
+                    Ok(s) => (s.total_input_tokens, s.total_output_tokens),
+                    Err(_) => (0, 0),
+                },
+                None => (0, 0),
+            };
+
+            summaries.push(SessionSummary {
+                session_id: session.id.clone(),
+                created_at: session.created_at,
+                last_active: session.last_active,
+                latest_job_status: latest.map(|j| j.status.clone()),
+                job_count: jobs.len(),
+                span_count,
+                input_tokens,
+                output_tokens,
+            });
+        }
+
+        // `SessionStore::list_all` already orders by `last_active`
+        // DESC, but the per-session work above preserves that order.
+        let total = summaries.len();
+        let start = page.offset.min(total);
+        let end = if page.limit == 0 {
+            total
+        } else {
+            start.saturating_add(page.limit).min(total)
+        };
+        let items = summaries[start..end].to_vec();
+        Ok(SessionSummaryListing { items, total })
     }
 
     // ── 9. replay ──────────────────────────────────────────────
