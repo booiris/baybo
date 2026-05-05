@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::registration::{Prompter as ChannelPrompter, RegistrationResult};
+use aura_channels::vault_keys;
 use aura_gateway::SidecarRuntime;
 use aura_model::ChannelType;
 use aura_security::SecretVault;
@@ -121,10 +122,6 @@ fn validate_bot_id(bot_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn secret_name(channel_type: &ChannelType, bot_id: &str) -> String {
-    format!("channel.{}.bot.{}.token", channel_type.as_str(), bot_id)
-}
-
 async fn persist_bot_registration(
     vault: &Arc<SecretVault>,
     store: &Arc<dyn ChannelBotStore>,
@@ -133,20 +130,35 @@ async fn persist_bot_registration(
 ) -> Result<()> {
     validate_bot_id(&result.bot_id)?;
 
-    let key = secret_name(ct, &result.bot_id);
+    let token_key = vault_keys::primary_token(ct, &result.bot_id);
     let token = result.token.clone();
     retry_on_busy("vault.store_secret", || {
-        vault.store_secret(&key, token.as_bytes())
+        vault.store_secret(&token_key, token.as_bytes())
     })
     .await
-    .map_err(|e| SetupError::Vault(format!("store secret '{key}': {e}")))?;
+    .map_err(|e| SetupError::Vault(format!("store secret '{token_key}': {e}")))?;
+
+    // Persist auxiliary registration secrets (Lark `app_secret`,
+    // `encrypt_key`, …) under the per-bot `config.*` namespace so the
+    // gateway's StartBot merger can fold them into `Frame::StartBot.metadata`.
+    for (key, value) in &result.secrets {
+        let vault_key = vault_keys::config(ct, &result.bot_id, key);
+        let value_owned = value.clone();
+        retry_on_busy("vault.store_secret", || {
+            vault.store_secret(&vault_key, value_owned.as_bytes())
+        })
+        .await
+        .map_err(|e| SetupError::Vault(format!("store secret '{vault_key}': {e}")))?;
+    }
 
     let ct_for_put = ct.clone();
     let bot_id_owned = result.bot_id.clone();
+    let metadata = result.metadata.clone();
     retry_on_busy("channel_bots.put", || {
         let ct = ct_for_put.clone();
         let id = bot_id_owned.clone();
-        async move { store.put(&ct, &id).await }
+        let metadata = metadata.clone();
+        async move { store.put(&ct, &id, metadata).await }
     })
     .await
     .map_err(|e| SetupError::Channel(format!("register bot metadata: {e}")))?;
