@@ -6,14 +6,16 @@ The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `val
 
 A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consumers (`main.rs` and `aura-agent`) map each section into the corresponding domain type.
 
-Top-level sections: `llm`, `agent`, `session`, `channels`, `security`, `skills`, `tools`, `cost`, `workspace`.
+Top-level sections: `llm`, `agent`, `session`, `channels`, `security`, `skills`, `cost`, `workspace`.
 
 > **MCP status note.** MCP server records do **not** live in `aura.json`.
 > They live in `<workspace>/.mcp.json`, owned by `aura-tools::mcp` (config
 > shape: `McpFile`, `McpServerEntry`, `McpTransportConfig`, `OAuthConfig`).
-> `aura.json`'s `tools` section keeps only `default_timeout_ms`. See
-> `docs/modules/tools.md` for the MCP client architecture and
-> `docs/modules/cli.md` for the `aura mcp {add,list,get,remove}` surface.
+> Per-tool execution timeouts are declared by each tool itself via
+> `Tool::max_timeout` (defaults to 30 s). See
+> `docs/modules/tools.md` for the MCP client architecture and per-tool
+> timeout overrides, and `docs/modules/cli.md` for the
+> `aura mcp {add,list,get,remove}` surface.
 
 There is no `storage` section. Storage paths are **derived** from the project root (`workspace.path`) — operators choose a project root, not individual data-file locations.
 
@@ -89,12 +91,11 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 | Section    | Maps to                                                     | Notes                                                                                                                                                                                                |
 | ---------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `llm`      | `aura_llm::LlmProviderConfig`                               | `fallback_model` is an orchestration concern, consumed by `agent` (not by `LlmProviderConfig`). Until wiring lands, the field is carried by `LlmConfig` for forward compatibility.                   |
-| `agent`    | `ExecutionPolicy` + `TokenBudget` + `Truncate::keep_recent` | Tool timeout layering: `agent.default_tool_timeout_ms` is the **per-call requested** timeout the agent loop asks for; `tools.default_timeout_ms` is the **hard cap** at the executor. Executor wins. |
+| `agent`    | `ExecutionPolicy` + `TokenBudget` + `Truncate::keep_recent` | Carries `max_iterations` and the context-window budget. Per-tool timeouts are not configured here — each `Tool` impl declares its own ceiling via `Tool::max_timeout` (default 30 s).                |
 | `session`  | `SessionManager` timeout + cleanup cadence                  | `timeout_minutes` sets idle expiry; `cleanup_interval_minutes` sets sweep cadence (`0` disables cleanup).                                                                                            |
 | `channels` | `ChannelRegistry` adapter enablement + mpsc buffer sizes    | See §"Channel enablement model".                                                                                                                                                                     |
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
 | `skills`   | `aura_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
-| `tools`    | `ToolExecutor` default timeout (MCP server list returns with reintroduction) |                                                                                                                                                                                      |
 | `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
 | `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/storage.db`).                                                                      |
 
@@ -144,7 +145,6 @@ When hot reload is implemented, the following contract must be in place **before
 | `llm.base_url`                        | if set, scheme is `http://` or `https://`            |
 | `llm.fallback_model`                  | if set, non-empty                                    |
 | `agent.max_iterations`                | in `1..=1000`                                        |
-| `agent.default_tool_timeout_ms`       | ≥ 100                                                |
 | `agent.context.max_tokens`            | ≥ 1                                                  |
 | `agent.context.compression_threshold` | in `(0.0, 1.0]`, finite                              |
 | `agent.context.keep_recent`           | ≥ 1                                                  |
@@ -155,7 +155,6 @@ When hot reload is implemented, the following contract must be in place **before
 | `channels.http.*`                     | non-empty `bind_address`, non-zero `port`            |
 | `channels.telegram.bot_token_env`     | non-empty                                            |
 | `channels.discord.bot_token_env`      | non-empty                                            |
-| `tools.default_timeout_ms`            | ≥ 100                                                |
 | `cost.spending_limits.daily_usd`      | if set, strictly positive, finite                    |
 | `cost.spending_limits.monthly_usd`    | if set, strictly positive, finite                    |
 | `cost.spending_limits`                | cross-field: `daily_usd ≤ monthly_usd` when both set |
@@ -191,7 +190,7 @@ Cross-section rules are part of the default `validate()` pass. A future strict-l
 | `main.rs`  | Loads the config at startup, maps each section into domain types, passes them down                                                                                                     |
 | `agent`    | Consumes `AgentConfig`, `SessionConfig`, `CostConfig`                                                                                                                                  |
 | `llm`      | Receives `LlmProviderConfig` built from `LlmConfig`                                                                                                                                    |
-| `tools`    | Receives `ToolsConfig::default_timeout_ms`. (Once MCP lands again, it will also receive `McpServerConfig` list built from `ToolsConfig::mcp_servers`.)                                 |
+| `tools`    | No `aura.json` section: per-tool timeouts come from `Tool::max_timeout`. (Once MCP lands again, the workspace-local `.mcp.json` continues to own MCP server records.)                                 |
 | `channels` | Channel adapters are registered based on `ChannelsConfig` section enablement                                                                                                           |
 | `hook`     | `ConfigChange` is an extension point that _observes_ or _vetoes_ proposed changes. It does **not** emit provenance — provenance is recorded by the bootstrap/agent layer into `trace`. |
 | `trace`    | Records `provider_config_hash` / `config_version` in `ExecutionProvenance` when config is loaded or changed                                                                            |

@@ -142,6 +142,15 @@ impl Tool for BashTool {
         }
     }
 
+    fn max_timeout(&self) -> Duration {
+        // Builds, test suites and migration scripts are all fair game
+        // through Bash, so the trait default 30 s would clip anything
+        // non-trivial. Cap the *outer* deadline at 10 min; per-call
+        // `timeout_ms` (and the in-tool sandbox spawn) still tighten
+        // further.
+        Duration::from_secs(600)
+    }
+
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
         // Sandboxed commands skip the pre-execution approval gate by
         // default. The OS sandbox constrains filesystem reach, and the

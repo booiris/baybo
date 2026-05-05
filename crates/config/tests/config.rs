@@ -151,14 +151,6 @@ fn max_iterations_bounds() {
 }
 
 #[test]
-fn tool_timeout_must_be_at_least_100ms() {
-    let mut c = AuraConfig::default();
-    c.agent.default_tool_timeout_ms = 50;
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "agent.default_tool_timeout_ms"));
-}
-
-#[test]
 fn session_timeout_must_be_positive() {
     let mut c = AuraConfig::default();
     c.session.timeout_minutes = 0;

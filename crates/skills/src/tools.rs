@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::TrustLevel;
@@ -89,6 +90,14 @@ impl Tool for SkillTool {
             },
             "required": ["skill"]
         })
+    }
+
+    fn max_timeout(&self) -> Duration {
+        // The risk assessor is an LLM call on every invocation and
+        // routinely takes 10-20 s; the trait-default 30 s leaves no
+        // headroom for the file read that follows. 60 s covers a
+        // slow assessor turn plus the SKILL.md / sub-file load.
+        Duration::from_secs(60)
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
@@ -410,6 +419,14 @@ impl Tool for SkillInstallTool {
             },
             "required": ["source_dir"]
         })
+    }
+
+    fn max_timeout(&self) -> Duration {
+        // The pipeline is risk-assessor LLM call + recursive directory
+        // copy + registry hot-reload. A bigger skill bundle (templates
+        // + scripts + reference docs) plus a slow assessor turn
+        // routinely exceeds 30 s; 120 s is the comfortable upper bound.
+        Duration::from_secs(120)
     }
 
     fn accessed_resources(&self, _params: &Value) -> Vec<ToolResourceAccess> {

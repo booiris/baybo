@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use aura_llm::{ChatRequest, LlmCompletion};
@@ -219,6 +219,15 @@ impl Tool for CodeBuilderTool {
             },
             "required": ["task"]
         })
+    }
+
+    fn max_timeout(&self) -> Duration {
+        // The sandboxed program is hard-capped at
+        // `HardCaps::wall_clock_seconds` (120s); add headroom for the
+        // planner LLM round-trip + uv setup + per-path approval
+        // prompts. The executor's APPROVAL_HEADROOM is layered on top
+        // of this for the mid-execution gate.
+        Duration::from_secs(180)
     }
 
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {

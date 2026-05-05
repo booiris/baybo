@@ -280,7 +280,6 @@ impl AgentTestHarnessBuilder {
         let approval_gates = Arc::new(ApprovalGateMap::new());
         let tool_executor = Arc::new(ToolExecutor::new(
             tool_registry.clone(),
-            Duration::from_secs(5),
             approval_gates,
             gateway.clone(),
             std::path::PathBuf::from("/tmp"),

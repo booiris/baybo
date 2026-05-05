@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use aura_agent::policy::ExecutionPolicy;
 use aura_config::{
-    AgentConfig, AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, SessionConfig, ToolsConfig,
+    AgentConfig, AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, SessionConfig,
     WorkspaceConfig,
 };
 use aura_context::TokenBudget;
@@ -195,7 +195,6 @@ pub fn load_encryption_key(cfg: &SecurityConfig) -> anyhow::Result<EncryptionKey
 pub fn to_execution_policy(cfg: &AgentConfig) -> ExecutionPolicy {
     ExecutionPolicy {
         max_iterations: cfg.max_iterations,
-        default_tool_timeout_ms: cfg.default_tool_timeout_ms,
     }
 }
 
@@ -213,10 +212,6 @@ pub fn to_token_budget(cfg: &aura_config::ContextConfig) -> TokenBudget {
 
 pub fn to_session_timeout(cfg: &SessionConfig) -> chrono::Duration {
     chrono::Duration::minutes(cfg.timeout_minutes as i64)
-}
-
-pub fn to_tool_timeout(cfg: &ToolsConfig) -> std::time::Duration {
-    std::time::Duration::from_millis(cfg.default_timeout_ms)
 }
 
 pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
@@ -238,20 +233,16 @@ pub fn build_leak_detector(cfg: &SecurityConfig) -> LeakDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_config::{
-        AgentConfig, ContextConfig, SecurityConfig, SessionConfig, ToolsConfig, WorkspaceConfig,
-    };
+    use aura_config::{AgentConfig, ContextConfig, SecurityConfig, SessionConfig, WorkspaceConfig};
 
     #[test]
-    fn execution_policy_maps_both_fields() {
+    fn execution_policy_maps_max_iterations() {
         let cfg = AgentConfig {
             max_iterations: 42,
-            default_tool_timeout_ms: 7_500,
             ..AgentConfig::default()
         };
         let policy = to_execution_policy(&cfg);
         assert_eq!(policy.max_iterations, 42);
-        assert_eq!(policy.default_tool_timeout_ms, 7_500);
     }
 
     #[test]
@@ -261,14 +252,6 @@ mod tests {
             ..SessionConfig::default()
         };
         assert_eq!(to_session_timeout(&cfg), chrono::Duration::minutes(15));
-    }
-
-    #[test]
-    fn tool_timeout_converts_millis() {
-        let cfg = ToolsConfig {
-            default_timeout_ms: 250,
-        };
-        assert_eq!(to_tool_timeout(&cfg), std::time::Duration::from_millis(250));
     }
 
     #[test]

@@ -108,7 +108,6 @@ fn tool_output_to_trace_value(output: &ToolOutput) -> Value {
 /// observability recording.
 pub struct ToolExecutor {
     tool_registry: Arc<ToolRegistry>,
-    default_timeout: Duration,
     gate_map: Arc<ApprovalGateMap>,
     security_gateway: Arc<SecurityGateway>,
     workspace_root: PathBuf,
@@ -118,7 +117,6 @@ pub struct ToolExecutor {
 impl ToolExecutor {
     pub fn new(
         tool_registry: Arc<ToolRegistry>,
-        default_timeout: Duration,
         gate_map: Arc<ApprovalGateMap>,
         security_gateway: Arc<SecurityGateway>,
         workspace_root: PathBuf,
@@ -126,7 +124,6 @@ impl ToolExecutor {
     ) -> Self {
         Self {
             tool_registry,
-            default_timeout,
             gate_map,
             security_gateway,
             workspace_root,
@@ -241,11 +238,19 @@ impl ToolExecutor {
 
                 // Approval gate: derive resource accesses from the tool
                 // and check them against the session's cached approvals.
-                let (accesses, call_label) = self
+                // Also pull the tool's declared `max_timeout` (default
+                // 30 s) so the executor uses the right deadline below.
+                let (accesses, call_label, effective_timeout) = self
                     .tool_registry
                     .get(&tool_name_owned)
-                    .map(|tool| (tool.accessed_resources(&params), tool.call_label(&params)))
-                    .unwrap_or_default();
+                    .map(|tool| {
+                        (
+                            tool.accessed_resources(&params),
+                            tool.call_label(&params),
+                            tool.max_timeout(),
+                        )
+                    })
+                    .unwrap_or_else(|| (Vec::new(), None, Duration::from_secs(30)));
 
                 let uncovered: Vec<ResourceAccess> = {
                     let approved = approved_resources.lock();
@@ -349,7 +354,7 @@ impl ToolExecutor {
                 let ctx = ToolContext {
                     session_id: session_id.to_string(),
                     user: user.clone(),
-                    timeout: self.default_timeout,
+                    timeout: effective_timeout,
                     cancellation_token: cancel_token,
                     workspace_root: self.workspace_root.clone(),
                     sandbox,

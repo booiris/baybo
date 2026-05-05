@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 pub struct AgentConfig {
     /// Maximum LLM iterations per user message before the loop stops.
     pub max_iterations: usize,
-    /// Default timeout for tool execution in milliseconds.
-    pub default_tool_timeout_ms: u64,
     /// Context window configuration.
     pub context: ContextConfig,
 }
@@ -16,7 +14,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_iterations: 20,
-            default_tool_timeout_ms: 30_000,
             context: ContextConfig::default(),
         }
     }

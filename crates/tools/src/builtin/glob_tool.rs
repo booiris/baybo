@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -56,6 +57,13 @@ impl Tool for GlobTool {
             },
             "required": ["pattern", "path"]
         })
+    }
+
+    fn max_timeout(&self) -> Duration {
+        // Recursive walks against large monorepos can blow past 30 s
+        // even with the SCAN_CAP early-exit; 60 s gives headroom while
+        // still bounding a runaway pattern.
+        Duration::from_secs(60)
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {

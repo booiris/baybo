@@ -24,7 +24,6 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 | `to_execution_policy` | `AgentConfig` → `aura_agent::ExecutionPolicy` |
 | `to_token_budget` | `ContextConfig` → `aura_context::TokenBudget` |
 | `to_session_timeout` | `SessionConfig` → `chrono::Duration` |
-| `to_tool_timeout` | `ToolsConfig` → `std::time::Duration` |
 | `build_leak_detector` | `SecurityConfig` → `aura_security::LeakDetector` |
 | `storage_db_path` | `WorkspaceConfig` → `PathBuf` at `<workspace.path>/storage.db` (the workspace root is itself the aura data directory) |
 

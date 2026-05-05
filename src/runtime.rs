@@ -415,7 +415,6 @@ pub async fn build_managers(
     info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
-        boot::to_tool_timeout(&config.tools),
         gate_map,
         Arc::clone(&security_gateway),
         sandbox_root,

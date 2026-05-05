@@ -1,7 +1,6 @@
 {
   "agent": {
     "max_iterations": 20,
-    "default_tool_timeout_ms": 30000,
     "context": {
       "max_tokens": 120000,
       "compression_threshold": 0.75,
@@ -25,9 +24,6 @@
   },
   "skills": {
     "risk_check": "primary"
-  },
-  "tools": {
-    "default_timeout_ms": 30000
   },
   "cost": {
     "spending_limits": {

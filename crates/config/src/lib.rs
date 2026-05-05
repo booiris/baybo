@@ -44,7 +44,7 @@ pub use crate::llm::LlmEntry;
 pub use crate::security::SecurityConfig;
 pub use crate::session::SessionConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
-pub use crate::tools::{ToolsConfig, TrustLevelConfig};
+pub use crate::tools::TrustLevelConfig;
 pub use crate::workspace::WorkspaceConfig;
 
 /// Root configuration object for Aura.
@@ -66,7 +66,6 @@ pub struct AuraConfig {
     pub channels: ChannelsConfig,
     pub security: SecurityConfig,
     pub skills: SkillsConfig,
-    pub tools: ToolsConfig,
     pub cost: CostConfig,
     pub workspace: WorkspaceConfig,
     pub gateway: GatewayConfig,

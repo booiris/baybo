@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_storage::BlobStore;
@@ -87,6 +88,16 @@ impl Tool for McpTool {
 
     fn accessed_resources(&self, _params: &Value) -> Vec<ResourceAccess> {
         self.default_resource_access.clone()
+    }
+
+    fn max_timeout(&self) -> Duration {
+        // Upstream MCP servers can be anything from a quick stdio
+        // round-trip to a remote HTTP API doing real work. The
+        // trait-default 30 s is too tight for the latter; 60 s is a
+        // reasonable common ceiling. A future per-server config
+        // (`McpServerEntry::max_timeout_secs`) can override this
+        // when an operator knows their server needs more headroom.
+        Duration::from_secs(60)
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {

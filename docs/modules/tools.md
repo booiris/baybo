@@ -179,6 +179,20 @@ Cross-host redirects are still rejected inside the redirect policy (with a "re-i
 
 `tool_definitions()` exposes only `name`, `description`, and `parameters_schema` to the model. Capabilities and trust level are never exposed.
 
+### Per-tool timeout ceiling
+
+Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self) -> Duration` (default 30 s). `ToolExecutor` reads it per call, writes the result into `ToolContext::timeout`, and uses it to size the outer cancel deadline (`+ APPROVAL_HEADROOM`). There is no `aura.json` knob — the cap lives in code, where the tool author already knows the right ceiling for the workload they own.
+
+Current overrides:
+
+- `BashTool` → 600 s — builds, test suites, and migrations regularly run for minutes; the per-call `timeout_ms` parameter still tightens further inside the tool.
+- `CodeBuilderTool` → 180 s — the sandboxed program is hard-capped at 120 s; the extra 60 s covers planner LLM round-trip, uv setup, and per-path approval prompts.
+- `WebFetchTool` → 120 s — slow upstreams need headroom, but a stuck host shouldn't pin a turn forever; `connect_timeout` independently caps the connect phase at 10 s.
+- `SkillInstallTool` → 120 s — risk-assessor LLM call + recursive directory copy + registry hot-reload, against bundles that may carry templates + scripts + reference docs.
+- `GlobTool`, `GrepTool`, `SendFileTool`, `SkillTool`, `McpTool` → 60 s — recursive walks against large monorepos (`Glob`, `Grep`), 100-MiB file streams into the blob store (`SendFile`), the per-call risk-assessor LLM round-trip (`Skill`), and arbitrary upstream MCP servers (`McpTool`) all routinely overflow the 30 s default.
+
+All other builtins (`Read`, `Write`, `Edit`, `Echo`, `Now`, `CronCreate`, `CronDelete`, `CronList`, `SkillUninstall`, every `todo` stub) use the default — they're either pure data ops or fail fast.
+
 ### Output control
 
 Tool output should prefer structured `Json`, use `LargeText` for long text with truncation, and be sanitized before entering Job or Trace.

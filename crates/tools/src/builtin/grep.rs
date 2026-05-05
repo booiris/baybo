@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -84,6 +85,13 @@ impl Tool for GrepTool {
             },
             "required": ["pattern", "path"]
         })
+    }
+
+    fn max_timeout(&self) -> Duration {
+        // Walk-and-match across a large tree (up to 50k files, 10 MiB
+        // per file) can exceed 30 s; 60 s gives headroom inside the
+        // tool's own MAX_FILES_VISITED / MAX_HITS caps.
+        Duration::from_secs(60)
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {

@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::{ContentBlock, TrustLevel};
@@ -81,6 +82,14 @@ impl Tool for SendFileTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn max_timeout(&self) -> Duration {
+        // Streams up to 100 MiB into BlobStore. On a slow disk the
+        // copy alone can take tens of seconds, so the trait-default
+        // 30 s is tight; 60 s covers the worst case while still
+        // bounding a stuck blob backend.
+        Duration::from_secs(60)
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {

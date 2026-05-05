@@ -52,6 +52,17 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Maximum wall-clock time this tool is allowed to run, declared
+    /// by the tool itself. The default is 30 s; tools whose natural
+    /// upper bound differs (e.g. `BashTool` for long shell commands,
+    /// `WebFetchTool` for network round-trips) override this. The
+    /// returned value is what the executor places into
+    /// [`ToolContext::timeout`] and uses to size the outer cancel
+    /// deadline.
+    fn max_timeout(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput>;
 }
 

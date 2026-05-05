@@ -9,7 +9,6 @@ use crate::error::{ConfigError, ValidationError};
 use crate::gateway::GatewayConfig;
 use crate::llm::LlmEntry;
 use crate::session::SessionConfig;
-use crate::tools::ToolsConfig;
 use crate::workspace::WorkspaceConfig;
 
 impl AuraConfig {
@@ -22,7 +21,6 @@ impl AuraConfig {
         validate_agent(self, &mut errors);
         validate_session(&self.session, &mut errors);
         validate_channels(&self.channels, &mut errors);
-        validate_tools(&self.tools, &mut errors);
         validate_cost(&self.cost, &mut errors);
         validate_workspace(&self.workspace, &mut errors);
         validate_gateway(&self.gateway, &mut errors);
@@ -86,12 +84,6 @@ fn validate_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
         errors.push(ValidationError::new(
             "agent.max_iterations",
             "must be <= 1000",
-        ));
-    }
-    if agent.default_tool_timeout_ms < 100 {
-        errors.push(ValidationError::new(
-            "agent.default_tool_timeout_ms",
-            "must be >= 100",
         ));
     }
     let ctx = &agent.context;
@@ -183,15 +175,6 @@ fn validate_channels(channels: &ChannelsConfig, errors: &mut Vec<ValidationError
                 "must be non-empty",
             ));
         }
-    }
-}
-
-fn validate_tools(tools: &ToolsConfig, errors: &mut Vec<ValidationError>) {
-    if tools.default_timeout_ms < 100 {
-        errors.push(ValidationError::new(
-            "tools.default_timeout_ms",
-            "must be >= 100",
-        ));
     }
 }
 

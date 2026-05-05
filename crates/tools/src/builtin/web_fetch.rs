@@ -213,6 +213,15 @@ Usage notes:
         })
     }
 
+    fn max_timeout(&self) -> Duration {
+        // Network fetches over slow upstreams routinely take longer
+        // than the trait-default 30 s, but we don't want a stuck host
+        // to block forever either. 2 minutes is a comfortable upper
+        // bound — `connect_timeout` already caps the connect phase at
+        // 10 s independently.
+        Duration::from_secs(120)
+    }
+
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
         // Three buckets, only the third actually prompts:
         //   1. hostname URL → []. The SSRF resolver is the sole guard;
