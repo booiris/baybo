@@ -330,6 +330,12 @@ pub async fn build_managers(
             risk_check,
         );
         tool_registry.register(install_tool, install_manifest);
+
+        let (uninstall_tool, uninstall_manifest) = aura_skills::tools::build_uninstall_tool(
+            workspace_paths.skills_dir(),
+            Arc::clone(&skill_registry),
+        );
+        tool_registry.register(uninstall_tool, uninstall_manifest);
     }
 
     // --- security gateway + tool executor

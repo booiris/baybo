@@ -524,6 +524,126 @@ impl Tool for SkillInstallTool {
     }
 }
 
+pub fn build_uninstall_tool(
+    workspace_skills_dir: PathBuf,
+    registry: Arc<SkillRegistry>,
+) -> (Arc<dyn Tool>, ToolManifest) {
+    let tool: Arc<dyn Tool> = Arc::new(SkillUninstallTool {
+        workspace_skills_dir,
+        registry,
+    });
+    let manifest = ToolManifest {
+        name: tool.name().to_string(),
+        description: tool.description().to_string(),
+        trust_level: TrustLevel::Trusted,
+        parameters_schema: tool.parameters_schema(),
+        capabilities: vec![ToolCapability::WriteFile],
+    };
+    (tool, manifest)
+}
+
+pub struct SkillUninstallTool {
+    workspace_skills_dir: PathBuf,
+    registry: Arc<SkillRegistry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UninstallParams {
+    name: String,
+}
+
+#[async_trait]
+impl Tool for SkillUninstallTool {
+    fn name(&self) -> &str {
+        "SkillUninstall"
+    }
+
+    fn description(&self) -> &str {
+        "Remove an installed skill from the workspace's skills folder. \
+         Refuses skills that aren't on disk under the workspace skills \
+         dir (so registry-only or third-party-mounted skills aren't \
+         accidentally deleted). The registry is hot-reloaded so the \
+         skill disappears from the next turn's listing."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the registered skill to remove."
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    fn accessed_resources(&self, _params: &Value) -> Vec<ToolResourceAccess> {
+        vec![ToolResourceAccess::WriteFile {
+            path: self.workspace_skills_dir.clone(),
+        }]
+    }
+
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        let p: UninstallParams =
+            serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+
+        let skill = self
+            .registry
+            .get(&p.name)
+            .ok_or_else(|| ToolError::NotFound(format!("skill '{}'", p.name)))?;
+
+        let source_path = skill.source_path.as_deref().ok_or_else(|| {
+            ToolError::Execution(format!(
+                "skill '{}' has no on-disk directory; cannot uninstall",
+                p.name
+            ))
+        })?;
+
+        // Canonicalize both sides before the prefix check — symlinks
+        // could otherwise let an attacker register a skill whose
+        // source_path resolves outside the skills dir but compares
+        // equal at the lexical level.
+        let real_source = tokio::fs::canonicalize(source_path).await.map_err(|e| {
+            ToolError::Execution(format!("canonicalize {}: {e}", source_path.display()))
+        })?;
+        let real_root = tokio::fs::canonicalize(&self.workspace_skills_dir)
+            .await
+            .map_err(|e| ToolError::Execution(format!("canonicalize skills dir: {e}")))?;
+        if !real_source.starts_with(&real_root) {
+            return Err(ToolError::Denied {
+                tool: self.name().to_string(),
+                reason: format!(
+                    "skill '{}' lives outside the workspace skills directory; refusing to delete {}",
+                    p.name,
+                    real_source.display()
+                ),
+            });
+        }
+        // Refuse to recurse into the skills root itself if a skill
+        // somehow registered with `source_path = <skills_dir>`.
+        if real_source == real_root {
+            return Err(ToolError::Denied {
+                tool: self.name().to_string(),
+                reason: "skill source_path equals the skills root; refusing to delete".into(),
+            });
+        }
+
+        tokio::fs::remove_dir_all(&real_source)
+            .await
+            .map_err(|e| ToolError::Execution(format!("remove {}: {e}", real_source.display())))?;
+
+        let reloaded = self.registry.reload();
+
+        Ok(ToolOutput::Json(json!({
+            "name": skill.name,
+            "removed_from": path_to_string(&real_source),
+            "registry_loaded": reloaded,
+        })))
+    }
+}
+
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     let mut total_files: usize = 0;
     let mut total_bytes: u64 = 0;
@@ -971,5 +1091,106 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(_)));
+    }
+
+    fn uninstall_tool(skills_dir: &Path, registry: Arc<SkillRegistry>) -> SkillUninstallTool {
+        SkillUninstallTool {
+            workspace_skills_dir: skills_dir.to_path_buf(),
+            registry,
+        }
+    }
+
+    #[tokio::test]
+    async fn uninstall_removes_dir_and_reloads_registry() {
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        let skill_dir = skills_dir.join("demo");
+        fs::create_dir(&skill_dir).unwrap();
+        write_minimal_skill(&skill_dir, "demo");
+        fs::create_dir(skill_dir.join("references")).unwrap();
+        fs::write(skill_dir.join("references/a.md"), "x").unwrap();
+
+        let registry = Arc::new(SkillRegistry::new());
+        let loaded = registry.load_dir(&skills_dir);
+        assert_eq!(loaded, 1);
+        assert!(registry.get("demo").is_some());
+
+        let tool = uninstall_tool(&skills_dir, Arc::clone(&registry));
+        let out = tool
+            .execute(json!({"name": "demo"}), &mk_ctx())
+            .await
+            .unwrap();
+        let v = match out {
+            ToolOutput::Json(v) => v,
+            other => panic!("expected json, got {other:?}"),
+        };
+        assert_eq!(v["name"], "demo");
+        assert_eq!(v["registry_loaded"], 0);
+        assert!(!skill_dir.exists());
+        assert!(registry.get("demo").is_none());
+    }
+
+    #[tokio::test]
+    async fn uninstall_unknown_skill_returns_not_found() {
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        let registry = Arc::new(SkillRegistry::new());
+        let tool = uninstall_tool(&skills_dir, registry);
+
+        let err = tool
+            .execute(json!({"name": "ghost"}), &mk_ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn uninstall_refuses_skill_outside_workspace() {
+        // Skill loaded from a directory outside the workspace skills
+        // root must not be deletable through this tool — the LLM is
+        // not allowed to roam the host filesystem.
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+
+        let other = tempdir().unwrap();
+        let outside = other.path().join("rogue");
+        fs::create_dir(&outside).unwrap();
+        write_minimal_skill(&outside, "rogue");
+
+        let registry = Arc::new(SkillRegistry::new());
+        registry.load_dir(other.path());
+        assert!(registry.get("rogue").is_some());
+
+        let tool = uninstall_tool(&skills_dir, registry);
+        let err = tool
+            .execute(json!({"name": "rogue"}), &mk_ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }));
+        assert!(outside.exists());
+    }
+
+    #[tokio::test]
+    async fn uninstall_refuses_inline_skill() {
+        // A registered skill with no source_path (e.g. directly
+        // injected for tests) has nothing on disk to delete.
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+
+        let mut def = mk_skill(workspace.path(), "inline");
+        def.source_path = None;
+        let registry = Arc::new(SkillRegistry::new());
+        registry.register(def);
+
+        let tool = uninstall_tool(&skills_dir, registry);
+        let err = tool
+            .execute(json!({"name": "inline"}), &mk_ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
     }
 }
