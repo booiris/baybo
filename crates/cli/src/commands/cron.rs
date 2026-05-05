@@ -1,4 +1,4 @@
-use aura_cron::{CronJob, CronStatus};
+use aura_cron::CronJob;
 use serde_json::{Value, json};
 
 use crate::cli::CronCmd;
@@ -18,13 +18,6 @@ fn cron(ctx: &CommandContext) -> Result<&aura_agent::CronScheduler> {
     })
 }
 
-fn status_label(s: &CronStatus) -> &'static str {
-    match s {
-        CronStatus::Enabled => "enabled",
-        CronStatus::Disabled => "disabled",
-    }
-}
-
 fn job_summary(j: &CronJob) -> Value {
     json!({
         "id": j.id,
@@ -32,7 +25,7 @@ fn job_summary(j: &CronJob) -> Value {
         "channel": format!("{:?}", j.channel),
         "schedule": j.schedule.display(),
         "one_shot": j.is_one_shot(),
-        "status": status_label(&j.status),
+        "status": j.status.as_str(),
         "next_trigger_at": j.next_trigger_at.map(|t| t.to_rfc3339()),
         "last_triggered_at": j.last_triggered_at.map(|t| t.to_rfc3339()),
     })
@@ -62,7 +55,7 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
             "{:<38}  {:<9}  {:<8}  {:<20}  {}\n",
             j.id,
             j.user_id,
-            status_label(&j.status),
+            j.status.as_str(),
             j.schedule.display(),
             j.next_trigger_at
                 .map(|t| t.to_rfc3339())

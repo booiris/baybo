@@ -72,6 +72,11 @@ pub trait CostStore: Send + Sync {
     /// Return an aggregated summary of all records within the given time range.
     async fn query_global(&self, range: TimeRange) -> CostResult<CostSummary>;
 
+    /// Return the raw `CostRecord`s within the time range (any user).
+    /// Powers analytics aggregations that need a per-day or per-model
+    /// breakdown the summary methods don't expose.
+    async fn query_records_in_range(&self, range: TimeRange) -> CostResult<Vec<CostRecord>>;
+
     /// Return the aggregated cost summary for a single session. Drives
     /// `QueryApi::cost_summary(CostScope::Session)`.
     async fn query_session(&self, session_id: &aura_model::SessionId) -> CostResult<CostSummary>;

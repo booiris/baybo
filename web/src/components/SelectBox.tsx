@@ -10,11 +10,11 @@ const CARET_SVG =
 export function SelectBox({ className = '', children, ...rest }: SelectBoxProps) {
   return (
     <select
-      className={`px-4 pr-10 py-3 border-2 border-black rounded-md bg-white font-semibold text-[0.95rem] cursor-pointer outline-none appearance-none ${className}`}
+      className={`inline-flex items-center px-4 pr-10 border-[3px] border-black rounded-md bg-white font-bold text-[0.95rem] cursor-pointer outline-none appearance-none transition-all leading-none ${className}`}
       style={{
         backgroundImage: CARET_SVG,
         backgroundRepeat: 'no-repeat',
-        backgroundPosition: 'right 1rem center',
+        backgroundPosition: 'right 0.8rem center',
         backgroundSize: '10px auto',
       }}
       {...rest}

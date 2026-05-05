@@ -231,6 +231,18 @@ impl CostStore for MemoryCostStore {
         Ok(summary)
     }
 
+    async fn query_records_in_range(&self, range: TimeRange) -> CostResult<Vec<CostRecord>> {
+        let mut out: Vec<CostRecord> = self
+            .records
+            .lock()
+            .iter()
+            .filter(|r| in_range(r, &range))
+            .cloned()
+            .collect();
+        out.sort_by_key(|r| r.timestamp);
+        Ok(out)
+    }
+
     async fn query_session(&self, session_id: &SessionId) -> CostResult<CostSummary> {
         let mut summary = CostSummary::default();
         for r in self

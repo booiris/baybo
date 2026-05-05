@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{CronSchedule, CronScheduler, CronStatus, TriggerAction};
+use crate::{CronSchedule, CronScheduler, DEFAULT_TIMEZONE, TriggerAction};
 
 /// Build every cron tool with its manifest, ready to be registered with a
 /// `ToolRegistry`. Always `Trusted` with no capabilities — they operate on
@@ -59,6 +59,8 @@ struct CreateParams {
     tool: Option<String>,
     #[serde(default)]
     params: Option<Value>,
+    #[serde(default)]
+    timezone: Option<String>,
 }
 
 #[async_trait]
@@ -99,6 +101,10 @@ impl Tool for CronCreateTool {
                 "params": {
                     "type": "object",
                     "description": "JSON parameters for the tool (requires `tool`)"
+                },
+                "timezone": {
+                    "type": "string",
+                    "description": "IANA timezone name the cron expression is interpreted in (e.g. \"Asia/Shanghai\"). Defaults to \"UTC\". Ignored for `at`."
                 }
             }
         })
@@ -142,6 +148,7 @@ impl Tool for CronCreateTool {
             }
         };
 
+        let timezone = p.timezone.unwrap_or_else(|| DEFAULT_TIMEZONE.to_string());
         let job = self
             .scheduler
             .create_job(
@@ -149,6 +156,7 @@ impl Tool for CronCreateTool {
                 ctx.user.channel.clone(),
                 schedule,
                 action,
+                timezone,
                 Some(ctx.session_id.clone()),
             )
             .await
@@ -261,10 +269,7 @@ impl Tool for CronListTool {
                     "channel": format!("{}", j.channel),
                     "schedule": j.schedule.display(),
                     "one_shot": j.is_one_shot(),
-                    "status": match j.status {
-                        CronStatus::Enabled => "enabled",
-                        CronStatus::Disabled => "disabled",
-                    },
+                    "status": j.status.as_str(),
                     "next_trigger_at": j.next_trigger_at.map(|t| t.to_rfc3339()),
                 })
             })

@@ -3,11 +3,41 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Lifecycle state of a cron job row.
+///
+/// `Executed` is reserved for one-shot (`At`) jobs after their single
+/// fire — the row is kept (not deleted) so callers and the web UI can
+/// see "this fired" history. Recurring (`Cron`) jobs cycle between
+/// `Enabled` and `Disabled` and never enter `Executed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CronStatus {
     Enabled,
     Disabled,
+    Executed,
+}
+
+/// Default IANA timezone applied to a `CronJob` when none was supplied.
+/// UTC keeps fire-time semantics deterministic across servers; callers
+/// (gateway, LLM tool, web form) all converge on this so the `serde`
+/// default and the create-path defaults agree.
+pub const DEFAULT_TIMEZONE: &str = "UTC";
+
+fn default_timezone() -> String {
+    DEFAULT_TIMEZONE.to_string()
+}
+
+impl CronStatus {
+    /// Stable wire string. Mirrors `serde(rename_all = "snake_case")` so
+    /// the storage row, CLI labels, and tool output stay in lockstep
+    /// without three independent match ladders that can drift.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CronStatus::Enabled => "enabled",
+            CronStatus::Disabled => "disabled",
+            CronStatus::Executed => "executed",
+        }
+    }
 }
 
 /// When a cron job fires.
@@ -79,6 +109,12 @@ pub struct CronJob {
     pub schedule: CronSchedule,
     /// What to do when the job fires.
     pub action: TriggerAction,
+    /// IANA timezone (e.g. `"Asia/Shanghai"`, `"UTC"`) the cron expression
+    /// is evaluated in. Has no effect for `At` schedules — those carry an
+    /// absolute UTC instant. Old rows without this field deserialize as
+    /// `"UTC"` to preserve their existing fire semantics.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
     pub status: CronStatus,
     pub last_triggered_at: Option<DateTime<Utc>>,
     /// Pre-computed next fire time for efficient DB queries. `None` means
@@ -157,6 +193,7 @@ mod tests {
             action: TriggerAction::Prompt {
                 prompt: "push news".to_string(),
             },
+            timezone: "Asia/Shanghai".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
             next_trigger_at: Some(Utc::now()),
@@ -168,6 +205,7 @@ mod tests {
         let restored: CronJob = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.id, "cj-1");
         assert_eq!(restored.status, CronStatus::Enabled);
+        assert_eq!(restored.timezone, "Asia/Shanghai");
         assert!(!restored.is_one_shot());
         assert!(restored.is_enabled());
         assert_eq!(restored.origin_session_id.as_deref(), Some("sess-1"));
@@ -184,6 +222,7 @@ mod tests {
             action: TriggerAction::Prompt {
                 prompt: "one shot".to_string(),
             },
+            timezone: "UTC".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
             next_trigger_at: Some(fire_at),
@@ -201,6 +240,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_row_without_timezone_defaults_to_utc() {
+        // Older rows persisted before the field existed must round-trip
+        // with `UTC` so their fire semantics don't silently change.
+        let json = r#"{
+            "id":"cj-old","user_id":"u-1","channel":"tui",
+            "schedule":{"kind":"cron","expr":"0 9 * * *"},
+            "action":{"kind":"prompt","prompt":"x"},
+            "status":"enabled","next_trigger_at":null,
+            "created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z"
+        }"#;
+        let restored: CronJob = serde_json::from_str(json).unwrap();
+        assert_eq!(restored.timezone, "UTC");
+    }
+
+    #[test]
     fn tool_call_round_trip() {
         let job = CronJob {
             id: "cj-2".to_string(),
@@ -214,6 +268,7 @@ mod tests {
                     host: aura_model::HostPattern::Exact("example.com".to_string()),
                 }],
             },
+            timezone: "UTC".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
             next_trigger_at: Some(Utc::now()),
@@ -243,6 +298,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CronStatus::Disabled).unwrap(),
             "\"disabled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CronStatus::Executed).unwrap(),
+            "\"executed\""
         );
     }
 

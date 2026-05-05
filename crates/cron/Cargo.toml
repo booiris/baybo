@@ -16,6 +16,7 @@ aura-storage = { workspace = true }
 aura-tools = { workspace = true }
 
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

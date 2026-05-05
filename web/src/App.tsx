@@ -2,15 +2,19 @@ import { useEffect, useState } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { RiLoader4Line } from 'react-icons/ri';
 import { Sidebar } from './components/Sidebar';
-import { TopNav } from './components/TopNav';
 import { LoginScreen } from './components/LoginScreen';
 import { LogsPage } from './pages/LogsPage';
+import { TracesPage } from './pages/TracesPage';
+import { TraceSessionPage } from './pages/TraceSessionPage';
+import { CronPage } from './pages/CronPage';
+import { AnalyticsPage } from './pages/AnalyticsPage';
 import { useAuth } from './api/auth';
 
 export default function App() {
   const { token, client, logout } = useAuth();
   const [isValidating, setIsValidating] = useState(true);
   const [isValid, setIsValid] = useState(false);
+  const [version, setVersion] = useState<string | undefined>();
 
   useEffect(() => {
     if (!token || !client) {
@@ -18,18 +22,19 @@ export default function App() {
       setIsValidating(false);
       return;
     }
-    
+
     setIsValidating(true);
     let canceled = false;
-    
+
     async function validate() {
       try {
-        const { response } = await client!.GET('/v1/status');
+        const { data, response } = await client!.GET('/v1/status');
         if (canceled) return;
         if (response.status === 401) {
           logout();
           setIsValid(false);
         } else {
+          setVersion(data?.version);
           setIsValid(true);
         }
       } catch {
@@ -38,7 +43,7 @@ export default function App() {
         if (!canceled) setIsValidating(false);
       }
     }
-    
+
     void validate();
     return () => { canceled = true; };
   }, [token, client, logout]);
@@ -55,12 +60,15 @@ export default function App() {
 
   return (
     <div className="flex h-screen">
-      <Sidebar />
+      <Sidebar version={version} />
       <main className="flex-1 flex flex-col overflow-hidden bg-canvas">
-        <TopNav breadcrumbs={['System Logs']} />
         <Routes>
           <Route path="/" element={<Navigate to="/logs" replace />} />
           <Route path="/logs" element={<LogsPage />} />
+          <Route path="/traces" element={<TracesPage />} />
+          <Route path="/traces/:id" element={<TraceSessionPage />} />
+          <Route path="/cron" element={<CronPage />} />
+          <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="*" element={<Navigate to="/logs" replace />} />
         </Routes>
       </main>
