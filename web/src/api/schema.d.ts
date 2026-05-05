@@ -4,6 +4,22 @@
  */
 
 export interface paths {
+    "/v1/analytics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_analytics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/channels": {
         parameters: {
             query?: never;
@@ -266,6 +282,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/traces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_traces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/traces/{session_id}": {
         parameters: {
             query?: never;
@@ -287,25 +319,63 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
-         * @description Mirror of [`aura_model::ApprovedResource`]. Paths serialize as
-         *     strings on the wire.
+         * @description One bucket per UTC day for the analytics chart.
+         *
+         *     `cost_micro_usd` is integer micro-USD (USD × 10^6). Rendering layers
+         *     divide by 1_000_000 to get USD; on-wire arithmetic stays exact.
          */
-        ApprovedResource: {
-            /** @enum {string} */
-            kind: "read_file";
-            path: string;
-        } | {
-            /** @enum {string} */
-            kind: "write_file";
-            path: string;
-        } | {
-            host: components["schemas"]["HostPattern"];
-            /** @enum {string} */
-            kind: "http";
-        } | {
-            command: string;
-            /** @enum {string} */
-            kind: "exec_command";
+        AnalyticsDayBucket: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
+            /**
+             * Format: int64
+             * @description Spend for the day, in **micro-USD** (1 USD = 1_000_000).
+             */
+            cost_micro_usd: number;
+            /** @description `YYYY-MM-DD` (UTC). */
+            date: string;
+            input_tokens: number;
+            output_tokens: number;
+            sessions_created: number;
+        };
+        /** @description Per-model breakdown row for the analytics dashboard. */
+        AnalyticsModelBucket: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
+            call_count: number;
+            /**
+             * Format: int64
+             * @description Spend for the model, in **micro-USD** (1 USD = 1_000_000).
+             */
+            cost_micro_usd: number;
+            input_tokens: number;
+            model: string;
+            output_tokens: number;
+        };
+        /** @description `GET /v1/analytics` response body. */
+        AnalyticsResponse: {
+            by_model: components["schemas"]["AnalyticsModelBucket"][];
+            daily: components["schemas"]["AnalyticsDayBucket"][];
+            /**
+             * Format: date-time
+             * @description Inclusive lower bound used for the aggregation (UTC).
+             */
+            since: string;
+            total_cache_creation_input_tokens: number;
+            total_cached_input_tokens: number;
+            /**
+             * Format: int64
+             * @description Total spend across the window, in **micro-USD** (1 USD = 1_000_000).
+             */
+            total_cost_micro_usd: number;
+            total_input_tokens: number;
+            total_output_tokens: number;
+            total_record_count: number;
+            /**
+             * Format: date-time
+             * @description Exclusive upper bound used for the aggregation (UTC).
+             */
+            until: string;
         };
         /**
          * @description Admin-surface mirror of [`aura_model::ChannelType`]. Transparent
@@ -323,11 +393,17 @@ export interface components {
             origin_session_id?: string | null;
             schedule: string;
             text: string;
+            /**
+             * @description IANA timezone (e.g. `"Asia/Shanghai"`) used to evaluate the cron
+             *     expression and to render time fields in responses. Required —
+             *     every time the API speaks is anchored to this zone, so callers
+             *     must commit to one explicitly.
+             */
+            timezone: string;
             user_id: string;
         };
         /** @description Mirror of [`aura_cron::CronJob`]. */
         CronJob: {
-            action: components["schemas"]["TriggerAction"];
             channel: components["schemas"]["ChannelType"];
             /** Format: date-time */
             created_at: string;
@@ -337,8 +413,10 @@ export interface components {
             /** Format: date-time */
             next_trigger_at?: string | null;
             origin_session_id?: string | null;
+            prompt: string;
             schedule: components["schemas"]["CronSchedule"];
             status: components["schemas"]["CronStatus"];
+            timezone: string;
             /** Format: date-time */
             updated_at: string;
             user_id: string;
@@ -358,7 +436,7 @@ export interface components {
          * @description Mirror of [`aura_cron::CronStatus`].
          * @enum {string}
          */
-        CronStatus: "enabled" | "disabled";
+        CronStatus: "enabled" | "disabled" | "executed";
         DiagnoseCheckEntry: {
             detail: string;
             name: string;
@@ -377,16 +455,6 @@ export interface components {
          */
         ErrorBody: {
             error: string;
-        };
-        /** @description Mirror of [`aura_model::HostPattern`]. */
-        HostPattern: {
-            /** @enum {string} */
-            kind: "exact";
-            value: string;
-        } | {
-            /** @enum {string} */
-            kind: "wildcard";
-            value: string;
         };
         /**
          * @description Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
@@ -527,17 +595,31 @@ export interface components {
             importance?: number | null;
             user_id?: string | null;
         };
-        /** @description Mirror of [`aura_cron::TriggerAction`]. */
-        TriggerAction: {
-            /** @enum {string} */
-            kind: "prompt";
-            prompt: string;
-        } | {
-            approved_resources: components["schemas"]["ApprovedResource"][];
-            /** @enum {string} */
-            kind: "tool_call";
-            params: Record<string, never>;
-            tool_name: string;
+        /**
+         * @description One row of the trace browser list view. Mirrors
+         *     [`aura_agent::SessionSummary`] for the wire.
+         */
+        TraceSessionSummary: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
+            /** Format: date-time */
+            created_at: string;
+            input_tokens: number;
+            job_count: number;
+            /** Format: date-time */
+            last_active: string;
+            latest_job_status?: null | components["schemas"]["JobStatus"];
+            output_tokens: number;
+            session_id: string;
+            span_count: number;
+        };
+        /**
+         * @description Envelope for `GET /v1/traces`. Carries `total` for "Showing X of N"
+         *     pagers, matching the shape of [`LogsResponse`].
+         */
+        TracesListResponse: {
+            items: components["schemas"]["TraceSessionSummary"][];
+            total: number;
         };
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
@@ -552,6 +634,38 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    get_analytics: {
+        parameters: {
+            query?: {
+                since?: string;
+                until?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregated tokens / cost / sessions over the time range */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AnalyticsResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_channels: {
         parameters: {
             query?: never;
@@ -801,7 +915,6 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
-                            action: components["schemas"]["TriggerAction"];
                             channel: components["schemas"]["ChannelType"];
                             /** Format: date-time */
                             created_at: string;
@@ -811,8 +924,10 @@ export interface operations {
                             /** Format: date-time */
                             next_trigger_at?: string | null;
                             origin_session_id?: string | null;
+                            prompt: string;
                             schedule: components["schemas"]["CronSchedule"];
                             status: components["schemas"]["CronStatus"];
+                            timezone: string;
                             /** Format: date-time */
                             updated_at: string;
                             user_id: string;
@@ -1488,6 +1603,46 @@ export interface operations {
                         }[];
                         next_cursor?: string | null;
                     };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_traces: {
+        parameters: {
+            query?: {
+                /** @description Filter on the latest job's status (snake_case enum). */
+                status?: components["schemas"]["JobStatusKind"];
+                /** @description Inclusive lower bound on `last_active`. */
+                since?: string;
+                /** @description Exclusive upper bound on `last_active`. */
+                until?: string;
+                /** @description Case-insensitive substring on session id. */
+                q?: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Paginated session summaries (newest active first) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TracesListResponse"];
                 };
             };
             /** @description Unauthorized */

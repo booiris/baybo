@@ -1,23 +1,25 @@
+//! Channel sidecar registration driver.
+//!
+//! Spawns the bundled `bun` sidecar in registration mode, drives the
+//! stdin/stdout JSON exchange (`RegisterIn` / `RegisterOut`), and
+//! returns the credentials it emits. Lifted from the previous
+//! `crates/cli/src/commands/channel/register.rs` — only the error
+//! type changed (`CliError` → `SetupError`).
+
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use aura_channels::register_wire::{MAX_FRAME_BYTES, PromptKind, RegisterIn, RegisterOut};
-use aura_channels::registration::{Prompter, RegistrationResult};
-use std::path::PathBuf;
-
+use aura_channels::registration::{Prompter as ChannelPrompter, RegistrationResult};
 use aura_gateway::{BUN_BINARY_ENV, SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
 use aura_model::ChannelType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 
-use crate::error::{CliError, Result};
+use crate::error::{Result, SetupError};
 
 const EXIT_GRACE: Duration = Duration::from_secs(5);
-
-// The registration subprocess inherits the same minimal env as the
-// supervised channel sidecars — see `aura_gateway::SIDECAR_ENV_ALLOWLIST`
-// for the canonical list. Keeping a single source of truth means a
-// future entry (or removal) lands in both spawn paths together.
 
 /// Spawn the channel's bundled sidecar in registration mode, drive the
 /// stdin/stdout JSON exchange, and return the credentials it emits.
@@ -27,11 +29,11 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 pub async fn run_registration(
     runtime: &SidecarRuntime,
     channel_type: &ChannelType,
-    prompter: &mut dyn Prompter,
+    prompter: &mut dyn ChannelPrompter,
     timeout: Duration,
 ) -> Result<RegistrationResult> {
     let bundle = runtime.bundle_for(channel_type.as_str()).ok_or_else(|| {
-        CliError::Config(format!(
+        SetupError::Channel(format!(
             "no embedded sidecar bundle for '{}' in this build",
             channel_type.as_str()
         ))
@@ -51,7 +53,7 @@ fn bun_binary() -> PathBuf {
 
 async fn drive(
     mut cmd: Command,
-    prompter: &mut dyn Prompter,
+    prompter: &mut dyn ChannelPrompter,
     timeout: Duration,
 ) -> Result<RegistrationResult> {
     cmd.stdin(Stdio::piped())
@@ -61,32 +63,28 @@ async fn drive(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| CliError::Io(format!("spawn registration subprocess: {e}")))?;
+        .map_err(|e| SetupError::Channel(format!("spawn registration subprocess: {e}")))?;
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| CliError::Io("child stdin was piped but missing".into()))?;
+        .ok_or_else(|| SetupError::Channel("child stdin was piped but missing".into()))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| CliError::Io("child stdout was piped but missing".into()))?;
+        .ok_or_else(|| SetupError::Channel("child stdout was piped but missing".into()))?;
 
     let result = tokio::time::timeout(timeout, pump(stdout, stdin, prompter))
         .await
         .map_err(|_| {
-            CliError::Config(format!(
+            SetupError::Channel(format!(
                 "registration timed out after {}s",
                 timeout.as_secs()
             ))
         })??;
 
-    // Once the sidecar has emitted its `Result` frame the registration
-    // is, by definition, complete — we have the credentials we need.
-    // Subsequent shutdown problems (slow cleanup hitting EXIT_GRACE,
-    // an unhandledRejection on disconnect, …) get logged for
-    // diagnostics but do not invalidate the captured result.
-    // `kill_on_drop(true)` ensures the child still dies when this
-    // function returns.
+    // Once the sidecar has emitted its `Result` frame we have the
+    // credentials we need. Subsequent shutdown problems get logged
+    // for diagnostics but do not invalidate the captured result.
     match tokio::time::timeout(EXIT_GRACE, child.wait()).await {
         Ok(Ok(status)) if !status.success() => {
             tracing::warn!(
@@ -113,7 +111,7 @@ async fn drive(
 async fn pump(
     stdout: ChildStdout,
     mut stdin: ChildStdin,
-    prompter: &mut dyn Prompter,
+    prompter: &mut dyn ChannelPrompter,
 ) -> Result<RegistrationResult> {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::new();
@@ -122,12 +120,12 @@ async fn pump(
         buf.clear();
         let eof = read_line_capped(&mut reader, &mut buf, MAX_FRAME_BYTES).await?;
         if eof && buf.is_empty() {
-            return Err(CliError::Config(
+            return Err(SetupError::Channel(
                 "sidecar closed stdout without emitting a result".into(),
             ));
         }
         let msg: RegisterOut = serde_json::from_slice(&buf)
-            .map_err(|e| CliError::Serialization(format!("parse sidecar frame: {e}")))?;
+            .map_err(|e| SetupError::Channel(format!("parse sidecar frame: {e}")))?;
 
         match msg {
             RegisterOut::Prompt {
@@ -140,18 +138,19 @@ async fn pump(
                     PromptKind::Input => prompter.input(&label, required),
                     PromptKind::Password => prompter.password(&label, required),
                 }
-                .map_err(|e| CliError::Config(format!("prompt failed: {e}")))?;
+                .map_err(|e| SetupError::Channel(format!("prompt failed: {e}")))?;
                 let reply = RegisterIn::PromptReply { id, value };
-                let mut bytes = serde_json::to_vec(&reply)?;
+                let mut bytes = serde_json::to_vec(&reply)
+                    .map_err(|e| SetupError::Channel(format!("serialize prompt reply: {e}")))?;
                 bytes.push(b'\n');
                 stdin
                     .write_all(&bytes)
                     .await
-                    .map_err(|e| CliError::Io(format!("write prompt reply: {e}")))?;
+                    .map_err(|e| SetupError::Channel(format!("write prompt reply: {e}")))?;
                 stdin
                     .flush()
                     .await
-                    .map_err(|e| CliError::Io(format!("flush prompt reply: {e}")))?;
+                    .map_err(|e| SetupError::Channel(format!("flush prompt reply: {e}")))?;
             }
             RegisterOut::Result {
                 bot_id,
@@ -167,7 +166,7 @@ async fn pump(
                 });
             }
             RegisterOut::Error { message } => {
-                return Err(CliError::Config(format!(
+                return Err(SetupError::Channel(format!(
                     "sidecar registration error: {message}"
                 )));
             }
@@ -185,7 +184,7 @@ async fn read_line_capped<R: AsyncReadExt + Unpin>(
         let n = reader
             .read(&mut byte)
             .await
-            .map_err(|e| CliError::Io(format!("read sidecar stdout: {e}")))?;
+            .map_err(|e| SetupError::Channel(format!("read sidecar stdout: {e}")))?;
         if n == 0 {
             return Ok(true);
         }
@@ -193,7 +192,7 @@ async fn read_line_capped<R: AsyncReadExt + Unpin>(
             return Ok(false);
         }
         if buf.len() >= max {
-            return Err(CliError::Config(format!(
+            return Err(SetupError::Channel(format!(
                 "sidecar frame exceeds {max} bytes"
             )));
         }
@@ -233,7 +232,7 @@ mod tests {
         }
     }
 
-    impl Prompter for FakePrompter {
+    impl ChannelPrompter for FakePrompter {
         fn input(&mut self, label: &str, _required: bool) -> anyhow::Result<String> {
             self.answers
                 .pop_front()

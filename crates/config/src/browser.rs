@@ -68,15 +68,14 @@ pub struct BrowserConfig {
 
     /// Override the per-sidecar Chrome profile directory.
     ///
-    /// Default: `<workspace_root>/work/.browser/profile` (computed by
+    /// Default: `<workspace_root>/state/browser/profile` (computed by
     /// `aura_gateway::collect_profiles` from `workspace.path`). The
     /// profile is **persistent across Aura restarts** (cookies /
     /// localStorage retained) and lives under the workspace so it
-    /// follows the operator's `workspace.path` and inherits the same
-    /// gitignore + lifecycle as other `work/` state. In docker mode
-    /// the same directory is bind-mounted at `/data/profile` inside
-    /// the container, so the path round-trips across host-headless
-    /// and docker modes (operator UID stays the owner).
+    /// follows the operator's `workspace.path`. In docker mode the
+    /// same directory is bind-mounted at `/data/profile` inside the
+    /// container, so the path round-trips across host-headless and
+    /// docker modes (operator UID stays the owner).
     ///
     /// Note that chrome-devtools-mcp serialises browser access — only
     /// one Aura process can drive a given profile dir at a time.

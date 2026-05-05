@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aura_job::{Job, JobError, JobKind, JobStatus, JobStatusKind};
-use aura_model::{JobId, Lineage, LineageKind, Session, SessionId, StepId};
+use aura_model::{JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId};
 use aura_storage::{
     CostError, CostStore, CostSummary, SessionStore, StorageError, TimeRange, TraceStore,
 };
@@ -172,6 +172,94 @@ pub enum CostScope {
 pub struct ReplayedConversation {
     pub session_id: SessionId,
     pub jobs: Vec<ReplayJob>,
+}
+
+/// Filter for [`QueryApi::list_session_summaries`]. All fields are
+/// AND-combined; `None` means no constraint. `status_kind` matches
+/// against the *latest* job's `JobStatusKind` (not any historical job).
+#[derive(Debug, Clone, Default)]
+pub struct SessionSummaryFilter {
+    pub status_kind: Option<JobStatusKind>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub session_id_prefix: Option<String>,
+}
+
+/// Offset/limit pagination for [`QueryApi::list_session_summaries`].
+/// `limit == 0` is treated as "no limit" — the full filtered list is
+/// returned. `offset` past the end yields an empty page.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionSummaryPage {
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// One row of the trace browser list view. Carries the cheap
+/// per-session aggregates the UI needs to render the table — full
+/// drill-in still goes through [`QueryApi::replay`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+    /// `None` when the session has no jobs (filtered out by default).
+    pub latest_job_status: Option<JobStatus>,
+    pub job_count: usize,
+    pub span_count: usize,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+}
+
+/// Result of [`QueryApi::list_session_summaries`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummaryListing {
+    pub items: Vec<SessionSummary>,
+    /// Total rows matching the filter, before pagination — drives the
+    /// `Showing X to Y of N` pager.
+    pub total: usize,
+}
+
+/// Result of [`QueryApi::compute_analytics`]. All counts/totals are
+/// over the supplied [`TimeRange`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnalyticsSummary {
+    pub total_input_tokens: usize,
+    pub total_output_tokens: usize,
+    pub total_cached_input_tokens: usize,
+    pub total_cache_creation_input_tokens: usize,
+    pub total_cost_usd: MicroUsd,
+    pub total_record_count: usize,
+    /// One bucket per UTC day in the range, oldest first. Days with no
+    /// activity still appear with zeros so the chart can render a
+    /// continuous x-axis.
+    pub daily: Vec<AnalyticsDayBucket>,
+    pub by_model: Vec<AnalyticsModelBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsDayBucket {
+    /// `YYYY-MM-DD` (UTC).
+    pub date: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    pub cost_usd: MicroUsd,
+    /// Distinct sessions whose `created_at` falls in this UTC day.
+    pub sessions_created: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsModelBucket {
+    pub model: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    pub cost_usd: MicroUsd,
+    pub call_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +492,8 @@ impl QueryApi {
                     summary.total_cost_usd += r.cost_usd;
                     summary.total_input_tokens += r.input_tokens;
                     summary.total_output_tokens += r.output_tokens;
+                    summary.total_cached_input_tokens += r.cached_input_tokens;
+                    summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
                     summary.record_count += 1;
                 }
                 Ok(summary)
@@ -411,6 +501,215 @@ impl QueryApi {
             CostScope::Session(sid) => Ok(costs.query_session(&sid).await?),
             CostScope::Job(jid) => Ok(costs.query_job(&jid).await?),
         }
+    }
+
+    // ── 10. list_session_summaries ─────────────────────────────
+
+    /// List session summaries for the trace browser. Filters apply
+    /// against `last_active` (time range), session id prefix, and the
+    /// **latest** job's status kind. Sessions with zero jobs are
+    /// dropped (a session with no trace is invisible to the browser).
+    ///
+    /// Cardinality: this iterates every live session and loads its
+    /// jobs/steps/spans to compute aggregates. Acceptable for the
+    /// admin surface (low request rate, modest session counts) and
+    /// avoids new storage methods. If session counts grow, the
+    /// natural follow-up is a denormalised per-session counter table.
+    pub async fn list_session_summaries(
+        &self,
+        filter: SessionSummaryFilter,
+        page: SessionSummaryPage,
+    ) -> Result<SessionSummaryListing> {
+        let mut sessions = self.sessions.list_all().await?;
+
+        // Cheap filters first so we don't pay per-session aggregate
+        // costs for rows about to be dropped.
+        if let Some(prefix) = filter.session_id_prefix.as_deref() {
+            let needle = prefix.to_ascii_lowercase();
+            sessions.retain(|s| s.id.as_str().to_ascii_lowercase().contains(&needle));
+        }
+        if let Some(since) = filter.since {
+            sessions.retain(|s| s.last_active >= since);
+        }
+        if let Some(until) = filter.until {
+            sessions.retain(|s| s.last_active < until);
+        }
+
+        // Now compute aggregates + apply latest-status filter +
+        // drop sessions with no jobs.
+        let mut summaries: Vec<SessionSummary> = Vec::new();
+        for session in &sessions {
+            let mut jobs = self.jobs.list_by_session(&session.id, None).await?;
+            if jobs.is_empty() {
+                continue;
+            }
+            // `list_by_session` returns newest-first, so the head is
+            // the latest job by `created_at`.
+            jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            let latest = jobs.first();
+            if let Some(want) = filter.status_kind
+                && latest.is_none_or(|j| j.status.kind() != want)
+            {
+                continue;
+            }
+
+            let mut span_count = 0usize;
+            for job in &jobs {
+                let steps = self.trace.list_steps_by_job(&job.id).await?;
+                for step in &steps {
+                    let spans = self.trace.list_spans_by_step(&step.id).await?;
+                    span_count += spans.len();
+                }
+            }
+
+            let (input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens) =
+                match self.costs.as_ref() {
+                    Some(c) => match c.query_session(&session.id).await {
+                        Ok(s) => (
+                            s.total_input_tokens,
+                            s.total_output_tokens,
+                            s.total_cached_input_tokens,
+                            s.total_cache_creation_input_tokens,
+                        ),
+                        Err(_) => (0, 0, 0, 0),
+                    },
+                    None => (0, 0, 0, 0),
+                };
+
+            summaries.push(SessionSummary {
+                session_id: session.id.clone(),
+                created_at: session.created_at,
+                last_active: session.last_active,
+                latest_job_status: latest.map(|j| j.status.clone()),
+                job_count: jobs.len(),
+                span_count,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+            });
+        }
+
+        // `SessionStore::list_all` already orders by `last_active`
+        // DESC, but the per-session work above preserves that order.
+        let total = summaries.len();
+        let start = page.offset.min(total);
+        let end = if page.limit == 0 {
+            total
+        } else {
+            start.saturating_add(page.limit).min(total)
+        };
+        let items = summaries[start..end].to_vec();
+        Ok(SessionSummaryListing { items, total })
+    }
+
+    // ── 11. compute_analytics ──────────────────────────────────
+
+    /// Aggregate cost records + session creations for the analytics
+    /// dashboard. Iterates `cost_records` once for token / model
+    /// breakdowns and `SessionStore::list_all` once for session-per-day
+    /// counts. `Unsupported` if no `CostStore` was wired (CLI-style
+    /// `QueryApi::without_costs` callers).
+    pub async fn compute_analytics(&self, range: TimeRange) -> Result<AnalyticsSummary> {
+        let costs = self.costs.as_ref().ok_or_else(|| {
+            QueryError::Unsupported("compute_analytics requires a CostStore".into())
+        })?;
+
+        // Pre-build a contiguous YYYY-MM-DD bucket list (UTC) so days
+        // with no activity still appear in the chart. Inclusive of the
+        // `to` date so the day in progress (today) gets its own bucket.
+        let mut day_index: HashMap<String, usize> = HashMap::new();
+        let mut daily: Vec<AnalyticsDayBucket> = Vec::new();
+        let mut cursor = range.from.date_naive();
+        let last = range.to.date_naive();
+        while cursor <= last {
+            let key = cursor.format("%Y-%m-%d").to_string();
+            day_index.insert(key.clone(), daily.len());
+            daily.push(AnalyticsDayBucket {
+                date: key,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: MicroUsd::ZERO,
+                sessions_created: 0,
+            });
+            cursor = cursor.succ_opt().unwrap_or(cursor);
+        }
+
+        let mut total_input = 0usize;
+        let mut total_output = 0usize;
+        let mut total_cached = 0usize;
+        let mut total_cache_create = 0usize;
+        let mut total_cost = MicroUsd::ZERO;
+        let mut total_records = 0usize;
+        let mut by_model: HashMap<String, AnalyticsModelBucket> = HashMap::new();
+
+        let records = costs.query_records_in_range(range.clone()).await?;
+        for r in &records {
+            total_input += r.input_tokens;
+            total_output += r.output_tokens;
+            total_cached += r.cached_input_tokens;
+            total_cache_create += r.cache_creation_input_tokens;
+            total_cost += r.cost_usd;
+            total_records += 1;
+
+            let day_key = r.timestamp.date_naive().format("%Y-%m-%d").to_string();
+            if let Some(&i) = day_index.get(&day_key) {
+                let bucket = &mut daily[i];
+                bucket.input_tokens += r.input_tokens;
+                bucket.output_tokens += r.output_tokens;
+                bucket.cached_input_tokens += r.cached_input_tokens;
+                bucket.cache_creation_input_tokens += r.cache_creation_input_tokens;
+                bucket.cost_usd += r.cost_usd;
+            }
+
+            let entry = by_model
+                .entry(r.model.clone())
+                .or_insert_with(|| AnalyticsModelBucket {
+                    model: r.model.clone(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cost_usd: MicroUsd::ZERO,
+                    call_count: 0,
+                });
+            entry.input_tokens += r.input_tokens;
+            entry.output_tokens += r.output_tokens;
+            entry.cached_input_tokens += r.cached_input_tokens;
+            entry.cache_creation_input_tokens += r.cache_creation_input_tokens;
+            entry.cost_usd += r.cost_usd;
+            entry.call_count += 1;
+        }
+
+        // sessions_created per day. Single SessionStore::list_all call;
+        // sessions outside the range are skipped.
+        for s in self.sessions.list_all().await? {
+            if s.created_at < range.from || s.created_at >= range.to {
+                continue;
+            }
+            let day_key = s.created_at.date_naive().format("%Y-%m-%d").to_string();
+            if let Some(&i) = day_index.get(&day_key) {
+                daily[i].sessions_created += 1;
+            }
+        }
+
+        let mut model_buckets: Vec<AnalyticsModelBucket> = by_model.into_values().collect();
+        model_buckets.sort_by(|a, b| {
+            (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
+        });
+
+        Ok(AnalyticsSummary {
+            total_input_tokens: total_input,
+            total_output_tokens: total_output,
+            total_cached_input_tokens: total_cached,
+            total_cache_creation_input_tokens: total_cache_create,
+            total_cost_usd: total_cost,
+            total_record_count: total_records,
+            daily,
+            by_model: model_buckets,
+        })
     }
 
     // ── 9. replay ──────────────────────────────────────────────
@@ -448,7 +747,7 @@ impl QueryApi {
         for s in &summaries {
             let job = match self.jobs.get(&s.id).await? {
                 Some(j) => j,
-                None => continue, // soft-deleted between calls; skip
+                None => continue, // deleted between calls; skip
             };
             let mut steps = self.trace.list_steps_by_job(&job.id).await?;
             steps.sort_by_key(|s| s.started_at);
@@ -534,7 +833,7 @@ mod tests {
                 .insert(session.id.clone(), session.clone());
             Ok(())
         }
-        async fn soft_delete(&self, _id: &SessionId) -> std::result::Result<bool, StorageError> {
+        async fn delete(&self, _id: &SessionId) -> std::result::Result<bool, StorageError> {
             Ok(true)
         }
         async fn list_expired(

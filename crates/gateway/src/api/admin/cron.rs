@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_cron::{CronSchedule, TriggerAction};
+use aura_cron::CronSchedule;
 use aura_model::ChannelType as ChannelTypeModel;
 
 use crate::api::dto::{CreateCronRequest, CronJob, ErrorBody, ListResponse};
@@ -57,7 +57,6 @@ async fn create_cron(
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronJob>)> {
     let schedule = CronSchedule::cron(&req.schedule);
-    let action = TriggerAction::Prompt { prompt: req.text };
     let channel: ChannelTypeModel = req
         .channel
         .map(Into::into)
@@ -68,7 +67,8 @@ async fn create_cron(
             &req.user_id,
             channel,
             schedule,
-            action,
+            req.text,
+            req.timezone,
             req.origin_session_id,
         )
         .await

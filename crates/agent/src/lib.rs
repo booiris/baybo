@@ -24,13 +24,14 @@ pub use agent_loop::AgentLoop;
 pub use aura_cron::{CronScheduler, CronTriggerEvent};
 pub use aura_security::SecretVault;
 pub use cancel::{JobCancellationGuard, JobCancellationRegistry};
-pub use cost::{CostGuard, CostGuardError, CostSubscriberMetrics, SpendingLimits};
+pub use cost::{CostGuardError, CostManager, CostMetrics, SpendingLimits};
 pub use job::JobLifecycle;
 pub use memory::MemoryManager;
 pub use policy::ExecutionPolicy;
 pub use query::{
-    CostScope, JobDetail, JobFilter, JobSummary, LineageNode, QueryApi, QueryError, ReplayJob,
-    ReplayStep, ReplayedConversation, StepDetail,
+    AnalyticsDayBucket, AnalyticsModelBucket, AnalyticsSummary, CostScope, JobDetail, JobFilter,
+    JobSummary, LineageNode, QueryApi, QueryError, ReplayJob, ReplayStep, ReplayedConversation,
+    SessionSummary, SessionSummaryFilter, SessionSummaryListing, SessionSummaryPage, StepDetail,
 };
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};

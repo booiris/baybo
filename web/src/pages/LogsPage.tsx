@@ -1,23 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
-  RiAlertFill,
-  RiBug2Fill,
   RiBroadcastLine,
-  RiCloseCircleFill,
   RiDownloadLine,
   RiEyeLine,
-  RiInformationFill,
-  RiPulseLine,
   RiRefreshLine,
   RiLoader4Line,
 } from 'react-icons/ri';
-import type { IconType } from 'react-icons';
 import { Button } from '../components/Button';
 import { IconButton } from '../components/IconButton';
 import { SearchBox } from '../components/SearchBox';
 import { SelectBox } from '../components/SelectBox';
 import { useAdminClient, useAuth } from '../api/auth';
 import type { components } from '../api/schema';
+import { useMockMode, MOCK_LOGS } from '../api/mock';
 
 type LogEntry = components['schemas']['LogEntry'];
 type ApiLogLevel = components['schemas']['LogLevel'];
@@ -26,12 +22,12 @@ type ApiLogLevel = components['schemas']['LogLevel'];
 const DEFAULT_PAGE_SIZE = 50;
 const PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500];
 
-const LEVEL_META: Record<ApiLogLevel, { className: string; Icon: IconType }> = {
-  error: { className: 'bg-err text-white', Icon: RiCloseCircleFill },
-  warn: { className: 'bg-warn text-white', Icon: RiAlertFill },
-  info: { className: 'bg-info text-white', Icon: RiInformationFill },
-  debug: { className: 'bg-gray-200 text-ink border-ink', Icon: RiBug2Fill },
-  trace: { className: 'bg-gray-100 text-ink-soft border-ink-soft', Icon: RiPulseLine },
+const LEVEL_META: Record<ApiLogLevel, { className: string }> = {
+  error: { className: 'bg-err text-white' },
+  warn: { className: 'bg-warn text-white' },
+  info: { className: 'bg-info text-white' },
+  debug: { className: 'bg-gray-200 text-ink border-ink' },
+  trace: { className: 'bg-gray-100 text-ink-soft border-ink-soft' },
 };
 
 const thCell =
@@ -67,6 +63,8 @@ function triggerDownload(filename: string, mime: string, body: string): void {
 }
 
 export function LogsPage() {
+  const isMock = useMockMode();
+  const [searchParams, setSearchParams] = useSearchParams();
   const client = useAdminClient();
   const { token, baseUrl, logout } = useAuth();
 
@@ -106,6 +104,14 @@ export function LogsPage() {
   useEffect(() => {
     let canceled = false;
     async function fetchData() {
+      if (isMock) {
+        setItems(MOCK_LOGS.slice(offset, offset + pageSize));
+        setTotal(MOCK_LOGS.length);
+        setLoading(false);
+        setError(null);
+        return;
+      }
+
       setLoading(true);
       setError(null);
       const query: Record<string, string | number> = {
@@ -140,7 +146,7 @@ export function LogsPage() {
     }
     void fetchData();
     return () => { canceled = true; };
-  }, [client, debouncedFilter, level, logout, offset, pageSize, refreshKey]);
+  }, [client, debouncedFilter, level, logout, offset, pageSize, refreshKey, isMock]);
 
   // Reset scroll on page change
   useEffect(() => {
@@ -155,7 +161,7 @@ export function LogsPage() {
   // `?token=...` as a fallback). Re-opened whenever the filter changes.
   useEffect(() => {
     setLiveConnected(false);
-    if (!live || offset !== 0 || !token) return;
+    if (isMock || !live || offset !== 0 || !token) return;
 
     const params = new URLSearchParams();
     params.set('token', token);
@@ -203,7 +209,7 @@ export function LogsPage() {
       es.close();
       setLiveConnected(false);
     };
-  }, [live, offset, token, baseUrl, level, debouncedFilter]);
+  }, [live, offset, token, baseUrl, level, debouncedFilter, isMock, pageSize]);
 
   // Pagination away from page 1 implicitly drops the user out of live
   // mode — the stream only makes sense at the head of the list.
@@ -222,16 +228,26 @@ export function LogsPage() {
     triggerDownload(`aura-logs-${stamp}.json`, 'application/json', body);
   }, [items]);
 
+  const toggleMock = () => {
+    const newParams = new URLSearchParams(searchParams);
+    if (isMock) {
+      newParams.delete('mock');
+    } else {
+      newParams.set('mock', 'true');
+    }
+    setSearchParams(newParams);
+    setOffset(0);
+  };
+
   const badge = useMemo(
     () =>
       ({ level: lvl }: { level: ApiLogLevel }) => {
-        const { className, Icon } = LEVEL_META[lvl];
+        const { className } = LEVEL_META[lvl];
         return (
           <span
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
+            className={`inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
           >
-            <Icon className="text-[0.85rem]" />
-            {lvl}
+            <span>{lvl}</span>
           </span>
         );
       },
@@ -246,14 +262,25 @@ export function LogsPage() {
             SYSTEM LOGS
           </h2>
         </div>
-        <Button 
-          variant="primary" 
-          onClick={handleExport} 
-          disabled={items.length === 0}
-          className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
-        >
-          <RiDownloadLine className="text-base" /> Export
-        </Button>
+        <div className="flex gap-3">
+          {import.meta.env.DEV && (
+            <Button
+              variant={isMock ? 'primary' : 'default'}
+              onClick={toggleMock}
+              className="!py-2 !px-4 !text-[0.9rem] h-10 w-[140px] justify-center gap-1.5"
+            >
+              {isMock ? 'Mock: ON' : 'Mock: OFF'}
+            </Button>
+          )}
+          <Button 
+            variant="primary" 
+            onClick={handleExport} 
+            disabled={items.length === 0}
+            className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
+          >
+            <RiDownloadLine className="text-lg shrink-0" /> Export
+          </Button>
+        </div>
       </div>
 
       <div className="flex items-center gap-3 mb-4">
@@ -266,7 +293,7 @@ export function LogsPage() {
         <SelectBox
           value={level}
           onChange={(e) => setLevel(e.target.value as 'all' | ApiLogLevel)}
-          className="!py-2 !px-3 !pr-8 text-[0.9rem] h-10"
+          className="h-10 px-3"
         >
           <option value="all">All Levels</option>
           <option value="error">Error</option>
@@ -280,29 +307,31 @@ export function LogsPage() {
           variant={live ? 'primary' : 'default'}
           onClick={() => setLive((v) => !v)}
           aria-pressed={live}
-          disabled={offset !== 0}
+          disabled={offset !== 0 || isMock}
           className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
           title={
-            offset !== 0
+            isMock 
+              ? 'Live tail disabled in mock mode'
+              : offset !== 0
               ? 'Return to page 1 to enable live tail'
               : 'Stream new log records as they arrive'
           }
         >
-          {live && !liveConnected ? (
-            <RiLoader4Line className="animate-spin text-base" />
+          {live && !liveConnected && !isMock ? (
+            <RiLoader4Line className="animate-spin text-lg shrink-0" />
           ) : (
             <RiBroadcastLine
-              className={`text-base ${live && liveConnected ? 'animate-pulse' : ''}`}
+              className={`text-lg shrink-0 ${live && liveConnected ? 'animate-pulse' : ''}`}
             />
           )}
           Live
         </Button>
-        <Button 
-          onClick={() => setRefreshKey((k) => k + 1)} 
-          disabled={loading}
+        <Button
+          onClick={() => setRefreshKey((k) => k + 1)}
+          disabled={loading || isMock}
           className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
         >
-          <RiRefreshLine className="text-base" /> Refresh
+          <RiRefreshLine className="text-lg shrink-0" /> Refresh
         </Button>
       </div>
 
@@ -314,7 +343,7 @@ export function LogsPage() {
 
       <div className="flex-1 flex flex-col min-h-0 bg-white border-[3px] border-black rounded-md shadow-brutal">
         <div ref={scrollRef} className="flex-1 overflow-auto overscroll-none">
-          <table className="w-full border-collapse">
+          <table className="w-full border-separate border-spacing-0">
           <thead>
             <tr>
               <th className={`${thCell} w-[160px]`}>Timestamp</th>
@@ -335,10 +364,9 @@ export function LogsPage() {
                 </td>
               </tr>
             )}
-            {items.map((log, idx) => {
+            {items.map((log) => {
               const { date, time } = splitTimestamp(log.timestamp);
-              const notLast = idx !== items.length - 1;
-              const cell = `px-6 py-4 align-top ${notLast ? 'border-b border-black' : ''}`;
+              const cell = `px-6 py-4 align-middle border-b border-black`;
               return (
                 <tr key={log.id} className="hover:bg-gray-50">
                   <td className={cell}>
@@ -388,7 +416,7 @@ export function LogsPage() {
               <SelectBox
                 value={pageSize}
                 onChange={(e) => setPageSize(Number(e.target.value))}
-                className="!py-1 !px-2 !pr-8 text-[0.85rem] h-8"
+                className="h-8 px-2"
               >
                 {PAGE_SIZE_OPTIONS.map((opt) => (
                   <option key={opt} value={opt}>
@@ -424,7 +452,7 @@ export function LogsPage() {
 
 function LogDetailModal({ entry, onClose }: { entry: LogEntry; onClose: () => void }) {
   const { date, time } = splitTimestamp(entry.timestamp);
-  const { className, Icon } = LEVEL_META[entry.level];
+  const { className } = LEVEL_META[entry.level];
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
@@ -439,9 +467,8 @@ function LogDetailModal({ entry, onClose }: { entry: LogEntry; onClose: () => vo
         <header className="flex items-center justify-between px-6 py-4 border-b-2 border-black">
           <div className="flex items-center gap-3">
             <span
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
+              className={`inline-flex items-center px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
             >
-              <Icon className="text-[0.85rem]" />
               {entry.level}
             </span>
             <code className="font-mono text-[0.9rem]">{entry.target}</code>

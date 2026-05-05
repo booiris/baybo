@@ -4,9 +4,9 @@
 //! pointed at `aura gateway`'s channel listener — the gateway holds
 //! the workspace singleton, the manager graph, and the router.
 //!
-//! Port discovery: the gateway writes `<workspace>/channel.port` on
-//! bind; both sides read the same file so they agree on the loopback
-//! port without any config roundtrip. TUI auth is a per-start
+//! Port discovery: the gateway writes `<workspace>/state/channel.port`
+//! on bind; both sides read the same file so they agree on the
+//! loopback port without any config roundtrip. TUI auth is a per-start
 //! temporary token the gateway publishes to the secret vault at
 //! `gateway.tui_token` (rotated on every `aura gateway start`); the
 //! TUI opens the same vault, reads the token, and presents it on the
@@ -145,8 +145,9 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the channel port-file path. Fixed at `<workspace>/channel.port`
-/// — not configurable, so gateway and TUI resolve it identically.
+/// Resolve the channel port-file path. Fixed at
+/// `<workspace>/state/channel.port` — not configurable, so gateway
+/// and TUI resolve it identically.
 fn port_file_path(config: &AuraConfig) -> PathBuf {
     aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).channel_port()
 }

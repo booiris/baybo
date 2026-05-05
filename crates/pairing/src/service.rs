@@ -127,7 +127,7 @@ impl PairingService {
         self.store.list(status).await.map_err(PairingError::Storage)
     }
 
-    /// Soft-delete a pairing row. Subsequent inbound messages for the
+    /// Hard-delete a pairing row. Subsequent inbound messages for the
     /// triple mint a fresh pending row with a fresh code.
     pub async fn revoke(
         &self,

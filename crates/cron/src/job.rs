@@ -1,13 +1,42 @@
-use aura_model::{ApprovedResource, ChannelType};
+use aura_model::ChannelType;
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
+/// Lifecycle state of a cron job row.
+///
+/// `Executed` is reserved for one-shot (`At`) jobs after their single
+/// fire — the row is kept (not deleted) so callers and the web UI can
+/// see "this fired" history. Recurring (`Cron`) jobs cycle between
+/// `Enabled` and `Disabled` and never enter `Executed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CronStatus {
     Enabled,
     Disabled,
+    Executed,
+}
+
+/// Storage backwards-compat default for the `timezone` field on
+/// `CronJob`. Rows persisted before this field existed deserialize
+/// with `"UTC"`, preserving their original behavior. Inputs no longer
+/// fall back to this — every entry point requires an explicit
+/// `timezone`.
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
+impl CronStatus {
+    /// Stable wire string. Mirrors `serde(rename_all = "snake_case")` so
+    /// the storage row, CLI labels, and tool output stay in lockstep
+    /// without three independent match ladders that can drift.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CronStatus::Enabled => "enabled",
+            CronStatus::Disabled => "disabled",
+            CronStatus::Executed => "executed",
+        }
+    }
 }
 
 /// When a cron job fires.
@@ -49,21 +78,6 @@ impl CronSchedule {
     }
 }
 
-/// What to do when a cron job fires.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TriggerAction {
-    /// Send prompt through the full agent loop (LLM).
-    Prompt { prompt: String },
-    /// Directly invoke a registered tool. Falls back to LLM on failure.
-    ToolCall {
-        tool_name: String,
-        params: Value,
-        /// Resources pre-approved at creation time.
-        approved_resources: Vec<ApprovedResource>,
-    },
-}
-
 // ── CronJob ──────────────────────────────────────────────────────────
 
 /// A persistent cron job definition.
@@ -77,8 +91,14 @@ pub struct CronJob {
     pub channel: ChannelType,
     /// When this job fires. See [`CronSchedule`] for the two variants.
     pub schedule: CronSchedule,
-    /// What to do when the job fires.
-    pub action: TriggerAction,
+    /// Prompt fed through the agent loop on every fire.
+    pub prompt: String,
+    /// IANA timezone (e.g. `"Asia/Shanghai"`, `"UTC"`) the cron expression
+    /// is evaluated in. Has no effect for `At` schedules — those carry an
+    /// absolute UTC instant. Old rows without this field deserialize as
+    /// `"UTC"` to preserve their existing fire semantics.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
     pub status: CronStatus,
     pub last_triggered_at: Option<DateTime<Utc>>,
     /// Pre-computed next fire time for efficient DB queries. `None` means
@@ -98,6 +118,30 @@ impl CronJob {
 
     pub fn is_one_shot(&self) -> bool {
         self.schedule.is_one_shot()
+    }
+
+    /// Format a UTC instant as RFC3339 in this job's `timezone`.
+    /// Falls back to UTC (with a warn log) if the stored zone string
+    /// is unparseable — display must never blow up on a single bad
+    /// row, since the row was already accepted at creation time.
+    pub fn format_time(&self, dt: DateTime<Utc>) -> String {
+        match self.timezone.parse::<Tz>() {
+            Ok(tz) => dt.with_timezone(&tz).to_rfc3339(),
+            Err(e) => {
+                tracing::warn!(
+                    job_id = %self.id,
+                    timezone = %self.timezone,
+                    error = %e,
+                    "stored cron job has unparseable timezone; formatting as UTC",
+                );
+                dt.to_rfc3339()
+            }
+        }
+    }
+
+    /// Convenience for optional timestamps.
+    pub fn format_time_opt(&self, dt: Option<DateTime<Utc>>) -> Option<String> {
+        dt.map(|t| self.format_time(t))
     }
 }
 
@@ -129,7 +173,7 @@ pub struct CronExecution {
     pub user_id: String,
     pub channel: ChannelType,
     pub schedule: CronSchedule,
-    pub action: TriggerAction,
+    pub prompt: String,
     /// The schedule slot that was due (i.e. the `next_trigger_at` value from the job).
     pub scheduled_fire_time: DateTime<Utc>,
     pub triggered_at: DateTime<Utc>,
@@ -147,6 +191,46 @@ pub struct CronExecution {
 mod tests {
     use super::*;
 
+    fn job_with_tz(tz: &str) -> CronJob {
+        CronJob {
+            id: "cj-fmt".to_string(),
+            user_id: "u-1".to_string(),
+            channel: ChannelType::tui(),
+            schedule: CronSchedule::cron("0 9 * * *"),
+            prompt: "fmt".to_string(),
+            timezone: tz.to_string(),
+            status: CronStatus::Enabled,
+            last_triggered_at: None,
+            next_trigger_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            origin_session_id: None,
+        }
+    }
+
+    #[test]
+    fn format_time_renders_with_offset() {
+        let dt: DateTime<Utc> = "2026-05-05T09:30:00Z".parse().unwrap();
+        assert_eq!(
+            job_with_tz("Asia/Shanghai").format_time(dt),
+            "2026-05-05T17:30:00+08:00"
+        );
+    }
+
+    #[test]
+    fn format_time_falls_back_to_utc_on_bad_zone() {
+        let dt: DateTime<Utc> = "2026-05-05T09:30:00Z".parse().unwrap();
+        assert_eq!(
+            job_with_tz("Mars/Olympus").format_time(dt),
+            "2026-05-05T09:30:00+00:00"
+        );
+    }
+
+    #[test]
+    fn format_time_opt_passes_through_none() {
+        assert!(job_with_tz("UTC").format_time_opt(None).is_none());
+    }
+
     #[test]
     fn serde_round_trip_cron() {
         let job = CronJob {
@@ -154,9 +238,8 @@ mod tests {
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::cron("0 9 * * *"),
-            action: TriggerAction::Prompt {
-                prompt: "push news".to_string(),
-            },
+            prompt: "push news".to_string(),
+            timezone: "Asia/Shanghai".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
             next_trigger_at: Some(Utc::now()),
@@ -168,6 +251,7 @@ mod tests {
         let restored: CronJob = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.id, "cj-1");
         assert_eq!(restored.status, CronStatus::Enabled);
+        assert_eq!(restored.timezone, "Asia/Shanghai");
         assert!(!restored.is_one_shot());
         assert!(restored.is_enabled());
         assert_eq!(restored.origin_session_id.as_deref(), Some("sess-1"));
@@ -181,9 +265,8 @@ mod tests {
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::at(fire_at),
-            action: TriggerAction::Prompt {
-                prompt: "one shot".to_string(),
-            },
+            prompt: "one shot".to_string(),
+            timezone: "UTC".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
             next_trigger_at: Some(fire_at),
@@ -201,37 +284,18 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_round_trip() {
-        let job = CronJob {
-            id: "cj-2".to_string(),
-            user_id: "u-1".to_string(),
-            channel: ChannelType::tui(),
-            schedule: CronSchedule::cron("*/5 * * * *"),
-            action: TriggerAction::ToolCall {
-                tool_name: "web_fetch".to_string(),
-                params: serde_json::json!({"url": "https://example.com"}),
-                approved_resources: vec![ApprovedResource::Http {
-                    host: aura_model::HostPattern::Exact("example.com".to_string()),
-                }],
-            },
-            status: CronStatus::Enabled,
-            last_triggered_at: None,
-            next_trigger_at: Some(Utc::now()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            origin_session_id: None,
-        };
-        let json = serde_json::to_string(&job).unwrap();
-        let restored: CronJob = serde_json::from_str(&json).unwrap();
-        match &restored.action {
-            TriggerAction::ToolCall {
-                tool_name, params, ..
-            } => {
-                assert_eq!(tool_name, "web_fetch");
-                assert_eq!(params["url"], "https://example.com");
-            }
-            other => panic!("expected ToolCall, got {other:?}"),
-        }
+    fn legacy_row_without_timezone_defaults_to_utc() {
+        // Older rows persisted before the field existed must round-trip
+        // with `UTC` so their fire semantics don't silently change.
+        let json = r#"{
+            "id":"cj-old","user_id":"u-1","channel":"tui",
+            "schedule":{"kind":"cron","expr":"0 9 * * *"},
+            "prompt":"x",
+            "status":"enabled","next_trigger_at":null,
+            "created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z"
+        }"#;
+        let restored: CronJob = serde_json::from_str(json).unwrap();
+        assert_eq!(restored.timezone, "UTC");
     }
 
     #[test]
@@ -243,6 +307,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CronStatus::Disabled).unwrap(),
             "\"disabled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CronStatus::Executed).unwrap(),
+            "\"executed\""
         );
     }
 
@@ -261,9 +329,7 @@ mod tests {
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::at(Utc::now()),
-            action: TriggerAction::Prompt {
-                prompt: "push news".to_string(),
-            },
+            prompt: "push news".to_string(),
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,

@@ -21,18 +21,16 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 #[async_trait]
 pub trait ChannelSessionStore: Send + Sync {
     /// Look up the aura `session_id` for `(channel_type, user_id)`.
-    /// Returns `Ok(None)` when no live mapping exists (including when
-    /// it was soft-deleted).
+    /// Returns `Ok(None)` when no mapping exists.
     async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<String>>;
 
-    /// Persist `session_id` under `(channel_type, user_id)`. Re-inserts
-    /// a previously soft-deleted row by clearing `deleted_at`. On
+    /// Persist `session_id` under `(channel_type, user_id)`. On
     /// conflict with a live row carrying a *different* `session_id`,
     /// the existing mapping wins — callers should call `get` first and
     /// only `put` on a cache miss.
     async fn put(&self, channel_type: &ChannelType, user_id: &str, session_id: &str) -> Result<()>;
 
-    /// Soft-delete the mapping. Later `put`s for the same pair revive
-    /// it (possibly with a different `session_id`).
+    /// Hard-delete the mapping. Later `put`s for the same pair create
+    /// a fresh row.
     async fn delete(&self, channel_type: &ChannelType, user_id: &str) -> Result<()>;
 }

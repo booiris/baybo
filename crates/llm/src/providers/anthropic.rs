@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
+use aura_model::MicroUsd;
 
 pub(crate) const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -34,8 +35,8 @@ impl LlmProviderFactory for AnthropicProviderFactory {
                 (
                     (*m).to_string(),
                     ModelPricing {
-                        input_per_1m_tokens: 3.0,
-                        output_per_1m_tokens: 15.0,
+                        input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
+                        output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
                     },
                 )
             })
@@ -57,7 +58,13 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         }
         .map_err(|e| crate::LlmError::Config(format!("failed to create Anthropic client: {e}")))?;
 
-        let model = client.completion_model(&config.model);
+        // rig's Anthropic model ships with caching off; without this the
+        // request omits cache_control breakpoints and Anthropic returns
+        // cached_input_tokens=0 / cache_creation_input_tokens=0 on every
+        // call. `with_prompt_caching` marks the system prompt + last
+        // message as ephemeral, which also caches the (tools, system,
+        // history) prefix on every subsequent turn.
+        let model = client.completion_model(&config.model).with_prompt_caching();
 
         let model_info = ModelInfo {
             id: config.model.clone(),
@@ -66,8 +73,8 @@ impl LlmProviderFactory for AnthropicProviderFactory {
             supports_tools: true,
             supports_vision: true,
             pricing: ModelPricing {
-                input_per_1m_tokens: 3.0,
-                output_per_1m_tokens: 15.0,
+                input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
+                output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
             },
         };
 

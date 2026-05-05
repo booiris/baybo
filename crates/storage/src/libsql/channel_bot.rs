@@ -66,7 +66,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let mut rows = conn
             .query(
                 "SELECT channel_type, bot_id, created_at, revision, metadata FROM channel_bots
-                 WHERE channel_type = ?1 AND deleted_at IS NULL
+                 WHERE channel_type = ?1
                  ORDER BY created_at DESC",
                 libsql::params![channel_type.as_str().to_string()],
             )
@@ -88,7 +88,7 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let mut rows = conn
             .query(
                 "SELECT channel_type, bot_id, created_at, revision, metadata FROM channel_bots
-                 WHERE channel_type = ?1 AND bot_id = ?2 AND deleted_at IS NULL",
+                 WHERE channel_type = ?1 AND bot_id = ?2",
                 libsql::params![channel_type.as_str().to_string(), bot_id.to_string()],
             )
             .await
@@ -112,22 +112,19 @@ impl ChannelBotStore for LibsqlChannelBotStore {
         let now = super::time::now_us();
         let metadata_json = serialize_metadata(&metadata)?;
         let conn = self.pool.conn();
-        // The conflict branch bumps `revision` even when nothing
-        // looks different in `metadata`: the bot reconciler treats a
-        // revision change as "rotated, restart"; bumping
-        // unconditionally is safe (a redundant restart) and keeps the
-        // contract honest — every `put` is a re-registration intent.
+        // Bump `revision` unconditionally on every put: the bot
+        // reconciler treats a revision change as "rotated, restart";
+        // a redundant restart is safe and keeps the contract honest —
+        // every `put` is a re-registration intent. The `ON CONFLICT`
+        // upsert preserves the existing row's `created_at` (rows are
+        // hard-deleted, so a conflict is always a re-registration of
+        // a still-live bot).
         conn.execute(
-            "INSERT INTO channel_bots (channel_type, bot_id, created_at, metadata, revision, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, 1, NULL)
+            "INSERT INTO channel_bots (channel_type, bot_id, created_at, metadata, revision)
+             VALUES (?1, ?2, ?3, ?4, 1)
              ON CONFLICT(channel_type, bot_id) DO UPDATE SET
-                 created_at = CASE
-                     WHEN channel_bots.deleted_at IS NULL THEN channel_bots.created_at
-                     ELSE excluded.created_at
-                 END,
                  metadata = excluded.metadata,
-                 revision = channel_bots.revision + 1,
-                 deleted_at = NULL",
+                 revision = channel_bots.revision + 1",
             libsql::params![
                 channel_type.as_str().to_string(),
                 bot_id.to_string(),
@@ -141,13 +138,11 @@ impl ChannelBotStore for LibsqlChannelBotStore {
     }
 
     async fn delete(&self, channel_type: &ChannelType, bot_id: &str) -> Result<()> {
-        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
-            "UPDATE channel_bots
-             SET deleted_at = ?3
-             WHERE channel_type = ?1 AND bot_id = ?2 AND deleted_at IS NULL",
-            libsql::params![channel_type.as_str().to_string(), bot_id.to_string(), now,],
+            "DELETE FROM channel_bots
+             WHERE channel_type = ?1 AND bot_id = ?2",
+            libsql::params![channel_type.as_str().to_string(), bot_id.to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
@@ -281,8 +276,8 @@ mod tests {
         // exactly the bug shape Codex flagged.
         pool.conn()
             .execute(
-                "INSERT INTO channel_bots (channel_type, bot_id, created_at, metadata, revision, deleted_at)
-                 VALUES ('telegram', 'pre-migration', 1700000000, '{}', 0, NULL)",
+                "INSERT INTO channel_bots (channel_type, bot_id, created_at, metadata, revision)
+                 VALUES ('telegram', 'pre-migration', 1700000000, '{}', 0)",
                 (),
             )
             .await
@@ -322,39 +317,6 @@ mod tests {
             migrated.revision, 1,
             "migration must lift revision-0 rows to 1 to break the reconciler StartBot loop",
         );
-    }
-
-    #[tokio::test]
-    async fn revive_after_delete_bumps_revision() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlChannelBotStore::new(pool);
-        store
-            .put(&ChannelType::telegram(), "alpha", HashMap::new())
-            .await
-            .unwrap();
-        let first = store
-            .get(&ChannelType::telegram(), "alpha")
-            .await
-            .unwrap()
-            .unwrap();
-        store
-            .delete(&ChannelType::telegram(), "alpha")
-            .await
-            .unwrap();
-        store
-            .put(&ChannelType::telegram(), "alpha", HashMap::new())
-            .await
-            .unwrap();
-        let revived = store
-            .get(&ChannelType::telegram(), "alpha")
-            .await
-            .unwrap()
-            .unwrap();
-        // Revision continues from where it left off — the reconciler
-        // sees a strictly larger value and restarts the bot, which is
-        // the right behaviour after a soft-delete revive (the bot may
-        // have been rotated while it was tombstoned).
-        assert!(revived.revision > first.revision);
     }
 
     #[tokio::test]

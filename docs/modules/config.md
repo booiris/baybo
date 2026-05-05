@@ -156,8 +156,9 @@ When hot reload is implemented, the following contract must be in place **before
 | `channels.telegram.bot_token_env`     | non-empty                                            |
 | `channels.discord.bot_token_env`      | non-empty                                            |
 | `tools.default_timeout_ms`            | ≥ 100                                                |
-| `cost.spending_limits.*_usd`          | if set, strictly positive, finite                    |
-| `cost.spending_limits.user_*`         | cross-field: `daily_usd ≤ monthly_usd` when both set |
+| `cost.spending_limits.daily_usd`      | if set, strictly positive, finite                    |
+| `cost.spending_limits.monthly_usd`    | if set, strictly positive, finite                    |
+| `cost.spending_limits`                | cross-field: `daily_usd ≤ monthly_usd` when both set |
 | `cost.rate_limit.*`                   | `max_requests ≥ 1`, `window_secs ≥ 1`                |
 
 ### Cross-section rules

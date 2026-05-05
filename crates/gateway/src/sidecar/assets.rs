@@ -1,9 +1,12 @@
 //! Embedded-asset extraction: turns the zstd-compressed sidecar
-//! bundles baked in by `build.rs` into on-disk JS files the host's
-//! `node` binary can run.
+//! bundles baked in by `build.rs` into on-disk JS files the host
+//! runtime can run (`bun` for channel sidecars, `node` for the
+//! browser tool sidecar).
 //!
-//! Sidecars are spawned at runtime with the local `node` resolved
-//! from `PATH` — no JS runtime is shipped inside the gateway binary.
+//! Sidecars are spawned at runtime with the host's `bun` / `node`
+//! binary resolved from `PATH` (overridable via `AURA_BUN_BIN` /
+//! `AURA_NODE_BIN`) — no JS runtime is shipped inside the gateway
+//! binary.
 
 use std::collections::HashSet;
 use std::fs;

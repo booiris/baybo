@@ -88,7 +88,12 @@ impl SlashHandler for CliSlashHandler {
                 continue;
             }
             let name = sub.get_name();
-            if name == "help" || name == "completion" {
+            if name == "help" || name == "completion" || name == "setup" {
+                // `setup` is the first-run wizard — interactive, requires
+                // a TTY, and bootstraps state before a chat session can
+                // even exist. Hiding from the slash menu prevents users
+                // from clicking on something the dispatcher would refuse
+                // anyway (`AgentSendForbiddenInSlash("setup")`).
                 continue;
             }
             let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
@@ -122,7 +127,7 @@ impl SlashHandler for CliSlashHandler {
     }
 
     async fn handle(&self, raw: &str) -> SlashOutcome {
-        // Bare `/skills`, `/tools`, `/jobs`, `/sessions`, `/memory` (no args)
+        // Bare `/skills`, `/jobs`, `/sessions`, `/memory` (no args)
         // open the corresponding dashboard view in TUI-capable adapters;
         // adapters that don't support views treat this as a no-op.
         if let Some(kind) = dashboard_shortcut(raw) {

@@ -124,10 +124,15 @@ pub struct ModelInfo {
 }
 
 /// Per-token pricing information for a model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Both rates are micro-USD per **1M tokens** (so $3.00 / MTok →
+/// `MicroUsd::from_micros(3_000_000)`). Use [`MicroUsd::cost_for_tokens`]
+/// to apply these to a token count — that path keeps everything in
+/// integer math, no float drift.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ModelPricing {
-    pub input_per_1m_tokens: f64,
-    pub output_per_1m_tokens: f64,
+    pub input_per_1m_tokens: aura_model::MicroUsd,
+    pub output_per_1m_tokens: aura_model::MicroUsd,
 }
 
 /// Unified response structure returned by `LlmClient::chat()`.
@@ -154,10 +159,18 @@ pub struct ToolCallInfo {
 }
 
 /// Token usage statistics for a single LLM call.
+///
+/// `cached_input_tokens` and `cache_creation_input_tokens` carry
+/// Anthropic-style prompt-cache accounting: how many input tokens were
+/// served from the provider's prompt cache vs. written into it. Both
+/// are 0 when the provider doesn't report cache usage (OpenAI
+/// subscription path, providers without prompt caching, etc.).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: usize,
     pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
 }
 
 /// A chat request to be sent to an LLM provider.
@@ -241,6 +254,39 @@ impl LlmStream {
             inner: Box::pin(mapped),
         }
     }
+
+    /// Gemini-specific variant of [`Self::from_rig_stream`]. rig 0.34's
+    /// `GetTokenUsage` impl for Gemini's streaming response leaves
+    /// `cached_input_tokens` at 0; this wrapper reads
+    /// `usage_metadata.cached_content_token_count` straight off the raw
+    /// `Final` payload so prompt-cache hits land in cost_records. Drop
+    /// once rig upstream fixes the impl.
+    fn from_gemini_stream(
+        rig_stream: streaming::StreamingCompletionResponse<
+            gemini::streaming::StreamingCompletionResponse,
+        >,
+    ) -> Self {
+        let mapped = rig_stream.filter_map(|result| {
+            futures::future::ready(match result {
+                Err(e) => Some(Err(LlmError::Provider(e.to_string()))),
+                Ok(StreamedAssistantContent::Final(r)) => {
+                    let mut usage = r.token_usage().unwrap_or_default();
+                    usage.cached_input_tokens =
+                        r.usage_metadata.cached_content_token_count.unwrap_or(0) as u64;
+                    Some(Ok(StreamEvent::Usage(TokenUsage {
+                        input_tokens: usage.input_tokens as usize,
+                        output_tokens: usage.output_tokens as usize,
+                        cached_input_tokens: usage.cached_input_tokens as usize,
+                        cache_creation_input_tokens: usage.cache_creation_input_tokens as usize,
+                    })))
+                }
+                Ok(event) => convert_stream_event(event),
+            })
+        });
+        Self {
+            inner: Box::pin(mapped),
+        }
+    }
 }
 
 fn convert_stream_event<R: GetTokenUsage>(
@@ -266,6 +312,8 @@ fn convert_stream_event<R: GetTokenUsage>(
             Ok(StreamEvent::Usage(TokenUsage {
                 input_tokens: usage.input_tokens as usize,
                 output_tokens: usage.output_tokens as usize,
+                cached_input_tokens: usage.cached_input_tokens as usize,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens as usize,
             }))
         }),
         // ToolCallDelta events are skipped — we emit the complete
@@ -311,9 +359,18 @@ impl AnyCompletionModel {
             }
             Self::Gemini(m) => {
                 let resp = m.completion(request).await?;
+                // rig 0.34's Gemini path leaves `cached_input_tokens` at 0
+                // even when the response carries `cachedContentTokenCount`.
+                // Re-derive it from the raw `usage_metadata` so prompt-cache
+                // hits land in cost_records correctly. Drop this once rig
+                // upstream populates the field itself.
+                let mut usage = resp.usage;
+                if let Some(meta) = resp.raw_response.usage_metadata.as_ref() {
+                    usage.cached_input_tokens = meta.cached_content_token_count.unwrap_or(0) as u64;
+                }
                 Ok(completion::CompletionResponse {
                     choice: resp.choice,
-                    usage: resp.usage,
+                    usage,
                     raw_response: (),
                     message_id: resp.message_id,
                 })
@@ -337,7 +394,7 @@ impl AnyCompletionModel {
             }
             Self::Gemini(m) => {
                 let stream = m.stream(request).await?;
-                Ok(LlmStream::from_rig_stream(stream))
+                Ok(LlmStream::from_gemini_stream(stream))
             }
             Self::OpenAiSubscription(m) => m.stream(request).await,
         }
@@ -780,6 +837,8 @@ impl LlmClient {
         let usage = TokenUsage {
             input_tokens: response.usage.input_tokens as usize,
             output_tokens: response.usage.output_tokens as usize,
+            cached_input_tokens: response.usage.cached_input_tokens as usize,
+            cache_creation_input_tokens: response.usage.cache_creation_input_tokens as usize,
         };
 
         LlmResponse {
@@ -1028,7 +1087,7 @@ mod multimodal_dispatch_tests {
 
     #[tokio::test]
     async fn fetcher_error_falls_back_to_text_stub_not_panic() {
-        // A blob the gateway can't read (soft-deleted, missing, etc.)
+        // A blob the gateway can't read (missing, deleted, etc.)
         // must not blow up the LLM call — drop to the same text stub
         // an unconfigured fetcher would emit, with a tracing warn so
         // operators can find it.

@@ -123,6 +123,14 @@ pub struct LlmCallResult {
     pub input_tokens: usize,
     #[serde(default)]
     pub output_tokens: usize,
+    /// Anthropic prompt-cache: input tokens served from the cache.
+    /// `#[serde(default)]` keeps already-persisted spans (which lack
+    /// the field) decodable.
+    #[serde(default)]
+    pub cached_input_tokens: usize,
+    /// Anthropic prompt-cache: input tokens written into the cache.
+    #[serde(default)]
+    pub cache_creation_input_tokens: usize,
 }
 
 /// Begin-time data for a `ToolCall` span.
@@ -131,8 +139,9 @@ pub struct ToolCallBegin {
     pub tool_name: String,
     pub tool_artifact_hash: String,
     /// Pairing back to the LLM `Span` that emitted the tool_use block.
-    /// `None` when the tool call did not originate from an LLM (e.g.
-    /// `TriggerAction::ToolCall` — cron's direct invoke).
+    /// Currently always `Some` — every tool call goes through the agent
+    /// loop. The field stays optional for storage backwards compat with
+    /// historical rows from removed direct-invoke paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triggered_by: Option<ToolCallOrigin>,
     pub params: Value,

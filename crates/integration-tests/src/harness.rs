@@ -7,17 +7,20 @@
 //! vault, and observability stores are all exposed so assertions can
 //! reach into post-run state without re-wiring anything.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::{
-    AgentLoop, ExecutionPolicy, JobLifecycle, MemoryManager, SecurityGateway, SpanRecorder,
+    AgentLoop, CostManager, ExecutionPolicy, JobLifecycle, MemoryManager, SecurityGateway,
+    SpanRecorder, SpendingLimits,
     actor::{AgentActor, AgentMessage},
     soul::Soul,
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_context::{ContextManager, TiktokenTokenizer, Truncate, budget::TokenBudget};
+use aura_llm::ModelPricing;
 use aura_llm::test_support::StubLlm;
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
@@ -55,6 +58,7 @@ pub struct AgentTestHarness {
     pub memory_store: Arc<MemoryMemoryStore>,
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
+    pub cost_manager: Arc<CostManager>,
     pub mailbox: mpsc::Sender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -150,6 +154,8 @@ pub struct AgentTestHarnessBuilder {
     output_capacity: usize,
     tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
     sidecar_mcp: Option<Arc<dyn aura_tools::mcp::SidecarMcpProvider>>,
+    spending_limits: SpendingLimits,
+    pricing: Arc<HashMap<String, ModelPricing>>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -161,6 +167,8 @@ impl Default for AgentTestHarnessBuilder {
             output_capacity: 64,
             tools: Vec::new(),
             sidecar_mcp: None,
+            spending_limits: SpendingLimits::default(),
+            pricing: Arc::new(HashMap::new()),
         }
     }
 }
@@ -206,6 +214,21 @@ impl AgentTestHarnessBuilder {
         self
     }
 
+    /// Override the harness's `SpendingLimits` (default: all `None`).
+    /// Use to write tests that exercise budget gates.
+    pub fn with_spending_limits(mut self, limits: SpendingLimits) -> Self {
+        self.spending_limits = limits;
+        self
+    }
+
+    /// Override the pricing map handed to `CostManager` (default: empty).
+    /// Pair with a `SpendingLimits` cap to make `record_call`-driven
+    /// state visible to budget gates.
+    pub fn with_pricing(mut self, pricing: Arc<HashMap<String, ModelPricing>>) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
     /// Wire everything and spawn the `AgentActor`. The returned harness
     /// owns the mailbox sender and the response receiver.
     pub fn build(self) -> AgentTestHarness {
@@ -248,13 +271,14 @@ impl AgentTestHarnessBuilder {
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
             trace_event_stream.clone(),
         ));
-        // Cost subscriber: pricing left empty for tests — token
-        // counts still land in cost_records, cost_usd reads as 0.
-        let _cost_handle = aura_agent::cost::CostSubscriber::new(
+        // Cost ledger. Default builder leaves pricing empty (cost_usd
+        // resolves to 0) and limits as `None` (no budget gate). Tests
+        // that exercise budgeting use `with_pricing` / `with_spending_limits`.
+        let cost_manager = aura_agent::CostManager::new(
             share_cost_store(&cost_store),
-            Arc::new(std::collections::HashMap::new()),
-        )
-        .spawn(&trace_event_stream);
+            self.pricing,
+            self.spending_limits,
+        );
 
         // Agent loop dependencies.
         let stub_llm = Arc::new(StubLlm::new());
@@ -299,7 +323,8 @@ impl AgentTestHarnessBuilder {
             ExecutionPolicy::default(),
             soul,
             gateway.clone(),
-        );
+        )
+        .with_cost_manager(Arc::clone(&cost_manager));
         if let Some(provider) = self.sidecar_mcp {
             agent_loop = agent_loop.with_sidecar_mcp(provider);
         }
@@ -310,7 +335,6 @@ impl AgentTestHarnessBuilder {
         let actor = AgentActor::new(
             session.clone(),
             agent_loop,
-            tool_executor,
             output_tx,
             job_lifecycle,
             span_recorder,
@@ -330,6 +354,7 @@ impl AgentTestHarnessBuilder {
             memory_store,
             tool_registry,
             skill_registry,
+            cost_manager,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),
@@ -340,7 +365,7 @@ impl AgentTestHarnessBuilder {
 // --- Helpers to obtain `Box<dyn Trait>` handles from `Arc<Concrete>` ---
 //
 // Each in-memory store is constructed once as an `Arc` and shared
-// directly with the managers — `JobManager`, `CostTracker`, and
+// directly with the managers — `JobLifecycle`, `CostManager`, and
 // `MemoryManager` all accept `Arc<dyn Trait>`, so the test handle and the
 // manager-owned handle point at the same instance and post-run
 // assertions see real state.

@@ -28,8 +28,6 @@
 //! using `ListResponse<Session>` still compiles even though `Session`
 //! stays outside the OpenAPI surface.
 
-use std::path::PathBuf;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -199,6 +197,11 @@ pub struct CreateCronRequest {
     #[serde(default)]
     pub channel: Option<ChannelType>,
     pub text: String,
+    /// IANA timezone (e.g. `"Asia/Shanghai"`) used to evaluate the cron
+    /// expression and to render time fields in responses. Required —
+    /// every time the API speaks is anchored to this zone, so callers
+    /// must commit to one explicitly.
+    pub timezone: String,
     #[serde(default)]
     pub origin_session_id: Option<String>,
 }
@@ -297,7 +300,7 @@ pub struct JobStatus {
     pub partial_artifacts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatusKind {
     Pending,
@@ -317,6 +320,19 @@ impl From<aura_job::JobStatusKind> for JobStatusKind {
             aura_job::JobStatusKind::Cancelled => Self::Cancelled,
             aura_job::JobStatusKind::Failed => Self::Failed,
             aura_job::JobStatusKind::Completed => Self::Completed,
+        }
+    }
+}
+
+impl From<JobStatusKind> for aura_job::JobStatusKind {
+    fn from(v: JobStatusKind) -> Self {
+        match v {
+            JobStatusKind::Pending => Self::Pending,
+            JobStatusKind::InProgress => Self::InProgress,
+            JobStatusKind::Stuck => Self::Stuck,
+            JobStatusKind::Cancelled => Self::Cancelled,
+            JobStatusKind::Failed => Self::Failed,
+            JobStatusKind::Completed => Self::Completed,
         }
     }
 }
@@ -429,6 +445,7 @@ impl From<aura_job::Job> for Job {
 pub enum CronStatus {
     Enabled,
     Disabled,
+    Executed,
 }
 
 impl From<aura_cron::CronStatus> for CronStatus {
@@ -436,6 +453,7 @@ impl From<aura_cron::CronStatus> for CronStatus {
         match v {
             aura_cron::CronStatus::Enabled => Self::Enabled,
             aura_cron::CronStatus::Disabled => Self::Disabled,
+            aura_cron::CronStatus::Executed => Self::Executed,
         }
     }
 }
@@ -457,87 +475,6 @@ impl From<aura_cron::CronSchedule> for CronSchedule {
     }
 }
 
-/// Mirror of [`aura_model::HostPattern`].
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum HostPattern {
-    Exact(String),
-    Wildcard(String),
-}
-
-impl From<aura_model::HostPattern> for HostPattern {
-    fn from(v: aura_model::HostPattern) -> Self {
-        match v {
-            aura_model::HostPattern::Exact(h) => Self::Exact(h),
-            aura_model::HostPattern::Wildcard(h) => Self::Wildcard(h),
-        }
-    }
-}
-
-/// Mirror of [`aura_model::ApprovedResource`]. Paths serialize as
-/// strings on the wire.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ApprovedResource {
-    ReadFile {
-        #[schema(value_type = String)]
-        path: PathBuf,
-    },
-    WriteFile {
-        #[schema(value_type = String)]
-        path: PathBuf,
-    },
-    Http {
-        host: HostPattern,
-    },
-    ExecCommand {
-        command: String,
-    },
-}
-
-impl From<aura_model::ApprovedResource> for ApprovedResource {
-    fn from(v: aura_model::ApprovedResource) -> Self {
-        match v {
-            aura_model::ApprovedResource::ReadFile { path } => Self::ReadFile { path },
-            aura_model::ApprovedResource::WriteFile { path } => Self::WriteFile { path },
-            aura_model::ApprovedResource::Http { host } => Self::Http { host: host.into() },
-            aura_model::ApprovedResource::ExecCommand { command } => Self::ExecCommand { command },
-        }
-    }
-}
-
-/// Mirror of [`aura_cron::TriggerAction`].
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TriggerAction {
-    Prompt {
-        prompt: String,
-    },
-    ToolCall {
-        tool_name: String,
-        #[schema(value_type = Object)]
-        params: serde_json::Value,
-        approved_resources: Vec<ApprovedResource>,
-    },
-}
-
-impl From<aura_cron::TriggerAction> for TriggerAction {
-    fn from(v: aura_cron::TriggerAction) -> Self {
-        match v {
-            aura_cron::TriggerAction::Prompt { prompt } => Self::Prompt { prompt },
-            aura_cron::TriggerAction::ToolCall {
-                tool_name,
-                params,
-                approved_resources,
-            } => Self::ToolCall {
-                tool_name,
-                params,
-                approved_resources: approved_resources.into_iter().map(Into::into).collect(),
-            },
-        }
-    }
-}
-
 /// Mirror of [`aura_cron::CronJob`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CronJob {
@@ -545,7 +482,8 @@ pub struct CronJob {
     pub user_id: String,
     pub channel: ChannelType,
     pub schedule: CronSchedule,
-    pub action: TriggerAction,
+    pub prompt: String,
+    pub timezone: String,
     pub status: CronStatus,
     pub last_triggered_at: Option<DateTime<Utc>>,
     pub next_trigger_at: Option<DateTime<Utc>>,
@@ -562,7 +500,8 @@ impl From<aura_cron::CronJob> for CronJob {
             user_id: v.user_id,
             channel: v.channel.into(),
             schedule: v.schedule.into(),
-            action: v.action.into(),
+            prompt: v.prompt,
+            timezone: v.timezone,
             status: v.status.into(),
             last_triggered_at: v.last_triggered_at,
             next_trigger_at: v.next_trigger_at,
@@ -678,6 +617,168 @@ pub struct LogsResponse {
     /// `limit`/`offset`, so clients can size the pager without asking
     /// for the full list.
     pub total: usize,
+}
+
+// ── Trace session summary (list view) ───────────────────────────────
+
+/// `GET /v1/traces` query params. All fields are optional; `None`
+/// removes that constraint.
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TracesListQuery {
+    /// Filter on the latest job's status (snake_case enum).
+    #[serde(default)]
+    pub status: Option<JobStatusKind>,
+    /// Inclusive lower bound on `last_active`.
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `last_active`.
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    /// Case-insensitive substring on session id.
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// One row of the trace browser list view. Mirrors
+/// [`aura_agent::SessionSummary`] for the wire.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TraceSessionSummary {
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+    /// `None` when the session has no jobs (those rows are filtered
+    /// out, but the type stays Option to keep the wire shape stable
+    /// if the policy ever flips).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_job_status: Option<JobStatus>,
+    pub job_count: usize,
+    pub span_count: usize,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+}
+
+impl From<aura_agent::SessionSummary> for TraceSessionSummary {
+    fn from(v: aura_agent::SessionSummary) -> Self {
+        Self {
+            session_id: v.session_id.to_string(),
+            created_at: v.created_at,
+            last_active: v.last_active,
+            latest_job_status: v.latest_job_status.map(Into::into),
+            job_count: v.job_count,
+            span_count: v.span_count,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            cached_input_tokens: v.cached_input_tokens,
+            cache_creation_input_tokens: v.cache_creation_input_tokens,
+        }
+    }
+}
+
+/// Envelope for `GET /v1/traces`. Carries `total` for "Showing X of N"
+/// pagers, matching the shape of [`LogsResponse`].
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TracesListResponse {
+    pub items: Vec<TraceSessionSummary>,
+    pub total: usize,
+}
+
+// ── Analytics ────────────────────────────────────────────────────────
+
+/// `GET /v1/analytics` query params. Defaults to the last 30 UTC days
+/// when no range is supplied.
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct AnalyticsQuery {
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// One bucket per UTC day for the analytics chart.
+///
+/// `cost_micro_usd` is integer micro-USD (USD × 10^6). Rendering layers
+/// divide by 1_000_000 to get USD; on-wire arithmetic stays exact.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnalyticsDayBucket {
+    /// `YYYY-MM-DD` (UTC).
+    pub date: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    /// Spend for the day, in **micro-USD** (1 USD = 1_000_000).
+    #[schema(value_type = i64)]
+    pub cost_micro_usd: aura_model::MicroUsd,
+    pub sessions_created: usize,
+}
+
+impl From<aura_agent::AnalyticsDayBucket> for AnalyticsDayBucket {
+    fn from(v: aura_agent::AnalyticsDayBucket) -> Self {
+        Self {
+            date: v.date,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            cached_input_tokens: v.cached_input_tokens,
+            cache_creation_input_tokens: v.cache_creation_input_tokens,
+            cost_micro_usd: v.cost_usd,
+            sessions_created: v.sessions_created,
+        }
+    }
+}
+
+/// Per-model breakdown row for the analytics dashboard.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnalyticsModelBucket {
+    pub model: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    /// Spend for the model, in **micro-USD** (1 USD = 1_000_000).
+    #[schema(value_type = i64)]
+    pub cost_micro_usd: aura_model::MicroUsd,
+    pub call_count: usize,
+}
+
+impl From<aura_agent::AnalyticsModelBucket> for AnalyticsModelBucket {
+    fn from(v: aura_agent::AnalyticsModelBucket) -> Self {
+        Self {
+            model: v.model,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            cached_input_tokens: v.cached_input_tokens,
+            cache_creation_input_tokens: v.cache_creation_input_tokens,
+            cost_micro_usd: v.cost_usd,
+            call_count: v.call_count,
+        }
+    }
+}
+
+/// `GET /v1/analytics` response body.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AnalyticsResponse {
+    /// Inclusive lower bound used for the aggregation (UTC).
+    pub since: DateTime<Utc>,
+    /// Exclusive upper bound used for the aggregation (UTC).
+    pub until: DateTime<Utc>,
+    pub total_input_tokens: usize,
+    pub total_output_tokens: usize,
+    pub total_cached_input_tokens: usize,
+    pub total_cache_creation_input_tokens: usize,
+    /// Total spend across the window, in **micro-USD** (1 USD = 1_000_000).
+    #[schema(value_type = i64)]
+    pub total_cost_micro_usd: aura_model::MicroUsd,
+    pub total_record_count: usize,
+    pub daily: Vec<AnalyticsDayBucket>,
+    pub by_model: Vec<AnalyticsModelBucket>,
 }
 
 // ── ToolDefinition ───────────────────────────────────────────────────

@@ -32,7 +32,10 @@ use std::future::Future;
 
 use aura_job::{CancelReason, JobOutput};
 use aura_model::{JobId, ParallelGroup};
-use aura_trace::{LifecycleOutcome, SpanFinalize, SpanHandle, SpanKind, StepHandle, StepKind};
+use aura_trace::{
+    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind, StepHandle,
+    StepKind,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -230,6 +233,61 @@ where
             Ok(_) => warn!(error = %close_err, "end_span failed on success path"),
             Err(orig) => {
                 warn!(error = %close_err, original = %orig, "end_span failed on error path")
+            }
+        }
+    }
+    value_result
+}
+
+/// LLM-call-aware variant of [`with_span`]: the body must always
+/// produce an [`LlmCallResult`] alongside the success-or-error result,
+/// so the resulting `LlmSpanEnded` event fires on **every** terminal
+/// path — including provider errors, sanitize failures, mid-stream
+/// drops, and cancellations.
+///
+/// `with_span`'s "Err → SpanFinalize::Empty" rule is the right
+/// behaviour for tool calls (no token economy attached) but for LLM
+/// calls it silently drops billing for any failed attempt that already
+/// consumed input tokens or streamed partial output. This helper
+/// closes that hole: callers compute a best-effort [`LlmCallResult`]
+/// (zero tokens when nothing was observed, partial counts when the
+/// stream got some way through) and the helper guarantees the
+/// `cost_records` row lands.
+///
+/// Cancel semantics mirror [`with_span`].
+pub(crate) async fn with_llm_span<F, Fut, T>(
+    rec: &SpanRecorder,
+    step: &StepHandle,
+    job_id: JobId,
+    begin: LlmCallBegin,
+    cancel: CancelContext<'_>,
+    body: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce(SpanHandle) -> Fut,
+    Fut: Future<Output = (LlmCallResult, anyhow::Result<T>)>,
+{
+    let span = rec
+        .begin_span(
+            step,
+            SpanKind::LlmCall {
+                begin,
+                result: None,
+            },
+            None,
+        )
+        .await?;
+    let (call_result, value_result) = body(span.clone()).await;
+    let outcome = match &value_result {
+        Ok(_) => LifecycleOutcome::Ok,
+        Err(e) => outcome_on_err(e, cancel),
+    };
+    let finalize = SpanFinalize::LlmCall(call_result);
+    if let Err(close_err) = rec.end_span(span, job_id, finalize, outcome).await {
+        match &value_result {
+            Ok(_) => warn!(error = %close_err, "end_llm_span failed on success path"),
+            Err(orig) => {
+                warn!(error = %close_err, original = %orig, "end_llm_span failed on error path")
             }
         }
     }

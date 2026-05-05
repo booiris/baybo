@@ -1,0 +1,36 @@
+[package]
+name = "aura-setup"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aura-channels = { workspace = true }
+aura-config = { workspace = true }
+aura-gateway = { workspace = true }
+aura-llm = { workspace = true }
+aura-model = { workspace = true }
+aura-security = { workspace = true }
+aura-storage = { workspace = true }
+aura-workspace = { workspace = true }
+
+anyhow = { workspace = true }
+crossterm = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+open = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# Gates the in-crate `MockPrompter` so it stays out of release builds.
+test-support = []
+
+[dev-dependencies]
+aura-setup = { workspace = true, features = ["test-support"] }
+aura-storage = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

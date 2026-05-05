@@ -186,8 +186,8 @@ impl OpenAiSubscriptionCompletionModel {
                 input_tokens: usage.input_tokens as u64,
                 output_tokens: usage.output_tokens as u64,
                 total_tokens: (usage.input_tokens + usage.output_tokens) as u64,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
+                cached_input_tokens: usage.cached_input_tokens as u64,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens as u64,
             },
             raw_response: (),
             message_id: None,
@@ -225,8 +225,8 @@ impl OpenAiSubscriptionCompletionModel {
                 .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
             if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
                 return Err(CompletionError::ProviderError(
-                    "openai-subscription: unauthorized after refresh — run `aura llm auth login \
-                     --provider openai-subscription`"
+                    "openai-subscription: unauthorized after refresh — run `aura llm edit` \
+                     and pick `OAuth login (re-authenticate)` for this entry"
                         .into(),
                 ));
             }
@@ -263,8 +263,9 @@ impl OpenAiSubscriptionCompletionModel {
                     );
                 }
                 return Err(LlmError::Config(
-                    "openai-subscription: not signed in — run \
-                     `aura llm auth login --provider openai-subscription`"
+                    "openai-subscription: not signed in — add an entry via \
+                     `aura llm add` (pick the openai-subscription provider) or \
+                     re-authenticate an existing entry via `aura llm edit`"
                         .into(),
                 ));
             }
@@ -951,9 +952,20 @@ fn translate_event(
                     .get("output_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
+                // OpenAI Responses API reports prompt-cache hits under
+                // `input_tokens_details.cached_tokens`. There is no
+                // cache-write counter — the API doesn't separate cache
+                // creation from regular input.
+                let cached = usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
                 out.push(Ok(StreamEvent::Usage(TokenUsage {
                     input_tokens: input,
                     output_tokens: output,
+                    cached_input_tokens: cached,
+                    cache_creation_input_tokens: 0,
                 })));
             }
         }
@@ -1736,7 +1748,7 @@ mod tests {
 
     /// Cache-hit path revalidates the vault every CACHE_VAULT_REVALIDATE_INTERVAL_SECS.
     /// Past the window, a missing vault entry invalidates the cached bundle
-    /// so a cross-process `aura llm auth logout` is honoured.
+    /// so a cross-process `aura llm remove` (which clears the vault entry) is honoured.
     #[tokio::test]
     async fn ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied() {
         use aura_security::{EncryptionKey, SecretVault};

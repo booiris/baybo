@@ -93,9 +93,8 @@ impl ChannelSessionResolver {
 
     /// Drop the existing `(channel_type, user_id)` mapping (if any) and
     /// allocate a brand-new aura session for the same user. Returns the
-    /// new `session_id`. The previous session row stays soft-deleted in
-    /// the `sessions` table for replay/audit; only the channel mapping
-    /// is repointed.
+    /// new `session_id`. Only the channel mapping is repointed — the
+    /// underlying `sessions` row is independent.
     ///
     /// `put`'s `ON CONFLICT` keeps the live `session_id` when a row is
     /// already live, so a delete is required to actually repoint.

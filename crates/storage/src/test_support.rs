@@ -20,7 +20,7 @@ use crate::StorageError;
 use crate::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };
-use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange, UserMonthlyCost};
+use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 use crate::job::{JobStore, Result as JobStoreResult};
 use crate::memory::{MemoryStore, Result as MemoryStoreResult};
 use crate::secret::{Result as SecretResult, SecretStore};
@@ -199,13 +199,10 @@ impl JobStore for MemoryJobStore {
 }
 
 /// In-memory `CostStore` for tests. Records are appended in arrival
-/// order; queries scan linearly. Plenty fast for tests. Carries the
-/// `user_monthly_cost` cache too so `CostSubscriber` integration
-/// tests can read it back.
+/// order; queries scan linearly. Plenty fast for tests.
 #[derive(Debug, Default)]
 pub struct MemoryCostStore {
     records: Mutex<Vec<CostRecord>>,
-    monthly: Mutex<HashMap<(String, String), UserMonthlyCost>>,
 }
 
 impl MemoryCostStore {
@@ -249,9 +246,23 @@ impl CostStore for MemoryCostStore {
             summary.total_cost_usd += r.cost_usd;
             summary.total_input_tokens += r.input_tokens;
             summary.total_output_tokens += r.output_tokens;
+            summary.total_cached_input_tokens += r.cached_input_tokens;
+            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
             summary.record_count += 1;
         }
         Ok(summary)
+    }
+
+    async fn query_records_in_range(&self, range: TimeRange) -> CostResult<Vec<CostRecord>> {
+        let mut out: Vec<CostRecord> = self
+            .records
+            .lock()
+            .iter()
+            .filter(|r| in_range(r, &range))
+            .cloned()
+            .collect();
+        out.sort_by_key(|r| r.timestamp);
+        Ok(out)
     }
 
     async fn query_session(&self, session_id: &SessionId) -> CostResult<CostSummary> {
@@ -265,6 +276,8 @@ impl CostStore for MemoryCostStore {
             summary.total_cost_usd += r.cost_usd;
             summary.total_input_tokens += r.input_tokens;
             summary.total_output_tokens += r.output_tokens;
+            summary.total_cached_input_tokens += r.cached_input_tokens;
+            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
             summary.record_count += 1;
         }
         Ok(summary)
@@ -276,71 +289,11 @@ impl CostStore for MemoryCostStore {
             summary.total_cost_usd += r.cost_usd;
             summary.total_input_tokens += r.input_tokens;
             summary.total_output_tokens += r.output_tokens;
+            summary.total_cached_input_tokens += r.cached_input_tokens;
+            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
             summary.record_count += 1;
         }
         Ok(summary)
-    }
-
-    async fn bump_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-        delta_usd: f64,
-    ) -> CostResult<()> {
-        let now = chrono::Utc::now();
-        let key = (user_id.to_string(), month.to_string());
-        let mut map = self.monthly.lock();
-        let entry = map.entry(key).or_insert_with(|| UserMonthlyCost {
-            user_id: user_id.to_string(),
-            month: month.to_string(),
-            cost_usd: 0.0,
-            updated_at: now,
-        });
-        entry.cost_usd += delta_usd;
-        entry.updated_at = now;
-        Ok(())
-    }
-
-    async fn get_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-    ) -> CostResult<Option<UserMonthlyCost>> {
-        Ok(self
-            .monthly
-            .lock()
-            .get(&(user_id.to_string(), month.to_string()))
-            .cloned())
-    }
-
-    async fn purge_user_monthly_cost_older_than(
-        &self,
-        cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> CostResult<u64> {
-        let mut map = self.monthly.lock();
-        let before = map.len();
-        map.retain(|_, v| v.updated_at >= cutoff);
-        Ok((before - map.len()) as u64)
-    }
-
-    async fn purge_cost_records_older_than(
-        &self,
-        cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> CostResult<u64> {
-        let mut records = self.records.lock();
-        let before = records.len();
-        records.retain(|r| r.timestamp >= cutoff);
-        Ok((before - records.len()) as u64)
-    }
-
-    async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64> {
-        Ok(self
-            .records
-            .lock()
-            .iter()
-            .filter(|r| r.user_id == user_id && in_range(r, &range))
-            .map(|r| r.cost_usd)
-            .sum())
     }
 }
 
@@ -431,8 +384,9 @@ impl TraceStore for MemoryTraceStore {
 }
 
 /// In-memory `MemoryStore` for tests. Keyed by `entry.id`. Search is a
-/// case-insensitive substring match against `key + value` — good enough
-/// for asserting "the entry I just stored shows up in search".
+/// case-insensitive substring match against the entry's `content` —
+/// good enough for asserting "the entry I just stored shows up in
+/// search".
 #[derive(Debug, Default)]
 pub struct MemoryMemoryStore {
     entries: Mutex<HashMap<String, MemoryEntry>>,
@@ -525,7 +479,6 @@ struct MemoryBlob {
     created_at: i64,
     last_accessed_at: i64,
     read_token: String,
-    deleted_at: Option<i64>,
 }
 
 impl MemoryBlobStore {
@@ -534,11 +487,7 @@ impl MemoryBlobStore {
     }
 
     pub fn len(&self) -> usize {
-        self.blobs
-            .lock()
-            .values()
-            .filter(|b| b.deleted_at.is_none())
-            .count()
+        self.blobs.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -574,7 +523,6 @@ impl BlobStore for MemoryBlobStore {
             .and_modify(|b| {
                 b.mime_type = mime_type.to_owned();
                 b.last_accessed_at = now;
-                b.deleted_at = None;
             })
             .or_insert(MemoryBlob {
                 bytes: bytes.to_vec(),
@@ -582,7 +530,6 @@ impl BlobStore for MemoryBlobStore {
                 created_at: now,
                 last_accessed_at: now,
                 read_token: read_token.to_owned(),
-                deleted_at: None,
             });
         Ok(BlobRef { blob_id })
     }
@@ -617,8 +564,8 @@ impl BlobStore for MemoryBlobStore {
         // every read, matching the libsql backend's contract.
         let _ = self.stat(blob_id).await?;
         match self.blobs.lock().get(blob_id) {
-            Some(b) if b.deleted_at.is_none() => Ok(b.bytes.clone()),
-            _ => Err(StorageError::NotFound(format!("blob {blob_id}"))),
+            Some(b) => Ok(b.bytes.clone()),
+            None => Err(StorageError::NotFound(format!("blob {blob_id}"))),
         }
     }
 
@@ -632,7 +579,7 @@ impl BlobStore for MemoryBlobStore {
         let now = chrono::Utc::now().timestamp_micros();
         let mut guard = self.blobs.lock();
         match guard.get_mut(blob_id) {
-            Some(b) if b.deleted_at.is_none() => {
+            Some(b) => {
                 if b.read_token != token {
                     return Err(StorageError::NotFound(format!("blob {blob_id}")));
                 }
@@ -648,30 +595,21 @@ impl BlobStore for MemoryBlobStore {
                     read_token: Some(b.read_token.clone()),
                 })
             }
-            _ => Err(StorageError::NotFound(format!("blob {blob_id}"))),
+            None => Err(StorageError::NotFound(format!("blob {blob_id}"))),
         }
     }
 
     async fn delete(&self, blob_id: &str) -> BlobResult<()> {
         let _ = split_id(blob_id)?;
-        if let Some(b) = self.blobs.lock().get_mut(blob_id) {
-            b.deleted_at
-                .get_or_insert_with(|| chrono::Utc::now().timestamp_micros());
-        }
+        self.blobs.lock().remove(blob_id);
         Ok(())
     }
 
     async fn purge_older_than(&self, cutoff_unix: i64) -> BlobResult<u64> {
         let mut guard = self.blobs.lock();
-        let now = chrono::Utc::now().timestamp_micros();
-        let mut purged: u64 = 0;
-        for blob in guard.values_mut() {
-            if blob.deleted_at.is_none() && blob.last_accessed_at < cutoff_unix {
-                blob.deleted_at = Some(now);
-                purged += 1;
-            }
-        }
-        Ok(purged)
+        let before = guard.len();
+        guard.retain(|_, blob| blob.last_accessed_at >= cutoff_unix);
+        Ok((before - guard.len()) as u64)
     }
 }
 

@@ -136,7 +136,15 @@ impl ToolRegistry {
                 },
             );
         }
-        defs.into_values().collect()
+        // Sort by name so the serialized `tools` array is byte-identical
+        // across calls. Anthropic's prompt cache keys on the exact
+        // request prefix (tools → system → messages); a HashMap-driven
+        // shuffle invalidates every breakpoint past `tools`, and the
+        // cache miss shows up as `cached_input_tokens` ≪ `input_tokens`
+        // on multi-turn runs.
+        let mut out: Vec<ToolDefinition> = defs.into_values().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// Look up a tool by name. Dynamic registrations shadow builtins.

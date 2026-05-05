@@ -1,5 +1,5 @@
-//! Redacted wrapper around secret bytes to keep plaintext out of `Debug`,
-//! `Display`, and serialized output.
+//! Redacted wrapper around secret bytes to keep plaintext out of `Debug`
+//! and `Display`.
 
 use crate::{Result, SecurityError};
 

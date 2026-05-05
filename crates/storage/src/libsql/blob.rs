@@ -68,8 +68,8 @@ impl LibsqlBlobStore {
     }
 
     /// Persist the metadata row + return the `BlobRef`. Idempotent:
-    /// `ON CONFLICT … DO UPDATE` keeps the latest mime and clears
-    /// `deleted_at`, matching the soft-delete revival rule.
+    /// `ON CONFLICT … DO UPDATE` keeps the latest mime + bumps the LRU
+    /// timestamp.
     async fn record_metadata(
         &self,
         hex: &str,
@@ -82,12 +82,11 @@ impl LibsqlBlobStore {
         let conn = self.pool.conn();
         let now = now_unix();
         conn.execute(
-            "INSERT INTO blobs (blob_id, mime_type, size, uploader_identity, read_token, created_at, last_accessed_at, deleted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, NULL) \
+            "INSERT INTO blobs (blob_id, mime_type, size, uploader_identity, read_token, created_at, last_accessed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
              ON CONFLICT(blob_id) DO UPDATE SET \
                 mime_type = excluded.mime_type, \
-                last_accessed_at = excluded.last_accessed_at, \
-                deleted_at = NULL",
+                last_accessed_at = excluded.last_accessed_at",
             libsql::params![
                 blob_id.clone(),
                 mime_type.to_string(),
@@ -110,7 +109,7 @@ impl LibsqlBlobStore {
         if let Err(e) = conn
             .execute(
                 "UPDATE blobs SET last_accessed_at = ?2 \
-                 WHERE blob_id = ?1 AND deleted_at IS NULL",
+                 WHERE blob_id = ?1",
                 libsql::params![blob_id.to_string(), now_unix()],
             )
             .await
@@ -310,10 +309,9 @@ impl BlobStore for LibsqlBlobStore {
 
     async fn get(&self, blob_id: &str) -> Result<Vec<u8>> {
         let (hex, _token) = split_id(blob_id)?;
-        // stat first so a soft-deleted blob whose bytes are still on
-        // disk surfaces as NotFound rather than reading them anyway —
-        // and so we have the recorded mime to reconstruct the on-disk
-        // extension the put path appended.
+        // stat first so we have the recorded mime to reconstruct the
+        // on-disk extension the put path appended (and so a missing
+        // metadata row surfaces as NotFound before we try the disk).
         let meta = self.stat(blob_id).await?;
         let path = self.blob_path(hex, mime_extension(&meta.mime_type));
         tokio::fs::read(&path).await.map_err(|e| {
@@ -345,7 +343,7 @@ impl BlobStore for LibsqlBlobStore {
         let mut rows = conn
             .query(
                 "SELECT blob_id, mime_type, size, created_at, read_token \
-                 FROM blobs WHERE blob_id = ?1 AND deleted_at IS NULL",
+                 FROM blobs WHERE blob_id = ?1",
                 libsql::params![blob_id.to_string()],
             )
             .await
@@ -397,15 +395,64 @@ impl BlobStore for LibsqlBlobStore {
     }
 
     async fn delete(&self, blob_id: &str) -> Result<()> {
-        let _ = split_id(blob_id)?;
+        let (hex, _token) = split_id(blob_id)?;
         let conn = self.pool.conn();
-        conn.execute(
-            "UPDATE blobs SET deleted_at = ?2 \
-             WHERE blob_id = ?1 AND deleted_at IS NULL",
-            libsql::params![blob_id.to_string(), now_unix()],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob delete: {e}")))?;
+
+        // Capture mime so we can locate the on-disk file before the
+        // metadata row is gone, then check whether any other live row
+        // still points at the same content path.
+        let mut rows = conn
+            .query(
+                "SELECT mime_type FROM blobs WHERE blob_id = ?1",
+                libsql::params![blob_id.to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob query: {e}")))?;
+        let mime_type: Option<String> = match rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob row: {e}")))?
+        {
+            Some(row) => Some(
+                row.get(0)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?,
+            ),
+            None => None,
+        };
+        drop(rows);
+
+        let affected = conn
+            .execute(
+                "DELETE FROM blobs WHERE blob_id = ?1",
+                libsql::params![blob_id.to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob delete: {e}")))?;
+
+        if affected > 0
+            && let Some(mime) = mime_type
+        {
+            let ext = mime_extension(&mime);
+            let path = self.blob_path(hex, ext);
+            // Two puts of the same content (and same mime) share one
+            // on-disk file by content addressing; deleting one
+            // capability must not yank the file out from under the
+            // other. Confirm the path is unreferenced before unlinking.
+            let still_referenced = self.any_live_for_path(hex, ext).await.unwrap_or(false);
+            if !still_referenced {
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "blob payload unlink failed",
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -419,14 +466,12 @@ impl BlobStore for LibsqlBlobStore {
         // long ago it was first written.
         //
         // Three DB calls total — independent of the victim count:
-        // (1) snapshot victims, (2) one UPDATE that flips them all,
-        // (3) snapshot the surviving live set so per-payload unlink
-        // checks come from an in-memory hashmap instead of an
-        // unindexed `LIKE` per victim.
+        // (1) snapshot victims, (2) one DELETE, (3) snapshot the
+        // surviving live set so per-payload unlink checks come from an
+        // in-memory hashmap instead of an unindexed `LIKE` per victim.
         let mut rows = conn
             .query(
-                "SELECT blob_id, mime_type FROM blobs \
-                 WHERE last_accessed_at < ?1 AND deleted_at IS NULL",
+                "SELECT blob_id, mime_type FROM blobs WHERE last_accessed_at < ?1",
                 libsql::params![cutoff_us],
             )
             .await
@@ -452,16 +497,14 @@ impl BlobStore for LibsqlBlobStore {
             return Ok(0);
         }
 
-        let now = now_unix();
         let purged = conn
             .execute(
-                "UPDATE blobs SET deleted_at = ?1 \
-                 WHERE last_accessed_at < ?2 AND deleted_at IS NULL",
-                libsql::params![now, cutoff_us],
+                "DELETE FROM blobs WHERE last_accessed_at < ?1",
+                libsql::params![cutoff_us],
             )
             .await
             .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql blob purge update: {e}"))
+                StorageError::Internal(anyhow::anyhow!("libsql blob purge delete: {e}"))
             })?;
 
         // Snapshot the surviving live set so we can answer "is anyone
@@ -471,10 +514,7 @@ impl BlobStore for LibsqlBlobStore {
         // on-disk path — different MIMEs of the same content live at
         // different paths.
         let mut live_rows = conn
-            .query(
-                "SELECT blob_id, mime_type FROM blobs WHERE deleted_at IS NULL",
-                libsql::params![],
-            )
+            .query("SELECT blob_id, mime_type FROM blobs", libsql::params![])
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live query: {e}")))?;
         let mut live_paths: std::collections::HashSet<(String, &'static str)> =
@@ -528,6 +568,40 @@ impl BlobStore for LibsqlBlobStore {
         }
 
         Ok(purged)
+    }
+}
+
+impl LibsqlBlobStore {
+    /// Return `true` if some other live blob row resolves to the same
+    /// on-disk path (i.e. shares this `(hex, mime_extension)` pair).
+    /// Used by [`BlobStore::delete`] before unlinking a payload so a
+    /// concurrent capability for the same content doesn't lose its
+    /// bytes.
+    async fn any_live_for_path(&self, hex: &str, ext: &'static str) -> Result<bool> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query("SELECT blob_id, mime_type FROM blobs", libsql::params![])
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live scan: {e}")))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live row: {e}")))?
+        {
+            let other_id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get blob_id: {e}")))?;
+            let other_mime: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?;
+            if let Ok((other_hex, _token)) = split_id(&other_id)
+                && other_hex == hex
+                && mime_extension(&other_mime) == ext
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -715,12 +789,11 @@ mod tests {
 
     #[tokio::test]
     async fn delete_does_not_affect_a_fresh_put_of_same_content() {
-        // Soft-delete revival via shared `blob_id` is gone with the
-        // capability-id model — each put is its own row keyed by a
-        // fresh token. This test pins the new contract: deleting one
-        // capability for some content must not block a different
-        // tenant from uploading the same content and getting their
-        // own (independent, readable) id.
+        // Each put is its own row keyed by a fresh token under the
+        // capability-id model. Deleting one capability for some
+        // content must not block a different tenant from uploading
+        // the same content and getting their own (independent,
+        // readable) id.
         let (store, _dir) = build().await;
         let first = store.put(b"shared", "text/plain", None).await.unwrap();
         store.delete(&first.blob_id).await.unwrap();
@@ -992,7 +1065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purge_older_than_soft_deletes_row_and_unlinks_payload() {
+    async fn purge_older_than_hard_deletes_row_and_unlinks_payload() {
         let (store, dir) = build().await;
         let stale = store.put(b"stale", "text/plain", None).await.unwrap();
         let fresh = store.put(b"fresh", "text/plain", None).await.unwrap();
@@ -1005,7 +1078,7 @@ mod tests {
             .unwrap();
         assert_eq!(purged, 1);
 
-        // Stale row is soft-deleted.
+        // Stale row is gone.
         match store.get(&stale.blob_id).await {
             Err(StorageError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
@@ -1035,8 +1108,8 @@ mod tests {
     #[tokio::test]
     async fn purge_older_than_keeps_payload_when_live_row_still_references_it() {
         // Two puts of identical (content, mime) share one on-disk file
-        // by content addressing. Soft-deleting the stale capability
-        // must NOT yank the file out from under the live capability.
+        // by content addressing. Purging the stale capability must NOT
+        // yank the file out from under the live capability.
         let (store, dir) = build().await;
         let stale = store.put(b"shared", "text/plain", None).await.unwrap();
         let live = store.put(b"shared", "text/plain", None).await.unwrap();
@@ -1049,7 +1122,7 @@ mod tests {
             .unwrap();
         assert_eq!(purged, 1);
 
-        // Stale row is soft-deleted...
+        // Stale row is gone...
         assert!(matches!(
             store.get(&stale.blob_id).await,
             Err(StorageError::NotFound(_)),

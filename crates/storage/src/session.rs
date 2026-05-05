@@ -18,22 +18,21 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub trait SessionStore: Send + Sync {
     async fn get(&self, session_id: &SessionId) -> Result<Option<Session>>;
     async fn save(&self, session: &Session) -> Result<()>;
-    /// Soft-delete the session.
+    /// Hard-delete the session.
     ///
-    /// Returns `Ok(true)` if a live row was flipped to deleted, `Ok(false)`
-    /// if the row did not exist or was already deleted (idempotent).
-    /// Returns `Err(StorageError::HasLiveForks { .. })` if any
-    /// non-deleted session has a `LineageKind::UserFork` pointing into
-    /// `session_id`. The live-fork scan, the parent-row update, and the
-    /// `cost_records.originating_session_deleted_at` mirror all run inside
-    /// one `BEGIN IMMEDIATE` write transaction — a fork inserted concurrently
-    /// either lands before the scan (and is reported back) or after the
-    /// commit (and protects a still-live parent on the *next* call).
+    /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`
+    /// if it did not exist (idempotent).
+    /// Returns `Err(StorageError::HasLiveForks { .. })` if any session has a
+    /// `LineageKind::UserFork` pointing into `session_id`. The live-fork
+    /// scan and the parent-row delete run inside one `BEGIN IMMEDIATE`
+    /// write transaction — a fork inserted concurrently either lands
+    /// before the scan (and is reported back) or after the commit (and
+    /// protects a still-live parent on the *next* call).
     ///
     /// Does **not** drain in-flight subagents — that is the
     /// `SessionManager`'s responsibility (cancel propagation through
     /// the actor token tree happens before this call).
-    async fn soft_delete(&self, session_id: &SessionId) -> Result<bool>;
+    async fn delete(&self, session_id: &SessionId) -> Result<bool>;
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>>;
     /// Return every live session, ordered by `last_active` descending.
     /// Operator-facing: drives `aura session list`.

@@ -19,13 +19,16 @@
 //!   5. Asserts on the channel output AND on store state, then calls
 //!      `shutdown()` to stop the actor cleanly.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aura_agent::SpendingLimits;
 use aura_channels::AgentOutput;
 use aura_integration_tests::{AgentTestHarness, capture_tracing};
 use aura_llm::test_support::StubLlm;
-use aura_llm::{LlmResponse, StreamEvent, ToolCallInfo};
+use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, ToolCallInfo};
+use aura_model::MicroUsd;
 use aura_tools::test_support::RecordingTool;
 use aura_tools::{Tool, ToolOutput};
 use serde_json::json;
@@ -185,6 +188,84 @@ async fn injection_marker_in_user_input_logs_warn() {
             .any(|e| e.contains("prompt-injection") && e.contains("inbound")),
         "expected an inbound prompt-injection warn; got: {:?}",
         cap.events()
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn budget_gate_blocks_retry_after_partial_stream_billing() {
+    // Regression: the budget gate must live INSIDE
+    // `call_llm_with_retry`'s loop, not just at `run_iteration`'s top.
+    // Otherwise streaming-partial billing in attempt N can push past
+    // the cap, but attempt N+1 of the SAME iteration would re-call the
+    // LLM without re-checking — silently spiralling.
+    //
+    // The setup:
+    //  * cap = $0.003
+    //  * pricing for the stub model so a single 1k-input attempt
+    //    bills exactly $0.003 (boundary case, gate is `>=`)
+    //  * stream events `[Usage{input=1000}, Err("timeout: ...")]` —
+    //    chat_streaming captures the Usage, then errors. The Err
+    //    message contains "timeout" so ErrorHandler::should_retry
+    //    returns true and the loop reaches its second `cm.check()`.
+    //
+    // If the gate fires, only one `chat_stream` call lands. If not,
+    // the second push_stream_results below would be consumed too.
+
+    let model = "stub-model";
+    let mut pricing_map = HashMap::new();
+    pricing_map.insert(
+        model.to_string(),
+        ModelPricing {
+            input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
+            output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
+        },
+    );
+    let pricing = Arc::new(pricing_map);
+    let limits = SpendingLimits {
+        daily_usd: Some(MicroUsd::from_usd_decimal(0.003)),
+        ..Default::default()
+    };
+
+    let mut harness = AgentTestHarness::builder()
+        .with_pricing(pricing)
+        .with_spending_limits(limits)
+        .build();
+
+    let usage = TokenUsage {
+        input_tokens: 1_000,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+    // Attempt 0: usage observed, then transient timeout. record_call
+    // bills $0.003 — exactly the cap.
+    harness.stub_llm.push_stream_results(vec![
+        Ok(StreamEvent::Usage(usage)),
+        Err(LlmError::Provider("timeout: connection dropped".into())),
+    ]);
+    // Attempt 1 should NEVER consume this — it's queued only so we
+    // can prove via captured_requests that the gate stopped it.
+    harness.stub_llm.push_stream_results(vec![
+        Ok(StreamEvent::Usage(usage)),
+        Err(LlmError::Provider("timeout: should not retry".into())),
+    ]);
+
+    harness.send_text("trigger the LLM").await.unwrap();
+    // ErrorHandler default backoff is 1s after attempt 0. Drain long
+    // enough for the loop to wake from sleep, hit the rejected
+    // pre-flight check, and surface the failure — but not so long
+    // that a buggy run could drain a full retry chain undetected.
+    let _outputs = harness.drain_outputs(Duration::from_millis(2_500)).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(
+        captured.len(),
+        1,
+        "budget gate inside call_llm_with_retry must reject attempt 2; \
+         got {} chat_stream invocations",
+        captured.len()
     );
 
     harness.shutdown().await;

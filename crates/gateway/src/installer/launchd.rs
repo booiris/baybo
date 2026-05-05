@@ -158,7 +158,7 @@ mod tests {
     fn ctx() -> InstallContext {
         InstallContext {
             exec_start: PathBuf::from("/usr/local/bin/aura"),
-            config_path: Some(PathBuf::from("/Users/me/.aura/profile/aura.json")),
+            config_path: Some(PathBuf::from("/Users/me/.aura/config/aura.json")),
             log_dir: PathBuf::from("/Users/me/.aura/logs"),
             user_mode: true,
         }
@@ -172,7 +172,7 @@ mod tests {
         assert!(body.contains("<string>/usr/local/bin/aura</string>"));
         assert!(body.contains("<string>gateway</string>"));
         assert!(body.contains("AURA_CONFIG_PATH"));
-        assert!(body.contains("/Users/me/.aura/profile/aura.json"));
+        assert!(body.contains("/Users/me/.aura/config/aura.json"));
         assert!(body.contains("<key>KeepAlive</key>"));
     }
 

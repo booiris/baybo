@@ -42,7 +42,7 @@ impl TraceStore for LibsqlTraceStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM steps WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT data FROM steps WHERE id = ?1",
                 libsql::params![step_id.to_string()],
             )
             .await
@@ -69,7 +69,7 @@ impl TraceStore for LibsqlTraceStore {
         let mut rows = conn
             .query(
                 "SELECT data FROM steps \
-                 WHERE job_id = ?1 AND deleted_at IS NULL ORDER BY started_at",
+                 WHERE job_id = ?1 ORDER BY started_at",
                 libsql::params![job_id.to_string()],
             )
             .await
@@ -108,7 +108,7 @@ impl TraceStore for LibsqlTraceStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM spans WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT data FROM spans WHERE id = ?1",
                 libsql::params![span_id.to_string()],
             )
             .await
@@ -135,7 +135,7 @@ impl TraceStore for LibsqlTraceStore {
         let mut rows = conn
             .query(
                 "SELECT data FROM spans \
-                 WHERE step_id = ?1 AND deleted_at IS NULL ORDER BY started_at",
+                 WHERE step_id = ?1 ORDER BY started_at",
                 libsql::params![step_id.to_string()],
             )
             .await
@@ -175,7 +175,7 @@ impl TraceStore for LibsqlTraceStore {
         let mut rows = conn
             .query(
                 "SELECT data FROM span_events \
-                 WHERE span_id = ?1 AND deleted_at IS NULL ORDER BY seq",
+                 WHERE span_id = ?1 ORDER BY seq",
                 libsql::params![span_id.to_string()],
             )
             .await

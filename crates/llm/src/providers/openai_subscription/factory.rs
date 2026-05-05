@@ -6,6 +6,7 @@ use super::{
 };
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, LlmError, ModelInfo, ModelPricing};
+use aura_model::MicroUsd;
 
 /// Hosts where the ChatGPT subscription bearer is allowed to land. Match
 /// is suffix-based (`chatgpt.com` covers `api.chatgpt.com` etc.). A
@@ -91,8 +92,8 @@ impl LlmProviderFactory for OpenAiSubscriptionProviderFactory {
             // Subscription billing is account-level, not per-token, so cost
             // records land at $0 — see design doc.
             pricing: ModelPricing {
-                input_per_1m_tokens: 0.0,
-                output_per_1m_tokens: 0.0,
+                input_per_1m_tokens: MicroUsd::ZERO,
+                output_per_1m_tokens: MicroUsd::ZERO,
             },
         };
         Ok(LlmClient::new(
@@ -179,7 +180,10 @@ mod tests {
             .expect("create should succeed");
         assert_eq!(client.model_info().provider, PROVIDER_NAME);
         assert_eq!(client.model_info().id, "gpt-5");
-        assert_eq!(client.model_info().pricing.input_per_1m_tokens, 0.0);
+        assert_eq!(
+            client.model_info().pricing.input_per_1m_tokens,
+            MicroUsd::ZERO
+        );
     }
 
     // base_url validator regressions.

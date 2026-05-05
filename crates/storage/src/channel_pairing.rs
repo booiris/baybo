@@ -64,13 +64,10 @@ impl ChannelPairingRow {
     }
 }
 
-/// Persistence contract for pairing rows. Implementations treat the
-/// natural key `(channel_type, bot_id, user_id)` as soft-deletable —
-/// `delete` sets a tombstone, `upsert_pending` revives it with fresh
-/// state.
+/// Persistence contract for pairing rows.
 #[async_trait]
 pub trait ChannelPairingStore: Send + Sync {
-    /// Return the live row for `(channel_type, bot_id, user_id)`.
+    /// Return the row for `(channel_type, bot_id, user_id)`.
     async fn get(
         &self,
         channel_type: &ChannelType,
@@ -78,11 +75,11 @@ pub trait ChannelPairingStore: Send + Sync {
         user_id: &str,
     ) -> Result<Option<ChannelPairingRow>>;
 
-    /// Return the live row that carries `code`.
+    /// Return the row that carries `code`.
     async fn get_by_code(&self, code: &str) -> Result<Option<ChannelPairingRow>>;
 
-    /// Insert a pending row for the triple if no live row exists, or
-    /// overwrite an expired / tombstoned row with the provided values.
+    /// Insert a pending row for the triple if none exists, or
+    /// overwrite an expired pending row with the provided values.
     /// A live non-expired row wins on conflict (the existing code
     /// survives so concurrent inbounds from the same user agree).
     /// `now` and `expires_at` are Unix seconds.
@@ -101,23 +98,24 @@ pub trait ChannelPairingStore: Send + Sync {
 
     /// Flip a pending row identified by `code` to approved. Returns
     /// the updated row, or `None` if the code is unknown, already
-    /// approved, expired, or revoked.
+    /// approved, or expired.
     async fn approve_by_code(&self, code: &str, now: i64) -> Result<Option<ChannelPairingRow>>;
 
-    /// List live rows, optionally filtered by status. Expired pending
-    /// rows are still returned — the caller computes the `EXPIRED`
-    /// badge against its own `now`.
+    /// List rows, optionally filtered by status. Expired pending rows
+    /// are still returned — the caller computes the `EXPIRED` badge
+    /// against its own `now`.
     async fn list(&self, status: Option<PairingStatus>) -> Result<Vec<ChannelPairingRow>>;
 
-    /// Soft-delete the row for the triple. No-op if already tombstoned.
+    /// Hard-delete the row for the triple. No-op if already removed.
     async fn delete(&self, channel_type: &ChannelType, bot_id: &str, user_id: &str) -> Result<()>;
 
     /// Hard-delete pairing rows that the retention sweep should reap:
     ///   * `Pending` rows whose `expires_at <= now_secs`, and
     ///   * `Approved` rows whose `approved_at < cutoff_secs`.
     /// Both classes are auth-flow ephemera — pending codes are
-    /// short-lived by nature, and an old approval is just a record of
-    /// a one-time grant, kept in `channel_bot` instead. Returns the
-    /// number of rows removed.
+    /// short-lived by nature, and an old approval is just a record
+    /// of a one-time grant; live access is established at
+    /// message-time via the channel route, not by retaining the
+    /// approval row. Returns the number of rows removed.
     async fn purge_expired(&self, now_secs: i64, approved_cutoff_secs: i64) -> Result<u64>;
 }

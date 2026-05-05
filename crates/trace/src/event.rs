@@ -9,8 +9,8 @@ use aura_model::{ApprovalDecision, PlaceholderId, ResourceAccess, SecretKind, Sp
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Discrete observation tied to a specific `Span`. Audit-only — no
-/// hooks fire from `SpanEvent` writes (see `agent.md` hook protocol).
+/// Discrete observation tied to a specific `Span`. Audit-only — writing
+/// a `SpanEvent` does not trigger any side effects beyond persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpanEvent {
     pub span_id: SpanId,
@@ -34,9 +34,9 @@ pub enum SpanEventKind {
         /// them via `SecretVault`.
         placeholder_ids: Vec<PlaceholderId>,
     },
-    /// **Every** approval decision is recorded — including
-    /// `ApproveOnce`. The audit trail of "what did the user approve
-    /// and when" is complete by design.
+    /// **Every** approval decision is recorded — `Approve`,
+    /// `ApproveAlways`, and `Deny` alike. The audit trail of "what
+    /// did the user approve and when" is complete by design.
     Approval {
         decision: ApprovalDecision,
         resource: ResourceAccess,

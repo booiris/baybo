@@ -1,7 +1,7 @@
 //! State shared with the WS channel server.
 //!
 //! Threaded through the axum router used by [`crate::channel::route`] so
-//! per-connection tasks can register a [`crate::channel::adapter::SidecarAdapter`]
+//! per-connection tasks can register a [`crate::channel::adapter::Sidecar`]
 //! on the workspace [`ChannelRegistry`], validate the caller's capability
 //! token against the live [`ChannelTokenTable`], and forward decoded
 //! frames onto the router's incoming mpsc.

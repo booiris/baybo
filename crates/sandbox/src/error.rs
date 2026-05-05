@@ -9,7 +9,7 @@ pub enum SandboxError {
     UnsupportedPlatform(&'static str),
 
     #[error(
-        "backend binary `{name}` not found in $PATH; install it (Linux: `apt install bubblewrap` / `dnf install bubblewrap`; macOS: ships with the system; or install docker as a cross-platform fallback) and restart aura"
+        "backend binary `{name}` not found in $PATH; install the named backend (or another supported one — see docs/modules/sandbox.md for per-platform install commands) and restart aura"
     )]
     BackendMissing { name: &'static str },
 

@@ -48,6 +48,12 @@ pub struct CompressionLlmCall {
     pub provider: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// Anthropic prompt-cache hits / writes for the compression call.
+    /// Defaulted so older `SessionState` JSON blobs decode cleanly.
+    #[serde(default)]
+    pub cached_input_tokens: usize,
+    #[serde(default)]
+    pub cache_creation_input_tokens: usize,
 }
 
 /// Manages session context: appending messages with automatic compression

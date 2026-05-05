@@ -3,10 +3,9 @@
 //! Channels that multiplex many tenants over one sidecar (Telegram
 //! bots, future Discord guilds, …) look up the active tenant set
 //! here. The token itself lives in [`aura_security::SecretVault`] —
-//! this table just records which bot ids exist, when they were
-//! created, and whether they're soft-deleted. Callers join the two
-//! at runtime via a well-known secret name pattern
-//! (`channel.<channel_type>.bot.<bot_id>.token`).
+//! this table just records which bot ids exist and when they were
+//! created. Callers join the two at runtime via a well-known secret
+//! name pattern (`channel.<channel_type>.bot.<bot_id>.token`).
 
 use std::collections::HashMap;
 
@@ -46,20 +45,19 @@ pub struct ChannelBotRow {
 
 #[async_trait]
 pub trait ChannelBotStore: Send + Sync {
-    /// List every live bot for the given channel type, newest first.
+    /// List every registered bot for the given channel type, newest first.
     async fn list_live(&self, channel_type: &ChannelType) -> Result<Vec<ChannelBotRow>>;
 
-    /// Return the single bot's metadata if it's live.
+    /// Return the single bot's metadata if it's registered.
     async fn get(&self, channel_type: &ChannelType, bot_id: &str) -> Result<Option<ChannelBotRow>>;
 
-    /// Mark a bot as live. Idempotent: re-adding a tombstone row
-    /// revives it (with a fresh `created_at`). On a live-row conflict
-    /// the existing row's `created_at` wins but `metadata` is
-    /// overwritten with the supplied value — this is the upsert path
-    /// the CLI / WebUI uses to amend a registration's auxiliary
-    /// configuration without losing the row's identity. `metadata` is
-    /// a free-form `HashMap<String, String>`; empty maps are stored
-    /// as `{}` and round-trip equivalently.
+    /// Register a bot. Idempotent on live-row conflict: the existing
+    /// row's `created_at` wins but `metadata` is overwritten with the
+    /// supplied value — this is the upsert path the CLI / WebUI uses
+    /// to amend a registration's auxiliary configuration without
+    /// losing the row's identity. `metadata` is a free-form
+    /// `HashMap<String, String>`; empty maps are stored as `{}` and
+    /// round-trip equivalently.
     async fn put(
         &self,
         channel_type: &ChannelType,
@@ -67,6 +65,6 @@ pub trait ChannelBotStore: Send + Sync {
         metadata: HashMap<String, String>,
     ) -> Result<()>;
 
-    /// Soft-delete the bot. Later `put`s revive.
+    /// Hard-delete the bot. Later `put`s create a fresh row.
     async fn delete(&self, channel_type: &ChannelType, bot_id: &str) -> Result<()>;
 }

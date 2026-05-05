@@ -15,10 +15,8 @@ pub trait SecretStore: Send + Sync {
     /// without pulling every name in the store into memory just to
     /// filter.
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
-    /// Soft-delete the secret. Later `store` calls with the same name
-    /// revive the entry (INSERT OR REPLACE + NULL default on the
-    /// `deleted_at` column). Idempotent on missing / already-deleted
-    /// names.
+    /// Hard-delete the secret. Later `store` calls with the same name
+    /// re-create it. Idempotent on missing names.
     async fn delete(&self, name: &str) -> Result<()>;
     /// Soft-delete every live secret whose name starts with `prefix`.
     /// Used to sweep a per-bot namespace

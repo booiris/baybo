@@ -127,11 +127,12 @@ pub enum Commands {
     },
     /// Launch the interactive Ratatui chat session.
     ///
-    /// Connects to an `aura gateway` over HTTP+SSE. The endpoint is
-    /// derived from `config.gateway.{bind_address,port}` and the
-    /// bearer token is read from the workspace vault. If the gateway
-    /// is unreachable the command exits with an error block
-    /// describing how to start one.
+    /// Connects to an `aura gateway` over its WebSocket channel
+    /// listener; the loopback port is discovered from
+    /// `<workspace>/state/channel.port`, and the per-start TUI
+    /// token is read from the workspace vault under
+    /// `gateway.tui_token`. If the gateway is unreachable the
+    /// command exits with an error block describing how to start one.
     Tui {
         /// Resume an existing session by id instead of creating a new
         /// one. Sessions created with a different channel (http) are
@@ -154,6 +155,15 @@ pub enum Commands {
     Status,
     /// Run health checks against config, storage, and env.
     Doctor,
+    /// Interactive first-run wizard: bootstrap the workspace, mint
+    /// the master encryption key, register an LLM provider, optionally
+    /// configure a channel bot and (in full mode) the browser tool,
+    /// then launch the gateway with the dashboard open.
+    ///
+    /// Idempotent: safe to re-run after the workspace exists. The
+    /// "Add another / Skip" picker on the LLM and channel steps lets
+    /// you extend an existing setup.
+    Setup,
     /// Emit shell completion script.
     Completion {
         #[arg(value_enum)]
@@ -243,9 +253,9 @@ pub enum ChannelCmd {
     Add,
     /// Deregister a bot. Opens an interactive single-select over every
     /// registered bot (showing bot id + channel), then asks for y/N
-    /// confirmation. Soft-deletes the row and removes its vault
-    /// secret; a running gateway's reconciler pushes a `StopBot` to
-    /// the sidecar on the next tick.
+    /// confirmation. Deletes the row and removes its vault secret; a
+    /// running gateway's reconciler pushes a `StopBot` to the sidecar
+    /// on the next tick.
     Remove,
 }
 
@@ -403,9 +413,9 @@ pub enum PairCmd {
         /// Short pairing code (6 chars, unambiguous alphabet).
         code: String,
     },
-    /// Soft-delete an approved or pending pairing. Subsequent
-    /// messages from the triple trigger a fresh pending row with a
-    /// fresh code.
+    /// Delete an approved or pending pairing. Subsequent messages
+    /// from the triple trigger a fresh pending row with a fresh
+    /// code.
     Revoke {
         /// Channel type, e.g. `telegram`.
         channel_type: String,

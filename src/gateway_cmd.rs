@@ -9,12 +9,12 @@
 //!
 //! `start` is a long-running server: it acquires the per-workspace
 //! singleton, builds the full manager graph via [`crate::runtime`]
-//! (passing [`BootMode::Gateway`] so the auth token is registered as
-//! a log redaction rule), and drives the router, admin
-//! [`GatewayServer`], and the loopback-TCP [`ChannelServer`] side by
-//! side under a shared `ShutdownSignal`. Sidecars register
-//! themselves with the channel registry from the WS route task when
-//! they connect.
+//! (seeding `runtime::build_leak_detector` with the gateway-owned
+//! tokens so any log line that echoes them is masked), and drives the
+//! router, admin [`GatewayServer`], and the loopback-TCP
+//! [`ChannelServer`] side by side under a shared `ShutdownSignal`.
+//! Sidecars register themselves with the channel registry from the WS
+//! route task when they connect.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,7 +83,7 @@ fn install_context(
 /// Resolution order:
 /// 1. `AURA_CONFIG_PATH` — canonicalized; errors if it cannot be
 ///    resolved to an existing file.
-/// 2. `<default_workspace_root>/profile/aura.json` — if it already exists.
+/// 2. `<default_workspace_root>/config/aura.json` — if it already exists.
 /// 3. Otherwise `None`, with a loud stderr warning: the service will
 ///    launch against built-in defaults (no LLM key, default workspace),
 ///    which is almost never what the user actually wants.
@@ -377,11 +377,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     {
         let mut janitor =
             aura_janitor::Janitor::new(workspace_paths.clone(), graph.stores.blob.clone())
-                .with_retention_stores(
-                    graph.stores.cost.clone(),
-                    graph.stores.cron.clone(),
-                    graph.stores.channel_pairing.clone(),
-                );
+                .with_pairing_store(graph.stores.channel_pairing.clone());
         if let Some(runtime) = sidecar_runtime.as_ref()
             && let Some(cache_root) = runtime.sidecars_cache_root()
         {
@@ -445,9 +441,9 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to
-    // `<workspace>/channel.port` (same workspace identity dir as the
-    // singleton lockfile) so TUI and sidecars can discover it without
-    // a config roundtrip.
+    // `<workspace>/state/channel.port` (next to the singleton
+    // lockfile) so TUI and sidecars can discover it without a config
+    // roundtrip.
     let channel_server = ChannelServer::bind(&deps, port_file, channel_tokens.clone())
         .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
     let channel_port = channel_server.port();
@@ -499,7 +495,10 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     let server = GatewayServer::new(deps);
     let banner_bind = server.bind();
-    println!("Aura gateway listening on http://{banner_bind}");
+    println!(
+        "{}http://{banner_bind}",
+        aura_gateway::LISTENING_BANNER_PREFIX
+    );
     println!("  Quick URL: http://{banner_bind}/v1/status?token={token}");
 
     tracing::info!(bind = %banner_bind, "gateway start: all components initialized");

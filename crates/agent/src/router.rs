@@ -3,11 +3,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aura_channels::{AgentOutput, Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
-use aura_model::{Session, SessionId, User};
+use aura_model::{Session, SessionId, TriggerSource, User};
 
 use aura_cron::CronTriggerEvent;
 
-use crate::cost::CostGuard;
+use crate::cost::CostManager;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
 use tokio::sync::mpsc;
@@ -60,7 +60,7 @@ impl RateLimiter {
 ///
 /// Returns the mailbox sender for communicating with the spawned actor.
 /// The closure captures all dependencies needed to construct an actor
-/// (AgentLoop, HookManager, JobLifecycle, SpanRecorder, etc.).
+/// (AgentLoop, ToolExecutor, JobLifecycle, SpanRecorder, etc.).
 ///
 /// `parent_token` is the cancellation parent the child actor's
 /// `actor_token` is derived from. Tripping the parent cascades cancel
@@ -81,7 +81,7 @@ pub struct Router {
     supervisor: AgentSupervisor,
     channels: Arc<ChannelRegistry>,
     security_gateway: Arc<SecurityGateway>,
-    cost_guard: Option<Arc<CostGuard>>,
+    cost_manager: Option<Arc<CostManager>>,
     rate_limiter: RateLimiter,
     actor_spawner: Option<ActorSpawner>,
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
@@ -110,7 +110,7 @@ impl Router {
             supervisor,
             channels,
             security_gateway,
-            cost_guard: None,
+            cost_manager: None,
             rate_limiter: RateLimiter::new(
                 DEFAULT_RATE_LIMIT_REQUESTS,
                 std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
@@ -131,9 +131,11 @@ impl Router {
         self
     }
 
-    /// Set a `CostGuard` for quota checks before routing messages.
-    pub fn with_cost_guard(mut self, guard: Arc<CostGuard>) -> Self {
-        self.cost_guard = Some(guard);
+    /// Attach the [`CostManager`] so the router can pre-flight reject
+    /// over-budget messages before they enter an actor — same gate the
+    /// agent loop uses before each LLM call, just at message ingress.
+    pub fn with_cost_manager(mut self, manager: Arc<CostManager>) -> Self {
+        self.cost_manager = Some(manager);
         self
     }
 
@@ -196,13 +198,23 @@ impl Router {
         self.supervisor.shutdown_all().await;
     }
 
-    /// Handle a cron trigger by resolving (or creating) a session for the
-    /// target user+channel combination and routing a `CronTrigger` message.
+    /// Handle a cron trigger by minting a fresh session and routing a
+    /// `CronTrigger` message into a one-shot actor.
+    ///
+    /// Each fire creates an isolated session so the trigger sees a
+    /// clean transcript and a fresh `SessionState` (no leaked
+    /// `approved_resources`, `active_skills`, or compression state
+    /// from prior fires). Continuity across fires belongs to memory +
+    /// skill loading, not to a shared mutable transcript.
+    ///
+    /// The spawned actor is intentionally NOT registered with the
+    /// supervisor: each cron session is one-shot and has no follow-up
+    /// traffic, so registering would just accumulate dangling actor
+    /// handles in the supervisor's map. We send `CronTrigger` followed
+    /// by `Shutdown`; the actor processes the trigger (FIFO), exits on
+    /// Shutdown, and its mailbox closes when this function returns and
+    /// drops the sender.
     async fn handle_cron_trigger(&mut self, event: CronTriggerEvent) -> anyhow::Result<()> {
-        // Stable session ID derived from user+channel so repeated cron
-        // triggers reuse a single session for conversational continuity.
-        let session_id = format!("cron-{}-{}", event.user_id, event.channel);
-
         let user = User {
             id: event.user_id.clone(),
             name: None,
@@ -210,42 +222,47 @@ impl Router {
             bot_id: None,
         };
 
+        let session = self
+            .session_manager
+            .create_session_with_trigger(
+                user,
+                event.channel.clone(),
+                TriggerSource::Cron {
+                    cron_job_id: event.job_id.clone(),
+                },
+            )
+            .await?;
+        let session_id = session.id.clone();
+
+        let Some(ref spawner) = self.actor_spawner else {
+            warn!(session_id = %session_id, "no actor spawner configured for cron trigger");
+            return Ok(());
+        };
+
         debug!(
             session_id = %session_id,
             job_id = %event.job_id,
-            "routing cron trigger"
+            "routing cron trigger to fresh session"
         );
 
-        let typed_session_id = SessionId::from(session_id.as_str());
-        let session = self
-            .session_manager
-            .get_or_create(&typed_session_id, user, event.channel.clone())
-            .await?;
+        let response_tx = self.supervisor.response_tx().clone();
+        let sender = spawner(session, response_tx, &self.actor_parent_token);
 
-        self.session_manager.touch(&typed_session_id).await?;
-
-        let message = AgentMessage::CronTrigger {
+        let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
-            action: event.action,
+            prompt: event.prompt,
         };
-
-        let routed = self.supervisor.route(&session_id, message.clone()).await;
-
-        if !routed {
-            if let Some(ref spawner) = self.actor_spawner {
-                info!(session_id = %session_id, "creating new actor for cron session");
-                let response_tx = self.supervisor.response_tx().clone();
-                let sender = spawner(session, response_tx, &self.actor_parent_token);
-                self.supervisor.register(session_id.clone(), sender);
-
-                if !self.supervisor.route(&session_id, message).await {
-                    warn!(session_id = %session_id, "failed to route cron trigger after actor creation");
-                }
-            } else {
-                warn!(session_id = %session_id, "no actor spawner configured for cron trigger");
-            }
+        if let Err(e) = sender.send(trigger_msg).await {
+            warn!(session_id = %session_id, error = %e, "failed to deliver cron trigger");
+            return Ok(());
         }
-
+        if let Err(e) = sender.send(AgentMessage::Shutdown).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to deliver post-trigger shutdown; actor will still exit when sender drops",
+            );
+        }
         Ok(())
     }
 
@@ -274,14 +291,16 @@ impl Router {
             anyhow::bail!("rate limit exceeded for user '{}'", user.id);
         }
 
-        // Quota check via CostGuard
-        if let Some(ref guard) = self.cost_guard {
-            guard.check_quota(&user.id).await.map_err(|e| {
+        // In-memory budget gate: same call agent_loop makes before
+        // each LLM call, fired here too so an over-cap user never even
+        // gets an actor spun up.
+        if let Some(ref cm) = self.cost_manager {
+            cm.check().map_err(|e| {
                 warn!(
                     user_id = %user.id,
                     session_id = %session_id,
                     error = %e,
-                    "cost guard rejected request"
+                    "cost manager rejected request"
                 );
                 anyhow::anyhow!(e)
             })?;

@@ -5,11 +5,44 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_tools::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{CronSchedule, CronScheduler, CronStatus, TriggerAction};
+use crate::{CronSchedule, CronScheduler};
+
+/// Parse an `at` parameter accepting either RFC3339 with offset
+/// (`2026-04-17T14:25:00Z` or `2026-04-17T22:25:00+08:00`) or a naive
+/// ISO-8601 datetime (`2026-04-17T14:25:00`, optionally space-separated)
+/// interpreted in `tz_name`. Naive ambiguous times (DST fall-back) take
+/// the earlier offset; nonexistent times (DST spring-forward gap) are
+/// rejected.
+fn parse_at_in_tz(at: &str, tz_name: &str) -> Result<DateTime<Utc>, ToolError> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(at) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    let tz = parse_tz(tz_name)?;
+    let naive = NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M:%S"))
+        .map_err(|e| {
+            ToolError::InvalidParams(format!(
+                "`at` must be RFC3339 with offset or naive `YYYY-MM-DDTHH:MM:SS`: {e}"
+            ))
+        })?;
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Ok(dt.with_timezone(&Utc)),
+        LocalResult::Ambiguous(earliest, _latest) => Ok(earliest.with_timezone(&Utc)),
+        LocalResult::None => Err(ToolError::InvalidParams(format!(
+            "`at` time {at} does not exist in timezone {tz_name} (DST gap)"
+        ))),
+    }
+}
+
+fn parse_tz(name: &str) -> Result<Tz, ToolError> {
+    name.parse::<Tz>()
+        .map_err(|e| ToolError::InvalidParams(format!("invalid timezone {name}: {e}")))
+}
 
 /// Build every cron tool with its manifest, ready to be registered with a
 /// `ToolRegistry`. Always `Trusted` with no capabilities — they operate on
@@ -55,10 +88,8 @@ struct CreateParams {
     schedule: Option<String>,
     #[serde(default)]
     at: Option<String>,
-    prompt: Option<String>,
-    tool: Option<String>,
-    #[serde(default)]
-    params: Option<Value>,
+    prompt: String,
+    timezone: String,
 }
 
 #[async_trait]
@@ -68,45 +99,44 @@ impl Tool for CronCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule a cron job. Exactly one of `schedule` (recurring cron \
-         expression, e.g. \"0 9 * * *\") or `at` (one-shot RFC3339 UTC \
-         timestamp, e.g. \"2026-04-17T14:25:00Z\") is required — `at` jobs \
-         fire once then auto-delete. Exactly one of `prompt` (sends text \
-         through the LLM on trigger) or `tool` (directly invokes a registered \
-         tool, with optional `params`) is required."
+        "Schedule a cron job. `timezone` and `prompt` are required — \
+         every fire sends `prompt` through the LLM, and every time in \
+         inputs and outputs is anchored to `timezone`. Exactly one of \
+         `schedule` (recurring cron expression, e.g. \"0 9 * * *\") or \
+         `at` (one-shot timestamp) is required — `at` jobs fire once \
+         then auto-delete."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "schedule": {
+                "timezone": {
                     "type": "string",
-                    "description": "Recurring cron expression (mutually exclusive with `at`)"
-                },
-                "at": {
-                    "type": "string",
-                    "description": "One-shot RFC3339 UTC timestamp; fires once and auto-deletes (mutually exclusive with `schedule`)"
+                    "description": "IANA timezone (e.g. \"Asia/Shanghai\", \"UTC\") used to evaluate `schedule`, interpret naive `at`, and render `next_trigger_at` in the output."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Prompt text sent to the LLM on each trigger (mutually exclusive with `tool`)"
+                    "description": "Prompt text sent through the LLM on each trigger."
                 },
-                "tool": {
+                "schedule": {
                     "type": "string",
-                    "description": "Registered tool name to invoke directly (mutually exclusive with `prompt`)"
+                    "description": "Recurring cron expression evaluated in `timezone`. Supply exactly one of `schedule` or `at`."
                 },
-                "params": {
-                    "type": "object",
-                    "description": "JSON parameters for the tool (requires `tool`)"
+                "at": {
+                    "type": "string",
+                    "description": "One-shot timestamp; fires once then auto-deletes. Either RFC3339 with offset (e.g. \"2026-04-17T14:25:00Z\" or \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS` interpreted in `timezone`. Supply exactly one of `schedule` or `at`."
                 }
-            }
+            },
+            "required": ["timezone", "prompt"]
         })
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         let p: CreateParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+
+        let timezone = p.timezone;
 
         let schedule = match (p.schedule, p.at) {
             (Some(_), Some(_)) => {
@@ -115,30 +145,11 @@ impl Tool for CronCreateTool {
                 ));
             }
             (Some(expr), None) => CronSchedule::cron(expr),
-            (None, Some(at)) => {
-                let parsed: DateTime<Utc> = at
-                    .parse()
-                    .map_err(|e| ToolError::InvalidParams(format!("`at` must be RFC3339: {e}")))?;
-                CronSchedule::at(parsed)
-            }
+            (None, Some(at)) => CronSchedule::at(parse_at_in_tz(&at, &timezone)?),
             (None, None) => {
                 return Err(ToolError::InvalidParams(
                     "either `schedule` or `at` is required".into(),
                 ));
-            }
-        };
-
-        let action = match p.tool {
-            Some(tool_name) => TriggerAction::ToolCall {
-                tool_name,
-                params: p.params.unwrap_or(json!({})),
-                approved_resources: Vec::new(),
-            },
-            None => {
-                let text = p.prompt.ok_or_else(|| {
-                    ToolError::InvalidParams("either `prompt` or `tool` is required".into())
-                })?;
-                TriggerAction::Prompt { prompt: text }
             }
         };
 
@@ -148,7 +159,8 @@ impl Tool for CronCreateTool {
                 &ctx.user.id,
                 ctx.user.channel.clone(),
                 schedule,
-                action,
+                p.prompt,
+                timezone,
                 Some(ctx.session_id.clone()),
             )
             .await
@@ -157,9 +169,8 @@ impl Tool for CronCreateTool {
         Ok(ToolOutput::Json(json!({
             "id": job.id,
             "schedule": job.schedule.display(),
-            "one_shot": job.is_one_shot(),
-            "status": "enabled",
-            "next_trigger_at": job.next_trigger_at.map(|t| t.to_rfc3339()),
+            "timezone": job.timezone,
+            "next_trigger_at": job.format_time_opt(job.next_trigger_at),
         })))
     }
 }
@@ -237,7 +248,8 @@ impl Tool for CronListTool {
     }
 
     fn description(&self) -> &str {
-        "List all scheduled cron jobs with their status and next trigger time."
+        "List all scheduled cron jobs. Trigger times are rendered in \
+         each job's own `timezone`."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -257,19 +269,65 @@ impl Tool for CronListTool {
             .map(|j| {
                 json!({
                     "id": j.id,
-                    "user": j.user_id,
-                    "channel": format!("{}", j.channel),
                     "schedule": j.schedule.display(),
-                    "one_shot": j.is_one_shot(),
-                    "status": match j.status {
-                        CronStatus::Enabled => "enabled",
-                        CronStatus::Disabled => "disabled",
-                    },
-                    "next_trigger_at": j.next_trigger_at.map(|t| t.to_rfc3339()),
+                    "status": j.status.as_str(),
+                    "timezone": j.timezone,
+                    "next_trigger_at": j.format_time_opt(j.next_trigger_at),
+                    "last_triggered_at": j.format_time_opt(j.last_triggered_at),
                 })
             })
             .collect();
 
         Ok(ToolOutput::Json(json!({ "jobs": rows })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_at_accepts_rfc3339_z() {
+        let dt = parse_at_in_tz("2026-04-17T14:25:00Z", "Asia/Shanghai").unwrap();
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T14:25:00+00:00");
+    }
+
+    #[test]
+    fn parse_at_accepts_rfc3339_with_offset() {
+        let dt = parse_at_in_tz("2026-04-17T22:25:00+08:00", "UTC").unwrap();
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T14:25:00+00:00");
+    }
+
+    #[test]
+    fn parse_at_naive_uses_supplied_timezone() {
+        let dt = parse_at_in_tz("2026-04-17T22:25:00", "Asia/Shanghai").unwrap();
+        // 22:25 +08:00 == 14:25 UTC.
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T14:25:00+00:00");
+    }
+
+    #[test]
+    fn parse_at_naive_space_separator() {
+        let dt = parse_at_in_tz("2026-04-17 22:25:00", "Asia/Shanghai").unwrap();
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T14:25:00+00:00");
+    }
+
+    #[test]
+    fn parse_at_rejects_garbage() {
+        let err = parse_at_in_tz("not a time", "UTC").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn parse_at_rejects_bad_timezone_for_naive() {
+        let err = parse_at_in_tz("2026-04-17T14:25:00", "Mars/Olympus").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn parse_at_rfc3339_offset_overrides_timezone_param() {
+        // Explicit offset wins; the `timezone` param is irrelevant for
+        // RFC3339-with-offset, but a bogus tz must not block parsing.
+        let dt = parse_at_in_tz("2026-04-17T14:25:00Z", "Mars/Olympus").unwrap();
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T14:25:00+00:00");
     }
 }

@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
+use aura_model::MicroUsd;
 
 pub(crate) const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -37,8 +38,8 @@ impl LlmProviderFactory for OpenAIProviderFactory {
                 (
                     (*m).to_string(),
                     ModelPricing {
-                        input_per_1m_tokens: 2.50,
-                        output_per_1m_tokens: 10.0,
+                        input_per_1m_tokens: MicroUsd::from_usd_decimal(2.50),
+                        output_per_1m_tokens: MicroUsd::from_usd_decimal(10.0),
                     },
                 )
             })
@@ -69,8 +70,8 @@ impl LlmProviderFactory for OpenAIProviderFactory {
             supports_tools: true,
             supports_vision: true,
             pricing: ModelPricing {
-                input_per_1m_tokens: 2.50,
-                output_per_1m_tokens: 10.0,
+                input_per_1m_tokens: MicroUsd::from_usd_decimal(2.50),
+                output_per_1m_tokens: MicroUsd::from_usd_decimal(10.0),
             },
         };
 

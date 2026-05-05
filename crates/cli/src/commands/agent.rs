@@ -38,8 +38,8 @@ async fn send(
     Err(CliError::Manager(format!(
         "agent send is not yet available in argv mode (session={session}, \
          message.len={len}): the agent runtime does not yet expose a \
-         synchronous one-shot entry point. Interactive use: launch `aura` \
-         and type directly at the chat prompt.",
+         synchronous one-shot entry point. Interactive use: run `aura tui` \
+         and type at the chat prompt.",
         len = message.len(),
     )))
 }

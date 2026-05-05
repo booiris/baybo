@@ -22,7 +22,7 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
         let mut rows = conn
             .query(
                 "SELECT session_id FROM channel_sessions
-                 WHERE channel_type = ?1 AND user_id = ?2 AND deleted_at IS NULL",
+                 WHERE channel_type = ?1 AND user_id = ?2",
                 libsql::params![channel_type.as_str().to_string(), user_id.to_string()],
             )
             .await
@@ -45,23 +45,11 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
     async fn put(&self, channel_type: &ChannelType, user_id: &str, session_id: &str) -> Result<()> {
         let now = super::time::now_us();
         let conn = self.pool.conn();
-        // Soft-delete aware upsert: clear `deleted_at` so a previously
-        // tombstone mapping is revived, and keep the existing
-        // `session_id` on conflict so two racing inserts don't split
-        // the mapping.
+        // Live row wins: `INSERT OR IGNORE` keeps the existing
+        // `session_id` so two racing inserts don't split the mapping.
         conn.execute(
-            "INSERT INTO channel_sessions (channel_type, user_id, session_id, created_at, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, NULL)
-             ON CONFLICT(channel_type, user_id) DO UPDATE SET
-                 session_id = CASE
-                     WHEN channel_sessions.deleted_at IS NULL THEN channel_sessions.session_id
-                     ELSE excluded.session_id
-                 END,
-                 created_at = CASE
-                     WHEN channel_sessions.deleted_at IS NULL THEN channel_sessions.created_at
-                     ELSE excluded.created_at
-                 END,
-                 deleted_at = NULL",
+            "INSERT OR IGNORE INTO channel_sessions (channel_type, user_id, session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
             libsql::params![
                 channel_type.as_str().to_string(),
                 user_id.to_string(),
@@ -75,13 +63,11 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
     }
 
     async fn delete(&self, channel_type: &ChannelType, user_id: &str) -> Result<()> {
-        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
-            "UPDATE channel_sessions
-             SET deleted_at = ?3
-             WHERE channel_type = ?1 AND user_id = ?2 AND deleted_at IS NULL",
-            libsql::params![channel_type.as_str().to_string(), user_id.to_string(), now,],
+            "DELETE FROM channel_sessions
+             WHERE channel_type = ?1 AND user_id = ?2",
+            libsql::params![channel_type.as_str().to_string(), user_id.to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
@@ -130,7 +116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_hides_mapping_but_put_revives() {
+    async fn delete_then_put_creates_fresh_mapping() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelSessionStore::new(pool);
         store
@@ -149,11 +135,9 @@ mod tests {
                 .is_none()
         );
 
-        // Revive with a fresh session id — the upsert clears
-        // `deleted_at` and, since the row was tombstoned, replaces the
-        // `session_id` with the newly provided one. (On a live-row
-        // conflict the UPDATE is a no-op, preserving concurrent-writer
-        // determinism; on a revive we want the fresh id.)
+        // After the row is gone, a fresh put inserts the new session id.
+        // (On a live-row conflict `INSERT OR IGNORE` keeps the existing
+        // row, preserving concurrent-writer determinism.)
         store
             .put(&ChannelType::telegram(), "tg_42", "sess-b")
             .await

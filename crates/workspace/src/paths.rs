@@ -10,13 +10,17 @@
 //!
 //! ```text
 //! <root>/
-//!   .gitignore         # allowlists profile/ and skills/
-//!   profile/           # git-tracked: aura.json, .mcp.json, *.md identity files
-//!   skills/            # git-tracked: user skill definitions
-//!   state/             # ignored: storage.db, aura.lock, channel.port
-//!   work/              # ignored: sandbox FS scope; code-builder/<uuid>/, future scratch
-//!   logs/              # ignored: aura.log.YYYY-MM-DD plus channel/<type>.log.<date>
+//!   config/            # standalone git repo: aura.json, .mcp.json
+//!   profile/           # standalone git repo: *.md identity files
+//!   skills/            # standalone git repo: user skill definitions
+//!   .key/              # not version-controlled: encryption.key
+//!   state/             # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
+//!   work/              # not version-controlled: sandbox FS scope; code-builder/<uuid>/, future scratch
+//!   logs/              # not version-controlled: aura.log.YYYY-MM-DD, channel/<type>.log, sessions/<id>.jsonl
 //! ```
+//!
+//! `config/`, `profile/`, and `skills/` each get their own `.git` repo on
+//! first `ensure_layout`; the workspace root itself is not git-tracked.
 
 use std::path::{Path, PathBuf};
 
@@ -24,45 +28,45 @@ use std::path::{Path, PathBuf};
 // Workspace top-level subdirectories
 // ---------------------------------------------------------------------------
 
-/// Git-tracked: aura.json, MCP registry, identity markdown files.
+/// Standalone git repo at `<root>/config/`: aura.json + MCP registry.
+/// Operator-edited, version-controlled.
+pub const CONFIG_DIR: &str = "config";
+
+/// Standalone git repo at `<root>/profile/`: identity markdown files
+/// (AGENTS, SOUL, USER, IDENTITY).
 pub const PROFILE_DIR: &str = "profile";
 
-/// Git-tracked: workspace-local skill definitions.
+/// Standalone git repo at `<root>/skills/`: workspace-local skill definitions.
 pub const SKILLS_DIR: &str = "skills";
 
-/// Gitignored: persistent runtime state (db, locks, ports).
+/// Master encryption-key directory at `<root>/.key/`. Not
+/// version-controlled. Setup mints the key file inside on first run with
+/// 0600 permissions.
+pub const KEY_DIR: &str = ".key";
+
+/// Persistent runtime state (db, locks, ports, browser profile). Not version-controlled.
 pub const STATE_DIR: &str = "state";
 
-/// Gitignored: tool-generated scratch (code-builder runs, future scratch dirs).
+/// Tool-generated scratch (code-builder runs, future scratch dirs). Not version-controlled.
 pub const WORK_DIR: &str = "work";
 
-/// Gitignored: rolling log files.
+/// Rolling log files (gateway, channels, per-session LLM call logs). Not version-controlled.
 pub const LOGS_DIR: &str = "logs";
 
-/// Repo-root marker that allowlists [`PROFILE_DIR`] and [`SKILLS_DIR`].
-pub const GITIGNORE_FILE: &str = ".gitignore";
-
-/// Contents of the workspace `.gitignore`. Allowlist style: ignore everything,
-/// then re-include the directories the user is meant to version. Keep this in
-/// sync with the directory constants above.
-pub const GITIGNORE_CONTENTS: &str = "\
-# Aura workspace gitignore — only profile/ and skills/ are version-controlled.
-/*
-!/.gitignore
-!/profile/
-!/skills/
-";
-
 // ---------------------------------------------------------------------------
-// Files inside `profile/` (git-tracked)
+// Files inside `config/` (standalone git repo)
 // ---------------------------------------------------------------------------
 
 /// Top-level config file (default name; `AURA_CONFIG_PATH` overrides).
-/// Stored at `<root>/profile/aura.json`.
+/// Stored at `<root>/config/aura.json`.
 pub const WORKSPACE_CONFIG_FILE: &str = "aura.json";
 
-/// MCP server registry file. Stored at `<root>/profile/.mcp.json`.
+/// MCP server registry file. Stored at `<root>/config/.mcp.json`.
 pub const MCP_CONFIG_FILE: &str = ".mcp.json";
+
+// ---------------------------------------------------------------------------
+// Files inside `profile/` (standalone git repo)
+// ---------------------------------------------------------------------------
 
 pub const IDENTITY_AGENTS_FILE: &str = "AGENTS.md";
 pub const IDENTITY_SOUL_FILE: &str = "SOUL.md";
@@ -70,7 +74,15 @@ pub const IDENTITY_USER_FILE: &str = "USER.md";
 pub const IDENTITY_IDENTITY_FILE: &str = "IDENTITY.md";
 
 // ---------------------------------------------------------------------------
-// Files inside `state/` (gitignored)
+// Files inside `.key/` (not version-controlled)
+// ---------------------------------------------------------------------------
+
+/// Master encryption-key file. Hex-encoded 32 random bytes, mode 0600.
+/// Stored at `<root>/.key/encryption.key`.
+pub const ENCRYPTION_KEY_FILE: &str = "encryption.key";
+
+// ---------------------------------------------------------------------------
+// Files inside `state/` (not version-controlled)
 // ---------------------------------------------------------------------------
 
 /// libsql database file.
@@ -82,17 +94,14 @@ pub const SINGLETON_LOCK_FILE: &str = "aura.lock";
 /// Channel TCP listener publishes its ephemeral port here.
 pub const CHANNEL_PORT_FILE: &str = "channel.port";
 
-/// Per-session LLM call logs land under [`STATE_DIR`]`/`[`SESSIONS_LOG_SUBDIR`]
-/// as `<session_id>.jsonl`. One line per LLM call: input messages,
-/// parameters, and the response (or error) plus latency / model metadata.
-pub const SESSIONS_LOG_SUBDIR: &str = "sessions";
-
-/// Per-session JSONL files inside [`SESSIONS_LOG_SUBDIR`] are named
-/// `<session_id>.<SESSION_LOG_EXTENSION>`.
-pub const SESSION_LOG_EXTENSION: &str = "jsonl";
+/// Browser sidecar Chrome user-data-dir lives at
+/// `<STATE_DIR>/<BROWSER_PROFILE_SUBDIR>`. Persistent across Aura
+/// restarts (cookies / localStorage retained); in docker mode this
+/// gets bind-mounted at `/data/profile` inside the container.
+pub const BROWSER_PROFILE_SUBDIR: &str = "browser/profile";
 
 // ---------------------------------------------------------------------------
-// Files inside `work/` (gitignored)
+// Files inside `work/` (not version-controlled)
 // ---------------------------------------------------------------------------
 
 /// Code-builder scratch parent inside [`WORK_DIR`]. Per-call scratch dirs
@@ -115,15 +124,6 @@ pub const CODE_BUILDER_WORKDIR_SUBDIR: &str = "workdir";
 /// gateway restart picks it up without touching system fontconfig.
 pub const BROWSER_FONTS_SUBDIR: &str = ".fonts";
 
-/// Browser sidecar Chrome user-data-dir inside [`WORK_DIR`]. Persistent
-/// across Aura restarts (cookies / localStorage retained); in docker
-/// mode this gets bind-mounted at `/data/profile` inside the container.
-/// Lives under `work/` so it sits next to other workspace-scoped state
-/// (and inherits the same gitignore + lifecycle as the rest of `work/`).
-/// Hidden (leading dot) so the agent's working directory stays
-/// uncluttered.
-pub const BROWSER_PROFILE_SUBDIR: &str = ".browser/profile";
-
 /// Tool-output spill dir inside [`WORK_DIR`]. The security gateway
 /// drops oversize tool results here as content-addressed `.txt` files
 /// so the LLM can `Read` the rest. Hidden (leading dot) to keep
@@ -131,7 +131,7 @@ pub const BROWSER_PROFILE_SUBDIR: &str = ".browser/profile";
 pub const TOOL_SPILLS_SUBDIR: &str = ".aura-tool-spills";
 
 // ---------------------------------------------------------------------------
-// Files inside `logs/` (gitignored)
+// Files inside `logs/` (not version-controlled)
 // ---------------------------------------------------------------------------
 
 /// File-name prefix for the gateway's rolling log files (`aura.log.YYYY-MM-DD`).
@@ -140,6 +140,15 @@ pub const LOG_FILE_PREFIX: &str = "aura.log";
 /// Subdirectory under [`LOGS_DIR`] holding per-channel sidecar log files
 /// (`<channel_type>.log.YYYY-MM-DD`).
 pub const CHANNEL_LOGS_SUBDIR: &str = "channel";
+
+/// Per-session LLM call logs land under [`LOGS_DIR`]`/`[`SESSIONS_LOG_SUBDIR`]
+/// as `<session_id>.jsonl`. One line per LLM call: input messages,
+/// parameters, and the response (or error) plus latency / model metadata.
+pub const SESSIONS_LOG_SUBDIR: &str = "sessions";
+
+/// Per-session JSONL files inside [`SESSIONS_LOG_SUBDIR`] are named
+/// `<session_id>.<SESSION_LOG_EXTENSION>`.
+pub const SESSION_LOG_EXTENSION: &str = "jsonl";
 
 // ---------------------------------------------------------------------------
 // Cache (XDG-style, outside the workspace root)
@@ -172,11 +181,11 @@ pub fn default_workspace_root() -> PathBuf {
     }
 }
 
-/// Default `aura.json` location: `<default_workspace_root>/profile/aura.json`.
+/// Default `aura.json` location: `<default_workspace_root>/config/aura.json`.
 /// Used as the fallback when `AURA_CONFIG_PATH` is not set.
 pub fn default_config_file() -> PathBuf {
     default_workspace_root()
-        .join(PROFILE_DIR)
+        .join(CONFIG_DIR)
         .join(WORKSPACE_CONFIG_FILE)
 }
 
@@ -255,12 +264,20 @@ impl WorkspacePaths {
 
     // -- top-level subdirectories --
 
+    pub fn config_dir(&self) -> PathBuf {
+        self.root.join(CONFIG_DIR)
+    }
+
     pub fn profile_dir(&self) -> PathBuf {
         self.root.join(PROFILE_DIR)
     }
 
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join(SKILLS_DIR)
+    }
+
+    pub fn key_dir(&self) -> PathBuf {
+        self.root.join(KEY_DIR)
     }
 
     pub fn state_dir(&self) -> PathBuf {
@@ -275,28 +292,40 @@ impl WorkspacePaths {
         self.root.join(LOGS_DIR)
     }
 
-    /// Per-channel sidecar log directory:
-    /// `<root>/logs/channel/<channel_type>.log.YYYY-MM-DD`.
+    /// Per-channel sidecar log directory: `<root>/logs/channel/`.
+    /// Individual files inside are named
+    /// `<channel_type>.log.YYYY-MM-DD`.
     pub fn channel_logs_dir(&self) -> PathBuf {
         self.logs_dir().join(CHANNEL_LOGS_SUBDIR)
     }
 
-    pub fn gitignore_file(&self) -> PathBuf {
-        self.root.join(GITIGNORE_FILE)
+    /// Per-session LLM call log directory:
+    /// `<root>/logs/sessions/`. Each session writes one
+    /// `<session_id>.jsonl` file inside this directory.
+    pub fn sessions_log_dir(&self) -> PathBuf {
+        self.logs_dir().join(SESSIONS_LOG_SUBDIR)
+    }
+
+    // -- config/ contents --
+
+    pub fn config_file(&self) -> PathBuf {
+        self.config_dir().join(WORKSPACE_CONFIG_FILE)
+    }
+
+    pub fn mcp_config(&self) -> PathBuf {
+        self.config_dir().join(MCP_CONFIG_FILE)
     }
 
     // -- profile/ contents --
 
-    pub fn config_file(&self) -> PathBuf {
-        self.profile_dir().join(WORKSPACE_CONFIG_FILE)
-    }
-
-    pub fn mcp_config(&self) -> PathBuf {
-        self.profile_dir().join(MCP_CONFIG_FILE)
-    }
-
     pub fn identity_file(&self, kind: IdentityKind) -> PathBuf {
         self.profile_dir().join(kind.file_name())
+    }
+
+    // -- .key/ contents --
+
+    pub fn encryption_key_file(&self) -> PathBuf {
+        self.key_dir().join(ENCRYPTION_KEY_FILE)
     }
 
     // -- state/ contents --
@@ -313,11 +342,10 @@ impl WorkspacePaths {
         self.state_dir().join(CHANNEL_PORT_FILE)
     }
 
-    /// Per-session LLM call log directory:
-    /// `<root>/state/sessions/`. Each session writes one
-    /// `<session_id>.jsonl` file inside this directory.
-    pub fn sessions_log_dir(&self) -> PathBuf {
-        self.state_dir().join(SESSIONS_LOG_SUBDIR)
+    /// Browser sidecar Chrome user-data-dir:
+    /// `<root>/state/browser/profile/`.
+    pub fn browser_profile_dir(&self) -> PathBuf {
+        self.state_dir().join(BROWSER_PROFILE_SUBDIR)
     }
 
     // -- work/ contents --
@@ -328,10 +356,6 @@ impl WorkspacePaths {
 
     pub fn browser_fonts_dir(&self) -> PathBuf {
         self.work_dir().join(BROWSER_FONTS_SUBDIR)
-    }
-
-    pub fn browser_profile_dir(&self) -> PathBuf {
-        self.work_dir().join(BROWSER_PROFILE_SUBDIR)
     }
 
     pub fn tool_spills_dir(&self) -> PathBuf {
@@ -346,14 +370,18 @@ mod tests {
     #[test]
     fn workspace_paths_compose_under_root() {
         let p = WorkspacePaths::new("/var/aura");
-        assert_eq!(
-            p.config_file(),
-            PathBuf::from("/var/aura/profile/aura.json")
-        );
-        assert_eq!(p.mcp_config(), PathBuf::from("/var/aura/profile/.mcp.json"));
+        assert_eq!(p.config_dir(), PathBuf::from("/var/aura/config"));
+        assert_eq!(p.config_file(), PathBuf::from("/var/aura/config/aura.json"));
+        assert_eq!(p.mcp_config(), PathBuf::from("/var/aura/config/.mcp.json"));
+        assert_eq!(p.profile_dir(), PathBuf::from("/var/aura/profile"));
         assert_eq!(
             p.identity_file(IdentityKind::Soul),
             PathBuf::from("/var/aura/profile/SOUL.md"),
+        );
+        assert_eq!(p.key_dir(), PathBuf::from("/var/aura/.key"));
+        assert_eq!(
+            p.encryption_key_file(),
+            PathBuf::from("/var/aura/.key/encryption.key"),
         );
         assert_eq!(p.storage_db(), PathBuf::from("/var/aura/state/storage.db"),);
         assert_eq!(
@@ -364,14 +392,14 @@ mod tests {
             p.channel_port(),
             PathBuf::from("/var/aura/state/channel.port"),
         );
-        assert_eq!(
-            p.sessions_log_dir(),
-            PathBuf::from("/var/aura/state/sessions"),
-        );
         assert_eq!(p.logs_dir(), PathBuf::from("/var/aura/logs"));
         assert_eq!(
             p.channel_logs_dir(),
             PathBuf::from("/var/aura/logs/channel"),
+        );
+        assert_eq!(
+            p.sessions_log_dir(),
+            PathBuf::from("/var/aura/logs/sessions"),
         );
         assert_eq!(p.skills_dir(), PathBuf::from("/var/aura/skills"));
         assert_eq!(
@@ -384,13 +412,12 @@ mod tests {
         );
         assert_eq!(
             p.browser_profile_dir(),
-            PathBuf::from("/var/aura/work/.browser/profile"),
+            PathBuf::from("/var/aura/state/browser/profile"),
         );
         assert_eq!(
             p.tool_spills_dir(),
             PathBuf::from("/var/aura/work/.aura-tool-spills"),
         );
-        assert_eq!(p.gitignore_file(), PathBuf::from("/var/aura/.gitignore"));
     }
 
     #[test]
@@ -417,17 +444,9 @@ mod tests {
     }
 
     #[test]
-    fn default_config_file_lives_under_default_root_profile() {
+    fn default_config_file_lives_under_default_root_config() {
         let cfg = default_config_file();
         let root = default_workspace_root();
-        assert_eq!(cfg, root.join(PROFILE_DIR).join(WORKSPACE_CONFIG_FILE));
-    }
-
-    #[test]
-    fn gitignore_contents_allowlists_profile_and_skills() {
-        assert!(GITIGNORE_CONTENTS.contains("/*"));
-        assert!(GITIGNORE_CONTENTS.contains("!/profile/"));
-        assert!(GITIGNORE_CONTENTS.contains("!/skills/"));
-        assert!(GITIGNORE_CONTENTS.contains("!/.gitignore"));
+        assert_eq!(cfg, root.join(CONFIG_DIR).join(WORKSPACE_CONFIG_FILE));
     }
 }

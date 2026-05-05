@@ -31,7 +31,7 @@ impl SecretStore for LibsqlSecretStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT encrypted_value FROM secrets WHERE name = ?1 AND deleted_at IS NULL",
+                "SELECT encrypted_value FROM secrets WHERE name = ?1",
                 libsql::params![name.to_string()],
             )
             .await
@@ -56,7 +56,7 @@ impl SecretStore for LibsqlSecretStore {
     async fn list(&self) -> crate::secret::Result<Vec<String>> {
         let conn = self.pool.conn();
         let mut rows = conn
-            .query("SELECT name FROM secrets WHERE deleted_at IS NULL", ())
+            .query("SELECT name FROM secrets", ())
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
@@ -100,12 +100,10 @@ impl SecretStore for LibsqlSecretStore {
     }
 
     async fn delete(&self, name: &str) -> crate::secret::Result<()> {
-        let now = super::time::now_us();
         let conn = self.pool.conn();
         conn.execute(
-            "UPDATE secrets SET deleted_at = ?2 \
-             WHERE name = ?1 AND deleted_at IS NULL",
-            libsql::params![name.to_string(), now],
+            "DELETE FROM secrets WHERE name = ?1",
+            libsql::params![name.to_string()],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete error: {e}")))?;

@@ -53,12 +53,6 @@ pub enum StepKind {
     /// step *may* have zero only when the trace-store write of the
     /// first `begin_span` itself errored.
     LlmIteration,
-    /// Exactly one tool `Span`, no `LlmCall`. Used by direct-trigger
-    /// paths (cron `TriggerAction::ToolCall`, system jobs that invoke
-    /// a tool without LLM mediation). Splitting these out from
-    /// `LlmIteration` keeps "LLM cost vs. direct-tool cost" cleanly
-    /// separable in per-step aggregation.
-    ToolDirect,
     Compression,
     MemoryRecall,
     MemoryWrite,
@@ -79,7 +73,6 @@ impl StepKind {
     pub fn tag(&self) -> &'static str {
         match self {
             StepKind::LlmIteration => "llm_iteration",
-            StepKind::ToolDirect => "tool_direct",
             StepKind::Compression => "compression",
             StepKind::MemoryRecall => "memory_recall",
             StepKind::MemoryWrite => "memory_write",

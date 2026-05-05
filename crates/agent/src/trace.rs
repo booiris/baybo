@@ -1,7 +1,7 @@
 //! `SpanRecorder` — facade that owns Step / Span / SpanEvent
 //! lifecycle for one session, and `TraceEventStream` — the
 //! `tokio::sync::broadcast` bus that downstream observers (cost
-//! tracker, hook router, TUI) subscribe to.
+//! subscriber, TUI / Web UI) subscribe to.
 //!
 //! Replaces the legacy `TraceCollector` + `ObservabilityRecorder`
 //! split. See `docs/modules/trace.md` for the design.
@@ -48,11 +48,11 @@ pub enum TraceEvent {
         outcome: LifecycleOutcome,
     },
     SpanEventEmitted(SpanEvent),
-    /// Fired specifically by `end_span` for `SpanKind::LlmCall` so
-    /// `CostTracker` can subscribe and write cost rows asynchronously.
-    /// Carries everything `cost_records` needs, including the owning
-    /// user (so `user_monthly_cost` rolls up per-user-per-month rather
-    /// than collapsing every event into one (`""`, month) row).
+    /// Fired by `end_span` for `SpanKind::LlmCall`. No internal cost
+    /// pipeline subscribes to this — `CostManager::record_call` is now
+    /// invoked directly by `agent_loop`. The event remains for trace
+    /// observers (WebUI live stream, etc.) that want a fan-out signal
+    /// when an LLM call closes.
     LlmSpanEnded {
         span_id: SpanId,
         job_id: JobId,
@@ -62,6 +62,8 @@ pub enum TraceEvent {
         provider: String,
         input_tokens: usize,
         output_tokens: usize,
+        cached_input_tokens: usize,
+        cache_creation_input_tokens: usize,
     },
 }
 
@@ -117,13 +119,11 @@ pub struct SpanRecorder {
 }
 
 impl SpanRecorder {
-    /// Construct a recorder. `stream` is **required** because the
-    /// `CostSubscriber` and any other downstream listeners subscribe
-    /// to one shared bus; a recorder that publishes into a private
-    /// bus silently under-bills (and the lag counter doesn't fire
-    /// either, because lag only counts events the *subscribed* bus
-    /// dropped). Callers without a process-wide bus pass
-    /// `TraceEventStream::new()` explicitly so the choice is on
+    /// Construct a recorder. `stream` is **required** because trace
+    /// observers subscribe to one shared bus per process; a recorder
+    /// that publishes into a private bus silently disappears from
+    /// downstream listeners. Callers without a process-wide bus
+    /// pass `TraceEventStream::new()` explicitly so the choice is on
     /// record at the call site.
     pub fn new(
         session_id: SessionId,
@@ -260,6 +260,8 @@ impl SpanRecorder {
                 provider: begin.provider.clone(),
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                cached_input_tokens: result.cached_input_tokens,
+                cache_creation_input_tokens: result.cache_creation_input_tokens,
             });
         }
         let span = Span {
@@ -367,6 +369,8 @@ mod tests {
             tool_calls: vec![],
             input_tokens,
             output_tokens,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         })
     }
 

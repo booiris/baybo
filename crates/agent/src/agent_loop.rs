@@ -179,8 +179,9 @@ pub struct AgentLoop {
     /// Optional subagent runtime. When set, LLM `tool_use` calls
     /// targeting `spawn_subagent` short-circuit the regular
     /// tool_executor path and route through here. Unset →
-    /// `spawn_subagent` falls back to the regular tool catalogue (and
-    /// today returns an unknown-tool error).
+    /// `spawn_subagent` calls return a synthetic
+    /// `SubagentExitStatus::Failed("no subagent runtime registered")`
+    /// tool result.
     subagent_runtime: Option<Arc<dyn SubagentRuntime>>,
     /// Optional LLM risk assessor. When set, every skill candidate is
     /// checked before injection: `Dangerous` verdicts veto the skill,
@@ -189,7 +190,7 @@ pub struct AgentLoop {
     /// Optional per-session JSONL logger for LLM calls. When set, every
     /// `call_llm` invocation appends a record (request, response or
     /// error, latency, model metadata) to
-    /// `<state>/sessions/<session_id>.jsonl`.
+    /// `<workspace>/logs/sessions/<session_id>.jsonl`.
     session_log: Option<Arc<SessionLlmLogger>>,
     /// Lazy per-session sidecar MCP provider. Defaults to a no-op so
     /// gateways without any `mcp_tunnel`-capable sidecar (and
@@ -197,6 +198,13 @@ pub struct AgentLoop {
     /// substitutes its `SidecarMcpManager` here when a sidecar
     /// connects.
     sidecar_mcp: Arc<dyn SidecarMcpProvider>,
+    /// Optional cost gate + ledger. When set, [`Self::run_iteration`]
+    /// rejects via [`crate::cost::CostManager::check`] *before*
+    /// dispatching the next LLM call, and [`Self::call_llm`] feeds the
+    /// observed token counts (success or partial-on-error) back via
+    /// [`crate::cost::CostManager::record_call`] so the next iteration's
+    /// gate sees the spend immediately.
+    cost_manager: Option<Arc<crate::cost::CostManager>>,
 }
 
 impl AgentLoop {
@@ -227,6 +235,7 @@ impl AgentLoop {
             skill_assessor: None,
             session_log: None,
             sidecar_mcp: Arc::new(NoSidecarMcp),
+            cost_manager: None,
         }
     }
 
@@ -250,6 +259,11 @@ impl AgentLoop {
 
     pub fn with_session_log(mut self, logger: Arc<SessionLlmLogger>) -> Self {
         self.session_log = Some(logger);
+        self
+    }
+
+    pub fn with_cost_manager(mut self, manager: Arc<crate::cost::CostManager>) -> Self {
+        self.cost_manager = Some(manager);
         self
     }
 
@@ -1003,6 +1017,13 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
+            // Re-check before *every* attempt, not just the first.
+            // Streaming partial-usage is billed via record_call even
+            // when the call ends in Err, so a retry past a cap-breach
+            // would silently keep accumulating spend without this gate.
+            if let Some(cm) = &self.cost_manager {
+                cm.check().map_err(|e| anyhow::anyhow!(e))?;
+            }
             match self.call_llm(session, span_recorder, step, delta_tx).await {
                 Ok(pair) => return Ok(pair),
                 Err(e) => {
@@ -1064,31 +1085,30 @@ impl AgentLoop {
             tools: tool_defs,
         };
 
-        crate::scope::with_span(
+        crate::scope::with_llm_span(
             span_recorder.as_ref(),
             step,
             step.job_id,
-            SpanKind::LlmCall {
-                begin: LlmCallBegin {
-                    model_id: model_info.id.clone(),
-                    provider: model_info.provider.clone(),
-                    provider_config_hash: String::new(),
-                    input_messages: session.messages.clone(),
-                    temperature: None,
-                },
-                result: None,
+            LlmCallBegin {
+                model_id: model_info.id.clone(),
+                provider: model_info.provider.clone(),
+                provider_config_hash: String::new(),
+                input_messages: session.messages.clone(),
+                temperature: None,
             },
-            None,
             None,
             |span| async move {
                 let started_at = std::time::Instant::now();
-                let llm_result = match delta_tx {
+                let (partial_usage, llm_result) = match delta_tx {
                     Some(tx) => self.chat_streaming(&request, session, tx).await,
-                    None => self.llm_client.chat(&request).await,
+                    None => match self.llm_client.chat(&request).await {
+                        Ok(r) => (r.usage, Ok(r)),
+                        Err(e) => (TokenUsage::default(), Err(e)),
+                    },
                 };
                 let latency_ms = started_at.elapsed().as_millis() as u64;
 
-                match llm_result {
+                let (finalize, value_result) = match llm_result {
                     Ok(mut response) => {
                         // Defensive scrub of LLM output.
                         if let Err(e) = self
@@ -1116,18 +1136,20 @@ impl AgentLoop {
                                 arguments: tc.arguments.clone(),
                             })
                             .collect();
-                        let finalize = SpanFinalize::LlmCall(LlmCallResult {
+                        let finalize = LlmCallResult {
                             output_content: response.content.clone(),
                             thinking: response.thinking.clone(),
                             tool_calls: trace_tool_calls,
                             input_tokens: response.usage.input_tokens,
                             output_tokens: response.usage.output_tokens,
-                        });
-                        Ok((finalize, LifecycleOutcome::Ok, (response, span.span_id)))
+                            cached_input_tokens: response.usage.cached_input_tokens,
+                            cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                        };
+                        (finalize, Ok((response, span.span_id)))
                     }
                     Err(e) => {
                         // Surface the *sanitized* message: this Err
-                        // bubbles into `with_span`, which writes
+                        // bubbles into `with_llm_span`, which writes
                         // `e.to_string()` into the span's
                         // `Failed { reason }` (via `outcome_for`) and
                         // from there into persisted trace storage.
@@ -1148,9 +1170,42 @@ impl AgentLoop {
                             },
                         )
                         .await;
-                        Err(anyhow::anyhow!(error_msg))
+                        // Bill the partial-stream tokens so a failed
+                        // LLM call still leaves a `cost_records` row
+                        // — operators see the attempt rather than
+                        // silently under-counting.
+                        let finalize = LlmCallResult {
+                            output_content: String::new(),
+                            thinking: None,
+                            tool_calls: Vec::new(),
+                            input_tokens: partial_usage.input_tokens,
+                            output_tokens: partial_usage.output_tokens,
+                            cached_input_tokens: partial_usage.cached_input_tokens,
+                            cache_creation_input_tokens: partial_usage.cache_creation_input_tokens,
+                        };
+                        (finalize, Err(anyhow::anyhow!(error_msg)))
                     }
+                };
+
+                // Memory-first, disk-second: in-memory budget state
+                // updates synchronously here so the next iteration's
+                // `check()` sees this spend; persistence is fire-and-
+                // forget inside record_call.
+                if let Some(cm) = &self.cost_manager {
+                    cm.record_call(
+                        &session.user.id,
+                        session.id.clone(),
+                        step.job_id,
+                        span.span_id,
+                        &model_info.id,
+                        finalize.input_tokens,
+                        finalize.output_tokens,
+                        finalize.cached_input_tokens,
+                        finalize.cache_creation_input_tokens,
+                    );
                 }
+
+                (finalize, value_result)
             },
         )
         .await
@@ -1233,13 +1288,23 @@ impl AgentLoop {
     /// being sent to the adapter. The returned `LlmResponse.content`
     /// remains in placeholder form so trace / memory / next-turn context
     /// never see real secrets.
+    ///
+    /// Returns `(TokenUsage, Result)` so partial usage seen before a
+    /// stream error still bills. Providers that only emit usage in
+    /// the terminal `Final` event (today: OpenAI / Anthropic via rig)
+    /// yield `TokenUsage::default()` on a mid-stream drop — the row
+    /// still lands in `cost_records` with zero counts so operators
+    /// see the failed call instead of silent under-billing.
     async fn chat_streaming(
         &self,
         request: &ChatRequest,
         session: &Session,
         delta_tx: &mpsc::Sender<AgentOutput>,
-    ) -> aura_llm::Result<LlmResponse> {
-        let mut stream = self.llm_client.chat_stream(request).await?;
+    ) -> (TokenUsage, aura_llm::Result<LlmResponse>) {
+        let mut stream = match self.llm_client.chat_stream(request).await {
+            Ok(s) => s,
+            Err(e) => return (TokenUsage::default(), Err(e)),
+        };
         let mut content = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = TokenUsage::default();
@@ -1247,12 +1312,16 @@ impl AgentLoop {
         let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
 
         // Buffer for a trailing fragment that might be the start of a
-        // placeholder (e.g. the chunk ends in "{{SECR"). We hold it back
-        // until a safe boundary is seen.
+        // placeholder (e.g. the chunk ends in "[{REDACTED_S"). We hold
+        // it back until a safe boundary is seen.
         let mut pending = String::new();
 
         while let Some(event) = stream.next().await {
-            match event? {
+            let event = match event {
+                Ok(e) => e,
+                Err(e) => return (usage, Err(e)),
+            };
+            match event {
                 StreamEvent::Text(chunk) => {
                     pending.push_str(&chunk);
 
@@ -1284,17 +1353,20 @@ impl AgentLoop {
             content_blocks.push(ContentBlock::Text(content.clone()));
         }
 
-        Ok(LlmResponse {
-            content,
-            content_blocks,
-            tool_calls,
+        (
             usage,
-            thinking: if thinking.is_empty() {
-                None
-            } else {
-                Some(thinking)
-            },
-        })
+            Ok(LlmResponse {
+                content,
+                content_blocks,
+                tool_calls,
+                usage,
+                thinking: if thinking.is_empty() {
+                    None
+                } else {
+                    Some(thinking)
+                },
+            }),
+        )
     }
 
     /// Tokenize a single stream fragment:
@@ -1520,6 +1592,8 @@ impl AgentLoop {
                             tool_calls: vec![],
                             input_tokens: response.usage.input_tokens,
                             output_tokens: response.usage.output_tokens,
+                            cached_input_tokens: response.usage.cached_input_tokens,
+                            cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
                         });
                         Ok((finalize, LifecycleOutcome::Ok, response.content))
                     },
@@ -1582,6 +1656,8 @@ impl AgentLoop {
             tool_calls: vec![],
             input_tokens: call.input_tokens,
             output_tokens: call.output_tokens,
+            cached_input_tokens: call.cached_input_tokens,
+            cache_creation_input_tokens: call.cache_creation_input_tokens,
         });
         let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
         let rec = span_recorder.as_ref();
