@@ -341,9 +341,9 @@ export function TracesPage() {
                 <th className={`${thCell} w-[160px]`}>Last Active</th>
                 <th className={`${thCell}`}>Session ID</th>
                 <th className={`${thCell} w-[140px]`}>Status</th>
-                <th className={`${thCell} w-[110px] !px-3 text-right`}>Spans</th>
-                <th className={`${thCell} w-[130px] !px-3 text-right whitespace-nowrap`}>Tok In</th>
-                <th className={`${thCell} w-[130px] !px-3 text-right whitespace-nowrap`}>Tok Out</th>
+                <th className={`${thCell} w-[110px]`}>Spans</th>
+                <th className={`${thCell} w-[130px] whitespace-nowrap`}>Tok In</th>
+                <th className={`${thCell} w-[130px] whitespace-nowrap`}>Tok Out</th>
               </tr>
             </thead>
             <tbody>
@@ -389,15 +389,15 @@ export function TracesPage() {
                     <td className={cell}>
                       <StatusBadge status={row.latest_job_status} />
                     </td>
-                    <td className={`${cell} !px-3 text-right`}>
+                    <td className={cell}>
                       <span className="text-[0.9rem] font-mono">{row.span_count}</span>
                     </td>
-                    <td className={`${cell} !px-3 text-right`}>
+                    <td className={cell}>
                       <span className="text-[0.9rem] font-mono text-ink-soft">
                         {formatNumber(row.input_tokens)}
                       </span>
                     </td>
-                    <td className={`${cell} !px-3 text-right`}>
+                    <td className={cell}>
                       <span className="text-[0.9rem] font-mono text-ink-soft">
                         {formatNumber(row.output_tokens)}
                       </span>
