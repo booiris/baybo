@@ -344,6 +344,7 @@ export function TracesPage() {
                 <th className={`${thCell} w-[110px]`}>Spans</th>
                 <th className={`${thCell} w-[130px] whitespace-nowrap`}>Tok In</th>
                 <th className={`${thCell} w-[130px] whitespace-nowrap`}>Tok Out</th>
+                <th className={`${thCell} w-[130px] whitespace-nowrap`}>Cached</th>
               </tr>
             </thead>
             <tbody>
@@ -400,6 +401,16 @@ export function TracesPage() {
                     <td className={cell}>
                       <span className="text-[0.9rem] font-mono text-ink-soft">
                         {formatNumber(row.output_tokens)}
+                      </span>
+                    </td>
+                    <td className={cell}>
+                      <span className="text-[0.9rem] font-mono text-ink-soft">
+                        {formatNumber(row.cached_input_tokens)}
+                        {row.cache_creation_input_tokens > 0 && (
+                          <span className="text-[0.75rem] ml-1">
+                            (+{formatNumber(row.cache_creation_input_tokens)})
+                          </span>
+                        )}
                       </span>
                     </td>
                   </tr>

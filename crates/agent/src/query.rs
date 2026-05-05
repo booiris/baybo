@@ -208,6 +208,8 @@ pub struct SessionSummary {
     pub span_count: usize,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
 }
 
 /// Result of [`QueryApi::list_session_summaries`].
@@ -225,6 +227,8 @@ pub struct SessionSummaryListing {
 pub struct AnalyticsSummary {
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
+    pub total_cached_input_tokens: usize,
+    pub total_cache_creation_input_tokens: usize,
     pub total_cost_usd: f64,
     pub total_record_count: usize,
     /// One bucket per UTC day in the range, oldest first. Days with no
@@ -240,6 +244,8 @@ pub struct AnalyticsDayBucket {
     pub date: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
     pub cost_usd: f64,
     /// Distinct sessions whose `created_at` falls in this UTC day.
     pub sessions_created: usize,
@@ -250,6 +256,8 @@ pub struct AnalyticsModelBucket {
     pub model: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
     pub cost_usd: f64,
     pub call_count: usize,
 }
@@ -484,6 +492,8 @@ impl QueryApi {
                     summary.total_cost_usd += r.cost_usd;
                     summary.total_input_tokens += r.input_tokens;
                     summary.total_output_tokens += r.output_tokens;
+                    summary.total_cached_input_tokens += r.cached_input_tokens;
+                    summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
                     summary.record_count += 1;
                 }
                 Ok(summary)
@@ -552,13 +562,19 @@ impl QueryApi {
                 }
             }
 
-            let (input_tokens, output_tokens) = match self.costs.as_ref() {
-                Some(c) => match c.query_session(&session.id).await {
-                    Ok(s) => (s.total_input_tokens, s.total_output_tokens),
-                    Err(_) => (0, 0),
-                },
-                None => (0, 0),
-            };
+            let (input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens) =
+                match self.costs.as_ref() {
+                    Some(c) => match c.query_session(&session.id).await {
+                        Ok(s) => (
+                            s.total_input_tokens,
+                            s.total_output_tokens,
+                            s.total_cached_input_tokens,
+                            s.total_cache_creation_input_tokens,
+                        ),
+                        Err(_) => (0, 0, 0, 0),
+                    },
+                    None => (0, 0, 0, 0),
+                };
 
             summaries.push(SessionSummary {
                 session_id: session.id.clone(),
@@ -569,6 +585,8 @@ impl QueryApi {
                 span_count,
                 input_tokens,
                 output_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
             });
         }
 
@@ -611,6 +629,8 @@ impl QueryApi {
                 date: key,
                 input_tokens: 0,
                 output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
                 cost_usd: 0.0,
                 sessions_created: 0,
             });
@@ -619,6 +639,8 @@ impl QueryApi {
 
         let mut total_input = 0usize;
         let mut total_output = 0usize;
+        let mut total_cached = 0usize;
+        let mut total_cache_create = 0usize;
         let mut total_cost = 0.0_f64;
         let mut total_records = 0usize;
         let mut by_model: HashMap<String, AnalyticsModelBucket> = HashMap::new();
@@ -627,6 +649,8 @@ impl QueryApi {
         for r in &records {
             total_input += r.input_tokens;
             total_output += r.output_tokens;
+            total_cached += r.cached_input_tokens;
+            total_cache_create += r.cache_creation_input_tokens;
             total_cost += r.cost_usd;
             total_records += 1;
 
@@ -635,6 +659,8 @@ impl QueryApi {
                 let bucket = &mut daily[i];
                 bucket.input_tokens += r.input_tokens;
                 bucket.output_tokens += r.output_tokens;
+                bucket.cached_input_tokens += r.cached_input_tokens;
+                bucket.cache_creation_input_tokens += r.cache_creation_input_tokens;
                 bucket.cost_usd += r.cost_usd;
             }
 
@@ -644,11 +670,15 @@ impl QueryApi {
                     model: r.model.clone(),
                     input_tokens: 0,
                     output_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                     cost_usd: 0.0,
                     call_count: 0,
                 });
             entry.input_tokens += r.input_tokens;
             entry.output_tokens += r.output_tokens;
+            entry.cached_input_tokens += r.cached_input_tokens;
+            entry.cache_creation_input_tokens += r.cache_creation_input_tokens;
             entry.cost_usd += r.cost_usd;
             entry.call_count += 1;
         }
@@ -673,6 +703,8 @@ impl QueryApi {
         Ok(AnalyticsSummary {
             total_input_tokens: total_input,
             total_output_tokens: total_output,
+            total_cached_input_tokens: total_cached,
+            total_cache_creation_input_tokens: total_cache_create,
             total_cost_usd: total_cost,
             total_record_count: total_records,
             daily,

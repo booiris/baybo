@@ -2,11 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   RiBarChartBoxLine,
-  RiCoinLine,
   RiUploadLine,
   RiDownloadLine,
   RiHistoryLine,
   RiCpuLine,
+  RiDatabase2Line,
   RiLoader4Line,
   RiRefreshLine,
   RiTeamLine,
@@ -102,23 +102,32 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
   let totOut = 0;
   let totCost = 0;
   let totRecords = 0;
+  let totCached = 0;
+  let totCacheCreate = 0;
   for (let i = days - 1; i >= 0; i--) {
     const d = new Date(until);
     d.setDate(d.getDate() - i);
     const date = d.toISOString().split('T')[0];
     const input = Math.floor(Math.random() * 5000) + 1000;
     const output = Math.floor(Math.random() * 3000) + 800;
+    // ~60% of input served from prompt cache, ~10% written into cache
+    const cached = Math.floor(input * 0.6);
+    const cacheCreate = Math.floor(input * 0.1);
     const cost = (input + output) * 0.0000035;
     const sessions = Math.floor(Math.random() * 50) + 5;
     daily.push({
       date,
       input_tokens: input,
       output_tokens: output,
+      cached_input_tokens: cached,
+      cache_creation_input_tokens: cacheCreate,
       cost_usd: cost,
       sessions_created: sessions,
     });
     totIn += input;
     totOut += output;
+    totCached += cached;
+    totCacheCreate += cacheCreate;
     totCost += cost;
     totRecords += Math.floor(sessions * 1.5);
   }
@@ -127,6 +136,8 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
     until: until.toISOString(),
     total_input_tokens: totIn,
     total_output_tokens: totOut,
+    total_cached_input_tokens: totCached,
+    total_cache_creation_input_tokens: totCacheCreate,
     total_cost_usd: totCost,
     total_record_count: totRecords,
     daily,
@@ -135,6 +146,8 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
         model: 'claude-sonnet-4-6',
         input_tokens: Math.floor(totIn * 0.7),
         output_tokens: Math.floor(totOut * 0.75),
+        cached_input_tokens: Math.floor(totCached * 0.7),
+        cache_creation_input_tokens: Math.floor(totCacheCreate * 0.7),
         cost_usd: totCost * 0.7,
         call_count: Math.floor(totRecords * 0.6),
       },
@@ -142,6 +155,8 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
         model: 'claude-haiku-4-5',
         input_tokens: Math.floor(totIn * 0.2),
         output_tokens: Math.floor(totOut * 0.18),
+        cached_input_tokens: Math.floor(totCached * 0.2),
+        cache_creation_input_tokens: Math.floor(totCacheCreate * 0.2),
         cost_usd: totCost * 0.15,
         call_count: Math.floor(totRecords * 0.3),
       },
@@ -149,6 +164,8 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
         model: 'gpt-4o',
         input_tokens: Math.floor(totIn * 0.1),
         output_tokens: Math.floor(totOut * 0.07),
+        cached_input_tokens: Math.floor(totCached * 0.1),
+        cache_creation_input_tokens: 0,
         cost_usd: totCost * 0.15,
         call_count: Math.floor(totRecords * 0.1),
       },
@@ -287,13 +304,6 @@ export function AnalyticsPage() {
         <>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
             <MetricCard
-              title="Total Tokens"
-              value={formatTokens(data.total_input_tokens + data.total_output_tokens)}
-              icon={RiCoinLine}
-              subtitle="Input + output"
-              colorClass="bg-brand/10"
-            />
-            <MetricCard
               title="Input Tokens"
               value={formatTokens(data.total_input_tokens)}
               icon={RiUploadLine}
@@ -304,6 +314,16 @@ export function AnalyticsPage() {
               value={formatTokens(data.total_output_tokens)}
               icon={RiDownloadLine}
               subtitle="Completions"
+            />
+            <MetricCard
+              title="Cached Input"
+              value={formatTokens(data.total_cached_input_tokens)}
+              icon={RiDatabase2Line}
+              subtitle={
+                data.total_cache_creation_input_tokens > 0
+                  ? `+ ${formatTokens(data.total_cache_creation_input_tokens)} cache writes`
+                  : 'Prompt-cache hits'
+              }
             />
             <MetricCard
               title="Total Cost"
@@ -356,6 +376,8 @@ export function AnalyticsPage() {
                   />
                   <Line yAxisId="tokens" type="monotone" dataKey="input_tokens" name="Input" stroke="#3b60e4" strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />
                   <Line yAxisId="tokens" type="monotone" dataKey="output_tokens" name="Output" stroke="#e53e3e" strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />
+                  <Line yAxisId="tokens" type="monotone" dataKey="cached_input_tokens" name="Cache read" stroke="#2f855a" strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />
+                  <Line yAxisId="tokens" type="monotone" dataKey="cache_creation_input_tokens" name="Cache write" stroke="#dd6b20" strokeWidth={3} strokeDasharray="4 3" dot={{ r: 3 }} activeDot={{ r: 5 }} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -411,6 +433,7 @@ export function AnalyticsPage() {
                     <th className={thCell}>Date</th>
                     <th className={`${thCell} text-right`}>Input</th>
                     <th className={`${thCell} text-right`}>Output</th>
+                    <th className={`${thCell} text-right`}>Cached</th>
                     <th className={`${thCell} text-right`}>Cost</th>
                     <th className={`${thCell} text-right`}>Sessions</th>
                   </tr>
@@ -418,7 +441,7 @@ export function AnalyticsPage() {
                 <tbody>
                   {last7Days.length === 0 && (
                     <tr>
-                      <td colSpan={5} className="px-6 py-8 text-center text-ink-soft text-[0.85rem]">
+                      <td colSpan={6} className="px-6 py-8 text-center text-ink-soft text-[0.85rem]">
                         No activity recorded.
                       </td>
                     </tr>
@@ -428,6 +451,15 @@ export function AnalyticsPage() {
                       <td className={tdCell}>{day.date}</td>
                       <td className={`${tdCell} text-right`}>{day.input_tokens.toLocaleString()}</td>
                       <td className={`${tdCell} text-right`}>{day.output_tokens.toLocaleString()}</td>
+                      <td className={`${tdCell} text-right`}>
+                        {day.cached_input_tokens.toLocaleString()}
+                        {day.cache_creation_input_tokens > 0 && (
+                          <span className="text-ink-soft">
+                            {' '}
+                            (+{day.cache_creation_input_tokens.toLocaleString()})
+                          </span>
+                        )}
+                      </td>
                       <td className={`${tdCell} text-right`}>{formatUsd(day.cost_usd)}</td>
                       <td className={`${tdCell} text-right`}>{day.sessions_created}</td>
                     </tr>
@@ -447,13 +479,14 @@ export function AnalyticsPage() {
                     <th className={`${thCell} text-right`}>Calls</th>
                     <th className={`${thCell} text-right`}>Input</th>
                     <th className={`${thCell} text-right`}>Output</th>
+                    <th className={`${thCell} text-right`}>Cached</th>
                     <th className={`${thCell} text-right`}>Cost</th>
                   </tr>
                 </thead>
                 <tbody>
                   {data.by_model.length === 0 && (
                     <tr>
-                      <td colSpan={5} className="px-6 py-8 text-center text-ink-soft text-[0.85rem]">
+                      <td colSpan={6} className="px-6 py-8 text-center text-ink-soft text-[0.85rem]">
                         No LLM calls recorded in this window.
                       </td>
                     </tr>
@@ -466,6 +499,15 @@ export function AnalyticsPage() {
                       <td className={`${tdCell} text-right`}>{m.call_count.toLocaleString()}</td>
                       <td className={`${tdCell} text-right`}>{formatTokens(m.input_tokens)}</td>
                       <td className={`${tdCell} text-right`}>{formatTokens(m.output_tokens)}</td>
+                      <td className={`${tdCell} text-right`}>
+                        {formatTokens(m.cached_input_tokens)}
+                        {m.cache_creation_input_tokens > 0 && (
+                          <span className="text-ink-soft">
+                            {' '}
+                            (+{formatTokens(m.cache_creation_input_tokens)})
+                          </span>
+                        )}
+                      </td>
                       <td className={`${tdCell} text-right`}>{formatUsd(m.cost_usd)}</td>
                     </tr>
                   ))}

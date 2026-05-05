@@ -298,6 +298,8 @@ export interface components {
     schemas: {
         /** @description One bucket per UTC day for the analytics chart. */
         AnalyticsDayBucket: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
             /** Format: double */
             cost_usd: number;
             /** @description `YYYY-MM-DD` (UTC). */
@@ -308,6 +310,8 @@ export interface components {
         };
         /** @description Per-model breakdown row for the analytics dashboard. */
         AnalyticsModelBucket: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
             call_count: number;
             /** Format: double */
             cost_usd: number;
@@ -324,6 +328,8 @@ export interface components {
              * @description Inclusive lower bound used for the aggregation (UTC).
              */
             since: string;
+            total_cache_creation_input_tokens: number;
+            total_cached_input_tokens: number;
             /** Format: double */
             total_cost_usd: number;
             total_input_tokens: number;
@@ -578,6 +584,8 @@ export interface components {
          *     [`aura_agent::SessionSummary`] for the wire.
          */
         TraceSessionSummary: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
             /** Format: date-time */
             created_at: string;
             input_tokens: number;

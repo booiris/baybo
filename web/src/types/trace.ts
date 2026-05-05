@@ -118,6 +118,8 @@ export interface LlmCallResult {
   tool_calls?: LlmToolCallRecord[];
   input_tokens?: number;
   output_tokens?: number;
+  cached_input_tokens?: number;
+  cache_creation_input_tokens?: number;
 }
 
 export interface ToolCallBegin {

@@ -123,6 +123,14 @@ pub struct LlmCallResult {
     pub input_tokens: usize,
     #[serde(default)]
     pub output_tokens: usize,
+    /// Anthropic prompt-cache: input tokens served from the cache.
+    /// `#[serde(default)]` keeps already-persisted spans (which lack
+    /// the field) decodable.
+    #[serde(default)]
+    pub cached_input_tokens: usize,
+    /// Anthropic prompt-cache: input tokens written into the cache.
+    #[serde(default)]
+    pub cache_creation_input_tokens: usize,
 }
 
 /// Begin-time data for a `ToolCall` span.

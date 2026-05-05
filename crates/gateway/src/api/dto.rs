@@ -742,6 +742,8 @@ pub struct TraceSessionSummary {
     pub span_count: usize,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
 }
 
 impl From<aura_agent::SessionSummary> for TraceSessionSummary {
@@ -755,6 +757,8 @@ impl From<aura_agent::SessionSummary> for TraceSessionSummary {
             span_count: v.span_count,
             input_tokens: v.input_tokens,
             output_tokens: v.output_tokens,
+            cached_input_tokens: v.cached_input_tokens,
+            cache_creation_input_tokens: v.cache_creation_input_tokens,
         }
     }
 }
@@ -787,6 +791,8 @@ pub struct AnalyticsDayBucket {
     pub date: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
     pub cost_usd: f64,
     pub sessions_created: usize,
 }
@@ -797,6 +803,8 @@ impl From<aura_agent::AnalyticsDayBucket> for AnalyticsDayBucket {
             date: v.date,
             input_tokens: v.input_tokens,
             output_tokens: v.output_tokens,
+            cached_input_tokens: v.cached_input_tokens,
+            cache_creation_input_tokens: v.cache_creation_input_tokens,
             cost_usd: v.cost_usd,
             sessions_created: v.sessions_created,
         }
@@ -809,6 +817,8 @@ pub struct AnalyticsModelBucket {
     pub model: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
     pub cost_usd: f64,
     pub call_count: usize,
 }
@@ -819,6 +829,8 @@ impl From<aura_agent::AnalyticsModelBucket> for AnalyticsModelBucket {
             model: v.model,
             input_tokens: v.input_tokens,
             output_tokens: v.output_tokens,
+            cached_input_tokens: v.cached_input_tokens,
+            cache_creation_input_tokens: v.cache_creation_input_tokens,
             cost_usd: v.cost_usd,
             call_count: v.call_count,
         }
@@ -834,6 +846,8 @@ pub struct AnalyticsResponse {
     pub until: DateTime<Utc>,
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
+    pub total_cached_input_tokens: usize,
+    pub total_cache_creation_input_tokens: usize,
     pub total_cost_usd: f64,
     pub total_record_count: usize,
     pub daily: Vec<AnalyticsDayBucket>,

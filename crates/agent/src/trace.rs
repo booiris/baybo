@@ -62,6 +62,8 @@ pub enum TraceEvent {
         provider: String,
         input_tokens: usize,
         output_tokens: usize,
+        cached_input_tokens: usize,
+        cache_creation_input_tokens: usize,
     },
 }
 
@@ -260,6 +262,8 @@ impl SpanRecorder {
                 provider: begin.provider.clone(),
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                cached_input_tokens: result.cached_input_tokens,
+                cache_creation_input_tokens: result.cache_creation_input_tokens,
             });
         }
         let span = Span {
@@ -367,6 +371,8 @@ mod tests {
             tool_calls: vec![],
             input_tokens,
             output_tokens,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         })
     }
 

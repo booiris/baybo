@@ -247,9 +247,14 @@ function SpanRow({
   let subtitle = '';
   if (span.kind.kind === 'llm_call') {
     title = span.kind.begin.model_id;
-    subtitle = span.kind.result
-      ? `${span.kind.result.input_tokens ?? 0} in / ${span.kind.result.output_tokens ?? 0} out`
-      : 'in flight';
+    if (span.kind.result) {
+      const cached = span.kind.result.cached_input_tokens ?? 0;
+      subtitle = `${span.kind.result.input_tokens ?? 0} in / ${span.kind.result.output_tokens ?? 0} out${
+        cached > 0 ? ` (${cached} cached)` : ''
+      }`;
+    } else {
+      subtitle = 'in flight';
+    }
   } else if (span.kind.kind === 'tool_call') {
     title = span.kind.begin.tool_name;
     if (!span.kind.result) {
@@ -570,6 +575,14 @@ function MetaTab({ span }: { span: Span }) {
         ['Input tokens', (span.kind.result.input_tokens ?? 0).toLocaleString()],
         ['Output tokens', (span.kind.result.output_tokens ?? 0).toLocaleString()],
       );
+      const cached = span.kind.result.cached_input_tokens ?? 0;
+      const cacheCreate = span.kind.result.cache_creation_input_tokens ?? 0;
+      if (cached > 0 || cacheCreate > 0) {
+        baseRows.push(['Cache reads', cached.toLocaleString()]);
+        if (cacheCreate > 0) {
+          baseRows.push(['Cache writes', cacheCreate.toLocaleString()]);
+        }
+      }
     }
   } else if (span.kind.kind === 'tool_call') {
     baseRows.push(
@@ -751,18 +764,27 @@ function SpanDetailPanel({
 
 // ── Job tokens helper ───────────────────────────────────────────────
 
-function jobTokens(job: ReplayJob): { input: number; output: number } {
+function jobTokens(job: ReplayJob): {
+  input: number;
+  output: number;
+  cached: number;
+  cacheCreate: number;
+} {
   let input = 0;
   let output = 0;
+  let cached = 0;
+  let cacheCreate = 0;
   for (const rs of job.steps) {
     for (const span of rs.spans) {
       if (span.kind.kind === 'llm_call' && span.kind.result) {
         input += span.kind.result.input_tokens ?? 0;
         output += span.kind.result.output_tokens ?? 0;
+        cached += span.kind.result.cached_input_tokens ?? 0;
+        cacheCreate += span.kind.result.cache_creation_input_tokens ?? 0;
       }
     }
   }
-  return { input, output };
+  return { input, output, cached, cacheCreate };
 }
 
 // Derive the user-facing input that kicked off the job: the last user
@@ -881,7 +903,7 @@ function JobSummaryPanel({
       </div>
     );
   }
-  const { input, output } = jobTokens(job);
+  const { input, output, cached, cacheCreate } = jobTokens(job);
   const total = input + output;
   const inputText = jobInputText(job);
   const outputText = jobOutputText(job);
@@ -963,6 +985,18 @@ function JobSummaryPanel({
             <dd>{input.toLocaleString()}</dd>
             <dt className="font-bold text-ink-soft">Output tokens</dt>
             <dd>{output.toLocaleString()}</dd>
+            {(cached > 0 || cacheCreate > 0) && (
+              <>
+                <dt className="font-bold text-ink-soft">Cache reads</dt>
+                <dd>{cached.toLocaleString()}</dd>
+                {cacheCreate > 0 && (
+                  <>
+                    <dt className="font-bold text-ink-soft">Cache writes</dt>
+                    <dd>{cacheCreate.toLocaleString()}</dd>
+                  </>
+                )}
+              </>
+            )}
             <dt className="font-bold text-ink-soft">Total tokens</dt>
             <dd className="text-brand font-bold">{total.toLocaleString()}</dd>
           </dl>

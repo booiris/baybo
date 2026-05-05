@@ -160,6 +160,8 @@ impl LibsqlPool {
                     model                           TEXT    NOT NULL,
                     input_tokens                    INTEGER NOT NULL,
                     output_tokens                   INTEGER NOT NULL,
+                    cached_input_tokens             INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_input_tokens     INTEGER NOT NULL DEFAULT 0,
                     cost_usd                        REAL    NOT NULL,
                     timestamp                       INTEGER NOT NULL
                 );
@@ -337,6 +339,22 @@ impl LibsqlPool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
+
+        // In-place upgrade for DBs created before the prompt-cache columns
+        // existed on cost_records. SQLite has no `ADD COLUMN IF NOT EXISTS`,
+        // so we run the ALTERs and swallow the duplicate-column error. Fresh
+        // DBs get the columns straight from `CREATE TABLE` above and these
+        // ALTERs become no-ops.
+        for stmt in [
+            "ALTER TABLE cost_records ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cost_records ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(e) = self.conn.execute(stmt, ()).await
+                && !e.to_string().contains("duplicate column name")
+            {
+                return Err(anyhow::anyhow!("failed to add cost_records column: {e}"));
+            }
+        }
         Ok(())
     }
 }

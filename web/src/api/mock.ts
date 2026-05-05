@@ -103,6 +103,8 @@ function generateMockSummaries(count: number): TraceSessionSummary[] {
       span_count: Math.floor(Math.random() * 60) + 1,
       input_tokens: Math.floor(Math.random() * 80_000),
       output_tokens: Math.floor(Math.random() * 40_000),
+      cached_input_tokens: Math.floor(Math.random() * 50_000),
+      cache_creation_input_tokens: Math.floor(Math.random() * 8_000),
     });
   }
   return out.sort(
@@ -211,6 +213,8 @@ function llmSpan(
         tool_calls: toolCalls,
         input_tokens: inTok,
         output_tokens: outTok,
+        cached_input_tokens: Math.floor(inTok * 0.6),
+        cache_creation_input_tokens: Math.floor(inTok * 0.1),
       },
     },
     parallel_group: null,

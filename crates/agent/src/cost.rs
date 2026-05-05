@@ -252,6 +252,8 @@ impl CostSubscriber {
                         model_id,
                         input_tokens,
                         output_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
                         ..
                     }) => {
                         let cost_usd =
@@ -265,6 +267,8 @@ impl CostSubscriber {
                             model: model_id,
                             input_tokens,
                             output_tokens,
+                            cached_input_tokens,
+                            cache_creation_input_tokens,
                             cost_usd,
                             timestamp: now,
                         };
@@ -376,6 +380,8 @@ mod tests {
                 provider: "anth".into(),
                 input_tokens: 100,
                 output_tokens: 200,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             });
         }
         // Give the spawned task a tick to drain.

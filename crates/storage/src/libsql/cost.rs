@@ -24,8 +24,8 @@ impl CostStore for LibsqlCostStore {
         conn.execute(
             "INSERT INTO cost_records \
              (user_id, session_id, job_id, span_id, model, input_tokens, output_tokens, \
-              cost_usd, timestamp) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              cached_input_tokens, cache_creation_input_tokens, cost_usd, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             libsql::params![
                 record.user_id.clone(),
                 record.session_id.as_str().to_string(),
@@ -34,6 +34,8 @@ impl CostStore for LibsqlCostStore {
                 record.model.clone(),
                 record.input_tokens as i64,
                 record.output_tokens as i64,
+                record.cached_input_tokens as i64,
+                record.cache_creation_input_tokens as i64,
                 record.cost_usd,
                 time::to_us(record.timestamp),
             ],
@@ -48,7 +50,8 @@ impl CostStore for LibsqlCostStore {
         let mut rows = conn
             .query(
                 "SELECT user_id, session_id, job_id, span_id, model, input_tokens, \
-                        output_tokens, cost_usd, timestamp \
+                        output_tokens, cached_input_tokens, cache_creation_input_tokens, \
+                        cost_usd, timestamp \
                  FROM cost_records \
                  WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
                 libsql::params![
@@ -76,7 +79,10 @@ impl CostStore for LibsqlCostStore {
         let mut rows = conn
             .query(
                 "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                        COALESCE(SUM(output_tokens), 0), COUNT(*) \
+                        COALESCE(SUM(output_tokens), 0), \
+                        COALESCE(SUM(cached_input_tokens), 0), \
+                        COALESCE(SUM(cache_creation_input_tokens), 0), \
+                        COUNT(*) \
                  FROM cost_records WHERE timestamp >= ?1 AND timestamp < ?2",
                 libsql::params![time::to_us(range.from), time::to_us(range.to)],
             )
@@ -95,7 +101,10 @@ impl CostStore for LibsqlCostStore {
         let mut rows = conn
             .query(
                 "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                        COALESCE(SUM(output_tokens), 0), COUNT(*) \
+                        COALESCE(SUM(output_tokens), 0), \
+                        COALESCE(SUM(cached_input_tokens), 0), \
+                        COALESCE(SUM(cache_creation_input_tokens), 0), \
+                        COUNT(*) \
                  FROM cost_records WHERE session_id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
@@ -114,7 +123,8 @@ impl CostStore for LibsqlCostStore {
         let mut rows = conn
             .query(
                 "SELECT user_id, session_id, job_id, span_id, model, input_tokens, \
-                        output_tokens, cost_usd, timestamp \
+                        output_tokens, cached_input_tokens, cache_creation_input_tokens, \
+                        cost_usd, timestamp \
                  FROM cost_records \
                  WHERE timestamp >= ?1 AND timestamp < ?2 \
                  ORDER BY timestamp",
@@ -139,7 +149,10 @@ impl CostStore for LibsqlCostStore {
         let mut rows = conn
             .query(
                 "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                        COALESCE(SUM(output_tokens), 0), COUNT(*) \
+                        COALESCE(SUM(output_tokens), 0), \
+                        COALESCE(SUM(cached_input_tokens), 0), \
+                        COALESCE(SUM(cache_creation_input_tokens), 0), \
+                        COUNT(*) \
                  FROM cost_records WHERE job_id = ?1",
                 libsql::params![job_id.to_string()],
             )
@@ -262,8 +275,16 @@ fn summary_from_aggregate_row(row: &libsql::Row) -> CostResult<CostSummary> {
             .get::<i64>(2)
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
-        record_count: row
+        total_cached_input_tokens: row
             .get::<i64>(3)
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            as usize,
+        total_cache_creation_input_tokens: row
+            .get::<i64>(4)
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            as usize,
+        record_count: row
+            .get::<i64>(5)
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
     })
@@ -271,7 +292,7 @@ fn summary_from_aggregate_row(row: &libsql::Row) -> CostResult<CostSummary> {
 
 fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
     let timestamp_us: i64 = row
-        .get(8)
+        .get(10)
         .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
     let timestamp = time::from_us(timestamp_us).ok_or_else(|| {
         CostError::Storage(format!(
@@ -311,8 +332,16 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
             .get::<i64>(6)
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
+        cached_input_tokens: row
+            .get::<i64>(7)
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            as usize,
+        cache_creation_input_tokens: row
+            .get::<i64>(8)
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            as usize,
         cost_usd: row
-            .get(7)
+            .get(9)
             .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         timestamp,
     })
@@ -332,6 +361,8 @@ mod tests {
             model: "gpt-4".to_string(),
             input_tokens: 100,
             output_tokens: 50,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             cost_usd: cost,
             timestamp: Utc::now(),
         }

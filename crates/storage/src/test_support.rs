@@ -226,6 +226,8 @@ impl CostStore for MemoryCostStore {
             summary.total_cost_usd += r.cost_usd;
             summary.total_input_tokens += r.input_tokens;
             summary.total_output_tokens += r.output_tokens;
+            summary.total_cached_input_tokens += r.cached_input_tokens;
+            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
             summary.record_count += 1;
         }
         Ok(summary)
@@ -254,6 +256,8 @@ impl CostStore for MemoryCostStore {
             summary.total_cost_usd += r.cost_usd;
             summary.total_input_tokens += r.input_tokens;
             summary.total_output_tokens += r.output_tokens;
+            summary.total_cached_input_tokens += r.cached_input_tokens;
+            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
             summary.record_count += 1;
         }
         Ok(summary)
@@ -265,6 +269,8 @@ impl CostStore for MemoryCostStore {
             summary.total_cost_usd += r.cost_usd;
             summary.total_input_tokens += r.input_tokens;
             summary.total_output_tokens += r.output_tokens;
+            summary.total_cached_input_tokens += r.cached_input_tokens;
+            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
             summary.record_count += 1;
         }
         Ok(summary)

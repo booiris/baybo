@@ -844,6 +844,8 @@ impl AgentLoop {
                             tool_calls: trace_tool_calls,
                             input_tokens: response.usage.input_tokens,
                             output_tokens: response.usage.output_tokens,
+                            cached_input_tokens: response.usage.cached_input_tokens,
+                            cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
                         });
                         Ok((finalize, LifecycleOutcome::Ok, (response, span.span_id)))
                     }
@@ -1242,6 +1244,8 @@ impl AgentLoop {
                             tool_calls: vec![],
                             input_tokens: response.usage.input_tokens,
                             output_tokens: response.usage.output_tokens,
+                            cached_input_tokens: response.usage.cached_input_tokens,
+                            cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
                         });
                         Ok((finalize, LifecycleOutcome::Ok, response.content))
                     },
@@ -1304,6 +1308,8 @@ impl AgentLoop {
             tool_calls: vec![],
             input_tokens: call.input_tokens,
             output_tokens: call.output_tokens,
+            cached_input_tokens: call.cached_input_tokens,
+            cache_creation_input_tokens: call.cache_creation_input_tokens,
         });
         let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
         let rec = span_recorder.as_ref();

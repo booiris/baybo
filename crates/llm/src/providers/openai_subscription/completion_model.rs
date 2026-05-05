@@ -186,8 +186,8 @@ impl OpenAiSubscriptionCompletionModel {
                 input_tokens: usage.input_tokens as u64,
                 output_tokens: usage.output_tokens as u64,
                 total_tokens: (usage.input_tokens + usage.output_tokens) as u64,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
+                cached_input_tokens: usage.cached_input_tokens as u64,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens as u64,
             },
             raw_response: (),
             message_id: None,
@@ -952,9 +952,20 @@ fn translate_event(
                     .get("output_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
+                // OpenAI Responses API reports prompt-cache hits under
+                // `input_tokens_details.cached_tokens`. There is no
+                // cache-write counter — the API doesn't separate cache
+                // creation from regular input.
+                let cached = usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
                 out.push(Ok(StreamEvent::Usage(TokenUsage {
                     input_tokens: input,
                     output_tokens: output,
+                    cached_input_tokens: cached,
+                    cache_creation_input_tokens: 0,
                 })));
             }
         }
