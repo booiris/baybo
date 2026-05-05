@@ -292,7 +292,7 @@ export function CronPage() {
               <tr>
                 <th className={`${thCell} w-[150px]`}>ID</th>
                 <th className={`${thCell} w-[140px]`}>Status</th>
-                <th className={`${thCell} w-[200px]`}>Schedule</th>
+                <th className={`${thCell} w-[280px]`}>Schedule</th>
                 <th className={`${thCell} w-[120px]`}>Channel</th>
                 <th className={thCell}>Action</th>
                 <th className={`${thCell} w-[160px]`}>Created At</th>
