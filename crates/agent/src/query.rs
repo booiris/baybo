@@ -598,12 +598,13 @@ impl QueryApi {
         })?;
 
         // Pre-build a contiguous YYYY-MM-DD bucket list (UTC) so days
-        // with no activity still appear in the chart.
+        // with no activity still appear in the chart. Inclusive of the
+        // `to` date so the day in progress (today) gets its own bucket.
         let mut day_index: HashMap<String, usize> = HashMap::new();
         let mut daily: Vec<AnalyticsDayBucket> = Vec::new();
         let mut cursor = range.from.date_naive();
         let last = range.to.date_naive();
-        while cursor < last {
+        while cursor <= last {
             let key = cursor.format("%Y-%m-%d").to_string();
             day_index.insert(key.clone(), daily.len());
             daily.push(AnalyticsDayBucket {
