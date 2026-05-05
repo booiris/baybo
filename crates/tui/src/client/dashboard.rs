@@ -64,7 +64,9 @@ impl DashboardProvider for TuiDashboardProvider {
             title: title.into(),
             columns,
             rows: Vec::new(),
-            footer: Some("admin surface — use the `aura` CLI (not reachable over channel ws)".into()),
+            footer: Some(
+                "admin surface — use the `aura` CLI (not reachable over channel ws)".into(),
+            ),
         }
     }
 }
