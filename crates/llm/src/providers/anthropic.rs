@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
+use aura_model::MicroUsd;
 
 pub(crate) const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -34,8 +35,8 @@ impl LlmProviderFactory for AnthropicProviderFactory {
                 (
                     (*m).to_string(),
                     ModelPricing {
-                        input_per_1m_tokens: 3.0,
-                        output_per_1m_tokens: 15.0,
+                        input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
+                        output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
                     },
                 )
             })
@@ -66,8 +67,8 @@ impl LlmProviderFactory for AnthropicProviderFactory {
             supports_tools: true,
             supports_vision: true,
             pricing: ModelPricing {
-                input_per_1m_tokens: 3.0,
-                output_per_1m_tokens: 15.0,
+                input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
+                output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
             },
         };
 

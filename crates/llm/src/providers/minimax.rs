@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
+use aura_model::MicroUsd;
 
 pub(crate) const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 /// Origin host MiniMax exposes for OpenAI-compatible model listing.
@@ -42,8 +43,8 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
                 (
                     (*m).to_string(),
                     ModelPricing {
-                        input_per_1m_tokens: 0.30,
-                        output_per_1m_tokens: 1.20,
+                        input_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
+                        output_per_1m_tokens: MicroUsd::from_usd_decimal(1.20),
                     },
                 )
             })
@@ -78,8 +79,8 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
             supports_tools: true,
             supports_vision: false,
             pricing: ModelPricing {
-                input_per_1m_tokens: 0.30,
-                output_per_1m_tokens: 1.20,
+                input_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
+                output_per_1m_tokens: MicroUsd::from_usd_decimal(1.20),
             },
         };
 

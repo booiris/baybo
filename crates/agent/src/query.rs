@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aura_job::{Job, JobError, JobKind, JobStatus, JobStatusKind};
-use aura_model::{JobId, Lineage, LineageKind, Session, SessionId, StepId};
+use aura_model::{JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId};
 use aura_storage::{
     CostError, CostStore, CostSummary, SessionStore, StorageError, TimeRange, TraceStore,
 };
@@ -229,7 +229,7 @@ pub struct AnalyticsSummary {
     pub total_output_tokens: usize,
     pub total_cached_input_tokens: usize,
     pub total_cache_creation_input_tokens: usize,
-    pub total_cost_usd: f64,
+    pub total_cost_usd: MicroUsd,
     pub total_record_count: usize,
     /// One bucket per UTC day in the range, oldest first. Days with no
     /// activity still appear with zeros so the chart can render a
@@ -246,7 +246,7 @@ pub struct AnalyticsDayBucket {
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
     pub cache_creation_input_tokens: usize,
-    pub cost_usd: f64,
+    pub cost_usd: MicroUsd,
     /// Distinct sessions whose `created_at` falls in this UTC day.
     pub sessions_created: usize,
 }
@@ -258,7 +258,7 @@ pub struct AnalyticsModelBucket {
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
     pub cache_creation_input_tokens: usize,
-    pub cost_usd: f64,
+    pub cost_usd: MicroUsd,
     pub call_count: usize,
 }
 
@@ -631,7 +631,7 @@ impl QueryApi {
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                cost_usd: 0.0,
+                cost_usd: MicroUsd::ZERO,
                 sessions_created: 0,
             });
             cursor = cursor.succ_opt().unwrap_or(cursor);
@@ -641,7 +641,7 @@ impl QueryApi {
         let mut total_output = 0usize;
         let mut total_cached = 0usize;
         let mut total_cache_create = 0usize;
-        let mut total_cost = 0.0_f64;
+        let mut total_cost = MicroUsd::ZERO;
         let mut total_records = 0usize;
         let mut by_model: HashMap<String, AnalyticsModelBucket> = HashMap::new();
 
@@ -672,7 +672,7 @@ impl QueryApi {
                     output_tokens: 0,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    cost_usd: 0.0,
+                    cost_usd: MicroUsd::ZERO,
                     call_count: 0,
                 });
             entry.input_tokens += r.input_tokens;

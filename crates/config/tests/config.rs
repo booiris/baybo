@@ -195,7 +195,7 @@ fn http_channel_requires_bind_address_and_port() {
 #[test]
 fn spending_limits_must_be_positive() {
     let mut c = AuraConfig::default();
-    c.cost.spending_limits.user_daily_usd = Some(-1.0);
+    c.cost.spending_limits.user_daily_usd = Some(aura_model::MicroUsd::from_usd_decimal(-1.0));
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "cost.spending_limits.user_daily_usd"));
 }
@@ -203,8 +203,8 @@ fn spending_limits_must_be_positive() {
 #[test]
 fn daily_cannot_exceed_monthly_spend() {
     let mut c = AuraConfig::default();
-    c.cost.spending_limits.user_daily_usd = Some(100.0);
-    c.cost.spending_limits.user_monthly_usd = Some(50.0);
+    c.cost.spending_limits.user_daily_usd = Some(aura_model::MicroUsd::from_usd_decimal(100.0));
+    c.cost.spending_limits.user_monthly_usd = Some(aura_model::MicroUsd::from_usd_decimal(50.0));
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "cost.spending_limits.user_daily_usd"));
 }

@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use aura_model::MicroUsd;
+
 use crate::AuraConfig;
 use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
@@ -359,9 +361,9 @@ fn is_env_var_name(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn check_positive(value: Option<f64>, field: &str, errors: &mut Vec<ValidationError>) {
+fn check_positive(value: Option<MicroUsd>, field: &str, errors: &mut Vec<ValidationError>) {
     if let Some(v) = value
-        && (!v.is_finite() || v <= 0.0)
+        && v <= MicroUsd::ZERO
     {
         errors.push(ValidationError::new(field, "must be > 0.0"));
     }

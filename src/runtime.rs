@@ -526,7 +526,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let registry = aura_llm::LlmProviderRegistry::with_default_providers();
         let mut map = registry.all_known_pricings();
         let info = graph.llm_client.model_info();
-        map.insert(info.id.clone(), info.pricing.clone());
+        map.insert(info.id.clone(), info.pricing);
         Arc::new(map)
     };
     let _cost_subscriber_handle =
@@ -619,6 +619,22 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let set_ok = subagent_runtime_slot.set(local_subagent_runtime).is_ok();
     debug_assert!(set_ok);
 
+    // Translate the user-facing `cost.spending_limits` config block into
+    // the agent crate's `SpendingLimits` shape. Both sides hold
+    // `Option<MicroUsd>` for the same three caps; field-by-field copy
+    // keeps the agent crate free of an aura-config dep.
+    let spending_limits = aura_agent::SpendingLimits {
+        user_daily_usd: graph.config.cost.spending_limits.user_daily_usd,
+        user_monthly_usd: graph.config.cost.spending_limits.user_monthly_usd,
+        global_daily_usd: graph.config.cost.spending_limits.global_daily_usd,
+    };
+    let cost_guard = Arc::new(aura_agent::CostGuard::new(
+        graph.cost_store.clone(),
+        spending_limits,
+    ));
+
+    let rate_limit_cfg = &graph.config.cost.rate_limit;
+
     let router = Router::new(
         Arc::clone(&graph.session_manager),
         supervisor,
@@ -626,6 +642,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         Arc::clone(&graph.security_gateway),
     )
     .with_actor_parent_token(graph.actor_parent_token.clone())
+    .with_cost_guard(cost_guard)
+    .with_rate_limit(
+        rate_limit_cfg.max_requests,
+        std::time::Duration::from_secs(rate_limit_cfg.window_secs),
+    )
     .with_actor_spawner(Box::new(move |session, response_tx, parent_token| {
         spawn_actor_for(session, response_tx, parent_token)
     }));

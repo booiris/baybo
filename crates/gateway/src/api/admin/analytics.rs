@@ -61,7 +61,7 @@ async fn get_analytics(
         total_output_tokens: summary.total_output_tokens,
         total_cached_input_tokens: summary.total_cached_input_tokens,
         total_cache_creation_input_tokens: summary.total_cache_creation_input_tokens,
-        total_cost_usd: summary.total_cost_usd,
+        total_cost_micro_usd: summary.total_cost_usd,
         total_record_count: summary.total_record_count,
         daily: summary.daily.into_iter().map(Into::into).collect(),
         by_model: summary.by_model.into_iter().map(Into::into).collect(),

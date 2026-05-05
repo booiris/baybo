@@ -300,7 +300,8 @@ mod tests {
         // provider regressed its pricing publication.
         for (id, p) in &pricings {
             assert!(
-                p.input_per_1m_tokens > 0.0 || p.output_per_1m_tokens > 0.0,
+                p.input_per_1m_tokens > aura_model::MicroUsd::ZERO
+                    || p.output_per_1m_tokens > aura_model::MicroUsd::ZERO,
                 "model {id} has zero pricing in known_pricings",
             );
         }

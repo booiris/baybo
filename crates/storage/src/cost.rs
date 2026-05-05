@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use aura_model::MicroUsd;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -35,7 +36,10 @@ pub struct CostRecord {
     pub cached_input_tokens: usize,
     /// Anthropic prompt-cache: input tokens written into the cache.
     pub cache_creation_input_tokens: usize,
-    pub cost_usd: f64,
+    /// Spend for this single LLM call. Stored as integer micro-USD —
+    /// see [`MicroUsd`] for the rationale (no float drift across
+    /// aggregations or quota checks).
+    pub cost_usd: MicroUsd,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -49,7 +53,7 @@ pub struct TimeRange {
 /// Aggregated cost information over a time range.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostSummary {
-    pub total_cost_usd: f64,
+    pub total_cost_usd: MicroUsd,
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
     pub total_cached_input_tokens: usize,
@@ -65,7 +69,7 @@ pub struct UserMonthlyCost {
     pub user_id: String,
     /// Calendar month tag — `YYYY-MM` (UTC).
     pub month: String,
-    pub cost_usd: f64,
+    pub cost_usd: MicroUsd,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -95,7 +99,7 @@ pub trait CostStore: Send + Sync {
     async fn query_job(&self, job_id: &aura_model::JobId) -> CostResult<CostSummary>;
 
     /// Return the sum of `cost_usd` for a user within the given time range.
-    async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64>;
+    async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<MicroUsd>;
 
     // ── Cached user-monthly aggregate (lazy materialisation) ──
 
@@ -105,7 +109,7 @@ pub trait CostStore: Send + Sync {
         &self,
         user_id: &str,
         month: &str,
-        delta_usd: f64,
+        delta_usd: MicroUsd,
     ) -> CostResult<()>;
 
     /// Read the cached monthly total. Returns `None` when the row is

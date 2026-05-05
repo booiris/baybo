@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use async_trait::async_trait;
 use aura_job::{Job, JobStatusKind, JobTransition};
-use aura_model::{BlobRef, JobId, MemoryEntry, SessionId, SpanId, StepId};
+use aura_model::{BlobRef, JobId, MemoryEntry, MicroUsd, SessionId, SpanId, StepId};
 use aura_trace::{Span, SpanEvent, Step};
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -280,7 +280,7 @@ impl CostStore for MemoryCostStore {
         &self,
         user_id: &str,
         month: &str,
-        delta_usd: f64,
+        delta_usd: MicroUsd,
     ) -> CostResult<()> {
         let now = chrono::Utc::now();
         let key = (user_id.to_string(), month.to_string());
@@ -288,7 +288,7 @@ impl CostStore for MemoryCostStore {
         let entry = map.entry(key).or_insert_with(|| UserMonthlyCost {
             user_id: user_id.to_string(),
             month: month.to_string(),
-            cost_usd: 0.0,
+            cost_usd: MicroUsd::ZERO,
             updated_at: now,
         });
         entry.cost_usd += delta_usd;
@@ -308,7 +308,7 @@ impl CostStore for MemoryCostStore {
             .cloned())
     }
 
-    async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64> {
+    async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<MicroUsd> {
         Ok(self
             .records
             .lock()

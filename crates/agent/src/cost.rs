@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aura_llm::ModelPricing;
+use aura_model::MicroUsd;
 use aura_storage::{CostRecord, CostStore, TimeRange};
 use chrono::{Datelike, NaiveDate, Utc};
 use thiserror::Error;
@@ -12,29 +13,31 @@ use crate::trace::{TraceEvent, TraceEventStream};
 
 #[derive(Debug, Error)]
 pub enum CostGuardError {
-    #[error("user '{user_id}' exceeded spending limit: current ${current:.4} >= limit ${limit:.4}")]
+    #[error("user '{user_id}' exceeded spending limit: current {current} >= limit {limit}")]
     UserLimitExceeded {
         user_id: String,
-        current: f64,
-        limit: f64,
+        current: MicroUsd,
+        limit: MicroUsd,
     },
 
-    #[error("global spending limit exceeded: current ${current:.4} >= limit ${limit:.4}")]
-    GlobalLimitExceeded { current: f64, limit: f64 },
+    #[error("global spending limit exceeded: current {current} >= limit {limit}")]
+    GlobalLimitExceeded { current: MicroUsd, limit: MicroUsd },
 
     #[error("cost query failed: {0}")]
     QueryFailed(#[from] aura_storage::CostError),
 }
 
-/// Per-user and global spending limits.
+/// Per-user and global spending limits, expressed as `MicroUsd` so
+/// comparisons with [`CostStore::sum_user`] / [`CostStore::query_global`]
+/// stay exact.
 #[derive(Debug, Clone, Default)]
 pub struct SpendingLimits {
-    /// Maximum USD a single user may spend per day. `None` means unlimited.
-    pub user_daily_usd: Option<f64>,
-    /// Maximum USD a single user may spend per month. `None` means unlimited.
-    pub user_monthly_usd: Option<f64>,
-    /// Maximum USD globally per day. `None` means unlimited.
-    pub global_daily_usd: Option<f64>,
+    /// Cap on a single user's daily spend. `None` means unlimited.
+    pub user_daily_usd: Option<MicroUsd>,
+    /// Cap on a single user's monthly spend. `None` means unlimited.
+    pub user_monthly_usd: Option<MicroUsd>,
+    /// Cap on global daily spend. `None` means unlimited.
+    pub global_daily_usd: Option<MicroUsd>,
 }
 
 /// Enforces per-user and global spending limits before execution.
@@ -196,12 +199,12 @@ fn compute_cost_usd(
     model_id: &str,
     input_tokens: usize,
     output_tokens: usize,
-) -> f64 {
+) -> MicroUsd {
     let Some(p) = pricing.get(model_id) else {
-        return 0.0;
+        return MicroUsd::ZERO;
     };
-    (input_tokens as f64 / 1_000_000.0) * p.input_per_1m_tokens
-        + (output_tokens as f64 / 1_000_000.0) * p.output_per_1m_tokens
+    MicroUsd::cost_for_tokens(p.input_per_1m_tokens, input_tokens as u64)
+        + MicroUsd::cost_for_tokens(p.output_per_1m_tokens, output_tokens as u64)
 }
 
 impl CostSubscriber {
@@ -226,10 +229,16 @@ impl CostSubscriber {
         Arc::clone(&self.metrics)
     }
 
-    /// Compute USD for the given token counts. Returns 0.0 when the
-    /// model is unknown — the raw record still records token counts
-    /// so the missing rate can be backfilled later.
-    pub fn cost_usd_for(&self, model_id: &str, input_tokens: usize, output_tokens: usize) -> f64 {
+    /// Compute spend for the given token counts. Returns
+    /// [`MicroUsd::ZERO`] when the model is unknown — the raw record
+    /// still captures token counts so the missing rate can be
+    /// backfilled later.
+    pub fn cost_usd_for(
+        &self,
+        model_id: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+    ) -> MicroUsd {
         compute_cost_usd(&self.pricing, model_id, input_tokens, output_tokens)
     }
 
@@ -334,8 +343,8 @@ mod tests {
         h.insert(
             model.to_string(),
             ModelPricing {
-                input_per_1m_tokens: input,
-                output_per_1m_tokens: output,
+                input_per_1m_tokens: MicroUsd::from_usd_decimal(input),
+                output_per_1m_tokens: MicroUsd::from_usd_decimal(output),
             },
         );
         Arc::new(h)
@@ -345,16 +354,121 @@ mod tests {
     fn cost_usd_for_known_model() {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let sub = CostSubscriber::new(store, pricing("m1", 3.0, 15.0));
-        // 1k input + 2k output → (1000/1e6)*3 + (2000/1e6)*15 = 0.003 + 0.030
+        // 1k input + 2k output → (1000/1e6)*3 + (2000/1e6)*15 = 0.003 + 0.030 = $0.033
         let cost = sub.cost_usd_for("m1", 1_000, 2_000);
-        assert!((cost - 0.033).abs() < 1e-9);
+        assert_eq!(cost, MicroUsd::from_usd_decimal(0.033));
     }
 
     #[test]
     fn cost_usd_for_unknown_model_is_zero() {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let sub = CostSubscriber::new(store, pricing("m1", 3.0, 15.0));
-        assert_eq!(sub.cost_usd_for("unknown", 1_000_000, 1_000_000), 0.0);
+        assert_eq!(
+            sub.cost_usd_for("unknown", 1_000_000, 1_000_000),
+            MicroUsd::ZERO
+        );
+    }
+
+    /// Push a synthetic spend row for `user_id` with `cost`. Timestamp
+    /// is `Utc::now()` so the calendar-day / calendar-month windows in
+    /// `check_quota` always include it.
+    async fn record_spend(store: &Arc<dyn CostStore>, user_id: &str, cost: MicroUsd) {
+        use aura_model::{JobId, SessionId, SpanId};
+        store
+            .record(&CostRecord {
+                user_id: user_id.into(),
+                session_id: SessionId::from("s1"),
+                job_id: JobId::new(),
+                span_id: SpanId::new(),
+                model: "m1".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: cost,
+                timestamp: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn usd(v: f64) -> MicroUsd {
+        MicroUsd::from_usd_decimal(v)
+    }
+
+    #[tokio::test]
+    async fn check_quota_allows_when_all_limits_unset() {
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        // Even after a large spend, with no caps configured the guard
+        // must never reject — operators rely on `None` meaning "off".
+        record_spend(&store, "u1", usd(9_999.0)).await;
+
+        let guard = CostGuard::new(store, SpendingLimits::default());
+        assert!(guard.check_quota("u1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_quota_rejects_user_at_or_over_daily_cap() {
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        record_spend(&store, "u1", usd(5.0)).await;
+
+        // Exactly at the cap → rejected (gate is `>=`, not `>`, so the
+        // first call past the budget can never sneak through with a
+        // ≤ comparison race).
+        let guard = CostGuard::new(
+            store.clone(),
+            SpendingLimits {
+                user_daily_usd: Some(usd(5.0)),
+                ..Default::default()
+            },
+        );
+        match guard.check_quota("u1").await {
+            Err(CostGuardError::UserLimitExceeded { user_id, .. }) => assert_eq!(user_id, "u1"),
+            other => panic!("expected UserLimitExceeded, got {other:?}"),
+        }
+
+        // Different user, same store: their bucket is empty → allowed.
+        assert!(guard.check_quota("u2").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_quota_rejects_global_daily_cap_across_users() {
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        record_spend(&store, "u1", usd(3.0)).await;
+        record_spend(&store, "u2", usd(2.5)).await;
+
+        let guard = CostGuard::new(
+            store,
+            SpendingLimits {
+                global_daily_usd: Some(usd(5.0)),
+                ..Default::default()
+            },
+        );
+        // Global pool is u1+u2 = $5.50 ≥ $5.00 — neither user can spend.
+        assert!(matches!(
+            guard.check_quota("u1").await,
+            Err(CostGuardError::GlobalLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            guard.check_quota("u3").await,
+            Err(CostGuardError::GlobalLimitExceeded { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_quota_passes_user_below_cap_and_no_global_cap() {
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        record_spend(&store, "u1", usd(2.0)).await;
+
+        let guard = CostGuard::new(
+            store,
+            SpendingLimits {
+                user_daily_usd: Some(usd(5.0)),
+                user_monthly_usd: Some(usd(100.0)),
+                ..Default::default()
+            },
+        );
+        assert!(guard.check_quota("u1").await.is_ok());
     }
 
     #[tokio::test]
