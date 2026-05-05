@@ -83,7 +83,7 @@ fn install_context(
 /// Resolution order:
 /// 1. `AURA_CONFIG_PATH` — canonicalized; errors if it cannot be
 ///    resolved to an existing file.
-/// 2. `<default_workspace_root>/profile/aura.json` — if it already exists.
+/// 2. `<default_workspace_root>/config/aura.json` — if it already exists.
 /// 3. Otherwise `None`, with a loud stderr warning: the service will
 ///    launch against built-in defaults (no LLM key, default workspace),
 ///    which is almost never what the user actually wants.
@@ -471,7 +471,10 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     let server = GatewayServer::new(deps);
     let banner_bind = server.bind();
-    println!("Aura gateway listening on http://{banner_bind}");
+    println!(
+        "{}http://{banner_bind}",
+        aura_gateway::LISTENING_BANNER_PREFIX
+    );
     println!("  Quick URL: http://{banner_bind}/v1/status?token={token}");
 
     tracing::info!(bind = %banner_bind, "gateway start: all components initialized");

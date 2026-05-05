@@ -50,4 +50,18 @@ impl From<aura_config::ConfigError> for CliError {
     }
 }
 
+impl From<aura_setup::SetupError> for CliError {
+    fn from(err: aura_setup::SetupError) -> Self {
+        use aura_setup::SetupError as S;
+        match err {
+            S::NotATerminal | S::Cancelled | S::Prompt(_) => Self::Config(err.to_string()),
+            S::Io { .. } => Self::Io(err.to_string()),
+            S::Config(_) | S::Vault(_) | S::Storage(_) | S::Browser(_) | S::Gateway(_) => {
+                Self::Config(err.to_string())
+            }
+            S::Llm(_) | S::Channel(_) => Self::Manager(err.to_string()),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CliError>;

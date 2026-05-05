@@ -81,9 +81,10 @@ pub fn decrypt(data: &[u8], key: &EncryptionKey) -> crate::Result<Vec<u8>> {
     })
 }
 
-#[cfg(test)]
 impl EncryptionKey {
-    fn generate() -> Self {
+    /// Mint a fresh 32-byte key from the OS RNG. Used by `aura setup`
+    /// for first-run key generation; tests use it for fixtures.
+    pub fn generate() -> Self {
         use rand::RngExt;
         let mut key = vec![0u8; AES256_KEY_LEN];
         rand::rng().fill(key.as_mut_slice());

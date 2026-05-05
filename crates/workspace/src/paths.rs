@@ -10,15 +10,17 @@
 //!
 //! ```text
 //! <root>/
-//!   profile/           # standalone git repo: aura.json, .mcp.json, *.md identity files
+//!   config/            # standalone git repo: aura.json, .mcp.json
+//!   profile/           # standalone git repo: *.md identity files
 //!   skills/            # standalone git repo: user skill definitions
+//!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; code-builder/<uuid>/, future scratch
 //!   logs/              # not version-controlled: aura.log.YYYY-MM-DD, channel/<type>.log, sessions/<id>.jsonl
 //! ```
 //!
-//! `profile/` and `skills/` each get their own `.git` repo on first
-//! `ensure_layout`; the workspace root itself is no longer git-tracked.
+//! `config/`, `profile/`, and `skills/` each get their own `.git` repo on
+//! first `ensure_layout`; the workspace root itself is not git-tracked.
 
 use std::path::{Path, PathBuf};
 
@@ -26,12 +28,21 @@ use std::path::{Path, PathBuf};
 // Workspace top-level subdirectories
 // ---------------------------------------------------------------------------
 
-/// Standalone git repo at `<root>/profile/`: aura.json, MCP registry,
-/// identity markdown files.
+/// Standalone git repo at `<root>/config/`: aura.json + MCP registry.
+/// Operator-edited, version-controlled.
+pub const CONFIG_DIR: &str = "config";
+
+/// Standalone git repo at `<root>/profile/`: identity markdown files
+/// (AGENTS, SOUL, USER, IDENTITY).
 pub const PROFILE_DIR: &str = "profile";
 
 /// Standalone git repo at `<root>/skills/`: workspace-local skill definitions.
 pub const SKILLS_DIR: &str = "skills";
+
+/// Master encryption-key directory at `<root>/.key/`. Not
+/// version-controlled. Setup mints the key file inside on first run with
+/// 0600 permissions.
+pub const KEY_DIR: &str = ".key";
 
 /// Persistent runtime state (db, locks, ports, browser profile). Not version-controlled.
 pub const STATE_DIR: &str = "state";
@@ -43,20 +54,32 @@ pub const WORK_DIR: &str = "work";
 pub const LOGS_DIR: &str = "logs";
 
 // ---------------------------------------------------------------------------
-// Files inside `profile/` (standalone git repo)
+// Files inside `config/` (standalone git repo)
 // ---------------------------------------------------------------------------
 
 /// Top-level config file (default name; `AURA_CONFIG_PATH` overrides).
-/// Stored at `<root>/profile/aura.json`.
+/// Stored at `<root>/config/aura.json`.
 pub const WORKSPACE_CONFIG_FILE: &str = "aura.json";
 
-/// MCP server registry file. Stored at `<root>/profile/.mcp.json`.
+/// MCP server registry file. Stored at `<root>/config/.mcp.json`.
 pub const MCP_CONFIG_FILE: &str = ".mcp.json";
+
+// ---------------------------------------------------------------------------
+// Files inside `profile/` (standalone git repo)
+// ---------------------------------------------------------------------------
 
 pub const IDENTITY_AGENTS_FILE: &str = "AGENTS.md";
 pub const IDENTITY_SOUL_FILE: &str = "SOUL.md";
 pub const IDENTITY_USER_FILE: &str = "USER.md";
 pub const IDENTITY_IDENTITY_FILE: &str = "IDENTITY.md";
+
+// ---------------------------------------------------------------------------
+// Files inside `.key/` (not version-controlled)
+// ---------------------------------------------------------------------------
+
+/// Master encryption-key file. Hex-encoded 32 random bytes, mode 0600.
+/// Stored at `<root>/.key/encryption.key`.
+pub const ENCRYPTION_KEY_FILE: &str = "encryption.key";
 
 // ---------------------------------------------------------------------------
 // Files inside `state/` (not version-controlled)
@@ -158,11 +181,11 @@ pub fn default_workspace_root() -> PathBuf {
     }
 }
 
-/// Default `aura.json` location: `<default_workspace_root>/profile/aura.json`.
+/// Default `aura.json` location: `<default_workspace_root>/config/aura.json`.
 /// Used as the fallback when `AURA_CONFIG_PATH` is not set.
 pub fn default_config_file() -> PathBuf {
     default_workspace_root()
-        .join(PROFILE_DIR)
+        .join(CONFIG_DIR)
         .join(WORKSPACE_CONFIG_FILE)
 }
 
@@ -241,12 +264,20 @@ impl WorkspacePaths {
 
     // -- top-level subdirectories --
 
+    pub fn config_dir(&self) -> PathBuf {
+        self.root.join(CONFIG_DIR)
+    }
+
     pub fn profile_dir(&self) -> PathBuf {
         self.root.join(PROFILE_DIR)
     }
 
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join(SKILLS_DIR)
+    }
+
+    pub fn key_dir(&self) -> PathBuf {
+        self.root.join(KEY_DIR)
     }
 
     pub fn state_dir(&self) -> PathBuf {
@@ -275,18 +306,26 @@ impl WorkspacePaths {
         self.logs_dir().join(SESSIONS_LOG_SUBDIR)
     }
 
-    // -- profile/ contents --
+    // -- config/ contents --
 
     pub fn config_file(&self) -> PathBuf {
-        self.profile_dir().join(WORKSPACE_CONFIG_FILE)
+        self.config_dir().join(WORKSPACE_CONFIG_FILE)
     }
 
     pub fn mcp_config(&self) -> PathBuf {
-        self.profile_dir().join(MCP_CONFIG_FILE)
+        self.config_dir().join(MCP_CONFIG_FILE)
     }
+
+    // -- profile/ contents --
 
     pub fn identity_file(&self, kind: IdentityKind) -> PathBuf {
         self.profile_dir().join(kind.file_name())
+    }
+
+    // -- .key/ contents --
+
+    pub fn encryption_key_file(&self) -> PathBuf {
+        self.key_dir().join(ENCRYPTION_KEY_FILE)
     }
 
     // -- state/ contents --
@@ -331,14 +370,18 @@ mod tests {
     #[test]
     fn workspace_paths_compose_under_root() {
         let p = WorkspacePaths::new("/var/aura");
-        assert_eq!(
-            p.config_file(),
-            PathBuf::from("/var/aura/profile/aura.json")
-        );
-        assert_eq!(p.mcp_config(), PathBuf::from("/var/aura/profile/.mcp.json"));
+        assert_eq!(p.config_dir(), PathBuf::from("/var/aura/config"));
+        assert_eq!(p.config_file(), PathBuf::from("/var/aura/config/aura.json"));
+        assert_eq!(p.mcp_config(), PathBuf::from("/var/aura/config/.mcp.json"));
+        assert_eq!(p.profile_dir(), PathBuf::from("/var/aura/profile"));
         assert_eq!(
             p.identity_file(IdentityKind::Soul),
             PathBuf::from("/var/aura/profile/SOUL.md"),
+        );
+        assert_eq!(p.key_dir(), PathBuf::from("/var/aura/.key"));
+        assert_eq!(
+            p.encryption_key_file(),
+            PathBuf::from("/var/aura/.key/encryption.key"),
         );
         assert_eq!(p.storage_db(), PathBuf::from("/var/aura/state/storage.db"),);
         assert_eq!(
@@ -401,9 +444,9 @@ mod tests {
     }
 
     #[test]
-    fn default_config_file_lives_under_default_root_profile() {
+    fn default_config_file_lives_under_default_root_config() {
         let cfg = default_config_file();
         let root = default_workspace_root();
-        assert_eq!(cfg, root.join(PROFILE_DIR).join(WORKSPACE_CONFIG_FILE));
+        assert_eq!(cfg, root.join(CONFIG_DIR).join(WORKSPACE_CONFIG_FILE));
     }
 }

@@ -30,20 +30,21 @@ Defaults: `~/.aura` in release builds, `./.aura` in debug builds. The
 debug default keeps `cargo run` self-contained inside the project
 checkout rather than polluting the real user home.
 
-| Subsystem      | Path                                       |
-| -------------- | ------------------------------------------ |
-| config         | `<workspace.path>/profile/aura.json`       |
-| MCP servers    | `<workspace.path>/profile/.mcp.json`       |
-| identity files | `<workspace.path>/profile/{AGENTS,SOUL,USER,IDENTITY}.md` |
-| skills         | `<workspace.path>/skills/`                 |
-| storage        | `<workspace.path>/state/storage.db`        |
-| singleton lock | `<workspace.path>/state/aura.lock`         |
-| channel port   | `<workspace.path>/state/channel.port`      |
-| browser profile | `<workspace.path>/state/browser/profile/` |
-| code-builder   | `<workspace.path>/work/code-builder/runs/<uuid>/` |
-| gateway logs   | `<workspace.path>/logs/aura.log.<date>`    |
-| channel logs   | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
-| session logs   | `<workspace.path>/logs/sessions/<session_id>.jsonl` |
+| Subsystem        | Path                                       |
+| ---------------- | ------------------------------------------ |
+| config           | `<workspace.path>/config/aura.json`        |
+| MCP servers      | `<workspace.path>/config/.mcp.json`        |
+| identity files   | `<workspace.path>/profile/{AGENTS,SOUL,USER,IDENTITY}.md` |
+| skills           | `<workspace.path>/skills/`                 |
+| encryption key   | `<workspace.path>/.key/encryption.key`     |
+| storage          | `<workspace.path>/state/storage.db`        |
+| singleton lock   | `<workspace.path>/state/aura.lock`         |
+| channel port     | `<workspace.path>/state/channel.port`      |
+| browser profile  | `<workspace.path>/state/browser/profile/`  |
+| code-builder     | `<workspace.path>/work/code-builder/runs/<uuid>/` |
+| gateway logs     | `<workspace.path>/logs/aura.log.<date>`    |
+| channel logs     | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
+| session logs     | `<workspace.path>/logs/sessions/<session_id>.jsonl` |
 
 New subsystem files belong as a method on `WorkspacePaths`, not as another `workspace_root.join("…")` call site.
 
@@ -51,14 +52,14 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 `WorkspaceManager::ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
-- Creates `profile/`, `skills/`, `state/`, `work/`, `logs/` if missing.
-- Runs `git init --quiet` inside `profile/` and `skills/` if the directory isn't already a git repo (`<dir>/.git` check).
+- Creates `config/`, `profile/`, `skills/`, `.key/`, `state/`, `work/`, `logs/` if missing.
+- Runs `git init --quiet` inside `config/`, `profile/`, and `skills/` if the directory isn't already a git repo (`<dir>/.git` check).
 
-`profile/` and `skills/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `state/`, `work/`, `logs/` simply live next to the two declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `profile/`; skill authors do the same inside `skills/`.
+`config/`, `profile/`, and `skills/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the three declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`. **Never** commit anything from `.key/` — `aura setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
 
 ## Config file resolution
 
-`AURA_CONFIG_PATH` overrides everything. When unset, the loader falls back to `default_config_file()` = `<default_workspace_root>/profile/aura.json`. Missing-file behaviour:
+`AURA_CONFIG_PATH` overrides everything. When unset, the loader falls back to `default_config_file()` = `<default_workspace_root>/config/aura.json`. Missing-file behaviour:
 
 - explicit `AURA_CONFIG_PATH` pointing at a non-existent file → hard error.
 - default path absent → silently fall back to `AuraConfig::default()` and log the resolved path that was checked.

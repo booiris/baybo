@@ -85,6 +85,12 @@ fn channels_list_parses() {
 }
 
 #[test]
+fn setup_takes_no_args() {
+    let cli = parse(&["setup"]);
+    assert!(matches!(cli.command, Some(Commands::Setup)));
+}
+
+#[test]
 fn channels_bot_add_takes_no_args() {
     let cli = parse(&["channel", "add"]);
     assert!(matches!(

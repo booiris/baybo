@@ -88,7 +88,12 @@ impl SlashHandler for CliSlashHandler {
                 continue;
             }
             let name = sub.get_name();
-            if name == "help" || name == "completion" {
+            if name == "help" || name == "completion" || name == "setup" {
+                // `setup` is the first-run wizard — interactive, requires
+                // a TTY, and bootstraps state before a chat session can
+                // even exist. Hiding from the slash menu prevents users
+                // from clicking on something the dispatcher would refuse
+                // anyway (`AgentSendForbiddenInSlash("setup")`).
                 continue;
             }
             let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();

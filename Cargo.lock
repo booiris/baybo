@@ -198,6 +198,7 @@ dependencies = [
  "aura-sandbox",
  "aura-security",
  "aura-session",
+ "aura-setup",
  "aura-skills",
  "aura-skills-assessor",
  "aura-storage",
@@ -292,6 +293,7 @@ dependencies = [
  "aura-model",
  "aura-security",
  "aura-session",
+ "aura-setup",
  "aura-skills",
  "aura-skills-assessor",
  "aura-storage",
@@ -460,6 +462,7 @@ dependencies = [
  "aura-llm",
  "aura-model",
  "aura-security",
+ "aura-setup",
  "aura-skills",
  "aura-storage",
  "aura-tools",
@@ -612,6 +615,33 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aura-setup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aura-channels",
+ "aura-config",
+ "aura-gateway",
+ "aura-llm",
+ "aura-model",
+ "aura-security",
+ "aura-setup",
+ "aura-storage",
+ "aura-workspace",
+ "crossterm",
+ "hex",
+ "libc",
+ "open",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

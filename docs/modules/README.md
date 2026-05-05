@@ -11,7 +11,7 @@ Bottom-up along the dependency graph:
 3. [llm.md](llm.md) → [security.md](security.md)
 4. [tools.md](tools.md) → [workspace.md](workspace.md) → [context.md](context.md)
 5. [trace.md](trace.md)
-6. [storage.md](storage.md) → [pairing.md](pairing.md) → [agent.md](agent.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md) → [tui.md](tui.md)
+6. [storage.md](storage.md) → [pairing.md](pairing.md) → [agent.md](agent.md) → [setup.md](setup.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md) → [tui.md](tui.md)
 
 ## Module Groups
 
@@ -47,6 +47,7 @@ Bottom-up along the dependency graph:
 - **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free. `ChannelPairingStore` defines `ChannelPairingRow` / `PairingStatus` so `aura-pairing` can stay a business-logic crate.
 - **[pairing](pairing.md)** — Per-user pairing gate for sidecar-routed inbound messages. `PairingService` checks the `(channel_type, bot_id, user_id)` triple, mints 6-char codes for unknown senders, and refuses with a `Frame::Notice` until `aura pair approve <code>` flips the row to `approved`. Store trait + row lives in `storage`; `aura-pairing` is the service + code generator.
 - **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, observability facades (`JobLifecycle` for the job state machine, `SpanRecorder` for Step/Span/SpanEvent writes), cost management (`CostTracker` as a `TraceEventStream` subscriber, `CostGuard`), plus all domain managers (SessionManager, MemoryManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
+- **[setup](setup.md)** — Interactive first-run wizard (`aura-setup`, exposed as `aura setup`). Bootstraps the workspace skeleton, mints the master encryption key under `<root>/.key/encryption.key`, writes a default `aura.json`, opens libsql + the secret vault, then runs Quick / Full step sequences (LLM / channel / browser). Same flow primitives back `aura llm add` / `aura channel add` (`flow::configure_*_step`), so the wizard's per-step UX is structurally identical to the argv path. β2 commit semantics — `aura.json` is the only deferred write.
 - **bootstrap** — Binary entry point (`src/main.rs`) and `boot` submodule. Loads `AuraConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
 - **cli** — Operator-facing command layer (`aura-cli`). One `clap` tree drives both argv-mode commands (`aura config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input that resolves to a CLI command never enters the agent's context. User-invocable skills are the one sanctioned exception: `/<skill>` is forwarded to the agent as a normal chat message so `SkillRegistry::select` can narrow on the exact-match branch.
 - **[tui](tui.md)** — Interactive terminal UI (`aura-tui`). Ratatui + Crossterm frontend driven by a WS+MessagePack `WsTransport` client of `aura-gateway`; no local manager graph, no workspace singleton. Hosts `TuiAdapter`, `TuiSlashHandler`, and `TuiDashboardProvider`. Input-history persistence is delivered over the same WS via `Frame::HistorySnapshot` / `Frame::HistoryAppend` — the TUI never opens the vault itself. Depends on `aura-channels` for shared trait definitions only.
@@ -80,6 +81,7 @@ sandbox   ──► (no internal deps; OS sandbox runner consumed by agent)
 agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, sandbox, storage, channels, config
 gateway   ──► agent, channels, config, cron, job, llm, model, pairing, security, session, skills, storage, tools, trace, workspace
 tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over HTTP+SSE)
+setup     ──► channels, config, gateway, llm, model, security, storage, workspace (interactive first-run wizard; aura-cli's llm-add/channel-add wrap its flow primitives)
 bootstrap ──► config + all domain crates it assembles (entry point only)
 ```
 

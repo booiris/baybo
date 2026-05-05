@@ -155,6 +155,15 @@ pub enum Commands {
     Status,
     /// Run health checks against config, storage, and env.
     Doctor,
+    /// Interactive first-run wizard: bootstrap the workspace, mint
+    /// the master encryption key, register an LLM provider, optionally
+    /// configure a channel bot and (in full mode) the browser tool,
+    /// then launch the gateway with the dashboard open.
+    ///
+    /// Idempotent: safe to re-run after the workspace exists. The
+    /// "Add another / Skip" picker on the LLM and channel steps lets
+    /// you extend an existing setup.
+    Setup,
     /// Emit shell completion script.
     Completion {
         #[arg(value_enum)]

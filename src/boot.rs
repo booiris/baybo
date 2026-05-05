@@ -29,7 +29,7 @@ use tracing::info;
 // ---------------------------------------------------------------------------
 
 /// Resolve the config path from `AURA_CONFIG_PATH`, else
-/// `<default_workspace_root>/profile/aura.json`, else fall back to
+/// `<default_workspace_root>/config/aura.json`, else fall back to
 /// `AuraConfig::default()`. An explicit `AURA_CONFIG_PATH` that points at a
 /// missing file is a hard error — silent fallback would hide typos.
 pub async fn load_config() -> anyhow::Result<AuraConfig> {
@@ -62,7 +62,7 @@ pub async fn load_config() -> anyhow::Result<AuraConfig> {
 /// Resolve the effective `aura.json` path, if any.
 ///
 /// Same precedence as [`load_config`]: `AURA_CONFIG_PATH` first, then
-/// `<default_workspace_root>/profile/aura.json` (only if present). Returns
+/// `<default_workspace_root>/config/aura.json` (only if present). Returns
 /// `None` when neither exists — callers running against
 /// `AuraConfig::default()` have no path to write back to, and mutation
 /// endpoints reject accordingly.

@@ -155,7 +155,6 @@ impl AgentActor {
                 }
             }
         }
-
         info!(session_id = %self.session.id, "agent actor stopped");
     }
 

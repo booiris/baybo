@@ -13,15 +13,18 @@ impl WorkspaceManager {
         Self { root }
     }
 
-    /// Materialise the workspace skeleton: create `profile/`, `skills/`,
-    /// `state/`, `work/`, `logs/`, and initialise a standalone git repo
-    /// inside each of `profile/` and `skills/` if it isn't one already.
-    /// Idempotent — safe to call on every boot.
+    /// Materialise the workspace skeleton: create `config/`, `profile/`,
+    /// `skills/`, `.key/`, `state/`, `work/`, `logs/`, and initialise a
+    /// standalone git repo inside each of `config/`, `profile/`, and
+    /// `skills/` if it isn't one already. Idempotent — safe to call on
+    /// every boot.
     pub async fn ensure_layout(&self) -> anyhow::Result<()> {
         let paths = WorkspacePaths::new(self.root.clone());
         for dir in [
+            paths.config_dir(),
             paths.profile_dir(),
             paths.skills_dir(),
+            paths.key_dir(),
             paths.state_dir(),
             paths.work_dir(),
             paths.logs_dir(),
@@ -31,7 +34,7 @@ impl WorkspaceManager {
                 .map_err(|e| anyhow::anyhow!("create workspace dir {}: {e}", dir.display()))?;
         }
 
-        for dir in [paths.profile_dir(), paths.skills_dir()] {
+        for dir in [paths.config_dir(), paths.profile_dir(), paths.skills_dir()] {
             ensure_git_repo(&dir).await?;
         }
         Ok(())
@@ -107,8 +110,10 @@ mod tests {
         let paths = WorkspacePaths::new(dir.clone());
 
         for d in [
+            paths.config_dir(),
             paths.profile_dir(),
             paths.skills_dir(),
+            paths.key_dir(),
             paths.state_dir(),
             paths.work_dir(),
             paths.logs_dir(),
@@ -117,12 +122,16 @@ mod tests {
         }
         // No workspace-root .gitignore should exist anymore.
         assert!(!dir.join(".gitignore").exists());
-        // Each of profile/ and skills/ is its own git repo.
+        // Each of config/, profile/, and skills/ is its own git repo.
+        assert!(paths.config_dir().join(".git").is_dir());
         assert!(paths.profile_dir().join(".git").is_dir());
         assert!(paths.skills_dir().join(".git").is_dir());
+        // .key/ is NOT a git repo — encryption key must never be tracked.
+        assert!(!paths.key_dir().join(".git").exists());
 
         // Idempotent: a re-apply must not re-init or fail.
         mgr.ensure_layout().await.expect("layout reapply");
+        assert!(paths.config_dir().join(".git").is_dir());
         assert!(paths.profile_dir().join(".git").is_dir());
         assert!(paths.skills_dir().join(".git").is_dir());
 

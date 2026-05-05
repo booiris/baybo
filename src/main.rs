@@ -1,6 +1,7 @@
 mod boot;
 mod gateway_cmd;
 mod runtime;
+mod setup_cmd;
 mod singleton;
 mod tracing_init;
 mod tui_cmd;
@@ -58,6 +59,14 @@ async fn main() -> anyhow::Result<()> {
     // server. Route them here before the generic argv/chat branch.
     if let Some(Commands::Gateway { cmd }) = cli.command {
         return gateway_cmd::run(cmd).await;
+    }
+
+    // `setup` is the first-run wizard. It bootstraps the workspace +
+    // master key + default aura.json before any of the normal
+    // `boot::load_config` machinery can run, so it gets its own
+    // entry point here, ahead of the argv/chat dispatch.
+    if let Some(Commands::Setup) = cli.command.as_ref() {
+        return setup_cmd::run().await;
     }
 
     // Bare `aura` (no subcommand) prints help and exits. The interactive

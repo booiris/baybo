@@ -29,5 +29,8 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Gateway { .. } => Err(crate::error::CliError::UnknownCommand(
             "`gateway` runs a long-lived server; main.rs handles it before dispatch".into(),
         )),
+        Commands::Setup => Err(crate::error::CliError::AgentSendForbiddenInSlash(
+            "setup".into(),
+        )),
     }
 }

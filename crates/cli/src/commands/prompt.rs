@@ -39,7 +39,10 @@ pub(crate) fn confirm(question: &str) -> Result<bool> {
     let mut writer = stderr.lock();
     let label = format!("{question} [y/N]: ");
     let ans = prompt_line(&mut reader, &mut writer, &label)?;
-    Ok(matches!(ans.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+    Ok(matches!(
+        ans.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Like `prompt_line` but substitutes `default` when the user

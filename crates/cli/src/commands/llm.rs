@@ -9,9 +9,7 @@ use aura_llm::providers::openai_subscription::{
     DeviceCode, PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS, VaultTokenStore,
     device_code_login, pkce_login, revoke,
 };
-use aura_llm::{
-    LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, default_base_url_for_provider,
-};
+use aura_llm::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::SecretVault;
 use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use serde_json::{Value, json};
@@ -23,15 +21,6 @@ use crate::commands::select::select_one;
 use crate::context::CommandContext;
 use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
-
-/// Built-in providers offered by `aura llm add`.
-const BUILTIN_PROVIDERS: &[&str] = &[
-    "openai",
-    "anthropic",
-    "gemini",
-    "minimax",
-    SUB_PROVIDER_NAME,
-];
 
 /// Hint appended to every config-mutating output. The runtime
 /// (`aura gateway start`) loads aura.json once at boot and holds the
@@ -240,156 +229,36 @@ async fn add(ctx: &CommandContext) -> Result<CommandOutput> {
     })?;
 
     require_tty()?;
-    let provider_idx = select_one("Provider:", BUILTIN_PROVIDERS)?;
-    let provider = BUILTIN_PROVIDERS[provider_idx].to_string();
-
-    let default_name = unique_default_name(&provider, &ctx.config.llm);
-    let name = prompt_with_default("Entry name", &default_name)?;
-    if name.trim().is_empty() {
-        return Err(CliError::Config("entry name must be non-empty".into()));
-    }
-    // Pre-check duplicates BEFORE we touch the vault. validate() at
-    // the end would catch the duplicate, but by then we'd have
-    // already overwritten the existing entry's vault api key (same
-    // vault key per name). Better to reject here and leave the
-    // vault untouched.
-    if ctx.config.llm.iter().any(|e| e.name == name) {
-        return Err(CliError::Config(format!(
-            "entry name {name:?} already exists; use `aura llm edit` or pick a different name"
-        )));
-    }
-
-    let default_base = default_base_url(&provider).unwrap_or("");
-    let base_url_input = prompt_with_default("Base URL", default_base)?;
-    let base_url = if base_url_input.trim().is_empty() {
-        None
-    } else {
-        Some(base_url_input.trim().to_string())
-    };
-
-    // `api_key_env` stays unset on the new entry. Setting it to a
-    // provider-default env var name would let a global
-    // `OPENAI_API_KEY` mask this entry's per-entry vault secret —
-    // the regression flagged by the adversarial review.
-    let api_key_env: Option<String> = if provider == SUB_PROVIDER_NAME {
-        run_subscription_login(vault).await?;
-        None
-    } else {
-        let api_key = read_masked_password("API key (will be encrypted into the vault): ")?;
-        if api_key.is_empty() {
-            return Err(CliError::Config("api key must be non-empty".into()));
-        }
-        vault
-            .store_secret(&vault_api_key_name(&name), api_key.as_bytes())
-            .await
-            .map_err(|e| CliError::Manager(format!("write api key to vault: {e}")))?;
-        None
-    };
-
-    let temp_entry = LlmEntry {
-        name: name.clone(),
-        provider: provider.clone(),
-        model: String::from("(unset)"),
-        api_key_env: api_key_env.clone(),
-        base_url: base_url.clone(),
-        supports_vision: None,
-        reasoning_effort: None,
-    };
-
-    eprintln!("Fetching live model catalog…");
-    let live = match fetch_live_models(&temp_entry, Some(vault.clone())).await {
-        Ok(models) => models,
-        Err(e) => {
-            // Discovery failure shouldn't strand the operator —
-            // fall back to typing the model id by hand.
-            eprintln!("(live model discovery failed: {e}; falling back to manual entry)");
-            Vec::new()
-        }
-    };
-    let mut labels: Vec<String> = live
-        .iter()
-        .map(|m| match (&m.display_name, m.context_window) {
-            (Some(d), Some(c)) if d != &m.id => format!("{}  [{c}]  ({d})", m.id),
-            (_, Some(c)) => format!("{}  [{c}]", m.id),
-            (Some(d), _) if d != &m.id => format!("{}  ({d})", m.id),
-            _ => m.id.clone(),
-        })
-        .collect();
-    const CUSTOM_LABEL: &str = "<enter custom model id>";
-    labels.push(CUSTOM_LABEL.to_string());
-    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-
-    let model_idx = select_one("Model:", &label_refs)?;
-    let model = if model_idx == live.len() {
-        let typed = prompt_with_default("Custom model id", "")?;
-        if typed.trim().is_empty() {
-            return Err(CliError::Config("model id must be non-empty".into()));
-        }
-        typed
-    } else {
-        live[model_idx].id.clone()
-    };
-
-    // Reasoning effort is meaningful only for openai-subscription
-    // (Codex Responses). Other providers either lack the knob or
-    // fix it server-side, so we don't even ask.
-    let reasoning_effort = if provider == SUB_PROVIDER_NAME {
-        let levels = aura_llm::providers::openai_subscription::allowed_efforts_for(&model);
-        let labels: Vec<&str> = levels.to_vec();
-        let idx = select_one("Reasoning effort:", &labels)?;
-        Some(levels[idx].to_string())
-    } else {
-        None
-    };
-
-    let entry = LlmEntry {
-        name: name.clone(),
-        provider: provider.clone(),
-        model: model.clone(),
-        api_key_env,
-        base_url,
-        supports_vision: None,
-        reasoning_effort,
-    };
-
+    let mut prompter = aura_setup::TtyPrompter::new()?;
     let mut new_config: AuraConfig = ctx.config.as_ref().clone();
-    new_config.llm.push(entry);
-    // Only ask when there's something to choose between. With a
-    // single entry there is no meaningful alternative, so auto-set
-    // it as default. Same applies when the prior `default-llm` is
-    // empty / dangling — without this, validate() would fail.
-    let prior_default_valid = new_config
-        .llm
-        .iter()
-        .any(|e| e.name == new_config.default_llm);
-    let auto_promote = new_config.llm.len() == 1 || !prior_default_valid;
-    let became_default = auto_promote
-        || confirm(&format!(
-            "Set {name:?} as default-llm? (current: {})",
-            new_config.default_llm
-        ))?;
-    if became_default {
-        new_config.default_llm = name.clone();
-    }
-    new_config
-        .validate()
-        .map_err(|e| CliError::Config(format!("config validation failed: {e}")))?;
+    // `allow_skip = false` makes the picker silent — the call always
+    // runs the add flow and returns `Added`.
+    let aura_setup::flow::LlmStepOutcome::Added(entry) =
+        aura_setup::flow::configure_llm_step(&mut prompter, vault, &mut new_config, false).await?
+    else {
+        unreachable!("configure_llm_step(allow_skip=false) must return Added");
+    };
+
     new_config.write_to_file(&target).await?;
 
+    let became_default = new_config.default_llm == entry.name;
     let mut human = format!(
-        "added entry {name:?} (provider={provider}, model={model})\nwrote {}",
-        target.display(),
+        "added entry {name:?} (provider={provider}, model={model})\nwrote {path}",
+        name = entry.name,
+        provider = entry.provider,
+        model = entry.model,
+        path = target.display(),
     );
     if became_default {
-        human.push_str(&format!("\ndefault-llm = {name}"));
+        human.push_str(&format!("\ndefault-llm = {}", entry.name));
     }
     human.push_str(RESTART_HINT);
     Ok(CommandOutput {
         human,
         data: Some(json!({
-            "name": name,
-            "provider": provider,
-            "model": model,
+            "name": entry.name,
+            "provider": entry.provider,
+            "model": entry.model,
             "is_default": became_default,
             "written_to": target.display().to_string(),
             "requires_restart": true,
@@ -809,20 +678,6 @@ fn pick_entry<'a>(entries: &'a [LlmEntry], prompt: &str) -> Result<&'a LlmEntry>
     let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let idx = select_one(prompt, &refs)?;
     Ok(&entries[idx])
-}
-
-fn unique_default_name(provider: &str, existing: &[LlmEntry]) -> String {
-    let mut candidate = provider.to_string();
-    let mut suffix = 2;
-    while existing.iter().any(|e| e.name == candidate) {
-        candidate = format!("{provider}{suffix}");
-        suffix += 1;
-    }
-    candidate
-}
-
-fn default_base_url(provider: &str) -> Option<&'static str> {
-    default_base_url_for_provider(provider)
 }
 
 async fn fetch_live_models(

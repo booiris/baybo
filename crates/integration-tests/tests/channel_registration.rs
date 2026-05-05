@@ -13,9 +13,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use aura_channels::Prompter;
-use aura_cli::run_registration;
 use aura_gateway::{SidecarError, SidecarRuntime};
 use aura_model::ChannelType;
+use aura_setup::flow::run_registration;
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 
