@@ -120,14 +120,6 @@ todo_tool!(
     reason = "notebook parsing/serialization is not yet implemented"
 );
 
-// -- Skill invocation --------------------------------------------------------
-todo_tool!(
-    SkillTool,
-    name = "Skill",
-    desc = "Execute a declared skill within the current conversation.",
-    reason = "tool-driven skill invocation is intentionally routed via the agent loop, not the Tool path"
-);
-
 // -- Task list ---------------------------------------------------------------
 todo_tool!(
     TaskCreateTool,
@@ -223,6 +215,7 @@ mod tests {
             workspace_root: std::path::PathBuf::from("/tmp"),
             sandbox: None,
             approval: None,
+            notifier: None,
         };
         let err = AgentTool.execute(json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::NotImplemented(_)));

@@ -748,6 +748,7 @@ mod tests {
             workspace_root: std::path::PathBuf::from("/tmp"),
             sandbox,
             approval: None,
+            notifier: None,
         }
     }
 

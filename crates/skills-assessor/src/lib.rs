@@ -22,6 +22,7 @@
 //! `<skill>` tag injection).
 
 mod assessor;
+mod gate_impl;
 mod hash;
 mod prompt;
 mod queue;

@@ -741,6 +741,7 @@ mod tests {
             workspace_root,
             sandbox: None,
             approval: None,
+            notifier: None,
         }
     }
 
@@ -1305,6 +1306,7 @@ mod tests {
             workspace_root,
             sandbox: None,
             approval: Some(handle),
+            notifier: None,
         }
     }
 

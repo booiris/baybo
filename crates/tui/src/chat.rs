@@ -403,6 +403,7 @@ fn access_summary(accesses: &[ResourceAccess]) -> String {
         ResourceAccess::WriteFile { path } => path.display().to_string(),
         ResourceAccess::Http { host } => host.clone(),
         ResourceAccess::ExecCommand { command } => command.clone(),
+        ResourceAccess::Env { vars } => vars.join(", "),
     }
 }
 
@@ -418,6 +419,7 @@ fn format_access(acc: &ResourceAccess) -> Vec<Span<'static>> {
             }
         }
         ResourceAccess::ExecCommand { command } => ("needs to run", command.clone()),
+        ResourceAccess::Env { vars } => ("needs to read env vars", vars.join(", ")),
     };
     let mut spans = vec![
         Span::raw("  • "),

@@ -26,8 +26,9 @@ permission rules.
 | `WebFetch`                                                                                                                                                                                                                                                            | implemented | returns raw body; no side-channel LLM extraction yet                                                        |
 | `SendFile`                                                                                                                                                                                                                                                            | implemented | streams a local file into `BlobStore` and returns a channel attachment                                      |
 | `Echo`                                                                                                                                                                                                                                                                | debug-only  | returns params verbatim; registered only under `debug_assertions` for round-trip smoke-testing              |
-| `CronCreate`, `CronDelete`, `CronList`                                                                                                                                                                                                                                | implemented | live in `aura-agent::cron_tools` (not `aura-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `src/main.rs` after the scheduler is constructed |
-| `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `Skill`, `Task*`/`TodoWrite`, `ToolSearch`, `WebSearch`, `Team*`                                                          | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed |
+| `CronCreate`, `CronDelete`, `CronList`                                                                                                                                                                                                                                | implemented | live in `aura-cron::tools` (not `aura-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `src/runtime.rs` after the scheduler is constructed |
+| `Skill`                                                                                                                                                                                                                                                               | implemented | lives in `aura-skills::tools` (parallel to `aura-cron::tools`) because it holds `Arc<SkillRegistry>` + `Arc<dyn SkillRiskCheck>`; registered from `src/runtime.rs` after the assessor is constructed. Mode 1 (no `file_path`) returns the SKILL.md body plus a categorized inventory of helper files (`references/`, `templates/`, `scripts/`, `other`). Mode 2 (`file_path` set) returns a sub-file's contents with path-traversal protections. Risk assessor and `required_env` approval gate fire on every call. |
+| `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `Task*`/`TodoWrite`, `ToolSearch`, `WebSearch`, `Team*`                                                                   | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed |
 
 `ToolRegistry::with_defaults(blob_store)` registers the implemented set with
 `TrustLevel::Trusted` manifests declaring their capabilities
@@ -91,6 +92,43 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   reports a single `ResourceAccess::Http { host }` (HTTP) or
   `ResourceAccess::ExecCommand { command }` (stdio) so the approval
   gate can prompt per host or per command.
+
+### Skill tool
+
+The `Skill` builtin is the LLM's entry point for declarative skills.
+Lives in `aura-skills::tools` so it can take `Arc<SkillRegistry>`
+without `aura-tools` gaining a dep edge into `aura-skills`.
+
+- **Visibility:** the per-turn system reminder in `AgentLoop` lists
+  every `agent_invocable && trust_level != Untrusted` skill. The
+  `Skill` tool itself is always registered; when the registry is
+  empty the reminder is skipped, so the LLM never sees a usable list
+  and won't call.
+- **Slash sugar:** `/<cmd> [args]` synthesizes a deterministic
+  iteration-0 `Skill(name, args)` call before iter-1, so slash and
+  LLM-driven invocations share one execution path (risk assessor,
+  env-var approval, trace provenance).
+- **Manifest:** `TrustLevel::Trusted`, no capabilities — the tool
+  itself only renders metadata and reads files inside the
+  operator-controlled skill directory; outbound side effects all
+  happen through whatever tools the skill body subsequently prompts.
+- **Output:** `ToolOutput::Json` with `name`, `description`,
+  `content`, `path`, `skill_dir`, `linked_files{references,templates,scripts,other}`,
+  optional `args`, optional `risk_warning`, and a `usage_hint`. Mode 2
+  (`file_path` set) collapses to `{name, file, content, file_type}`.
+- **Risk:** verdict from `Arc<dyn SkillRiskCheck>` (impl in
+  `aura-skills-assessor`). `Dangerous` → `ToolError::Denied`;
+  `Suspicious` → response carries `risk_warning` and a
+  `SessionNotifier` warn (when wired); `Safe` runs silently.
+- **Env-var gate:** `SkillRequirements::required_env` is checked
+  *before* prompting — any missing var fails with
+  `ToolError::Execution`. If everything is set, an approval prompt
+  fires using the new `ResourceAccess::Env { vars }` variant. Env
+  *values* are never templated into the response; the skill body is
+  expected to instruct downstream tool calls on how to read them.
+
+See [`skills.md`](./skills.md#selection-pipeline) for how the agent
+loop publishes the per-turn skill list.
 
 ### Capability-driven governance
 
