@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   RiArrowDownSLine,
   RiArrowRightSLine,
@@ -23,11 +23,14 @@ const ROLE_META: Record<
 
 const TEXT_CLIP_THRESHOLD = 2_000;
 
-function previewLine(blocks: ContentBlock[]): string {
+function previewLine(blocks: ContentBlock[], toolNames: Map<string, string>): string {
   for (const b of blocks) {
     if ('Text' in b) return b.Text.slice(0, 160);
     if ('ToolUse' in b) return `→ ${b.ToolUse.name}(...)`;
-    if ('ToolResult' in b) return `← result(${b.ToolResult.tool_use_id})`;
+    if ('ToolResult' in b) {
+      const name = toolNames.get(b.ToolResult.tool_use_id);
+      return name ? `← ${name} result` : `← result(${b.ToolResult.tool_use_id})`;
+    }
     if ('Thinking' in b) return '(thinking)';
     if ('Image' in b) return '(image)';
     if ('Audio' in b) return '(audio)';
@@ -71,9 +74,11 @@ function ClippedText({
 function ContentBlockView({
   block,
   kindHint,
+  toolNames,
 }: {
   block: ContentBlock;
   kindHint?: SecretKind;
+  toolNames: Map<string, string>;
 }) {
   // Tool / structured blocks default-collapsed (they're noisy).
   const isStructured =
@@ -99,7 +104,8 @@ function ContentBlockView({
       </pre>
     );
   } else if ('ToolResult' in block) {
-    label = `tool_result (${block.ToolResult.tool_use_id})`;
+    const name = toolNames.get(block.ToolResult.tool_use_id);
+    label = name ? `tool_result ← ${name}` : `tool_result (${block.ToolResult.tool_use_id})`;
     body = (
       <pre className="whitespace-pre-wrap break-words font-mono text-[0.8rem] text-ink bg-gray-50 border-2 border-black rounded-md p-2">
         {renderWithSanitizeChips(block.ToolResult.content, kindHint)}
@@ -157,10 +163,12 @@ function MessageCard({
   message,
   index,
   kindHint,
+  toolNames,
 }: {
   message: ChatMessage;
   index: number;
   kindHint?: SecretKind;
+  toolNames: Map<string, string>;
 }) {
   const meta = ROLE_META[message.role];
   const Icon = meta.icon;
@@ -179,13 +187,13 @@ function MessageCard({
         <Icon className={`text-base ${meta.accent}`} />
         <span className="font-bold uppercase tracking-wider text-[0.75rem]">{meta.label}</span>
         <span className="ml-auto text-ink-soft text-[0.8rem] font-mono truncate max-w-[60%]">
-          {previewLine(message.content)}
+          {previewLine(message.content, toolNames)}
         </span>
       </button>
       {open && (
         <div className="px-3 pb-3 pt-1 space-y-2 border-t border-black/20">
           {message.content.map((c, i) => (
-            <ContentBlockView key={i} block={c} kindHint={kindHint} />
+            <ContentBlockView key={i} block={c} kindHint={kindHint} toolNames={toolNames} />
           ))}
         </div>
       )}
@@ -200,6 +208,18 @@ export function MessageList({
   messages: ChatMessage[];
   kindHint?: SecretKind;
 }) {
+  // Build a lookup so ToolResult blocks can show the tool name they
+  // pair with — the wire only carries `tool_use_id` on results.
+  const toolNames = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const msg of messages) {
+      for (const block of msg.content) {
+        if ('ToolUse' in block) m.set(block.ToolUse.id, block.ToolUse.name);
+      }
+    }
+    return m;
+  }, [messages]);
+
   if (messages.length === 0) {
     return <div className="text-ink-soft text-[0.85rem]">No messages.</div>;
   }
@@ -210,7 +230,7 @@ export function MessageList({
         {messages.length} {messages.length === 1 ? 'message' : 'messages'}
       </div>
       {messages.map((m, i) => (
-        <MessageCard key={i} message={m} index={i} kindHint={kindHint} />
+        <MessageCard key={i} message={m} index={i} kindHint={kindHint} toolNames={toolNames} />
       ))}
     </div>
   );

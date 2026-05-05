@@ -5,7 +5,6 @@ import {
   RiArchiveLine,
   RiBookmark3Line,
   RiBrainLine,
-  RiCloseLine,
   RiCornerDownRightLine,
   RiCpuLine,
   RiLoader4Line,
@@ -233,12 +232,10 @@ function stepSummaryText(step: Step, spans: Span[]): string {
 
 function SpanRow({
   span,
-  llmIndexById,
   selected,
   onSelect,
 }: {
   span: Span;
-  llmIndexById: Map<string, number>; // llm_span_id -> "LLM #N" label
   selected: boolean;
   onSelect: (id: string) => void;
 }) {
@@ -248,7 +245,6 @@ function SpanRow({
 
   let title = '';
   let subtitle = '';
-  let pairingLabel: string | null = null;
   if (span.kind.kind === 'llm_call') {
     title = span.kind.begin.model_id;
     subtitle = span.kind.result
@@ -256,14 +252,17 @@ function SpanRow({
       : 'in flight';
   } else if (span.kind.kind === 'tool_call') {
     title = span.kind.begin.tool_name;
-    subtitle = span.kind.result
-      ? span.kind.result.success
-        ? 'success'
-        : 'failed'
-      : 'in flight';
-    if (span.kind.begin.triggered_by) {
-      const idx = llmIndexById.get(span.kind.begin.triggered_by.llm_span_id);
-      if (idx !== undefined) pairingLabel = `from LLM #${idx + 1}`;
+    if (!span.kind.result) {
+      subtitle = 'in flight';
+    } else if (span.kind.result.success) {
+      subtitle = 'success';
+    } else {
+      // Surface the structured outcome reason when present — the row
+      // is otherwise the only place a glanceable error sits.
+      subtitle =
+        span.outcome.outcome === 'failed' && span.outcome.reason
+          ? `failed: ${span.outcome.reason}`
+          : 'failed';
     }
   } else {
     title = `subagent → ${span.kind.child_session_id}`;
@@ -288,12 +287,6 @@ function SpanRow({
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="font-bold uppercase tracking-wide text-[0.85rem] truncate">{title}</span>
-          {pairingLabel && (
-            <span className="inline-flex items-center gap-1 text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft border border-ink-soft rounded px-1">
-              <RiCornerDownRightLine />
-              {pairingLabel}
-            </span>
-          )}
           {span.parallel_group && (
             <span className="text-[0.7rem] font-bold uppercase tracking-wider text-warn border-2 border-warn rounded px-1">
               ‖ parallel
@@ -330,19 +323,6 @@ function StepBlock({
   const Icon = visual.icon;
   const summary = stepSummaryText(step, spans);
   const ms = durationMs(step);
-
-  // Index LLM spans so tool spans can show "from LLM #N".
-  const llmIndexById = useMemo(() => {
-    const m = new Map<string, number>();
-    let idx = 0;
-    for (const s of spans) {
-      if (s.kind.kind === 'llm_call') {
-        m.set(s.id, idx);
-        idx += 1;
-      }
-    }
-    return m;
-  }, [spans]);
 
   // Sibling spans, sorted by started_at (the wire already does so but
   // be defensive).
@@ -383,7 +363,6 @@ function StepBlock({
           <SpanRow
             key={span.id}
             span={span}
-            llmIndexById={llmIndexById}
             selected={selectedSpanId === span.id}
             onSelect={onSelect}
           />
@@ -474,6 +453,8 @@ function ToolCallDetail({
   if (span.kind.kind !== 'tool_call') return null;
   const { begin, result } = span.kind;
   const hint = SanitizeKindHint(span.events);
+  const failureReason =
+    span.outcome.outcome === 'failed' ? span.outcome.reason : null;
 
   return (
     <div className="space-y-6">
@@ -493,6 +474,17 @@ function ToolCallDetail({
           </button>
         )}
       </section>
+
+      {failureReason && (
+        <section>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-err pb-1 text-err">
+            Failure reason
+          </h4>
+          <div className="font-mono text-[0.85rem] bg-err/5 border-2 border-err rounded-md p-3 whitespace-pre-wrap break-words text-err">
+            {failureReason}
+          </div>
+        </section>
+      )}
 
       <section>
         <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
@@ -685,14 +677,12 @@ function SpanDetailPanel({
   span,
   tab,
   onTabChange,
-  onClose,
   onJumpToLlm,
   onDrillIn,
 }: {
   span: Span;
   tab: 'io' | 'meta' | 'events';
   onTabChange: (t: 'io' | 'meta' | 'events') => void;
-  onClose: () => void;
   onJumpToLlm: (id: string) => void;
   onDrillIn: (id: string) => void;
 }) {
@@ -705,7 +695,7 @@ function SpanDetailPanel({
   return (
     <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
       <div className="flex flex-col border-b-[3px] border-black bg-canvas">
-        <div className="flex items-center justify-between p-4 pb-2">
+        <div className="flex items-center p-4 pb-2">
           <div className="flex items-center gap-3 min-w-0">
             <div
               className={`w-10 h-10 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${visual.bg}`}
@@ -721,9 +711,6 @@ function SpanDetailPanel({
               </div>
             </div>
           </div>
-          <IconButton onClick={onClose} aria-label="Close detail">
-            <RiCloseLine className="text-xl" />
-          </IconButton>
         </div>
         <div className="flex px-4 gap-6 relative top-[3px]">
           {(['io', 'meta', 'events'] as const).map((t) => {
@@ -778,15 +765,60 @@ function jobTokens(job: ReplayJob): { input: number; output: number } {
   return { input, output };
 }
 
+// Derive the user-facing input that kicked off the job: the last user
+// message in the *first* LLM call's input_messages (the chat-history
+// passed in already contains all prior turns; the most recent user
+// message is the prompt for this iteration).
+function jobInputText(job: ReplayJob): string | null {
+  for (const rs of job.steps) {
+    for (const span of rs.spans) {
+      if (span.kind.kind === 'llm_call') {
+        const messages = span.kind.begin.input_messages;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'user') {
+            const parts: string[] = [];
+            for (const block of messages[i].content) {
+              if ('Text' in block) parts.push(block.Text);
+              else if ('ToolResult' in block)
+                parts.push(`[tool_result ${block.ToolResult.tool_use_id}]`);
+              else if ('Image' in block) parts.push(`[image ${block.Image.mime_type}]`);
+              else if ('Audio' in block) parts.push(`[audio ${block.Audio.mime_type}]`);
+              else if ('File' in block) parts.push(`[file ${block.File.filename}]`);
+            }
+            return parts.length > 0 ? parts.join('\n') : null;
+          }
+        }
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+// Derive the final output text of the job: the most recent LLM call's
+// output_content (walking jobs back-to-front).
+function jobOutputText(job: ReplayJob): string | null {
+  for (let i = job.steps.length - 1; i >= 0; i--) {
+    const rs = job.steps[i];
+    for (let j = rs.spans.length - 1; j >= 0; j--) {
+      const span = rs.spans[j];
+      if (span.kind.kind === 'llm_call' && span.kind.result?.output_content) {
+        return span.kind.result.output_content;
+      }
+    }
+  }
+  return null;
+}
+
 function formatTok(n: number): string {
   if (n < 1_000) return n.toString();
   if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}k`;
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
-// ── Job tabs ────────────────────────────────────────────────────────
+// ── Job sidebar (multi-job picker) ─────────────────────────────────
 
-function JobTabs({
+function JobSidebar({
   jobs,
   active,
   onChange,
@@ -797,29 +829,149 @@ function JobTabs({
 }) {
   if (jobs.length <= 1) return null;
   return (
-    <div className="flex gap-2 px-5 pt-2 border-b-[3px] border-black bg-canvas overflow-x-auto">
-      {jobs.map((j, i) => {
-        const isActive = j.job_id === active;
-        const { input, output } = jobTokens(j);
-        return (
-          <button
-            type="button"
-            key={j.job_id}
-            onClick={() => onChange(j.job_id)}
-            className={`px-3 py-2 text-[0.8rem] font-bold uppercase tracking-wider border-2 border-b-0 rounded-t-md cursor-pointer transition-colors whitespace-nowrap shrink-0 ${
-              isActive
-                ? 'border-black bg-white text-ink'
-                : 'border-ink-soft bg-canvas text-ink-soft hover:text-ink'
-            }`}
-          >
-            Job #{i + 1}
-            <span className="ml-2 font-mono text-[0.7rem] opacity-70">{j.job_status_kind}</span>
-            <span className="ml-2 font-mono text-[0.7rem] text-ink-soft">
-              ↓{formatTok(input)} ↑{formatTok(output)}
-            </span>
-          </button>
-        );
-      })}
+    <div className="w-[120px] shrink-0 border-r-[3px] border-black bg-white flex flex-col z-10 overflow-y-auto">
+      <div className="px-2 py-1.5 border-b-2 border-black font-bold uppercase tracking-wider text-[0.65rem] text-ink-soft bg-canvas">
+        Jobs · {jobs.length}
+      </div>
+      <div className="flex flex-col">
+        {jobs.map((j, i) => {
+          const isActive = j.job_id === active;
+          const { input, output } = jobTokens(j);
+          return (
+            <button
+              type="button"
+              key={j.job_id}
+              onClick={() => onChange(j.job_id)}
+              className={`px-2 py-1.5 text-left border-b border-black/20 cursor-pointer transition-colors border-l-[3px] ${
+                isActive
+                  ? 'bg-brand/10 border-l-brand'
+                  : 'bg-white hover:bg-gray-50 border-l-transparent'
+              }`}
+            >
+              <div className="font-bold text-[0.85rem] leading-tight">#{i + 1}</div>
+              <div className="font-mono text-[0.65rem] text-ink-soft mt-0.5 truncate">
+                {j.job_status_kind}
+              </div>
+              <div className="font-mono text-[0.65rem] text-ink-soft mt-0.5">
+                ↓{formatTok(input)} ↑{formatTok(output)}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Right panel default: job-level summary ─────────────────────────
+
+function JobSummaryPanel({
+  job,
+  jobIndex,
+  totalJobs,
+}: {
+  job: ReplayJob | undefined;
+  jobIndex: number;
+  totalJobs: number;
+}) {
+  if (!job) {
+    return (
+      <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
+        <div className="p-5 text-ink-soft italic text-[0.85rem]">No job available.</div>
+      </div>
+    );
+  }
+  const { input, output } = jobTokens(job);
+  const total = input + output;
+  const inputText = jobInputText(job);
+  const outputText = jobOutputText(job);
+  let llmCount = 0;
+  let toolCount = 0;
+  for (const rs of job.steps) {
+    for (const span of rs.spans) {
+      if (span.kind.kind === 'llm_call') llmCount += 1;
+      else if (span.kind.kind === 'tool_call') toolCount += 1;
+    }
+  }
+  const stepCount = job.steps.length;
+
+  return (
+    <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
+      <div className="border-b-[3px] border-black bg-canvas p-4">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-10 h-10 rounded-full border-2 border-black flex items-center justify-center shrink-0 bg-brand/10">
+            <RiCpuLine className="text-brand text-xl" />
+          </div>
+          <div className="min-w-0">
+            <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">
+              {totalJobs > 1 ? `Job #${jobIndex + 1}` : 'Job Overview'}
+            </h3>
+            <div className="text-ink-soft text-[0.8rem] font-mono truncate">
+              {job.job_status_kind} • {stepCount} {stepCount === 1 ? 'step' : 'steps'}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-scroll p-5 space-y-6">
+        <section>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
+            Input
+          </h4>
+          {inputText ? (
+            <pre className="whitespace-pre-wrap break-words font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
+              {inputText}
+            </pre>
+          ) : (
+            <div className="text-ink-soft text-[0.8rem] italic">No user input recorded.</div>
+          )}
+        </section>
+
+        <section>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
+            Output
+          </h4>
+          {outputText ? (
+            <pre className="whitespace-pre-wrap break-words font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
+              {outputText}
+            </pre>
+          ) : (
+            <div className="text-ink-soft text-[0.8rem] italic">
+              {job.job_status_kind === 'completed' ? 'No output text.' : 'Awaiting final output…'}
+            </div>
+          )}
+        </section>
+
+        <section>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
+            Activity
+          </h4>
+          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 font-mono text-[0.85rem]">
+            <dt className="font-bold text-ink-soft">Job ID</dt>
+            <dd className="break-all">
+              <code>{job.job_id}</code>
+            </dd>
+            <dt className="font-bold text-ink-soft">Status</dt>
+            <dd>{job.job_status_kind}</dd>
+            <dt className="font-bold text-ink-soft">Steps</dt>
+            <dd>{stepCount}</dd>
+            <dt className="font-bold text-ink-soft">LLM calls</dt>
+            <dd>{llmCount}</dd>
+            <dt className="font-bold text-ink-soft">Tool calls</dt>
+            <dd>{toolCount}</dd>
+            <dt className="font-bold text-ink-soft">Input tokens</dt>
+            <dd>{input.toLocaleString()}</dd>
+            <dt className="font-bold text-ink-soft">Output tokens</dt>
+            <dd>{output.toLocaleString()}</dd>
+            <dt className="font-bold text-ink-soft">Total tokens</dt>
+            <dd className="text-brand font-bold">{total.toLocaleString()}</dd>
+          </dl>
+        </section>
+
+        <section className="text-[0.8rem] text-ink-soft italic">
+          Select a span on the left to inspect its inputs, outputs, and metadata.
+        </section>
+      </div>
     </div>
   );
 }
@@ -978,10 +1130,6 @@ export function TraceSessionPage() {
     [tabParam, updateUrl],
   );
 
-  const handleCloseDetail = useCallback(() => {
-    updateUrl({ span: null });
-  }, [updateUrl]);
-
   const handleJumpToLlm = useCallback(
     (llmSpanId: string) => {
       updateUrl({ span: llmSpanId });
@@ -1084,13 +1232,13 @@ export function TraceSessionPage() {
         </Button>
       </div>
 
-      <JobTabs
-        jobs={replay.jobs}
-        active={activeJobId}
-        onChange={(j) => updateUrl({ job: j })}
-      />
-
       <div className="flex-1 flex overflow-hidden min-h-0">
+        <JobSidebar
+          jobs={replay.jobs}
+          active={activeJobId}
+          onChange={(j) => updateUrl({ job: j, span: null })}
+        />
+
         <div className="flex-1 overflow-y-scroll p-5">
           <div className="max-w-4xl mx-auto space-y-4 pb-10">
             {activeJob?.steps.map((rs) => (
@@ -1104,14 +1252,19 @@ export function TraceSessionPage() {
           </div>
         </div>
 
-        {selectedSpan && (
+        {selectedSpan ? (
           <SpanDetailPanel
             span={selectedSpan}
             tab={tabParam}
             onTabChange={(t) => updateUrl({ tab: t })}
-            onClose={handleCloseDetail}
             onJumpToLlm={handleJumpToLlm}
             onDrillIn={handleDrillIntoChild}
+          />
+        ) : (
+          <JobSummaryPanel
+            job={activeJob}
+            jobIndex={activeJob ? replay.jobs.indexOf(activeJob) : 0}
+            totalJobs={replay.jobs.length}
           />
         )}
       </div>
