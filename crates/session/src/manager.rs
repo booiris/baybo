@@ -52,6 +52,7 @@ impl SessionManager {
             SessionId::from(uuid::Uuid::new_v4().to_string()),
             user,
             channel,
+            TriggerSource::User,
         )
         .await
     }
@@ -103,6 +104,7 @@ impl SessionManager {
         id: SessionId,
         user: User,
         channel: ChannelType,
+        trigger: TriggerSource,
     ) -> Result<Session> {
         let now = Utc::now();
         let session = Session {
@@ -114,7 +116,7 @@ impl SessionManager {
             last_active: now,
             state: SessionState::default(),
             root_session_id: id,
-            trigger: TriggerSource::User,
+            trigger,
             lineage: None,
             bound_soul_version: self.default_soul_version.clone(),
         };
@@ -129,20 +131,36 @@ impl SessionManager {
         user: User,
         channel: ChannelType,
     ) -> Result<Session> {
+        self.get_or_create_with_trigger(session_id, user, channel, TriggerSource::User)
+            .await
+    }
+
+    /// Like `get_or_create` but stamps a specific `TriggerSource` on
+    /// freshly-created sessions. The cron router uses this so that
+    /// `Job::start_job` lets `JobKind::Cron` jobs through the
+    /// `session.trigger.kind() == job.kind()` invariant. Existing
+    /// sessions are returned as-is — the trigger is locked at creation.
+    pub async fn get_or_create_with_trigger(
+        &self,
+        session_id: &SessionId,
+        user: User,
+        channel: ChannelType,
+        trigger: TriggerSource,
+    ) -> Result<Session> {
         if let Some(session) = self.store.get(session_id).await.map_err(wrap)? {
             let cutoff = Utc::now() - self.session_timeout;
             if session.last_active < cutoff {
                 debug!(session_id = %session_id, "session expired, replacing with new session");
                 self.store.delete(session_id).await.map_err(wrap)?;
                 return self
-                    .create_session_with_id(session_id.clone(), user, channel)
+                    .create_session_with_id(session_id.clone(), user, channel, trigger)
                     .await;
             }
             debug!(session_id = %session_id, "returning existing session");
             return Ok(session);
         }
         debug!(session_id = %session_id, "session not found, creating new session");
-        self.create_session_with_id(session_id.clone(), user, channel)
+        self.create_session_with_id(session_id.clone(), user, channel, trigger)
             .await
     }
 

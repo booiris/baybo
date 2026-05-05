@@ -442,6 +442,7 @@ impl From<aura_job::Job> for Job {
 pub enum CronStatus {
     Enabled,
     Disabled,
+    Executed,
 }
 
 impl From<aura_cron::CronStatus> for CronStatus {
@@ -449,6 +450,7 @@ impl From<aura_cron::CronStatus> for CronStatus {
         match v {
             aura_cron::CronStatus::Enabled => Self::Enabled,
             aura_cron::CronStatus::Disabled => Self::Disabled,
+            aura_cron::CronStatus::Executed => Self::Executed,
         }
     }
 }

@@ -3,11 +3,31 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Lifecycle state of a cron job row.
+///
+/// `Executed` is reserved for one-shot (`At`) jobs after their single
+/// fire — the row is kept (not deleted) so callers and the web UI can
+/// see "this fired" history. Recurring (`Cron`) jobs cycle between
+/// `Enabled` and `Disabled` and never enter `Executed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CronStatus {
     Enabled,
     Disabled,
+    Executed,
+}
+
+impl CronStatus {
+    /// Stable wire string. Mirrors `serde(rename_all = "snake_case")` so
+    /// the storage row, CLI labels, and tool output stay in lockstep
+    /// without three independent match ladders that can drift.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CronStatus::Enabled => "enabled",
+            CronStatus::Disabled => "disabled",
+            CronStatus::Executed => "executed",
+        }
+    }
 }
 
 /// When a cron job fires.
@@ -243,6 +263,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CronStatus::Disabled).unwrap(),
             "\"disabled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CronStatus::Executed).unwrap(),
+            "\"executed\""
         );
     }
 

@@ -1914,7 +1914,8 @@
         "description": "Mirror of [`aura_cron::CronStatus`].",
         "enum": [
           "enabled",
-          "disabled"
+          "disabled",
+          "executed"
         ]
       },
       "ErrorBody": {

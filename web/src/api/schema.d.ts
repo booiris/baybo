@@ -407,7 +407,7 @@ export interface components {
          * @description Mirror of [`aura_cron::CronStatus`].
          * @enum {string}
          */
-        CronStatus: "enabled" | "disabled";
+        CronStatus: "enabled" | "disabled" | "executed";
         /**
          * @description Uniform error envelope for every non-2xx admin response.
          *

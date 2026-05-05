@@ -31,14 +31,10 @@ type Result<T> = std::result::Result<T, CronError>;
 fn job_to_row(job: &CronJob) -> Result<CronJobRow> {
     let data = serde_json::to_string(job)
         .map_err(|e| CronError::Storage(format!("failed to serialize cron job: {e}")))?;
-    let status_str = match job.status {
-        CronStatus::Enabled => "enabled",
-        CronStatus::Disabled => "disabled",
-    };
     Ok(CronJobRow {
         id: job.id.clone(),
         user_id: job.user_id.clone(),
-        status: status_str.to_string(),
+        status: job.status.as_str().to_string(),
         next_trigger_at: job
             .next_trigger_at
             .map(|t| t.timestamp_micros())
@@ -175,6 +171,28 @@ impl CronScheduler {
         Ok(())
     }
 
+    /// Transition a one-shot job to `Executed` and persist. Shared between
+    /// `trigger_now` and the tick loop so manual vs. scheduled firing
+    /// produce identical lifecycle effects. Failures are logged but not
+    /// propagated — the trigger event has already been dispatched, so
+    /// the row state is best-effort cleanup.
+    async fn mark_one_shot_executed(&self, job: &mut CronJob, now: DateTime<Utc>) {
+        job.status = CronStatus::Executed;
+        job.next_trigger_at = None;
+        job.last_triggered_at = Some(now);
+        job.updated_at = now;
+        let row = match job_to_row(job) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(job_id = %job.id, error = %e, "failed to serialize one-shot cron job after fire");
+                return;
+            }
+        };
+        if let Err(e) = self.store.save(&row).await {
+            error!(job_id = %job.id, error = %e, "failed to mark one-shot cron job as executed");
+        }
+    }
+
     /// Enable a cron job, recomputing the next trigger time. Returns an error
     /// if the job is an `At` schedule whose time has already passed — there
     /// is no future fire time to enable.
@@ -266,8 +284,10 @@ impl CronScheduler {
     /// Records an execution row (so the run is auditable) and dispatches the
     /// trigger event. Recurring (`Cron`) jobs keep their existing
     /// `next_trigger_at` — the normal schedule continues independently.
-    /// One-shot (`At`) jobs are evicted after dispatch, matching the tick
-    /// path so manual vs scheduled firing have identical lifecycle effects.
+    /// One-shot (`At`) jobs transition to `CronStatus::Executed` after
+    /// dispatch (the row is preserved for history; the `enabled` filter
+    /// in `list_due` keeps it from re-firing), matching the tick path so
+    /// manual vs scheduled firing have identical lifecycle effects.
     pub async fn trigger_now(&self, job_id: &str) -> Result<CronExecution> {
         let row = self
             .store
@@ -275,7 +295,7 @@ impl CronScheduler {
             .await
             .map_err(store_err)?
             .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
-        let job = row_to_job(row)?;
+        let mut job = row_to_job(row)?;
 
         let now = Utc::now();
         let execution = CronExecution {
@@ -316,10 +336,8 @@ impl CronScheduler {
             .map_err(store_err)?;
 
         if job.is_one_shot() {
-            info!(job_id = %job.id, "evicting one-shot cron job after manual trigger");
-            if let Err(e) = self.store.delete(&job.id).await {
-                error!(job_id = %job.id, error = %e, "failed to evict one-shot cron job after manual trigger");
-            }
+            info!(job_id = %job.id, "marking one-shot cron job as executed after manual trigger");
+            self.mark_one_shot_executed(&mut job, now).await;
         }
 
         let mut updated = execution;
@@ -495,10 +513,8 @@ impl CronScheduler {
 
             // Phase 2: Advance job schedule (before dispatch, so crash won't re-fire)
             if job.is_one_shot() {
-                info!(job_id = %job.id, "evicting one-shot cron job after execution");
-                if let Err(e) = self.store.delete(&job.id).await {
-                    error!(job_id = %job.id, error = %e, "failed to evict one-shot cron job");
-                }
+                info!(job_id = %job.id, "marking one-shot cron job as executed");
+                self.mark_one_shot_executed(&mut job, now).await;
             } else {
                 job.last_triggered_at = Some(now);
                 job.next_trigger_at = compute_next_trigger(&job.schedule, now);
@@ -954,7 +970,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn at_job_evicted_after_firing() {
+    async fn at_job_marked_executed_after_firing() {
         let store = InMemoryCronStore::new();
         let (scheduler, mut rx) = make_scheduler(store);
 
@@ -987,8 +1003,12 @@ mod tests {
         let event = rx.try_recv().unwrap();
         assert_eq!(event.job_id, job_id);
 
-        // Job was evicted
-        assert!(scheduler.store.get(&job_id).await.unwrap().is_none());
+        // Row preserved with Executed status — `list_due` filter on
+        // `status = 'enabled'` keeps it from re-firing.
+        let fetched = scheduler.get_job(&job_id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, CronStatus::Executed);
+        assert!(fetched.next_trigger_at.is_none());
+        assert!(fetched.last_triggered_at.is_some());
 
         // Execution record preserved
         let execs = scheduler.list_executions(&job_id).await.unwrap();
@@ -1168,7 +1188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trigger_now_evicts_at_job() {
+    async fn trigger_now_marks_at_job_executed() {
         let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
         let fire_at = Utc::now() + chrono::Duration::minutes(5);
         let job = scheduler
@@ -1188,8 +1208,11 @@ mod tests {
         assert_eq!(exec.status, ExecutionStatus::Dispatched);
         assert!(rx.try_recv().is_ok());
 
-        // Job gone, execution preserved.
-        assert!(scheduler.get_job(&job.id).await.unwrap().is_none());
+        // Row preserved with Executed status; execution kept.
+        let fetched = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, CronStatus::Executed);
+        assert!(fetched.next_trigger_at.is_none());
+        assert!(fetched.last_triggered_at.is_some());
         let execs = scheduler.list_executions(&job.id).await.unwrap();
         assert_eq!(execs.len(), 1);
     }

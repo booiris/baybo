@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aura_channels::{AgentOutput, Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
-use aura_model::{Session, SessionId, User};
+use aura_model::{Session, SessionId, TriggerSource, User};
 
 use aura_cron::CronTriggerEvent;
 
@@ -218,7 +218,14 @@ impl Router {
         let typed_session_id = SessionId::from(session_id.as_str());
         let session = self
             .session_manager
-            .get_or_create(&typed_session_id, user, event.channel.clone())
+            .get_or_create_with_trigger(
+                &typed_session_id,
+                user,
+                event.channel.clone(),
+                TriggerSource::Cron {
+                    cron_job_id: event.job_id.clone(),
+                },
+            )
             .await?;
 
         self.session_manager.touch(&typed_session_id).await?;

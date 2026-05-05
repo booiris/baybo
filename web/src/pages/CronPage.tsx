@@ -29,6 +29,12 @@ const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
 const thCell =
   'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black sticky top-0 z-10 bg-white';
 
+const STATUS_BADGE_STYLE: Record<CronStatus, string> = {
+  enabled: 'bg-ok text-white',
+  disabled: 'bg-gray-200 text-ink-soft',
+  executed: 'bg-brand text-white',
+};
+
 function formatTimestamp(iso: string | null | undefined): string {
   if (!iso) return '-';
   const d = new Date(iso);
@@ -209,18 +215,13 @@ export function CronPage() {
     setSearchParams(newParams);
   };
 
-  const statusBadge = (status: components['schemas']['CronStatus']) => {
-    const isEnabled = status === 'enabled';
-    return (
-      <span
-        className={`inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${
-          isEnabled ? 'bg-ok text-white' : 'bg-gray-200 text-ink-soft'
-        }`}
-      >
-        <span>{status}</span>
-      </span>
-    );
-  };
+  const statusBadge = (status: CronStatus) => (
+    <span
+      className={`inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${STATUS_BADGE_STYLE[status]}`}
+    >
+      <span>{status}</span>
+    </span>
+  );
 
   const scheduleDisplay = (schedule: components['schemas']['CronSchedule']) => {
     if (schedule.kind === 'cron') {
@@ -294,6 +295,7 @@ export function CronPage() {
           <option value="all">All Status</option>
           <option value="enabled">Enabled</option>
           <option value="disabled">Disabled</option>
+          <option value="executed">Executed</option>
         </SelectBox>
 
         <SelectBox

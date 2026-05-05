@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{CronSchedule, CronScheduler, CronStatus, TriggerAction};
+use crate::{CronSchedule, CronScheduler, TriggerAction};
 
 /// Build every cron tool with its manifest, ready to be registered with a
 /// `ToolRegistry`. Always `Trusted` with no capabilities — they operate on
@@ -261,10 +261,7 @@ impl Tool for CronListTool {
                     "channel": format!("{}", j.channel),
                     "schedule": j.schedule.display(),
                     "one_shot": j.is_one_shot(),
-                    "status": match j.status {
-                        CronStatus::Enabled => "enabled",
-                        CronStatus::Disabled => "disabled",
-                    },
+                    "status": j.status.as_str(),
                     "next_trigger_at": j.next_trigger_at.map(|t| t.to_rfc3339()),
                 })
             })
