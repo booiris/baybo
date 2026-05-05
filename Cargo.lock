@@ -648,12 +648,20 @@ dependencies = [
 name = "aura-skills"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aura-model",
+ "aura-tools",
  "dashmap",
  "parking_lot",
  "regex",
  "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

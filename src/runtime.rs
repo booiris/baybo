@@ -312,6 +312,32 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
+    // --- Skill tool — registered with the risk assessor as the
+    // gate. Lives in aura-skills (parallel to aura-cron::tools)
+    // because it needs the registry + assessor; both are constructed
+    // above. Always registered: when the registry is empty the
+    // per-turn system reminder is suppressed and the LLM never tries
+    // the call.
+    {
+        let risk_check: Arc<dyn aura_skills::SkillRiskCheck> = Arc::clone(&skill_assessor) as _;
+        let (tool, manifest) =
+            aura_skills::build_skill_tool(Arc::clone(&skill_registry), Arc::clone(&risk_check));
+        tool_registry.register(tool, manifest);
+
+        let (install_tool, install_manifest) = aura_skills::tools::build_install_tool(
+            workspace_paths.skills_dir(),
+            Arc::clone(&skill_registry),
+            risk_check,
+        );
+        tool_registry.register(install_tool, install_manifest);
+
+        let (uninstall_tool, uninstall_manifest) = aura_skills::tools::build_uninstall_tool(
+            workspace_paths.skills_dir(),
+            Arc::clone(&skill_registry),
+        );
+        tool_registry.register(uninstall_tool, uninstall_manifest);
+    }
+
     // --- security gateway + tool executor
     let tool_spill_dir =
         aura_workspace::WorkspacePaths::new(workspace_root.clone()).tool_spills_dir();

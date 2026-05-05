@@ -70,6 +70,36 @@ pub struct ToolContext {
     /// this handle. `None` means the executor did not wire one in;
     /// callers must fail-closed.
     pub approval: Option<ApprovalHandle>,
+    /// Side-channel to surface non-fatal verdicts (warnings, blocks)
+    /// to the user channel without going through the LLM-visible tool
+    /// result. Today only the `Skill` tool emits notices (when the
+    /// risk assessor returns `Suspicious` or `Dangerous`); other tools
+    /// leave this `None`.
+    pub notifier: Option<Arc<dyn SessionNotifier>>,
+}
+
+/// Severity of a [`SessionNotifier`] event. Matches
+/// `aura_channels::NoticeLevel` exactly — the agent-loop bridge does
+/// a one-to-one variant mapping when it forwards onto
+/// `AgentOutput::Notice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Warn,
+    Error,
+}
+
+/// Side-channel emitter for tool-side notices. Sync, fire-and-forget —
+/// tools should not `await` notice delivery.
+pub trait SessionNotifier: Send + Sync {
+    fn emit(&self, level: NoticeLevel, summary: &str, detail: &str);
+}
+
+/// No-op notifier for tests and for call sites that don't have a
+/// channel-attached notifier wired in.
+pub struct NoopNotifier;
+
+impl SessionNotifier for NoopNotifier {
+    fn emit(&self, _level: NoticeLevel, _summary: &str, _detail: &str) {}
 }
 
 /// Mid-execution approval entry point handed to a tool through

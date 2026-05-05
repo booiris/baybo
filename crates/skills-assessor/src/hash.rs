@@ -48,14 +48,7 @@ const PRIMARY_SCOPE_TAG: &[u8] = b"aura.skill.primary:v1\n";
 /// The entrypoint file inspected by the primary-scope hash.
 pub(crate) const PRIMARY_FILE: &str = "SKILL.md";
 
-/// Directory-level hard-reject thresholds. Any skill directory whose
-/// file count or aggregate byte size exceeds these caps is refused
-/// outright — a legitimate skill is a prompt plus a handful of helper
-/// files, so a tree bigger than this is either a misconfiguration or
-/// an attempt to DoS the hash/LLM pipeline with garbage. Enforced by
-/// [`hash_skill_dir`] before any hashing work starts.
-const MAX_TOTAL_FILES: usize = 500;
-const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+use aura_skills::{MAX_SKILL_DIR_BYTES as MAX_TOTAL_BYTES, MAX_SKILL_DIR_FILES as MAX_TOTAL_FILES};
 
 /// Tiered-assessment thresholds under `Full` mode. A skill directory at
 /// or below both caps is small enough to classify synchronously; above

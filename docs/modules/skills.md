@@ -86,21 +86,41 @@ The `/<name>` entry point is surfaced on channel adapters by `aura-cli`'s `CliSl
 
 ### Selection pipeline
 
-Selection runs in `registry.rs` as a pure function — no LLM is consulted and no prompt body is read, so an already-loaded skill cannot bias which skill loads next.
+Skills are no longer auto-injected at user-turn start. Instead the
+agent loop publishes a per-turn **system reminder** listing every
+agent-invocable, non-`Untrusted` skill (name, description, optional
+`argument-hint`); the LLM pulls one in by calling the `Skill` tool
+(see [`tools.md`](./tools.md#skill-tool)). The list comes from
+`SkillRegistry::all_summaries_sorted()` — a lightweight projection
+(`SkillSummary`) carrying only the fields needed for the listing.
+Cloning every `SkillDefinition`'s `prompt_template` / `allowed_tools`
+/ `requirements` per turn would burn allocator pressure proportional
+to skill count × body size; the projection avoids that. Filtered to
+`agent_invocable && trust_level != Untrusted`, sorted by name for
+stable across-turn ordering. When the registry is empty,
+`SkillRegistry::is_empty()` short-circuits before the projection
+runs at all.
 
-`SkillRegistry::select` has two cases:
+Slash invocations short-circuit through the same code path: when the
+user types `/<cmd> [args]`, the agent loop synthesizes a deterministic
+iteration-0 `Skill` tool call (`{skill: <name>, args: <rest>}`) before
+the first LLM call. The tool runs through `ToolExecutor::execute`
+exactly like an LLM-invoked call, so risk assessment, env-var
+approval, and trace provenance all flow through one path.
 
-| Message shape                                | Returned |
-|----------------------------------------------|----------|
-| Trimmed message equals `/<cmd>` exactly      | Just that skill. An explicit slash invocation narrows the context to the one skill the user asked for. |
-| Anything else (including `/<cmd> <args>`)    | Every registered skill. The downstream risk assessor filters, and the model decides which description is relevant. |
+`SkillRegistry::select` is retained for `aura skills check` /
+operator inspection and still has the same two cases (slash narrows
+to one; anything else returns the full set), but it is no longer
+consulted by `AgentLoop` to decide what gets injected — only to
+populate the per-turn list. `score` on every returned
+`SkillCandidate` is `1.0`; the field is kept on the struct for future
+ranking work.
 
-`score` on every returned `SkillCandidate` is `1.0` — the field is kept on the struct for future ranking work but is currently unused. Heuristic ranking (mention scanning, description matching, agent-invocable fallback tiers) was removed because ranking by regex either over-fires or lags authors, both of which eat trust; the LLM does better on intent matching than any rule we ship.
+Downstream gating happens lazily, on call:
 
-Downstream gating still happens, just not here:
-
-- `AgentLoop` runs every candidate through `SkillAssessor`; `Dangerous` verdicts drop the skill.
-- `SkillRegistry::validate_all` reports unmet `required_bins` / `required_env`; callers that care (e.g. `aura skills check`) act on that report.
+- The `Skill` tool runs the assessor (via `Arc<dyn SkillRiskCheck>`) before returning the body. `Dangerous` aborts with `ToolError::Denied`; `Suspicious` continues but adds a `risk_warning` field to the response and emits a notice (when a `SessionNotifier` is wired).
+- The tool also enforces `SkillRequirements::required_env`: missing host env vars short-circuit the call with `ToolError::Execution` *before* prompting the user. If every required var is present, an approval gate fires (`ResourceAccess::Env { vars }`); the env *values* are never templated into the response.
+- `SkillRegistry::validate_all` still reports unmet `required_bins` / `required_env`; callers that care (e.g. `aura skills check`) act on that report.
 - Trust-level attenuation of the tool ceiling is a design stage not yet wired in.
 
 ### Risk assessment
@@ -148,10 +168,10 @@ The hash is a **metadata fingerprint**, not a content hash — see [skills-asses
 
 **Non-blocking error policy**: only `Dangerous` blocks execution. Assessor errors (LLM unreachable, unparseable reply, I/O failure), skills without an on-disk `source_path` (e.g. test fixtures), and the `Suspicious` tier all pass through with a `warn!` log. Availability is preferred over false-positive blocks; the verdict is still surfaced in `aura skills check` output so a human can review.
 
-**Integration points** (both lazy — no work until the skill is actually reached):
+**Integration points** (both lazy — no work until the skill is actually invoked):
 
 - **CLI `aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. Output includes `risk: {status, scope, background_pending, level, rationale, model, content_hash, assessed_at}`.
-- **`AgentLoop` skill injection** — `assess_skill_risk` returns a `SkillGate` (`Pass` / `PassWithWarning { rationale }` / `Block { rationale }`) per candidate. `Block` drops the skill and emits `AgentOutput::Notice { level: Error }`; `PassWithWarning` keeps the skill and emits `Notice { level: Warn }`; `Pass` injects silently. There is no longer a silent-drop band: either the user invoked the skill via `/<cmd>` or every registered skill is in play, and in both cases a non-Safe verdict is worth surfacing.
+- **`Skill` tool** — `SkillRiskCheck::assess` returns a `SkillGate` (`Pass` / `PassWithWarning { rationale }` / `Block { rationale }`). `Block` aborts the call with `ToolError::Denied`; `PassWithWarning` returns the body with the rationale embedded as a `risk_warning` JSON field (and emits `Notice { level: Warn }` if a `SessionNotifier` is wired); `Pass` returns silently. Risk is checked once per call, not once per turn — the LLM only pays for assessment of the skill it actually invoked.
 
 The assessor is wired in `main.rs` alongside the other shared services using `with_background_worker(llm, store, mode)` where `mode` is read from `config.skills.risk_check`; `recover_pending_jobs` runs once after the skill registry is populated and drains persisted rows regardless of mode — `Off` only suppresses new enqueues. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
 
@@ -186,7 +206,7 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 | Module | Role |
 |--------|------|
 | `agent` | `AgentLoop` calls `SkillRegistry.select()` and executes skills |
-| `tools` | Skills declare allowed tool sets but don't execute tools directly |
+| `tools` | Skills declare allowed tool sets but don't execute tools directly. The `Skill` builtin (registered from `aura-skills::tools`, parallel to `aura-cron::tools`) is the LLM's single entry point for invoking them. |
 | `registry` | Supplies source, version, and hash metadata for installed skills |
 | `trace` | Records skill version, source, and execution results |
 | `workspace` | Provides trusted local skill directories for hot reload |

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, NoticeLevel, OutgoingMessage};
+use aura_channels::{AgentOutput, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobOutput};
 use aura_llm::{
@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
 use aura_model::Session;
-use aura_skills::SkillRegistry;
-use aura_skills_assessor::{RiskLevel, SkillAssessor};
+use aura_skills::{SkillRegistry, SkillSummary};
+use aura_skills_assessor::SkillAssessor;
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, StepHandle, StepKind,
@@ -99,14 +99,36 @@ fn push_bounded<I: IntoIterator<Item = ContentBlock>>(dst: &mut Vec<ContentBlock
     }
 }
 
-/// Outcome of the skill risk assessor for a single candidate. `run()`
-/// dispatches on this — `Block` drops the skill with an error notice,
-/// `PassWithWarning` keeps it with a warning notice, and `Pass` is
-/// silent.
-enum SkillGate {
-    Pass,
-    PassWithWarning { rationale: String },
-    Block { rationale: String },
+/// `try_send` drops on a full channel: notices are non-load-bearing
+/// (the verdict still lands in the trace) and `SessionNotifier::emit`
+/// is sync, so blocking the tool path on backpressure would be worse
+/// than losing the line.
+struct DeltaTxNotifier {
+    tx: tokio::sync::mpsc::Sender<AgentOutput>,
+    session_id: String,
+    user_id: String,
+    channel: aura_model::ChannelType,
+}
+
+impl aura_tools::SessionNotifier for DeltaTxNotifier {
+    fn emit(&self, level: aura_tools::NoticeLevel, summary: &str, detail: &str) {
+        let level = match level {
+            aura_tools::NoticeLevel::Warn => aura_channels::NoticeLevel::Warn,
+            aura_tools::NoticeLevel::Error => aura_channels::NoticeLevel::Error,
+        };
+        let text = if detail.is_empty() {
+            summary.to_string()
+        } else {
+            format!("{summary}: {detail}")
+        };
+        let _ = self.tx.try_send(AgentOutput::Notice {
+            session_id: self.session_id.clone(),
+            user_id: self.user_id.clone(),
+            channel: self.channel.clone(),
+            level,
+            text,
+        });
+    }
 }
 
 /// What one `LlmIteration` step's body produced. The terminal-vs-loop
@@ -292,6 +314,18 @@ impl AgentLoop {
         let _ = job_lifecycle;
         self.ensure_system_prompt(session).await;
 
+        // Bound to the *outer* delta_tx, not iter_delta_tx — notices
+        // need to reach the channel on iter-2+ where streaming is
+        // suppressed.
+        let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
+            Arc::new(DeltaTxNotifier {
+                tx: tx.clone(),
+                session_id: session.id.to_string(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+            }) as Arc<dyn aura_tools::SessionNotifier>
+        });
+
         // Recall relevant memories
         let memories = self
             .memory_manager
@@ -320,61 +354,102 @@ impl AgentLoop {
         };
         self.append_context_message(session, &user_msg).await?;
 
-        // Skill selection: `SkillRegistry::select` returns exactly the
-        // one skill invoked by `/<cmd>`, or the full registered set
-        // otherwise. We inject every returned candidate after the risk
-        // assessor clears it — narrowing already happened upstream.
-        //
-        // Risk gating: `Dangerous` drops the skill with an error
-        // notice, `Suspicious` keeps it with a warn notice. Slash
-        // invocations were explicit, and the full-set fall-through is
-        // also a user-visible action (they opened the chat with this
-        // registry loaded), so in both cases a non-Safe verdict is
-        // surfaced via `AgentOutput::Notice` rather than hidden.
         let user_text = aura_llm::multimodal::extract_text(&user_content);
-        let skill_candidates = self.skill_registry.select(&user_text);
+        let skills_for_turn = if self.skill_registry.is_empty() {
+            Vec::new()
+        } else {
+            self.invocable_skills()
+        };
 
-        let mut active_skills: Vec<aura_skills::SkillDefinition> = Vec::new();
-        for candidate in skill_candidates.into_iter() {
-            match self.assess_skill_risk(&candidate.skill).await {
-                SkillGate::Pass => active_skills.push(candidate.skill),
-                SkillGate::PassWithWarning { rationale } => {
-                    self.emit_skill_notice(
-                        session,
-                        NoticeLevel::Warn,
-                        &candidate.skill.name,
-                        "rated suspicious",
-                        &rationale,
-                        delta_tx.as_ref(),
-                    )
-                    .await;
-                    active_skills.push(candidate.skill);
-                }
-                SkillGate::Block { rationale } => {
-                    self.emit_skill_notice(
-                        session,
-                        NoticeLevel::Error,
-                        &candidate.skill.name,
-                        "blocked",
-                        &rationale,
-                        delta_tx.as_ref(),
-                    )
-                    .await;
-                }
-            }
-        }
-
-        for skill in &active_skills {
-            let skill_msg = ChatMessage {
+        if let Some(reminder) = build_skill_reminder(&skills_for_turn) {
+            let reminder_msg = ChatMessage {
                 role: Role::System,
-                content: vec![ContentBlock::Text(aura_skills::render::render_skill_block(
-                    skill,
-                ))],
+                content: vec![ContentBlock::Text(reminder)],
             };
-            self.push_session_message(session, skill_msg).await;
+            self.append_context_message(session, &reminder_msg).await?;
         }
 
-        session.state.active_skills = active_skills.iter().map(|s| s.name.clone()).collect();
+        session.state.active_skills = skills_for_turn.iter().map(|s| s.name.clone()).collect();
+
+        if let Some((skill_name, args)) = detect_slash_invocation(&user_text, &skills_for_turn) {
+            let synthesized_id = format!("synthskill-{}", uuid::Uuid::new_v4());
+            let mut input = serde_json::json!({ "skill": skill_name });
+            if !args.is_empty() {
+                input["args"] = serde_json::Value::String(args);
+            }
+            let tool_use_block = ContentBlock::ToolUse {
+                id: synthesized_id.clone(),
+                name: "Skill".to_string(),
+                input: input.clone(),
+                signature: None,
+            };
+            let assistant_msg = ChatMessage {
+                role: Role::Assistant,
+                content: vec![tool_use_block],
+            };
+            self.append_context_message(session, &assistant_msg).await?;
+
+            let approved = std::sync::Arc::new(parking_lot::Mutex::new(
+                session.state.approved_resources.clone(),
+            ));
+
+            let executor_clone = Arc::clone(&self.tool_executor);
+            let span_recorder_clone = Arc::clone(span_recorder);
+            let session_id_clone = session.id.clone();
+            let user_clone = session.user.clone();
+            let approved_clone = Arc::clone(&approved);
+            let synth_id_clone = synthesized_id.clone();
+            let input_clone = input.clone();
+            let cancel_token_clone = cancel_token.clone();
+            let notifier_clone = notifier.clone();
+
+            let result_text = crate::scope::with_step(
+                span_recorder.as_ref(),
+                job_id,
+                StepKind::LlmIteration,
+                Some((&cancel_token, aura_job::CancelReason::ParentCancelled)),
+                move |step| async move {
+                    let res = executor_clone
+                        .execute(
+                            "Skill",
+                            input_clone,
+                            &session_id_clone,
+                            &user_clone,
+                            &approved_clone,
+                            &span_recorder_clone,
+                            &step,
+                            None,
+                            synth_id_clone,
+                            None,
+                            Some(job_id),
+                            cancel_token_clone.child_token(),
+                            notifier_clone,
+                        )
+                        .await;
+                    let text = match res {
+                        Ok(ToolOutput::Text(s)) => s,
+                        Ok(ToolOutput::Json(v)) => v.to_string(),
+                        Ok(ToolOutput::WithAttachments { text, .. })
+                        | Ok(ToolOutput::MultiModalText { text, .. }) => text,
+                        Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
+                        Err(e) => format!("Error: {e}"),
+                    };
+                    Ok((LifecycleOutcome::Ok, text))
+                },
+            )
+            .await?;
+
+            session.state.approved_resources = approved.lock().clone();
+
+            let tool_msg = ChatMessage {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: synthesized_id,
+                    content: result_text,
+                }],
+            };
+            self.append_context_message(session, &tool_msg).await?;
+        }
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -430,6 +505,7 @@ impl AgentLoop {
                         job_id,
                         iterations,
                         iter_delta_tx,
+                        notifier.clone(),
                         &cancel_token,
                         &mut accumulated_tool_uses,
                         &mut accumulated_attachments,
@@ -515,6 +591,7 @@ impl AgentLoop {
         job_id: JobId,
         iterations: usize,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
         accumulated_tool_uses: &mut Vec<ContentBlock>,
         accumulated_attachments: &mut Vec<ContentBlock>,
@@ -647,6 +724,7 @@ impl AgentLoop {
                     None,
                     Some(job_id),
                     cancel_token.child_token(),
+                    notifier.clone(),
                 )
                 .await;
 
@@ -973,11 +1051,6 @@ impl AgentLoop {
         self.context_manager.append(session, message).await?;
         self.write_session_message_log(session, message).await;
         Ok(())
-    }
-
-    async fn push_session_message(&self, session: &mut Session, message: ChatMessage) {
-        session.messages.push(message.clone());
-        self.write_session_message_log(session, &message).await;
     }
 
     async fn insert_session_message(
@@ -1418,85 +1491,124 @@ impl AgentLoop {
         }
     }
 
-    /// Run the LLM risk assessor against a selected skill. The caller
-    /// surfaces `PassWithWarning` / `Block` verdicts as user-facing
-    /// notices. All non-verdict outcomes — no assessor configured,
-    /// inline skill with no on-disk source, or a transient assessor
-    /// error — fall through as `Pass` so the agent stays functional
-    /// when the judge is unavailable.
-    async fn assess_skill_risk(&self, skill: &aura_skills::SkillDefinition) -> SkillGate {
-        let Some(assessor) = self.skill_assessor.as_ref() else {
-            return SkillGate::Pass;
+    fn invocable_skills(&self) -> Vec<SkillSummary> {
+        self.skill_registry
+            .all_summaries_sorted()
+            .into_iter()
+            .filter(|s| {
+                s.agent_invocable && !matches!(s.trust_level, aura_model::TrustLevel::Untrusted)
+            })
+            .collect()
+    }
+}
+
+fn build_skill_reminder(skills: &[SkillSummary]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let mut s =
+        String::from("Available skills (invoke via the `Skill` tool with `skill: \"<name>\"`):\n");
+    for sk in skills {
+        let cmd = sk.command.as_deref().unwrap_or(sk.name.as_str());
+        s.push_str(&format!("- /{cmd}: {}", sk.description.trim()));
+        if let Some(hint) = sk.argument_hint.as_deref() {
+            s.push_str(&format!(" {hint}"));
+        }
+        s.push('\n');
+    }
+    Some(s)
+}
+
+fn detect_slash_invocation(user_text: &str, skills: &[SkillSummary]) -> Option<(String, String)> {
+    let rest = user_text.trim_start().strip_prefix('/')?;
+    let (cmd, args) = match rest.find(char::is_whitespace) {
+        Some(idx) => (&rest[..idx], rest[idx..].trim().to_string()),
+        None => (rest, String::new()),
+    };
+    if cmd.is_empty() {
+        return None;
+    }
+    let skill = skills.iter().find(|s| s.command.as_deref() == Some(cmd))?;
+    Some((skill.name.clone(), args))
+}
+
+#[cfg(test)]
+mod notifier_bridge_tests {
+    use super::*;
+    use aura_channels::AgentOutput;
+    use aura_tools::{NoticeLevel as ToolsNoticeLevel, SessionNotifier};
+
+    fn mk_notifier() -> (DeltaTxNotifier, tokio::sync::mpsc::Receiver<AgentOutput>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let n = DeltaTxNotifier {
+            tx,
+            session_id: "s".into(),
+            user_id: "u".into(),
+            channel: aura_model::ChannelType::tui(),
         };
-        match assessor.check(skill).await {
-            Ok(assessed) => match assessed.verdict.level {
-                RiskLevel::Dangerous => {
-                    warn!(
-                        skill = %skill.name,
-                        scope = %assessed.scope.as_str(),
-                        rationale = %assessed.verdict.rationale,
-                        "skill blocked by risk assessor"
-                    );
-                    SkillGate::Block {
-                        rationale: assessed.verdict.rationale,
-                    }
-                }
-                RiskLevel::Suspicious => {
-                    warn!(
-                        skill = %skill.name,
-                        scope = %assessed.scope.as_str(),
-                        background_pending = assessed.background_pending,
-                        rationale = %assessed.verdict.rationale,
-                        "skill rated suspicious — injecting with warning"
-                    );
-                    SkillGate::PassWithWarning {
-                        rationale: assessed.verdict.rationale,
-                    }
-                }
-                RiskLevel::Safe => SkillGate::Pass,
-            },
-            Err(aura_skills_assessor::AssessError::NoSourcePath) => SkillGate::Pass,
-            Err(err) => {
-                warn!(
-                    skill = %skill.name,
-                    error = %err,
-                    "risk assessor failed; allowing skill through"
-                );
-                SkillGate::Pass
+        (n, rx)
+    }
+
+    #[test]
+    fn warn_forwards_as_agent_output_warn() {
+        let (n, mut rx) = mk_notifier();
+        n.emit(ToolsNoticeLevel::Warn, "summary", "detail");
+        let out = rx.try_recv().expect("notice should be queued");
+        match out {
+            AgentOutput::Notice {
+                level,
+                text,
+                session_id,
+                user_id,
+                ..
+            } => {
+                assert_eq!(level, aura_channels::NoticeLevel::Warn);
+                assert_eq!(text, "summary: detail");
+                assert_eq!(session_id, "s");
+                assert_eq!(user_id, "u");
             }
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 
-    /// Fire an `AgentOutput::Notice` telling the user that a skill they
-    /// explicitly invoked was flagged by the risk assessor. `headline`
-    /// is the short verb ("blocked", "rated suspicious"); `rationale`
-    /// is the assessor's free-form reason. Silently no-ops when no
-    /// output channel is attached (e.g. cron-triggered turns with no
-    /// live user surface).
-    async fn emit_skill_notice(
-        &self,
-        session: &Session,
-        level: NoticeLevel,
-        skill_name: &str,
-        headline: &str,
-        rationale: &str,
-        output_tx: Option<&mpsc::Sender<AgentOutput>>,
-    ) {
-        let Some(tx) = output_tx else { return };
-        let text = format!("Skill '{skill_name}' {headline}: {rationale}");
-        if tx
-            .send(AgentOutput::Notice {
-                session_id: session.id.to_string(),
-                user_id: session.user.id.clone(),
-                channel: session.channel.clone(),
-                level,
-                text,
-            })
-            .await
-            .is_err()
-        {
-            debug!("notice receiver dropped; skipping skill risk notice");
+    #[test]
+    fn error_forwards_as_agent_output_error() {
+        let (n, mut rx) = mk_notifier();
+        n.emit(ToolsNoticeLevel::Error, "blocked", "rationale");
+        match rx.try_recv().unwrap() {
+            AgentOutput::Notice { level, text, .. } => {
+                assert_eq!(level, aura_channels::NoticeLevel::Error);
+                assert_eq!(text, "blocked: rationale");
+            }
+            _ => panic!(),
         }
+    }
+
+    #[test]
+    fn empty_detail_collapses_text() {
+        let (n, mut rx) = mk_notifier();
+        n.emit(ToolsNoticeLevel::Warn, "headline", "");
+        match rx.try_recv().unwrap() {
+            AgentOutput::Notice { text, .. } => assert_eq!(text, "headline"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn full_channel_drops_silently() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let n = DeltaTxNotifier {
+            tx,
+            session_id: "s".into(),
+            user_id: "u".into(),
+            channel: aura_model::ChannelType::tui(),
+        };
+        n.emit(ToolsNoticeLevel::Warn, "first", "");
+        // Second emit should not block or panic — try_send drops it.
+        n.emit(ToolsNoticeLevel::Warn, "second", "");
+        // Only the first one is in the queue.
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
     }
 }
 

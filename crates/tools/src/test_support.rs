@@ -233,6 +233,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp"),
             sandbox: None,
             approval: None,
+            notifier: None,
         }
     }
 

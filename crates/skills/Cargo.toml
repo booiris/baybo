@@ -5,8 +5,19 @@ edition.workspace = true
 
 [dependencies]
 aura-model = { workspace = true }
+aura-tools = { workspace = true }
+async-trait = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
+uuid = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
+tokio-util = { workspace = true }

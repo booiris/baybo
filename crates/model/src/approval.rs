@@ -57,6 +57,15 @@ pub enum ResourceAccess {
     ExecCommand {
         command: String,
     },
+    /// A skill-style declaration that the call wants the listed
+    /// environment variables read on the user's behalf. Match is exact
+    /// set equality after sort+dedup; approving `[FOO, BAR]` does NOT
+    /// cover a later request for `[FOO]`. Env approvals are not
+    /// auto-cached by `to_approved` — they are sensitive enough to
+    /// justify per-session re-prompting.
+    Env {
+        vars: Vec<String>,
+    },
 }
 
 impl ResourceAccess {
@@ -75,8 +84,18 @@ impl ResourceAccess {
             ResourceAccess::ExecCommand { command } => ApprovedResource::ExecCommand {
                 command: command.clone(),
             },
+            ResourceAccess::Env { vars } => ApprovedResource::Env {
+                vars: normalize_vars(vars),
+            },
         }
     }
+}
+
+fn normalize_vars(vars: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = vars.to_vec();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Persistent "approve always" entry stored on `SessionState`.
@@ -87,6 +106,7 @@ pub enum ApprovedResource {
     WriteFile { path: PathBuf },
     Http { host: HostPattern },
     ExecCommand { command: String },
+    Env { vars: Vec<String> },
 }
 
 impl ApprovedResource {
@@ -109,6 +129,9 @@ impl ApprovedResource {
                 ApprovedResource::ExecCommand { command: approved },
                 ResourceAccess::ExecCommand { command: requested },
             ) => approved == requested,
+            (ApprovedResource::Env { vars: approved }, ResourceAccess::Env { vars: requested }) => {
+                approved.as_slice() == normalize_vars(requested).as_slice()
+            }
             _ => false,
         }
     }
@@ -234,6 +257,30 @@ mod tests {
             HostPattern::Wildcard("Foo.Com".into()),
             HostPattern::Wildcard("foo.com".into()),
         );
+    }
+
+    #[test]
+    fn env_vars_match_after_normalization() {
+        // Approving [FOO, BAR] covers a request for [BAR, FOO] after sort+dedup.
+        let approved = ResourceAccess::Env {
+            vars: vec!["FOO".into(), "BAR".into()],
+        }
+        .to_approved();
+        assert!(approved.covers(&ResourceAccess::Env {
+            vars: vec!["BAR".into(), "FOO".into()],
+        }));
+        // Subset is NOT covered — env grants are exact set equality.
+        assert!(!approved.covers(&ResourceAccess::Env {
+            vars: vec!["FOO".into()],
+        }));
+        // Superset is NOT covered.
+        assert!(!approved.covers(&ResourceAccess::Env {
+            vars: vec!["FOO".into(), "BAR".into(), "BAZ".into()],
+        }));
+        // Duplicates in the request normalize away.
+        assert!(approved.covers(&ResourceAccess::Env {
+            vars: vec!["FOO".into(), "FOO".into(), "BAR".into()],
+        }));
     }
 
     #[test]

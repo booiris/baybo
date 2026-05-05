@@ -199,6 +199,7 @@ impl ToolExecutor {
         parallel_group: Option<ParallelGroup>,
         _parent_job_for_log: Option<JobId>,
         cancel_token: CancellationToken,
+        notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
@@ -353,6 +354,7 @@ impl ToolExecutor {
                     workspace_root: self.workspace_root.clone(),
                     sandbox,
                     approval: Some(approval),
+                    notifier: notifier.clone(),
                 };
 
                 // Reveal placeholders in the tool's arguments just
