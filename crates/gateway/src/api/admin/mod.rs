@@ -2,6 +2,7 @@
 //! memory/traces/skills/tools/llm and a read-only channel list. No chat
 //! content flows through these endpoints.
 
+pub mod analytics;
 pub mod channels;
 pub mod config;
 pub mod cron;
@@ -38,6 +39,7 @@ use crate::server::AdminState;
         (name = "cron", description = "Scheduled prompts / tool calls"),
         (name = "memory", description = "Long-term memory entries"),
         (name = "traces", description = "Per-session trace export"),
+        (name = "analytics", description = "Aggregated cost / session activity dashboards"),
         (name = "skills", description = "Registered skills"),
         (name = "tools", description = "Registered tool manifests"),
         (name = "channels", description = "Registered channel plugins"),
@@ -61,6 +63,7 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(cron::routes())
         .merge(memory::routes())
         .merge(traces::routes())
+        .merge(analytics::routes())
         .merge(skills::routes())
         .merge(tools::routes())
         .merge(channels::routes())

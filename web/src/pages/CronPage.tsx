@@ -1,6 +1,7 @@
-import { useEffect, useState, type ChangeEvent } from 'react';
+import { useEffect, useState, type ChangeEvent, type FormEvent } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
+  RiAddLine,
   RiAlarmLine,
   RiRefreshLine,
   RiEyeLine,
@@ -8,6 +9,7 @@ import {
   RiTerminalLine,
   RiChatSmile2Line,
   RiLoader4Line,
+  RiDeleteBinLine,
 } from 'react-icons/ri';
 import { Button } from '../components/Button';
 import { IconButton } from '../components/IconButton';
@@ -56,6 +58,10 @@ export function CronPage() {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<CronJob | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [showCreate, setShowCreate] = useState(false);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [mutating, setMutating] = useState(false);
+  const [mutationError, setMutationError] = useState<string | null>(null);
 
   // Debounce the filter input
   useEffect(() => {
@@ -132,6 +138,67 @@ export function CronPage() {
   const hasPrev = offset > 0;
   const hasNext = pageEnd < total;
 
+  const handleCreate = async (
+    body: components['schemas']['CreateCronRequest'],
+  ): Promise<void> => {
+    if (isMock) {
+      setMutationError('Create disabled in mock mode.');
+      return;
+    }
+    setMutating(true);
+    setMutationError(null);
+    try {
+      const { error: apiError, response } = await client.POST('/v1/cron', { body });
+      if (response.status === 401) {
+        logout();
+        return;
+      }
+      if (apiError || !response.ok) {
+        setMutationError(apiError?.error || `HTTP Error ${response.status}`);
+        return;
+      }
+      setShowCreate(false);
+      setRefreshKey((k) => k + 1);
+    } catch (e) {
+      setMutationError(
+        e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway',
+      );
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const handleDelete = async (id: string): Promise<void> => {
+    if (isMock) {
+      setMutationError('Delete disabled in mock mode.');
+      return;
+    }
+    setMutating(true);
+    setMutationError(null);
+    try {
+      const { error: apiError, response } = await client.DELETE('/v1/cron/{id}', {
+        params: { path: { id } },
+      });
+      if (response.status === 401) {
+        logout();
+        return;
+      }
+      if (apiError || !response.ok) {
+        setMutationError(apiError?.error || `HTTP Error ${response.status}`);
+        return;
+      }
+      setPendingDeleteId(null);
+      setSelected((cur) => (cur?.id === id ? null : cur));
+      setRefreshKey((k) => k + 1);
+    } catch (e) {
+      setMutationError(
+        e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway',
+      );
+    } finally {
+      setMutating(false);
+    }
+  };
+
   const toggleMock = () => {
     const newParams = new URLSearchParams(searchParams);
     if (isMock) {
@@ -190,12 +257,23 @@ export function CronPage() {
               {isMock ? 'Mock: ON' : 'Mock: OFF'}
             </Button>
           )}
-          <Button 
-            onClick={() => setRefreshKey((k) => k + 1)} 
+          <Button
+            variant="primary"
+            onClick={() => {
+              setMutationError(null);
+              setShowCreate(true);
+            }}
+            disabled={isMock}
+            className="!py-2 !px-4 !text-[0.9rem] h-10 w-[140px] justify-center gap-1.5"
+          >
+            <RiAddLine className="text-lg shrink-0" /> New Cron
+          </Button>
+          <Button
+            onClick={() => setRefreshKey((k) => k + 1)}
             disabled={loading || isMock}
             className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
           >
-            <RiRefreshLine className="text-base" /> Refresh
+            <RiRefreshLine className="text-lg shrink-0" /> Refresh
           </Button>
         </div>
       </div>
@@ -258,7 +336,7 @@ export function CronPage() {
                 <th className={thCell}>Action</th>
                 <th className={`${thCell} w-[160px]`}>Created At</th>
                 <th className={`${thCell} w-[160px]`}>Next Trigger</th>
-                <th className={`${thCell} w-[80px] text-right`}>Detail</th>
+                <th className={`${thCell} w-[110px] text-right`}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -307,12 +385,25 @@ export function CronPage() {
                       </div>
                     </td>
                     <td className={`${cell} text-right`}>
-                      <IconButton
-                        aria-label="View job detail"
-                        onClick={() => setSelected(job)}
-                      >
-                        <RiEyeLine />
-                      </IconButton>
+                      <div className="inline-flex gap-1">
+                        <IconButton
+                          aria-label="View job detail"
+                          onClick={() => setSelected(job)}
+                        >
+                          <RiEyeLine />
+                        </IconButton>
+                        <IconButton
+                          aria-label="Delete cron job"
+                          onClick={() => {
+                            setMutationError(null);
+                            setPendingDeleteId(job.id);
+                          }}
+                          disabled={isMock || mutating}
+                          className="!border-err !text-err hover:!bg-err/10"
+                        >
+                          <RiDeleteBinLine />
+                        </IconButton>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -368,12 +459,47 @@ export function CronPage() {
         </div>
       </div>
 
-      {selected && <CronDetailModal job={selected} onClose={() => setSelected(null)} />}
+      {selected && (
+        <CronDetailModal
+          job={selected}
+          onClose={() => setSelected(null)}
+          onDelete={() => {
+            setMutationError(null);
+            setPendingDeleteId(selected.id);
+          }}
+        />
+      )}
+      {showCreate && (
+        <CronCreateModal
+          submitting={mutating}
+          error={mutationError}
+          channels={availableChannels}
+          onClose={() => setShowCreate(false)}
+          onSubmit={handleCreate}
+        />
+      )}
+      {pendingDeleteId && (
+        <DeleteConfirmModal
+          id={pendingDeleteId}
+          submitting={mutating}
+          error={mutationError}
+          onCancel={() => setPendingDeleteId(null)}
+          onConfirm={() => handleDelete(pendingDeleteId)}
+        />
+      )}
     </div>
   );
 }
 
-function CronDetailModal({ job, onClose }: { job: CronJob; onClose: () => void }) {
+function CronDetailModal({
+  job,
+  onClose,
+  onDelete,
+}: {
+  job: CronJob;
+  onClose: () => void;
+  onDelete?: () => void;
+}) {
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
@@ -390,13 +516,24 @@ function CronDetailModal({ job, onClose }: { job: CronJob; onClose: () => void }
             <h3 className="font-bold uppercase tracking-wider">Cron Job Detail</h3>
             <code className="font-mono text-[0.9rem] bg-gray-100 px-2 py-0.5 rounded border border-black">{job.id}</code>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-[0.85rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink cursor-pointer"
-          >
-            Close
-          </button>
+          <div className="flex items-center gap-3">
+            {onDelete && (
+              <button
+                type="button"
+                onClick={onDelete}
+                className="text-[0.85rem] font-bold uppercase tracking-wider text-err hover:text-err/80 cursor-pointer inline-flex items-center gap-1"
+              >
+                <RiDeleteBinLine className="text-base" /> Delete
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-[0.85rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink cursor-pointer"
+            >
+              Close
+            </button>
+          </div>
         </header>
         <div className="px-6 py-4 space-y-4">
           <div className="grid grid-cols-2 gap-4">
@@ -438,6 +575,227 @@ function CronDetailModal({ job, onClose }: { job: CronJob; onClose: () => void }
             </div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function CronCreateModal({
+  submitting,
+  error,
+  channels,
+  onClose,
+  onSubmit,
+}: {
+  submitting: boolean;
+  error: string | null;
+  channels: string[];
+  onClose: () => void;
+  onSubmit: (body: components['schemas']['CreateCronRequest']) => void | Promise<void>;
+}) {
+  const [schedule, setSchedule] = useState('0 9 * * *');
+  const [userId, setUserId] = useState('');
+  const [channel, setChannel] = useState(channels[0] ?? 'http');
+  const [text, setText] = useState('');
+  const [originSessionId, setOriginSessionId] = useState('');
+
+  const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (submitting) return;
+    onSubmit({
+      schedule: schedule.trim(),
+      user_id: userId.trim(),
+      channel: channel.trim(),
+      text: text.trim(),
+      ...(originSessionId.trim() ? { origin_session_id: originSessionId.trim() } : {}),
+    });
+  };
+
+  const valid = schedule.trim() && userId.trim() && channel.trim() && text.trim();
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+    >
+      <form
+        onSubmit={handleSubmit}
+        className="max-w-xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="flex items-center justify-between px-6 py-4 border-b-2 border-black">
+          <h3 className="font-bold uppercase tracking-wider">New Cron Job</h3>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={submitting}
+            className="text-[0.85rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink cursor-pointer disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        </header>
+        <div className="px-6 py-4 space-y-4">
+          {error && (
+            <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem]">
+              {error}
+            </div>
+          )}
+          <div>
+            <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
+              Schedule (cron expression)
+            </label>
+            <input
+              value={schedule}
+              onChange={(e) => setSchedule(e.target.value)}
+              required
+              placeholder="0 9 * * *"
+              className="w-full border-2 border-black rounded-md px-3 h-10 font-mono text-[0.95rem] bg-white"
+            />
+            <div className="text-[0.7rem] text-ink-soft font-mono mt-1">
+              Standard 5-field cron — e.g. "0 9 * * *" (every day 09:00).
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
+                User ID
+              </label>
+              <input
+                value={userId}
+                onChange={(e) => setUserId(e.target.value)}
+                required
+                className="w-full border-2 border-black rounded-md px-3 h-10 font-mono text-[0.95rem] bg-white"
+              />
+            </div>
+            <div>
+              <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
+                Channel
+              </label>
+              <input
+                value={channel}
+                onChange={(e) => setChannel(e.target.value)}
+                required
+                placeholder="http"
+                list="cron-channel-suggestions"
+                className="w-full border-2 border-black rounded-md px-3 h-10 font-mono text-[0.95rem] bg-white"
+              />
+              <datalist id="cron-channel-suggestions">
+                {channels.map((c) => (
+                  <option key={c} value={c} />
+                ))}
+              </datalist>
+            </div>
+          </div>
+          <div>
+            <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
+              Prompt
+            </label>
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              required
+              rows={4}
+              placeholder="Summarize my unread messages"
+              className="w-full border-2 border-black rounded-md px-3 py-2 font-mono text-[0.9rem] bg-white resize-y"
+            />
+          </div>
+          <div>
+            <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
+              Origin session (optional)
+            </label>
+            <input
+              value={originSessionId}
+              onChange={(e) => setOriginSessionId(e.target.value)}
+              className="w-full border-2 border-black rounded-md px-3 h-10 font-mono text-[0.9rem] bg-white"
+            />
+          </div>
+        </div>
+        <footer className="flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+          <Button
+            type="button"
+            onClick={onClose}
+            disabled={submitting}
+            className="!py-1 !px-3 !text-[0.85rem] h-9"
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            type="submit"
+            disabled={!valid || submitting}
+            className="!py-1 !px-3 !text-[0.85rem] h-9 gap-1.5"
+          >
+            {submitting ? <RiLoader4Line className="animate-spin text-base shrink-0" /> : <RiAddLine className="text-base shrink-0" />}
+            Create
+          </Button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function DeleteConfirmModal({
+  id,
+  submitting,
+  error,
+  onCancel,
+  onConfirm,
+}: {
+  id: string;
+  submitting: boolean;
+  error: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+      role="dialog"
+      aria-modal="true"
+      onClick={onCancel}
+    >
+      <div
+        className="max-w-md w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="px-6 py-4 border-b-2 border-black">
+          <h3 className="font-bold uppercase tracking-wider">Delete Cron Job</h3>
+        </header>
+        <div className="px-6 py-4 space-y-3">
+          <p className="text-[0.95rem]">
+            Permanently delete cron job{' '}
+            <code className="font-mono text-[0.85rem] bg-gray-100 px-1 rounded border border-black">
+              {id}
+            </code>
+            ? This cannot be undone.
+          </p>
+          {error && (
+            <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem]">
+              {error}
+            </div>
+          )}
+        </div>
+        <footer className="flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+          <Button
+            type="button"
+            onClick={onCancel}
+            disabled={submitting}
+            className="!py-1 !px-3 !text-[0.85rem] h-9"
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            onClick={onConfirm}
+            disabled={submitting}
+            className="!py-1 !px-3 !text-[0.85rem] h-9 gap-1.5 !bg-err !text-white !border-err hover:!bg-err/90"
+          >
+            {submitting && <RiLoader4Line className="animate-spin text-base shrink-0" />}
+            <RiDeleteBinLine className="text-base shrink-0" /> Delete
+          </Button>
+        </footer>
       </div>
     </div>
   );

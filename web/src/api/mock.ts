@@ -158,91 +158,9 @@ function generateMockCrons(count: number): components['schemas']['CronJob'][] {
 
 export const MOCK_CRONS = import.meta.env.DEV ? generateMockCrons(20) : [];
 
-// --- Analytics Mock Data ---
-
-export interface AnalyticsData {
-  totalTokens: {
-    input: number;
-    cache: number;
-    output: number;
-  };
-  dailyConsumption: Array<{
-    date: string;
-    input: number;
-    cache: number;
-    output: number;
-    sessionsCreated: number;
-  }>;
-  modelUsage: Array<{
-    model: string;
-    input: number;
-    output: number;
-  }>;
-  skillUsage: Array<{
-    skill: string;
-    count: number;
-  }>;
-  toolUsage: Array<{
-    tool: string;
-    count: number;
-    avgExecutionTimeMs: number;
-  }>;
-}
-
-function generateMockAnalytics(): AnalyticsData {
-  const days = 30;
-  const now = new Date();
-  const dailyConsumption = [];
-  
-  let totalInput = 0;
-  let totalCache = 0;
-  let totalOutput = 0;
-
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(now);
-    d.setDate(d.getDate() - i);
-    const date = d.toISOString().split('T')[0];
-    
-    const input = Math.floor(Math.random() * 5000) + 1000;
-    const cache = Math.floor(Math.random() * 2000) + 500;
-    const output = Math.floor(Math.random() * 3000) + 800;
-    const sessionsCreated = Math.floor(Math.random() * 50) + 10;
-
-    totalInput += input;
-    totalCache += cache;
-    totalOutput += output;
-
-    dailyConsumption.push({ date, input, cache, output, sessionsCreated });
-  }
-
-  return {
-    totalTokens: {
-      input: totalInput,
-      cache: totalCache,
-      output: totalOutput,
-    },
-    dailyConsumption,
-    modelUsage: [
-      { model: 'gpt-4o', input: totalInput * 0.6, output: totalOutput * 0.7 },
-      { model: 'gpt-4-turbo', input: totalInput * 0.25, output: totalOutput * 0.2 },
-      { model: 'claude-3-5-sonnet', input: totalInput * 0.15, output: totalOutput * 0.1 },
-    ],
-    skillUsage: [
-      { skill: 'codebase_investigator', count: 142 },
-      { skill: 'generalist', count: 85 },
-      { skill: 'cli_help', count: 34 },
-    ],
-    toolUsage: [
-      { tool: 'read_file', count: 450, avgExecutionTimeMs: 45 },
-      { tool: 'grep_search', count: 320, avgExecutionTimeMs: 120 },
-      { tool: 'run_shell_command', count: 180, avgExecutionTimeMs: 2400 },
-      { tool: 'replace_file', count: 120, avgExecutionTimeMs: 85 },
-      { tool: 'list_directory', count: 95, avgExecutionTimeMs: 30 },
-    ],
-  };
-}
-
-export const MOCK_ANALYTICS = import.meta.env.DEV ? generateMockAnalytics() : null;
+// Analytics mock lives inline in `pages/AnalyticsPage.tsx` so it can
+// produce the exact `AnalyticsResponse` shape from the OpenAPI schema
+// without having a parallel TS interface to keep in sync.
 
 // --- Session detail (full Job→Step→Span tree) ---
 

@@ -109,6 +109,31 @@ impl CostStore for LibsqlCostStore {
         summary_from_aggregate_row(&row)
     }
 
+    async fn query_records_in_range(&self, range: TimeRange) -> CostResult<Vec<CostRecord>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT user_id, session_id, job_id, span_id, model, input_tokens, \
+                        output_tokens, cost_usd, timestamp \
+                 FROM cost_records \
+                 WHERE timestamp >= ?1 AND timestamp < ?2 \
+                 ORDER BY timestamp",
+                libsql::params![time::to_us(range.from), time::to_us(range.to)],
+            )
+            .await
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+
+        let mut records = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+        {
+            records.push(row_to_cost_record(&row)?);
+        }
+        Ok(records)
+    }
+
     async fn query_job(&self, job_id: &JobId) -> CostResult<CostSummary> {
         let conn = self.pool.conn();
         let mut rows = conn

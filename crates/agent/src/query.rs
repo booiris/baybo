@@ -219,6 +219,41 @@ pub struct SessionSummaryListing {
     pub total: usize,
 }
 
+/// Result of [`QueryApi::compute_analytics`]. All counts/totals are
+/// over the supplied [`TimeRange`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnalyticsSummary {
+    pub total_input_tokens: usize,
+    pub total_output_tokens: usize,
+    pub total_cost_usd: f64,
+    pub total_record_count: usize,
+    /// One bucket per UTC day in the range, oldest first. Days with no
+    /// activity still appear with zeros so the chart can render a
+    /// continuous x-axis.
+    pub daily: Vec<AnalyticsDayBucket>,
+    pub by_model: Vec<AnalyticsModelBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsDayBucket {
+    /// `YYYY-MM-DD` (UTC).
+    pub date: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cost_usd: f64,
+    /// Distinct sessions whose `created_at` falls in this UTC day.
+    pub sessions_created: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsModelBucket {
+    pub model: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cost_usd: f64,
+    pub call_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayJob {
     pub job: Job,
@@ -548,6 +583,100 @@ impl QueryApi {
         };
         let items = summaries[start..end].to_vec();
         Ok(SessionSummaryListing { items, total })
+    }
+
+    // ── 11. compute_analytics ──────────────────────────────────
+
+    /// Aggregate cost records + session creations for the analytics
+    /// dashboard. Iterates `cost_records` once for token / model
+    /// breakdowns and `SessionStore::list_all` once for session-per-day
+    /// counts. `Unsupported` if no `CostStore` was wired (CLI-style
+    /// `QueryApi::without_costs` callers).
+    pub async fn compute_analytics(&self, range: TimeRange) -> Result<AnalyticsSummary> {
+        let costs = self.costs.as_ref().ok_or_else(|| {
+            QueryError::Unsupported("compute_analytics requires a CostStore".into())
+        })?;
+
+        // Pre-build a contiguous YYYY-MM-DD bucket list (UTC) so days
+        // with no activity still appear in the chart.
+        let mut day_index: HashMap<String, usize> = HashMap::new();
+        let mut daily: Vec<AnalyticsDayBucket> = Vec::new();
+        let mut cursor = range.from.date_naive();
+        let last = range.to.date_naive();
+        while cursor < last {
+            let key = cursor.format("%Y-%m-%d").to_string();
+            day_index.insert(key.clone(), daily.len());
+            daily.push(AnalyticsDayBucket {
+                date: key,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+                sessions_created: 0,
+            });
+            cursor = cursor.succ_opt().unwrap_or(cursor);
+        }
+
+        let mut total_input = 0usize;
+        let mut total_output = 0usize;
+        let mut total_cost = 0.0_f64;
+        let mut total_records = 0usize;
+        let mut by_model: HashMap<String, AnalyticsModelBucket> = HashMap::new();
+
+        let records = costs.query_records_in_range(range.clone()).await?;
+        for r in &records {
+            total_input += r.input_tokens;
+            total_output += r.output_tokens;
+            total_cost += r.cost_usd;
+            total_records += 1;
+
+            let day_key = r.timestamp.date_naive().format("%Y-%m-%d").to_string();
+            if let Some(&i) = day_index.get(&day_key) {
+                let bucket = &mut daily[i];
+                bucket.input_tokens += r.input_tokens;
+                bucket.output_tokens += r.output_tokens;
+                bucket.cost_usd += r.cost_usd;
+            }
+
+            let entry = by_model
+                .entry(r.model.clone())
+                .or_insert_with(|| AnalyticsModelBucket {
+                    model: r.model.clone(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_usd: 0.0,
+                    call_count: 0,
+                });
+            entry.input_tokens += r.input_tokens;
+            entry.output_tokens += r.output_tokens;
+            entry.cost_usd += r.cost_usd;
+            entry.call_count += 1;
+        }
+
+        // sessions_created per day. Single SessionStore::list_all call;
+        // sessions outside the range are skipped.
+        for s in self.sessions.list_all().await? {
+            if s.created_at < range.from || s.created_at >= range.to {
+                continue;
+            }
+            let day_key = s.created_at.date_naive().format("%Y-%m-%d").to_string();
+            if let Some(&i) = day_index.get(&day_key) {
+                daily[i].sessions_created += 1;
+            }
+        }
+
+        let mut model_buckets: Vec<AnalyticsModelBucket> = by_model.into_values().collect();
+        model_buckets.sort_by(|a, b| {
+            (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
+        });
+
+        Ok(AnalyticsSummary {
+            total_input_tokens: total_input,
+            total_output_tokens: total_output,
+            total_cost_usd: total_cost,
+            total_record_count: total_records,
+            daily,
+            by_model: model_buckets,
+        })
     }
 
     // ── 9. replay ──────────────────────────────────────────────

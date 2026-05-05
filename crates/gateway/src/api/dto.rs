@@ -759,6 +759,79 @@ pub struct TracesListResponse {
     pub total: usize,
 }
 
+// ── Analytics ────────────────────────────────────────────────────────
+
+/// `GET /v1/analytics` query params. Defaults to the last 30 UTC days
+/// when no range is supplied.
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct AnalyticsQuery {
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// One bucket per UTC day for the analytics chart.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnalyticsDayBucket {
+    /// `YYYY-MM-DD` (UTC).
+    pub date: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cost_usd: f64,
+    pub sessions_created: usize,
+}
+
+impl From<aura_agent::AnalyticsDayBucket> for AnalyticsDayBucket {
+    fn from(v: aura_agent::AnalyticsDayBucket) -> Self {
+        Self {
+            date: v.date,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            cost_usd: v.cost_usd,
+            sessions_created: v.sessions_created,
+        }
+    }
+}
+
+/// Per-model breakdown row for the analytics dashboard.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnalyticsModelBucket {
+    pub model: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cost_usd: f64,
+    pub call_count: usize,
+}
+
+impl From<aura_agent::AnalyticsModelBucket> for AnalyticsModelBucket {
+    fn from(v: aura_agent::AnalyticsModelBucket) -> Self {
+        Self {
+            model: v.model,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            cost_usd: v.cost_usd,
+            call_count: v.call_count,
+        }
+    }
+}
+
+/// `GET /v1/analytics` response body.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AnalyticsResponse {
+    /// Inclusive lower bound used for the aggregation (UTC).
+    pub since: DateTime<Utc>,
+    /// Exclusive upper bound used for the aggregation (UTC).
+    pub until: DateTime<Utc>,
+    pub total_input_tokens: usize,
+    pub total_output_tokens: usize,
+    pub total_cost_usd: f64,
+    pub total_record_count: usize,
+    pub daily: Vec<AnalyticsDayBucket>,
+    pub by_model: Vec<AnalyticsModelBucket>,
+}
+
 // ── ToolDefinition ───────────────────────────────────────────────────
 
 /// Mirror of [`aura_tools::ToolDefinition`].
