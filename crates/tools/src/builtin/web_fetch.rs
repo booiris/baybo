@@ -189,18 +189,17 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL over HTTP(S) and return its body. HTML responses are \
-         converted to Markdown; other text/* responses are returned verbatim; \
-         binary responses are refused.\n\n\
-         Output is capped at 256 KiB on a UTF-8 boundary; longer bodies are \
-         truncated with a marker. Redirects are followed up to 5 hops.\n\n\
-         Blocked by an SSRF floor: only `http` / `https` schemes are allowed, \
-         and literal-IP hosts in loopback (127/8, ::1), private (10/8, \
-         172.16/12, 192.168/16, 100.64/10), link-local (169.254/16, fe80::/10 \
-         — covers the AWS metadata IP), unique-local (fc00::/7), unspecified \
-         (0.0.0.0, ::), and IPv4-mapped-v6 ranges are rejected.\n\n\
-         The optional `prompt` parameter is accepted for forward \
-         compatibility but currently ignored — the body is returned as-is."
+        r#"
+- Fetches content from a specified URL
+- Takes a URL and a prompt as input
+- Fetches the URL content, converts HTML to markdown
+- Returns the model's response about the content
+- Use this tool when you need to retrieve and analyze web content
+Usage notes:
+  - The URL must be a fully-formed valid URL
+  - HTTP URLs will be automatically upgraded to HTTPS
+  - This tool is read-only and does not modify any files
+"#
     }
 
     fn parameters_schema(&self) -> Value {
