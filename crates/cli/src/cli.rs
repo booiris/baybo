@@ -481,11 +481,11 @@ pub enum LlmCmd {
 pub enum WorkspaceCmd {
     /// Show the workspace root and loaded identity files.
     Show,
-    /// Overwrite one of the four workspace identity documents
-    /// (`AGENTS.md` / `SOUL.md` / `USER.md` / `IDENTITY.md`). Requires
-    /// `--yes` in slash mode. Change picks up after restart.
+    /// Overwrite one of the three workspace identity documents
+    /// (`SOUL.md` / `USER.md` / `IDENTITY.md`). Requires `--yes` in
+    /// slash mode. Change picks up after restart.
     SetIdentity {
-        /// Which identity file to write: `agents`, `soul`, `user`, or `identity`.
+        /// Which identity file to write: `soul`, `user`, or `identity`.
         name: String,
         /// Path to a file whose contents replace the identity document.
         /// Mutually exclusive with `--content`.

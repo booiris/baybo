@@ -10,13 +10,16 @@ pub struct Soul {
 }
 
 impl Soul {
-    /// Build a Soul from workspace identity files. Always prepends an
+    /// Build a Soul from workspace identity files. Always appends an
     /// environment block describing the workspace layout — the LLM
     /// uses this to construct absolute paths inside the working
     /// directory so tool calls land where the OS sandbox is rooted.
+    /// The env block goes last so the identity files set the voice up
+    /// front and the runtime details are the freshest piece of context
+    /// before the user message.
     pub async fn from_workspace(workspace: &WorkspaceManager) -> anyhow::Result<Self> {
         let identity = workspace.load_identity_files().await?;
-        let mut parts = vec![build_env_block(workspace)];
+        let mut parts = vec![];
 
         if let Some(soul_text) = &identity.soul {
             parts.push(soul_text.clone());
@@ -24,9 +27,10 @@ impl Soul {
         if let Some(identity_text) = &identity.identity {
             parts.push(identity_text.clone());
         }
-        if let Some(agents_text) = &identity.agents {
-            parts.push(agents_text.clone());
+        if let Some(user) = &identity.user {
+            parts.push(user.clone());
         }
+        parts.push(build_env_block(workspace));
 
         if parts.len() == 1 {
             // Only the env block — no identity files were present. Add
@@ -181,7 +185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_workspace_keeps_identity_files_after_env_block() {
+    async fn from_workspace_appends_env_block_after_identity_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = WorkspaceManager::new(dir.path().to_path_buf());
         workspace.ensure_layout().await.expect("layout");
@@ -201,8 +205,8 @@ mod tests {
         let soul_pos = prompt.find("I am thoughtful.").expect("soul text present");
         let identity_pos = prompt.find("Name: Aura.").expect("identity text present");
         assert!(
-            env_pos < soul_pos && soul_pos < identity_pos,
-            "expected env < soul < identity, got positions env={env_pos} soul={soul_pos} identity={identity_pos}"
+            soul_pos < identity_pos && identity_pos < env_pos,
+            "expected soul < identity < env, got positions soul={soul_pos} identity={identity_pos} env={env_pos}"
         );
         assert!(
             !prompt.contains("You are Aura, an intelligent assistant."),

@@ -221,7 +221,7 @@ fn workspace_set_identity_accepts_file_or_content_exclusively() {
     let cli = parse(&[
         "workspace",
         "set-identity",
-        "agents",
+        "identity",
         "--file",
         "/tmp/a.md",
         "-y",
@@ -232,7 +232,7 @@ fn workspace_set_identity_accepts_file_or_content_exclusively() {
                 name, file, yes, ..
             },
         }) => {
-            assert_eq!(name, "agents");
+            assert_eq!(name, "identity");
             assert_eq!(file.as_deref(), Some("/tmp/a.md"));
             assert!(yes);
         }

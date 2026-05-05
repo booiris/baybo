@@ -24,6 +24,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::prompt::*;
+
 // ---------------------------------------------------------------------------
 // Workspace top-level subdirectories
 // ---------------------------------------------------------------------------
@@ -68,7 +70,6 @@ pub const MCP_CONFIG_FILE: &str = ".mcp.json";
 // Files inside `profile/` (standalone git repo)
 // ---------------------------------------------------------------------------
 
-pub const IDENTITY_AGENTS_FILE: &str = "AGENTS.md";
 pub const IDENTITY_SOUL_FILE: &str = "SOUL.md";
 pub const IDENTITY_USER_FILE: &str = "USER.md";
 pub const IDENTITY_IDENTITY_FILE: &str = "IDENTITY.md";
@@ -203,10 +204,9 @@ pub fn aura_cache_root() -> Option<PathBuf> {
 // IdentityKind
 // ---------------------------------------------------------------------------
 
-/// One of the four well-known workspace identity files.
+/// One of the three well-known workspace identity files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityKind {
-    Agents,
     Soul,
     User,
     Identity,
@@ -217,18 +217,36 @@ impl IdentityKind {
     /// profile directory.
     pub fn file_name(self) -> &'static str {
         match self {
-            Self::Agents => IDENTITY_AGENTS_FILE,
             Self::Soul => IDENTITY_SOUL_FILE,
             Self::User => IDENTITY_USER_FILE,
             Self::Identity => IDENTITY_IDENTITY_FILE,
         }
     }
 
-    /// Parse a user-facing label (`"agents"`, `"soul"`, `"user"`, `"identity"`).
+    /// Default initial markdown body used to seed this identity file on
+    /// first workspace materialisation. Templates are intentionally
+    /// minimal so the default system prompt stays neutral; users edit
+    /// them in place to tune behaviour.
+    pub fn default_content(self) -> &'static str {
+        match self {
+            Self::Soul => DEFAULT_SOUL_CONTENT,
+            Self::User => DEFAULT_USER_CONTENT,
+            Self::Identity => DEFAULT_IDENTITY_CONTENT,
+        }
+    }
+
+    /// Iterator over all three identity kinds in the canonical order
+    /// (soul, user, identity). Useful for code that needs to process
+    /// every identity file uniformly — e.g. `ensure_layout` seeding
+    /// defaults.
+    pub fn all() -> [Self; 3] {
+        [Self::Soul, Self::User, Self::Identity]
+    }
+
+    /// Parse a user-facing label (`"soul"`, `"user"`, `"identity"`).
     /// Accepts any of `name`, uppercase, or `NAME.md`.
     pub fn from_label(label: &str) -> Option<Self> {
         match label.trim().to_ascii_lowercase().as_str() {
-            "agents" | "agents.md" => Some(Self::Agents),
             "soul" | "soul.md" => Some(Self::Soul),
             "user" | "user.md" => Some(Self::User),
             "identity" | "identity.md" => Some(Self::Identity),
@@ -424,15 +442,36 @@ mod tests {
     fn identity_kind_round_trips_labels() {
         assert_eq!(IdentityKind::from_label("soul"), Some(IdentityKind::Soul));
         assert_eq!(
-            IdentityKind::from_label(" AGENTS "),
-            Some(IdentityKind::Agents)
+            IdentityKind::from_label(" IDENTITY "),
+            Some(IdentityKind::Identity)
         );
         assert_eq!(
             IdentityKind::from_label("user.md"),
             Some(IdentityKind::User)
         );
         assert_eq!(IdentityKind::from_label("CLAUDE.md"), None);
+        assert_eq!(IdentityKind::from_label("agents"), None);
         assert_eq!(IdentityKind::Soul.file_name(), "SOUL.md");
+    }
+
+    #[test]
+    fn identity_kind_default_content_is_non_empty_per_kind() {
+        for kind in IdentityKind::all() {
+            let body = kind.default_content();
+            assert!(
+                !body.trim().is_empty(),
+                "default content for {kind:?} must be non-empty"
+            );
+        }
+        // The defaults must be distinct — if any two collide a
+        // copy-paste mistake would make the seeded prompt incoherent.
+        let mut seen = std::collections::HashSet::new();
+        for kind in IdentityKind::all() {
+            assert!(
+                seen.insert(kind.default_content()),
+                "default content collision involving {kind:?}"
+            );
+        }
     }
 
     #[test]

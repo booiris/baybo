@@ -23,10 +23,17 @@ pub struct SetupContext {
 pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<SetupContext> {
     let paths = WorkspacePaths::new(workspace_root.clone());
 
-    WorkspaceManager::new(workspace_root.clone())
+    let workspace = WorkspaceManager::new(workspace_root.clone());
+    workspace
         .ensure_layout()
         .await
         .map_err(|e| SetupError::io(workspace_root.clone(), format!("ensure_layout: {e}")))?;
+    workspace.seed_default_identity_files().await.map_err(|e| {
+        SetupError::io(
+            workspace_root.clone(),
+            format!("seed default identity files: {e}"),
+        )
+    })?;
 
     let key_file = paths.encryption_key_file();
     if !key_file.exists() {
@@ -124,6 +131,7 @@ fn load_encryption_key(path: &Path) -> Result<EncryptionKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_workspace::IdentityKind;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
@@ -152,6 +160,68 @@ mod tests {
         assert_eq!(
             ctx.config.security.encryption_key_file.as_deref(),
             Some(paths.encryption_key_file().display().to_string()).as_deref(),
+        );
+    }
+
+    #[tokio::test]
+    async fn first_run_seeds_default_identity_files() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let paths = WorkspacePaths::new(root.clone());
+
+        bootstrap_workspace_if_needed(root.clone()).await.unwrap();
+
+        for kind in IdentityKind::all() {
+            let target = paths.identity_file(kind);
+            let body = std::fs::read_to_string(&target)
+                .unwrap_or_else(|e| panic!("read seeded {}: {e}", target.display()));
+            assert_eq!(
+                body,
+                kind.default_content(),
+                "{kind:?} must be seeded with its default template"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn re_running_setup_restores_deleted_identity_file() {
+        // Plain gateway boots use `ensure_layout` directly and do NOT
+        // re-seed; only an explicit `aura setup` invocation does. So a
+        // file deleted by the operator stays gone across reboots, but a
+        // deliberate re-run of setup brings it back.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let paths = WorkspacePaths::new(root.clone());
+
+        bootstrap_workspace_if_needed(root.clone()).await.unwrap();
+        let soul_path = paths.identity_file(IdentityKind::Soul);
+        std::fs::remove_file(&soul_path).expect("remove SOUL.md");
+
+        bootstrap_workspace_if_needed(root.clone()).await.unwrap();
+        assert!(
+            soul_path.exists(),
+            "re-running setup must re-seed a missing identity file"
+        );
+        let body = std::fs::read_to_string(&soul_path).unwrap();
+        assert_eq!(body, IdentityKind::Soul.default_content());
+    }
+
+    #[tokio::test]
+    async fn re_running_setup_does_not_overwrite_edited_identity_file() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let paths = WorkspacePaths::new(root.clone());
+
+        bootstrap_workspace_if_needed(root.clone()).await.unwrap();
+        let soul_path = paths.identity_file(IdentityKind::Soul);
+        const CUSTOM: &str = "# Soul\n\nOperator override.\n";
+        std::fs::write(&soul_path, CUSTOM).expect("operator edit");
+
+        bootstrap_workspace_if_needed(root.clone()).await.unwrap();
+        let body = std::fs::read_to_string(&soul_path).unwrap();
+        assert_eq!(
+            body, CUSTOM,
+            "operator edits to identity files must survive a setup re-run"
         );
     }
 

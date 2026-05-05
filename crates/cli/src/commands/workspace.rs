@@ -27,7 +27,6 @@ async fn show(ctx: &CommandContext) -> Result<CommandOutput> {
 
     let value = json!({
         "identity_files": {
-            "agents": identity.agents.is_some(),
             "soul": identity.soul.is_some(),
             "user": identity.user.is_some(),
             "identity": identity.identity.is_some(),
@@ -36,8 +35,7 @@ async fn show(ctx: &CommandContext) -> Result<CommandOutput> {
 
     let flag = |present: bool| if present { "present" } else { "missing" };
     let human = format!(
-        "identity files:\n  AGENTS.md   {}\n  SOUL.md     {}\n  USER.md     {}\n  IDENTITY.md {}",
-        flag(identity.agents.is_some()),
+        "identity files:\n  SOUL.md     {}\n  USER.md     {}\n  IDENTITY.md {}",
         flag(identity.soul.is_some()),
         flag(identity.user.is_some()),
         flag(identity.identity.is_some()),
@@ -63,7 +61,7 @@ async fn set_identity(
 
     let kind = IdentityKind::from_label(name).ok_or_else(|| {
         CliError::Parse(format!(
-            "unknown identity name '{name}'; expected one of agents, soul, user, identity"
+            "unknown identity name '{name}'; expected one of soul, user, identity"
         ))
     })?;
 

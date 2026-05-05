@@ -4,8 +4,8 @@
 
 The `workspace` crate is the single source of truth for Aura's workspace layout. It owns:
 
-- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for every workspace-relative file/dir name (`profile/`, `skills/`, `state/`, `work/`, `logs/`, `aura.json`, `.mcp.json`, `storage.db`, `aura.lock`, `channel.port`, `AGENTS.md` / `SOUL.md` / `USER.md` / `IDENTITY.md`, `code-builder/runs/`), the `AURA_CONFIG_PATH` env-var name, and the `default_workspace_root` / `default_config_file` / `aura_cache_root` resolvers.
-- **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the four identity documents and the workspace-skeleton initializer.
+- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for every workspace-relative file/dir name (`profile/`, `skills/`, `state/`, `work/`, `logs/`, `aura.json`, `.mcp.json`, `storage.db`, `aura.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `code-builder/runs/`), the `AURA_CONFIG_PATH` env-var name, and the `default_workspace_root` / `default_config_file` / `aura_cache_root` resolvers.
+- **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
 
 Pure-data consumers (e.g. `aura-config`, `aura-tools`, `aura-code-builder`) take this crate with `default-features = false` so they never inherit a transitive `tokio`/`anyhow` dependency just to read a path constant. Crates that actually drive workspace I/O (`aura-agent`, `aura-cli`, `aura-gateway`, the binary) depend on it with `features = ["io"]`.
 
@@ -34,7 +34,7 @@ checkout rather than polluting the real user home.
 | ---------------- | ------------------------------------------ |
 | config           | `<workspace.path>/config/aura.json`        |
 | MCP servers      | `<workspace.path>/config/.mcp.json`        |
-| identity files   | `<workspace.path>/profile/{AGENTS,SOUL,USER,IDENTITY}.md` |
+| identity files   | `<workspace.path>/profile/{SOUL,USER,IDENTITY}.md` |
 | skills           | `<workspace.path>/skills/`                 |
 | encryption key   | `<workspace.path>/.key/encryption.key`     |
 | storage          | `<workspace.path>/state/storage.db`        |
@@ -68,7 +68,6 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 ### Identity file responsibilities
 
-- **AGENTS.md**: runtime constraints, roles, and high-level rules
 - **SOUL.md**: personality, tone, and preferences
 - **USER.md**: long-term user profile
 - **IDENTITY.md**: system or instance identity description

@@ -1,5 +1,6 @@
 pub mod paths;
 pub use paths::{IdentityKind, WorkspacePaths};
+pub mod prompt;
 
 #[cfg(feature = "io")]
 pub mod identity;

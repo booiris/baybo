@@ -6,8 +6,6 @@ use crate::paths::WorkspacePaths;
 /// Contents of the workspace identity files.
 #[derive(Debug, Clone, Default)]
 pub struct IdentityFiles {
-    /// AGENTS.md - runtime constraints, roles, and high-level rules.
-    pub agents: Option<String>,
     /// SOUL.md - personality, tone, and preferences.
     pub soul: Option<String>,
     /// USER.md - long-term user profile.
@@ -46,20 +44,17 @@ pub async fn write_identity_file(
 /// Loads all identity files from the workspace `profile/` directory.
 pub async fn load_identity_files(root: &Path) -> anyhow::Result<IdentityFiles> {
     let paths = WorkspacePaths::new(root.to_path_buf());
-    let agents_path = paths.identity_file(IdentityKind::Agents);
     let soul_path = paths.identity_file(IdentityKind::Soul);
     let user_path = paths.identity_file(IdentityKind::User);
     let identity_path = paths.identity_file(IdentityKind::Identity);
 
-    let (agents, soul, user, identity) = tokio::try_join!(
-        read_optional_file(&agents_path),
+    let (soul, user, identity) = tokio::try_join!(
         read_optional_file(&soul_path),
         read_optional_file(&user_path),
         read_optional_file(&identity_path),
     )?;
 
     Ok(IdentityFiles {
-        agents,
         soul,
         user,
         identity,
@@ -110,7 +105,8 @@ mod tests {
 
         let files = load_identity_files(&dir).await.unwrap();
         assert_eq!(files.soul.as_deref(), Some("You are helpful."));
-        assert!(files.agents.is_none());
+        assert!(files.user.is_none());
+        assert!(files.identity.is_none());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
