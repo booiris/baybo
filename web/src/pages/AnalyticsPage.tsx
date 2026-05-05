@@ -239,9 +239,6 @@ export function AnalyticsPage() {
       <div className="mb-6 flex justify-between items-start gap-3 flex-wrap">
         <div>
           <h2 className="text-[1.7rem] font-bold uppercase -tracking-[0.05em] mb-1">ANALYTICS</h2>
-          <p className="text-ink-soft text-sm">
-            System consumption and per-model breakdown over the selected window.
-          </p>
         </div>
         <div className="flex items-center gap-3">
           <SelectBox
