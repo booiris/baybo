@@ -10,6 +10,7 @@ import {
   RiLoader4Line,
   RiRefreshLine,
   RiTeamLine,
+  RiMoneyDollarCircleLine,
 } from 'react-icons/ri';
 import type { IconType } from 'react-icons';
 import {
@@ -307,7 +308,7 @@ export function AnalyticsPage() {
             <MetricCard
               title="Total Cost"
               value={formatUsd(data.total_cost_usd)}
-              icon={RiCoinLine}
+              icon={RiMoneyDollarCircleLine}
               subtitle={`${data.total_record_count.toLocaleString()} LLM calls`}
             />
           </div>
