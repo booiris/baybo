@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use aura_model::{ArtifactSource, TrustLevel};
+use tracing::warn;
 
 use crate::validation::{normalize_line_endings, validate_skill_name, validate_skill_version};
-use crate::{SkillDefinition, SkillRequirements};
+use crate::{LinkedFiles, SkillDefinition, SkillRequirements, linked_files};
 
 /// Read `<dir>/SKILL.md` and build a `SkillDefinition` from it. The
 /// canonical directory path is recorded on the definition so downstream
@@ -34,6 +35,13 @@ pub fn load_skill_from_dir(dir: &Path) -> Result<SkillDefinition, String> {
         .to_string();
     let mut skill = parse_skill_md(&content, &default_name)?;
     skill.source_path = Some(dir.to_path_buf());
+    skill.linked_files = match linked_files::enumerate(dir) {
+        Ok(lf) => lf,
+        Err(err) => {
+            warn!(skill = %skill.name, dir = %dir.display(), error = %err, "linked-file enumeration failed; loading with empty inventory");
+            LinkedFiles::default()
+        }
+    };
     Ok(skill)
 }
 
@@ -110,6 +118,7 @@ pub fn parse_skill_md(content: &str, default_name: &str) -> Result<SkillDefiniti
         requirements: SkillRequirements::default(),
         token_budget_hint: 2048,
         source_path: None,
+        linked_files: LinkedFiles::default(),
     })
 }
 

@@ -16,19 +16,11 @@ use aura_tools::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use walkdir::WalkDir;
 
-use crate::{
-    MAX_SKILL_DIR_BYTES, MAX_SKILL_DIR_FILES, SkillDefinition, SkillGate, SkillRegistry,
-    SkillRiskCheck,
-};
+use crate::{SkillDefinition, SkillGate, SkillRegistry, SkillRiskCheck};
 
 const MAX_SUBFILE_BYTES: u64 = 256 * 1024;
 const MAX_ARGS_BYTES: usize = 4 * 1024;
-
-const REFERENCES: &str = "references";
-const TEMPLATES: &str = "templates";
-const SCRIPTS: &str = "scripts";
 
 pub fn build(
     registry: Arc<SkillRegistry>,
@@ -248,11 +240,6 @@ fn render_main(skill: &SkillDefinition, args: Option<&str>) -> aura_tools::Resul
     let dir = skill.source_path.as_deref();
     let path = dir.map(|d| d.join("SKILL.md"));
 
-    let linked = match dir {
-        Some(d) => enumerate_linked(d)?,
-        None => LinkedFiles::default(),
-    };
-
     let mut out = json!({
         "name": skill.name,
         "version": skill.version,
@@ -260,7 +247,7 @@ fn render_main(skill: &SkillDefinition, args: Option<&str>) -> aura_tools::Resul
         "content": skill.prompt_template,
         "skill_dir": dir.map(path_to_string),
         "path": path.as_deref().map(path_to_string),
-        "linked_files": linked.to_json(),
+        "linked_files": skill.linked_files.to_json(),
         "usage_hint": "To pull in a linked file, call this tool again with `file_path` set to a relative path returned in `linked_files`.",
     });
 
@@ -360,84 +347,6 @@ async fn resolve_subpath(skill_dir: &Path, rel: &str) -> Result<PathBuf, String>
     Ok(real_target)
 }
 
-#[derive(Default)]
-struct LinkedFiles {
-    references: Vec<String>,
-    templates: Vec<String>,
-    scripts: Vec<String>,
-    other: Vec<String>,
-}
-
-impl LinkedFiles {
-    fn to_json(&self) -> Value {
-        json!({
-            REFERENCES: self.references,
-            TEMPLATES: self.templates,
-            SCRIPTS: self.scripts,
-            "other": self.other,
-        })
-    }
-}
-
-fn enumerate_linked(skill_dir: &Path) -> aura_tools::Result<LinkedFiles> {
-    let mut out = LinkedFiles::default();
-    let mut total_bytes: u64 = 0;
-    let mut total_files: usize = 0;
-
-    for entry in WalkDir::new(skill_dir).follow_links(false).min_depth(1) {
-        let entry =
-            entry.map_err(|err| ToolError::Execution(format!("walk skill dir failed: {err}")))?;
-
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if entry.depth() == 1 && entry.file_name() == "SKILL.md" {
-            continue;
-        }
-
-        total_files += 1;
-        if total_files > MAX_SKILL_DIR_FILES {
-            return Err(ToolError::Execution(format!(
-                "skill directory contains more than {MAX_SKILL_DIR_FILES} files"
-            )));
-        }
-        if let Ok(meta) = entry.metadata() {
-            total_bytes = total_bytes.saturating_add(meta.len());
-            if total_bytes > MAX_SKILL_DIR_BYTES {
-                return Err(ToolError::Execution(format!(
-                    "skill directory exceeds {MAX_SKILL_DIR_BYTES} bytes"
-                )));
-            }
-        }
-
-        let rel = match entry.path().strip_prefix(skill_dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let rel_str = path_to_string(rel);
-        match top_level_dir(rel) {
-            Some(REFERENCES) => out.references.push(rel_str),
-            Some(TEMPLATES) => out.templates.push(rel_str),
-            Some(SCRIPTS) => out.scripts.push(rel_str),
-            _ => out.other.push(rel_str),
-        }
-    }
-
-    out.references.sort();
-    out.templates.sort();
-    out.scripts.sort();
-    out.other.sort();
-
-    Ok(out)
-}
-
-fn top_level_dir(rel: &Path) -> Option<&str> {
-    match rel.components().next()? {
-        std::path::Component::Normal(name) => name.to_str(),
-        _ => None,
-    }
-}
-
 fn path_to_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -452,7 +361,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{AlwaysPass, SkillRequirements};
+    use crate::{AlwaysPass, SkillRequirements, linked_files};
 
     fn mk_skill(dir: &Path, name: &str) -> SkillDefinition {
         SkillDefinition {
@@ -469,6 +378,7 @@ mod tests {
             requirements: SkillRequirements::default(),
             token_budget_hint: 0,
             source_path: Some(dir.to_path_buf()),
+            linked_files: linked_files::enumerate(dir).unwrap_or_default(),
         }
     }
 

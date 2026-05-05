@@ -416,6 +416,7 @@ mod tests {
             requirements: SkillRequirements::default(),
             token_budget_hint: 1024,
             source_path: None,
+            linked_files: Default::default(),
         }
     }
 

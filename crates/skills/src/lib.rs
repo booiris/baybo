@@ -1,4 +1,5 @@
 pub mod gate;
+pub mod linked_files;
 pub mod loader;
 pub mod registry;
 pub mod render;
@@ -6,6 +7,7 @@ pub mod tools;
 pub mod validation;
 
 pub use gate::{AlwaysPass, SkillGate, SkillRiskCheck};
+pub use linked_files::LinkedFiles;
 pub use registry::{
     SkillCandidate, SkillIssue, SkillIssueKind, SkillRegistry, SkillSummary, SkillValidation,
 };
@@ -52,6 +54,11 @@ pub struct SkillDefinition {
     /// scripts also invalidate the cached verdict on change.
     #[serde(default)]
     pub source_path: Option<std::path::PathBuf>,
+    /// Categorized helper-file inventory cached from `source_path` at
+    /// load time. Empty for inline-defined skills with no on-disk
+    /// directory; refreshed by [`SkillRegistry::reload`].
+    #[serde(default)]
+    pub linked_files: LinkedFiles,
 }
 
 /// Pre-execution requirements that must be satisfied.
