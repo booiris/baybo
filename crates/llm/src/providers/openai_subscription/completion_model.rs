@@ -225,8 +225,8 @@ impl OpenAiSubscriptionCompletionModel {
                 .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
             if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
                 return Err(CompletionError::ProviderError(
-                    "openai-subscription: unauthorized after refresh — run `aura llm auth login \
-                     --provider openai-subscription`"
+                    "openai-subscription: unauthorized after refresh — run `aura llm edit` \
+                     and pick `OAuth login (re-authenticate)` for this entry"
                         .into(),
                 ));
             }
@@ -263,8 +263,9 @@ impl OpenAiSubscriptionCompletionModel {
                     );
                 }
                 return Err(LlmError::Config(
-                    "openai-subscription: not signed in — run \
-                     `aura llm auth login --provider openai-subscription`"
+                    "openai-subscription: not signed in — add an entry via \
+                     `aura llm add` (pick the openai-subscription provider) or \
+                     re-authenticate an existing entry via `aura llm edit`"
                         .into(),
                 ));
             }
@@ -1724,7 +1725,7 @@ mod tests {
 
     /// Cache-hit path revalidates the vault every CACHE_VAULT_REVALIDATE_INTERVAL_SECS.
     /// Past the window, a missing vault entry invalidates the cached bundle
-    /// so a cross-process `aura llm auth logout` is honoured.
+    /// so a cross-process `aura llm remove` (which clears the vault entry) is honoured.
     #[tokio::test]
     async fn ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied() {
         use aura_security::{EncryptionKey, SecretVault};

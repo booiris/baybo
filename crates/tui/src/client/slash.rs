@@ -96,8 +96,8 @@ fn help_text() -> String {
          Tool approvals are resolved from the modal (a / A / d).\n\
          \n\
          Admin commands (status, config, jobs, skills, tools, memory,\n\
-         sessions, …) live in `aura cli` and are not reachable from the\n\
-         TUI.\n",
+         sessions, …) are reached via the `aura` CLI and are not\n\
+         reachable from the TUI.\n",
     )
 }
 

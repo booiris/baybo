@@ -113,8 +113,9 @@ pub trait ChannelPairingStore: Send + Sync {
     ///   * `Pending` rows whose `expires_at <= now_secs`, and
     ///   * `Approved` rows whose `approved_at < cutoff_secs`.
     /// Both classes are auth-flow ephemera — pending codes are
-    /// short-lived by nature, and an old approval is just a record of
-    /// a one-time grant, kept in `channel_bot` instead. Returns the
-    /// number of rows removed.
+    /// short-lived by nature, and an old approval is just a record
+    /// of a one-time grant; live access is established at
+    /// message-time via the channel route, not by retaining the
+    /// approval row. Returns the number of rows removed.
     async fn purge_expired(&self, now_secs: i64, approved_cutoff_secs: i64) -> Result<u64>;
 }

@@ -49,7 +49,7 @@ pub enum TraceEvent {
     },
     SpanEventEmitted(SpanEvent),
     /// Fired specifically by `end_span` for `SpanKind::LlmCall` so
-    /// `CostTracker` can subscribe and write cost rows asynchronously.
+    /// `CostSubscriber` can subscribe and write cost rows asynchronously.
     /// Carries everything `cost_records` needs, including the owning
     /// user (so `user_monthly_cost` rolls up per-user-per-month rather
     /// than collapsing every event into one (`""`, month) row).

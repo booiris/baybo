@@ -1,8 +1,8 @@
 //! [`DashboardProvider`] for the WS-backed TUI.
 //!
 //! The TUI's channel-surface no longer carries session CRUD (it's been
-//! folded back into `aura cli`), so every view here is rendered as an
-//! "admin-only" snapshot with a footer pointing the operator at the
+//! folded back into the `aura` CLI), so every view here is rendered as
+//! an "admin-only" snapshot with a footer pointing the operator at the
 //! CLI. The provider still exists so dashboard keybindings keep working
 //! and the user sees a clear message rather than an empty pane.
 
@@ -64,7 +64,7 @@ impl DashboardProvider for TuiDashboardProvider {
             title: title.into(),
             columns,
             rows: Vec::new(),
-            footer: Some("admin surface — use `aura cli` (not reachable over channel ws)".into()),
+            footer: Some("admin surface — use the `aura` CLI (not reachable over channel ws)".into()),
         }
     }
 }
