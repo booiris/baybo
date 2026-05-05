@@ -11,8 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aura_model::TrustLevel;
 use aura_tools::{
-    ApprovalDecision, NoticeLevel, ResourceAccess as ToolResourceAccess, Tool, ToolContext,
-    ToolError, ToolManifest, ToolOutput,
+    ApprovalDecision, NoticeLevel, ResourceAccess as ToolResourceAccess, Tool, ToolCapability,
+    ToolContext, ToolError, ToolManifest, ToolOutput,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -351,6 +351,230 @@ fn path_to_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+pub fn build_install_tool(
+    workspace_skills_dir: PathBuf,
+    registry: Arc<SkillRegistry>,
+    risk_check: Arc<dyn SkillRiskCheck>,
+) -> (Arc<dyn Tool>, ToolManifest) {
+    let tool: Arc<dyn Tool> = Arc::new(SkillInstallTool {
+        workspace_skills_dir,
+        registry,
+        risk_check,
+    });
+    let manifest = ToolManifest {
+        name: tool.name().to_string(),
+        description: tool.description().to_string(),
+        trust_level: TrustLevel::Trusted,
+        parameters_schema: tool.parameters_schema(),
+        capabilities: vec![ToolCapability::WriteFile],
+    };
+    (tool, manifest)
+}
+
+pub struct SkillInstallTool {
+    workspace_skills_dir: PathBuf,
+    registry: Arc<SkillRegistry>,
+    risk_check: Arc<dyn SkillRiskCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallParams {
+    source_dir: String,
+}
+
+#[async_trait]
+impl Tool for SkillInstallTool {
+    fn name(&self) -> &str {
+        "SkillInstall"
+    }
+
+    fn description(&self) -> &str {
+        "Install a skill from an on-disk directory into the workspace's \
+         skills folder. The directory must contain a valid SKILL.md; the \
+         skill is run through the risk assessor (Dangerous verdicts \
+         abort the install) and the registry is hot-reloaded so the new \
+         skill is available on the next turn. Refuses to overwrite an \
+         existing installation; the operator must remove the old copy \
+         first."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "source_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the skill source directory (must contain SKILL.md)."
+                }
+            },
+            "required": ["source_dir"]
+        })
+    }
+
+    fn accessed_resources(&self, _params: &Value) -> Vec<ToolResourceAccess> {
+        vec![ToolResourceAccess::WriteFile {
+            path: self.workspace_skills_dir.clone(),
+        }]
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        let p: InstallParams =
+            serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+
+        let source_dir = PathBuf::from(&p.source_dir);
+        let source_dir = tokio::fs::canonicalize(&source_dir)
+            .await
+            .map_err(|e| ToolError::InvalidParams(format!("source_dir `{}`: {e}", p.source_dir)))?;
+        let meta = tokio::fs::metadata(&source_dir)
+            .await
+            .map_err(|e| ToolError::InvalidParams(format!("stat source_dir: {e}")))?;
+        if !meta.is_dir() {
+            return Err(ToolError::InvalidParams(format!(
+                "`{}` is not a directory",
+                source_dir.display()
+            )));
+        }
+
+        // Reject before parsing if the source resolves into the
+        // workspace skills directory — operator pointed at an
+        // already-installed skill by mistake.
+        if let Ok(canonical_skills_root) = tokio::fs::canonicalize(&self.workspace_skills_dir).await
+            && source_dir.starts_with(&canonical_skills_root)
+        {
+            return Err(ToolError::InvalidParams(format!(
+                "source_dir `{}` is already inside the workspace skills directory",
+                source_dir.display()
+            )));
+        }
+
+        let skill = crate::loader::load_skill_from_dir(&source_dir)
+            .map_err(|e| ToolError::InvalidParams(format!("invalid skill source: {e}")))?;
+
+        let dest_dir = self.workspace_skills_dir.join(&skill.name);
+        if tokio::fs::try_exists(&dest_dir).await.unwrap_or(false) {
+            return Err(ToolError::Execution(format!(
+                "skill '{}' already installed at {}; remove it first",
+                skill.name,
+                dest_dir.display()
+            )));
+        }
+
+        let warning = match self.risk_check.assess(&skill).await {
+            SkillGate::Pass => None,
+            SkillGate::PassWithWarning { rationale } => {
+                emit_skill_notice(
+                    ctx,
+                    NoticeLevel::Warn,
+                    &skill.name,
+                    "rated suspicious",
+                    &rationale,
+                );
+                Some(rationale)
+            }
+            SkillGate::Block { rationale } => {
+                emit_skill_notice(ctx, NoticeLevel::Error, &skill.name, "blocked", &rationale);
+                return Err(ToolError::Denied {
+                    tool: self.name().to_string(),
+                    reason: format!(
+                        "skill '{}' blocked by risk assessor: {rationale}",
+                        skill.name
+                    ),
+                });
+            }
+        };
+
+        tokio::fs::create_dir_all(&self.workspace_skills_dir)
+            .await
+            .map_err(|e| ToolError::Execution(format!("ensure skills dir: {e}")))?;
+
+        // Stage to a sibling temp dir, then rename. Atomic on Unix:
+        // partial copies never expose a half-installed skill to the
+        // registry's reload scan.
+        let staging = self.workspace_skills_dir.join(format!(
+            ".{}.installing.{}",
+            skill.name,
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(e) = copy_dir_recursive(&source_dir, &staging).await {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(ToolError::Execution(format!("copy skill files: {e}")));
+        }
+        if let Err(e) = tokio::fs::rename(&staging, &dest_dir).await {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(ToolError::Execution(format!(
+                "rename {} -> {}: {e}",
+                staging.display(),
+                dest_dir.display()
+            )));
+        }
+
+        let reloaded = self.registry.reload();
+
+        let mut out = json!({
+            "name": skill.name,
+            "version": skill.version,
+            "installed_at": path_to_string(&dest_dir),
+            "registry_loaded": reloaded,
+            "linked_files": skill.linked_files.to_json(),
+        });
+        if let Some(w) = warning {
+            out["risk_warning"] = Value::String(w);
+        }
+        Ok(ToolOutput::Json(out))
+    }
+}
+
+async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut total_files: usize = 0;
+    let mut total_bytes: u64 = 0;
+    tokio::fs::create_dir_all(dst)
+        .await
+        .map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    let entries = walkdir::WalkDir::new(src).follow_links(false).min_depth(1);
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("walk {}: {e}", src.display()))?;
+        let rel = entry.path().strip_prefix(src).map_err(|e| e.to_string())?;
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            tokio::fs::create_dir_all(&target)
+                .await
+                .map_err(|e| format!("mkdir {}: {e}", target.display()))?;
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        total_files += 1;
+        if total_files > crate::MAX_SKILL_DIR_FILES {
+            return Err(format!(
+                "skill directory contains more than {} files",
+                crate::MAX_SKILL_DIR_FILES
+            ));
+        }
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        total_bytes = total_bytes.saturating_add(len);
+        if total_bytes > crate::MAX_SKILL_DIR_BYTES {
+            return Err(format!(
+                "skill directory exceeds {} bytes",
+                crate::MAX_SKILL_DIR_BYTES
+            ));
+        }
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        tokio::fs::copy(entry.path(), &target).await.map_err(|e| {
+            format!(
+                "copy {} -> {}: {e}",
+                entry.path().display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -598,5 +822,154 @@ mod tests {
             .block_on(tool.execute(json!({"skill": "demo"}), &mk_ctx()))
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied { .. }));
+    }
+
+    fn write_minimal_skill(dir: &Path, name: &str) {
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: t\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    fn install_tool(
+        skills_dir: &Path,
+        registry: Arc<SkillRegistry>,
+        risk: Arc<dyn SkillRiskCheck>,
+    ) -> SkillInstallTool {
+        SkillInstallTool {
+            workspace_skills_dir: skills_dir.to_path_buf(),
+            registry,
+            risk_check: risk,
+        }
+    }
+
+    #[tokio::test]
+    async fn install_copies_files_and_reloads() {
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        let source = tempdir().unwrap();
+        write_minimal_skill(source.path(), "axolotl");
+        fs::create_dir(source.path().join("references")).unwrap();
+        fs::write(source.path().join("references/a.md"), "ref").unwrap();
+
+        let registry = Arc::new(SkillRegistry::new());
+        registry.load_dir(&skills_dir);
+        let tool = install_tool(&skills_dir, Arc::clone(&registry), Arc::new(AlwaysPass));
+
+        let out = tool
+            .execute(
+                json!({"source_dir": source.path().to_str().unwrap()}),
+                &mk_ctx(),
+            )
+            .await
+            .unwrap();
+        let v = match out {
+            ToolOutput::Json(v) => v,
+            other => panic!("expected json, got {other:?}"),
+        };
+        assert_eq!(v["name"], "axolotl");
+        assert!(skills_dir.join("axolotl/SKILL.md").exists());
+        assert!(skills_dir.join("axolotl/references/a.md").exists());
+        assert!(registry.get("axolotl").is_some());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_overwrite() {
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        fs::create_dir(skills_dir.join("axolotl")).unwrap();
+        fs::write(skills_dir.join("axolotl/SKILL.md"), "x").unwrap();
+
+        let source = tempdir().unwrap();
+        write_minimal_skill(source.path(), "axolotl");
+
+        let registry = Arc::new(SkillRegistry::new());
+        let tool = install_tool(&skills_dir, registry, Arc::new(AlwaysPass));
+
+        let err = tool
+            .execute(
+                json!({"source_dir": source.path().to_str().unwrap()}),
+                &mk_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(msg) if msg.contains("already installed")),
+            "expected already-installed error",
+        );
+    }
+
+    #[tokio::test]
+    async fn install_blocks_on_dangerous_verdict() {
+        struct AlwaysBlock;
+        #[async_trait]
+        impl SkillRiskCheck for AlwaysBlock {
+            async fn assess(&self, _: &SkillDefinition) -> SkillGate {
+                SkillGate::Block {
+                    rationale: "smells like exfiltration".into(),
+                }
+            }
+        }
+
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        let source = tempdir().unwrap();
+        write_minimal_skill(source.path(), "demo");
+
+        let registry = Arc::new(SkillRegistry::new());
+        let tool = install_tool(&skills_dir, registry, Arc::new(AlwaysBlock));
+
+        let err = tool
+            .execute(
+                json!({"source_dir": source.path().to_str().unwrap()}),
+                &mk_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }));
+        assert!(!skills_dir.join("demo").exists());
+    }
+
+    #[tokio::test]
+    async fn install_invalid_source_returns_invalid_params() {
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        let source = tempdir().unwrap();
+        // No SKILL.md in source.
+        let registry = Arc::new(SkillRegistry::new());
+        let tool = install_tool(&skills_dir, registry, Arc::new(AlwaysPass));
+
+        let err = tool
+            .execute(
+                json!({"source_dir": source.path().to_str().unwrap()}),
+                &mk_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn install_rejects_source_inside_skills_dir() {
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        let source = skills_dir.join("foo");
+        fs::create_dir(&source).unwrap();
+        write_minimal_skill(&source, "foo");
+
+        let registry = Arc::new(SkillRegistry::new());
+        let tool = install_tool(&skills_dir, registry, Arc::new(AlwaysPass));
+
+        let err = tool
+            .execute(json!({"source_dir": source.to_str().unwrap()}), &mk_ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParams(_)));
     }
 }

@@ -321,8 +321,15 @@ pub async fn build_managers(
     {
         let risk_check: Arc<dyn aura_skills::SkillRiskCheck> = Arc::clone(&skill_assessor) as _;
         let (tool, manifest) =
-            aura_skills::build_skill_tool(Arc::clone(&skill_registry), risk_check);
+            aura_skills::build_skill_tool(Arc::clone(&skill_registry), Arc::clone(&risk_check));
         tool_registry.register(tool, manifest);
+
+        let (install_tool, install_manifest) = aura_skills::tools::build_install_tool(
+            workspace_paths.skills_dir(),
+            Arc::clone(&skill_registry),
+            risk_check,
+        );
+        tool_registry.register(install_tool, install_manifest);
     }
 
     // --- security gateway + tool executor
