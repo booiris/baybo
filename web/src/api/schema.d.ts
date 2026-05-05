@@ -379,10 +379,12 @@ export interface components {
             schedule: string;
             text: string;
             /**
-             * @description IANA timezone (e.g. `"Asia/Shanghai"`) the cron expression is
-             *     interpreted in. Defaults to `"UTC"` when omitted.
+             * @description IANA timezone (e.g. `"Asia/Shanghai"`) used to evaluate the cron
+             *     expression and to render time fields in responses. Required —
+             *     every time the API speaks is anchored to this zone, so callers
+             *     must commit to one explicitly.
              */
-            timezone?: string | null;
+            timezone: string;
             user_id: string;
         };
         /** @description Mirror of [`aura_cron::CronJob`]. */

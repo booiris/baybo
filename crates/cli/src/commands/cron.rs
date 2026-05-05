@@ -26,8 +26,9 @@ fn job_summary(j: &CronJob) -> Value {
         "schedule": j.schedule.display(),
         "one_shot": j.is_one_shot(),
         "status": j.status.as_str(),
-        "next_trigger_at": j.next_trigger_at.map(|t| t.to_rfc3339()),
-        "last_triggered_at": j.last_triggered_at.map(|t| t.to_rfc3339()),
+        "timezone": j.timezone,
+        "next_trigger_at": j.format_time_opt(j.next_trigger_at),
+        "last_triggered_at": j.format_time_opt(j.last_triggered_at),
     })
 }
 
@@ -57,8 +58,7 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
             j.user_id,
             j.status.as_str(),
             j.schedule.display(),
-            j.next_trigger_at
-                .map(|t| t.to_rfc3339())
+            j.format_time_opt(j.next_trigger_at)
                 .unwrap_or_else(|| "(disabled)".into()),
         ));
     }

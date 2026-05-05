@@ -1809,7 +1809,8 @@
         "required": [
           "schedule",
           "user_id",
-          "text"
+          "text",
+          "timezone"
         ],
         "properties": {
           "channel": {
@@ -1835,11 +1836,8 @@
             "type": "string"
           },
           "timezone": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "IANA timezone (e.g. `\"Asia/Shanghai\"`) the cron expression is\ninterpreted in. Defaults to `\"UTC\"` when omitted."
+            "type": "string",
+            "description": "IANA timezone (e.g. `\"Asia/Shanghai\"`) used to evaluate the cron\nexpression and to render time fields in responses. Required —\nevery time the API speaks is anchored to this zone, so callers\nmust commit to one explicitly."
           },
           "user_id": {
             "type": "string"

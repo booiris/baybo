@@ -4,13 +4,13 @@
 
 The `cron` crate defines domain types for scheduled recurring work: `CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `TriggerAction`, `ExecutionStatus`, and `CronError`. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs.
 
-CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Session resolution happens dynamically at trigger time in the agent layer. A `CronJob` also records its `origin_session_id` — the session that created it — purely for traceability; trigger-time session resolution is unaffected.
+CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Each fire mints a brand-new session in the agent layer — one trigger = one session — so the run sees a clean transcript and fresh `SessionState`. A `CronJob` also records its `origin_session_id` — the session that created it — purely for traceability; trigger-time session creation is unaffected.
 
 ## Design Decisions
 
 ### Bind to user_id + channel, not session_id
 
-Sessions are ephemeral (30-min default timeout). A cron job is a long-lived intent that must outlive any single session. Binding to `user_id + channel` provides a stable identity; the Router resolves or creates a session at trigger time using a deterministic session ID (`cron-{user_id}-{channel}`).
+Sessions are ephemeral (30-min default timeout). A cron job is a long-lived intent that must outlive any single session. Binding to `user_id + channel` provides a stable identity; the Router mints a fresh session per fire (UUID id, `TriggerSource::Cron { cron_job_id }` stamped at creation) and runs a one-shot actor that exits after `CronTrigger` + `Shutdown`. Continuity across fires lives in long-term memory, not in a shared mutable transcript — reusing one session would replay every prior fire's messages and `SessionState` into the next run.
 
 ### Pre-computed next_trigger_at
 

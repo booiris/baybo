@@ -199,10 +199,11 @@ pub struct CreateCronRequest {
     #[serde(default)]
     pub channel: Option<ChannelType>,
     pub text: String,
-    /// IANA timezone (e.g. `"Asia/Shanghai"`) the cron expression is
-    /// interpreted in. Defaults to `"UTC"` when omitted.
-    #[serde(default)]
-    pub timezone: Option<String>,
+    /// IANA timezone (e.g. `"Asia/Shanghai"`) used to evaluate the cron
+    /// expression and to render time fields in responses. Required —
+    /// every time the API speaks is anchored to this zone, so callers
+    /// must commit to one explicitly.
+    pub timezone: String,
     #[serde(default)]
     pub origin_session_id: Option<String>,
 }

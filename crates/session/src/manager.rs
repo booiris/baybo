@@ -48,13 +48,32 @@ impl SessionManager {
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
-        self.create_session_with_id(
-            SessionId::from(uuid::Uuid::new_v4().to_string()),
-            user,
-            channel,
-            TriggerSource::User,
-        )
-        .await
+        self.create_session_with_trigger(user, channel, TriggerSource::User)
+            .await
+    }
+
+    /// Mint a brand-new session with an explicit `TriggerSource`. Used
+    /// by the cron router so each fire gets an isolated session
+    /// (`TriggerSource::Cron { cron_job_id }` stamped at creation,
+    /// continuity across fires deferred to long-term memory rather
+    /// than a shared mutable transcript). The id is prefixed by trigger
+    /// kind (`cron-` / `system-`) so logs and admin listings can
+    /// recognize machine-triggered sessions at a glance; `User`
+    /// sessions stay bare-UUID.
+    pub async fn create_session_with_trigger(
+        &self,
+        user: User,
+        channel: ChannelType,
+        trigger: TriggerSource,
+    ) -> Result<Session> {
+        let prefix = match &trigger {
+            TriggerSource::User => "",
+            TriggerSource::Cron { .. } => "cron-",
+            TriggerSource::System { .. } => "system-",
+        };
+        let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        self.create_session_with_id(id, user, channel, trigger)
+            .await
     }
 
     /// Create a session that descends from `parent` via the given
@@ -131,36 +150,20 @@ impl SessionManager {
         user: User,
         channel: ChannelType,
     ) -> Result<Session> {
-        self.get_or_create_with_trigger(session_id, user, channel, TriggerSource::User)
-            .await
-    }
-
-    /// Like `get_or_create` but stamps a specific `TriggerSource` on
-    /// freshly-created sessions. The cron router uses this so that
-    /// `Job::start_job` lets `JobKind::Cron` jobs through the
-    /// `session.trigger.kind() == job.kind()` invariant. Existing
-    /// sessions are returned as-is — the trigger is locked at creation.
-    pub async fn get_or_create_with_trigger(
-        &self,
-        session_id: &SessionId,
-        user: User,
-        channel: ChannelType,
-        trigger: TriggerSource,
-    ) -> Result<Session> {
         if let Some(session) = self.store.get(session_id).await.map_err(wrap)? {
             let cutoff = Utc::now() - self.session_timeout;
             if session.last_active < cutoff {
                 debug!(session_id = %session_id, "session expired, replacing with new session");
                 self.store.delete(session_id).await.map_err(wrap)?;
                 return self
-                    .create_session_with_id(session_id.clone(), user, channel, trigger)
+                    .create_session_with_id(session_id.clone(), user, channel, TriggerSource::User)
                     .await;
             }
             debug!(session_id = %session_id, "returning existing session");
             return Ok(session);
         }
         debug!(session_id = %session_id, "session not found, creating new session");
-        self.create_session_with_id(session_id.clone(), user, channel, trigger)
+        self.create_session_with_id(session_id.clone(), user, channel, TriggerSource::User)
             .await
     }
 

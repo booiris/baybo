@@ -1,5 +1,6 @@
 use aura_model::{ApprovedResource, ChannelType};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,14 +18,13 @@ pub enum CronStatus {
     Executed,
 }
 
-/// Default IANA timezone applied to a `CronJob` when none was supplied.
-/// UTC keeps fire-time semantics deterministic across servers; callers
-/// (gateway, LLM tool, web form) all converge on this so the `serde`
-/// default and the create-path defaults agree.
-pub const DEFAULT_TIMEZONE: &str = "UTC";
-
+/// Storage backwards-compat default for the `timezone` field on
+/// `CronJob`. Rows persisted before this field existed deserialize
+/// with `"UTC"`, preserving their original behavior. Inputs no longer
+/// fall back to this — every entry point requires an explicit
+/// `timezone`.
 fn default_timezone() -> String {
-    DEFAULT_TIMEZONE.to_string()
+    "UTC".to_string()
 }
 
 impl CronStatus {
@@ -135,6 +135,30 @@ impl CronJob {
     pub fn is_one_shot(&self) -> bool {
         self.schedule.is_one_shot()
     }
+
+    /// Format a UTC instant as RFC3339 in this job's `timezone`.
+    /// Falls back to UTC (with a warn log) if the stored zone string
+    /// is unparseable — display must never blow up on a single bad
+    /// row, since the row was already accepted at creation time.
+    pub fn format_time(&self, dt: DateTime<Utc>) -> String {
+        match self.timezone.parse::<Tz>() {
+            Ok(tz) => dt.with_timezone(&tz).to_rfc3339(),
+            Err(e) => {
+                tracing::warn!(
+                    job_id = %self.id,
+                    timezone = %self.timezone,
+                    error = %e,
+                    "stored cron job has unparseable timezone; formatting as UTC",
+                );
+                dt.to_rfc3339()
+            }
+        }
+    }
+
+    /// Convenience for optional timestamps.
+    pub fn format_time_opt(&self, dt: Option<DateTime<Utc>>) -> Option<String> {
+        dt.map(|t| self.format_time(t))
+    }
 }
 
 // ── ExecutionStatus ──────────────────────────────────────────────────
@@ -182,6 +206,48 @@ pub struct CronExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job_with_tz(tz: &str) -> CronJob {
+        CronJob {
+            id: "cj-fmt".to_string(),
+            user_id: "u-1".to_string(),
+            channel: ChannelType::tui(),
+            schedule: CronSchedule::cron("0 9 * * *"),
+            action: TriggerAction::Prompt {
+                prompt: "fmt".to_string(),
+            },
+            timezone: tz.to_string(),
+            status: CronStatus::Enabled,
+            last_triggered_at: None,
+            next_trigger_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            origin_session_id: None,
+        }
+    }
+
+    #[test]
+    fn format_time_renders_with_offset() {
+        let dt: DateTime<Utc> = "2026-05-05T09:30:00Z".parse().unwrap();
+        assert_eq!(
+            job_with_tz("Asia/Shanghai").format_time(dt),
+            "2026-05-05T17:30:00+08:00"
+        );
+    }
+
+    #[test]
+    fn format_time_falls_back_to_utc_on_bad_zone() {
+        let dt: DateTime<Utc> = "2026-05-05T09:30:00Z".parse().unwrap();
+        assert_eq!(
+            job_with_tz("Mars/Olympus").format_time(dt),
+            "2026-05-05T09:30:00+00:00"
+        );
+    }
+
+    #[test]
+    fn format_time_opt_passes_through_none() {
+        assert!(job_with_tz("UTC").format_time_opt(None).is_none());
+    }
 
     #[test]
     fn serde_round_trip_cron() {

@@ -196,30 +196,32 @@ impl Router {
         self.supervisor.shutdown_all().await;
     }
 
-    /// Handle a cron trigger by resolving (or creating) a session for the
-    /// target user+channel combination and routing a `CronTrigger` message.
+    /// Handle a cron trigger by minting a fresh session and routing a
+    /// `CronTrigger` message into a one-shot actor.
+    ///
+    /// Each fire creates an isolated session so the trigger sees a
+    /// clean transcript and a fresh `SessionState` (no leaked
+    /// `approved_resources`, `active_skills`, or compression state
+    /// from prior fires). Continuity across fires belongs to memory +
+    /// skill loading, not to a shared mutable transcript.
+    ///
+    /// The spawned actor is intentionally NOT registered with the
+    /// supervisor: each cron session is one-shot and has no follow-up
+    /// traffic, so registering would just accumulate dangling actor
+    /// handles in the supervisor's map. We send `CronTrigger` followed
+    /// by `Shutdown`; the actor processes the trigger (FIFO), exits on
+    /// Shutdown, and its mailbox closes when this function returns and
+    /// drops the sender.
     async fn handle_cron_trigger(&mut self, event: CronTriggerEvent) -> anyhow::Result<()> {
-        // Stable session ID derived from user+channel so repeated cron
-        // triggers reuse a single session for conversational continuity.
-        let session_id = format!("cron-{}-{}", event.user_id, event.channel);
-
         let user = User {
             id: event.user_id.clone(),
             name: None,
             channel: event.channel.clone(),
         };
 
-        debug!(
-            session_id = %session_id,
-            job_id = %event.job_id,
-            "routing cron trigger"
-        );
-
-        let typed_session_id = SessionId::from(session_id.as_str());
         let session = self
             .session_manager
-            .get_or_create_with_trigger(
-                &typed_session_id,
+            .create_session_with_trigger(
                 user,
                 event.channel.clone(),
                 TriggerSource::Cron {
@@ -227,31 +229,37 @@ impl Router {
                 },
             )
             .await?;
+        let session_id = session.id.clone();
 
-        self.session_manager.touch(&typed_session_id).await?;
+        let Some(ref spawner) = self.actor_spawner else {
+            warn!(session_id = %session_id, "no actor spawner configured for cron trigger");
+            return Ok(());
+        };
 
-        let message = AgentMessage::CronTrigger {
+        debug!(
+            session_id = %session_id,
+            job_id = %event.job_id,
+            "routing cron trigger to fresh session"
+        );
+
+        let response_tx = self.supervisor.response_tx().clone();
+        let sender = spawner(session, response_tx, &self.actor_parent_token);
+
+        let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
             action: event.action,
         };
-
-        let routed = self.supervisor.route(&session_id, message.clone()).await;
-
-        if !routed {
-            if let Some(ref spawner) = self.actor_spawner {
-                info!(session_id = %session_id, "creating new actor for cron session");
-                let response_tx = self.supervisor.response_tx().clone();
-                let sender = spawner(session, response_tx, &self.actor_parent_token);
-                self.supervisor.register(session_id.clone(), sender);
-
-                if !self.supervisor.route(&session_id, message).await {
-                    warn!(session_id = %session_id, "failed to route cron trigger after actor creation");
-                }
-            } else {
-                warn!(session_id = %session_id, "no actor spawner configured for cron trigger");
-            }
+        if let Err(e) = sender.send(trigger_msg).await {
+            warn!(session_id = %session_id, error = %e, "failed to deliver cron trigger");
+            return Ok(());
         }
-
+        if let Err(e) = sender.send(AgentMessage::Shutdown).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to deliver post-trigger shutdown; actor will still exit when sender drops",
+            );
+        }
         Ok(())
     }
 
