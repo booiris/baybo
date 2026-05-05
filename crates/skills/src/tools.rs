@@ -140,7 +140,13 @@ impl Tool for SkillTool {
         let warning = match self.risk_check.assess(&skill).await {
             SkillGate::Pass => None,
             SkillGate::PassWithWarning { rationale } => {
-                emit_skill_notice(ctx, NoticeLevel::Warn, &skill.name, "rated suspicious", &rationale);
+                emit_skill_notice(
+                    ctx,
+                    NoticeLevel::Warn,
+                    &skill.name,
+                    "rated suspicious",
+                    &rationale,
+                );
                 Some(rationale)
             }
             SkillGate::Block { rationale } => {
@@ -180,7 +186,11 @@ fn emit_skill_notice(
     let Some(notifier) = ctx.notifier.as_ref() else {
         return;
     };
-    notifier.emit(level, &format!("Skill '{skill_name}' {headline}"), rationale);
+    notifier.emit(
+        level,
+        &format!("Skill '{skill_name}' {headline}"),
+        rationale,
+    );
 }
 
 async fn check_env_or_prompt(
@@ -375,8 +385,8 @@ fn enumerate_linked(skill_dir: &Path) -> aura_tools::Result<LinkedFiles> {
     let mut total_files: usize = 0;
 
     for entry in WalkDir::new(skill_dir).follow_links(false).min_depth(1) {
-        let entry = entry
-            .map_err(|err| ToolError::Execution(format!("walk skill dir failed: {err}")))?;
+        let entry =
+            entry.map_err(|err| ToolError::Execution(format!("walk skill dir failed: {err}")))?;
 
         if !entry.file_type().is_file() {
             continue;

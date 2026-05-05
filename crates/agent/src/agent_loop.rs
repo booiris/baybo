@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
 use aura_model::Session;
-use aura_skills::{SkillDefinition, SkillRegistry};
+use aura_skills::{SkillRegistry, SkillSummary};
 use aura_skills_assessor::SkillAssessor;
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
@@ -304,15 +304,14 @@ impl AgentLoop {
         // Bound to the *outer* delta_tx, not iter_delta_tx — notices
         // need to reach the channel on iter-2+ where streaming is
         // suppressed.
-        let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> =
-            delta_tx.as_ref().map(|tx| {
-                Arc::new(DeltaTxNotifier {
-                    tx: tx.clone(),
-                    session_id: session.id.to_string(),
-                    user_id: session.user.id.clone(),
-                    channel: session.channel.clone(),
-                }) as Arc<dyn aura_tools::SessionNotifier>
-            });
+        let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
+            Arc::new(DeltaTxNotifier {
+                tx: tx.clone(),
+                session_id: session.id.to_string(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+            }) as Arc<dyn aura_tools::SessionNotifier>
+        });
 
         // Recall relevant memories
         let memories = self
@@ -1419,9 +1418,9 @@ impl AgentLoop {
         }
     }
 
-    fn invocable_skills(&self) -> Vec<SkillDefinition> {
+    fn invocable_skills(&self) -> Vec<SkillSummary> {
         self.skill_registry
-            .all_sorted()
+            .all_summaries_sorted()
             .into_iter()
             .filter(|s| {
                 s.agent_invocable && !matches!(s.trust_level, aura_model::TrustLevel::Untrusted)
@@ -1430,7 +1429,7 @@ impl AgentLoop {
     }
 }
 
-fn build_skill_reminder(skills: &[SkillDefinition]) -> Option<String> {
+fn build_skill_reminder(skills: &[SkillSummary]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
@@ -1447,10 +1446,7 @@ fn build_skill_reminder(skills: &[SkillDefinition]) -> Option<String> {
     Some(s)
 }
 
-fn detect_slash_invocation(
-    user_text: &str,
-    skills: &[SkillDefinition],
-) -> Option<(String, String)> {
+fn detect_slash_invocation(user_text: &str, skills: &[SkillSummary]) -> Option<(String, String)> {
     let rest = user_text.trim_start().strip_prefix('/')?;
     let (cmd, args) = match rest.find(char::is_whitespace) {
         Some(idx) => (&rest[..idx], rest[idx..].trim().to_string()),
@@ -1469,10 +1465,7 @@ mod notifier_bridge_tests {
     use aura_channels::AgentOutput;
     use aura_tools::{NoticeLevel as ToolsNoticeLevel, SessionNotifier};
 
-    fn mk_notifier() -> (
-        DeltaTxNotifier,
-        tokio::sync::mpsc::Receiver<AgentOutput>,
-    ) {
+    fn mk_notifier() -> (DeltaTxNotifier, tokio::sync::mpsc::Receiver<AgentOutput>) {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let n = DeltaTxNotifier {
             tx,

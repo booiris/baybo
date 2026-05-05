@@ -6,7 +6,9 @@ pub mod tools;
 pub mod validation;
 
 pub use gate::{AlwaysPass, SkillGate, SkillRiskCheck};
-pub use registry::{SkillCandidate, SkillIssue, SkillIssueKind, SkillRegistry, SkillValidation};
+pub use registry::{
+    SkillCandidate, SkillIssue, SkillIssueKind, SkillRegistry, SkillSummary, SkillValidation,
+};
 pub use tools::build as build_skill_tool;
 
 /// Directory-level hard-reject thresholds shared between the

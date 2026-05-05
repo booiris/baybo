@@ -16,6 +16,35 @@ pub struct SkillCandidate {
     pub score: f64,
 }
 
+/// Lightweight projection over a [`SkillDefinition`] for callers that
+/// only need to display, list, or dispatch by name — agent loop's
+/// per-turn skill reminder and slash-command detector being the
+/// primary consumers. Cloning a full `SkillDefinition` every turn just
+/// to read four short fields was wasting `prompt_template` /
+/// `allowed_tools` / `requirements` allocations on every message.
+#[derive(Debug, Clone)]
+pub struct SkillSummary {
+    pub name: String,
+    pub command: Option<String>,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    pub agent_invocable: bool,
+    pub trust_level: aura_model::TrustLevel,
+}
+
+impl From<&SkillDefinition> for SkillSummary {
+    fn from(skill: &SkillDefinition) -> Self {
+        Self {
+            name: skill.name.clone(),
+            command: skill.command.clone(),
+            description: skill.description.clone(),
+            argument_hint: skill.argument_hint.clone(),
+            agent_invocable: skill.agent_invocable,
+            trust_level: skill.trust_level.clone(),
+        }
+    }
+}
+
 /// Central registry for skill definitions.
 ///
 /// Skills are loaded from workspace files or the extension registry.
@@ -143,6 +172,19 @@ impl SkillRegistry {
     /// Return every registered skill, sorted by name for stable operator output.
     pub fn all_sorted(&self) -> Vec<SkillDefinition> {
         let mut out: Vec<SkillDefinition> = self.skills.iter().map(|e| e.value().clone()).collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Lightweight equivalent of [`Self::all_sorted`] that skips
+    /// `prompt_template`/`allowed_tools`/`requirements` cloning.
+    /// Use for hot-path listings (per-turn reminder, slash dispatch).
+    pub fn all_summaries_sorted(&self) -> Vec<SkillSummary> {
+        let mut out: Vec<SkillSummary> = self
+            .skills
+            .iter()
+            .map(|e| SkillSummary::from(e.value()))
+            .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
