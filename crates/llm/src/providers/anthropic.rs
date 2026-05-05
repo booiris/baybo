@@ -57,7 +57,13 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         }
         .map_err(|e| crate::LlmError::Config(format!("failed to create Anthropic client: {e}")))?;
 
-        let model = client.completion_model(&config.model);
+        // rig's Anthropic model ships with caching off; without this the
+        // request omits cache_control breakpoints and Anthropic returns
+        // cached_input_tokens=0 / cache_creation_input_tokens=0 on every
+        // call. `with_prompt_caching` marks the system prompt + last
+        // message as ephemeral, which also caches the (tools, system,
+        // history) prefix on every subsequent turn.
+        let model = client.completion_model(&config.model).with_prompt_caching();
 
         let model_info = ModelInfo {
             id: config.model.clone(),
