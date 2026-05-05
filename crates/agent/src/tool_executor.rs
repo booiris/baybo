@@ -36,6 +36,74 @@ const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
 /// the other.
 const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
 
+/// Cap on the failure-reason string we copy out of a `ToolOutput::Error`
+/// payload. The full text is still preserved verbatim in the span's
+/// `result.output`; this bound only governs the row-level reason label.
+const FAILURE_REASON_MAX_BYTES: usize = 512;
+
+fn truncate_for_reason(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &s[..cut])
+}
+
+/// Project a [`ToolOutput`] into a trace-friendly JSON value.
+///
+/// We can't just `serde_json::to_value(&output)` because `ToolOutput`
+/// is `#[serde(tag = "type")]` (internally tagged) but `Text(String)`,
+/// `Error(String)`, and `Json(<non-object>)` are tuple variants whose
+/// content can't host the injected `type` tag — serde returns
+/// "cannot serialize tagged newtype variant … containing a string"
+/// and the previous `.unwrap_or(Value::Null)` quietly stored `null`,
+/// so the trace UI's Output panel was empty for every text-returning
+/// tool (browser/*, WebFetch text, etc.). The struct variants and
+/// `Json(Object)` are unaffected — those are the cases that previously
+/// rendered correctly (e.g. `NowTool` returns `Json({...})`), so we
+/// preserve their on-disk shape verbatim.
+fn tool_output_to_trace_value(output: &ToolOutput) -> Value {
+    use serde_json::Map;
+    match output {
+        ToolOutput::Text(s) => {
+            let mut m = Map::new();
+            m.insert("type".into(), Value::String("text".into()));
+            m.insert("text".into(), Value::String(s.clone()));
+            Value::Object(m)
+        }
+        ToolOutput::Error(s) => {
+            let mut m = Map::new();
+            m.insert("type".into(), Value::String("error".into()));
+            m.insert("error".into(), Value::String(s.clone()));
+            Value::Object(m)
+        }
+        ToolOutput::Json(v) => match v {
+            Value::Object(map) => {
+                // Match the existing on-disk shape: type-tag injected
+                // into the inner object alongside the original fields.
+                let mut m = map.clone();
+                m.insert("type".into(), Value::String("json".into()));
+                Value::Object(m)
+            }
+            _ => {
+                let mut m = Map::new();
+                m.insert("type".into(), Value::String("json".into()));
+                m.insert("value".into(), v.clone());
+                Value::Object(m)
+            }
+        },
+        ToolOutput::WithAttachments { .. } | ToolOutput::MultiModalText { .. } => {
+            // Struct variants serialize correctly under
+            // `#[serde(tag = "type")]`; defer to the derive so we
+            // keep the historical shape exactly.
+            serde_json::to_value(output).unwrap_or(Value::Null)
+        }
+    }
+}
+
 /// Executes tools with trust-level validation, approval gating, and
 /// observability recording.
 pub struct ToolExecutor {
@@ -314,14 +382,30 @@ impl ToolExecutor {
                             .sanitize_tool_output(&mut output)
                             .await
                             .map_err(|e| anyhow::anyhow!("sanitize_tool_output: {e}"))?;
-                        let output_value = serde_json::to_value(&output).unwrap_or(Value::Null);
+                        let output_value = tool_output_to_trace_value(&output);
                         let success = !matches!(output, ToolOutput::Error(_));
                         let outcome = if success {
                             LifecycleOutcome::Ok
                         } else {
-                            LifecycleOutcome::Failed {
-                                reason: "tool returned error output".into(),
-                            }
+                            // Surface the actual error text in the
+                            // outcome reason so the trace row label
+                            // ("failed: …") is informative without
+                            // having to drill into the Output panel.
+                            // The body has already been sanitized by
+                            // sanitize_tool_output above; we only
+                            // truncate for display sanity.
+                            let reason = match &output {
+                                ToolOutput::Error(s) => {
+                                    let trimmed = s.trim();
+                                    if trimmed.is_empty() {
+                                        "tool returned empty error output".to_string()
+                                    } else {
+                                        truncate_for_reason(trimmed, FAILURE_REASON_MAX_BYTES)
+                                    }
+                                }
+                                _ => "tool returned error output".to_string(),
+                            };
+                            LifecycleOutcome::Failed { reason }
                         };
                         Ok((
                             SpanFinalize::ToolCall(ToolCallResult {
@@ -360,5 +444,52 @@ impl ToolExecutor {
             },
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn trace_value_preserves_text_payload() {
+        let v = tool_output_to_trace_value(&ToolOutput::Text("hello world".into()));
+        assert_eq!(v, json!({ "type": "text", "text": "hello world" }));
+    }
+
+    #[test]
+    fn trace_value_preserves_error_payload() {
+        let v = tool_output_to_trace_value(&ToolOutput::Error("read_page failed: …".into()));
+        assert_eq!(
+            v,
+            json!({ "type": "error", "error": "read_page failed: …" })
+        );
+    }
+
+    #[test]
+    fn trace_value_preserves_json_object_shape() {
+        // NowTool-shaped output: an object payload. The historical
+        // shape — type tag flattened into the inner map — is what the
+        // web UI is already showing for spans like Now, so changing
+        // it would invalidate older traces.
+        let v = tool_output_to_trace_value(&ToolOutput::Json(json!({
+            "utc": "2026-01-01T00:00:00Z",
+            "timezone": "UTC",
+        })));
+        assert_eq!(
+            v,
+            json!({
+                "type": "json",
+                "utc": "2026-01-01T00:00:00Z",
+                "timezone": "UTC",
+            })
+        );
+    }
+
+    #[test]
+    fn trace_value_wraps_non_object_json_payload() {
+        let v = tool_output_to_trace_value(&ToolOutput::Json(json!("scalar")));
+        assert_eq!(v, json!({ "type": "json", "value": "scalar" }));
     }
 }
