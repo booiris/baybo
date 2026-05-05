@@ -483,18 +483,16 @@ impl Tool for SkillInstallTool {
             }
         };
 
-        tokio::fs::create_dir_all(&self.workspace_skills_dir)
+        // Stage at depth 2 (`<skills_dir>/.staging/<uuid>/`) rather
+        // than alongside `<skills_dir>/<name>/`. `SkillRegistry::scan_dir`
+        // only inspects depth-1 children for `SKILL.md`, so a leaked
+        // staging tree (process killed between copy and rename) won't
+        // be loaded as a phantom skill on the next reload.
+        let staging_root = self.workspace_skills_dir.join(".staging");
+        tokio::fs::create_dir_all(&staging_root)
             .await
-            .map_err(|e| ToolError::Execution(format!("ensure skills dir: {e}")))?;
-
-        // Stage to a sibling temp dir, then rename. Atomic on Unix:
-        // partial copies never expose a half-installed skill to the
-        // registry's reload scan.
-        let staging = self.workspace_skills_dir.join(format!(
-            ".{}.installing.{}",
-            skill.name,
-            uuid::Uuid::new_v4()
-        ));
+            .map_err(|e| ToolError::Execution(format!("ensure staging dir: {e}")))?;
+        let staging = staging_root.join(uuid::Uuid::new_v4().to_string());
         if let Err(e) = copy_dir_recursive(&source_dir, &staging).await {
             let _ = tokio::fs::remove_dir_all(&staging).await;
             return Err(ToolError::Execution(format!("copy skill files: {e}")));
@@ -1072,6 +1070,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn leaked_staging_dir_is_not_loaded_by_registry() {
+        // Simulates a crash mid-install: a fully-copied skill tree
+        // sits under `<skills_dir>/.staging/<uuid>/` because the
+        // rename never happened. `SkillRegistry::reload()` must NOT
+        // pick it up (only depth-1 children of skills_dir get
+        // scanned for SKILL.md).
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        let staging = skills_dir.join(".staging").join("abc-123");
+        fs::create_dir_all(&staging).unwrap();
+        write_minimal_skill(&staging, "phantom");
+
+        let registry = Arc::new(SkillRegistry::new());
+        let loaded = registry.load_dir(&skills_dir);
+        assert_eq!(loaded, 0, "leaked staging tree must not register");
+        assert!(registry.get("phantom").is_none());
     }
 
     #[tokio::test]
