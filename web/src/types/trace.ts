@@ -39,7 +39,6 @@ export function isTerminal(state: LifecycleState): boolean {
 
 export type StepKind =
   | { kind: 'llm_iteration' }
-  | { kind: 'tool_direct' }
   | { kind: 'compression' }
   | { kind: 'memory_recall' }
   | { kind: 'memory_write' }

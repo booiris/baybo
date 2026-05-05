@@ -10,7 +10,7 @@ use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{CronSchedule, CronScheduler, TriggerAction};
+use crate::{CronSchedule, CronScheduler};
 
 /// Parse an `at` parameter accepting either RFC3339 with offset
 /// (`2026-04-17T14:25:00Z` or `2026-04-17T22:25:00+08:00`) or a naive
@@ -88,10 +88,7 @@ struct CreateParams {
     schedule: Option<String>,
     #[serde(default)]
     at: Option<String>,
-    prompt: Option<String>,
-    tool: Option<String>,
-    #[serde(default)]
-    params: Option<Value>,
+    prompt: String,
     timezone: String,
 }
 
@@ -102,13 +99,12 @@ impl Tool for CronCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule a cron job. `timezone` is required — every time in \
-         inputs and outputs is anchored to it. Exactly one of `schedule` \
-         (recurring cron expression, e.g. \"0 9 * * *\") or `at` (one-shot \
-         timestamp) is required — `at` jobs fire once then auto-delete. \
-         Exactly one of `prompt` (sends text through the LLM on trigger) \
-         or `tool` (directly invokes a registered tool, with optional \
-         `params`) is required."
+        "Schedule a cron job. `timezone` and `prompt` are required — \
+         every fire sends `prompt` through the LLM, and every time in \
+         inputs and outputs is anchored to `timezone`. Exactly one of \
+         `schedule` (recurring cron expression, e.g. \"0 9 * * *\") or \
+         `at` (one-shot timestamp) is required — `at` jobs fire once \
+         then auto-delete."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -117,30 +113,22 @@ impl Tool for CronCreateTool {
             "properties": {
                 "timezone": {
                     "type": "string",
-                    "description": "IANA timezone (e.g. \"Asia/Shanghai\", \"UTC\") used to evaluate `schedule`, interpret naive `at`, and render `next_trigger_at` in the output. Required."
-                },
-                "schedule": {
-                    "type": "string",
-                    "description": "Recurring cron expression evaluated in `timezone` (mutually exclusive with `at`)"
-                },
-                "at": {
-                    "type": "string",
-                    "description": "One-shot timestamp. Either RFC3339 with offset (e.g. \"2026-04-17T14:25:00Z\" or \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS` interpreted in `timezone`. Fires once and auto-deletes. Mutually exclusive with `schedule`."
+                    "description": "IANA timezone (e.g. \"Asia/Shanghai\", \"UTC\") used to evaluate `schedule`, interpret naive `at`, and render `next_trigger_at` in the output."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Prompt text sent to the LLM on each trigger (mutually exclusive with `tool`)"
+                    "description": "Prompt text sent through the LLM on each trigger."
                 },
-                "tool": {
+                "schedule": {
                     "type": "string",
-                    "description": "Registered tool name to invoke directly (mutually exclusive with `prompt`)"
+                    "description": "Recurring cron expression evaluated in `timezone`. Supply exactly one of `schedule` or `at`."
                 },
-                "params": {
-                    "type": "object",
-                    "description": "JSON parameters for the tool (requires `tool`)"
+                "at": {
+                    "type": "string",
+                    "description": "One-shot timestamp; fires once then auto-deletes. Either RFC3339 with offset (e.g. \"2026-04-17T14:25:00Z\" or \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS` interpreted in `timezone`. Supply exactly one of `schedule` or `at`."
                 }
             },
-            "required": ["timezone"]
+            "required": ["timezone", "prompt"]
         })
     }
 
@@ -165,27 +153,13 @@ impl Tool for CronCreateTool {
             }
         };
 
-        let action = match p.tool {
-            Some(tool_name) => TriggerAction::ToolCall {
-                tool_name,
-                params: p.params.unwrap_or(json!({})),
-                approved_resources: Vec::new(),
-            },
-            None => {
-                let text = p.prompt.ok_or_else(|| {
-                    ToolError::InvalidParams("either `prompt` or `tool` is required".into())
-                })?;
-                TriggerAction::Prompt { prompt: text }
-            }
-        };
-
         let job = self
             .scheduler
             .create_job(
                 &ctx.user.id,
                 ctx.user.channel.clone(),
                 schedule,
-                action,
+                p.prompt,
                 timezone,
                 Some(ctx.session_id.clone()),
             )

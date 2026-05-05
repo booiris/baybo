@@ -25,7 +25,6 @@ Steps cannot nest. Spans within a Step can be parallel (siblings sharing a `para
 ```rust
 pub enum StepKind {
     LlmIteration,
-    ToolDirect,
     Compression,
     MemoryRecall,
     MemoryWrite,

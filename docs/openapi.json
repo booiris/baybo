@@ -302,16 +302,13 @@
                           "user_id",
                           "channel",
                           "schedule",
-                          "action",
+                          "prompt",
                           "timezone",
                           "status",
                           "created_at",
                           "updated_at"
                         ],
                         "properties": {
-                          "action": {
-                            "$ref": "#/components/schemas/TriggerAction"
-                          },
                           "channel": {
                             "$ref": "#/components/schemas/ChannelType"
                           },
@@ -341,6 +338,9 @@
                               "string",
                               "null"
                             ]
+                          },
+                          "prompt": {
+                            "type": "string"
                           },
                           "schedule": {
                             "$ref": "#/components/schemas/CronSchedule"
@@ -1722,83 +1722,6 @@
           }
         }
       },
-      "ApprovedResource": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "path",
-              "kind"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "read_file"
-                ]
-              },
-              "path": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "path",
-              "kind"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "write_file"
-                ]
-              },
-              "path": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "host",
-              "kind"
-            ],
-            "properties": {
-              "host": {
-                "$ref": "#/components/schemas/HostPattern"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "http"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "command",
-              "kind"
-            ],
-            "properties": {
-              "command": {
-                "type": "string"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "exec_command"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "Mirror of [`aura_model::ApprovedResource`]. Paths serialize as\nstrings on the wire."
-      },
       "ChannelType": {
         "type": "string",
         "description": "Admin-surface mirror of [`aura_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
@@ -1852,16 +1775,13 @@
           "user_id",
           "channel",
           "schedule",
-          "action",
+          "prompt",
           "timezone",
           "status",
           "created_at",
           "updated_at"
         ],
         "properties": {
-          "action": {
-            "$ref": "#/components/schemas/TriggerAction"
-          },
           "channel": {
             "$ref": "#/components/schemas/ChannelType"
           },
@@ -1891,6 +1811,9 @@
               "string",
               "null"
             ]
+          },
+          "prompt": {
+            "type": "string"
           },
           "schedule": {
             "$ref": "#/components/schemas/CronSchedule"
@@ -1972,47 +1895,6 @@
             "type": "string"
           }
         }
-      },
-      "HostPattern": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "value",
-              "kind"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "exact"
-                ]
-              },
-              "value": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "value",
-              "kind"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "wildcard"
-                ]
-              },
-              "value": {
-                "type": "string"
-              }
-            }
-          }
-        ],
-        "description": "Mirror of [`aura_model::HostPattern`]."
       },
       "Job": {
         "type": "object",
@@ -2481,58 +2363,6 @@
             "minimum": 0
           }
         }
-      },
-      "TriggerAction": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "prompt",
-              "kind"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "prompt"
-                ]
-              },
-              "prompt": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "tool_name",
-              "params",
-              "approved_resources",
-              "kind"
-            ],
-            "properties": {
-              "approved_resources": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/ApprovedResource"
-                }
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "tool_call"
-                ]
-              },
-              "params": {
-                "type": "object"
-              },
-              "tool_name": {
-                "type": "string"
-              }
-            }
-          }
-        ],
-        "description": "Mirror of [`aura_cron::TriggerAction`]."
       },
       "UnsetConfigRequest": {
         "type": "object",

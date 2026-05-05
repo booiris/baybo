@@ -5,7 +5,6 @@ import {
   RiRefreshLine,
   RiEyeLine,
   RiTimeLine,
-  RiTerminalLine,
   RiChatSmile2Line,
   RiLoader4Line,
   RiDeleteBinLine,
@@ -123,9 +122,8 @@ export function CronPage() {
     if (debouncedFilter.trim()) {
       const q = debouncedFilter.toLowerCase().trim();
       const matchId = item.id.toLowerCase().includes(q);
-      const matchPrompt = item.action.kind === 'prompt' && item.action.prompt.toLowerCase().includes(q);
-      const matchTool = item.action.kind === 'tool_call' && item.action.tool_name.toLowerCase().includes(q);
-      if (!matchId && !matchPrompt && !matchTool) return false;
+      const matchPrompt = item.prompt.toLowerCase().includes(q);
+      if (!matchId && !matchPrompt) return false;
     }
     
     return true;
@@ -327,14 +325,8 @@ export function CronPage() {
                     </td>
                     <td className={cell}>
                       <div className="flex items-center gap-2">
-                        {job.action.kind === 'prompt' ? (
-                          <RiChatSmile2Line className="text-brand shrink-0 text-lg" />
-                        ) : (
-                          <RiTerminalLine className="text-warn shrink-0 text-lg" />
-                        )}
-                        <span className="text-[0.9rem] line-clamp-1">
-                          {job.action.kind === 'prompt' ? job.action.prompt : job.action.tool_name}
-                        </span>
+                        <RiChatSmile2Line className="text-brand shrink-0 text-lg" />
+                        <span className="text-[0.9rem] line-clamp-1">{job.prompt}</span>
                       </div>
                     </td>
                     <td className={cell}>
@@ -514,15 +506,9 @@ function CronDetailModal({
           </div>
 
           <div>
-            <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">Action ({job.action.kind})</label>
+            <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">Prompt</label>
             <div className="bg-gray-50 border-2 border-black rounded-md px-4 py-3 font-mono text-[0.9rem]">
-              {job.action.kind === 'prompt' ? (
-                <div>{job.action.prompt}</div>
-              ) : (
-                <pre className="whitespace-pre-wrap">
-                  {job.action.tool_name}({JSON.stringify(job.action.params, null, 2)})
-                </pre>
-              )}
+              {job.prompt}
             </div>
           </div>
 

@@ -594,7 +594,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 let actor = AgentActor::new(
                     session,
                     agent_loop,
-                    Arc::clone(&tool_executor),
                     response_tx,
                     Arc::clone(&job_lifecycle),
                     span_recorder,

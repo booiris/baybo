@@ -10,9 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::error::CronError;
-use crate::job::{
-    CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus, TriggerAction,
-};
+use crate::job::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
 use crate::shutdown::Shutdown;
 
 // ── Error bridging ────────────────────────────────────────────────────
@@ -86,7 +84,7 @@ pub struct CronTriggerEvent {
     pub job_id: String,
     pub user_id: String,
     pub channel: ChannelType,
-    pub action: TriggerAction,
+    pub prompt: String,
     /// The session that originally registered the cron job (if any).
     /// Symmetric to `create_spawned_session` lineage: lets the
     /// downstream actor stamp `TriggerSource::Cron { origin_session_id }`
@@ -132,10 +130,11 @@ impl CronScheduler {
         user_id: &str,
         channel: ChannelType,
         schedule: CronSchedule,
-        action: TriggerAction,
+        prompt: impl Into<String>,
         timezone: String,
         origin_session_id: Option<String>,
     ) -> Result<CronJob> {
+        let prompt = prompt.into();
         validate_schedule(&schedule)?;
         let tz = parse_timezone(&timezone)?;
 
@@ -154,7 +153,7 @@ impl CronScheduler {
             user_id: user_id.to_string(),
             channel,
             schedule,
-            action,
+            prompt,
             timezone,
             status: CronStatus::Enabled,
             last_triggered_at: None,
@@ -332,7 +331,7 @@ impl CronScheduler {
             user_id: job.user_id.clone(),
             channel: job.channel.clone(),
             schedule: job.schedule.clone(),
-            action: job.action.clone(),
+            prompt: job.prompt.clone(),
             scheduled_fire_time: now,
             triggered_at: now,
             status: ExecutionStatus::Pending,
@@ -349,7 +348,7 @@ impl CronScheduler {
             job_id: execution.job_id.clone(),
             user_id: execution.user_id.clone(),
             channel: execution.channel.clone(),
-            action: execution.action.clone(),
+            prompt: execution.prompt.clone(),
             origin_session_id: execution.origin_session_id.clone(),
         };
 
@@ -438,7 +437,7 @@ impl CronScheduler {
                 job_id: exec.job_id.clone(),
                 user_id: exec.user_id.clone(),
                 channel: exec.channel,
-                action: exec.action.clone(),
+                prompt: exec.prompt.clone(),
                 origin_session_id: exec.origin_session_id.clone(),
             };
 
@@ -507,7 +506,7 @@ impl CronScheduler {
                 user_id: job.user_id.clone(),
                 channel: job.channel.clone(),
                 schedule: job.schedule.clone(),
-                action: job.action.clone(),
+                prompt: job.prompt.clone(),
                 scheduled_fire_time,
                 triggered_at: now,
                 origin_session_id: job.origin_session_id.clone(),
@@ -545,7 +544,7 @@ impl CronScheduler {
                 job_id: execution.job_id.clone(),
                 user_id: execution.user_id.clone(),
                 channel: execution.channel,
-                action: execution.action.clone(),
+                prompt: execution.prompt.clone(),
                 origin_session_id: execution.origin_session_id.clone(),
             };
 
@@ -827,9 +826,7 @@ mod tests {
                 user_id,
                 ChannelType::tui(),
                 CronSchedule::cron(expr),
-                TriggerAction::Prompt {
-                    prompt: prompt.to_string(),
-                },
+                prompt,
                 "UTC".to_string(),
                 None,
             )
@@ -856,9 +853,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::at(fire_at),
-                TriggerAction::Prompt {
-                    prompt: "later".into(),
-                },
+                "later",
                 "UTC".to_string(),
                 None,
             )
@@ -877,9 +872,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::at(past),
-                TriggerAction::Prompt {
-                    prompt: "too late".into(),
-                },
+                "too late",
                 "UTC".to_string(),
                 None,
             )
@@ -896,9 +889,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::cron("not a cron"),
-                TriggerAction::Prompt {
-                    prompt: "test".to_string(),
-                },
+                "test",
                 "UTC".to_string(),
                 None,
             )
@@ -919,9 +910,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::cron("0 9 * * *"),
-                TriggerAction::Prompt {
-                    prompt: "morning".into(),
-                },
+                "morning",
                 "Asia/Shanghai".to_string(),
                 None,
             )
@@ -940,7 +929,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::cron("0 9 * * *"),
-                TriggerAction::Prompt { prompt: "x".into() },
+                "x",
                 "Mars/Olympus_Mons".to_string(),
                 None,
             )
@@ -974,9 +963,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::at(fire_at),
-                TriggerAction::Prompt {
-                    prompt: "later".into(),
-                },
+                "later",
                 "UTC".to_string(),
                 None,
             )
@@ -1017,10 +1004,7 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.job_id, job.id);
-        assert!(matches!(
-            &event.action,
-            TriggerAction::Prompt { prompt } if prompt == "every minute"
-        ));
+        assert_eq!(event.prompt, "every minute");
 
         // Verify next_trigger_at was advanced
         let updated_row = scheduler.store.get(&job.id).await.unwrap().unwrap();
@@ -1074,9 +1058,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::at(fire_at),
-                TriggerAction::Prompt {
-                    prompt: "run once".into(),
-                },
+                "run once",
                 "UTC".to_string(),
                 None,
             )
@@ -1118,9 +1100,7 @@ mod tests {
             user_id: "u1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::cron("0 9 * * *"),
-            action: TriggerAction::Prompt {
-                prompt: "test".to_string(),
-            },
+            prompt: "test".to_string(),
             timezone: "UTC".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
@@ -1186,9 +1166,7 @@ mod tests {
             user_id: "u1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::cron("* * * * *"),
-            action: TriggerAction::Prompt {
-                prompt: "recover me".to_string(),
-            },
+            prompt: "recover me".to_string(),
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,
@@ -1203,10 +1181,7 @@ mod tests {
         // The pending execution was re-dispatched
         let event = rx.try_recv().unwrap();
         assert_eq!(event.job_id, "cj-1");
-        assert!(matches!(
-            &event.action,
-            TriggerAction::Prompt { prompt } if prompt == "recover me"
-        ));
+        assert_eq!(event.prompt, "recover me");
 
         // Status updated to dispatched
         let execs = scheduler
@@ -1249,10 +1224,7 @@ mod tests {
 
         let got = scheduler.get_job(&created.id).await.unwrap().unwrap();
         assert_eq!(got.id, created.id);
-        assert!(matches!(
-            &got.action,
-            TriggerAction::Prompt { prompt } if prompt == "fetch me"
-        ));
+        assert_eq!(got.prompt, "fetch me");
     }
 
     #[tokio::test]
@@ -1267,10 +1239,7 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.job_id, job.id);
-        assert!(matches!(
-            &event.action,
-            TriggerAction::Prompt { prompt } if prompt == "manual fire"
-        ));
+        assert_eq!(event.prompt, "manual fire");
 
         // Recurring job preserved, schedule unchanged.
         let fetched = scheduler.get_job(&job.id).await.unwrap().unwrap();
@@ -1292,9 +1261,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::at(fire_at),
-                TriggerAction::Prompt {
-                    prompt: "manual one-shot".into(),
-                },
+                "manual one-shot",
                 "UTC".to_string(),
                 None,
             )
@@ -1330,9 +1297,7 @@ mod tests {
                 "u1",
                 ChannelType::tui(),
                 CronSchedule::at(future),
-                TriggerAction::Prompt {
-                    prompt: "lineage carries".into(),
-                },
+                "lineage carries",
                 "UTC".to_string(),
                 Some("sess-creator".into()),
             )
@@ -1351,9 +1316,7 @@ mod tests {
             user_id: "u1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::cron("0 9 * * *"),
-            action: TriggerAction::Prompt {
-                prompt: "test".to_string(),
-            },
+            prompt: "test".to_string(),
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,

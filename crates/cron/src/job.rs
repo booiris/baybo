@@ -1,8 +1,7 @@
-use aura_model::{ApprovedResource, ChannelType};
+use aura_model::ChannelType;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Lifecycle state of a cron job row.
 ///
@@ -79,21 +78,6 @@ impl CronSchedule {
     }
 }
 
-/// What to do when a cron job fires.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TriggerAction {
-    /// Send prompt through the full agent loop (LLM).
-    Prompt { prompt: String },
-    /// Directly invoke a registered tool. Falls back to LLM on failure.
-    ToolCall {
-        tool_name: String,
-        params: Value,
-        /// Resources pre-approved at creation time.
-        approved_resources: Vec<ApprovedResource>,
-    },
-}
-
 // ── CronJob ──────────────────────────────────────────────────────────
 
 /// A persistent cron job definition.
@@ -107,8 +91,8 @@ pub struct CronJob {
     pub channel: ChannelType,
     /// When this job fires. See [`CronSchedule`] for the two variants.
     pub schedule: CronSchedule,
-    /// What to do when the job fires.
-    pub action: TriggerAction,
+    /// Prompt fed through the agent loop on every fire.
+    pub prompt: String,
     /// IANA timezone (e.g. `"Asia/Shanghai"`, `"UTC"`) the cron expression
     /// is evaluated in. Has no effect for `At` schedules — those carry an
     /// absolute UTC instant. Old rows without this field deserialize as
@@ -189,7 +173,7 @@ pub struct CronExecution {
     pub user_id: String,
     pub channel: ChannelType,
     pub schedule: CronSchedule,
-    pub action: TriggerAction,
+    pub prompt: String,
     /// The schedule slot that was due (i.e. the `next_trigger_at` value from the job).
     pub scheduled_fire_time: DateTime<Utc>,
     pub triggered_at: DateTime<Utc>,
@@ -213,9 +197,7 @@ mod tests {
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::cron("0 9 * * *"),
-            action: TriggerAction::Prompt {
-                prompt: "fmt".to_string(),
-            },
+            prompt: "fmt".to_string(),
             timezone: tz.to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
@@ -256,9 +238,7 @@ mod tests {
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::cron("0 9 * * *"),
-            action: TriggerAction::Prompt {
-                prompt: "push news".to_string(),
-            },
+            prompt: "push news".to_string(),
             timezone: "Asia/Shanghai".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
@@ -285,9 +265,7 @@ mod tests {
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::at(fire_at),
-            action: TriggerAction::Prompt {
-                prompt: "one shot".to_string(),
-            },
+            prompt: "one shot".to_string(),
             timezone: "UTC".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
@@ -312,47 +290,12 @@ mod tests {
         let json = r#"{
             "id":"cj-old","user_id":"u-1","channel":"tui",
             "schedule":{"kind":"cron","expr":"0 9 * * *"},
-            "action":{"kind":"prompt","prompt":"x"},
+            "prompt":"x",
             "status":"enabled","next_trigger_at":null,
             "created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z"
         }"#;
         let restored: CronJob = serde_json::from_str(json).unwrap();
         assert_eq!(restored.timezone, "UTC");
-    }
-
-    #[test]
-    fn tool_call_round_trip() {
-        let job = CronJob {
-            id: "cj-2".to_string(),
-            user_id: "u-1".to_string(),
-            channel: ChannelType::tui(),
-            schedule: CronSchedule::cron("*/5 * * * *"),
-            action: TriggerAction::ToolCall {
-                tool_name: "web_fetch".to_string(),
-                params: serde_json::json!({"url": "https://example.com"}),
-                approved_resources: vec![ApprovedResource::Http {
-                    host: aura_model::HostPattern::Exact("example.com".to_string()),
-                }],
-            },
-            timezone: "UTC".to_string(),
-            status: CronStatus::Enabled,
-            last_triggered_at: None,
-            next_trigger_at: Some(Utc::now()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            origin_session_id: None,
-        };
-        let json = serde_json::to_string(&job).unwrap();
-        let restored: CronJob = serde_json::from_str(&json).unwrap();
-        match &restored.action {
-            TriggerAction::ToolCall {
-                tool_name, params, ..
-            } => {
-                assert_eq!(tool_name, "web_fetch");
-                assert_eq!(params["url"], "https://example.com");
-            }
-            other => panic!("expected ToolCall, got {other:?}"),
-        }
     }
 
     #[test]
@@ -386,9 +329,7 @@ mod tests {
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
             schedule: CronSchedule::at(Utc::now()),
-            action: TriggerAction::Prompt {
-                prompt: "push news".to_string(),
-            },
+            prompt: "push news".to_string(),
             scheduled_fire_time: Utc::now(),
             triggered_at: Utc::now(),
             status: ExecutionStatus::Pending,

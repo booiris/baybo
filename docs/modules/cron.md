@@ -28,14 +28,9 @@ Each `CronJob` carries an IANA `timezone` field (e.g. `"Asia/Shanghai"`, `"UTC"`
 
 The `schedule` field is `CronSchedule`, a tagged enum with two variants: `Cron { expr: String }` for recurring jobs and `At { time: DateTime<Utc> }` for one-shot jobs. The variant alone determines recurrence — there is no separate "run mode". Cron-expression parsing and validation happen at creation time in `CronScheduler` (in the `agent` crate), not at the type level.
 
-### Two trigger modes: `Prompt` vs `ToolCall`
+### Trigger action: `Prompt` only
 
-`TriggerAction` is a tagged enum (`#[serde(tag = "kind")]`) with two variants:
-
-- `Prompt { prompt }` — feeds `prompt` through the full agent loop every fire. Use for open-ended tasks ("summarize overnight news") where the LLM decides what tools to invoke.
-- `ToolCall { tool_name, params, approved_resources }` — directly invokes a registered tool, bypassing the LLM. Use for deterministic recurring work (fetch a URL, run a backup script). `approved_resources` is captured at creation time so the execution does not need to prompt the user on every fire. If the direct call fails, the agent layer falls back to dispatching a diagnostic prompt through the LLM so the failure surfaces as a normal reply.
-
-The same enum is stored on `CronExecution` as an immutable snapshot of what was actually executed at fire time.
+`TriggerAction` is a tagged enum (`#[serde(tag = "kind")]`) with a single `Prompt { prompt }` variant — every fire feeds `prompt` through the full agent loop, and the LLM decides what tools (if any) to invoke. The enum shape is preserved (rather than collapsed to a bare string) so the wire format is stable and future trigger modes can be added without re-shaping every persisted row. The same enum is stored on `CronExecution` as an immutable snapshot of what was actually executed at fire time.
 
 ### Domain crate, not business logic
 

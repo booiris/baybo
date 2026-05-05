@@ -342,27 +342,6 @@ export interface components {
             until: string;
         };
         /**
-         * @description Mirror of [`aura_model::ApprovedResource`]. Paths serialize as
-         *     strings on the wire.
-         */
-        ApprovedResource: {
-            /** @enum {string} */
-            kind: "read_file";
-            path: string;
-        } | {
-            /** @enum {string} */
-            kind: "write_file";
-            path: string;
-        } | {
-            host: components["schemas"]["HostPattern"];
-            /** @enum {string} */
-            kind: "http";
-        } | {
-            command: string;
-            /** @enum {string} */
-            kind: "exec_command";
-        };
-        /**
          * @description Admin-surface mirror of [`aura_model::ChannelType`]. Transparent
          *     wrapper around a snake_case string so the OpenAPI surface stays
          *     stable while the core type is open-ended (runtime-registered
@@ -389,7 +368,6 @@ export interface components {
         };
         /** @description Mirror of [`aura_cron::CronJob`]. */
         CronJob: {
-            action: components["schemas"]["TriggerAction"];
             channel: components["schemas"]["ChannelType"];
             /** Format: date-time */
             created_at: string;
@@ -399,6 +377,7 @@ export interface components {
             /** Format: date-time */
             next_trigger_at?: string | null;
             origin_session_id?: string | null;
+            prompt: string;
             schedule: components["schemas"]["CronSchedule"];
             status: components["schemas"]["CronStatus"];
             timezone: string;
@@ -431,16 +410,6 @@ export interface components {
          */
         ErrorBody: {
             error: string;
-        };
-        /** @description Mirror of [`aura_model::HostPattern`]. */
-        HostPattern: {
-            /** @enum {string} */
-            kind: "exact";
-            value: string;
-        } | {
-            /** @enum {string} */
-            kind: "wildcard";
-            value: string;
         };
         /**
          * @description Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
@@ -606,18 +575,6 @@ export interface components {
         TracesListResponse: {
             items: components["schemas"]["TraceSessionSummary"][];
             total: number;
-        };
-        /** @description Mirror of [`aura_cron::TriggerAction`]. */
-        TriggerAction: {
-            /** @enum {string} */
-            kind: "prompt";
-            prompt: string;
-        } | {
-            approved_resources: components["schemas"]["ApprovedResource"][];
-            /** @enum {string} */
-            kind: "tool_call";
-            params: Record<string, never>;
-            tool_name: string;
         };
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
@@ -856,7 +813,6 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
-                            action: components["schemas"]["TriggerAction"];
                             channel: components["schemas"]["ChannelType"];
                             /** Format: date-time */
                             created_at: string;
@@ -866,6 +822,7 @@ export interface operations {
                             /** Format: date-time */
                             next_trigger_at?: string | null;
                             origin_session_id?: string | null;
+                            prompt: string;
                             schedule: components["schemas"]["CronSchedule"];
                             status: components["schemas"]["CronStatus"];
                             timezone: string;

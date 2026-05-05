@@ -5,7 +5,7 @@ mod shutdown;
 mod tools;
 
 pub use error::CronError;
-pub use job::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus, TriggerAction};
+pub use job::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
 pub use scheduler::{CronScheduler, CronTriggerEvent};
 pub use shutdown::Shutdown;
 pub use tools::agent_tools;

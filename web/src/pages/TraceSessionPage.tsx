@@ -56,12 +56,6 @@ const STEP_VISUALS: Record<StepKindTag, KindVisual> = {
     bg: 'bg-brand/10',
     label: 'LLM iteration',
   },
-  tool_direct: {
-    icon: RiToolsLine,
-    accent: 'text-warn',
-    bg: 'bg-warn/10',
-    label: 'Tool direct',
-  },
   compression: {
     icon: RiArchiveLine,
     accent: 'text-ink-soft',
@@ -190,13 +184,6 @@ function stepSummaryText(step: Step, spans: Span[]): string {
         return tools > 0 ? `${model} • ${tools} tool ${tools === 1 ? 'call' : 'calls'}` : model;
       }
       return 'llm iteration';
-    }
-    case 'tool_direct': {
-      const tool = spans.find((s) => s.kind.kind === 'tool_call');
-      if (tool && tool.kind.kind === 'tool_call') {
-        return `${tool.kind.begin.tool_name} (direct)`;
-      }
-      return 'direct tool call';
     }
     case 'compression': {
       const llm = spans.find((s) => s.kind.kind === 'llm_call');

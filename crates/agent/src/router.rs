@@ -247,7 +247,7 @@ impl Router {
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
-            action: event.action,
+            prompt: event.prompt,
         };
         if let Err(e) = sender.send(trigger_msg).await {
             warn!(session_id = %session_id, error = %e, "failed to deliver cron trigger");

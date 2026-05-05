@@ -41,11 +41,10 @@ impl JobKind {
 
 /// What initially fed this job.
 ///
-/// `Cron::action_payload` is a serialized `aura_cron::TriggerAction` —
-/// kept as `Value` here so `aura-job` does not depend on `aura-cron`
-/// (which would invert the layer order). The marshal point is in
-/// `aura-cron` at job creation; consumers (e.g. `aura-cron::tools`)
-/// deserialize it on demand.
+/// `Cron::action_payload` is an opaque trace blob written by the cron
+/// router (currently `{cron_job_id, prompt}`). Kept as `Value` here so
+/// `aura-job` does not depend on `aura-cron`, which would invert the
+/// layer order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobInput {

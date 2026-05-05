@@ -293,7 +293,6 @@ impl AgentTestHarnessBuilder {
         let actor = AgentActor::new(
             session.clone(),
             agent_loop,
-            tool_executor,
             output_tx,
             job_lifecycle,
             span_recorder,

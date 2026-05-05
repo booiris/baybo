@@ -28,8 +28,6 @@
 //! using `ListResponse<Session>` still compiles even though `Session`
 //! stays outside the OpenAPI surface.
 
-use std::path::PathBuf;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -477,87 +475,6 @@ impl From<aura_cron::CronSchedule> for CronSchedule {
     }
 }
 
-/// Mirror of [`aura_model::HostPattern`].
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum HostPattern {
-    Exact(String),
-    Wildcard(String),
-}
-
-impl From<aura_model::HostPattern> for HostPattern {
-    fn from(v: aura_model::HostPattern) -> Self {
-        match v {
-            aura_model::HostPattern::Exact(h) => Self::Exact(h),
-            aura_model::HostPattern::Wildcard(h) => Self::Wildcard(h),
-        }
-    }
-}
-
-/// Mirror of [`aura_model::ApprovedResource`]. Paths serialize as
-/// strings on the wire.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ApprovedResource {
-    ReadFile {
-        #[schema(value_type = String)]
-        path: PathBuf,
-    },
-    WriteFile {
-        #[schema(value_type = String)]
-        path: PathBuf,
-    },
-    Http {
-        host: HostPattern,
-    },
-    ExecCommand {
-        command: String,
-    },
-}
-
-impl From<aura_model::ApprovedResource> for ApprovedResource {
-    fn from(v: aura_model::ApprovedResource) -> Self {
-        match v {
-            aura_model::ApprovedResource::ReadFile { path } => Self::ReadFile { path },
-            aura_model::ApprovedResource::WriteFile { path } => Self::WriteFile { path },
-            aura_model::ApprovedResource::Http { host } => Self::Http { host: host.into() },
-            aura_model::ApprovedResource::ExecCommand { command } => Self::ExecCommand { command },
-        }
-    }
-}
-
-/// Mirror of [`aura_cron::TriggerAction`].
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TriggerAction {
-    Prompt {
-        prompt: String,
-    },
-    ToolCall {
-        tool_name: String,
-        #[schema(value_type = Object)]
-        params: serde_json::Value,
-        approved_resources: Vec<ApprovedResource>,
-    },
-}
-
-impl From<aura_cron::TriggerAction> for TriggerAction {
-    fn from(v: aura_cron::TriggerAction) -> Self {
-        match v {
-            aura_cron::TriggerAction::Prompt { prompt } => Self::Prompt { prompt },
-            aura_cron::TriggerAction::ToolCall {
-                tool_name,
-                params,
-                approved_resources,
-            } => Self::ToolCall {
-                tool_name,
-                params,
-                approved_resources: approved_resources.into_iter().map(Into::into).collect(),
-            },
-        }
-    }
-}
-
 /// Mirror of [`aura_cron::CronJob`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CronJob {
@@ -565,7 +482,7 @@ pub struct CronJob {
     pub user_id: String,
     pub channel: ChannelType,
     pub schedule: CronSchedule,
-    pub action: TriggerAction,
+    pub prompt: String,
     pub timezone: String,
     pub status: CronStatus,
     pub last_triggered_at: Option<DateTime<Utc>>,
@@ -583,7 +500,7 @@ impl From<aura_cron::CronJob> for CronJob {
             user_id: v.user_id,
             channel: v.channel.into(),
             schedule: v.schedule.into(),
-            action: v.action.into(),
+            prompt: v.prompt,
             timezone: v.timezone,
             status: v.status.into(),
             last_triggered_at: v.last_triggered_at,
