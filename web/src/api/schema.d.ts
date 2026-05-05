@@ -372,6 +372,11 @@ export interface components {
             origin_session_id?: string | null;
             schedule: string;
             text: string;
+            /**
+             * @description IANA timezone (e.g. `"Asia/Shanghai"`) the cron expression is
+             *     interpreted in. Defaults to `"UTC"` when omitted.
+             */
+            timezone?: string | null;
             user_id: string;
         };
         /** @description Mirror of [`aura_cron::CronJob`]. */
@@ -388,6 +393,7 @@ export interface components {
             origin_session_id?: string | null;
             schedule: components["schemas"]["CronSchedule"];
             status: components["schemas"]["CronStatus"];
+            timezone: string;
             /** Format: date-time */
             updated_at: string;
             user_id: string;
@@ -852,6 +858,7 @@ export interface operations {
                             origin_session_id?: string | null;
                             schedule: components["schemas"]["CronSchedule"];
                             status: components["schemas"]["CronStatus"];
+                            timezone: string;
                             /** Format: date-time */
                             updated_at: string;
                             user_id: string;

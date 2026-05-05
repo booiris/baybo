@@ -35,6 +35,14 @@ const STATUS_BADGE_STYLE: Record<CronStatus, string> = {
   executed: 'bg-brand text-white',
 };
 
+function detectBrowserTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
 function formatTimestamp(iso: string | null | undefined): string {
   if (!iso) return '-';
   const d = new Date(iso);
@@ -223,12 +231,16 @@ export function CronPage() {
     </span>
   );
 
-  const scheduleDisplay = (schedule: components['schemas']['CronSchedule']) => {
+  const scheduleDisplay = (
+    schedule: components['schemas']['CronSchedule'],
+    timezone: string,
+  ) => {
     if (schedule.kind === 'cron') {
       return (
         <div className="flex items-center gap-2 font-mono text-[0.9rem]">
           <RiTimeLine className="text-ink-soft text-lg shrink-0" />
           <span>{schedule.expr}</span>
+          <span className="text-[0.7rem] text-ink-soft">({timezone})</span>
         </div>
       );
     }
@@ -360,7 +372,7 @@ export function CronPage() {
                       <code className="font-mono text-[0.85rem]">{job.id}</code>
                     </td>
                     <td className={cell}>{statusBadge(job.status)}</td>
-                    <td className={cell}>{scheduleDisplay(job.schedule)}</td>
+                    <td className={cell}>{scheduleDisplay(job.schedule, job.timezone)}</td>
                     <td className={cell}>
                       <span className="text-[0.9rem] font-bold uppercase tracking-wider">{job.channel}</span>
                     </td>
@@ -555,6 +567,10 @@ function CronDetailModal({
               <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">Last Triggered</label>
               <div className="text-[0.9rem]">{formatTimestamp(job.last_triggered_at)}</div>
             </div>
+            <div>
+              <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">Timezone</label>
+              <div className="font-mono text-[0.9rem]">{job.timezone}</div>
+            </div>
           </div>
 
           <div>
@@ -599,6 +615,7 @@ function CronCreateModal({
   const [userId, setUserId] = useState('');
   const [channel, setChannel] = useState(channels[0] ?? 'http');
   const [text, setText] = useState('');
+  const [timezone, setTimezone] = useState(detectBrowserTimezone());
   const [originSessionId, setOriginSessionId] = useState('');
 
   const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
@@ -609,11 +626,13 @@ function CronCreateModal({
       user_id: userId.trim(),
       channel: channel.trim(),
       text: text.trim(),
+      timezone: timezone.trim(),
       ...(originSessionId.trim() ? { origin_session_id: originSessionId.trim() } : {}),
     });
   };
 
-  const valid = schedule.trim() && userId.trim() && channel.trim() && text.trim();
+  const valid =
+    schedule.trim() && userId.trim() && channel.trim() && text.trim() && timezone.trim();
 
   return (
     <div
@@ -644,19 +663,37 @@ function CronCreateModal({
               {error}
             </div>
           )}
-          <div>
-            <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
-              Schedule (cron expression)
-            </label>
-            <input
-              value={schedule}
-              onChange={(e) => setSchedule(e.target.value)}
-              required
-              placeholder="0 9 * * *"
-              className="w-full border-2 border-black rounded-md px-3 h-10 font-mono text-[0.95rem] bg-white"
-            />
-            <div className="text-[0.7rem] text-ink-soft font-mono mt-1">
-              Standard 5-field cron — e.g. "0 9 * * *" (every day 09:00).
+          <div className="grid grid-cols-[1fr_auto] gap-3">
+            <div>
+              <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
+                Schedule (cron expression)
+              </label>
+              <input
+                value={schedule}
+                onChange={(e) => setSchedule(e.target.value)}
+                required
+                placeholder="0 9 * * *"
+                className="w-full border-2 border-black rounded-md px-3 h-10 font-mono text-[0.95rem] bg-white"
+              />
+              <div className="text-[0.7rem] text-ink-soft font-mono mt-1">
+                Standard 5-field cron — e.g. "0 9 * * *" (every day 09:00 in
+                the timezone below).
+              </div>
+            </div>
+            <div className="w-[200px]">
+              <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
+                Timezone (IANA)
+              </label>
+              <input
+                value={timezone}
+                onChange={(e) => setTimezone(e.target.value)}
+                required
+                placeholder="UTC"
+                className="w-full border-2 border-black rounded-md px-3 h-10 font-mono text-[0.95rem] bg-white"
+              />
+              <div className="text-[0.7rem] text-ink-soft font-mono mt-1">
+                Defaults to your browser tz.
+              </div>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-3">

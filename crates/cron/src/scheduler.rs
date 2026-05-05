@@ -5,6 +5,7 @@ use std::time::Duration;
 use aura_model::ChannelType;
 use aura_storage::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
@@ -132,12 +133,14 @@ impl CronScheduler {
         channel: ChannelType,
         schedule: CronSchedule,
         action: TriggerAction,
+        timezone: String,
         origin_session_id: Option<String>,
     ) -> Result<CronJob> {
         validate_schedule(&schedule)?;
+        let tz = parse_timezone(&timezone)?;
 
         let now = Utc::now();
-        let next_trigger_at = compute_next_trigger(&schedule, now);
+        let next_trigger_at = compute_next_trigger(&schedule, tz, now);
         if next_trigger_at.is_none() {
             // Only `At` with past time (Cron is infinite and never returns None here).
             return Err(CronError::InvalidSchedule(format!(
@@ -152,6 +155,7 @@ impl CronScheduler {
             channel,
             schedule,
             action,
+            timezone,
             status: CronStatus::Enabled,
             last_triggered_at: None,
             next_trigger_at,
@@ -169,6 +173,29 @@ impl CronScheduler {
     pub async fn delete_job(&self, job_id: &str) -> Result<()> {
         self.store.delete(job_id).await.map_err(store_err)?;
         Ok(())
+    }
+
+    /// Advance a recurring job to its next fire slot and persist. Used
+    /// by both the tick-loop dedup path (already-recorded slot, advance
+    /// past it) and the normal-fire path (recompute after dispatch).
+    /// Failures are logged but not propagated — like
+    /// `mark_one_shot_executed`, the trigger has already gone out and
+    /// the row state is best-effort cleanup.
+    async fn advance_recurring(&self, job: &mut CronJob, now: DateTime<Utc>) {
+        let tz = parse_timezone_or_utc(&job.timezone, &job.id);
+        job.last_triggered_at = Some(now);
+        job.next_trigger_at = compute_next_trigger(&job.schedule, tz, now);
+        job.updated_at = now;
+        match job_to_row(job) {
+            Ok(row) => {
+                if let Err(e) = self.store.save(&row).await {
+                    error!(job_id = %job.id, error = %e, "failed to advance cron job after trigger");
+                }
+            }
+            Err(e) => {
+                error!(job_id = %job.id, error = %e, "failed to serialize cron job after trigger");
+            }
+        }
     }
 
     /// Transition a one-shot job to `Executed` and persist. Shared between
@@ -204,9 +231,10 @@ impl CronScheduler {
             .map_err(store_err)?
             .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
         let mut job = row_to_job(row)?;
+        let tz = parse_timezone(&job.timezone)?;
 
         let now = Utc::now();
-        let next = compute_next_trigger(&job.schedule, now);
+        let next = compute_next_trigger(&job.schedule, tz, now);
         if next.is_none() {
             return Err(CronError::InvalidSchedule(format!(
                 "cannot enable cron job {job_id}: schedule {} has no future fire time",
@@ -461,15 +489,8 @@ impl CronScheduler {
                 .await
             {
                 Ok(true) => {
-                    // Already recorded — advance job and skip
-                    job.last_triggered_at = Some(now);
-                    job.next_trigger_at = compute_next_trigger(&job.schedule, now);
-                    job.updated_at = now;
-                    if let Ok(updated_row) = job_to_row(&job)
-                        && let Err(e) = self.store.save(&updated_row).await
-                    {
-                        error!(job_id = %job.id, error = %e, "failed to advance duplicate cron job");
-                    }
+                    // Already recorded — advance past the slot and skip
+                    self.advance_recurring(&mut job, now).await;
                     continue;
                 }
                 Ok(false) => {}
@@ -516,14 +537,7 @@ impl CronScheduler {
                 info!(job_id = %job.id, "marking one-shot cron job as executed");
                 self.mark_one_shot_executed(&mut job, now).await;
             } else {
-                job.last_triggered_at = Some(now);
-                job.next_trigger_at = compute_next_trigger(&job.schedule, now);
-                job.updated_at = now;
-                if let Ok(updated_row) = job_to_row(&job)
-                    && let Err(e) = self.store.save(&updated_row).await
-                {
-                    error!(job_id = %job.id, error = %e, "failed to update cron job after trigger");
-                }
+                self.advance_recurring(&mut job, now).await;
             }
 
             // Phase 3: Dispatch trigger
@@ -584,18 +598,51 @@ fn validate_schedule(schedule: &CronSchedule) -> Result<()> {
 
 /// Compute the next trigger time for a schedule after the given timestamp.
 ///
-/// - `Cron(expr)` returns the next matching tick (infinite-recurring, so this
-///   effectively never returns `None` for a valid expression).
-/// - `At(time)` returns `Some(time)` if it is strictly in the future, else
-///   `None` — callers treat `None` as "nothing more to fire".
-fn compute_next_trigger(schedule: &CronSchedule, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+/// - `Cron(expr)` returns the next matching tick **interpreted in `tz`**, then
+///   converted back to UTC for storage. So `0 9 * * *` with `tz = Asia/Shanghai`
+///   fires at 09:00 Shanghai time daily, not 09:00 UTC. Returns `None` only
+///   if the underlying cron parser fails (caught earlier by `validate_schedule`).
+/// - `At(time)` ignores `tz` (the timestamp is already absolute UTC) and
+///   returns `Some(time)` iff strictly in the future.
+fn compute_next_trigger(
+    schedule: &CronSchedule,
+    tz: Tz,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
     match schedule {
         CronSchedule::Cron { expr } => {
             let normalized = normalize_cron_expression(expr);
             let parsed = cron::Schedule::from_str(&normalized).ok()?;
-            parsed.after(&after).next()
+            parsed
+                .after(&after.with_timezone(&tz))
+                .next()
+                .map(|t| t.with_timezone(&Utc))
         }
         CronSchedule::At { time } => (*time > after).then_some(*time),
+    }
+}
+
+/// Parse an IANA timezone string, mapping failure to `InvalidSchedule`
+/// (the user asked for a timezone we cannot evaluate against).
+fn parse_timezone(name: &str) -> Result<Tz> {
+    name.parse::<Tz>()
+        .map_err(|e| CronError::InvalidSchedule(format!("invalid timezone {name}: {e}")))
+}
+
+/// Parse a timezone for a stored job. Falls back to UTC and warns —
+/// the row was already accepted at creation time, so we never want a
+/// rare bad name (e.g. operator hand-edited the row) to silently
+/// stop the tick loop from advancing other jobs.
+fn parse_timezone_or_utc(name: &str, job_id: &str) -> Tz {
+    match name.parse::<Tz>() {
+        Ok(tz) => tz,
+        Err(e) => {
+            tracing::warn!(
+                job_id, timezone = name, error = %e,
+                "stored cron job has unparseable timezone; falling back to UTC for this fire"
+            );
+            chrono_tz::UTC
+        }
     }
 }
 
@@ -783,6 +830,7 @@ mod tests {
                 TriggerAction::Prompt {
                     prompt: prompt.to_string(),
                 },
+                "UTC".to_string(),
                 None,
             )
             .await
@@ -811,6 +859,7 @@ mod tests {
                 TriggerAction::Prompt {
                     prompt: "later".into(),
                 },
+                "UTC".to_string(),
                 None,
             )
             .await
@@ -831,6 +880,7 @@ mod tests {
                 TriggerAction::Prompt {
                     prompt: "too late".into(),
                 },
+                "UTC".to_string(),
                 None,
             )
             .await
@@ -849,6 +899,49 @@ mod tests {
                 TriggerAction::Prompt {
                     prompt: "test".to_string(),
                 },
+                "UTC".to_string(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CronError::InvalidSchedule(_)));
+    }
+
+    #[tokio::test]
+    async fn create_job_honors_timezone_for_cron_expression() {
+        // `0 9 * * *` in Asia/Shanghai (UTC+08) should fire at 01:00 UTC,
+        // not 09:00 UTC. This is the bug the timezone field exists to
+        // fix; the test pins the contract.
+        use chrono::Timelike;
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(
+                "u1",
+                ChannelType::tui(),
+                CronSchedule::cron("0 9 * * *"),
+                TriggerAction::Prompt {
+                    prompt: "morning".into(),
+                },
+                "Asia/Shanghai".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let next = job.next_trigger_at.expect("must have next trigger");
+        assert_eq!(next.hour(), 1, "9am Shanghai = 1am UTC, got {next}");
+        assert_eq!(next.minute(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_job_rejects_invalid_timezone() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let err = scheduler
+            .create_job(
+                "u1",
+                ChannelType::tui(),
+                CronSchedule::cron("0 9 * * *"),
+                TriggerAction::Prompt { prompt: "x".into() },
+                "Mars/Olympus_Mons".to_string(),
                 None,
             )
             .await
@@ -884,6 +977,7 @@ mod tests {
                 TriggerAction::Prompt {
                     prompt: "later".into(),
                 },
+                "UTC".to_string(),
                 None,
             )
             .await
@@ -983,6 +1077,7 @@ mod tests {
                 TriggerAction::Prompt {
                     prompt: "run once".into(),
                 },
+                "UTC".to_string(),
                 None,
             )
             .await
@@ -1026,6 +1121,7 @@ mod tests {
             action: TriggerAction::Prompt {
                 prompt: "test".to_string(),
             },
+            timezone: "UTC".to_string(),
             status: CronStatus::Enabled,
             last_triggered_at: None,
             next_trigger_at: Some(Utc::now()),
@@ -1199,6 +1295,7 @@ mod tests {
                 TriggerAction::Prompt {
                     prompt: "manual one-shot".into(),
                 },
+                "UTC".to_string(),
                 None,
             )
             .await
@@ -1236,6 +1333,7 @@ mod tests {
                 TriggerAction::Prompt {
                     prompt: "lineage carries".into(),
                 },
+                "UTC".to_string(),
                 Some("sess-creator".into()),
             )
             .await

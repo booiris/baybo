@@ -199,6 +199,10 @@ pub struct CreateCronRequest {
     #[serde(default)]
     pub channel: Option<ChannelType>,
     pub text: String,
+    /// IANA timezone (e.g. `"Asia/Shanghai"`) the cron expression is
+    /// interpreted in. Defaults to `"UTC"` when omitted.
+    #[serde(default)]
+    pub timezone: Option<String>,
     #[serde(default)]
     pub origin_session_id: Option<String>,
 }
@@ -561,6 +565,7 @@ pub struct CronJob {
     pub channel: ChannelType,
     pub schedule: CronSchedule,
     pub action: TriggerAction,
+    pub timezone: String,
     pub status: CronStatus,
     pub last_triggered_at: Option<DateTime<Utc>>,
     pub next_trigger_at: Option<DateTime<Utc>>,
@@ -578,6 +583,7 @@ impl From<aura_cron::CronJob> for CronJob {
             channel: v.channel.into(),
             schedule: v.schedule.into(),
             action: v.action.into(),
+            timezone: v.timezone,
             status: v.status.into(),
             last_triggered_at: v.last_triggered_at,
             next_trigger_at: v.next_trigger_at,

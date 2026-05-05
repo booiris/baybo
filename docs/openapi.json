@@ -303,6 +303,7 @@
                           "channel",
                           "schedule",
                           "action",
+                          "timezone",
                           "status",
                           "created_at",
                           "updated_at"
@@ -346,6 +347,9 @@
                           },
                           "status": {
                             "$ref": "#/components/schemas/CronStatus"
+                          },
+                          "timezone": {
+                            "type": "string"
                           },
                           "updated_at": {
                             "type": "string",
@@ -1800,6 +1804,13 @@
           "text": {
             "type": "string"
           },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "IANA timezone (e.g. `\"Asia/Shanghai\"`) the cron expression is\ninterpreted in. Defaults to `\"UTC\"` when omitted."
+          },
           "user_id": {
             "type": "string"
           }
@@ -1814,6 +1825,7 @@
           "channel",
           "schedule",
           "action",
+          "timezone",
           "status",
           "created_at",
           "updated_at"
@@ -1857,6 +1869,9 @@
           },
           "status": {
             "$ref": "#/components/schemas/CronStatus"
+          },
+          "timezone": {
+            "type": "string"
           },
           "updated_at": {
             "type": "string",

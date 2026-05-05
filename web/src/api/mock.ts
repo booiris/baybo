@@ -146,6 +146,7 @@ function generateMockCrons(count: number): components['schemas']['CronJob'][] {
         kind: 'prompt',
         prompt: prompts[Math.floor(Math.random() * prompts.length)],
       },
+      timezone: 'UTC',
       last_triggered_at: Math.random() > 0.3 ? new Date(now - Math.random() * 1000 * 60 * 60).toISOString() : null,
       next_trigger_at: new Date(now + Math.random() * 1000 * 60 * 60).toISOString(),
       created_at: createdAt.toISOString(),
