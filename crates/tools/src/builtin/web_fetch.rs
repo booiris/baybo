@@ -1,15 +1,20 @@
 //! `WebFetch` — GET an `http(s)` URL, render the body as Markdown, return text.
 //!
-//! Matches Claude Code's WebFetch tool shape: `{ url, prompt? }`. The `prompt`
-//! field is accepted for API compatibility but currently ignored — `ToolContext`
-//! does not expose an LLM handle, so server-side summarization is deferred.
-//! `docs/modules/tools.md` records this gap as "returns raw body; no
-//! side-channel LLM extraction yet".
+//! Matches Claude Code's WebFetch tool shape: `{ url, prompt? }`. When a
+//! `prompt` is supplied AND the tool was constructed with an
+//! `Arc<dyn LlmCompletion>` via [`WebFetchTool::with_llm`] (the
+//! `default_tools` factory threads one in when an LLM is available), the
+//! rendered markdown is run through that side LLM with a fixed system
+//! instruction and the tool returns the model's extraction instead of the
+//! raw body. Without an LLM (e.g. argv-mode boot, tests) the `prompt` is
+//! silently ignored and the raw markdown is returned — the legacy behaviour.
 //!
-//! Output is capped at 256 KiB on a UTF-8 char boundary, matching the per-tool
-//! cap documented in `docs/modules/security.md`. The gateway applies a final
-//! cap on top of this; injection scanning and `<tool_output>` wrapping are also
-//! the gateway's job — this tool just returns the raw text.
+//! Raw output is capped at 256 KiB on a UTF-8 char boundary, matching the
+//! per-tool cap documented in `docs/modules/security.md`. LLM input is capped
+//! independently at 96 KiB so a giant page can't blow the side LLM's context.
+//! The gateway applies a final cap on top of this; injection scanning and
+//! `<tool_output>` wrapping are also the gateway's job — this tool just
+//! returns the rendered (or summarised) text.
 //!
 //! SSRF guard runs at two layers:
 //!  1. URL parse: `validate_url_with` rejects non-http(s) schemes, literal-IP
@@ -32,6 +37,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aura_llm::{ChatRequest, LlmCompletion};
+use aura_model::{ChatMessage, ContentBlock, Role};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use serde::Deserialize;
@@ -41,10 +48,21 @@ use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Cap on the rendered text passed into the side LLM when a `prompt` is
+/// supplied. 96 KiB ≈ 24 K tokens — well inside every modern context
+/// window after the system+prompt overhead, and capped low enough that a
+/// pathological page can't dominate the per-call cost.
+const MAX_SUMMARY_INPUT_BYTES: usize = 96 * 1024;
 const ERROR_BODY_PREVIEW_BYTES: usize = 8 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIRECT_LIMIT: usize = 5;
 const CALL_LABEL_MAX: usize = 120;
+
+const SUMMARY_SYSTEM_PROMPT: &str = "You are extracting information from a fetched web page. \
+The user supplies a prompt describing what they want to know, followed by the page content rendered \
+as Markdown. Respond with a concise extraction or summary that directly answers the prompt. \
+Quote short fragments verbatim when accuracy matters; do not invent details. If the page does not \
+contain the requested information, say so explicitly.";
 
 fn host_to_literal_ip(host: &str) -> Option<IpAddr> {
     if let Ok(addr) = host.parse::<IpAddr>() {
@@ -115,6 +133,10 @@ impl Resolve for SafeResolver {
 pub struct WebFetchTool {
     client: reqwest::Client,
     validator_allow_loopback: bool,
+    /// Optional side LLM for prompt-driven extraction. `None` falls back
+    /// to returning the raw rendered markdown verbatim — the prompt is
+    /// then silently ignored, matching the pre-LLM behaviour.
+    llm: Option<Arc<dyn LlmCompletion>>,
 }
 
 impl WebFetchTool {
@@ -154,7 +176,18 @@ impl WebFetchTool {
         Self {
             client,
             validator_allow_loopback,
+            llm: None,
         }
+    }
+
+    /// Attach a side LLM client. When the caller passes a non-empty
+    /// `prompt`, the rendered markdown is forwarded to this LLM with a
+    /// fixed extraction system prompt and the model's reply replaces the
+    /// raw body in the tool output. Without it the prompt is silently
+    /// ignored.
+    pub fn with_llm(mut self, llm: Arc<dyn LlmCompletion>) -> Self {
+        self.llm = Some(llm);
+        self
     }
 
     #[cfg(test)]
@@ -178,7 +211,6 @@ impl Default for WebFetchTool {
 struct Params {
     url: String,
     #[serde(default)]
-    #[allow(dead_code)]
     prompt: Option<String>,
 }
 
@@ -191,14 +223,15 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         r#"
 - Fetches content from a specified URL
-- Takes a URL and a prompt as input
+- Takes a URL and an optional prompt as input
 - Fetches the URL content, converts HTML to markdown
-- Returns the model's response about the content
+- When a prompt is supplied the rendered page is run through a side LLM that extracts a focused answer; otherwise the raw markdown is returned
 - Use this tool when you need to retrieve and analyze web content
 Usage notes:
   - The URL must be a fully-formed valid URL
   - HTTP URLs will be automatically upgraded to HTTPS
   - This tool is read-only and does not modify any files
+  - If no LLM is configured the prompt is ignored and the raw body is returned
 "#
     }
 
@@ -207,7 +240,7 @@ Usage notes:
             "type": "object",
             "properties": {
                 "url":    { "type": "string", "format": "uri", "description": "The http(s) URL to fetch" },
-                "prompt": { "type": "string", "description": "Currently ignored; reserved for future LLM-side extraction" }
+                "prompt": { "type": "string", "description": "Optional extraction prompt: when set, the rendered page is forwarded to a side LLM that returns a focused answer instead of the raw body" }
             },
             "required": ["url"]
         })
@@ -339,6 +372,39 @@ Usage notes:
             raw_text.into_owned()
         };
 
+        // Side-channel summary path: only when the caller asked for one
+        // (`prompt` is non-empty) AND an LLM was wired in. Without one the
+        // prompt is silently ignored — argv-mode boot, tests, and any
+        // deployment that hasn't configured a model still get useful raw
+        // output instead of an error.
+        if let (Some(llm), Some(prompt_text)) = (
+            self.llm.as_ref(),
+            p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        ) {
+            let summary_input = truncate_utf8(rendered.as_bytes(), MAX_SUMMARY_INPUT_BYTES);
+            let summary = run_summary(llm.as_ref(), prompt_text, &summary_input, ctx).await;
+            return match summary {
+                Ok(text) => {
+                    let output = truncate_utf8(text.as_bytes(), MAX_OUTPUT_BYTES);
+                    tracing::info!(
+                        host = %host,
+                        status = status.as_u16(),
+                        body_bytes_read,
+                        summary_input_bytes = summary_input.len(),
+                        output_bytes = output.len(),
+                        "WebFetch done (summarised)"
+                    );
+                    Ok(ToolOutput::Text(output))
+                }
+                Err(e) => {
+                    tracing::warn!(host = %host, error = %e, "WebFetch summarise failed");
+                    Ok(ToolOutput::Error(format!(
+                        "WebFetch: side LLM summarisation failed: {e}"
+                    )))
+                }
+            };
+        }
+
         let output = truncate_utf8(rendered.as_bytes(), MAX_OUTPUT_BYTES);
         tracing::info!(
             host = %host,
@@ -348,6 +414,51 @@ Usage notes:
             "WebFetch done"
         );
         Ok(ToolOutput::Text(output))
+    }
+}
+
+/// Run the side LLM with the fixed extraction system prompt and the user's
+/// `(prompt, page)` pair. Honours `ctx.cancellation_token` and `ctx.timeout`
+/// so a slow model can't pin the outer deadline.
+async fn run_summary(
+    llm: &dyn LlmCompletion,
+    prompt: &str,
+    page: &str,
+    ctx: &ToolContext,
+) -> Result<String, String> {
+    let user_text = format!("Prompt: {prompt}\n\nPage content (Markdown):\n{page}");
+    let request = ChatRequest {
+        messages: vec![
+            ChatMessage {
+                role: Role::System,
+                content: vec![ContentBlock::Text(SUMMARY_SYSTEM_PROMPT.to_string())],
+            },
+            ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text(user_text)],
+            },
+        ],
+        temperature: Some(0.0),
+        tools: vec![],
+    };
+    tokio::select! {
+        _ = ctx.cancellation_token.cancelled() => {
+            Err("cancelled".to_string())
+        }
+        res = tokio::time::timeout(ctx.timeout, llm.chat(&request)) => {
+            match res {
+                Err(_) => Err(format!("summary timed out after {:?}", ctx.timeout)),
+                Ok(Err(e)) => Err(e.to_string()),
+                Ok(Ok(resp)) => {
+                    let trimmed = resp.content.trim();
+                    if trimmed.is_empty() {
+                        Err("model returned empty content".to_string())
+                    } else {
+                        Ok(trimmed.to_string())
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -916,5 +1027,160 @@ mod tests {
             matches!(err, ToolError::Execution(ref m) if m.contains("cross-host")),
             "got: {err:?}"
         );
+    }
+
+    /// Side-LLM summary path: when both `prompt` and an `LlmCompletion`
+    /// are present, the rendered markdown is replaced by the model's
+    /// reply. The captured request is asserted to confirm the page
+    /// content actually flowed through.
+    #[tokio::test]
+    async fn prompt_with_llm_returns_summary() {
+        use aura_llm::test_support::StubLlm;
+        use aura_llm::{LlmResponse, TokenUsage};
+
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response(LlmResponse {
+            content: "Title is `Hello`.".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+
+        let server = spawn(Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<h1>Hello</h1><p>body</p>",
+                )
+            }),
+        ))
+        .await;
+
+        let llm: Arc<dyn LlmCompletion> = stub.clone();
+        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let out = tool
+            .execute(
+                json!({ "url": url_to(&server, "/"), "prompt": "what's the title?" }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!("expected Text, got: {out:?}")
+        };
+        assert_eq!(s, "Title is `Hello`.");
+
+        let captured = stub.captured_requests();
+        assert_eq!(captured.len(), 1, "exactly one chat call");
+        let req = &captured[0];
+        // System prompt for extraction.
+        assert!(matches!(
+            req.messages.first().map(|m| m.role),
+            Some(aura_model::Role::System)
+        ));
+        // User message carries both the prompt and the rendered markdown.
+        let user = req.messages.last().expect("user msg");
+        assert!(matches!(user.role, aura_model::Role::User));
+        let aura_model::ContentBlock::Text(user_text) = user.content.first().expect("text block")
+        else {
+            panic!("expected text block")
+        };
+        assert!(user_text.contains("what's the title?"));
+        assert!(user_text.contains("# Hello"));
+    }
+
+    /// Without a prompt the LLM is *not* called even when one is wired
+    /// in — raw markdown still wins. Guards against spending tokens on
+    /// every fetch.
+    #[tokio::test]
+    async fn no_prompt_skips_llm_even_when_wired() {
+        use aura_llm::test_support::StubLlm;
+
+        let stub = Arc::new(StubLlm::new());
+        // Intentionally no `push_response`: a stray call would 500.
+        let server = spawn(Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<h1>Hi</h1>",
+                )
+            }),
+        ))
+        .await;
+        let llm: Arc<dyn LlmCompletion> = stub.clone();
+        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let out = tool
+            .execute(json!({ "url": url_to(&server, "/") }), &ctx())
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!("expected Text, got: {out:?}")
+        };
+        assert!(s.contains("# Hi"));
+        assert!(stub.captured_requests().is_empty());
+    }
+
+    /// Empty/whitespace-only prompts are equivalent to no prompt — same
+    /// raw-markdown short-circuit, no LLM call.
+    #[tokio::test]
+    async fn whitespace_prompt_skips_llm() {
+        use aura_llm::test_support::StubLlm;
+
+        let stub = Arc::new(StubLlm::new());
+        let server = spawn(Router::new().route(
+            "/",
+            get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "ok") }),
+        ))
+        .await;
+        let llm: Arc<dyn LlmCompletion> = stub.clone();
+        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let out = tool
+            .execute(
+                json!({ "url": url_to(&server, "/"), "prompt": "   \t\n  " }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!("expected Text, got: {out:?}")
+        };
+        assert_eq!(s.trim(), "ok");
+        assert!(stub.captured_requests().is_empty());
+    }
+
+    /// LLM error is surfaced as `ToolOutput::Error` rather than a hard
+    /// `ToolError`, so the caller can see the failure reason and retry
+    /// (e.g. without `prompt`) instead of having the call disappear into
+    /// the timeout/cancel buckets.
+    #[tokio::test]
+    async fn llm_error_returns_tool_output_error() {
+        use aura_llm::LlmError;
+        use aura_llm::test_support::StubLlm;
+
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response_err(LlmError::Provider("boom".into()));
+
+        let server = spawn(Router::new().route(
+            "/",
+            get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "page text") }),
+        ))
+        .await;
+        let llm: Arc<dyn LlmCompletion> = stub.clone();
+        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let out = tool
+            .execute(
+                json!({ "url": url_to(&server, "/"), "prompt": "?" }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Error(s) = out else {
+            panic!("expected Error, got: {out:?}")
+        };
+        assert!(s.contains("summarisation failed"), "got: {s}");
+        assert!(s.contains("boom"), "got: {s}");
     }
 }

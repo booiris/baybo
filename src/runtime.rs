@@ -240,8 +240,6 @@ pub async fn build_managers(
     // `Arc` once all registrations are done — that way the "single
     // owner" invariant the registrations relied on is enforced by the
     // type system, not by an `Arc::get_mut().expect()` runtime check.
-    let mut tool_registry = ToolRegistry::with_defaults(stores.blob.clone());
-
     // Vault is constructed up here (before `build_llm_client`) so the
     // openai-subscription provider can read its OAuth bundle straight away.
     // Other providers ignore the vault. Comment from the original site:
@@ -250,7 +248,9 @@ pub async fn build_managers(
     let master_key = load_master_key(&config.security)?;
     let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
 
-    // Built after `stores` so `build_llm_client` can wire the blob
+    // Built before the tool registry so `default_tools` can wire the
+    // side-LLM into `WebFetch` for prompt-driven extraction. Also
+    // built after `stores` so `build_llm_client` can wire the blob
     // store in as a `BlobFetcher` — without it, multimodal user
     // content would degrade to a `[image: …]` text stub even on
     // vision-capable models.
@@ -271,6 +271,11 @@ pub async fn build_managers(
         );
         client
     };
+
+    let mut tool_registry = ToolRegistry::with_defaults(
+        stores.blob.clone(),
+        Some(Arc::clone(&llm_client) as Arc<dyn aura_llm::LlmCompletion>),
+    );
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
     let skill_assessor = Arc::new(SkillAssessor::with_background_worker(

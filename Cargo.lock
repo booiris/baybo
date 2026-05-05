@@ -716,6 +716,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aura-llm",
  "aura-model",
  "aura-security",
  "aura-storage",

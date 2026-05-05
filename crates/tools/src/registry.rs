@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aura_llm::LlmCompletion;
 use aura_storage::BlobStore;
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -35,9 +36,16 @@ impl ToolRegistry {
         }
     }
 
-    pub fn with_defaults(blob_store: Arc<dyn BlobStore>) -> Self {
+    /// Register every default builtin tool. `llm` is forwarded to
+    /// `WebFetch` so prompt-driven extraction works when a model is
+    /// available; pass `None` from boot paths that have no LLM
+    /// configured (argv-mode `aura llm/doctor/status`, tests).
+    pub fn with_defaults(
+        blob_store: Arc<dyn BlobStore>,
+        llm: Option<Arc<dyn LlmCompletion>>,
+    ) -> Self {
         let mut registry = Self::new();
-        for (tool, manifest) in crate::builtin::default_tools(blob_store) {
+        for (tool, manifest) in crate::builtin::default_tools(blob_store, llm) {
             registry.register(tool, manifest);
         }
         registry
@@ -190,7 +198,7 @@ mod tests {
     #[test]
     fn defaults_register_send_file() {
         let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        let registry = ToolRegistry::with_defaults(blob_store);
+        let registry = ToolRegistry::with_defaults(blob_store, None);
 
         assert!(registry.get("SendFile").is_some());
         assert!(registry.get_manifest("SendFile").is_some());
