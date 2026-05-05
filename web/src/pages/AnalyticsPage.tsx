@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import {
   RiBarChartBoxLine,
   RiCoinLine,
-  RiInputMethodLine,
+  RiUploadLine,
   RiDownloadLine,
   RiHistoryLine,
   RiCpuLine,
@@ -298,7 +298,7 @@ export function AnalyticsPage() {
             <MetricCard
               title="Input Tokens"
               value={formatTokens(data.total_input_tokens)}
-              icon={RiInputMethodLine}
+              icon={RiUploadLine}
               subtitle="Prompts & context"
             />
             <MetricCard
@@ -372,7 +372,7 @@ export function AnalyticsPage() {
             </div>
             <div className="flex-1 w-full min-h-[220px]">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={chartData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+                <BarChart data={chartData} margin={{ top: 5, right: 30, left: 20, bottom: 45 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" vertical={false} />
                   <XAxis
                     dataKey="date"
