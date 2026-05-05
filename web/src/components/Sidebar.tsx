@@ -7,13 +7,13 @@ const navItem =
 const navItemActive =
   'bg-brand text-white !border-black shadow-brutal-sm hover:!bg-brand active:translate-x-[2px] active:translate-y-[2px] active:shadow-none';
 
-export function Sidebar() {
+export function Sidebar({ version }: { version?: string }) {
   const { logout } = useAuth();
   return (
     <aside className="w-[180px] border-r-2 border-black flex flex-col bg-white shrink-0">
       <div className="px-4 py-5">
         <h1 className="text-4xl font-bold uppercase -tracking-[0.05em]">AURA</h1>
-        <span className="text-sm text-ink-soft font-mono">v1.0.4</span>
+        <span className="text-sm text-ink-soft font-mono">{version ? `v${version}` : '—'}</span>
       </div>
 
       <nav className="flex-1 px-3 py-2 flex flex-col gap-2">
