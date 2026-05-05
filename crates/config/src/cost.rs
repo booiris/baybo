@@ -9,19 +9,17 @@ pub struct CostConfig {
     pub rate_limit: RateLimitConfig,
 }
 
-/// Spending caps stored internally as `MicroUsd` so quota arithmetic
-/// stays exact. The TOML wire format keeps the human-friendly USD
-/// decimal — operators write `user_daily_usd = 5.0` and the
-/// `usd_decimal_option` bridge converts on load.
+/// Total spending caps. Personal-assistant deployment — there's no
+/// per-user dimension. TOML wire format keeps the human-friendly USD
+/// decimal (operators write `daily_usd = 5.0`); the
+/// `usd_decimal_option` bridge converts to integer micro-USD on load.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct SpendingLimitsConfig {
     #[serde(skip_serializing_if = "Option::is_none", with = "usd_decimal_option")]
-    pub user_daily_usd: Option<MicroUsd>,
+    pub daily_usd: Option<MicroUsd>,
     #[serde(skip_serializing_if = "Option::is_none", with = "usd_decimal_option")]
-    pub user_monthly_usd: Option<MicroUsd>,
-    #[serde(skip_serializing_if = "Option::is_none", with = "usd_decimal_option")]
-    pub global_daily_usd: Option<MicroUsd>,
+    pub monthly_usd: Option<MicroUsd>,
 }
 
 /// Per-user request rate limit.

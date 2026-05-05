@@ -173,15 +173,6 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_cost_session ON cost_records(session_id);
                 CREATE INDEX IF NOT EXISTS idx_cost_job ON cost_records(job_id);
 
-                CREATE TABLE IF NOT EXISTS user_monthly_cost (
-                    user_id     TEXT    NOT NULL,
-                    month       TEXT    NOT NULL,
-                    -- Cumulative spend in micro-USD; see cost_records above.
-                    cost_usd    INTEGER NOT NULL,
-                    updated_at  INTEGER NOT NULL,
-                    PRIMARY KEY (user_id, month)
-                );
-
                 CREATE TABLE IF NOT EXISTS jobs (
                     id                       TEXT PRIMARY KEY,
                     session_id               TEXT NOT NULL,

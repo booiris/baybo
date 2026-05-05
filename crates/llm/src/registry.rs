@@ -184,7 +184,7 @@ impl LlmProviderRegistry {
 
     /// Aggregate every registered factory's `known_pricings()` into a
     /// single `model_id -> ModelPricing` map. Used by the runtime to
-    /// seed the `CostSubscriber` so spans from non-active models still
+    /// seed `CostManager` so spans from non-active models still
     /// resolve to real USD instead of 0.0. Conflicting model-id entries
     /// across providers are last-wins; in practice the model-id space
     /// is provider-disjoint so this doesn't matter.

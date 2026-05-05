@@ -8,7 +8,7 @@
 //!
 //! Float `f64` is reserved for two boundaries only:
 //!
-//! * **Config TOML** — operators write `user_daily_usd = 5.0`. The
+//! * **Config TOML** — operators write `daily_usd = 5.0`. The
 //!   [`usd_decimal_option`] serde-with module bridges that to
 //!   `Option<MicroUsd>` on load and back to a USD float on save.
 //! * **Display** — [`MicroUsd::as_usd_decimal`] for human-facing
@@ -126,7 +126,7 @@ impl<'a> Sum<&'a MicroUsd> for MicroUsd {
 }
 
 /// `serde(with = …)` bridge that lets TOML/JSON keep writing USD floats
-/// (`user_daily_usd = 5.0`) while the in-memory value is `Option<MicroUsd>`.
+/// (`daily_usd = 5.0`) while the in-memory value is `Option<MicroUsd>`.
 pub mod usd_decimal_option {
     use super::MicroUsd;
     use serde::{Deserialize, Deserializer, Serializer};

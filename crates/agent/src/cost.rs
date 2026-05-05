@@ -1,196 +1,125 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aura_llm::ModelPricing;
-use aura_model::MicroUsd;
+use aura_model::{JobId, MicroUsd, SessionId, SpanId};
 use aura_storage::{CostRecord, CostStore, TimeRange};
 use chrono::{Datelike, NaiveDate, Utc};
+use parking_lot::RwLock;
 use thiserror::Error;
-use tokio::task::JoinHandle;
-use tracing::{debug, warn};
-
-use crate::trace::{TraceEvent, TraceEventStream};
+use tracing::warn;
 
 #[derive(Debug, Error)]
 pub enum CostGuardError {
-    #[error("user '{user_id}' exceeded spending limit: current {current} >= limit {limit}")]
-    UserLimitExceeded {
-        user_id: String,
-        current: MicroUsd,
-        limit: MicroUsd,
-    },
+    #[error("daily spending limit exceeded: current {current} >= limit {limit}")]
+    DailyLimitExceeded { current: MicroUsd, limit: MicroUsd },
 
-    #[error("global spending limit exceeded: current {current} >= limit {limit}")]
-    GlobalLimitExceeded { current: MicroUsd, limit: MicroUsd },
-
-    #[error("cost query failed: {0}")]
-    QueryFailed(#[from] aura_storage::CostError),
+    #[error("monthly spending limit exceeded: current {current} >= limit {limit}")]
+    MonthlyLimitExceeded { current: MicroUsd, limit: MicroUsd },
 }
 
-/// Per-user and global spending limits, expressed as `MicroUsd` so
-/// comparisons with [`CostStore::sum_user`] / [`CostStore::query_global`]
-/// stay exact.
+/// Total spending caps. This is a personal-assistant deployment so
+/// budgeting is one global pool, not per-user — `user_id` on
+/// `cost_records` is just provenance, never a budget dimension.
 #[derive(Debug, Clone, Default)]
 pub struct SpendingLimits {
-    /// Cap on a single user's daily spend. `None` means unlimited.
-    pub user_daily_usd: Option<MicroUsd>,
-    /// Cap on a single user's monthly spend. `None` means unlimited.
-    pub user_monthly_usd: Option<MicroUsd>,
-    /// Cap on global daily spend. `None` means unlimited.
-    pub global_daily_usd: Option<MicroUsd>,
+    /// Cap on total daily spend. `None` means unlimited.
+    pub daily_usd: Option<MicroUsd>,
+    /// Cap on total monthly spend. `None` means unlimited.
+    pub monthly_usd: Option<MicroUsd>,
 }
 
-/// Enforces per-user and global spending limits before execution.
+// ── CostManager ──────────────────────────────────────────────────────
+
+/// Single owner of cost-related side effects for the agent loop.
+/// `agent_loop::call_llm` invokes [`Self::record_call`] with the
+/// token counts it already has:
 ///
-/// `CostGuard` queries the `CostStore` for current spending totals and
-/// rejects requests that would exceed configured limits. It is checked
-/// by the `Router` before a message enters an actor.
-pub struct CostGuard {
-    store: Arc<dyn CostStore>,
-    limits: SpendingLimits,
-}
-
-impl CostGuard {
-    pub fn new(store: Arc<dyn CostStore>, limits: SpendingLimits) -> Self {
-        Self { store, limits }
-    }
-
-    /// Check whether a user is within all spending limits.
-    ///
-    /// Returns `Ok(())` if the user may proceed, or `Err(CostGuardError)` if
-    /// any limit has been reached.
-    pub async fn check_quota(&self, user_id: &str) -> Result<(), CostGuardError> {
-        let now = Utc::now();
-
-        // Per-user daily limit
-        if let Some(daily_limit) = self.limits.user_daily_usd {
-            let day_start = now
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Utc).single())
-                .unwrap_or(now);
-            let range = TimeRange {
-                from: day_start,
-                to: now,
-            };
-            let spent = self.store.sum_user(user_id, range).await?;
-            if spent >= daily_limit {
-                return Err(CostGuardError::UserLimitExceeded {
-                    user_id: user_id.to_string(),
-                    current: spent,
-                    limit: daily_limit,
-                });
-            }
-        }
-
-        // Per-user monthly limit
-        if let Some(monthly_limit) = self.limits.user_monthly_usd {
-            let naive = now.date_naive();
-            let first_of_month =
-                NaiveDate::from_ymd_opt(naive.year(), naive.month(), 1).unwrap_or(naive);
-            let month_start = first_of_month
-                .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Utc).single())
-                .unwrap_or(now);
-            let range = TimeRange {
-                from: month_start,
-                to: now,
-            };
-            let spent = self.store.sum_user(user_id, range).await?;
-            if spent >= monthly_limit {
-                return Err(CostGuardError::UserLimitExceeded {
-                    user_id: user_id.to_string(),
-                    current: spent,
-                    limit: monthly_limit,
-                });
-            }
-        }
-
-        // Global daily limit
-        if let Some(global_limit) = self.limits.global_daily_usd {
-            let day_start = now
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Utc).single())
-                .unwrap_or(now);
-            let range = TimeRange {
-                from: day_start,
-                to: now,
-            };
-            let summary = self.store.query_global(range).await?;
-            if summary.total_cost_usd >= global_limit {
-                return Err(CostGuardError::GlobalLimitExceeded {
-                    current: summary.total_cost_usd,
-                    limit: global_limit,
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn limits(&self) -> &SpendingLimits {
-        &self.limits
-    }
-}
-
-/// Subscribes to a `TraceEventStream` and writes `cost_records` +
-/// lazily updates the `user_monthly_cost` cache for every
-/// `TraceEvent::LlmSpanEnded` it sees. Designed to run process-wide
-/// behind a shared stream — every session's `SpanRecorder` publishes
-/// into the same bus, one task drains it.
-pub struct CostSubscriber {
+/// 1. The in-memory accumulators update synchronously, so the next
+///    iteration's [`Self::check`] sees the spend immediately.
+/// 2. A `tokio::spawn`'d task persists the `cost_records` row.
+///    Persist failures log a warning and tick
+///    `metrics.persist_failures`; they never fail the call.
+///
+/// [`Router`] also calls `check` at message ingress so an over-cap
+/// user never even gets an actor spun up. [`Self::hydrate`] runs at
+/// boot to rebuild today's / this month's totals from disk so a
+/// restart doesn't silently widen the budget.
+///
+/// [`Router`]: crate::router::Router
+pub struct CostManager {
     store: Arc<dyn CostStore>,
     pricing: Arc<HashMap<String, ModelPricing>>,
-    metrics: Arc<CostSubscriberMetrics>,
+    limits: SpendingLimits,
+    state: Arc<RwLock<BudgetState>>,
+    metrics: Arc<CostMetrics>,
 }
 
-/// Cumulative metrics for `CostSubscriber`. Exposed so operators (or
-/// the gateway's status endpoint) can detect silent under-billing —
-/// a non-zero `lagged_events` count means the broadcast bus dropped
-/// LlmSpanEnded events before this subscriber could process them, so
-/// `cost_records` and the `CostGuard` quota check are undercounting.
-///
-/// Clone the `Arc` to read the counters from another task; the
-/// internal counters are `AtomicU64` so reads are lock-free.
+/// Lock-free counters for ops dashboards.
 #[derive(Default)]
-pub struct CostSubscriberMetrics {
-    /// Number of `LlmSpanEnded` events the broadcast bus dropped
-    /// before this subscriber could pick them up. Each lagged event
-    /// is one missing `cost_records` row.
-    pub lagged_events: std::sync::atomic::AtomicU64,
-    /// Total `cost_records` rows successfully written, including
-    /// system-driven events with empty `user_id` (e.g. internal
-    /// probes). Use [`recorded_user_events`] for user-billable counts.
-    ///
-    /// [`recorded_user_events`]: Self::recorded_user_events
-    pub recorded_events: std::sync::atomic::AtomicU64,
-    /// `cost_records` rows attributable to a real user (non-empty
-    /// `user_id`) — i.e. the subset that also bumps the monthly cache
-    /// and counts toward `CostGuard` quota checks. Operators dashboards
-    /// should usually display this counter, not `recorded_events`,
-    /// because the difference is system traffic with no billing impact.
-    pub recorded_user_events: std::sync::atomic::AtomicU64,
+pub struct CostMetrics {
+    /// Total `cost_records` rows successfully persisted.
+    pub recorded_events: AtomicU64,
+    /// Increments when the fire-and-forget persist task fails. A
+    /// non-zero value means in-memory budget state is ahead of
+    /// `cost_records` until the next successful write reconciles.
+    pub persist_failures: AtomicU64,
 }
 
-impl CostSubscriberMetrics {
+impl CostMetrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    pub fn lagged(&self) -> u64 {
-        self.lagged_events
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     pub fn recorded(&self) -> u64 {
-        self.recorded_events
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.recorded_events.load(Ordering::Relaxed)
     }
 
-    pub fn recorded_user(&self) -> u64 {
-        self.recorded_user_events
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub fn persist_failures(&self) -> u64 {
+        self.persist_failures.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+struct BudgetState {
+    daily: MicroUsd,
+    daily_date: Option<NaiveDate>,
+    monthly: MicroUsd,
+    monthly_year_month: Option<(i32, u32)>,
+}
+
+impl BudgetState {
+    /// Drop yesterday's daily total / last month's monthly total if
+    /// the wall clock has moved forward into a new window.
+    fn roll_to(&mut self, today: NaiveDate, year_month: (i32, u32)) {
+        if self.daily_date != Some(today) {
+            self.daily_date = Some(today);
+            self.daily = MicroUsd::ZERO;
+        }
+        if self.monthly_year_month != Some(year_month) {
+            self.monthly_year_month = Some(year_month);
+            self.monthly = MicroUsd::ZERO;
+        }
+    }
+
+    /// Spend in the current daily window. Returns zero when the
+    /// in-memory window is stale (the rollover wipe happens lazily
+    /// on the next mutating path).
+    fn daily_for(&self, today: NaiveDate) -> MicroUsd {
+        if self.daily_date == Some(today) {
+            self.daily
+        } else {
+            MicroUsd::ZERO
+        }
+    }
+
+    fn monthly_for(&self, year_month: (i32, u32)) -> MicroUsd {
+        if self.monthly_year_month == Some(year_month) {
+            self.monthly
+        } else {
+            MicroUsd::ZERO
+        }
     }
 }
 
@@ -207,32 +136,36 @@ fn compute_cost_usd(
         + MicroUsd::cost_for_tokens(p.output_per_1m_tokens, output_tokens as u64)
 }
 
-impl CostSubscriber {
-    pub fn new(store: Arc<dyn CostStore>, pricing: Arc<HashMap<String, ModelPricing>>) -> Self {
-        Self::with_metrics(store, pricing, CostSubscriberMetrics::new())
+impl CostManager {
+    pub fn new(
+        store: Arc<dyn CostStore>,
+        pricing: Arc<HashMap<String, ModelPricing>>,
+        limits: SpendingLimits,
+    ) -> Arc<Self> {
+        Self::with_metrics(store, pricing, limits, CostMetrics::new())
     }
 
     pub fn with_metrics(
         store: Arc<dyn CostStore>,
         pricing: Arc<HashMap<String, ModelPricing>>,
-        metrics: Arc<CostSubscriberMetrics>,
-    ) -> Self {
-        Self {
+        limits: SpendingLimits,
+        metrics: Arc<CostMetrics>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             store,
             pricing,
+            limits,
+            state: Arc::new(RwLock::new(BudgetState::default())),
             metrics,
-        }
+        })
     }
 
-    /// Clone the metrics handle so other tasks can read the counters.
-    pub fn metrics(&self) -> Arc<CostSubscriberMetrics> {
+    pub fn metrics(&self) -> Arc<CostMetrics> {
         Arc::clone(&self.metrics)
     }
 
     /// Compute spend for the given token counts. Returns
-    /// [`MicroUsd::ZERO`] when the model is unknown — the raw record
-    /// still captures token counts so the missing rate can be
-    /// backfilled later.
+    /// [`MicroUsd::ZERO`] when the model is unknown.
     pub fn cost_usd_for(
         &self,
         model_id: &str,
@@ -242,95 +175,164 @@ impl CostSubscriber {
         compute_cost_usd(&self.pricing, model_id, input_tokens, output_tokens)
     }
 
-    /// Spawn a tokio task that subscribes to the given stream and
-    /// drains forever (until all senders drop). Returns the JoinHandle
-    /// so the caller can await shutdown.
-    pub fn spawn(self, stream: &TraceEventStream) -> JoinHandle<()> {
-        let mut rx = stream.subscribe();
-        let store = Arc::clone(&self.store);
-        let pricing = self.pricing;
-        let metrics = self.metrics;
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(TraceEvent::LlmSpanEnded {
-                        span_id,
-                        job_id,
-                        session_id,
-                        user_id,
-                        model_id,
-                        input_tokens,
-                        output_tokens,
-                        cached_input_tokens,
-                        cache_creation_input_tokens,
-                        ..
-                    }) => {
-                        let cost_usd =
-                            compute_cost_usd(&pricing, &model_id, input_tokens, output_tokens);
-                        let now = Utc::now();
-                        let record = CostRecord {
-                            user_id,
-                            session_id,
-                            job_id,
-                            span_id,
-                            model: model_id,
-                            input_tokens,
-                            output_tokens,
-                            cached_input_tokens,
-                            cache_creation_input_tokens,
-                            cost_usd,
-                            timestamp: now,
-                        };
-                        if let Err(e) = store.record(&record).await {
-                            warn!(error = %e, "failed to write cost_record");
-                            continue;
-                        }
-                        metrics
-                            .recorded_events
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Skip the monthly cache bump for system-driven
-                        // events that lack a real user (e.g. an internal
-                        // probe call); otherwise every such event would
-                        // land on a single ("", month) row that conflates
-                        // unrelated traffic. The user-billable counter
-                        // only ticks past this guard so dashboards don't
-                        // conflate probe traffic with real spend.
-                        if record.user_id.is_empty() {
-                            continue;
-                        }
-                        metrics
-                            .recorded_user_events
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let month = format!("{:04}-{:02}", now.year(), now.month());
-                        if let Err(e) = store
-                            .bump_user_monthly_cost(&record.user_id, &month, cost_usd)
-                            .await
-                        {
-                            warn!(error = %e, "failed to bump user_monthly_cost cache");
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // Lagged events are LlmSpanEnded events the bus
-                        // dropped before we picked them up — each one
-                        // is a missing cost_record. Surface the count so
-                        // operators see silent under-billing in metrics
-                        // / status endpoints. A non-zero counter here
-                        // means CostGuard quota checks are undercounting.
-                        metrics
-                            .lagged_events
-                            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                        warn!(missed = n, "cost subscriber lagged on TraceEventStream");
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        debug!("cost subscriber: stream closed, exiting");
-                        return;
-                    }
-                }
+    /// Pre-fill in-memory accumulators from persisted `cost_records`
+    /// for the current UTC day / month. Hydration failures log+swallow
+    /// and leave the affected accumulator empty — operator-set caps
+    /// are silently widened until the next `record_call` rebuilds
+    /// state, so monitor `CostManager day/month hydrate failed` warns.
+    pub async fn hydrate(self: &Arc<Self>) {
+        let now = Utc::now();
+        let Some(day_start) = utc_day_start(now) else {
+            return;
+        };
+        let Some(month_start) = utc_month_start(now) else {
+            return;
+        };
+        let today = now.date_naive();
+        let year_month = (now.year(), now.month());
+
+        match self
+            .store
+            .query_records_in_range(TimeRange {
+                from: day_start,
+                to: now,
+            })
+            .await
+        {
+            Ok(records) => {
+                let total: MicroUsd = records.iter().map(|r| r.cost_usd).sum();
+                let mut state = self.state.write();
+                state.daily_date = Some(today);
+                state.daily = total;
             }
-        })
+            Err(e) => warn!(error = %e, "CostManager day hydrate failed"),
+        }
+        match self
+            .store
+            .query_records_in_range(TimeRange {
+                from: month_start,
+                to: now,
+            })
+            .await
+        {
+            Ok(records) => {
+                let total: MicroUsd = records.iter().map(|r| r.cost_usd).sum();
+                let mut state = self.state.write();
+                state.monthly_year_month = Some(year_month);
+                state.monthly = total;
+            }
+            Err(e) => warn!(error = %e, "CostManager month hydrate failed"),
+        }
     }
+
+    /// Record one finished LLM call. Memory first, disk second:
+    /// 1. The in-memory budget state updates synchronously so the
+    ///    next [`Self::check`] sees the new spend before this method
+    ///    returns.
+    /// 2. The `cost_records` row is persisted in a `tokio::spawn`'d
+    ///    task. Persist errors log+swallow and tick
+    ///    `metrics.persist_failures` so dashboards can spot drift
+    ///    between in-memory and on-disk totals.
+    ///
+    /// `user_id` is recorded on the row for provenance only — budget
+    /// is global, never per-user.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_call(
+        self: &Arc<Self>,
+        user_id: &str,
+        session_id: SessionId,
+        job_id: JobId,
+        span_id: SpanId,
+        model_id: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        cached_input_tokens: usize,
+        cache_creation_input_tokens: usize,
+    ) {
+        let now = Utc::now();
+        let cost = compute_cost_usd(&self.pricing, model_id, input_tokens, output_tokens);
+
+        if cost > MicroUsd::ZERO {
+            let mut state = self.state.write();
+            state.roll_to(now.date_naive(), (now.year(), now.month()));
+            state.daily += cost;
+            state.monthly += cost;
+        }
+
+        let record = CostRecord {
+            user_id: user_id.to_string(),
+            session_id,
+            job_id,
+            span_id,
+            model: model_id.to_string(),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            cost_usd: cost,
+            timestamp: now,
+        };
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            me.persist(record).await;
+        });
+    }
+
+    async fn persist(self: Arc<Self>, record: CostRecord) {
+        if let Err(e) = self.store.record(&record).await {
+            warn!(error = %e, "failed to write cost_record");
+            self.metrics
+                .persist_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.metrics.recorded_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Synchronous in-memory budget gate. Called by `Router` at
+    /// message ingress and by `AgentLoop` before every LLM call.
+    /// A UTC rollover that happens between the most recent
+    /// `record_call` and `now` is honoured by treating the stale
+    /// window as zero spend.
+    pub fn check(&self) -> Result<(), CostGuardError> {
+        let now = Utc::now();
+        let today = now.date_naive();
+        let year_month = (now.year(), now.month());
+        let state = self.state.read();
+
+        if let Some(daily_limit) = self.limits.daily_usd {
+            let spent = state.daily_for(today);
+            if spent >= daily_limit {
+                return Err(CostGuardError::DailyLimitExceeded {
+                    current: spent,
+                    limit: daily_limit,
+                });
+            }
+        }
+        if let Some(monthly_limit) = self.limits.monthly_usd {
+            let spent = state.monthly_for(year_month);
+            if spent >= monthly_limit {
+                return Err(CostGuardError::MonthlyLimitExceeded {
+                    current: spent,
+                    limit: monthly_limit,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn utc_day_start(now: chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> {
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|dt| dt.and_local_timezone(Utc).single())
+}
+
+fn utc_month_start(now: chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> {
+    let d = now.date_naive();
+    NaiveDate::from_ymd_opt(d.year(), d.month(), 1)?
+        .and_hms_opt(0, 0, 0)
+        .and_then(|dt| dt.and_local_timezone(Utc).single())
 }
 
 #[cfg(test)]
@@ -353,7 +355,7 @@ mod tests {
     #[test]
     fn cost_usd_for_known_model() {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        let sub = CostSubscriber::new(store, pricing("m1", 3.0, 15.0));
+        let sub = CostManager::new(store, pricing("m1", 3.0, 15.0), SpendingLimits::default());
         // 1k input + 2k output → (1000/1e6)*3 + (2000/1e6)*15 = 0.003 + 0.030 = $0.033
         let cost = sub.cost_usd_for("m1", 1_000, 2_000);
         assert_eq!(cost, MicroUsd::from_usd_decimal(0.033));
@@ -362,7 +364,7 @@ mod tests {
     #[test]
     fn cost_usd_for_unknown_model_is_zero() {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        let sub = CostSubscriber::new(store, pricing("m1", 3.0, 15.0));
+        let sub = CostManager::new(store, pricing("m1", 3.0, 15.0), SpendingLimits::default());
         assert_eq!(
             sub.cost_usd_for("unknown", 1_000_000, 1_000_000),
             MicroUsd::ZERO
@@ -396,119 +398,196 @@ mod tests {
         MicroUsd::from_usd_decimal(v)
     }
 
-    #[tokio::test]
-    async fn check_quota_allows_when_all_limits_unset() {
-        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        // Even after a large spend, with no caps configured the guard
-        // must never reject — operators rely on `None` meaning "off".
-        record_spend(&store, "u1", usd(9_999.0)).await;
+    // ── CostManager ───────────────────────────────────────────────
 
-        let guard = CostGuard::new(store, SpendingLimits::default());
-        assert!(guard.check_quota("u1").await.is_ok());
+    fn manager_with(limits: SpendingLimits) -> Arc<CostManager> {
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        CostManager::new(store, pricing("m1", 3.0, 15.0), limits)
     }
 
-    #[tokio::test]
-    async fn check_quota_rejects_user_at_or_over_daily_cap() {
-        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        record_spend(&store, "u1", usd(5.0)).await;
-
-        // Exactly at the cap → rejected (gate is `>=`, not `>`, so the
-        // first call past the budget can never sneak through with a
-        // ≤ comparison race).
-        let guard = CostGuard::new(
-            store.clone(),
-            SpendingLimits {
-                user_daily_usd: Some(usd(5.0)),
-                ..Default::default()
-            },
+    /// Drive `record_call` through the public API, then wait for the
+    /// fire-and-forget persist to finish before returning.
+    async fn record_then_drain(
+        cm: &Arc<CostManager>,
+        user_id: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+    ) {
+        cm.record_call(
+            user_id,
+            SessionId::from("s1"),
+            JobId::new(),
+            SpanId::new(),
+            "m1",
+            input_tokens,
+            output_tokens,
+            0,
+            0,
         );
-        match guard.check_quota("u1").await {
-            Err(CostGuardError::UserLimitExceeded { user_id, .. }) => assert_eq!(user_id, "u1"),
-            other => panic!("expected UserLimitExceeded, got {other:?}"),
+        // record_call returns sync after updating in-memory state and
+        // spawning the persist task. Yield until the metrics counter
+        // ticks so persist-dependent assertions are deterministic.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let target = cm.metrics().recorded() + 1;
+        while cm.metrics().recorded() < target {
+            if std::time::Instant::now() >= deadline {
+                panic!("persist task never completed");
+            }
+            tokio::task::yield_now().await;
         }
-
-        // Different user, same store: their bucket is empty → allowed.
-        assert!(guard.check_quota("u2").await.is_ok());
     }
 
     #[tokio::test]
-    async fn check_quota_rejects_global_daily_cap_across_users() {
-        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        record_spend(&store, "u1", usd(3.0)).await;
-        record_spend(&store, "u2", usd(2.5)).await;
-
-        let guard = CostGuard::new(
-            store,
-            SpendingLimits {
-                global_daily_usd: Some(usd(5.0)),
-                ..Default::default()
-            },
+    async fn check_rejects_at_or_over_daily_cap() {
+        let cm = manager_with(SpendingLimits {
+            daily_usd: Some(usd(0.003)),
+            ..Default::default()
+        });
+        // 1k input @ $3/MTok = $0.003 — boundary case, `>=` trips.
+        cm.record_call(
+            "u1",
+            SessionId::from("s1"),
+            JobId::new(),
+            SpanId::new(),
+            "m1",
+            1_000,
+            0,
+            0,
+            0,
         );
-        // Global pool is u1+u2 = $5.50 ≥ $5.00 — neither user can spend.
         assert!(matches!(
-            guard.check_quota("u1").await,
-            Err(CostGuardError::GlobalLimitExceeded { .. })
-        ));
-        assert!(matches!(
-            guard.check_quota("u3").await,
-            Err(CostGuardError::GlobalLimitExceeded { .. })
+            cm.check(),
+            Err(CostGuardError::DailyLimitExceeded { .. })
         ));
     }
 
     #[tokio::test]
-    async fn check_quota_passes_user_below_cap_and_no_global_cap() {
-        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        record_spend(&store, "u1", usd(2.0)).await;
-
-        let guard = CostGuard::new(
-            store,
-            SpendingLimits {
-                user_daily_usd: Some(usd(5.0)),
-                user_monthly_usd: Some(usd(100.0)),
-                ..Default::default()
-            },
+    async fn check_rejects_at_or_over_monthly_cap() {
+        let cm = manager_with(SpendingLimits {
+            monthly_usd: Some(usd(0.003)),
+            ..Default::default()
+        });
+        cm.record_call(
+            "u1",
+            SessionId::from("s1"),
+            JobId::new(),
+            SpanId::new(),
+            "m1",
+            1_000,
+            0,
+            0,
+            0,
         );
-        assert!(guard.check_quota("u1").await.is_ok());
+        assert!(matches!(
+            cm.check(),
+            Err(CostGuardError::MonthlyLimitExceeded { .. })
+        ));
     }
 
     #[tokio::test]
-    async fn metrics_count_recorded_events_through_real_stream() {
-        use aura_model::{JobId, SessionId, SpanId};
+    async fn check_passes_when_no_caps_configured() {
+        let cm = manager_with(SpendingLimits::default());
+        cm.record_call(
+            "u1",
+            SessionId::from("s1"),
+            JobId::new(),
+            SpanId::new(),
+            "m1",
+            1_000_000_000,
+            0,
+            0,
+            0,
+        );
+        assert!(cm.check().is_ok());
+    }
+
+    #[tokio::test]
+    async fn record_call_updates_state_synchronously() {
+        // Hot-path invariant: by the time record_call returns, check
+        // already sees the new spend.
+        let cm = manager_with(SpendingLimits {
+            daily_usd: Some(usd(0.003)),
+            ..Default::default()
+        });
+        cm.record_call(
+            "u1",
+            SessionId::from("s1"),
+            JobId::new(),
+            SpanId::new(),
+            "m1",
+            1_000,
+            0,
+            0,
+            0,
+        );
+        // Synchronous: no .await between record_call return and check.
+        assert!(cm.check().is_err());
+    }
+
+    #[tokio::test]
+    async fn record_call_persists_asynchronously() {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        let metrics = CostSubscriberMetrics::new();
-        let sub = CostSubscriber::with_metrics(
+        let cm = CostManager::new(
             Arc::clone(&store),
             pricing("m1", 3.0, 15.0),
-            Arc::clone(&metrics),
+            SpendingLimits::default(),
         );
-        let stream = TraceEventStream::new();
-        let handle = sub.spawn(&stream);
+        record_then_drain(&cm, "u1", 1_000, 2_000).await;
+        let records = store
+            .query_user(
+                "u1",
+                TimeRange {
+                    from: Utc::now() - chrono::Duration::hours(1),
+                    to: Utc::now() + chrono::Duration::hours(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_tokens, 1_000);
+        assert_eq!(records[0].output_tokens, 2_000);
+        assert_eq!(cm.metrics().recorded(), 1);
+    }
 
-        for _ in 0..3 {
-            stream.publish(TraceEvent::LlmSpanEnded {
-                span_id: SpanId::new(),
-                job_id: JobId::new(),
-                session_id: SessionId::from("s1"),
-                user_id: "u1".into(),
-                model_id: "m1".into(),
-                provider: "anth".into(),
-                input_tokens: 100,
-                output_tokens: 200,
-                cached_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            });
+    #[tokio::test]
+    async fn hydrate_seeds_state_from_persisted_records() {
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        record_spend(&store, "u1", usd(0.6)).await;
+        record_spend(&store, "u2", usd(0.5)).await;
+        let cm = CostManager::new(
+            Arc::clone(&store),
+            pricing("m1", 3.0, 15.0),
+            SpendingLimits {
+                daily_usd: Some(usd(1.0)),
+                ..Default::default()
+            },
+        );
+        cm.hydrate().await;
+        // Hydrated total $1.10 ≥ $1.00 → check rejects before any
+        // new event lands. Protects against post-restart wide-open
+        // budgets and proves spend across users sums into one pool.
+        assert!(matches!(
+            cm.check(),
+            Err(CostGuardError::DailyLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn check_treats_stale_window_as_zero_spend() {
+        // Build state directly so we can backdate `daily_date` —
+        // record_call always uses Utc::now and can't drive rollover.
+        let cm = manager_with(SpendingLimits {
+            daily_usd: Some(usd(0.001)),
+            ..Default::default()
+        });
+        let yesterday = Utc::now() - chrono::Duration::days(1);
+        {
+            let mut state = cm.state.write();
+            state.daily_date = Some(yesterday.date_naive());
+            state.daily = MicroUsd::from_usd_decimal(0.999);
         }
-        // Give the spawned task a tick to drain.
-        for _ in 0..10 {
-            if metrics.recorded() == 3 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(metrics.recorded(), 3, "all three events should land");
-        assert_eq!(metrics.lagged(), 0, "no lag in this test path");
-        drop(stream);
-        // Clean up: subscriber exits when the last sender drops.
-        let _ = handle.await;
+        // check() at "today" must read yesterday's window as stale
+        // (zero spend) and pass.
+        assert!(cm.check().is_ok(), "stale daily window must read as zero");
     }
 }

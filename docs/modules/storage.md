@@ -70,7 +70,7 @@ Use transactions wherever a check-and-write pair must be atomic — most importa
 
 ### Hard delete
 
-All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tombstone column, no soft-delete protocol, and no revival semantics — once a row is gone it is gone. Retention sweeps in `aura-janitor` (`cron_executions`, `cost_records`, `user_monthly_cost`, `channel_pairings`, `blobs`) issue the same `DELETE FROM` against rows past their retention horizon.
+All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tombstone column, no soft-delete protocol, and no revival semantics — once a row is gone it is gone. Retention sweeps in `aura-janitor` (`cron_executions`, `cost_records`, `channel_pairings`, `blobs`) issue the same `DELETE FROM` against rows past their retention horizon.
 
 ## Constraints
 

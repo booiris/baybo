@@ -61,18 +61,6 @@ pub struct CostSummary {
     pub record_count: usize,
 }
 
-/// Cached per-user-per-month total. Populated lazily by
-/// `CostSubscriber` after each `cost_records` write; read by
-/// `CostGuard` for monthly-quota checks.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UserMonthlyCost {
-    pub user_id: String,
-    /// Calendar month tag — `YYYY-MM` (UTC).
-    pub month: String,
-    pub cost_usd: MicroUsd,
-    pub updated_at: DateTime<Utc>,
-}
-
 /// Persistence backend for cost records.
 #[async_trait]
 pub trait CostStore: Send + Sync {
@@ -97,27 +85,4 @@ pub trait CostStore: Send + Sync {
     /// Return the aggregated cost summary for a single job. Drives
     /// `QueryApi::cost_summary(CostScope::Job)`.
     async fn query_job(&self, job_id: &aura_model::JobId) -> CostResult<CostSummary>;
-
-    /// Return the sum of `cost_usd` for a user within the given time range.
-    async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<MicroUsd>;
-
-    // ── Cached user-monthly aggregate (lazy materialisation) ──
-
-    /// Add `delta_usd` to the (`user_id`, `month`) cache row,
-    /// inserting if absent.
-    async fn bump_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-        delta_usd: MicroUsd,
-    ) -> CostResult<()>;
-
-    /// Read the cached monthly total. Returns `None` when the row is
-    /// missing (caller should recompute from raw `cost_records` and
-    /// re-bump).
-    async fn get_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-    ) -> CostResult<Option<UserMonthlyCost>>;
 }

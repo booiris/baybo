@@ -197,27 +197,18 @@ fn validate_tools(tools: &ToolsConfig, errors: &mut Vec<ValidationError>) {
 
 fn validate_cost(cost: &CostConfig, errors: &mut Vec<ValidationError>) {
     let limits = &cost.spending_limits;
+    check_positive(limits.daily_usd, "cost.spending_limits.daily_usd", errors);
     check_positive(
-        limits.user_daily_usd,
-        "cost.spending_limits.user_daily_usd",
+        limits.monthly_usd,
+        "cost.spending_limits.monthly_usd",
         errors,
     );
-    check_positive(
-        limits.user_monthly_usd,
-        "cost.spending_limits.user_monthly_usd",
-        errors,
-    );
-    check_positive(
-        limits.global_daily_usd,
-        "cost.spending_limits.global_daily_usd",
-        errors,
-    );
-    if let (Some(daily), Some(monthly)) = (limits.user_daily_usd, limits.user_monthly_usd)
+    if let (Some(daily), Some(monthly)) = (limits.daily_usd, limits.monthly_usd)
         && daily > monthly
     {
         errors.push(ValidationError::new(
-            "cost.spending_limits.user_daily_usd",
-            "must be <= cost.spending_limits.user_monthly_usd",
+            "cost.spending_limits.daily_usd",
+            "must be <= cost.spending_limits.monthly_usd",
         ));
     }
 

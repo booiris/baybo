@@ -2,9 +2,7 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 use super::time;
-use crate::cost::{
-    CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange, UserMonthlyCost,
-};
+use crate::cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
 
 pub struct LibsqlCostStore {
@@ -165,107 +163,6 @@ impl CostStore for LibsqlCostStore {
             .ok_or_else(|| CostError::Storage("expected aggregate row".to_string()))?;
         summary_from_aggregate_row(&row)
     }
-
-    async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<MicroUsd> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records \
-                 WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
-                libsql::params![
-                    user_id.to_string(),
-                    time::to_us(range.from),
-                    time::to_us(range.to),
-                ],
-            )
-            .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-            .ok_or_else(|| CostError::Storage("expected aggregate row".to_string()))?;
-
-        row.get::<i64>(0)
-            .map(MicroUsd::from_micros)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))
-    }
-
-    async fn bump_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-        delta_usd: MicroUsd,
-    ) -> CostResult<()> {
-        let conn = self.pool.conn();
-        let now = time::now_us();
-        // ON CONFLICT DO UPDATE so a re-bump increments the running
-        // total instead of clobbering it.
-        conn.execute(
-            "INSERT INTO user_monthly_cost (user_id, month, cost_usd, updated_at) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(user_id, month) DO UPDATE SET \
-               cost_usd = cost_usd + excluded.cost_usd, \
-               updated_at = excluded.updated_at",
-            libsql::params![
-                user_id.to_string(),
-                month.to_string(),
-                delta_usd.into_micros(),
-                now
-            ],
-        )
-        .await
-        .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql upsert: {e}")))?;
-        Ok(())
-    }
-
-    async fn get_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-    ) -> CostResult<Option<UserMonthlyCost>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT user_id, month, cost_usd, updated_at FROM user_monthly_cost \
-                 WHERE user_id = ?1 AND month = ?2",
-                libsql::params![user_id.to_string(), month.to_string()],
-            )
-            .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
-        match row {
-            None => Ok(None),
-            Some(row) => {
-                let user_id: String = row
-                    .get(0)
-                    .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let month: String = row
-                    .get(1)
-                    .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let cost_usd_micros: i64 = row
-                    .get(2)
-                    .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let updated_at: i64 = row
-                    .get(3)
-                    .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                Ok(Some(UserMonthlyCost {
-                    user_id,
-                    month,
-                    cost_usd: MicroUsd::from_micros(cost_usd_micros),
-                    updated_at: time::from_us(updated_at).ok_or_else(|| {
-                        CostError::Storage(format!(
-                            "user_monthly_cost.updated_at out of range: {updated_at}"
-                        ))
-                    })?,
-                }))
-            }
-        }
-    }
 }
 
 fn summary_from_aggregate_row(row: &libsql::Row) -> CostResult<CostSummary> {
@@ -406,16 +303,5 @@ mod tests {
         let summary = store.query_global(wide_range()).await.unwrap();
         assert_eq!(summary.record_count, 2);
         assert_eq!(summary.total_cost_usd, usd(0.30));
-    }
-
-    #[tokio::test]
-    async fn sum_user_cost() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCostStore::new(pool);
-        store.record(&test_record("u1", usd(0.10))).await.unwrap();
-        store.record(&test_record("u1", usd(0.25))).await.unwrap();
-        store.record(&test_record("u2", usd(1.00))).await.unwrap();
-        let sum = store.sum_user("u1", wide_range()).await.unwrap();
-        assert_eq!(sum, usd(0.35));
     }
 }

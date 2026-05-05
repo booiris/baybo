@@ -234,13 +234,14 @@ impl AgentTestHarnessBuilder {
             trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
             trace_event_stream.clone(),
         ));
-        // Cost subscriber: pricing left empty for tests — token
-        // counts still land in cost_records, cost_usd reads as 0.
-        let _cost_handle = aura_agent::cost::CostSubscriber::new(
+        // Cost ledger: pricing left empty for tests — token counts
+        // still land in cost_records via record_call (called by
+        // agent_loop), cost_usd reads as 0.
+        let cost_manager = aura_agent::CostManager::new(
             share_cost_store(&cost_store),
             Arc::new(std::collections::HashMap::new()),
-        )
-        .spawn(&trace_event_stream);
+            aura_agent::SpendingLimits::default(),
+        );
 
         // Agent loop dependencies.
         let stub_llm = Arc::new(StubLlm::new());
@@ -285,7 +286,8 @@ impl AgentTestHarnessBuilder {
             ExecutionPolicy::default(),
             soul,
             gateway.clone(),
-        );
+        )
+        .with_cost_manager(cost_manager);
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
@@ -323,7 +325,7 @@ impl AgentTestHarnessBuilder {
 // --- Helpers to obtain `Box<dyn Trait>` handles from `Arc<Concrete>` ---
 //
 // Each in-memory store is constructed once as an `Arc` and shared
-// directly with the managers — `JobLifecycle`, `CostSubscriber`, and
+// directly with the managers — `JobLifecycle`, `CostManager`, and
 // `MemoryManager` all accept `Arc<dyn Trait>`, so the test handle and the
 // manager-owned handle point at the same instance and post-run
 // assertions see real state.
