@@ -180,6 +180,14 @@ impl CostManager {
     /// and leave the affected accumulator empty — operator-set caps
     /// are silently widened until the next `record_call` rebuilds
     /// state, so monitor `CostManager day/month hydrate failed` warns.
+    ///
+    /// **Must be awaited before any [`Self::record_call`] can fire.**
+    /// Hydrate **overwrites** the daily / monthly accumulators with the
+    /// SUM read from the store; a `record_call` that lands during the
+    /// awaited DB query would have its bump silently dropped.
+    /// `runtime.rs` enforces this by awaiting `hydrate` before the
+    /// `spawn_actor_for` closure even constructs an actor (no actor →
+    /// no `record_call` source). New callers must keep that invariant.
     pub async fn hydrate(self: &Arc<Self>) {
         let now = Utc::now();
         let Some(day_start) = utc_day_start(now) else {
