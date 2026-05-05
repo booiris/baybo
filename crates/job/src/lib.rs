@@ -1,7 +1,7 @@
 //! Job lifecycle types — see `docs/modules/job.md` for the design.
 //!
-//! This crate is types-only: no async, no storage. The persistence /
-//! hook orchestrator (`JobLifecycle`) lives in `agent::job`.
+//! This crate is types-only: no async, no storage. The persistence
+//! orchestrator (`JobLifecycle`) lives in `agent::job`.
 
 mod cancel;
 mod drift;

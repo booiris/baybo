@@ -472,15 +472,16 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
 }
 
 /// Warning appended below a `CronCreate` tool call whose schedule recurs.
-/// TUI sessions are ephemeral — triggers fired while the daemon is down
+/// TUI sessions are ephemeral — triggers fired while the gateway is down
 /// are lost, and a fresh TUI session will not replay them. Keeping this
 /// purely in the TUI renderer means cron/the LLM stay agnostic to channel
 /// quirks: whoever schedules it doesn't need to know, but whoever watches
 /// the TUI gets the caveat inline.
 const TUI_CRON_RECURRING_HINT: &str = "⚠ This cron is tied to the TUI channel. \
-    It only fires while the Aura daemon is running, and a new TUI session \
-    will not replay triggers missed while it was down. For long-lived \
-    recurring jobs, prefer a persistent channel (telegram/discord/http).";
+    It only fires while `aura gateway` is running, and a new TUI session \
+    will not replay triggers missed while the gateway was down. For \
+    long-lived recurring jobs, prefer a persistent channel \
+    (telegram/discord/http).";
 
 fn render_block(block: &ContentBlock) -> Option<String> {
     match block {

@@ -127,11 +127,12 @@ pub enum Commands {
     },
     /// Launch the interactive Ratatui chat session.
     ///
-    /// Connects to an `aura gateway` over HTTP+SSE. The endpoint is
-    /// derived from `config.gateway.{bind_address,port}` and the
-    /// bearer token is read from the workspace vault. If the gateway
-    /// is unreachable the command exits with an error block
-    /// describing how to start one.
+    /// Connects to an `aura gateway` over its WebSocket channel
+    /// listener; the loopback port is discovered from
+    /// `<workspace>/state/channel.port`, and the per-start TUI
+    /// token is read from the workspace vault under
+    /// `gateway.tui_token`. If the gateway is unreachable the
+    /// command exits with an error block describing how to start one.
     Tui {
         /// Resume an existing session by id instead of creating a new
         /// one. Sessions created with a different channel (http) are

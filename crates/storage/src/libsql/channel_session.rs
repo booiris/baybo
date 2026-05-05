@@ -136,8 +136,8 @@ mod tests {
         );
 
         // After the row is gone, a fresh put inserts the new session id.
-        // (On a live-row conflict the UPDATE is a no-op, preserving
-        // concurrent-writer determinism.)
+        // (On a live-row conflict `INSERT OR IGNORE` keeps the existing
+        // row, preserving concurrent-writer determinism.)
         store
             .put(&ChannelType::telegram(), "tg_42", "sess-b")
             .await
