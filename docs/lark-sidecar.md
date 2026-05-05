@@ -5,7 +5,7 @@ the gateway binary. It speaks the standard channel WS protocol (see
 [`modules/channels.md`](modules/channels.md)) plus the optional
 `secrets`, `mcp_tunnel`, `tool_telemetry`, and `diagnose`
 capabilities. The full upstream gap analysis is at
-[`../LARK_CHANNEL_REPORT.md`](../LARK_CHANNEL_REPORT.md); this
+[`todo/LARK_CHANNEL_REPORT.md`](todo/LARK_CHANNEL_REPORT.md); this
 document covers the architecture that landed, not the design
 exploration.
 
