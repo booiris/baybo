@@ -96,11 +96,7 @@ impl McpTunnelRouter {
             tunnel_id,
             router: Arc::clone(self),
         };
-        McpTunnel {
-            sender,
-            rx,
-            guard: Some(guard),
-        }
+        McpTunnel { sender, rx, guard }
     }
 
     /// Forward an inbound `Frame::Mcp` payload from a sidecar to its
@@ -146,10 +142,7 @@ impl McpTunnelRouter {
 pub struct McpTunnel {
     sender: Arc<McpTunnelSender>,
     rx: mpsc::Receiver<Vec<u8>>,
-    /// Holds the registry-cleanup guard. `Option` so
-    /// [`Self::into_transport_parts`] can transfer ownership to the
-    /// caller when an rmcp `Transport` takes over.
-    guard: Option<McpTunnelGuard>,
+    guard: McpTunnelGuard,
 }
 
 impl McpTunnel {
@@ -184,15 +177,13 @@ impl McpTunnel {
     ///
     /// [`Transport`]: rmcp::transport::Transport
     pub fn into_transport_parts(
-        mut self,
+        self,
     ) -> (
         Arc<dyn SidecarSender>,
         mpsc::Receiver<Vec<u8>>,
         McpTunnelGuard,
     ) {
-        let guard = self.guard.take().expect("tunnel guard set in open()");
-        let sender: Arc<dyn SidecarSender> = self.sender.clone();
-        let rx = std::mem::replace(&mut self.rx, mpsc::channel(1).1);
+        let Self { sender, rx, guard } = self;
         (sender, rx, guard)
     }
 }

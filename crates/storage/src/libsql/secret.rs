@@ -113,7 +113,7 @@ impl SecretStore for LibsqlSecretStore {
     }
 
     async fn delete_with_prefix(&self, prefix: &str) -> crate::secret::Result<usize> {
-        let now = chrono::Utc::now().timestamp();
+        let now = super::time::now_us();
         let conn = self.pool.conn();
         // `substr` instead of `LIKE` so a prefix containing `%` or `_`
         // (sqlite's LIKE wildcards) matches literally. Our channel

@@ -965,7 +965,7 @@ impl AgentLoop {
                     .sanitize_tool_output(&mut output)
                     .await
                 {
-                    warn!(error = %e, tool = %tool_name_owned, "sidecar mcp: sanitize_tool_output failed");
+                    return Err(anyhow::anyhow!("sanitize_tool_output: {e}"));
                 }
 
                 let output_value = serde_json::to_value(&output).unwrap_or(serde_json::Value::Null);
