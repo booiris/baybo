@@ -342,7 +342,11 @@ impl AgentLoop {
         self.append_context_message(session, &user_msg).await?;
 
         let user_text = aura_llm::multimodal::extract_text(&user_content);
-        let skills_for_turn = self.invocable_skills();
+        let skills_for_turn = if self.skill_registry.is_empty() {
+            Vec::new()
+        } else {
+            self.invocable_skills()
+        };
 
         if let Some(reminder) = build_skill_reminder(&skills_for_turn) {
             let reminder_msg = ChatMessage {

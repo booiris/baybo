@@ -26,7 +26,10 @@ pub fn build(
     registry: Arc<SkillRegistry>,
     risk_check: Arc<dyn SkillRiskCheck>,
 ) -> (Arc<dyn Tool>, ToolManifest) {
-    let tool: Arc<dyn Tool> = Arc::new(SkillTool::new(registry, risk_check));
+    let tool: Arc<dyn Tool> = Arc::new(SkillTool {
+        registry,
+        risk_check,
+    });
     let manifest = ToolManifest {
         name: tool.name().to_string(),
         description: tool.description().to_string(),
@@ -37,19 +40,9 @@ pub fn build(
     (tool, manifest)
 }
 
-/// Tool implementation. See module-level docs for the contract.
-pub struct SkillTool {
+struct SkillTool {
     registry: Arc<SkillRegistry>,
     risk_check: Arc<dyn SkillRiskCheck>,
-}
-
-impl SkillTool {
-    pub fn new(registry: Arc<SkillRegistry>, risk_check: Arc<dyn SkillRiskCheck>) -> Self {
-        Self {
-            registry,
-            risk_check,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,8 +154,16 @@ impl Tool for SkillTool {
             None => render_main(&skill, p.args.as_deref())?,
             Some(rel) => render_subfile(&skill, rel).await?,
         };
-        if let (Some(warn), ToolOutput::Json(v)) = (warning.as_deref(), &mut out) {
-            v["risk_warning"] = serde_json::Value::String(warn.to_string());
+        if let Some(warn) = warning.as_deref() {
+            match &mut out {
+                ToolOutput::Json(v) => {
+                    v["risk_warning"] = serde_json::Value::String(warn.to_string());
+                }
+                _ => debug_assert!(
+                    false,
+                    "Skill tool must return Json so risk_warning can attach"
+                ),
+            }
         }
         Ok(out)
     }
@@ -371,7 +372,7 @@ pub fn build_install_tool(
     (tool, manifest)
 }
 
-pub struct SkillInstallTool {
+struct SkillInstallTool {
     workspace_skills_dir: PathBuf,
     registry: Arc<SkillRegistry>,
     risk_check: Arc<dyn SkillRiskCheck>,
@@ -540,7 +541,7 @@ pub fn build_uninstall_tool(
     (tool, manifest)
 }
 
-pub struct SkillUninstallTool {
+struct SkillUninstallTool {
     workspace_skills_dir: PathBuf,
     registry: Arc<SkillRegistry>,
 }
@@ -759,7 +760,10 @@ mod tests {
 
         let registry = Arc::new(SkillRegistry::new());
         registry.register(mk_skill(root, "demo"));
-        let tool = SkillTool::new(registry, Arc::new(AlwaysPass));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
 
         let out = tool
             .execute(json!({"skill": "demo"}), &mk_ctx())
@@ -788,7 +792,10 @@ mod tests {
 
         let registry = Arc::new(SkillRegistry::new());
         registry.register(mk_skill(root, "demo"));
-        let tool = SkillTool::new(registry, Arc::new(AlwaysPass));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
 
         let out = tool
             .execute(
@@ -814,7 +821,10 @@ mod tests {
 
         let registry = Arc::new(SkillRegistry::new());
         registry.register(mk_skill(root, "demo"));
-        let tool = SkillTool::new(registry, Arc::new(AlwaysPass));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
 
         for bad in ["../etc/passwd", "/etc/passwd", "a/../../b", ""] {
             let err = tool
@@ -834,7 +844,10 @@ mod tests {
 
         let registry = Arc::new(SkillRegistry::new());
         registry.register(s);
-        let tool = SkillTool::new(registry, Arc::new(AlwaysPass));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
 
         let err = tool
             .execute(json!({"skill": "demo"}), &mk_ctx())
@@ -852,7 +865,10 @@ mod tests {
 
         let registry = Arc::new(SkillRegistry::new());
         registry.register(s);
-        let tool = SkillTool::new(registry, Arc::new(AlwaysPass));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
 
         let err = tool
             .execute(json!({"skill": "demo"}), &mk_ctx())
@@ -871,7 +887,10 @@ mod tests {
 
         let registry = Arc::new(SkillRegistry::new());
         registry.register(s);
-        let tool = SkillTool::new(registry, Arc::new(AlwaysPass));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
 
         let err = tool
             .execute(json!({"skill": "demo"}), &mk_ctx())
@@ -891,7 +910,10 @@ mod tests {
         fs::write(dir.path().join("SKILL.md"), "# Body\n").unwrap();
         let registry = Arc::new(SkillRegistry::new());
         registry.register(mk_skill(dir.path(), "demo"));
-        let tool = SkillTool::new(registry, Arc::new(AlwaysPass));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
 
         let out = tool
             .execute(
@@ -934,7 +956,10 @@ mod tests {
         fs::write(dir.path().join("SKILL.md"), "# Body\n").unwrap();
         let registry = Arc::new(SkillRegistry::new());
         registry.register(mk_skill(dir.path(), "demo"));
-        let tool = SkillTool::new(registry, Arc::new(AlwaysBlock));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysBlock),
+        };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let err = rt
             .block_on(tool.execute(json!({"skill": "demo"}), &mk_ctx()))
@@ -1017,6 +1042,80 @@ mod tests {
         assert!(
             matches!(err, ToolError::Execution(msg) if msg.contains("already installed")),
             "expected already-installed error",
+        );
+    }
+
+    #[tokio::test]
+    async fn install_with_suspicious_verdict_succeeds_with_warning() {
+        struct AlwaysSuspicious;
+        #[async_trait]
+        impl SkillRiskCheck for AlwaysSuspicious {
+            async fn assess(&self, _: &SkillDefinition) -> SkillGate {
+                SkillGate::PassWithWarning {
+                    rationale: "minor concern".into(),
+                }
+            }
+        }
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join("skills");
+        fs::create_dir(&skills_dir).unwrap();
+        let source = tempdir().unwrap();
+        write_minimal_skill(source.path(), "demo");
+
+        let registry = Arc::new(SkillRegistry::new());
+        registry.load_dir(&skills_dir);
+        let tool = install_tool(
+            &skills_dir,
+            Arc::clone(&registry),
+            Arc::new(AlwaysSuspicious),
+        );
+
+        let out = tool
+            .execute(
+                json!({"source_dir": source.path().to_str().unwrap()}),
+                &mk_ctx(),
+            )
+            .await
+            .unwrap();
+        let v = match out {
+            ToolOutput::Json(v) => v,
+            other => panic!("expected json, got {other:?}"),
+        };
+        assert_eq!(v["risk_warning"], "minor concern");
+        assert!(skills_dir.join("demo/SKILL.md").exists());
+    }
+
+    #[tokio::test]
+    async fn mode2_rejects_symlink_escape() {
+        let secrets = tempdir().unwrap();
+        fs::write(secrets.path().join("victim.txt"), "leaked").unwrap();
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("SKILL.md"), "# Body\n").unwrap();
+        fs::create_dir(dir.path().join("references")).unwrap();
+        std::os::unix::fs::symlink(
+            secrets.path().join("victim.txt"),
+            dir.path().join("references/escape"),
+        )
+        .unwrap();
+
+        let registry = Arc::new(SkillRegistry::new());
+        registry.register(mk_skill(dir.path(), "demo"));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
+
+        let err = tool
+            .execute(
+                json!({"skill": "demo", "file_path": "references/escape"}),
+                &mk_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(msg) if msg.contains("outside")),
+            "expected outside-skill-directory error",
         );
     }
 

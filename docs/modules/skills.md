@@ -91,8 +91,15 @@ agent loop publishes a per-turn **system reminder** listing every
 agent-invocable, non-`Untrusted` skill (name, description, optional
 `argument-hint`); the LLM pulls one in by calling the `Skill` tool
 (see [`tools.md`](./tools.md#skill-tool)). The list comes from
-`SkillRegistry::all_sorted()` filtered to `agent_invocable && trust_level != Untrusted`,
-sorted by name for stable across-turn ordering.
+`SkillRegistry::all_summaries_sorted()` — a lightweight projection
+(`SkillSummary`) carrying only the fields needed for the listing.
+Cloning every `SkillDefinition`'s `prompt_template` / `allowed_tools`
+/ `requirements` per turn would burn allocator pressure proportional
+to skill count × body size; the projection avoids that. Filtered to
+`agent_invocable && trust_level != Untrusted`, sorted by name for
+stable across-turn ordering. When the registry is empty,
+`SkillRegistry::is_empty()` short-circuits before the projection
+runs at all.
 
 Slash invocations short-circuit through the same code path: when the
 user types `/<cmd> [args]`, the agent loop synthesizes a deterministic
