@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
+use aura_model::MicroUsd;
 
 pub(crate) const GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -33,8 +34,8 @@ impl LlmProviderFactory for GeminiProviderFactory {
                 (
                     (*m).to_string(),
                     ModelPricing {
-                        input_per_1m_tokens: 0.075,
-                        output_per_1m_tokens: 0.30,
+                        input_per_1m_tokens: MicroUsd::from_usd_decimal(0.075),
+                        output_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
                     },
                 )
             })
@@ -65,8 +66,8 @@ impl LlmProviderFactory for GeminiProviderFactory {
             supports_tools: true,
             supports_vision: true,
             pricing: ModelPricing {
-                input_per_1m_tokens: 0.075,
-                output_per_1m_tokens: 0.30,
+                input_per_1m_tokens: MicroUsd::from_usd_decimal(0.075),
+                output_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
             },
         };
 

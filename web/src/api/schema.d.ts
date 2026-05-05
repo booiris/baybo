@@ -296,12 +296,20 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** @description One bucket per UTC day for the analytics chart. */
+        /**
+         * @description One bucket per UTC day for the analytics chart.
+         *
+         *     `cost_micro_usd` is integer micro-USD (USD × 10^6). Rendering layers
+         *     divide by 1_000_000 to get USD; on-wire arithmetic stays exact.
+         */
         AnalyticsDayBucket: {
             cache_creation_input_tokens: number;
             cached_input_tokens: number;
-            /** Format: double */
-            cost_usd: number;
+            /**
+             * Format: int64
+             * @description Spend for the day, in **micro-USD** (1 USD = 1_000_000).
+             */
+            cost_micro_usd: number;
             /** @description `YYYY-MM-DD` (UTC). */
             date: string;
             input_tokens: number;
@@ -313,8 +321,11 @@ export interface components {
             cache_creation_input_tokens: number;
             cached_input_tokens: number;
             call_count: number;
-            /** Format: double */
-            cost_usd: number;
+            /**
+             * Format: int64
+             * @description Spend for the model, in **micro-USD** (1 USD = 1_000_000).
+             */
+            cost_micro_usd: number;
             input_tokens: number;
             model: string;
             output_tokens: number;
@@ -330,8 +341,11 @@ export interface components {
             since: string;
             total_cache_creation_input_tokens: number;
             total_cached_input_tokens: number;
-            /** Format: double */
-            total_cost_usd: number;
+            /**
+             * Format: int64
+             * @description Total spend across the window, in **micro-USD** (1 USD = 1_000_000).
+             */
+            total_cost_micro_usd: number;
             total_input_tokens: number;
             total_output_tokens: number;
             total_record_count: number;

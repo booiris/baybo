@@ -124,10 +124,15 @@ pub struct ModelInfo {
 }
 
 /// Per-token pricing information for a model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Both rates are micro-USD per **1M tokens** (so $3.00 / MTok →
+/// `MicroUsd::from_micros(3_000_000)`). Use [`MicroUsd::cost_for_tokens`]
+/// to apply these to a token count — that path keeps everything in
+/// integer math, no float drift.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ModelPricing {
-    pub input_per_1m_tokens: f64,
-    pub output_per_1m_tokens: f64,
+    pub input_per_1m_tokens: aura_model::MicroUsd,
+    pub output_per_1m_tokens: aura_model::MicroUsd,
 }
 
 /// Unified response structure returned by `LlmClient::chat()`.

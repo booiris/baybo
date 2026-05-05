@@ -7,7 +7,7 @@ use aura_model::{Session, SessionId, TriggerSource, User};
 
 use aura_cron::CronTriggerEvent;
 
-use crate::cost::CostGuard;
+use crate::cost::CostManager;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
 use tokio::sync::mpsc;
@@ -81,7 +81,7 @@ pub struct Router {
     supervisor: AgentSupervisor,
     channels: Arc<ChannelRegistry>,
     security_gateway: Arc<SecurityGateway>,
-    cost_guard: Option<Arc<CostGuard>>,
+    cost_manager: Option<Arc<CostManager>>,
     rate_limiter: RateLimiter,
     actor_spawner: Option<ActorSpawner>,
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
@@ -110,7 +110,7 @@ impl Router {
             supervisor,
             channels,
             security_gateway,
-            cost_guard: None,
+            cost_manager: None,
             rate_limiter: RateLimiter::new(
                 DEFAULT_RATE_LIMIT_REQUESTS,
                 std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
@@ -131,9 +131,11 @@ impl Router {
         self
     }
 
-    /// Set a `CostGuard` for quota checks before routing messages.
-    pub fn with_cost_guard(mut self, guard: Arc<CostGuard>) -> Self {
-        self.cost_guard = Some(guard);
+    /// Attach the [`CostManager`] so the router can pre-flight reject
+    /// over-budget messages before they enter an actor — same gate the
+    /// agent loop uses before each LLM call, just at message ingress.
+    pub fn with_cost_manager(mut self, manager: Arc<CostManager>) -> Self {
+        self.cost_manager = Some(manager);
         self
     }
 
@@ -288,14 +290,16 @@ impl Router {
             anyhow::bail!("rate limit exceeded for user '{}'", user.id);
         }
 
-        // Quota check via CostGuard
-        if let Some(ref guard) = self.cost_guard {
-            guard.check_quota(&user.id).await.map_err(|e| {
+        // In-memory budget gate: same call agent_loop makes before
+        // each LLM call, fired here too so an over-cap user never even
+        // gets an actor spun up.
+        if let Some(ref cm) = self.cost_manager {
+            cm.check().map_err(|e| {
                 warn!(
                     user_id = %user.id,
                     session_id = %session_id,
                     error = %e,
-                    "cost guard rejected request"
+                    "cost manager rejected request"
                 );
                 anyhow::anyhow!(e)
             })?;

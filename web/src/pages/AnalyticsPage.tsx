@@ -86,10 +86,14 @@ function formatTokens(val: number): string {
   return Math.floor(val).toString();
 }
 
-function formatUsd(val: number): string {
-  if (val >= 1_000) return `$${val.toFixed(0).toLocaleString()}`;
-  if (val >= 10) return `$${val.toFixed(2)}`;
-  return `$${val.toFixed(4)}`;
+// Wire format is integer micro-USD (USD × 10^6). Divide here at the
+// rendering boundary so the rest of the stack stays in exact integer
+// math — no float drift across totals or chart aggregates.
+function formatMicroUsd(microUsd: number): string {
+  const usd = microUsd / 1_000_000;
+  if (usd >= 1_000) return `$${usd.toFixed(0).toLocaleString()}`;
+  if (usd >= 10) return `$${usd.toFixed(2)}`;
+  return `$${usd.toFixed(4)}`;
 }
 
 // Build a synthetic mock AnalyticsResponse for DEV mock mode so the
@@ -100,7 +104,9 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
   const daily: AnalyticsResponse['daily'] = [];
   let totIn = 0;
   let totOut = 0;
-  let totCost = 0;
+  // Cost is in micro-USD on the wire — keep the mock generator in the
+  // same unit so it reads back identically through formatMicroUsd.
+  let totCostMicroUsd = 0;
   let totRecords = 0;
   let totCached = 0;
   let totCacheCreate = 0;
@@ -113,7 +119,8 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
     // ~60% of input served from prompt cache, ~10% written into cache
     const cached = Math.floor(input * 0.6);
     const cacheCreate = Math.floor(input * 0.1);
-    const cost = (input + output) * 0.0000035;
+    // Original mock rate: $0.0000035 per token ≈ 3.5 micro-USD/token.
+    const costMicroUsd = Math.floor((input + output) * 3.5);
     const sessions = Math.floor(Math.random() * 50) + 5;
     daily.push({
       date,
@@ -121,14 +128,14 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
       output_tokens: output,
       cached_input_tokens: cached,
       cache_creation_input_tokens: cacheCreate,
-      cost_usd: cost,
+      cost_micro_usd: costMicroUsd,
       sessions_created: sessions,
     });
     totIn += input;
     totOut += output;
     totCached += cached;
     totCacheCreate += cacheCreate;
-    totCost += cost;
+    totCostMicroUsd += costMicroUsd;
     totRecords += Math.floor(sessions * 1.5);
   }
   return {
@@ -138,7 +145,7 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
     total_output_tokens: totOut,
     total_cached_input_tokens: totCached,
     total_cache_creation_input_tokens: totCacheCreate,
-    total_cost_usd: totCost,
+    total_cost_micro_usd: totCostMicroUsd,
     total_record_count: totRecords,
     daily,
     by_model: [
@@ -148,7 +155,7 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
         output_tokens: Math.floor(totOut * 0.75),
         cached_input_tokens: Math.floor(totCached * 0.7),
         cache_creation_input_tokens: Math.floor(totCacheCreate * 0.7),
-        cost_usd: totCost * 0.7,
+        cost_micro_usd: Math.floor(totCostMicroUsd * 0.7),
         call_count: Math.floor(totRecords * 0.6),
       },
       {
@@ -157,7 +164,7 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
         output_tokens: Math.floor(totOut * 0.18),
         cached_input_tokens: Math.floor(totCached * 0.2),
         cache_creation_input_tokens: Math.floor(totCacheCreate * 0.2),
-        cost_usd: totCost * 0.15,
+        cost_micro_usd: Math.floor(totCostMicroUsd * 0.15),
         call_count: Math.floor(totRecords * 0.3),
       },
       {
@@ -166,7 +173,7 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
         output_tokens: Math.floor(totOut * 0.07),
         cached_input_tokens: Math.floor(totCached * 0.1),
         cache_creation_input_tokens: 0,
-        cost_usd: totCost * 0.15,
+        cost_micro_usd: Math.floor(totCostMicroUsd * 0.15),
         call_count: Math.floor(totRecords * 0.1),
       },
     ],
@@ -327,7 +334,7 @@ export function AnalyticsPage() {
             />
             <MetricCard
               title="Total Cost"
-              value={formatUsd(data.total_cost_usd)}
+              value={formatMicroUsd(data.total_cost_micro_usd)}
               icon={RiMoneyDollarCircleLine}
               subtitle={`${data.total_record_count.toLocaleString()} LLM calls`}
             />
@@ -460,7 +467,7 @@ export function AnalyticsPage() {
                           </span>
                         )}
                       </td>
-                      <td className={`${tdCell} text-right`}>{formatUsd(day.cost_usd)}</td>
+                      <td className={`${tdCell} text-right`}>{formatMicroUsd(day.cost_micro_usd)}</td>
                       <td className={`${tdCell} text-right`}>{day.sessions_created}</td>
                     </tr>
                   ))}
@@ -508,7 +515,7 @@ export function AnalyticsPage() {
                           </span>
                         )}
                       </td>
-                      <td className={`${tdCell} text-right`}>{formatUsd(m.cost_usd)}</td>
+                      <td className={`${tdCell} text-right`}>{formatMicroUsd(m.cost_micro_usd)}</td>
                     </tr>
                   ))}
                 </tbody>

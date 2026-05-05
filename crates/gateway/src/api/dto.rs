@@ -703,6 +703,9 @@ pub struct AnalyticsQuery {
 }
 
 /// One bucket per UTC day for the analytics chart.
+///
+/// `cost_micro_usd` is integer micro-USD (USD × 10^6). Rendering layers
+/// divide by 1_000_000 to get USD; on-wire arithmetic stays exact.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AnalyticsDayBucket {
     /// `YYYY-MM-DD` (UTC).
@@ -711,7 +714,9 @@ pub struct AnalyticsDayBucket {
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
     pub cache_creation_input_tokens: usize,
-    pub cost_usd: f64,
+    /// Spend for the day, in **micro-USD** (1 USD = 1_000_000).
+    #[schema(value_type = i64)]
+    pub cost_micro_usd: aura_model::MicroUsd,
     pub sessions_created: usize,
 }
 
@@ -723,7 +728,7 @@ impl From<aura_agent::AnalyticsDayBucket> for AnalyticsDayBucket {
             output_tokens: v.output_tokens,
             cached_input_tokens: v.cached_input_tokens,
             cache_creation_input_tokens: v.cache_creation_input_tokens,
-            cost_usd: v.cost_usd,
+            cost_micro_usd: v.cost_usd,
             sessions_created: v.sessions_created,
         }
     }
@@ -737,7 +742,9 @@ pub struct AnalyticsModelBucket {
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
     pub cache_creation_input_tokens: usize,
-    pub cost_usd: f64,
+    /// Spend for the model, in **micro-USD** (1 USD = 1_000_000).
+    #[schema(value_type = i64)]
+    pub cost_micro_usd: aura_model::MicroUsd,
     pub call_count: usize,
 }
 
@@ -749,7 +756,7 @@ impl From<aura_agent::AnalyticsModelBucket> for AnalyticsModelBucket {
             output_tokens: v.output_tokens,
             cached_input_tokens: v.cached_input_tokens,
             cache_creation_input_tokens: v.cache_creation_input_tokens,
-            cost_usd: v.cost_usd,
+            cost_micro_usd: v.cost_usd,
             call_count: v.call_count,
         }
     }
@@ -766,7 +773,9 @@ pub struct AnalyticsResponse {
     pub total_output_tokens: usize,
     pub total_cached_input_tokens: usize,
     pub total_cache_creation_input_tokens: usize,
-    pub total_cost_usd: f64,
+    /// Total spend across the window, in **micro-USD** (1 USD = 1_000_000).
+    #[schema(value_type = i64)]
+    pub total_cost_micro_usd: aura_model::MicroUsd,
     pub total_record_count: usize,
     pub daily: Vec<AnalyticsDayBucket>,
     pub by_model: Vec<AnalyticsModelBucket>,

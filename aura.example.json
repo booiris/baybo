@@ -31,9 +31,8 @@
   },
   "cost": {
     "spending_limits": {
-      "user_daily_usd": null,
-      "user_monthly_usd": null,
-      "global_daily_usd": null
+      "daily_usd": null,
+      "monthly_usd": null
     },
     "rate_limit": {
       "max_requests": 30,

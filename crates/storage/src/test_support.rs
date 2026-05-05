@@ -20,7 +20,7 @@ use crate::StorageError;
 use crate::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };
-use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange, UserMonthlyCost};
+use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 use crate::job::{JobStore, Result as JobStoreResult};
 use crate::memory::{MemoryStore, Result as MemoryStoreResult};
 use crate::secret::{Result as SecretResult, SecretStore};
@@ -176,13 +176,10 @@ impl JobStore for MemoryJobStore {
 }
 
 /// In-memory `CostStore` for tests. Records are appended in arrival
-/// order; queries scan linearly. Plenty fast for tests. Carries the
-/// `user_monthly_cost` cache too so `CostSubscriber` integration
-/// tests can read it back.
+/// order; queries scan linearly. Plenty fast for tests.
 #[derive(Debug, Default)]
 pub struct MemoryCostStore {
     records: Mutex<Vec<CostRecord>>,
-    monthly: Mutex<HashMap<(String, String), UserMonthlyCost>>,
 }
 
 impl MemoryCostStore {
@@ -274,48 +271,6 @@ impl CostStore for MemoryCostStore {
             summary.record_count += 1;
         }
         Ok(summary)
-    }
-
-    async fn bump_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-        delta_usd: f64,
-    ) -> CostResult<()> {
-        let now = chrono::Utc::now();
-        let key = (user_id.to_string(), month.to_string());
-        let mut map = self.monthly.lock();
-        let entry = map.entry(key).or_insert_with(|| UserMonthlyCost {
-            user_id: user_id.to_string(),
-            month: month.to_string(),
-            cost_usd: 0.0,
-            updated_at: now,
-        });
-        entry.cost_usd += delta_usd;
-        entry.updated_at = now;
-        Ok(())
-    }
-
-    async fn get_user_monthly_cost(
-        &self,
-        user_id: &str,
-        month: &str,
-    ) -> CostResult<Option<UserMonthlyCost>> {
-        Ok(self
-            .monthly
-            .lock()
-            .get(&(user_id.to_string(), month.to_string()))
-            .cloned())
-    }
-
-    async fn sum_user(&self, user_id: &str, range: TimeRange) -> CostResult<f64> {
-        Ok(self
-            .records
-            .lock()
-            .iter()
-            .filter(|r| r.user_id == user_id && in_range(r, &range))
-            .map(|r| r.cost_usd)
-            .sum())
     }
 }
 

@@ -162,21 +162,16 @@ impl LibsqlPool {
                     output_tokens                   INTEGER NOT NULL,
                     cached_input_tokens             INTEGER NOT NULL DEFAULT 0,
                     cache_creation_input_tokens     INTEGER NOT NULL DEFAULT 0,
-                    cost_usd                        REAL    NOT NULL,
+                    -- Spend in micro-USD (USD × 10^6). INTEGER, never REAL —
+                    -- floats accumulate rounding error across SUM() and
+                    -- quota comparisons.
+                    cost_usd                        INTEGER NOT NULL,
                     timestamp                       INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cost_user_id ON cost_records(user_id);
                 CREATE INDEX IF NOT EXISTS idx_cost_timestamp ON cost_records(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_cost_session ON cost_records(session_id);
                 CREATE INDEX IF NOT EXISTS idx_cost_job ON cost_records(job_id);
-
-                CREATE TABLE IF NOT EXISTS user_monthly_cost (
-                    user_id     TEXT    NOT NULL,
-                    month       TEXT    NOT NULL,
-                    cost_usd    REAL    NOT NULL,
-                    updated_at  INTEGER NOT NULL,
-                    PRIMARY KEY (user_id, month)
-                );
 
                 CREATE TABLE IF NOT EXISTS jobs (
                     id                       TEXT PRIMARY KEY,

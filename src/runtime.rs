@@ -506,32 +506,34 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     let supervisor = AgentSupervisor::new(response_tx);
 
-    // Process-wide trace event bus. Every `SpanRecorder` publishes
-    // through it, and a single `CostSubscriber` task drains it for
-    // the entire process — no per-session subscriber and no per-session
-    // pricing clones.
+    // Process-wide trace event bus. Stays for trace observers
+    // (WebUI live stream etc.); `CostManager` no longer subscribes
+    // — agent_loop calls it directly with the token counts it
+    // already has.
     let trace_event_stream = TraceEventStream::new();
     let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> = {
         // Seed with every provider's `known_pricings()`, then layer the
         // active model's pricing on top so a config-flip mid-flight
-        // doesn't drop spans of the previous model to $0. Providers
-        // that haven't published `known_pricings` yet contribute
-        // nothing — the active-model fallback still covers their case.
+        // doesn't drop spans of the previous model to $0.
         //
         // Per-model accuracy caveat: today's publishers report one
         // flat rate per provider, so e.g. gpt-5-mini attributes at the
         // same rate as gpt-5. Tracked as a follow-up in
-        // `docs/todo/trace-redesign.md` ("CostSubscriber per-model
-        // pricing accuracy").
+        // `docs/todo/trace-redesign.md`.
         let registry = aura_llm::LlmProviderRegistry::with_default_providers();
         let mut map = registry.all_known_pricings();
         let info = graph.llm_client.model_info();
-        map.insert(info.id.clone(), info.pricing.clone());
+        map.insert(info.id.clone(), info.pricing);
         Arc::new(map)
     };
-    let _cost_subscriber_handle =
-        aura_agent::cost::CostSubscriber::new(graph.cost_store.clone(), pricing)
-            .spawn(&trace_event_stream);
+
+    let spending_limits = aura_agent::SpendingLimits {
+        daily_usd: graph.config.cost.spending_limits.daily_usd,
+        monthly_usd: graph.config.cost.spending_limits.monthly_usd,
+    };
+    let cost_manager =
+        aura_agent::CostManager::new(graph.cost_store.clone(), pricing, spending_limits);
+    cost_manager.hydrate().await;
 
     // Spawner-vs-runtime build cycle: closure captures the slot and is
     // built first, then `LocalSubagentRuntime` patches itself in.
@@ -557,6 +559,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let token_budget = token_budget.clone();
         let policy = policy.clone();
         let system_prompt = system_prompt.clone();
+        let cost_manager = Arc::clone(&cost_manager);
 
         Arc::new(
             move |session: aura_model::Session,
@@ -578,7 +581,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     Arc::clone(&security_gateway),
                 )
                 .with_skill_assessor(Arc::clone(&skill_assessor))
-                .with_session_log(Arc::clone(&session_logger));
+                .with_session_log(Arc::clone(&session_logger))
+                .with_cost_manager(Arc::clone(&cost_manager));
 
                 if let Some(rt) = subagent_runtime_slot.get() {
                     agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
@@ -618,6 +622,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let set_ok = subagent_runtime_slot.set(local_subagent_runtime).is_ok();
     debug_assert!(set_ok);
 
+    let rate_limit_cfg = &graph.config.cost.rate_limit;
+
     let router = Router::new(
         Arc::clone(&graph.session_manager),
         supervisor,
@@ -625,6 +631,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         Arc::clone(&graph.security_gateway),
     )
     .with_actor_parent_token(graph.actor_parent_token.clone())
+    .with_cost_manager(Arc::clone(&cost_manager))
+    .with_rate_limit(
+        rate_limit_cfg.max_requests,
+        std::time::Duration::from_secs(rate_limit_cfg.window_secs),
+    )
     .with_actor_spawner(Box::new(move |session, response_tx, parent_token| {
         spawn_actor_for(session, response_tx, parent_token)
     }));
