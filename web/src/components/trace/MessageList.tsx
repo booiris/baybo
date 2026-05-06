@@ -161,20 +161,21 @@ function ContentBlockView({
 
 function MessageCard({
   message,
-  index,
+  isCurrentInput,
   kindHint,
   toolNames,
 }: {
   message: ChatMessage;
-  index: number;
+  isCurrentInput: boolean;
   kindHint?: SecretKind;
   toolNames: Map<string, string>;
 }) {
   const meta = ROLE_META[message.role];
   const Icon = meta.icon;
-  // Default collapsed for system messages (always boilerplate) and any
-  // message past the first 5 in long threads.
-  const [open, setOpen] = useState(message.role !== 'system' && index < 5);
+  // Only the trailing run of non-assistant messages — the new prompt or
+  // tool results that triggered this LLM call — is open by default.
+  // Prior turns and system boilerplate start collapsed.
+  const [open, setOpen] = useState(message.role !== 'system' && isCurrentInput);
 
   return (
     <div className="border-2 border-black rounded-md bg-white shadow-brutal-xs">
@@ -220,17 +221,67 @@ export function MessageList({
     return m;
   }, [messages]);
 
+  // First index of the trailing run of non-assistant messages — the new
+  // prompt or tool results that drove this LLM call. Everything before
+  // is prior history and stays hidden behind a toggle so the current
+  // input is visible without scrolling past long chat histories.
+  const currentInputStart = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'assistant') return i + 1;
+    }
+    return 0;
+  }, [messages]);
+
+  const [showHistory, setShowHistory] = useState(false);
+
   if (messages.length === 0) {
     return <div className="text-ink-soft text-[0.85rem]">No messages.</div>;
   }
+
+  const priorMessages = messages.slice(0, currentInputStart);
+  const currentMessages = messages.slice(currentInputStart);
+
   return (
     <div className="space-y-2">
       <div className="text-[0.7rem] text-ink-soft uppercase font-bold tracking-wider">
         <RiBrainLine className="inline mr-1" />
         {messages.length} {messages.length === 1 ? 'message' : 'messages'}
       </div>
-      {messages.map((m, i) => (
-        <MessageCard key={i} message={m} index={i} kindHint={kindHint} toolNames={toolNames} />
+      {priorMessages.length > 0 && (
+        <>
+          <button
+            type="button"
+            onClick={() => setShowHistory((v) => !v)}
+            className="w-full flex items-center gap-2 px-3 py-2 text-left text-[0.75rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink border-2 border-dashed border-black/40 rounded-md bg-canvas hover:bg-gray-50 cursor-pointer"
+          >
+            {showHistory ? (
+              <RiArrowDownSLine className="text-ink-soft" />
+            ) : (
+              <RiArrowRightSLine className="text-ink-soft" />
+            )}
+            {showHistory ? 'Hide' : 'Show'} {priorMessages.length} earlier{' '}
+            {priorMessages.length === 1 ? 'message' : 'messages'}
+          </button>
+          {showHistory &&
+            priorMessages.map((m, i) => (
+              <MessageCard
+                key={`prior-${i}`}
+                message={m}
+                isCurrentInput={false}
+                kindHint={kindHint}
+                toolNames={toolNames}
+              />
+            ))}
+        </>
+      )}
+      {currentMessages.map((m, i) => (
+        <MessageCard
+          key={`current-${i}`}
+          message={m}
+          isCurrentInput={true}
+          kindHint={kindHint}
+          toolNames={toolNames}
+        />
       ))}
     </div>
   );
