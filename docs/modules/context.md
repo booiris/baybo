@@ -26,17 +26,21 @@ ContextManager (struct)
 
 **Key design choice**: `ContextManager` is a **concrete struct**, not a trait. The management logic (append, budget check) is invariant — only the compression algorithm varies. Polymorphism lives at the `CompressionStrategy` trait level, not at the manager level.
 
-### Auto-compression in `append`
+### Compression is caller-driven
 
-Compression is triggered automatically inside `append()` when the token budget threshold is exceeded. The caller does not need to (and cannot) manually trigger compression. This eliminates the class of bugs where compression is forgotten after tool results or other message appends.
+`append()` only pushes the message and updates the token budget — it does **not** auto-compress. The agent loop calls `maybe_compress()` at the top of every iteration; that's the single point where compression LLM calls happen and where their cost is recorded against the cost ledger.
+
+This trade-off — losing the "impossible to forget" property of auto-compression — is deliberate: with `Summarize` as the default strategy every compression spawns a billable LLM call, and the cost-recording context (`SpanRecorder`, `JobId`, `CostManager`) only exists at the agent-loop layer. Auto-compressing inside `append()` would silently bypass that recording.
 
 ```rust
-// Agent loop — simple, no manual compression step
-self.context_manager.append(session, &user_msg).await?;
-// If compression happened, it's already done and logged.
+// Append in any number of places without cost-recording overhead.
+self.context_manager.append(session, &user_msg);
+
+// Single explicit compression site at the top of each iteration.
+self.compress_if_needed(session, span_recorder, job_id, &cancel_token).await?;
 ```
 
-`append` returns `Option<CompressStats>` — `None` if no compression occurred, `Some(stats)` if it did.
+`maybe_compress` returns `Option<CompressStats>` — `None` if no compression occurred, `Some(stats)` if it did. The `CompressStats::llm_call` field carries the `CompressionLlmCall` provenance the agent loop needs to record cost.
 
 ## Design Decisions
 
@@ -51,8 +55,8 @@ self.context_manager.append(session, &user_msg).await?;
 
 ### Two compression strategies
 
-- **Truncate**: keep only the most recent N non-system messages, always preserving system messages. Simple, zero latency, predictable — but may discard important early context.
-- **Summarize**: combines truncation with LLM summarization. Old non-system messages are summarized via an injected `SummarizeCallback`, then the summary is kept alongside the most recent `keep_recent` messages. The `SummarizeCallback` trait keeps `context` independent from `llm` — the callback is injected externally.
+- **Summarize** (default in production): combines truncation with LLM summarization. Old non-system messages are summarized via an injected `SummarizeCallback`, then the summary is kept alongside the most recent `keep_recent` messages. The `SummarizeCallback` trait keeps `context` independent from `llm` — the callback is injected externally; the production implementation is `aura_agent::compression::LlmSummarizer`. On any callback failure (transport error, rate limit, empty content), `Summarize` logs a `warn!` and falls back internally to a Truncate-equivalent slice — a single transient summarizer failure must never kill the user's turn.
+- **Truncate**: keep only the most recent N non-system messages, always preserving system messages. Simple, zero latency, predictable — but discards early context. Used as the internal fallback inside `Summarize::compress` and as the explicit choice in test harnesses where deterministic behavior matters more than semantic preservation.
 
 ### Context priority structure
 
@@ -76,9 +80,9 @@ The context sent to the LLM is organized in descending priority:
 - Compression threshold around 0.7–0.85 is usually reasonable
 - Tool-heavy conversations often need a larger `keep_recent`
 
-## TODO
+## Cost recording
 
-- **Concrete `SummarizeCallback` implementation**: The `Summarize` strategy is implemented in `context`, but it requires a `SummarizeCallback` to be injected at construction. A concrete implementation that wraps `LlmClient::chat()` needs to be built in the `agent` crate to bridge the two. Until then, only `Truncate` is usable end-to-end.
+When `maybe_compress` returns `Some(stats)` with `stats.llm_call`, the agent loop's `compress_if_needed` opens a `StepKind::Compression` step containing one `SpanKind::LlmCall` span (post-hoc — the LLM call already ran inside the strategy), and inside that span's lifecycle calls `CostManager::record_call` with the matching `span_id`. The cost row's `span_id` therefore joins back to the trace span; downstream UIs can navigate cost → trace by id without extra plumbing. Cost recording lives entirely on the agent side; `context` itself takes no `CostManager` dependency.
 
 ## Collaboration
 

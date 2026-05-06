@@ -16,3 +16,4 @@ tiktoken-rs = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }

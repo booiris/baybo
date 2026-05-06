@@ -1049,7 +1049,7 @@ impl AgentLoop {
         session: &mut Session,
         message: &ChatMessage,
     ) -> anyhow::Result<()> {
-        self.context_manager.append(session, message).await?;
+        self.context_manager.append(session, message);
         self.write_session_message_log(session, message).await;
         Ok(())
     }
@@ -1437,8 +1437,8 @@ impl AgentLoop {
         // wall-clock ordering.
         let llm_call_kind = SpanKind::LlmCall {
             begin: LlmCallBegin {
-                model_id: call.model_id,
-                provider: call.provider,
+                model_id: call.model_id.clone(),
+                provider: call.provider.clone(),
                 provider_config_hash: String::new(),
                 input_messages: Vec::new(),
                 temperature: None,
@@ -1456,6 +1456,9 @@ impl AgentLoop {
         });
         let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
         let rec = span_recorder.as_ref();
+        let cost_manager = self.cost_manager.clone();
+        let user_id = session.user.id.clone();
+        let session_id = session.id.clone();
         crate::scope::with_step(
             rec,
             job_id,
@@ -1469,7 +1472,31 @@ impl AgentLoop {
                     llm_call_kind,
                     None,
                     cancel_ctx,
-                    |_span| async move { Ok((finalize, LifecycleOutcome::Ok, ())) },
+                    |span| async move {
+                        // Record cost while the span is still open so
+                        // the cost row's `span_id` matches the trace
+                        // span (mirroring the main-loop pattern at
+                        // `record_llm_call`). The compression LLM call
+                        // already happened inside `maybe_compress`;
+                        // the span here is post-hoc, but recording
+                        // cost here keeps the join key intact and
+                        // means the next turn's `cm.check()` sees
+                        // this spend.
+                        if let Some(cm) = &cost_manager {
+                            cm.record_call(
+                                &user_id,
+                                session_id.clone(),
+                                job_id,
+                                span.span_id,
+                                &call.model_id,
+                                call.input_tokens,
+                                call.output_tokens,
+                                call.cached_input_tokens,
+                                call.cache_creation_input_tokens,
+                            );
+                        }
+                        Ok((finalize, LifecycleOutcome::Ok, ()))
+                    },
                 )
                 .await?;
                 Ok((LifecycleOutcome::Ok, ()))

@@ -5,6 +5,8 @@
 mod agent_loop_e2e;
 #[path = "channel_registration.rs"]
 mod channel_registration;
+#[path = "context_compression_e2e.rs"]
+mod context_compression_e2e;
 #[path = "multimodal_tool_output.rs"]
 mod multimodal_tool_output;
 #[path = "security_pipeline.rs"]

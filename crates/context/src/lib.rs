@@ -81,64 +81,20 @@ impl ContextManager {
         }
     }
 
-    /// Append a message to the session context.
+    /// Append a message to the session context and update the token
+    /// budget. Does **not** trigger compression — the caller (the
+    /// agent loop) is responsible for invoking
+    /// [`Self::maybe_compress`] at well-defined points where it can
+    /// also record the compression LLM call's cost. Auto-compressing
+    /// here would silently bypass that cost-recording path.
     ///
-    /// Automatically triggers compression when the token budget threshold
-    /// is exceeded. Returns compression statistics if compression occurred.
-    pub async fn append(
-        &mut self,
-        session: &mut Session,
-        msg: &ChatMessage,
-    ) -> crate::Result<Option<CompressStats>> {
+    /// Safe because the agent loop runs `maybe_compress` at the top
+    /// of every iteration, so any over-budget state from intermediate
+    /// `append` calls is resolved before the next LLM request is
+    /// built.
+    pub fn append(&mut self, session: &mut Session, msg: &ChatMessage) {
         session.messages.push(msg.clone());
         self.budget.update(self.count_tokens(&session.messages));
-
-        if !self.budget.needs_compression() {
-            return Ok(None);
-        }
-
-        let start = Instant::now();
-        let before_tokens = self.budget.current();
-        let before_len = session.messages.len();
-
-        let output = self
-            .strategy
-            .compress(&session.messages, &*self.tokenizer)
-            .await?;
-
-        let llm_call = output.llm_call.clone();
-        session.messages = output.messages;
-        let after_tokens = self.count_tokens(&session.messages);
-        self.budget.update(after_tokens);
-
-        // Strategy couldn't reduce the message count (e.g. already at keep_recent)
-        if session.messages.len() >= before_len {
-            return Ok(None);
-        }
-
-        if after_tokens > self.budget.max_tokens() {
-            warn!(
-                after_tokens,
-                max_tokens = self.budget.max_tokens(),
-                "token count still exceeds max_tokens after compression"
-            );
-        }
-
-        let stats = CompressStats {
-            before_tokens,
-            after_tokens,
-            latency: start.elapsed(),
-            llm_call,
-        };
-
-        debug!(
-            before = stats.before_tokens,
-            after = stats.after_tokens,
-            latency_ms = stats.latency.as_millis() as u64,
-            "context compressed"
-        );
-
-        Ok(Some(stats))
     }
 
     /// Check the token budget and compress if the threshold is exceeded.
@@ -281,35 +237,28 @@ mod tests {
         let mut session = make_session(vec![]);
 
         let msg = make_msg(Role::User, "hello");
-        let stats = ctx.append(&mut session, &msg).await.unwrap();
+        ctx.append(&mut session, &msg);
 
-        assert!(stats.is_none());
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].role, Role::User);
+        assert!(ctx.maybe_compress(&mut session).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn auto_compress_on_token_threshold() {
+    async fn maybe_compress_on_token_threshold() {
         // max=50, threshold=0.5 → compress when > 25 tokens
         let mut ctx = make_ctx(2, 50, 0.5);
         let mut session = make_session(vec![]);
 
-        // Build up messages one by one
-        ctx.append(&mut session, &make_msg(Role::System, "You are helpful"))
-            .await
-            .unwrap();
-        ctx.append(&mut session, &make_msg(Role::User, "First message here"))
-            .await
-            .unwrap();
-        ctx.append(&mut session, &make_msg(Role::Assistant, "First reply here"))
-            .await
-            .unwrap();
+        // Build up messages one by one. `append` no longer
+        // auto-compresses; the agent loop is responsible for calling
+        // `maybe_compress` at well-defined cost-recording points.
+        ctx.append(&mut session, &make_msg(Role::System, "You are helpful"));
+        ctx.append(&mut session, &make_msg(Role::User, "First message here"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, "First reply here"));
+        ctx.append(&mut session, &make_msg(Role::User, "Second message here"));
 
-        // This append pushes past threshold and has enough messages to compress
-        let stats = ctx
-            .append(&mut session, &make_msg(Role::User, "Second message here"))
-            .await
-            .unwrap();
+        let stats = ctx.maybe_compress(&mut session).await.unwrap();
 
         assert!(stats.is_some());
         // system + 2 most recent non-system
@@ -322,16 +271,11 @@ mod tests {
         let mut ctx = make_ctx(10, 100_000, 0.75);
         let mut session = make_session(vec![]);
 
-        ctx.append(&mut session, &make_msg(Role::System, "sys"))
-            .await
-            .unwrap();
-        ctx.append(&mut session, &make_msg(Role::User, "hi"))
-            .await
-            .unwrap();
-        let stats = ctx
-            .append(&mut session, &make_msg(Role::Assistant, "hello"))
-            .await
-            .unwrap();
+        ctx.append(&mut session, &make_msg(Role::System, "sys"));
+        ctx.append(&mut session, &make_msg(Role::User, "hi"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, "hello"));
+
+        let stats = ctx.maybe_compress(&mut session).await.unwrap();
 
         assert!(stats.is_none());
         assert_eq!(session.messages.len(), 3);
@@ -344,16 +288,11 @@ mod tests {
         let mut ctx = make_ctx(5, 10, 0.1);
         let mut session = make_session(vec![]);
 
-        ctx.append(&mut session, &make_msg(Role::System, "sys"))
-            .await
-            .unwrap();
-        ctx.append(&mut session, &make_msg(Role::User, "hi"))
-            .await
-            .unwrap();
-        let stats = ctx
-            .append(&mut session, &make_msg(Role::Assistant, "hello"))
-            .await
-            .unwrap();
+        ctx.append(&mut session, &make_msg(Role::System, "sys"));
+        ctx.append(&mut session, &make_msg(Role::User, "hi"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, "hello"));
+
+        let stats = ctx.maybe_compress(&mut session).await.unwrap();
 
         assert!(stats.is_none());
         assert_eq!(session.messages.len(), 3);
@@ -366,9 +305,7 @@ mod tests {
 
         assert_eq!(ctx.budget().current(), 0);
 
-        ctx.append(&mut session, &make_msg(Role::User, "hello world"))
-            .await
-            .unwrap();
+        ctx.append(&mut session, &make_msg(Role::User, "hello world"));
 
         assert!(ctx.budget().current() > 0);
         assert!(ctx.budget().remaining() < 100_000);

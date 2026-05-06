@@ -104,6 +104,7 @@ pub struct CompressOutput {
 /// Carries both the summary text and the provenance/usage of the
 /// underlying LLM call so the strategy can surface it via
 /// `CompressOutput::llm_call`.
+#[derive(Debug, Clone)]
 pub struct SummarizeOutput {
     pub summary: String,
     pub llm_call: crate::CompressionLlmCall,

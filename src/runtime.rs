@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::AgentLoop;
+use aura_agent::compression::LlmSummarizer;
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::session_log::SessionLlmLogger;
@@ -36,7 +37,7 @@ use aura_agent::{
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
+use aura_context::{ContextManager, Summarize, TiktokenTokenizer, Tokenizer};
 use aura_llm::LlmClient;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -603,7 +604,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     Arc::clone(&tool_executor),
                     ContextManager::new(
                         Arc::clone(&tokenizer),
-                        Box::new(Truncate::new(keep_recent)),
+                        Box::new(Summarize::new(
+                            Arc::new(LlmSummarizer::new(Arc::clone(&llm_client) as _)),
+                            keep_recent,
+                        )),
                         token_budget.clone(),
                     ),
                     Arc::clone(&memory_manager),
