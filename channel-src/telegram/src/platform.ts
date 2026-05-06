@@ -20,6 +20,7 @@ import {
   type TelegramInboundMedia,
 } from "./media/inbound.js";
 import { sendTelegramAttachment } from "./media/outbound.js";
+import { markdownToTelegram, TELEGRAM_PARSE_MODE } from "./markdown.js";
 
 /**
  * Telegram conversation address. `chatId` is the chat/supergroup;
@@ -39,10 +40,14 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
   constructor(private readonly logger: Logger) {}
 
   async sendText(bot: Bot, chat: TelegramChat, text: string): Promise<void> {
-    await bot.api.sendMessage(
-      chat.chatId,
+    await sendWithMarkdownFallback(
       text,
-      chat.threadId !== undefined ? { message_thread_id: chat.threadId } : {},
+      (msg, parseOpts) =>
+        bot.api.sendMessage(chat.chatId, msg, {
+          ...parseOpts,
+          ...threadOpts(chat),
+        }),
+      this.logger,
     );
   }
 
@@ -53,11 +58,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
    * user is actually posting in.
    */
   async notifyTyping(bot: Bot, chat: TelegramChat): Promise<void> {
-    await bot.api.sendChatAction(
-      chat.chatId,
-      "typing",
-      chat.threadId !== undefined ? { message_thread_id: chat.threadId } : {},
-    );
+    await bot.api.sendChatAction(chat.chatId, "typing", threadOpts(chat));
   }
 
   async stopBot(bot: Bot): Promise<void> {
@@ -305,13 +306,50 @@ function mediaFallbackText(media: TelegramInboundMedia): string {
   return `[${media.kind}: ${media.mimeType}${name}]`;
 }
 
+export function threadOpts(
+  chat: TelegramChat,
+): { message_thread_id?: number } {
+  return chat.threadId !== undefined ? { message_thread_id: chat.threadId } : {};
+}
+
+type ParseOpts = { parse_mode: typeof TELEGRAM_PARSE_MODE } | Record<string, never>;
+
 /**
- * Render an error in a form that's actually useful for diagnosing a
- * sidecar failure. `String(err)` on grammy's errors only yields
- * `HttpError: Network request for 'sendPhoto' failed!` — the real
- * cause (`fetch failed`, `ConnectTimeoutError`, certificate problem,
- * …) is hidden under `err.error` (grammy) or `err.cause` (standard).
- * Walk both chains so we surface every link.
+ * Send `text` formatted as MarkdownV2; on the Bot API's
+ * `can't parse entities` 400 (and only that), retry with the original
+ * plain text so the message still lands. Other errors propagate so
+ * callers see real failures (chat not found, network, 401 …).
+ */
+export async function sendWithMarkdownFallback<R>(
+  text: string,
+  send: (text: string, parseOpts: ParseOpts) => Promise<R>,
+  logger: Logger,
+): Promise<R> {
+  try {
+    return await send(markdownToTelegram(text), {
+      parse_mode: TELEGRAM_PARSE_MODE,
+    });
+  } catch (err) {
+    if (!isParseEntitiesError(err)) throw err;
+    logger.warn(
+      `telegram MarkdownV2 parse failed; resending as plain text: ${describeError(err)}`,
+    );
+    return await send(text, {});
+  }
+}
+
+function isParseEntitiesError(err: unknown): boolean {
+  if (!(err instanceof GrammyError)) return false;
+  if (err.error_code !== 400) return false;
+  // Match on the `can't parse entities` prefix — the byte-offset
+  // suffix varies, so equality wouldn't match.
+  return err.description.toLowerCase().includes("can't parse entities");
+}
+
+/**
+ * `String(err)` on grammy errors hides the real cause under
+ * `err.error` (grammy) or `err.cause` (standard); walk both chains so
+ * the warn-log surfaces every link.
  */
 function describeError(err: unknown): string {
   if (err instanceof GrammyError) {

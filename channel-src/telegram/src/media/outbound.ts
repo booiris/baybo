@@ -3,7 +3,8 @@ import { InputFile } from "grammy";
 
 import type { WireAttachment } from "@aura/channel-sdk";
 
-import type { TelegramChat } from "../platform.js";
+import { markdownToTelegram, TELEGRAM_PARSE_MODE } from "../markdown.js";
+import { threadOpts, type TelegramChat } from "../platform.js";
 
 /** Telegram caption ceiling per the Bot API: 1024 chars after entity
  * parsing. Cut at the codepoint boundary to avoid mid-grapheme breaks
@@ -31,9 +32,16 @@ export async function sendTelegramAttachment(
   source: AttachmentSource,
   caption: string,
 ): Promise<void> {
-  const threadOpt =
-    chat.threadId !== undefined ? { message_thread_id: chat.threadId } : {};
-  const captionOpt = caption ? { caption: truncateCaption(caption) } : {};
+  const thread = threadOpts(chat);
+  // Truncate before converting: the 1024 cap is on entity-parsed
+  // chars, not the raw `\.`-escaped form, so capping the source keeps
+  // us safely under regardless of how many escapes the conversion adds.
+  const captionOpt = caption
+    ? {
+        caption: markdownToTelegram(truncateCaption(caption)),
+        parse_mode: TELEGRAM_PARSE_MODE,
+      }
+    : {};
   const inputName = att.filename ?? defaultFilename(att);
   const file = new InputFile(source, inputName);
 
@@ -41,7 +49,7 @@ export async function sendTelegramAttachment(
     case "image":
       await bot.api.sendPhoto(chat.chatId, file, {
         ...captionOpt,
-        ...threadOpt,
+        ...thread,
       });
       return;
     case "audio":
@@ -50,12 +58,12 @@ export async function sendTelegramAttachment(
       if (isVoiceMime(att.mime_type)) {
         await bot.api.sendVoice(chat.chatId, file, {
           ...captionOpt,
-          ...threadOpt,
+          ...thread,
         });
       } else {
         await bot.api.sendAudio(chat.chatId, file, {
           ...captionOpt,
-          ...threadOpt,
+          ...thread,
         });
       }
       return;
@@ -66,12 +74,12 @@ export async function sendTelegramAttachment(
       if (att.mime_type.startsWith("video/")) {
         await bot.api.sendVideo(chat.chatId, file, {
           ...captionOpt,
-          ...threadOpt,
+          ...thread,
         });
       } else {
         await bot.api.sendDocument(chat.chatId, file, {
           ...captionOpt,
-          ...threadOpt,
+          ...thread,
         });
       }
       return;
