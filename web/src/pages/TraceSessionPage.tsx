@@ -837,7 +837,6 @@ function JobSidebar({
   active: string;
   onChange: (id: string) => void;
 }) {
-  if (jobs.length <= 1) return null;
   return (
     <div className="w-[120px] shrink-0 border-r-[3px] border-black bg-white flex flex-col z-10 overflow-y-auto">
       <div className="px-2 py-1.5 border-b-2 border-black font-bold uppercase tracking-wider text-[0.65rem] text-ink-soft bg-canvas">
