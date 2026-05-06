@@ -19,6 +19,17 @@ pub enum MemoryManagerError {
 
 pub type Result<T> = std::result::Result<T, MemoryManagerError>;
 
+/// Outcome of [`MemoryManager::store_or_dedup`].
+#[derive(Debug, Clone)]
+pub enum StoreOutcome {
+    /// The entry was new and persisted.
+    Stored,
+    /// The entry was suppressed because an existing entry was too
+    /// similar; `against_id` is the id of the existing match (useful
+    /// for "Skipped K duplicates" telemetry from the self_improvement flow).
+    Deduplicated { against_id: String },
+}
+
 /// A minimal embedding model trait for generating vector embeddings from text.
 #[async_trait::async_trait]
 pub(crate) trait EmbeddingModel: Send + Sync {
@@ -102,7 +113,7 @@ impl MemoryManager {
                 let entry = MemoryEntry::new(
                     session.user.id.clone(),
                     response.to_owned(),
-                    MemoryCategory::UserPreference,
+                    MemoryCategory::User,
                     0.7,
                 );
                 return self.store_with_dedup(entry).await;
@@ -114,7 +125,7 @@ impl MemoryManager {
                 let entry = MemoryEntry::new(
                     session.user.id.clone(),
                     response.to_owned(),
-                    MemoryCategory::KeyFact,
+                    MemoryCategory::User,
                     0.6,
                 );
                 return self.store_with_dedup(entry).await;
@@ -263,6 +274,18 @@ impl MemoryManager {
     }
 
     async fn store_with_dedup(&self, entry: MemoryEntry) -> Result<()> {
+        match self.store_or_dedup(entry).await? {
+            StoreOutcome::Stored | StoreOutcome::Deduplicated { .. } => Ok(()),
+        }
+    }
+
+    /// Store an entry unless an existing one is too similar to the new
+    /// content (vector cosine ≥ `DEDUP_SIMILARITY_THRESHOLD` when an
+    /// embedder is wired in; exact text match otherwise). Returns
+    /// [`StoreOutcome::Deduplicated`] when the write was skipped so the
+    /// caller can report it (the self_improvement flow's final-message
+    /// `"Skipped K duplicates"` line).
+    pub async fn store_or_dedup(&self, entry: MemoryEntry) -> Result<StoreOutcome> {
         let existing = self.store.list_by_user(&entry.user_id).await?;
 
         if let Some(ref embedder) = self.embedder {
@@ -276,7 +299,9 @@ impl MemoryManager {
                             similarity = sim,
                             "skipping duplicate memory (vector)"
                         );
-                        return Ok(());
+                        return Ok(StoreOutcome::Deduplicated {
+                            against_id: existing_entry.id.clone(),
+                        });
                     }
                 }
             }
@@ -287,12 +312,15 @@ impl MemoryManager {
                         existing_id = existing_entry.id,
                         "skipping duplicate memory (text)"
                     );
-                    return Ok(());
+                    return Ok(StoreOutcome::Deduplicated {
+                        against_id: existing_entry.id.clone(),
+                    });
                 }
             }
         }
 
-        self.store(entry).await
+        self.store(entry).await?;
+        Ok(StoreOutcome::Stored)
     }
 
     async fn enforce_user_limit(&self, user_id: &str) -> Result<()> {
@@ -418,10 +446,10 @@ mod tests {
 
     #[test]
     fn test_memory_entry_new_clamps_importance() {
-        let entry = MemoryEntry::new("u1".into(), "test".into(), MemoryCategory::KeyFact, 1.5);
+        let entry = MemoryEntry::new("u1".into(), "test".into(), MemoryCategory::User, 1.5);
         assert!((entry.importance - 1.0).abs() < f32::EPSILON);
 
-        let entry2 = MemoryEntry::new("u1".into(), "test".into(), MemoryCategory::KeyFact, -0.5);
+        let entry2 = MemoryEntry::new("u1".into(), "test".into(), MemoryCategory::User, -0.5);
         assert!((entry2.importance - 0.0).abs() < f32::EPSILON);
     }
 
@@ -507,7 +535,7 @@ mod tests {
     }
 
     fn make_entry(user: &str, content: &str, session: Option<&str>) -> MemoryEntry {
-        let mut e = MemoryEntry::new(user.into(), content.into(), MemoryCategory::KeyFact, 0.5);
+        let mut e = MemoryEntry::new(user.into(), content.into(), MemoryCategory::User, 0.5);
         e.source_session_id = session.map(str::to_string);
         e
     }

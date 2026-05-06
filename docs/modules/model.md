@@ -54,7 +54,7 @@ Cleanup is triggered externally (cron); memory exposes methods but does not own 
 
 #### Memory categories
 
-`UserPreference`, `KeyFact` — providing semantic categorization for retrieval and management.
+`User`, `Feedback`, `Project`, `Reference` — providing semantic categorization for retrieval and management. Pre-self_improvement rows used `UserPreference` / `KeyFact`; both deserialize to `User` via serde aliases. See [`self-improvement.md`](self-improvement.md) for the design rationale behind the four-category split.
 
 #### Vector embeddings
 

@@ -850,6 +850,148 @@
         }
       }
     },
+    "/v1/jobs/{id}/children": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "list_job_children",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Parent job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Children of the given job, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
+                        "required": [
+                          "id",
+                          "session_id",
+                          "kind",
+                          "status",
+                          "emitted_span_ids",
+                          "effective_soul_version",
+                          "created_at"
+                        ],
+                        "properties": {
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "effective_soul_version": {
+                            "type": "string"
+                          },
+                          "emitted_span_ids": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "ended_at": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "format": "date-time"
+                          },
+                          "final_result": {
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "$ref": "#/components/schemas/JobKind"
+                          },
+                          "parent_job_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "session_id": {
+                            "type": "string"
+                          },
+                          "started_at": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "format": "date-time"
+                          },
+                          "status": {
+                            "$ref": "#/components/schemas/JobStatus"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid job id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Job store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/llm": {
       "get": {
         "tags": [
@@ -2128,8 +2270,10 @@
           "type": {
             "type": "string",
             "enum": [
-              "UserPreference",
-              "KeyFact"
+              "User",
+              "Feedback",
+              "Project",
+              "Reference"
             ]
           }
         }

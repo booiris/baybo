@@ -132,6 +132,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/jobs/{id}/children": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_job_children"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/llm": {
         parameters: {
             query?: never;
@@ -519,7 +535,7 @@ export interface components {
         };
         MemoryCategory: {
             /** @enum {string} */
-            type: "UserPreference" | "KeyFact";
+            type: "User" | "Feedback" | "Project" | "Reference";
         };
         /** @description Mirror of [`aura_model::MemoryEntry`]. */
         MemoryEntry: {
@@ -1170,6 +1186,74 @@ export interface operations {
                 };
             };
             /** @description Cancel failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_job_children: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Parent job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Children of the given job, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /** Format: date-time */
+                            created_at: string;
+                            effective_soul_version: string;
+                            emitted_span_ids: string[];
+                            /** Format: date-time */
+                            ended_at?: string | null;
+                            final_result?: Record<string, never> | null;
+                            id: string;
+                            kind: components["schemas"]["JobKind"];
+                            parent_job_id?: string | null;
+                            session_id: string;
+                            /** Format: date-time */
+                            started_at?: string | null;
+                            status: components["schemas"]["JobStatus"];
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Invalid job id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Job store error */
             500: {
                 headers: {
                     [name: string]: unknown;

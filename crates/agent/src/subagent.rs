@@ -344,7 +344,7 @@ impl SubagentRuntime for LocalSubagentRuntime {
                     event = terminal_rx.recv() => {
                         match event {
                             Ok(ev) if ev.session_id == child_session_id => {
-                                return terminal_event_to_status(ev.kind, captured.take());
+                                return terminal_event_to_status(ev.status_kind, captured.take());
                             }
                             Ok(_) => continue,
                             Err(broadcast::error::RecvError::Lagged(n)) => {

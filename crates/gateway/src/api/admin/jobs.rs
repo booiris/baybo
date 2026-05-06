@@ -15,6 +15,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(list_jobs))
         .routes(routes!(get_job))
+        .routes(routes!(list_job_children))
         .routes(routes!(cancel_job))
 }
 
@@ -132,6 +133,36 @@ async fn get_job(State(state): State<AdminState>, Path(id): Path<String>) -> Res
         .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?
         .ok_or_else(|| GatewayError::NotFound(format!("job {id}")))?;
     Ok(Json(Job::from(job)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/jobs/{id}/children",
+    tag = "jobs",
+    params(
+        ("id" = String, Path, description = "Parent job id"),
+    ),
+    responses(
+        (status = 200, description = "Children of the given job, newest first", body = inline(ListResponse<Job>)),
+        (status = 400, description = "Invalid job id", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Job store error", body = ErrorBody),
+    )
+)]
+async fn list_job_children(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<ListResponse<Job>>> {
+    let job_id: aura_model::JobId = id
+        .parse()
+        .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
+    let jobs = state
+        .job_lifecycle
+        .list_children(&job_id)
+        .await
+        .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?;
+    let items: Vec<_> = jobs.into_iter().map(Job::from).collect();
+    Ok(Json(ListResponse::new(items)))
 }
 
 #[utoipa::path(

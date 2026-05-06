@@ -134,8 +134,11 @@ pub enum TriggerKind {
 pub enum SystemReason {
     /// `aura review` or equivalent retrospective pass over a prior session.
     HistoryReview,
-    /// Background memory consolidation / summarization task.
-    MemoryConsolidation,
+    /// Side-channel post-completion pass that extracts memory entries
+    /// and skill candidates from a finished complex user-chat job. See
+    /// `docs/modules/self-improvement.md` for the full design.
+    #[serde(alias = "memory_consolidation", alias = "distillation")]
+    SelfImprovement,
 }
 
 /// Direct parent relationship for sessions spawned from another session.

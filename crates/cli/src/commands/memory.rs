@@ -26,8 +26,10 @@ fn manager(ctx: &CommandContext) -> Result<&aura_agent::MemoryManager> {
 
 fn category_label(c: &MemoryCategory) -> &'static str {
     match c {
-        MemoryCategory::UserPreference => "preference",
-        MemoryCategory::KeyFact => "fact",
+        MemoryCategory::User => "user",
+        MemoryCategory::Feedback => "feedback",
+        MemoryCategory::Project => "project",
+        MemoryCategory::Reference => "reference",
     }
 }
 

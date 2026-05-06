@@ -312,7 +312,6 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
-        let _ = job_lifecycle;
         self.ensure_system_prompt(session).await;
 
         // Bound to the *outer* delta_tx, not iter_delta_tx — notices
@@ -481,6 +480,9 @@ impl AgentLoop {
                 break;
             }
             iterations += 1;
+            if let Err(e) = job_lifecycle.record_iteration(&job_id).await {
+                warn!(job_id = %job_id, error = %e, "failed to record iteration count");
+            }
 
             // Proactive compression before building the ChatRequest.
             self.compress_if_needed(session, span_recorder, job_id, &cancel_token)

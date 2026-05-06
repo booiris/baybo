@@ -170,8 +170,10 @@ async fn memory_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
 
 fn category_label(c: &aura_model::MemoryCategory) -> &'static str {
     match c {
-        aura_model::MemoryCategory::UserPreference => "preference",
-        aura_model::MemoryCategory::KeyFact => "fact",
+        aura_model::MemoryCategory::User => "user",
+        aura_model::MemoryCategory::Feedback => "feedback",
+        aura_model::MemoryCategory::Project => "project",
+        aura_model::MemoryCategory::Reference => "reference",
     }
 }
 

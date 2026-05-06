@@ -209,13 +209,15 @@ pub struct CreateCronRequest {
 // ── MemoryEntry ──────────────────────────────────────────────────────
 
 /// Mirror of [`aura_model::MemoryCategory`]. Serde uses an adjacently
-/// tagged shape where unit variants collapse to `{"type":"KeyFact"}`;
+/// tagged shape where unit variants collapse to `{"type":"User"}`;
 /// utoipa's derive can't express that, so the schema is hand-written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum MemoryCategory {
-    UserPreference,
-    KeyFact,
+    User,
+    Feedback,
+    Project,
+    Reference,
 }
 
 impl utoipa::PartialSchema for MemoryCategory {
@@ -226,7 +228,7 @@ impl utoipa::PartialSchema for MemoryCategory {
                 "type",
                 ObjectBuilder::new()
                     .schema_type(SchemaType::Type(Type::String))
-                    .enum_values(Some(vec!["UserPreference", "KeyFact"])),
+                    .enum_values(Some(vec!["User", "Feedback", "Project", "Reference"])),
             )
             .required("type")
             .build()
@@ -243,8 +245,10 @@ impl utoipa::ToSchema for MemoryCategory {
 impl From<aura_model::MemoryCategory> for MemoryCategory {
     fn from(v: aura_model::MemoryCategory) -> Self {
         match v {
-            aura_model::MemoryCategory::UserPreference => Self::UserPreference,
-            aura_model::MemoryCategory::KeyFact => Self::KeyFact,
+            aura_model::MemoryCategory::User => Self::User,
+            aura_model::MemoryCategory::Feedback => Self::Feedback,
+            aura_model::MemoryCategory::Project => Self::Project,
+            aura_model::MemoryCategory::Reference => Self::Reference,
         }
     }
 }
