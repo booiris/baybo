@@ -19,7 +19,8 @@
   },
   "dependencies": {
     "@aura/channel-sdk": "workspace:*",
-    "grammy": "^1.30.0"
+    "grammy": "^1.30.0",
+    "telegramify-markdown": "^1.3.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
