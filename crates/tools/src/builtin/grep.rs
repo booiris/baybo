@@ -1,43 +1,55 @@
-//! `Grep` — regex content search across files.
+//! `Grep` — regex content search via the `rg` (ripgrep) binary.
 //!
-//! This is a minimal implementation that walks the tree with [`walkdir`] and
-//! matches each line with the [`regex`] crate. It honors neither `.gitignore`
-//! nor file-type filters as richly as ripgrep does; a follow-up can swap in
-//! the `grep`/`ignore` crates once we know we need that throughput.
+//! Each call shells out to `rg` and parses an unambiguous output
+//! format: `--json` for `content` mode and `--null` for the path-only
+//! modes. Sensitive paths (SSH/AWS/GPG configs, `.env`, `/etc/shadow`,
+//! …) are filtered using the full structured path **before** any match
+//! line is included in the result, so their contents never leak.
+//!
+//! Security note: we deliberately avoid parsing rg's default text
+//! format (`path:line:match`) because Unix paths may themselves contain
+//! `:` (or even `\n`), and a `split_once(':')` on a path like
+//! `/tmp/work:copy/.env:1:SECRET` would mis-classify the path as the
+//! non-sensitive `/tmp/work` and leak the secret line.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_HITS: usize = 500;
-const MAX_FILES_VISITED: usize = 50_000;
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
+/// Cap on raw `rg` stdout we will buffer in-process. Past this we stop
+/// reading and let `rg` exit on EPIPE.
+const MAX_RG_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RG_STDERR_BYTES: u64 = 64 * 1024;
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Search file contents with a regular expression. Always use this \
-         instead of Bash commands like grep or rg. `output_mode` may be \
-         `content` (matching lines), `files_with_matches` (default, paths \
-         only), or `count` (match counts per file). Supports file-type \
-         filtering via the `glob` parameter. Sensitive paths (SSH/AWS/GPG \
-         configs, .env, /etc/shadow, …) are pruned from the walk so their \
-         contents never enter the result.\n\n\
+        "Search file contents with a regular expression by spawning the \
+         `rg` (ripgrep) binary. Always use this instead of Bash commands \
+         like grep or rg. `output_mode` may be `content` (matching lines), \
+         `files_with_matches` (default, paths only), or `count` (match \
+         counts per file). Supports file-type filtering via the `glob` \
+         parameter. Sensitive paths (SSH/AWS/GPG configs, .env, \
+         /etc/shadow, …) are filtered out of the output so their contents \
+         never enter the result.\n\n\
          PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
          Relative paths and omission are rejected.\n\n\
          BEFORE SEARCHING: For an unfamiliar directory, first probe its \
          scale with `Glob` (e.g. count entries) and narrow the search root \
-         or `glob` filter accordingly. Walks stop after {MAX_FILES_VISITED} \
-         files visited, individual files larger than {MAX_FILE_MIB} MiB are \
-         skipped, and per-mode results are capped at {MAX_HITS}."
+         or `glob` filter accordingly. Files larger than {MAX_FILE_MIB} MiB \
+         are skipped, and per-mode results are capped at {MAX_HITS}."
     )
 });
 
@@ -88,9 +100,9 @@ impl Tool for GrepTool {
     }
 
     fn max_timeout(&self) -> Duration {
-        // Walk-and-match across a large tree (up to 50k files, 10 MiB
-        // per file) can exceed 30 s; 60 s gives headroom inside the
-        // tool's own MAX_FILES_VISITED / MAX_HITS caps.
+        // ripgrep is fast, but a cold-cache traversal of a large
+        // monorepo can still exceed the 30 s default. 60 s gives
+        // headroom inside the per-mode MAX_HITS cap.
         Duration::from_secs(60)
     }
 
@@ -106,174 +118,240 @@ impl Tool for GrepTool {
             .unwrap_or_default()
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
         require_absolute(&p.path, "Grep", "path")?;
 
-        let base = p.path.clone();
-        tokio::task::spawn_blocking(move || run_grep(&base, &p))
-            .await
-            .map_err(|e| ToolError::Execution(format!("join: {e}")))?
+        match p.output_mode.as_str() {
+            "content" | "files_with_matches" | "count" => {}
+            other => {
+                return Err(ToolError::InvalidParams(format!(
+                    "unknown output_mode `{other}`"
+                )));
+            }
+        }
+
+        run_rg(&p, ctx).await
     }
 }
 
-fn run_grep(base: &std::path::Path, p: &Params) -> crate::Result<ToolOutput> {
-    let re = regex::RegexBuilder::new(&p.pattern)
-        .case_insensitive(p.case_insensitive)
-        .build()
-        .map_err(|e| ToolError::InvalidParams(format!("regex: {e}")))?;
+async fn run_rg(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    let mut cmd = Command::new("rg");
+    cmd.arg("--no-config")
+        .arg("--no-messages")
+        .arg("--color=never")
+        .arg("--hidden")
+        .arg(format!("--max-filesize={MAX_FILE_BYTES}"));
 
-    let name_filter: Option<Regex> = match &p.glob {
-        Some(g) => Some(
-            Regex::new(&glob_to_regex(g))
-                .map_err(|e| ToolError::InvalidParams(format!("glob: {e}")))?,
-        ),
-        None => None,
-    };
-
-    let mut files_with_matches: Vec<PathBuf> = Vec::new();
-    let mut content_hits: Vec<String> = Vec::new();
-    let mut counts: Vec<(PathBuf, usize)> = Vec::new();
-    let mut total_hits = 0usize;
-    let mut visited = 0usize;
-    let mut walk_truncated = false;
-
-    let walker = walkdir::WalkDir::new(base)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| !aura_security::is_sensitive_path(e.path()));
-
-    for entry in walker.filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if let Some(f) = &name_filter {
-            let name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            if !f.is_match(name) {
-                continue;
-            }
-        }
-
-        visited += 1;
-        if visited > MAX_FILES_VISITED {
-            walk_truncated = true;
-            break;
-        }
-
-        if let Ok(meta) = path.metadata()
-            && meta.len() > MAX_FILE_BYTES
-        {
-            continue;
-        }
-
-        let Ok(contents) = std::fs::read_to_string(path) else {
-            continue;
-        };
-
-        let mut file_hits = 0usize;
-        for (lineno, line) in contents.lines().enumerate() {
-            if re.is_match(line) {
-                file_hits += 1;
-                total_hits += 1;
-                if p.output_mode == "content" && content_hits.len() < MAX_HITS {
-                    content_hits.push(format!("{}:{}: {}", path.display(), lineno + 1, line));
-                }
-            }
-        }
-
-        if file_hits > 0 {
-            if p.output_mode == "files_with_matches" {
-                if files_with_matches.len() < MAX_HITS {
-                    files_with_matches.push(path.to_path_buf());
-                }
-            } else if p.output_mode == "count" && counts.len() < MAX_HITS {
-                counts.push((path.to_path_buf(), file_hits));
-            }
-        }
+    if p.case_insensitive {
+        cmd.arg("--ignore-case");
+    }
+    if let Some(g) = &p.glob {
+        cmd.arg("--glob").arg(g);
     }
 
-    let body = match p.output_mode.as_str() {
-        "content" => {
-            let mut s = content_hits.join("\n");
-            if total_hits > MAX_HITS {
-                s.push_str(&format!("\n… [truncated: {total_hits} total matches]"));
-            }
-            if walk_truncated {
-                s.push_str(&format!(
-                    "\n… [walk truncated after {MAX_FILES_VISITED} files visited]"
-                ));
-            }
-            s
+    match p.output_mode.as_str() {
+        "files_with_matches" => {
+            cmd.arg("--files-with-matches").arg("--null");
         }
         "count" => {
-            let mut s = counts
-                .into_iter()
-                .map(|(p, n)| format!("{}: {n}", p.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if walk_truncated {
-                s.push_str(&format!(
-                    "\n… [walk truncated after {MAX_FILES_VISITED} files visited]"
-                ));
-            }
-            s
+            cmd.arg("--count").arg("--null");
         }
-        "files_with_matches" => {
-            let mut s = files_with_matches
-                .into_iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if walk_truncated {
-                s.push_str(&format!(
-                    "\n… [walk truncated after {MAX_FILES_VISITED} files visited]"
-                ));
-            }
-            s
+        "content" => {
+            cmd.arg("--json");
         }
-        other => {
-            return Err(ToolError::InvalidParams(format!(
-                "unknown output_mode `{other}`"
-            )));
+        _ => unreachable!(),
+    }
+
+    cmd.arg("--regexp").arg(&p.pattern).arg("--").arg(&p.path);
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ToolError::Execution(
+            "ripgrep (`rg`) not found on PATH; install it (e.g. `apt install ripgrep`, \
+             `brew install ripgrep`, `pacman -S ripgrep`)"
+                .into(),
+        ),
+        _ => ToolError::Execution(format!("spawn rg: {e}")),
+    })?;
+
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| ToolError::Execution("rg stdout pipe missing".into()))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| ToolError::Execution("rg stderr pipe missing".into()))?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut limited = stdout_pipe.take(MAX_RG_STDOUT_BYTES);
+        let _ = limited.read_to_end(&mut buf).await;
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut limited = stderr_pipe.take(MAX_RG_STDERR_BYTES);
+        let _ = limited.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let exit = tokio::select! {
+        _ = ctx.cancellation_token.cancelled() => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(ToolError::Execution("cancelled".into()));
         }
+        wait = child.wait() => wait,
+    };
+    let exit_status = exit.map_err(|e| ToolError::Execution(format!("rg wait: {e}")))?;
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    // rg exit codes: 0 = matches, 1 = no matches, 2+ = real error.
+    let code = exit_status.code().unwrap_or(-1);
+    if code >= 2 {
+        let stderr_str = String::from_utf8_lossy(&stderr);
+        return Err(ToolError::Execution(format!(
+            "rg exited with code {code}: {}",
+            stderr_str.trim()
+        )));
+    }
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut hits_truncated = false;
+
+    let push = |row: String, kept: &mut Vec<String>, truncated: &mut bool| {
+        if kept.len() >= MAX_HITS {
+            *truncated = true;
+            return false;
+        }
+        kept.push(row);
+        true
     };
 
+    match p.output_mode.as_str() {
+        "files_with_matches" => {
+            for path in iter_null_paths(&stdout) {
+                if aura_security::is_sensitive_path(Path::new(&path)) {
+                    continue;
+                }
+                if !push(path, &mut kept, &mut hits_truncated) {
+                    break;
+                }
+            }
+        }
+        "count" => {
+            for (path, count) in iter_count_records(&stdout) {
+                if aura_security::is_sensitive_path(Path::new(&path)) {
+                    continue;
+                }
+                if !push(format!("{path}:{count}"), &mut kept, &mut hits_truncated) {
+                    break;
+                }
+            }
+        }
+        "content" => {
+            for hit in iter_json_matches(&stdout) {
+                if aura_security::is_sensitive_path(Path::new(&hit.path)) {
+                    continue;
+                }
+                let row = format!("{}:{}:{}", hit.path, hit.line_number, hit.line_text);
+                if !push(row, &mut kept, &mut hits_truncated) {
+                    break;
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    let mut body = kept.join("\n");
+    if hits_truncated {
+        body.push_str(&format!("\n… [truncated to {MAX_HITS} results]"));
+    }
     Ok(ToolOutput::Text(body))
 }
 
-/// Translate a shell-style glob into a regex anchored to the full filename.
-/// Supports `*`, `?`, and character classes; not a complete glob dialect.
-fn glob_to_regex(glob: &str) -> String {
-    let mut re = String::from("^");
-    let mut chars = glob.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => re.push_str(".*"),
-            '?' => re.push('.'),
-            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '\\' => {
-                re.push('\\');
-                re.push(c);
-            }
-            '[' => {
-                re.push('[');
-                for inner in chars.by_ref() {
-                    re.push(inner);
-                    if inner == ']' {
-                        break;
-                    }
-                }
-            }
-            _ => re.push(c),
-        }
+/// Decode `path1\0path2\0…` records from `rg --files-with-matches --null`.
+/// Non-UTF-8 paths are dropped — we can't safely round-trip them through
+/// the JSON tool result anyway, and a sensitive non-UTF-8 path would
+/// otherwise have no way of being matched against [`is_sensitive_path`].
+fn iter_null_paths(stdout: &[u8]) -> impl Iterator<Item = String> + '_ {
+    stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| std::str::from_utf8(s).ok().map(String::from))
+}
+
+/// Decode `path\0count\n` records from `rg --count --null`. Uses `\n`
+/// to delimit records and `\0` to split each record into path + count
+/// — the path itself may contain `:` or other punctuation, so the NUL
+/// boundary is the only unambiguous split.
+fn iter_count_records(stdout: &[u8]) -> impl Iterator<Item = (String, String)> + '_ {
+    stdout
+        .split(|b| *b == b'\n')
+        .filter(|s| !s.is_empty())
+        .filter_map(|line| {
+            let nul = line.iter().position(|&b| b == 0)?;
+            let path = std::str::from_utf8(&line[..nul]).ok()?;
+            let count = std::str::from_utf8(&line[nul + 1..]).ok()?;
+            Some((path.to_string(), count.to_string()))
+        })
+}
+
+struct ContentHit {
+    path: String,
+    line_number: u64,
+    line_text: String,
+}
+
+/// Walk `rg --json` NDJSON and yield `match` events. Non-`match`
+/// events (`begin`/`end`/`summary`/`context`) are skipped. Matches
+/// whose path or line text is non-UTF-8 (so rg sends `bytes` instead
+/// of `text`) are dropped — we don't have a UTF-8 string to feed the
+/// caller's text result without lossy conversion that could hide a
+/// sensitive substring.
+fn iter_json_matches(stdout: &[u8]) -> impl Iterator<Item = ContentHit> + '_ {
+    #[derive(Deserialize)]
+    struct RgEvent {
+        #[serde(rename = "type")]
+        kind: String,
+        data: Value,
     }
-    re.push('$');
-    re
+    stdout
+        .split(|b| *b == b'\n')
+        .filter(|s| !s.is_empty())
+        .filter_map(|line| {
+            let evt: RgEvent = serde_json::from_slice(line).ok()?;
+            if evt.kind != "match" {
+                return None;
+            }
+            let path = evt
+                .data
+                .get("path")
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())?
+                .to_string();
+            let raw_line = evt
+                .data
+                .get("lines")
+                .and_then(|l| l.get("text"))
+                .and_then(|t| t.as_str())?;
+            let line_text = raw_line.trim_end_matches('\n').to_string();
+            let line_number = evt.data.get("line_number").and_then(|n| n.as_u64())?;
+            Some(ContentHit {
+                path,
+                line_number,
+                line_text,
+            })
+        })
 }
 
 #[cfg(test)]
@@ -405,5 +483,50 @@ mod tests {
         };
         assert!(s.contains("a.rs"));
         assert!(!s.contains("a.txt"));
+    }
+
+    /// Regression for the colon-in-path bypass that codex flagged: a
+    /// sensitive `.env` under a directory whose own name contains `:`
+    /// must not leak. Pre-fix, `content` mode parsed `path:line:match`
+    /// with `split_once(':')`, classified the path as the unrelated
+    /// prefix `<tmp>/work`, and returned the secret.
+    #[tokio::test]
+    async fn content_mode_handles_colon_in_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let weird = dir.path().join("work:copy");
+        if tokio::fs::create_dir(&weird).await.is_err() {
+            // Some filesystems (HFS+) reject `:`; nothing to test there.
+            return;
+        }
+        tokio::fs::write(weird.join(".env"), "SECRET=needle-value")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("ok.txt"), "needle")
+            .await
+            .unwrap();
+
+        let out = GrepTool
+            .execute(
+                json!({
+                    "pattern": "needle",
+                    "path": dir.path(),
+                    "output_mode": "content"
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!();
+        };
+        assert!(s.contains("ok.txt"), "regular file should match: {s}");
+        assert!(
+            !s.contains(".env"),
+            ".env path under colon-containing dir leaked: {s}"
+        );
+        assert!(
+            !s.contains("SECRET=needle-value"),
+            "sensitive file content leaked: {s}"
+        );
     }
 }

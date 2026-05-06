@@ -735,7 +735,6 @@ dependencies = [
  "open",
  "parking_lot",
  "rand 0.10.1",
- "regex",
  "reqwest 0.13.2",
  "rmcp",
  "serde",
@@ -750,7 +749,6 @@ dependencies = [
  "ts-rs",
  "url",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
