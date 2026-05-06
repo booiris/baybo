@@ -84,7 +84,8 @@ fn build_env_block(workspace: &WorkspaceManager) -> String {
          `Write`, `Glob`, `Grep`) expect absolute paths. Construct \
          absolute paths under the working directory to keep operations \
          inside the sandbox; reach outside (e.g. read `/etc/hosts`) \
-         only when the task explicitly calls for it.",
+         only when the task explicitly calls for it.\n\
+         Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear.",
         work_dir = work_dir.display(),
         platform = std::env::consts::OS,
     )
