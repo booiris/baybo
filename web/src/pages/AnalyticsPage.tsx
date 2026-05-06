@@ -86,6 +86,17 @@ function formatTokens(val: number): string {
   return Math.floor(val).toString();
 }
 
+// All three Anthropic-style input fields count as input sent to the model;
+// they only differ in the cache billing tier. Total input volume = sum of
+// uncached + cache reads + cache writes.
+function totalInput(row: {
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_input_tokens: number;
+}): number {
+  return row.input_tokens + row.cached_input_tokens + row.cache_creation_input_tokens;
+}
+
 // Wire format is integer micro-USD (USD × 10^6). Divide here at the
 // rendering boundary so the rest of the stack stays in exact integer
 // math — no float drift across totals or chart aggregates.
@@ -236,7 +247,18 @@ export function AnalyticsPage() {
     };
   }, [client, days, logout, refreshKey, isMock]);
 
-  const chartData = useMemo(() => data?.daily ?? [], [data]);
+  const chartData = useMemo(
+    () =>
+      (data?.daily ?? []).map((d) => ({
+        ...d,
+        total_input_tokens: totalInput(d),
+        // "Uncached" = anything not served from prompt cache. Cache *creation*
+        // is the first-time write — at this call it is not a cache hit, so it
+        // bills at the non-cached tier and is grouped here.
+        uncached_input_tokens: d.input_tokens + d.cache_creation_input_tokens,
+      })),
+    [data],
+  );
   const last7Days = useMemo(() => chartData.slice(-7).reverse(), [chartData]);
   const totalSessions = useMemo(
     () => chartData.reduce((acc, d) => acc + d.sessions_created, 0),
@@ -311,10 +333,14 @@ export function AnalyticsPage() {
         <>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
             <MetricCard
-              title="Input Tokens"
-              value={formatTokens(data.total_input_tokens)}
+              title="Total Input Tokens"
+              value={formatTokens(
+                data.total_input_tokens +
+                  data.total_cached_input_tokens +
+                  data.total_cache_creation_input_tokens,
+              )}
               icon={RiUploadLine}
-              subtitle="Prompts & context"
+              subtitle="Prompts & context (incl. cache)"
             />
             <MetricCard
               title="Output Tokens"
@@ -381,10 +407,10 @@ export function AnalyticsPage() {
                       fontSize: '11px',
                     }}
                   />
-                  <Line yAxisId="tokens" type="monotone" dataKey="input_tokens" name="Input" stroke="#3b60e4" strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />
+                  <Line yAxisId="tokens" type="monotone" dataKey="total_input_tokens" name="Input (total)" stroke="#3b60e4" strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />
+                  <Line yAxisId="tokens" type="monotone" dataKey="cached_input_tokens" name="Input (cached)" stroke="#2f855a" strokeWidth={2} strokeDasharray="4 3" dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                  <Line yAxisId="tokens" type="monotone" dataKey="uncached_input_tokens" name="Input (uncached)" stroke="#dd6b20" strokeWidth={2} strokeDasharray="4 3" dot={{ r: 2 }} activeDot={{ r: 4 }} />
                   <Line yAxisId="tokens" type="monotone" dataKey="output_tokens" name="Output" stroke="#e53e3e" strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />
-                  <Line yAxisId="tokens" type="monotone" dataKey="cached_input_tokens" name="Cache read" stroke="#2f855a" strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />
-                  <Line yAxisId="tokens" type="monotone" dataKey="cache_creation_input_tokens" name="Cache write" stroke="#dd6b20" strokeWidth={3} strokeDasharray="4 3" dot={{ r: 3 }} activeDot={{ r: 5 }} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -456,7 +482,7 @@ export function AnalyticsPage() {
                   {last7Days.map((day) => (
                     <tr key={day.date} className="hover:bg-gray-50">
                       <td className={tdCell}>{day.date}</td>
-                      <td className={`${tdCell} text-right`}>{day.input_tokens.toLocaleString()}</td>
+                      <td className={`${tdCell} text-right`}>{totalInput(day).toLocaleString()}</td>
                       <td className={`${tdCell} text-right`}>{day.output_tokens.toLocaleString()}</td>
                       <td className={`${tdCell} text-right`}>
                         {day.cached_input_tokens.toLocaleString()}
@@ -504,7 +530,7 @@ export function AnalyticsPage() {
                         <span className="font-bold">{m.model}</span>
                       </td>
                       <td className={`${tdCell} text-right`}>{m.call_count.toLocaleString()}</td>
-                      <td className={`${tdCell} text-right`}>{formatTokens(m.input_tokens)}</td>
+                      <td className={`${tdCell} text-right`}>{formatTokens(totalInput(m))}</td>
                       <td className={`${tdCell} text-right`}>{formatTokens(m.output_tokens)}</td>
                       <td className={`${tdCell} text-right`}>
                         {formatTokens(m.cached_input_tokens)}
