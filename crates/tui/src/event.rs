@@ -48,6 +48,7 @@ pub struct LogRecord {
 /// surfaces — lower levels stay in the log file only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
+    Info,
     Warn,
     Error,
 }

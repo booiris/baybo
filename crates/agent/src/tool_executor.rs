@@ -110,7 +110,12 @@ pub struct ToolExecutor {
     tool_registry: Arc<ToolRegistry>,
     gate_map: Arc<ApprovalGateMap>,
     security_gateway: Arc<SecurityGateway>,
+    /// Sandbox FS scope (= `<workspace>/work/`). Forwarded to
+    /// [`ToolContext::workspace_root`].
     workspace_root: PathBuf,
+    /// Layout addresses anchored at the actual workspace root.
+    /// Forwarded to [`ToolContext::workspace_paths`].
+    workspace_paths: aura_workspace::WorkspacePaths,
     sandbox_runner: Option<Arc<dyn SandboxRunner>>,
 }
 
@@ -120,6 +125,7 @@ impl ToolExecutor {
         gate_map: Arc<ApprovalGateMap>,
         security_gateway: Arc<SecurityGateway>,
         workspace_root: PathBuf,
+        workspace_paths: aura_workspace::WorkspacePaths,
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
     ) -> Self {
         Self {
@@ -127,6 +133,7 @@ impl ToolExecutor {
             gate_map,
             security_gateway,
             workspace_root,
+            workspace_paths,
             sandbox_runner,
         }
     }
@@ -357,6 +364,7 @@ impl ToolExecutor {
                     timeout: effective_timeout,
                     cancellation_token: cancel_token,
                     workspace_root: self.workspace_root.clone(),
+                    workspace_paths: self.workspace_paths.clone(),
                     sandbox,
                     approval: Some(approval),
                     notifier: notifier.clone(),

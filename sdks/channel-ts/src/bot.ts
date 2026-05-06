@@ -176,7 +176,9 @@ export interface BotPlatform<BotHandle, ChatId> {
   /**
    * Optional platform-specific renderer for out-of-band notices.
    * Defaults to `sendText` with a level-keyed emoji prefix (`⚠️` warn,
-   * `❌` error). Override when your platform supports richer
+   * `❌` error). `info` notices are sent verbatim with no prefix —
+   * successful out-of-band confirmations should read like normal chat
+   * lines, not warnings. Override when your platform supports richer
    * formatting (embeds, block-kit attachments).
    */
   sendNotice?(
@@ -598,12 +600,11 @@ export class BotChannel<BotHandle, ChatId>
       if (this.platform.sendNotice) {
         await this.platform.sendNotice(route.handle, route.chat, notice);
       } else {
-        const prefix = notice.level === "error" ? "❌" : "⚠️";
-        await this.platform.sendText(
-          route.handle,
-          route.chat,
-          `${prefix} ${notice.text}`,
-        );
+        const text =
+          notice.level === "info"
+            ? notice.text
+            : `${notice.level === "error" ? "❌" : "⚠️"} ${notice.text}`;
+        await this.platform.sendText(route.handle, route.chat, text);
       }
     } catch (err) {
       this.logger.error("notice send failed", err);

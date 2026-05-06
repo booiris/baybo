@@ -241,6 +241,7 @@ async fn agent_output_to_frame(
             ..
         } => {
             let level = match level {
+                NoticeLevel::Info => "info",
                 NoticeLevel::Warn => "warn",
                 NoticeLevel::Error => "error",
             };

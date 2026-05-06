@@ -102,7 +102,7 @@ export interface ApprovalRequest {
 
 export type ApprovalDecision = "approve" | "approve_always" | "deny";
 
-export type NoticeLevel = "warn" | "error";
+export type NoticeLevel = "info" | "warn" | "error";
 
 /**
  * Control-plane: aura is telling the sidecar to attach a new

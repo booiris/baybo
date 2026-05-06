@@ -423,6 +423,7 @@ pub async fn build_managers(
         gate_map,
         Arc::clone(&security_gateway),
         sandbox_root,
+        workspace_paths.clone(),
         sandbox_runner,
     ));
 

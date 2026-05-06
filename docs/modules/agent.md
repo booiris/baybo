@@ -24,7 +24,7 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### Main execution path (AgentLoop)
 
-1. Build system prompt, Soul, identity injection from `workspace`
+1. Build system prompt, Soul, identity injection from `workspace` — `Soul` reads the three identity files (`profile/{SOUL,USER,IDENTITY}.md`) once here and bakes them into a single `system_prompt` `String`. Mid-session writes (e.g. via the `UpdateProfile` tool) are **not** picked up by this session; see [`docs/todo/profile-hot-reload.md`](../todo/profile-hot-reload.md).
 2. Recall long-term memory
 3. Append current user message to Context
 4. Skill selection (derived from `SkillRegistry::select`):

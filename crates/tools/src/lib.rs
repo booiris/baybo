@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::User;
+use aura_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -72,7 +73,16 @@ pub struct ToolContext {
     pub user: User,
     pub timeout: Duration,
     pub cancellation_token: tokio_util::sync::CancellationToken,
+    /// Sandbox FS scope — points at `<workspace>/work/`. Tools whose
+    /// reach is bounded by the OS sandbox use this; tools that need to
+    /// touch other workspace subtrees (`profile/`, `config/`, `logs/`,
+    /// `state/`) reach for [`Self::workspace_paths`] instead.
     pub workspace_root: PathBuf,
+    /// Layout addresses anchored at the actual workspace root. Lets a
+    /// tool resolve `profile/SOUL.md`, `state/storage.db`, etc. without
+    /// hard-coding the relative offset from `workspace_root`. Cheap to
+    /// clone (one `PathBuf` inside).
+    pub workspace_paths: WorkspacePaths,
     pub sandbox: Option<Arc<dyn ExecSandbox>>,
     /// Mid-execution approval handle. Tools that decide which resources
     /// they will touch only after some internal work (e.g. CodeBuilder
@@ -95,6 +105,7 @@ pub struct ToolContext {
 /// `AgentOutput::Notice`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
+    Info,
     Warn,
     Error,
 }

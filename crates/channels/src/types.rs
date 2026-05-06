@@ -83,8 +83,12 @@ pub enum AgentOutput {
 /// baked into the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
+    /// Action fully succeeded, surfaced as an out-of-band confirmation
+    /// (e.g. `UpdateProfile` reporting that an identity file changed).
+    Info,
     /// Action proceeded with a caveat worth seeing (e.g. suspicious
-    /// skill still injected).
+    /// skill still injected; profile write succeeded but git commit
+    /// failed).
     Warn,
     /// Action was blocked or degraded (e.g. dangerous skill filtered
     /// out; tools the user asked for are unavailable this turn).

@@ -234,6 +234,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
             workspace_root: PathBuf::from("/tmp"),
+            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,

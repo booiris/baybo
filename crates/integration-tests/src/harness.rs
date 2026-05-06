@@ -283,6 +283,7 @@ impl AgentTestHarnessBuilder {
             approval_gates,
             gateway.clone(),
             std::path::PathBuf::from("/tmp"),
+            aura_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
             None,
         ));
 

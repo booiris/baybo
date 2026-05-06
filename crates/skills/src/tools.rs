@@ -753,6 +753,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(10),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
+            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: Some(ApprovalHandle::new(
                 Arc::new(AutoDenyGate),

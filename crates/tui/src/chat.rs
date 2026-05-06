@@ -95,6 +95,7 @@ fn render_scrollback(frame: &mut Frame, area: Rect, state: &AppState) {
                 let (label, color) = match record.level {
                     LogLevel::Error => ("error", Color::Red),
                     LogLevel::Warn => ("warn ", Color::Yellow),
+                    LogLevel::Info => ("info ", Color::Cyan),
                 };
                 let prefix = Span::styled(
                     format!("{label} "),

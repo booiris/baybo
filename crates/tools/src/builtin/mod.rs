@@ -38,6 +38,7 @@ pub(crate) mod paths;
 pub mod read;
 pub mod send_local_file;
 pub mod todo;
+pub mod update_profile;
 pub mod web_fetch;
 pub mod write;
 
@@ -52,6 +53,7 @@ pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use now::NowTool;
 pub use read::ReadTool;
+pub use update_profile::UpdateProfileTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
 
@@ -92,6 +94,7 @@ pub fn default_tools(
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
         trusted(web_fetch, vec![ToolCapability::Http]),
         send_local_file::tool(blob_store.clone()),
+        trusted(UpdateProfileTool, vec![ToolCapability::WriteFile]),
         trusted(NowTool, vec![]),
     ];
     #[cfg(debug_assertions)]

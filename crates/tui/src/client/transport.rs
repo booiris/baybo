@@ -230,6 +230,7 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             }
             let level = match level.as_str() {
                 "error" => NoticeLevel::Error,
+                "info" => NoticeLevel::Info,
                 _ => NoticeLevel::Warn,
             };
             Some(TransportEvent::Notice { level, text })

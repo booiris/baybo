@@ -292,6 +292,7 @@ async fn spawn_transport_pump(
                 TransportEvent::Response(blocks) => Some(AppEvent::Outgoing(blocks)),
                 TransportEvent::Notice { level, text } => Some(AppEvent::Log(LogRecord {
                     level: match level {
+                        NoticeLevel::Info => LogLevel::Info,
                         NoticeLevel::Warn => LogLevel::Warn,
                         NoticeLevel::Error => LogLevel::Error,
                     },

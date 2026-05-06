@@ -506,7 +506,12 @@ function dispatchFrame(
     }
     case "notice": {
       if (!channel.onNotice) return;
-      const level: NoticeLevel = frame.level === "error" ? "error" : "warn";
+      const level: NoticeLevel =
+        frame.level === "error"
+          ? "error"
+          : frame.level === "info"
+            ? "info"
+            : "warn";
       void safeInvoke(
         () =>
           channel.onNotice!({

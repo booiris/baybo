@@ -113,6 +113,7 @@ struct DeltaTxNotifier {
 impl aura_tools::SessionNotifier for DeltaTxNotifier {
     fn emit(&self, level: aura_tools::NoticeLevel, summary: &str, detail: &str) {
         let level = match level {
+            aura_tools::NoticeLevel::Info => aura_channels::NoticeLevel::Info,
             aura_tools::NoticeLevel::Warn => aura_channels::NoticeLevel::Warn,
             aura_tools::NoticeLevel::Error => aura_channels::NoticeLevel::Error,
         };
