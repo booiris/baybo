@@ -79,6 +79,13 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 /// returned handle is sealed: every `chat`/`chat_stream` runs through
 /// `guard` first.
 ///
+/// `registry` is borrowed by the caller so the same instance can be
+/// reused for harvesting `all_known_pricings()` and constructing the
+/// client — `LlmProviderRegistry::with_default_providers()` is cheap
+/// but the runtime needs both anyway, and threading a single registry
+/// makes the "one source of truth for providers" relationship
+/// explicit at the call site.
+///
 /// `blob_store` is optional. When `Some`, the inner client is wired
 /// with a `BlobFetcher` so vision-capable models actually receive
 /// image bytes; without it, multimodal blocks degrade to a text stub
@@ -92,6 +99,7 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 /// always-`Ok(())` closure so the probe isn't billed against anyone.
 pub async fn build_llm_client(
     cfg: &AuraConfig,
+    registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
     guard: LlmCallGuard,
@@ -113,7 +121,7 @@ pub async fn build_llm_client(
             )
         }
     })?;
-    build_llm_client_for_entry(entry, blob_store, vault, guard).await
+    build_llm_client_for_entry(entry, registry, blob_store, vault, guard).await
 }
 
 /// Same wiring as [`build_llm_client`] but pinned to a specific
@@ -122,6 +130,7 @@ pub async fn build_llm_client(
 /// default.
 pub async fn build_llm_client_for_entry(
     entry: &LlmEntry,
+    registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
     guard: LlmCallGuard,
@@ -133,7 +142,6 @@ pub async fn build_llm_client_for_entry(
         vault.as_deref(),
     )
     .await;
-    let registry = LlmProviderRegistry::with_default_providers();
     let blob_fetcher: Option<std::sync::Arc<dyn aura_llm::BlobFetcher>> = blob_store.map(|store| {
         std::sync::Arc::new(BlobStoreFetcher(store)) as std::sync::Arc<dyn aura_llm::BlobFetcher>
     });

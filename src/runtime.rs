@@ -273,8 +273,14 @@ pub async fn build_managers(
     // operator-overridden custom-model pricing won't be reflected
     // until the registry surfaces it. Mainstream models work as
     // before since they're already in `all_known_pricings()`.
+    //
+    // Build the provider registry once and thread it into both the
+    // pricing harvest and `boot::build_llm_client` — same source of
+    // truth for both, instead of two independent factory-registration
+    // passes that would be load-bearing identical.
+    let provider_registry = aura_llm::LlmProviderRegistry::with_default_providers();
     let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> =
-        Arc::new(aura_llm::LlmProviderRegistry::with_default_providers().all_known_pricings());
+        Arc::new(provider_registry.all_known_pricings());
     let spending_limits = SpendingLimits {
         daily_usd: config.cost.spending_limits.daily_usd,
         monthly_usd: config.cost.spending_limits.monthly_usd,
@@ -290,6 +296,7 @@ pub async fn build_managers(
     // can't accidentally pull a raw client and bypass the gate.
     let llm_client = boot::build_llm_client(
         config.as_ref(),
+        &provider_registry,
         Some(stores.blob.clone()),
         Some(Arc::clone(&secret_vault)),
         cost_manager.as_guard(),

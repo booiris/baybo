@@ -158,7 +158,10 @@ async fn main() -> anyhow::Result<()> {
         // probes that don't need OAuth tokens; the openai-subscription
         // provider's create() returns a clear error if it's selected
         // without a vault.
-        match boot::build_llm_client(&config, None, None, Arc::new(|| Ok(()))).await {
+        let provider_registry = aura_llm::LlmProviderRegistry::with_default_providers();
+        match boot::build_llm_client(&config, &provider_registry, None, None, Arc::new(|| Ok(())))
+            .await
+        {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "LLM client unavailable for this command");
