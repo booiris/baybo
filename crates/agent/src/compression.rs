@@ -49,14 +49,14 @@ impl CompressionRunner {
     /// Execute the compression LLM call. Brackets it in a
     /// `StepKind::Compression` step + `LlmCall` span (real lifecycle —
     /// not a post-hoc placeholder), records the cost row against the
-    /// span_id while the span is open, and returns the trimmed summary
-    /// text. On any error returns `ContextError`; the strategy's
-    /// deterministic `on_failure` slice is then used by
-    /// `maybe_compress` instead.
+    /// span_id while the span is open, and returns the sanitized
+    /// `LlmResponse`. `maybe_compress` then trims the content and
+    /// applies the strategy's `on_failure` slice if the response is
+    /// empty or this method returns `Err`.
     pub(crate) async fn run(
         self,
         request: aura_llm::ChatRequest,
-    ) -> std::result::Result<String, aura_context::ContextError> {
+    ) -> Result<aura_llm::LlmResponse, aura_context::ContextError> {
         let CompressionRunner {
             llm_client,
             recorder,
@@ -79,13 +79,13 @@ impl CompressionRunner {
         };
 
         let recorder_inner = Arc::clone(&recorder);
-        let summary = crate::scope::with_step(
+        crate::scope::with_step(
             recorder.as_ref(),
             job_id,
             StepKind::Compression,
             cancel_ctx,
             |step| async move {
-                let summary = crate::scope::with_llm_span(
+                let response = crate::scope::with_llm_span(
                     recorder_inner.as_ref(),
                     &step,
                     job_id,
@@ -115,7 +115,6 @@ impl CompressionRunner {
                                         response.usage.cache_creation_input_tokens,
                                     );
                                 }
-                                let summary = response.content.trim().to_string();
                                 let call_result = LlmCallResult {
                                     output_content: response.content.clone(),
                                     thinking: response.thinking.clone(),
@@ -127,7 +126,7 @@ impl CompressionRunner {
                                         .usage
                                         .cache_creation_input_tokens,
                                 };
-                                (call_result, Ok(summary))
+                                (call_result, Ok(response))
                             }
                             Err(e) => {
                                 let raw = e.to_string();
@@ -148,15 +147,10 @@ impl CompressionRunner {
                     },
                 )
                 .await?;
-                Ok((LifecycleOutcome::Ok, summary))
+                Ok((LifecycleOutcome::Ok, response))
             },
         )
         .await
-        .map_err(|e| aura_context::ContextError::Compression(e.to_string()))?;
-
-        if summary.is_empty() {
-            return Err(aura_context::ContextError::EmptySummary);
-        }
-        Ok(summary)
+        .map_err(|e| aura_context::ContextError::Compression(e.to_string()))
     }
 }

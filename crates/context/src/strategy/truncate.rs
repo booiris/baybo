@@ -1,6 +1,7 @@
+use async_trait::async_trait;
 use aura_model::{ChatMessage, Role};
 
-use super::{CompressOutput, CompressionStrategy, pair_preserving_cut};
+use super::{ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut};
 use crate::tokenizer::Tokenizer;
 
 /// Truncation compression: keeps system messages and the most recent
@@ -28,11 +29,13 @@ impl Truncate {
     }
 }
 
+#[async_trait]
 impl CompressionStrategy for Truncate {
-    fn compress(
+    async fn compress(
         &self,
         messages: &[ChatMessage],
         _tokenizer: &dyn Tokenizer,
+        _chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
         let (system_msgs, non_system) = Self::partition_system(messages);
 
@@ -88,8 +91,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn keeps_system_and_recent() {
+    /// Truncate ignores the chat callback. Asserts via a panic-on-call
+    /// stub so a future regression that wires Truncate into the LLM
+    /// path can't slip past.
+    fn never_chat() -> ChatCallback {
+        Box::new(|_req| {
+            Box::pin(async move {
+                panic!("Truncate must not invoke the chat callback");
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn keeps_system_and_recent() {
         let strategy = Truncate::new(2);
         let tokenizer = SimpleTokenizer;
 
@@ -102,17 +116,21 @@ mod tests {
             make_msg(Role::User, "msg 3"),
         ];
 
-        match strategy.compress(&messages, &tokenizer).unwrap() {
+        match strategy
+            .compress(&messages, &tokenizer, never_chat())
+            .await
+            .unwrap()
+        {
             CompressOutput::Replaced(new_messages) => {
                 assert_eq!(new_messages.len(), 3);
                 assert_eq!(new_messages[0].role, Role::System);
             }
-            other => panic!("expected Replaced, got {:?}", variant_name(&other)),
+            _ => panic!("expected Replaced"),
         }
     }
 
-    #[test]
-    fn no_op_when_under_keep_recent() {
+    #[tokio::test]
+    async fn no_op_when_under_keep_recent() {
         let strategy = Truncate::new(10);
         let tokenizer = SimpleTokenizer;
 
@@ -122,17 +140,13 @@ mod tests {
             make_msg(Role::Assistant, "hi"),
         ];
 
-        match strategy.compress(&messages, &tokenizer).unwrap() {
+        match strategy
+            .compress(&messages, &tokenizer, never_chat())
+            .await
+            .unwrap()
+        {
             CompressOutput::NoOp => {}
-            other => panic!("expected NoOp, got {:?}", variant_name(&other)),
-        }
-    }
-
-    fn variant_name(o: &CompressOutput) -> &'static str {
-        match o {
-            CompressOutput::NoOp => "NoOp",
-            CompressOutput::Replaced(_) => "Replaced",
-            CompressOutput::NeedsLlmCall { .. } => "NeedsLlmCall",
+            _ => panic!("expected NoOp"),
         }
     }
 }

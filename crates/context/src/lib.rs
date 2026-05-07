@@ -18,7 +18,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aura_llm::ChatRequest;
+use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::ChatMessage;
 use aura_model::Session;
 use parking_lot::RwLock;
@@ -222,13 +222,14 @@ impl ContextManager {
     /// the baseline (the prior `actual_tokens` was tokenised by the
     /// old provider).
     ///
-    /// `chat` is invoked only if the strategy returns
-    /// [`CompressOutput::NeedsLlmCall`]. The closure must perform the
-    /// LLM call and return just the summary text — wrapping the call
-    /// in a trace span and recording cost against the ledger is the
-    /// caller's job. On `Err`, the strategy's deterministic fallback
-    /// (typically a Truncate-equivalent slice) is applied so a
-    /// transient summarizer failure never kills the user's turn.
+    /// `chat` is invoked only if the strategy chooses to make an LLM
+    /// call (i.e. [`Summarize`]). It performs the request inside a
+    /// trace span and records cost against the ledger; the strategy
+    /// owns trim + empty-summary checking and falls back to a
+    /// Truncate-equivalent slice on transport / sanitize failure or
+    /// empty content so a transient summarizer failure never kills
+    /// the user's turn. Pure strategies (`Truncate`) ignore `chat`
+    /// entirely.
     pub async fn maybe_compress<F, Fut>(
         &mut self,
         session: &mut Session,
@@ -236,8 +237,8 @@ impl ContextManager {
         chat: F,
     ) -> crate::Result<CompressionOutcome>
     where
-        F: FnOnce(ChatRequest) -> Fut + Send,
-        Fut: Future<Output = std::result::Result<String, ContextError>> + Send,
+        F: FnOnce(ChatRequest) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
         self.set_current_model(model_id);
 
@@ -247,23 +248,14 @@ impl ContextManager {
             return Ok(CompressionOutcome::NoChange);
         }
 
+        let chat_box: crate::strategy::ChatCallback = Box::new(move |req| Box::pin(chat(req)));
         let plan = self
             .strategy
-            .compress(&session.messages, &*self.tokenizer)?;
+            .compress(&session.messages, &*self.tokenizer, chat_box)
+            .await?;
         let new_messages = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::NoChange),
             CompressOutput::Replaced(messages) => messages,
-            CompressOutput::NeedsLlmCall {
-                request,
-                on_success,
-                on_failure,
-            } => match chat(request).await {
-                Ok(summary) => on_success(summary),
-                Err(e) => {
-                    warn!(error = %e, "summarization failed; falling back to truncation");
-                    on_failure
-                }
-            },
         };
 
         let before_tokens = self.budget.current();
@@ -399,7 +391,7 @@ mod tests {
     /// `Truncate`, which never returns `NeedsLlmCall`, so the closure
     /// should never run. Failing loudly here means a future regression
     /// that wires `Summarize` into these tests can't slip past.
-    async fn never_chat(_: ChatRequest) -> std::result::Result<String, ContextError> {
+    async fn never_chat(_: ChatRequest) -> std::result::Result<LlmResponse, ContextError> {
         panic!("Truncate-only tests must not invoke the chat closure");
     }
 

@@ -1,11 +1,30 @@
 pub mod summarize;
 pub mod truncate;
 
-use aura_llm::ChatRequest;
-use aura_model::{ChatMessage, ContentBlock};
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 
+use async_trait::async_trait;
+use aura_llm::{ChatRequest, LlmResponse};
+use aura_model::{ChatMessage, ContentBlock};
+
+use crate::error::ContextError;
 use crate::tokenizer::Tokenizer;
+
+/// Future returned by a [`ChatCallback`]. Boxed because the callback
+/// is passed through a `dyn`-compatible trait method.
+pub type ChatFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<LlmResponse, ContextError>> + Send>>;
+
+/// One-shot chat invocation handed to a [`CompressionStrategy`].
+///
+/// The strategy calls it at most once. Strategies that don't need an
+/// LLM call (e.g. [`crate::Truncate`]) ignore it; strategies that do
+/// (e.g. [`crate::Summarize`]) drive the call themselves so the chat
+/// → trim → fallback flow stays inside the strategy. `'static` because
+/// the agent loop's runner moves its captures by value.
+pub type ChatCallback = Box<dyn FnOnce(ChatRequest) -> ChatFuture + Send>;
 
 /// Adjust a candidate cut index over `messages` so the kept tail
 /// (`messages[cut..]`) contains every `ToolUse` whose matching
@@ -75,49 +94,33 @@ pub(crate) fn pair_preserving_cut(messages: &[ChatMessage], cut: usize) -> usize
 
 /// Strategy for compressing context messages when the token budget is exceeded.
 ///
-/// Strategies are **pure planners** — they never make LLM calls
-/// themselves. Implementations receive the full message list and a
-/// tokenizer and return a [`CompressOutput`] describing what to do.
-/// `ContextManager` then either applies the plan directly (NoOp /
-/// Replaced) or invokes the caller-supplied chat closure to fulfil
-/// `NeedsLlmCall` and applies the result. This keeps the LLM call's
-/// trace span and cost recording on the agent-loop side, where the
-/// `SpanRecorder` and `CostManager` live.
+/// Implementations receive the full message list, a tokenizer, and a
+/// one-shot chat callback they can invoke if they need to call an
+/// LLM (e.g. `Summarize`). The callback hides trace span / cost /
+/// security wiring on the agent side — the strategy just sees
+/// `request → LlmResponse`. Strategies that don't need an LLM
+/// (e.g. `Truncate`) ignore the callback.
+#[async_trait]
 pub trait CompressionStrategy: Send + Sync {
-    /// Plan a compression over `messages`. Returns synchronously
-    /// because no I/O happens inside a strategy.
-    fn compress(
+    async fn compress(
         &self,
         messages: &[ChatMessage],
         tokenizer: &dyn Tokenizer,
+        chat: ChatCallback,
     ) -> crate::Result<CompressOutput>;
 }
 
-/// Plan returned by [`CompressionStrategy::compress`].
-///
-/// The strategy decides *what* to do; `ContextManager` decides *how*
-/// to apply it (and the agent loop fulfils any LLM call). Splitting
-/// the decision from the I/O keeps strategies pure and lets the
-/// agent loop wrap LLM calls in real trace spans.
+/// Result of a [`CompressionStrategy::compress`] call.
 pub enum CompressOutput {
     /// Strategy chose not to compress (e.g. message count already at
     /// or below the keep threshold). `ContextManager` returns
     /// `CompressionOutcome::NoChange` without touching `session`.
     NoOp,
-    /// Strategy produced a new message list without needing an LLM
-    /// call (`Truncate`, or any future deterministic compaction).
+    /// Strategy produced a new message list. For deterministic
+    /// strategies this is the truncated slice; for LLM-driven
+    /// strategies this is `[system, [Conversation Summary], recent...]`
+    /// (or the deterministic fallback when the summarizer call fails).
     Replaced(Vec<ChatMessage>),
-    /// Strategy needs the caller to perform `request` and feed the
-    /// summary text into `on_success` to assemble the new message
-    /// list. `on_failure` is the deterministic fallback list to use
-    /// when the call errors — typically a Truncate-equivalent slice
-    /// — so a transient summarizer failure never kills the user's
-    /// turn.
-    NeedsLlmCall {
-        request: ChatRequest,
-        on_success: Box<dyn FnOnce(String) -> Vec<ChatMessage> + Send>,
-        on_failure: Vec<ChatMessage>,
-    },
 }
 
 #[cfg(test)]

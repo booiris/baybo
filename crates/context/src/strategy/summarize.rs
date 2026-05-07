@@ -1,13 +1,15 @@
+use async_trait::async_trait;
 use aura_llm::ChatRequest;
 use aura_model::{ChatMessage, ContentBlock, Role};
+use tracing::warn;
 
-use super::{CompressOutput, CompressionStrategy, pair_preserving_cut};
+use super::{ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut};
 use crate::tokenizer::Tokenizer;
 
 /// Trailing instruction appended to the messages handed to the
 /// summarizer LLM. Lives here rather than in the agent loop because
 /// it's the strategy that decides what shape of summary to ask for —
-/// the agent loop just dispatches the request and returns the text.
+/// the agent loop just runs the call.
 const SUMMARIZE_INSTRUCTION: &str = "\
 You are summarizing the older portion of an agent's own conversation \
 so it can continue the same task. Preserve: the user's current request \
@@ -20,11 +22,12 @@ exchanges, exploratory dead-ends. Output plain prose, no preamble.";
 /// single `[Conversation Summary]` block and keeps the most recent
 /// `keep_recent` non-system messages alongside it.
 ///
-/// The strategy itself never makes an LLM call. Instead it returns a
-/// `CompressOutput::NeedsLlmCall` plan with the prepared `ChatRequest`
-/// and the assembly closures; `ContextManager::maybe_compress` invokes
-/// the caller-supplied chat closure to fulfil the plan, and the agent
-/// loop wraps that closure in a real trace span and cost record.
+/// Drives the LLM call itself via the [`ChatCallback`] passed in by
+/// `ContextManager::maybe_compress`: builds the request, invokes the
+/// callback, trims the response, and either assembles the new
+/// message list or falls back to a Truncate-equivalent slice on
+/// failure / empty content. The callback is where the agent loop
+/// wraps the call in a real trace span and cost record.
 pub struct Summarize {
     keep_recent: usize,
 }
@@ -35,11 +38,13 @@ impl Summarize {
     }
 }
 
+#[async_trait]
 impl CompressionStrategy for Summarize {
-    fn compress(
+    async fn compress(
         &self,
         messages: &[ChatMessage],
         _tokenizer: &dyn Tokenizer,
+        chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
         let mut system_msgs = Vec::new();
         let mut non_system = Vec::new();
@@ -80,36 +85,45 @@ impl CompressionStrategy for Summarize {
             tools: Vec::new(),
         };
 
-        // Failure fallback: a Truncate-equivalent slice (system + recent)
-        // so a transient summarizer error never kills the user's turn.
-        let mut on_failure = system_msgs.clone();
-        on_failure.extend_from_slice(&recent);
+        // Deterministic fallback used on transport / sanitize failure
+        // or empty summary: a Truncate-equivalent slice (system +
+        // recent) so a transient summarizer error never kills the
+        // user's turn.
+        let fallback = || {
+            let mut out = system_msgs.clone();
+            out.extend_from_slice(&recent);
+            out
+        };
 
-        let on_success_system = system_msgs;
-        let on_success_recent = recent;
-        let on_success = Box::new(move |summary: String| {
-            let mut new_messages = on_success_system;
-            new_messages.push(ChatMessage {
-                role: Role::System,
-                content: vec![ContentBlock::Text(format!(
-                    "[Conversation Summary]\n{summary}"
-                ))],
-            });
-            new_messages.extend(on_success_recent);
-            new_messages
-        });
-
-        Ok(CompressOutput::NeedsLlmCall {
-            request,
-            on_success,
-            on_failure,
-        })
+        match chat(request).await {
+            Ok(response) => {
+                let summary = response.content.trim().to_string();
+                if summary.is_empty() {
+                    warn!("summarizer returned empty content; falling back to truncation");
+                    return Ok(CompressOutput::Replaced(fallback()));
+                }
+                let mut new_messages = system_msgs;
+                new_messages.push(ChatMessage {
+                    role: Role::System,
+                    content: vec![ContentBlock::Text(format!(
+                        "[Conversation Summary]\n{summary}"
+                    ))],
+                });
+                new_messages.extend(recent);
+                Ok(CompressOutput::Replaced(new_messages))
+            }
+            Err(e) => {
+                warn!(error = %e, "summarization failed; falling back to truncation");
+                Ok(CompressOutput::Replaced(fallback()))
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_llm::{LlmResponse, TokenUsage};
 
     struct SimpleTokenizer;
 
@@ -140,12 +154,40 @@ mod tests {
         }
     }
 
-    /// Plan for a 6-message conversation with `keep_recent=2` should
-    /// be `NeedsLlmCall` carrying a request that contains the 3 old
-    /// non-system messages + the trailing instruction. `on_success`
-    /// must produce `[system, summary-as-system, recent...]`.
-    #[test]
-    fn produces_needs_llm_call_with_old_messages() {
+    fn ok_chat(content: &'static str) -> ChatCallback {
+        Box::new(move |_req| {
+            Box::pin(async move {
+                Ok(LlmResponse {
+                    content: content.to_string(),
+                    content_blocks: vec![],
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                    thinking: None,
+                })
+            })
+        })
+    }
+
+    fn err_chat() -> ChatCallback {
+        Box::new(|_req| {
+            Box::pin(async move { Err(crate::error::ContextError::Compression("boom".into())) })
+        })
+    }
+
+    fn never_chat() -> ChatCallback {
+        Box::new(|_req| {
+            Box::pin(async move {
+                panic!("chat must not be invoked when strategy NoOps");
+            })
+        })
+    }
+
+    /// 6 non-system + 1 system, `keep_recent=2`. `chat` returns
+    /// "CANNED"; the resulting Replaced list must be
+    /// `[system, summary-as-system, recent...]` (2 recent + 1 summary
+    /// + 1 original system = 4 entries).
+    #[tokio::test]
+    async fn produces_replaced_with_summary_and_recent() {
         let strategy = Summarize::new(2);
         let tokenizer = SimpleTokenizer;
         let messages = vec![
@@ -157,52 +199,94 @@ mod tests {
             make_msg(Role::User, "msg 3"),
         ];
 
-        match strategy.compress(&messages, &tokenizer).unwrap() {
-            CompressOutput::NeedsLlmCall {
-                request,
-                on_success,
-                on_failure,
-            } => {
-                // 3 old non-system messages + 1 instruction message
-                assert_eq!(request.messages.len(), 4);
-                assert!(request.tools.is_empty());
-                assert!(request.temperature.is_none());
-
-                let trailing = request.messages.last().unwrap();
-                assert_eq!(trailing.role, Role::User);
-                if let ContentBlock::Text(t) = &trailing.content[0] {
-                    assert!(t.contains("summarizing the older portion"));
-                } else {
-                    panic!("expected text instruction");
-                }
-
-                // on_success → system + summary + 2 recent non-system
-                let assembled = on_success("CANNED".into());
-                assert_eq!(assembled.len(), 4);
-                assert_eq!(assembled[0].role, Role::System);
-                assert_eq!(assembled[1].role, Role::System);
-                if let ContentBlock::Text(t) = &assembled[1].content[0] {
+        match strategy
+            .compress(&messages, &tokenizer, ok_chat("CANNED"))
+            .await
+            .unwrap()
+        {
+            CompressOutput::Replaced(new_messages) => {
+                assert_eq!(new_messages.len(), 4);
+                assert_eq!(new_messages[0].role, Role::System);
+                assert_eq!(new_messages[1].role, Role::System);
+                if let ContentBlock::Text(t) = &new_messages[1].content[0] {
                     assert!(t.contains("[Conversation Summary]"));
                     assert!(t.contains("CANNED"));
                 } else {
                     panic!("expected summary text");
                 }
+            }
+            _ => panic!("expected Replaced"),
+        }
+    }
 
-                // on_failure → system + 2 recent non-system, no summary
-                assert_eq!(on_failure.len(), 3);
-                assert_eq!(on_failure[0].role, Role::System);
-                if let ContentBlock::Text(t) = &on_failure[1].content[0] {
+    /// On chat error the strategy must fall back to a Truncate-equivalent
+    /// slice: `[system, recent...]` — no summary block.
+    #[tokio::test]
+    async fn chat_error_falls_back_to_truncation() {
+        let strategy = Summarize::new(2);
+        let tokenizer = SimpleTokenizer;
+        let messages = vec![
+            make_msg(Role::System, "system"),
+            make_msg(Role::User, "msg 1"),
+            make_msg(Role::Assistant, "reply 1"),
+            make_msg(Role::User, "msg 2"),
+            make_msg(Role::Assistant, "reply 2"),
+            make_msg(Role::User, "msg 3"),
+        ];
+
+        match strategy
+            .compress(&messages, &tokenizer, err_chat())
+            .await
+            .unwrap()
+        {
+            CompressOutput::Replaced(new_messages) => {
+                assert_eq!(new_messages.len(), 3);
+                assert_eq!(new_messages[0].role, Role::System);
+                if let ContentBlock::Text(t) = &new_messages[1].content[0] {
                     assert_eq!(t, "reply 2");
                 } else {
                     panic!("expected text content");
                 }
             }
-            other => panic!("expected NeedsLlmCall, got: {:?}", variant_name(&other)),
+            _ => panic!("expected Replaced fallback"),
         }
     }
 
-    #[test]
-    fn no_op_when_under_keep_recent() {
+    /// Empty / whitespace-only summary takes the same fallback path
+    /// as a transport error.
+    #[tokio::test]
+    async fn empty_summary_falls_back_to_truncation() {
+        let strategy = Summarize::new(2);
+        let tokenizer = SimpleTokenizer;
+        let messages = vec![
+            make_msg(Role::System, "system"),
+            make_msg(Role::User, "msg 1"),
+            make_msg(Role::Assistant, "reply 1"),
+            make_msg(Role::User, "msg 2"),
+            make_msg(Role::Assistant, "reply 2"),
+            make_msg(Role::User, "msg 3"),
+        ];
+
+        match strategy
+            .compress(&messages, &tokenizer, ok_chat("   \n  "))
+            .await
+            .unwrap()
+        {
+            CompressOutput::Replaced(new_messages) => {
+                // No summary block — fallback shape.
+                assert_eq!(new_messages.len(), 3);
+                if let ContentBlock::Text(t) = &new_messages[1].content[0] {
+                    assert_eq!(t, "reply 2");
+                } else {
+                    panic!("expected text content");
+                }
+            }
+            _ => panic!("expected Replaced fallback"),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_op_when_under_keep_recent() {
         let strategy = Summarize::new(10);
         let tokenizer = SimpleTokenizer;
         let messages = vec![
@@ -211,9 +295,13 @@ mod tests {
             make_msg(Role::Assistant, "hi"),
         ];
 
-        match strategy.compress(&messages, &tokenizer).unwrap() {
+        match strategy
+            .compress(&messages, &tokenizer, never_chat())
+            .await
+            .unwrap()
+        {
             CompressOutput::NoOp => {}
-            other => panic!("expected NoOp, got: {:?}", variant_name(&other)),
+            _ => panic!("expected NoOp"),
         }
     }
 
@@ -221,8 +309,8 @@ mod tests {
     /// the head's tool_uses are only resolved by tool_results in the
     /// tail. The strategy must NoOp instead of paying for a summarizer
     /// call on an empty old slice.
-    #[test]
-    fn no_op_when_pair_cut_collapses_to_zero() {
+    #[tokio::test]
+    async fn no_op_when_pair_cut_collapses_to_zero() {
         let strategy = Summarize::new(1);
         let tokenizer = SimpleTokenizer;
         let tool_use = ChatMessage {
@@ -248,17 +336,13 @@ mod tests {
             tool_result,
         ];
 
-        match strategy.compress(&messages, &tokenizer).unwrap() {
+        match strategy
+            .compress(&messages, &tokenizer, never_chat())
+            .await
+            .unwrap()
+        {
             CompressOutput::NoOp => {}
-            other => panic!("expected NoOp, got: {:?}", variant_name(&other)),
-        }
-    }
-
-    fn variant_name(o: &CompressOutput) -> &'static str {
-        match o {
-            CompressOutput::NoOp => "NoOp",
-            CompressOutput::Replaced(_) => "Replaced",
-            CompressOutput::NeedsLlmCall { .. } => "NeedsLlmCall",
+            _ => panic!("expected NoOp"),
         }
     }
 }
