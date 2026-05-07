@@ -117,11 +117,21 @@ pub enum CompressOutput {
     /// or below the keep threshold). `ContextManager` returns
     /// `CompressionOutcome::NoChange` without touching `session`.
     NoOp,
-    /// Strategy produced a new message list. For deterministic
-    /// strategies this is the truncated slice; for LLM-driven
-    /// strategies this is `[system, [Conversation Summary], recent...]`
-    /// (or the deterministic fallback when the summarizer call fails).
-    Replaced(Vec<ChatMessage>),
+    /// Strategy produced a new message list.
+    ///
+    /// `replaced_full_history` declares whether this output discards
+    /// the prior conversation in favour of an opaque condensation
+    /// (e.g. a summary message that no longer carries the original
+    /// `ToolUse` blocks). `ContextManager` uses the flag to decide
+    /// whether to append a fresh skill trailer (reminder + per-skill
+    /// detail blocks) — necessary after a full-history wipe so the
+    /// model still sees the authoritative skill list, redundant after
+    /// a tail-preserving truncation that already kept the historical
+    /// reminder + tool_use trail in the kept slice.
+    Replaced {
+        messages: Vec<ChatMessage>,
+        replaced_full_history: bool,
+    },
 }
 
 #[cfg(test)]

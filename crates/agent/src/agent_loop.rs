@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
 use aura_model::Session;
-use aura_skills::{SkillRegistry, SkillSummary};
+use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_skills_assessor::SkillAssessor;
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
@@ -413,13 +413,13 @@ impl AgentLoop {
 
         if let Some((skill_name, args)) = detect_slash_invocation(&user_text, &skills_for_turn) {
             let synthesized_id = format!("synthskill-{}", uuid::Uuid::new_v4());
-            let mut input = serde_json::json!({ "skill": skill_name });
+            let mut input = serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name });
             if !args.is_empty() {
                 input["args"] = serde_json::Value::String(args);
             }
             let tool_use_block = ContentBlock::ToolUse {
                 id: synthesized_id.clone(),
-                name: "Skill".to_string(),
+                name: SKILL_TOOL_NAME.to_string(),
                 input: input.clone(),
                 signature: None,
             };
@@ -451,7 +451,7 @@ impl AgentLoop {
                 move |step| async move {
                     let res = executor_clone
                         .execute(
-                            "Skill",
+                            SKILL_TOOL_NAME,
                             input_clone,
                             &session_id_clone,
                             &user_clone,
@@ -1538,15 +1538,7 @@ impl AgentLoop {
 /// Uses the skill *name* (the value the model passes as `Skill`'s `skill`
 /// argument), not the slash command — slash commands are a user-input
 /// affordance, while reminders direct the model's tool invocation.
-fn format_skill_body(sk: &SkillSummary) -> String {
-    let mut line = format!("{}: {}", sk.name, sk.description.trim());
-    if let Some(hint) = sk.argument_hint.as_deref() {
-        line.push(' ');
-        line.push_str(hint);
-    }
-    line
-}
-
+///
 /// Compare `current` against `previous` (last turn's `active_skills`
 /// names) and return a `<system-reminder>`-wrapped *full* skill list when
 /// the set has changed, or `None` when it has not.
@@ -1570,23 +1562,7 @@ fn build_skill_reminder_if_changed(
     if prev_set == cur_set {
         return None;
     }
-
-    if current.is_empty() {
-        return Some(String::from(
-            "<system-reminder>\nNo skills are currently available.\n</system-reminder>",
-        ));
-    }
-
-    let mut s = String::from(
-        "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n",
-    );
-    for sk in current {
-        s.push_str("- ");
-        s.push_str(&format_skill_body(sk));
-        s.push('\n');
-    }
-    s.push_str("</system-reminder>");
-    Some(s)
+    Some(aura_skills::render::render_skill_reminder(current))
 }
 
 /// Strip leading/trailing whitespace from the LLM response's text fields.

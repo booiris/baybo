@@ -625,7 +625,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         Box::new(Summarize::new(keep_recent)),
                         token_budget.clone(),
                     )
-                    .with_calibration(Arc::clone(&token_calibration)),
+                    .with_calibration(Arc::clone(&token_calibration))
+                    .with_skill_registry(Arc::clone(&skill_registry)),
                     Arc::clone(&memory_manager),
                     policy.clone(),
                     Soul::custom(system_prompt.clone()),

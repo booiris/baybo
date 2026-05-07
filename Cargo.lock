@@ -363,6 +363,7 @@ dependencies = [
  "async-trait",
  "aura-llm",
  "aura-model",
+ "aura-skills",
  "chrono",
  "parking_lot",
  "serde",

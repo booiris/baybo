@@ -21,8 +21,27 @@ use std::time::Instant;
 use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::ChatMessage;
 use aura_model::Session;
+use aura_model::{ContentBlock, Role};
+use aura_skills::render::{render_skill_block, render_skill_reminder};
+use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry};
 use parking_lot::RwLock;
 use tracing::{debug, warn};
+
+/// Maximum tokens the rendered detail block of a single previously
+/// called skill may take up after compression — anything bigger gets
+/// its body truncated (with a marker) so an oversized skill still
+/// surfaces enough context to be useful without crowding out the rest.
+const PER_SKILL_TOKEN_CAP: usize = 5_000;
+
+/// Cumulative token cap across every skill detail block we attach
+/// after a summary. Skills near the end of the called-list get
+/// truncated harder to fit whatever budget remains; once nothing fits,
+/// further skills are dropped.
+const TOTAL_SKILL_TOKEN_CAP: usize = 25_000;
+
+/// Marker appended to a truncated skill body so the model can tell
+/// the definition is incomplete.
+const TRUNCATION_MARKER: &str = "\n…[truncated]";
 
 /// Anchor for cheap, near-exact token estimation between calls:
 /// `actual_tokens` is the provider's `usage.input_tokens` for the
@@ -53,14 +72,31 @@ pub enum CompressionOutcome {
 /// Manages session context: appending messages with automatic compression
 /// and token budget tracking.
 ///
-/// This is a concrete struct, not a trait. The only extension point is the
-/// `CompressionStrategy` injected at construction — the management logic
-/// (append, budget check) is invariant.
+/// This is a concrete struct, not a trait. The extension points are the
+/// `CompressionStrategy` injected at construction (the management logic
+/// — append, budget check — is invariant) and the optional
+/// `SkillRegistry` plumbed in via [`Self::with_skill_registry`] which
+/// lets the manager re-broadcast the authoritative skill list and
+/// re-attach per-skill detail blocks after a summary-style compression
+/// has wiped the historical `<skill>` / `<system-reminder>` messages
+/// off the front of the conversation.
 pub struct ContextManager {
     tokenizer: Arc<dyn Tokenizer>,
     strategy: Box<dyn CompressionStrategy>,
     budget: TokenBudget,
     calibration: Option<Arc<TokenCalibration>>,
+    /// Used to render the post-compression skill trailer. `None` keeps
+    /// the manager skill-agnostic for callers that don't need the
+    /// trailer (Truncate-only flows, isolated tests).
+    skill_registry: Option<Arc<SkillRegistry>>,
+    /// Skills the model has invoked via the `Skill` tool somewhere in
+    /// the current `session.messages`, in first-seen order with
+    /// duplicates collapsed. Maintained incrementally by
+    /// [`Self::append`] and rebuilt on every compression apply so the
+    /// vector always mirrors the current message slice. Plain `Vec`
+    /// (not `RwLock`) because every read/write site is on a
+    /// `&mut self` path; nothing else looks at it.
+    called_skills: Vec<String>,
     // Interior-mutable: `record_call_actual` runs from the agent
     // loop's `&self`-only `call_llm` path.
     baseline: RwLock<Option<TokenBaseline>>,
@@ -102,6 +138,8 @@ impl ContextManager {
             strategy,
             budget,
             calibration: None,
+            skill_registry: None,
+            called_skills: Vec::new(),
             baseline: RwLock::new(None),
             current_model: RwLock::new(None),
             per_message_tokens: RwLock::new(Vec::new()),
@@ -115,6 +153,17 @@ impl ContextManager {
     /// accurate vs real `usage.input_tokens`).
     pub fn with_calibration(mut self, calibration: Arc<TokenCalibration>) -> Self {
         self.calibration = Some(calibration);
+        self
+    }
+
+    /// Attach a `SkillRegistry` so the manager can append a fresh
+    /// skill trailer (authoritative `<system-reminder>` skill list +
+    /// per-skill detail blocks for skills called during the now-wiped
+    /// history) after any compression that flagged
+    /// `replaced_full_history`. Without this, the post-compression
+    /// message list is whatever the strategy produced, unmodified.
+    pub fn with_skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.skill_registry = Some(registry);
         self
     }
 
@@ -207,6 +256,7 @@ impl ContextManager {
     /// built.
     pub fn append(&mut self, session: &mut Session, msg: &ChatMessage) {
         let count = self.tokenizer.count_message(msg);
+        record_skill_calls(&mut self.called_skills, msg);
         session.messages.push(msg.clone());
         self.per_message_tokens.write().push(count);
         self.budget.update(self.count_tokens(&session.messages));
@@ -250,10 +300,28 @@ impl ContextManager {
 
         let chat_box: crate::strategy::ChatCallback = Box::new(move |req| Box::pin(chat(req)));
         let plan = self.strategy.compress(&session.messages, chat_box).await?;
-        let new_messages = match plan {
+        let (mut new_messages, replaced_full_history) = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::NoChange),
-            CompressOutput::Replaced(messages) => messages,
+            CompressOutput::Replaced {
+                messages,
+                replaced_full_history,
+            } => (messages, replaced_full_history),
         };
+
+        // Strategy with `replaced_full_history` discarded the
+        // historical skill_reminder / tool_use trail; the manager
+        // re-attaches the authoritative reminder + per-skill detail
+        // blocks so the next LLM call still sees the skill set the
+        // user expects. `called_skills` was tracked incrementally on
+        // every `append` and tells us which skills' details to ship.
+        if replaced_full_history && let Some(registry) = &self.skill_registry {
+            append_skill_trailer(
+                &mut new_messages,
+                registry.as_ref(),
+                self.tokenizer.as_ref(),
+                &self.called_skills,
+            );
+        }
 
         let before_tokens = self.budget.current();
         let start = Instant::now();
@@ -280,6 +348,12 @@ impl ContextManager {
 
         session.messages = new_messages;
         *self.per_message_tokens.write() = new_per_message;
+        // Rebuild called_skills from the freshly-applied slice so the
+        // vector mirrors session.messages: a successful summary leaves
+        // it empty (the trailer carries plain text, no `ToolUse`), and
+        // a Truncate apply scopes it to whatever's still in the kept
+        // tail. Either way, the next compression sees the right set.
+        self.called_skills = scan_skill_calls(&session.messages);
         self.budget.update(after_tokens);
 
         if after_tokens > self.budget.max_tokens() {
@@ -326,6 +400,160 @@ impl ContextManager {
             (Some(cal), Some(model_id)) => cal.adjust(model_id, raw),
             _ => raw,
         }
+    }
+}
+
+/// Walk one message's `ContentBlock::ToolUse` entries and append
+/// every freshly-seen skill name (in the order they appear) to `acc`.
+/// Only `ToolUse` blocks for the canonical Skill tool are considered;
+/// insertion-order dedup keeps the post-summary trailer deterministic.
+fn record_skill_calls(acc: &mut Vec<String>, msg: &ChatMessage) {
+    for block in &msg.content {
+        let ContentBlock::ToolUse { name, input, .. } = block else {
+            continue;
+        };
+        if name != SKILL_TOOL_NAME {
+            continue;
+        }
+        let Some(skill_name) = input.get(SKILL_INPUT_NAME_FIELD).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !acc.iter().any(|n| n == skill_name) {
+            acc.push(skill_name.to_string());
+        }
+    }
+}
+
+/// Rebuild the called-skills vector from a full message slice.
+/// Used after a compression apply to scope the vector to whatever
+/// `ToolUse` blocks survived in the new `session.messages`.
+fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
+    let mut out = Vec::new();
+    for msg in messages {
+        record_skill_calls(&mut out, msg);
+    }
+    out
+}
+
+/// Render `skill` as a `<skill>` block, truncating the body in place
+/// if the full rendering would exceed `cap` tokens. Returns `None` when
+/// `cap` is too small to fit even a truncated body — the caller drops
+/// the skill entirely rather than ship an empty wrapper.
+///
+/// Sizing is proportional (`body_chars * cap / full_cost`) with a
+/// 10 % safety margin against per-region BPE-ratio drift, then a
+/// post-render verification: if the truncated block still costs more
+/// than `cap`, return `None`. One pass, no iteration.
+fn render_skill_block_capped(
+    mut skill: SkillDefinition,
+    tokenizer: &dyn Tokenizer,
+    cap: usize,
+) -> Option<String> {
+    let full = render_skill_block(&skill);
+    let full_cost = tokenizer.count_text(&full);
+    if full_cost <= cap {
+        return Some(full);
+    }
+    let body_chars = skill.prompt_template.chars().count();
+    if body_chars == 0 {
+        return None;
+    }
+    // `* 9 / 10`: 10 % headroom so a body with slightly denser BPE
+    // tokens than the rest of the rendering still lands under `cap`.
+    let target_body_chars = body_chars
+        .saturating_mul(cap)
+        .saturating_div(full_cost)
+        .saturating_mul(9)
+        .saturating_div(10);
+    if target_body_chars == 0 {
+        return None;
+    }
+    let truncated_body: String = skill
+        .prompt_template
+        .chars()
+        .take(target_body_chars)
+        .chain(TRUNCATION_MARKER.chars())
+        .collect();
+    skill.prompt_template = truncated_body;
+    let rendered = render_skill_block(&skill);
+    // BPE ratio can still drift past the 10 % margin in pathological
+    // cases (heavy emoji, code with rare tokens). Bail rather than
+    // ship an over-budget block.
+    if tokenizer.count_text(&rendered) > cap {
+        return None;
+    }
+    Some(rendered)
+}
+
+/// Render the per-skill detail blocks for `called_skills`, truncating
+/// any single block that would exceed [`PER_SKILL_TOKEN_CAP`] and
+/// shrinking the effective per-skill budget toward the end of the
+/// list so the cumulative payload stays under
+/// [`TOTAL_SKILL_TOKEN_CAP`]. Returns `None` when nothing survives so
+/// callers can skip emitting an empty wrapper.
+fn build_skill_detail_payload(
+    registry: &SkillRegistry,
+    tokenizer: &dyn Tokenizer,
+    called_skills: &[String],
+) -> Option<String> {
+    let mut total = 0usize;
+    let mut blocks: Vec<String> = Vec::new();
+    for name in called_skills {
+        let Some(skill) = registry.get(name) else {
+            continue;
+        };
+        let remaining = TOTAL_SKILL_TOKEN_CAP.saturating_sub(total);
+        if remaining == 0 {
+            break;
+        }
+        // The effective cap shrinks toward the end of the list:
+        // earliest skills get up to `PER_SKILL_TOKEN_CAP`, latest ones
+        // get whatever's left of the total budget.
+        let cap = remaining.min(PER_SKILL_TOKEN_CAP);
+        let Some(rendered) = render_skill_block_capped(skill, tokenizer, cap) else {
+            continue;
+        };
+        total = total.saturating_add(tokenizer.count_text(&rendered));
+        blocks.push(rendered);
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "<system-reminder>\nFull definitions for skills referenced in the conversation summary above:\n\n",
+    );
+    for (i, b) in blocks.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n\n");
+        }
+        out.push_str(b);
+    }
+    out.push_str("\n</system-reminder>");
+    Some(out)
+}
+
+/// Append the post-summary skill trailer to `messages`: always the
+/// authoritative reminder, plus a detail block when at least one
+/// previously-called skill survives the per-skill / total token caps.
+/// Both ride as `Role::User` text so `merge_for_llm` folds them into
+/// the leading user message before dispatch; the in-storage messages
+/// stay separate for trace clarity.
+fn append_skill_trailer(
+    messages: &mut Vec<ChatMessage>,
+    registry: &SkillRegistry,
+    tokenizer: &dyn Tokenizer,
+    called_skills: &[String],
+) {
+    let reminder = render_skill_reminder(&registry.all_summaries_sorted());
+    messages.push(ChatMessage {
+        role: Role::User,
+        content: vec![ContentBlock::Text(reminder)],
+    });
+    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
+        messages.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text(detail)],
+        });
     }
 }
 
@@ -659,5 +887,408 @@ mod tests {
             .map(|m| ctx.tokenizer.count_message(m))
             .sum();
         assert_eq!(ctx.count_tokens(&session.messages), raw);
+    }
+
+    // ---------- Skill-trailer tests ----------
+
+    use aura_model::{ArtifactSource, TrustLevel};
+    use aura_skills::{SkillDefinition, SkillRequirements};
+
+    /// Build a minimally-populated `SkillDefinition` so tests can
+    /// register skills with a chosen body — the registry's renderer
+    /// wraps `prompt_template` in `<skill name="…" version="…">…</skill>`,
+    /// which is what we assert against downstream.
+    fn mk_skill(name: &str, body: &str) -> SkillDefinition {
+        SkillDefinition {
+            name: name.into(),
+            version: "0.1.0".into(),
+            description: format!("desc for {name}"),
+            command: None,
+            agent_invocable: true,
+            argument_hint: None,
+            prompt_template: body.into(),
+            allowed_tools: vec![],
+            source: ArtifactSource::Workspace,
+            trust_level: TrustLevel::Trusted,
+            requirements: SkillRequirements::default(),
+            token_budget_hint: 0,
+            source_path: None,
+            linked_files: Default::default(),
+        }
+    }
+
+    fn registry_with(skills: &[(&str, &str)]) -> Arc<SkillRegistry> {
+        let r = Arc::new(SkillRegistry::new());
+        for (name, body) in skills {
+            r.register(mk_skill(name, body));
+        }
+        r
+    }
+
+    fn skill_call(skill_name: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: format!("call-{skill_name}"),
+                name: SKILL_TOOL_NAME.into(),
+                input: serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name }),
+                signature: None,
+            }],
+        }
+    }
+
+    /// `append` records every fresh `Skill` ToolUse it sees, in
+    /// first-seen order with insertion-order dedup.
+    #[test]
+    fn append_records_skill_calls_in_order() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        let mut session = make_session(vec![]);
+
+        ctx.append(&mut session, &skill_call("foo"));
+        ctx.append(&mut session, &make_msg(Role::User, "u"));
+        ctx.append(&mut session, &skill_call("bar"));
+        ctx.append(&mut session, &skill_call("foo")); // duplicate
+        ctx.append(&mut session, &skill_call("baz"));
+
+        assert_eq!(ctx.called_skills, vec!["foo", "bar", "baz"]);
+    }
+
+    /// `record_skill_calls` must ignore `ToolUse` blocks for non-Skill
+    /// tools so we don't accidentally render Bash / WebFetch / etc.
+    /// detail blocks at compression time.
+    #[test]
+    fn append_ignores_non_skill_tool_uses() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        let mut session = make_session(vec![]);
+        let bash_call = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({ "command": "ls" }),
+                signature: None,
+            }],
+        };
+        ctx.append(&mut session, &bash_call);
+        assert!(ctx.called_skills.is_empty());
+    }
+
+    /// Without a skill registry, a `replaced_full_history: true`
+    /// compression apply leaves the message vector exactly as the
+    /// strategy returned it — no trailer is invented out of thin air.
+    #[tokio::test]
+    async fn no_skill_registry_means_no_trailer() {
+        let mut ctx = ContextManager::new(
+            Arc::new(SimpleTokenizer),
+            Box::new(crate::strategy::summarize::Summarize::new(2)),
+            TokenBudget::new(50, 0.5),
+        );
+        let mut session = make_session(vec![]);
+        // Long enough that compression with the (real, registry-rendered)
+        // trailer still wins on tokens — SimpleTokenizer counts text as
+        // `len()/4 + 1`, so a few hundred bytes of user text easily out-
+        // weighs the ~120-byte reminder + ~150-byte detail trailer.
+        ctx.append(&mut session, &make_msg(Role::System, "sys"));
+        ctx.append(&mut session, &make_msg(Role::User, &"u1 ".repeat(80)));
+        ctx.append(&mut session, &skill_call("foo"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, &"a1 ".repeat(80)));
+        ctx.append(&mut session, &make_msg(Role::User, &"u2 ".repeat(80)));
+
+        let chat = |_req: ChatRequest| async move {
+            Ok(LlmResponse {
+                content: "<analysis>x</analysis><summary>S</summary>".into(),
+                content_blocks: vec![],
+                tool_calls: vec![],
+                usage: Default::default(),
+                thinking: None,
+            })
+        };
+        let outcome = ctx
+            .maybe_compress(&mut session, "test-model", chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        // [system, summary] only — no reminder, no detail.
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, Role::System);
+        if let ContentBlock::Text(t) = &session.messages[1].content[0] {
+            assert_eq!(t, "<summary>S</summary>");
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    /// With a skill registry attached, after a Summarize compression
+    /// the manager appends `[reminder, detail]` (when there are
+    /// previously-called skills the registry can render).
+    #[tokio::test]
+    async fn summarize_apply_appends_skill_trailer() {
+        let registry = registry_with(&[("foo", "FOO_BODY")]);
+        let mut ctx = ContextManager::new(
+            Arc::new(SimpleTokenizer),
+            Box::new(crate::strategy::summarize::Summarize::new(2)),
+            TokenBudget::new(50, 0.5),
+        )
+        .with_skill_registry(registry);
+        let mut session = make_session(vec![]);
+        // Long enough that compression with the (real, registry-rendered)
+        // trailer still wins on tokens — SimpleTokenizer counts text as
+        // `len()/4 + 1`, so a few hundred bytes of user text easily out-
+        // weighs the ~120-byte reminder + ~150-byte detail trailer.
+        ctx.append(&mut session, &make_msg(Role::System, "sys"));
+        ctx.append(&mut session, &make_msg(Role::User, &"u1 ".repeat(80)));
+        ctx.append(&mut session, &skill_call("foo"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, &"a1 ".repeat(80)));
+        ctx.append(&mut session, &make_msg(Role::User, &"u2 ".repeat(80)));
+
+        let chat = |_req: ChatRequest| async move {
+            Ok(LlmResponse {
+                content: "<analysis>x</analysis><summary>S</summary>".into(),
+                content_blocks: vec![],
+                tool_calls: vec![],
+                usage: Default::default(),
+                thinking: None,
+            })
+        };
+        let outcome = ctx
+            .maybe_compress(&mut session, "test-model", chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        // [system, summary, reminder, detail]
+        assert_eq!(session.messages.len(), 4);
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| match m.content.first() {
+                Some(ContentBlock::Text(t)) => t.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(texts[0], "sys");
+        assert_eq!(texts[1], "<summary>S</summary>");
+        assert!(texts[2].contains("The following skills are available"));
+        assert!(texts[2].contains("- foo: desc for foo"));
+        assert!(texts[3].contains("<skill name=\"foo\" version=\"0.1.0\">"));
+        assert!(texts[3].contains("FOO_BODY"));
+    }
+
+    /// Truncate compression (`replaced_full_history: false`) does NOT
+    /// trigger trailer attachment — the tail still carries the
+    /// historical reminder + tool_use trail, so re-broadcasting
+    /// would just duplicate.
+    #[tokio::test]
+    async fn truncate_apply_skips_skill_trailer() {
+        let registry = registry_with(&[("foo", "FOO_BODY")]);
+        let mut ctx = ContextManager::new(
+            Arc::new(SimpleTokenizer),
+            Box::new(Truncate::new(2)),
+            TokenBudget::new(50, 0.5),
+        )
+        .with_skill_registry(registry);
+        let mut session = make_session(vec![]);
+        // Long enough that compression with the (real, registry-rendered)
+        // trailer still wins on tokens — SimpleTokenizer counts text as
+        // `len()/4 + 1`, so a few hundred bytes of user text easily out-
+        // weighs the ~120-byte reminder + ~150-byte detail trailer.
+        ctx.append(&mut session, &make_msg(Role::System, "sys"));
+        ctx.append(&mut session, &make_msg(Role::User, &"u1 ".repeat(80)));
+        ctx.append(&mut session, &skill_call("foo"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, &"a1 ".repeat(80)));
+        ctx.append(&mut session, &make_msg(Role::User, &"u2 ".repeat(80)));
+
+        let outcome = ctx
+            .maybe_compress(&mut session, "test-model", never_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        // No reminder / detail messages were appended; the result is
+        // just system + the kept tail (which itself may still have
+        // the original Skill ToolUse).
+        for msg in &session.messages {
+            for block in &msg.content {
+                if let ContentBlock::Text(t) = block {
+                    assert!(!t.contains("The following skills are available"));
+                    assert!(!t.contains("Full definitions for skills"));
+                }
+            }
+        }
+    }
+
+    /// After a Summarize apply the called_skills vector is empty: the
+    /// trailer is plain text with no `ToolUse`, and the rebuild
+    /// re-scans only the new (post-trailer) slice.
+    #[tokio::test]
+    async fn called_skills_clears_after_summarize_apply() {
+        let registry = registry_with(&[("foo", "FOO_BODY")]);
+        let mut ctx = ContextManager::new(
+            Arc::new(SimpleTokenizer),
+            Box::new(crate::strategy::summarize::Summarize::new(2)),
+            TokenBudget::new(50, 0.5),
+        )
+        .with_skill_registry(registry);
+        let mut session = make_session(vec![]);
+        // Long enough that compression with the (real, registry-rendered)
+        // trailer still wins on tokens — SimpleTokenizer counts text as
+        // `len()/4 + 1`, so a few hundred bytes of user text easily out-
+        // weighs the ~120-byte reminder + ~150-byte detail trailer.
+        ctx.append(&mut session, &make_msg(Role::System, "sys"));
+        ctx.append(&mut session, &make_msg(Role::User, &"u1 ".repeat(80)));
+        ctx.append(&mut session, &skill_call("foo"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, &"a1 ".repeat(80)));
+        ctx.append(&mut session, &make_msg(Role::User, &"u2 ".repeat(80)));
+        assert_eq!(ctx.called_skills, vec!["foo"]);
+
+        let chat = |_req: ChatRequest| async move {
+            Ok(LlmResponse {
+                content: "<analysis>x</analysis><summary>S</summary>".into(),
+                content_blocks: vec![],
+                tool_calls: vec![],
+                usage: Default::default(),
+                thinking: None,
+            })
+        };
+        ctx.maybe_compress(&mut session, "test-model", chat)
+            .await
+            .unwrap();
+        assert!(ctx.called_skills.is_empty());
+    }
+
+    // ---------- render_skill_block_capped / build_skill_detail_payload ----------
+    //
+    // The end-to-end `maybe_compress` path is hard to drive against
+    // these caps because compression also has to *win* on tokens
+    // before the manager applies the new slice. Unit-test the helpers
+    // directly so the truncation contract is exercised without the
+    // budget-comparison gate getting in the way.
+
+    #[test]
+    fn render_skill_block_capped_returns_full_when_under_cap() {
+        let skill = mk_skill("foo", "short body");
+        let rendered = render_skill_block_capped(skill.clone(), &SimpleTokenizer, 10_000)
+            .expect("must render");
+        // Identical to the un-capped rendering — no truncation marker.
+        assert_eq!(rendered, render_skill_block(&skill));
+        assert!(!rendered.contains("[truncated]"));
+    }
+
+    #[test]
+    fn render_skill_block_capped_truncates_oversized_body() {
+        // SimpleTokenizer: text.len()/4 + 1. A 24_000-byte body alone
+        // costs ~6_001 tokens, so the full block lands well past
+        // PER_SKILL_TOKEN_CAP (5_000).
+        let body = "x".repeat(24_000);
+        let skill = mk_skill("big", &body);
+        let rendered = render_skill_block_capped(skill, &SimpleTokenizer, PER_SKILL_TOKEN_CAP)
+            .expect("must render");
+
+        assert!(rendered.contains("name=\"big\""));
+        assert!(rendered.contains("[truncated]"));
+        assert!(rendered.ends_with("</skill>"));
+        assert!(SimpleTokenizer.count_text(&rendered) <= PER_SKILL_TOKEN_CAP);
+        // Body shrank — way fewer 'x's than the original 24_000.
+        assert!(rendered.matches('x').count() < 24_000);
+    }
+
+    #[test]
+    fn render_skill_block_capped_returns_none_when_cap_too_small() {
+        let skill = mk_skill("foo", &"x".repeat(1_000));
+        // 10 tokens wouldn't fit even the wrapper, never mind the
+        // truncation marker — the proportional sizing rounds to 0
+        // and the helper bails.
+        assert!(render_skill_block_capped(skill, &SimpleTokenizer, 10).is_none());
+    }
+
+    #[test]
+    fn build_skill_detail_payload_truncates_only_oversized_entries() {
+        let big = "x".repeat(24_000);
+        let registry = registry_with(&[("big", big.as_str()), ("small", "SMALL_BODY")]);
+        let payload = build_skill_detail_payload(
+            &registry,
+            &SimpleTokenizer,
+            &["big".to_string(), "small".to_string()],
+        )
+        .expect("payload");
+
+        assert!(payload.contains("name=\"big\""));
+        assert!(payload.contains("[truncated]"));
+        assert!(payload.contains("name=\"small\""));
+        assert!(payload.contains("SMALL_BODY"));
+        // Small skill rendered untouched — no marker on its body.
+        let small_block_start = payload.find("name=\"small\"").unwrap();
+        let small_block = &payload[small_block_start..];
+        assert!(!small_block.contains("[truncated]"));
+    }
+
+    #[test]
+    fn build_skill_detail_payload_keeps_total_under_cap() {
+        // Eight ~24_000-char bodies, each rendering at ~6_000 tokens
+        // when uncapped → far past the 25_000 total. The routine must
+        // shrink the effective per-skill budget toward the end of the
+        // list (and drop entries once nothing fits) so the final
+        // payload stays under TOTAL_SKILL_TOKEN_CAP regardless.
+        let body = "z".repeat(24_000);
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let entries: Vec<(&str, &str)> = names.iter().map(|n| (*n, body.as_str())).collect();
+        let registry = registry_with(&entries);
+
+        let payload = build_skill_detail_payload(
+            &registry,
+            &SimpleTokenizer,
+            &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .expect("payload");
+
+        let cost = SimpleTokenizer.count_text(&payload);
+        // Wrapper adds ~100 chars of fixed overhead — allow a small slack.
+        assert!(
+            cost <= TOTAL_SKILL_TOKEN_CAP + 100,
+            "trailer cost {cost} exceeded total cap"
+        );
+        // First skills always make it in.
+        assert!(payload.contains("name=\"a\""));
+        // Truncation marker proves at least one entry was shrunk
+        // rather than rendered full.
+        assert!(payload.contains("[truncated]"));
+    }
+
+    #[test]
+    fn build_skill_detail_payload_drops_skills_when_budget_zero() {
+        // Three ~24_000-char bodies fed into a registry where the
+        // first occupies almost the full total cap. The trailing
+        // skills get a vanishing per-skill cap and the final entry
+        // ends up dropped entirely.
+        let body = "w".repeat(24_000);
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+        let entries: Vec<(&str, &str)> = names.iter().map(|n| (*n, body.as_str())).collect();
+        let registry = registry_with(&entries);
+
+        let payload = build_skill_detail_payload(
+            &registry,
+            &SimpleTokenizer,
+            &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .expect("payload");
+
+        let cost = SimpleTokenizer.count_text(&payload);
+        assert!(cost <= TOTAL_SKILL_TOKEN_CAP + 100);
+        // Last skill in the list cannot survive — by then the
+        // remaining budget is at or near zero and `render_skill_block_capped`
+        // refuses to ship an empty wrapper.
+        assert!(!payload.contains("name=\"j\""));
+    }
+
+    #[test]
+    fn build_skill_detail_payload_returns_none_when_nothing_fits() {
+        // All skills are missing from the registry → payload is None,
+        // so the trailer-emitting caller skips the message entirely.
+        let registry = Arc::new(SkillRegistry::new());
+        assert!(
+            build_skill_detail_payload(&registry, &SimpleTokenizer, &["ghost".to_string()])
+                .is_none()
+        );
     }
 }

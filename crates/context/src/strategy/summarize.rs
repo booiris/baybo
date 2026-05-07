@@ -103,9 +103,15 @@ Here's an example of how your output should be structured:
 REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block. Tool calls will be rejected and you will fail the task."#;
 
 /// Summarize compression: hands the entire conversation (system +
-/// non-system) plus a trailing summarization prompt to the LLM, then
+/// non-system) plus a trailing summarisation prompt to the LLM, then
 /// replaces the conversation with the original system messages plus a
 /// single user message containing the parsed summary.
+///
+/// The strategy itself is a pure planner: it produces a summary
+/// message and signals `replaced_full_history: true` so
+/// `ContextManager` knows to attach the post-compression skill
+/// trailer (authoritative reminder + per-skill detail blocks) on top
+/// of the returned slice.
 ///
 /// Parsing is two-stage: first the `<analysis>...</analysis>` block is
 /// stripped, then a `<summary>...</summary>` block is extracted (tags
@@ -217,7 +223,11 @@ impl CompressionStrategy for Summarize {
         // the response is empty after stripping the analysis block:
         // keep the system messages plus the last `keep_recent`
         // non-system messages, pair-preserved so we don't sever a
-        // tool_use / tool_result pair.
+        // tool_use / tool_result pair. Even though we kept some
+        // history here, we still flag `replaced_full_history: true`
+        // because the strategy *attempted* a summary-style replacement
+        // and the manager should re-broadcast the authoritative skill
+        // reminder regardless of how the truncation tail looks.
         let fallback = || {
             let mut out = system_msgs.clone();
             let initial_split = non_system.len().saturating_sub(self.keep_recent);
@@ -234,18 +244,27 @@ impl CompressionStrategy for Summarize {
                         role: Role::User,
                         content: vec![ContentBlock::Text(content)],
                     });
-                    Ok(CompressOutput::Replaced(new_messages))
+                    Ok(CompressOutput::Replaced {
+                        messages: new_messages,
+                        replaced_full_history: true,
+                    })
                 }
                 None => {
                     warn!(
                         "summarizer response empty after stripping analysis; falling back to truncation"
                     );
-                    Ok(CompressOutput::Replaced(fallback()))
+                    Ok(CompressOutput::Replaced {
+                        messages: fallback(),
+                        replaced_full_history: true,
+                    })
                 }
             },
             Err(e) => {
                 warn!(error = %e, "summarization failed; falling back to truncation");
-                Ok(CompressOutput::Replaced(fallback()))
+                Ok(CompressOutput::Replaced {
+                    messages: fallback(),
+                    replaced_full_history: true,
+                })
             }
         }
     }
@@ -291,8 +310,10 @@ mod tests {
         })
     }
 
-    /// Replaced shape: `[system, user(<summary>...</summary>)]`. The
-    /// summary block must be carried over verbatim with its tags.
+    /// Replaced shape: `[system, user(<summary>...</summary>)]` with
+    /// `replaced_full_history: true`. The summary block must be
+    /// carried over verbatim with its tags. Skill trailer attachment
+    /// is `ContextManager`'s responsibility, not the strategy's.
     #[tokio::test]
     async fn produces_replaced_with_summary_block() {
         let strategy = Summarize::new(2);
@@ -312,7 +333,11 @@ mod tests {
             .await
             .unwrap()
         {
-            CompressOutput::Replaced(new_messages) => {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                replaced_full_history,
+            } => {
+                assert!(replaced_full_history);
                 assert_eq!(new_messages.len(), 2);
                 assert_eq!(new_messages[0].role, Role::System);
                 assert_eq!(new_messages[1].role, Role::User);
@@ -346,7 +371,10 @@ mod tests {
             .await
             .unwrap()
         {
-            CompressOutput::Replaced(new_messages) => {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                ..
+            } => {
                 assert_eq!(new_messages.len(), 3);
                 assert_eq!(new_messages[0].role, Role::System);
                 assert_eq!(new_messages[1].role, Role::System);
@@ -361,8 +389,10 @@ mod tests {
         }
     }
 
-    /// On chat error the strategy must fall back to a Truncate-equivalent
-    /// slice: `[system, last keep_recent non-system...]` — no summary block.
+    /// On chat error the strategy falls back to a Truncate-equivalent
+    /// slice. The flag stays `true` so the manager still re-broadcasts
+    /// the skill reminder — the user-visible failure mode is "summary
+    /// didn't land", not "skill list went stale".
     #[tokio::test]
     async fn chat_error_falls_back_to_truncation() {
         let strategy = Summarize::new(2);
@@ -377,7 +407,11 @@ mod tests {
         ];
 
         match strategy.compress(&messages, err_chat()).await.unwrap() {
-            CompressOutput::Replaced(new_messages) => {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                replaced_full_history,
+            } => {
+                assert!(replaced_full_history);
                 assert_eq!(new_messages.len(), 3);
                 assert_eq!(new_messages[0].role, Role::System);
                 if let ContentBlock::Text(t) = &new_messages[1].content[0] {
@@ -414,7 +448,10 @@ mod tests {
             .await
             .unwrap()
         {
-            CompressOutput::Replaced(new_messages) => {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                ..
+            } => {
                 assert_eq!(new_messages.len(), 3);
                 if let ContentBlock::Text(t) = &new_messages[1].content[0] {
                     assert_eq!(t, "reply 2");
@@ -448,7 +485,10 @@ mod tests {
             .await
             .unwrap()
         {
-            CompressOutput::Replaced(new_messages) => {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                ..
+            } => {
                 assert_eq!(new_messages.len(), 2);
                 assert_eq!(new_messages[0].role, Role::System);
                 assert_eq!(new_messages[1].role, Role::User);
@@ -482,7 +522,10 @@ mod tests {
             .await
             .unwrap()
         {
-            CompressOutput::Replaced(new_messages) => {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                ..
+            } => {
                 assert_eq!(new_messages.len(), 2);
                 if let ContentBlock::Text(t) = &new_messages[1].content[0] {
                     assert_eq!(t, "just plain summary content");
@@ -494,8 +537,8 @@ mod tests {
         }
     }
 
-    /// Empty `<summary></summary>` block (no content between the tags
-    /// once trimmed) falls back too.
+    /// A wholly-empty payload falls back to the truncate-equivalent
+    /// slice.
     #[tokio::test]
     async fn empty_summary_block_falls_back_to_truncation() {
         let strategy = Summarize::new(2);
@@ -509,16 +552,15 @@ mod tests {
             make_msg(Role::User, "msg 3"),
         ];
 
-        // The block is `<summary></summary>` — non-empty as a string,
-        // so we still accept it (tag-bearing); but a truly empty wrapper
-        // is whitespace-only after trim, so missing-block path triggers.
-        // Use a wholly-empty payload to confirm fallback.
         match strategy
             .compress(&messages, ok_chat("   \n  "))
             .await
             .unwrap()
         {
-            CompressOutput::Replaced(new_messages) => {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                ..
+            } => {
                 assert_eq!(new_messages.len(), 3);
                 if let ContentBlock::Text(t) = &new_messages[1].content[0] {
                     assert_eq!(t, "reply 2");

@@ -31,6 +31,7 @@ RUST_LOG=aura::agent=debug cargo run         # agent module only
 - No `.unwrap()` or `.expect()` in production code (tests are fine)
 - Use `thiserror` for error types in `error.rs`; map errors with context: `.map_err(|e| SomeError::Variant { reason: e.to_string() })?`
 - Prefer strong types over strings (enums, newtypes); use typed structs instead of `HashMap<String, Value>`, only keep an `extra` field for truly dynamic extensions
+- No magic numbers / strings for values that have a single source of truth or cross a module boundary. Lift them into a named `const` (e.g. `SKILL_TOOL_NAME`, `MAX_SKILL_DIR_FILES`) and reference the const at every site. Two sites with the same literal are already a smell; three is a bug waiting to happen. Throwaway test fixtures and one-off log strings are fine inline.
 - Keep functions focused, extract helpers when logic is reused
 - Default to zero comments. Only add one when the WHY is non-obvious (hidden constraint, subtle invariant, workaround). Don't narrate WHAT the code does — well-named identifiers cover that.
 - Avoid exporting unnecessary item, prefer `pub(crate)`; use `pub` only when necessary

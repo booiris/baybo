@@ -51,7 +51,10 @@ impl CompressionStrategy for Truncate {
         let mut new_messages = system_msgs;
         new_messages.extend(kept);
 
-        Ok(CompressOutput::Replaced(new_messages))
+        Ok(CompressOutput::Replaced {
+            messages: new_messages,
+            replaced_full_history: false,
+        })
     }
 }
 
@@ -92,9 +95,13 @@ mod tests {
         ];
 
         match strategy.compress(&messages, never_chat()).await.unwrap() {
-            CompressOutput::Replaced(new_messages) => {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                replaced_full_history,
+            } => {
                 assert_eq!(new_messages.len(), 3);
                 assert_eq!(new_messages[0].role, Role::System);
+                assert!(!replaced_full_history, "Truncate keeps the tail in place");
             }
             _ => panic!("expected Replaced"),
         }

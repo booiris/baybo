@@ -23,6 +23,19 @@ use crate::{SkillDefinition, SkillGate, SkillRegistry, SkillRiskCheck};
 const MAX_SUBFILE_BYTES: u64 = 256 * 1024;
 const MAX_ARGS_BYTES: usize = 4 * 1024;
 
+/// Wire-level name of the Skill tool. Single source of truth for any
+/// caller that needs to recognise a `ContentBlock::ToolUse { name, .. }`
+/// as a skill invocation (compression trailer, slash-command synthesis,
+/// trace filters).
+pub const SKILL_TOOL_NAME: &str = "Skill";
+
+/// JSON input field name carrying the skill identifier inside a
+/// `ContentBlock::ToolUse { input, .. }` for the Skill tool. Shared
+/// across the agent loop's slash synthesis, the compression-trailer
+/// scanner, and this tool's own param parsing so all four sites stay
+/// in lockstep.
+pub const SKILL_INPUT_NAME_FIELD: &str = "skill";
+
 pub fn build(
     registry: Arc<SkillRegistry>,
     risk_check: Arc<dyn SkillRiskCheck>,
@@ -58,7 +71,7 @@ struct SkillParams {
 #[async_trait]
 impl Tool for SkillTool {
     fn name(&self) -> &str {
-        "Skill"
+        SKILL_TOOL_NAME
     }
 
     fn description(&self) -> &str {
@@ -75,7 +88,7 @@ impl Tool for SkillTool {
         json!({
             "type": "object",
             "properties": {
-                "skill": {
+                SKILL_INPUT_NAME_FIELD: {
                     "type": "string",
                     "description": "Name of the skill to load — must match an entry from the system-reminder skill list."
                 },
@@ -88,7 +101,7 @@ impl Tool for SkillTool {
                     "description": "Optional sub-file path relative to the skill's directory (e.g. \"references/dataset-formats.md\"). When set, the tool returns that file's contents instead of SKILL.md plus the linked-file inventory."
                 }
             },
-            "required": ["skill"]
+            "required": [SKILL_INPUT_NAME_FIELD]
         })
     }
 
@@ -951,7 +964,7 @@ mod tests {
     fn manifest_is_trusted_with_no_capabilities() {
         let registry = Arc::new(SkillRegistry::new());
         let (tool, manifest) = build(registry, Arc::new(AlwaysPass));
-        assert_eq!(tool.name(), "Skill");
+        assert_eq!(tool.name(), SKILL_TOOL_NAME);
         assert!(matches!(manifest.trust_level, TrustLevel::Trusted));
         assert!(manifest.capabilities.is_empty());
     }
