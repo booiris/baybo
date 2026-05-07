@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aura_llm::ModelPricing;
+use aura_llm::{LlmCallGuard, LlmError, ModelPricing};
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
 use aura_storage::{CostRecord, CostStore, TimeRange};
 use chrono::{Datelike, NaiveDate, Utc};
@@ -297,11 +297,11 @@ impl CostManager {
         self.metrics.recorded_events.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Synchronous in-memory budget gate. Called by `Router` at
-    /// message ingress and by `AgentLoop` before every LLM call.
-    /// A UTC rollover that happens between the most recent
-    /// `record_call` and `now` is honoured by treating the stale
-    /// window as zero spend.
+    /// Synchronous in-memory budget gate. Runs before every
+    /// dispatched LLM call (via `GuardedLlm`) and at `Router`
+    /// ingress. A UTC rollover between the most recent `record_call`
+    /// and `now` is honoured by treating the stale window as zero
+    /// spend.
     pub fn check(&self) -> Result<(), CostGuardError> {
         let now = Utc::now();
         let today = now.date_naive();
@@ -327,6 +327,19 @@ impl CostManager {
             }
         }
         Ok(())
+    }
+
+    /// Project this `CostManager` into a bare [`LlmCallGuard`] closure
+    /// — the closure form `LlmProviderRegistry::create_client` and
+    /// other low-level construction sites take. Mapping
+    /// `CostGuardError` → `LlmError::GuardRejected` happens here so
+    /// downstream consumers see the standard `LlmError` shape.
+    pub fn as_guard(self: &Arc<Self>) -> LlmCallGuard {
+        let cm = Arc::clone(self);
+        Arc::new(move || {
+            cm.check()
+                .map_err(|e| LlmError::GuardRejected(e.to_string()))
+        })
     }
 }
 

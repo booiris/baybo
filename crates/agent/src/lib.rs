@@ -1,7 +1,6 @@
 pub mod actor;
 pub mod agent_loop;
 pub mod cancel;
-pub mod compression;
 pub mod cost;
 pub mod error_recovery;
 pub mod job;
@@ -25,7 +24,7 @@ pub use agent_loop::AgentLoop;
 pub use aura_cron::{CronScheduler, CronTriggerEvent};
 pub use aura_security::SecretVault;
 pub use cancel::{JobCancellationGuard, JobCancellationRegistry};
-pub use cost::{CostGuardError, CostManager, CostMetrics, SpendingLimits};
+pub use cost::{CostGuardError, CostManager, CostMetrics, SpendingLimits, guarded_with_cost};
 pub use job::JobLifecycle;
 pub use memory::MemoryManager;
 pub use policy::ExecutionPolicy;

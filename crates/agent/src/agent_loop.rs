@@ -4,7 +4,7 @@ use aura_channels::{AgentOutput, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobOutput};
 use aura_llm::{
-    ChatRequest, LlmCompletion, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
+    ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
 use aura_model::{ChatMessage, ContentBlock, JobId, Role};
 use futures::StreamExt;
@@ -20,6 +20,7 @@ use aura_trace::{
 };
 use tracing::{debug, info, warn};
 
+use crate::compression::CompressionRunner;
 use crate::error_recovery::ErrorHandler;
 use crate::job::{JobLifecycle, JobSpec};
 use crate::policy::ExecutionPolicy;
@@ -179,7 +180,7 @@ enum IterationOutcome {
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
-    llm_client: Arc<dyn LlmCompletion>,
+    llm_client: Arc<GuardedLlm>,
     tool_registry: Arc<ToolRegistry>,
     skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
@@ -205,19 +206,15 @@ pub struct AgentLoop {
     /// error, latency, model metadata) to
     /// `<workspace>/logs/sessions/<session_id>.jsonl`.
     session_log: Option<Arc<SessionLlmLogger>>,
-    /// Optional cost gate + ledger. When set, [`Self::run_iteration`]
-    /// rejects via [`crate::cost::CostManager::check`] *before*
-    /// dispatching the next LLM call, and [`Self::call_llm`] feeds the
-    /// observed token counts (success or partial-on-error) back via
-    /// [`crate::cost::CostManager::record_call`] so the next iteration's
-    /// gate sees the spend immediately.
+    /// Cost gate + ledger; `record_call` feeds spend back so the
+    /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
     cost_manager: Option<Arc<crate::cost::CostManager>>,
 }
 
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        llm_client: Arc<dyn LlmCompletion>,
+        llm_client: Arc<GuardedLlm>,
         tool_registry: Arc<ToolRegistry>,
         skill_registry: Arc<SkillRegistry>,
         tool_executor: Arc<ToolExecutor>,
@@ -869,13 +866,6 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
-            // Re-check before *every* attempt, not just the first.
-            // Streaming partial-usage is billed via record_call even
-            // when the call ends in Err, so a retry past a cap-breach
-            // would silently keep accumulating spend without this gate.
-            if let Some(cm) = &self.cost_manager {
-                cm.check().map_err(|e| anyhow::anyhow!(e))?;
-            }
             match self.call_llm(session, span_recorder, step, delta_tx).await {
                 Ok(pair) => return Ok(pair),
                 Err(e) => {
@@ -1009,15 +999,12 @@ impl AgentLoop {
                         (finalize, Ok((response, span.span_id)))
                     }
                     Err(e) => {
-                        // Surface the *sanitized* message: this Err
-                        // bubbles into `with_llm_span`, which writes
-                        // `e.to_string()` into the span's
-                        // `Failed { reason }` (via `outcome_for`) and
-                        // from there into persisted trace storage.
-                        // Returning the raw `e` would leak any secrets
-                        // in the upstream provider error text.
+                        // Sanitize the JSONL log; return the raw typed
+                        // `LlmError` so `should_retry` can dispatch on
+                        // the variant. The trace's `Failed` reason
+                        // still carries the provider text.
                         let raw = e.to_string();
-                        let error_msg = self
+                        let log_msg = self
                             .security_gateway
                             .sanitize_error(&raw)
                             .await
@@ -1026,15 +1013,13 @@ impl AgentLoop {
                             session,
                             &request,
                             LlmCallOutcome::Err {
-                                error: error_msg.clone(),
+                                error: log_msg,
                                 latency_ms,
                             },
                         )
                         .await;
                         // Bill the partial-stream tokens so a failed
-                        // LLM call still leaves a `cost_records` row
-                        // — operators see the attempt rather than
-                        // silently under-counting.
+                        // call still leaves a `cost_records` row.
                         let finalize = LlmCallResult {
                             output_content: String::new(),
                             thinking: None,
@@ -1044,7 +1029,7 @@ impl AgentLoop {
                             cached_input_tokens: partial_usage.cached_input_tokens,
                             cache_creation_input_tokens: partial_usage.cache_creation_input_tokens,
                         };
-                        (finalize, Err(anyhow::anyhow!(error_msg)))
+                        (finalize, Err(anyhow::Error::new(e)))
                     }
                 };
 
@@ -1065,6 +1050,13 @@ impl AgentLoop {
                         finalize.cache_creation_input_tokens,
                     );
                 }
+
+                // `record_call_actual` self-skips on zero. Pass
+                // `session.messages` because the assistant message is
+                // inserted later by `insert_session_message`, so the
+                // slice here matches what the provider billed.
+                self.context_manager
+                    .record_call_actual(&session.messages, finalize.input_tokens);
 
                 (finalize, value_result)
             },
@@ -1481,11 +1473,12 @@ impl AgentLoop {
         }
     }
 
-    /// Compress if the budget calls for it. When the strategy ran an
-    /// LLM call, brackets it in a `StepKind::Compression` step +
-    /// `SpanKind::LlmCall` span so the cost lands in per-step
-    /// aggregation. Strategies that don't call an LLM (e.g. `Truncate`)
-    /// don't open a step.
+    /// Compress if the budget calls for it. The `chat` closure is
+    /// invoked only when the strategy returns `NeedsLlmCall`; pure
+    /// strategies (Truncate, Summarize fallback) skip it entirely. The
+    /// closure brackets the real LLM call in a `Compression` step +
+    /// `LlmCall` span and records cost against that span — budget
+    /// enforcement on the call itself rides on the wrapped client.
     async fn compress_if_needed(
         &mut self,
         session: &mut Session,
@@ -1493,90 +1486,24 @@ impl AgentLoop {
         job_id: JobId,
         cancel_token: &CancellationToken,
     ) -> anyhow::Result<()> {
-        let outcome = self.context_manager.maybe_compress(session).await?;
-        let Some(stats) = outcome else {
-            return Ok(());
-        };
-        debug!(
-            before = stats.before_tokens,
-            after = stats.after_tokens,
-            "compressed context before LLM call"
-        );
-        let Some(call) = stats.llm_call else {
-            return Ok(());
+        let model_info = self.llm_client.model_info().clone();
+        let model_id = model_info.id.clone();
+        let runner = CompressionRunner {
+            llm_client: self.llm_client.clone(),
+            recorder: Arc::clone(span_recorder),
+            cost_manager: self.cost_manager.clone(),
+            security_gateway: Arc::clone(&self.security_gateway),
+            job_id,
+            user_id: session.user.id.clone(),
+            session_id: session.id.clone(),
+            model_info,
+            cancel_token: cancel_token.clone(),
         };
 
-        // Post-hoc record — `SpanRecorder::end_span` publishes
-        // `LlmSpanEnded` for the cost subscriber regardless of
-        // wall-clock ordering.
-        let llm_call_kind = SpanKind::LlmCall {
-            begin: LlmCallBegin {
-                model_id: call.model_id.clone(),
-                provider: call.provider.clone(),
-                provider_config_hash: String::new(),
-                input_messages: Vec::new(),
-                temperature: None,
-            },
-            result: None,
-        };
-        let finalize = SpanFinalize::LlmCall(LlmCallResult {
-            output_content: String::new(),
-            thinking: None,
-            tool_calls: vec![],
-            input_tokens: call.input_tokens,
-            output_tokens: call.output_tokens,
-            cached_input_tokens: call.cached_input_tokens,
-            cache_creation_input_tokens: call.cache_creation_input_tokens,
-        });
-        let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
-        let rec = span_recorder.as_ref();
-        let cost_manager = self.cost_manager.clone();
-        let user_id = session.user.id.clone();
-        let session_id = session.id.clone();
-        crate::scope::with_step(
-            rec,
-            job_id,
-            StepKind::Compression,
-            cancel_ctx,
-            |step| async move {
-                crate::scope::with_span(
-                    rec,
-                    &step,
-                    job_id,
-                    llm_call_kind,
-                    None,
-                    cancel_ctx,
-                    |span| async move {
-                        // Record cost while the span is still open so
-                        // the cost row's `span_id` matches the trace
-                        // span (mirroring the main-loop pattern at
-                        // `record_llm_call`). The compression LLM call
-                        // already happened inside `maybe_compress`;
-                        // the span here is post-hoc, but recording
-                        // cost here keeps the join key intact and
-                        // means the next turn's `cm.check()` sees
-                        // this spend.
-                        if let Some(cm) = &cost_manager {
-                            cm.record_call(
-                                &user_id,
-                                session_id.clone(),
-                                job_id,
-                                span.span_id,
-                                &call.model_id,
-                                call.input_tokens,
-                                call.output_tokens,
-                                call.cached_input_tokens,
-                                call.cache_creation_input_tokens,
-                            );
-                        }
-                        Ok((finalize, LifecycleOutcome::Ok, ()))
-                    },
-                )
-                .await?;
-                Ok((LifecycleOutcome::Ok, ()))
-            },
-        )
-        .await
+        self.context_manager
+            .maybe_compress(session, &model_id, |req| runner.run(req))
+            .await?;
+        Ok(())
     }
 
     async fn ensure_system_prompt(&self, session: &mut Session) {

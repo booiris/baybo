@@ -1,5 +1,6 @@
 pub mod credentials;
 mod error;
+pub mod guard;
 pub mod multimodal;
 pub mod providers;
 pub mod registry;
@@ -27,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 pub use crate::error::LlmError;
+pub(crate) use crate::error::{reqwest_to_error, rig_completion_to_error, status_to_error};
+pub use crate::guard::{GuardedLlm, LlmCallGuard};
 pub use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, ProviderModels};
 
 /// Default chat-completion base URL for each built-in provider id.
@@ -246,7 +249,7 @@ impl LlmStream {
     {
         let mapped = rig_stream.filter_map(|result| {
             futures::future::ready(match result {
-                Err(e) => Some(Err(LlmError::Provider(e.to_string()))),
+                Err(e) => Some(Err(rig_completion_to_error(e))),
                 Ok(event) => convert_stream_event(event),
             })
         });
@@ -268,7 +271,7 @@ impl LlmStream {
     ) -> Self {
         let mapped = rig_stream.filter_map(|result| {
             futures::future::ready(match result {
-                Err(e) => Some(Err(LlmError::Provider(e.to_string()))),
+                Err(e) => Some(Err(rig_completion_to_error(e))),
                 Ok(StreamedAssistantContent::Final(r)) => {
                     let mut usage = r.token_usage().unwrap_or_default();
                     usage.cached_input_tokens =
@@ -481,7 +484,7 @@ impl LlmClient {
             .model
             .completion(rig_request)
             .await
-            .map_err(|e| LlmError::Provider(e.to_string()))?;
+            .map_err(rig_completion_to_error)?;
 
         let llm_response = self.convert_response(response);
 
@@ -510,7 +513,7 @@ impl LlmClient {
             .model
             .stream(rig_request)
             .await
-            .map_err(|e| LlmError::Provider(e.to_string()))?;
+            .map_err(rig_completion_to_error)?;
 
         Ok(stream)
     }
@@ -1006,7 +1009,7 @@ mod multimodal_dispatch_tests {
     #[async_trait::async_trait]
     impl BlobFetcher for FailingFetcher {
         async fn fetch(&self, blob_id: &str) -> Result<Vec<u8>> {
-            Err(LlmError::Provider(format!("nope: {blob_id}")))
+            Err(LlmError::Transient(format!("nope: {blob_id}")))
         }
     }
 
@@ -1018,7 +1021,7 @@ mod multimodal_dispatch_tests {
         // exactly the same way an operator on MiniMax-VL-01 would.
         let registry = LlmProviderRegistry::with_default_providers();
         registry
-            .create_client(&LlmProviderConfig {
+            .build_client(&LlmProviderConfig {
                 provider: "minimax".into(),
                 api_key: Some("test".into()),
                 base_url: None,
@@ -1110,7 +1113,7 @@ mod multimodal_dispatch_tests {
         let bytes = b"unused".to_vec();
         let registry = LlmProviderRegistry::with_default_providers();
         let mut client = registry
-            .create_client(&LlmProviderConfig {
+            .build_client(&LlmProviderConfig {
                 provider: "openai".into(),
                 api_key: Some("test".into()),
                 base_url: None,
