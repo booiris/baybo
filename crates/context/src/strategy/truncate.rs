@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use aura_model::{ChatMessage, Role};
 
 use super::{ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut};
-use crate::tokenizer::Tokenizer;
 
 /// Truncation compression: keeps system messages and the most recent
 /// `keep_recent` non-system messages, discarding everything in between.
@@ -34,7 +33,6 @@ impl CompressionStrategy for Truncate {
     async fn compress(
         &self,
         messages: &[ChatMessage],
-        _tokenizer: &dyn Tokenizer,
         _chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
         let (system_msgs, non_system) = Self::partition_system(messages);
@@ -62,28 +60,6 @@ mod tests {
     use super::*;
     use aura_model::ContentBlock;
 
-    struct SimpleTokenizer;
-
-    impl Tokenizer for SimpleTokenizer {
-        fn count_text(&self, text: &str) -> usize {
-            text.len() / 4 + 1
-        }
-        fn count_image(&self, _w: u32, _h: u32) -> usize {
-            100
-        }
-        fn count_message(&self, msg: &ChatMessage) -> usize {
-            let mut tokens = 4;
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text(text) => tokens += self.count_text(text),
-                    ContentBlock::Image { .. } => tokens += 100,
-                    _ => tokens += 50,
-                }
-            }
-            tokens
-        }
-    }
-
     fn make_msg(role: Role, text: &str) -> ChatMessage {
         ChatMessage {
             role,
@@ -105,7 +81,6 @@ mod tests {
     #[tokio::test]
     async fn keeps_system_and_recent() {
         let strategy = Truncate::new(2);
-        let tokenizer = SimpleTokenizer;
 
         let messages = vec![
             make_msg(Role::System, "system prompt"),
@@ -116,11 +91,7 @@ mod tests {
             make_msg(Role::User, "msg 3"),
         ];
 
-        match strategy
-            .compress(&messages, &tokenizer, never_chat())
-            .await
-            .unwrap()
-        {
+        match strategy.compress(&messages, never_chat()).await.unwrap() {
             CompressOutput::Replaced(new_messages) => {
                 assert_eq!(new_messages.len(), 3);
                 assert_eq!(new_messages[0].role, Role::System);
@@ -132,7 +103,6 @@ mod tests {
     #[tokio::test]
     async fn no_op_when_under_keep_recent() {
         let strategy = Truncate::new(10);
-        let tokenizer = SimpleTokenizer;
 
         let messages = vec![
             make_msg(Role::System, "system"),
@@ -140,11 +110,7 @@ mod tests {
             make_msg(Role::Assistant, "hi"),
         ];
 
-        match strategy
-            .compress(&messages, &tokenizer, never_chat())
-            .await
-            .unwrap()
-        {
+        match strategy.compress(&messages, never_chat()).await.unwrap() {
             CompressOutput::NoOp => {}
             _ => panic!("expected NoOp"),
         }

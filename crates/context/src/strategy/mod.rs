@@ -10,7 +10,6 @@ use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::{ChatMessage, ContentBlock};
 
 use crate::error::ContextError;
-use crate::tokenizer::Tokenizer;
 
 /// Future returned by a [`ChatCallback`]. Boxed because the callback
 /// is passed through a `dyn`-compatible trait method.
@@ -94,18 +93,20 @@ pub(crate) fn pair_preserving_cut(messages: &[ChatMessage], cut: usize) -> usize
 
 /// Strategy for compressing context messages when the token budget is exceeded.
 ///
-/// Implementations receive the full message list, a tokenizer, and a
-/// one-shot chat callback they can invoke if they need to call an
-/// LLM (e.g. `Summarize`). The callback hides trace span / cost /
-/// security wiring on the agent side — the strategy just sees
+/// Implementations receive the full message list and a one-shot chat
+/// callback they can invoke if they need to call an LLM (e.g.
+/// `Summarize`). The callback hides trace span / cost / security
+/// wiring on the agent side — the strategy just sees
 /// `request → LlmResponse`. Strategies that don't need an LLM
-/// (e.g. `Truncate`) ignore the callback.
+/// (e.g. `Truncate`) ignore the callback. Token counting is owned
+/// by `ContextManager` and not exposed here; if a future strategy
+/// needs token-aware decisions, plumb a tokenizer in alongside
+/// `messages` rather than reviving a blanket trait parameter.
 #[async_trait]
 pub trait CompressionStrategy: Send + Sync {
     async fn compress(
         &self,
         messages: &[ChatMessage],
-        tokenizer: &dyn Tokenizer,
         chat: ChatCallback,
     ) -> crate::Result<CompressOutput>;
 }

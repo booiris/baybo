@@ -4,7 +4,6 @@ use aura_model::{ChatMessage, ContentBlock, Role};
 use tracing::warn;
 
 use super::{ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut};
-use crate::tokenizer::Tokenizer;
 
 /// Trailing instruction appended to the messages handed to the
 /// summarizer LLM. Lives here rather than in the agent loop because
@@ -43,7 +42,6 @@ impl CompressionStrategy for Summarize {
     async fn compress(
         &self,
         messages: &[ChatMessage],
-        _tokenizer: &dyn Tokenizer,
         chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
         let mut system_msgs = Vec::new();
@@ -125,28 +123,6 @@ mod tests {
     use super::*;
     use aura_llm::{LlmResponse, TokenUsage};
 
-    struct SimpleTokenizer;
-
-    impl Tokenizer for SimpleTokenizer {
-        fn count_text(&self, text: &str) -> usize {
-            text.len() / 4 + 1
-        }
-        fn count_image(&self, _w: u32, _h: u32) -> usize {
-            100
-        }
-        fn count_message(&self, msg: &ChatMessage) -> usize {
-            let mut tokens = 4;
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text(text) => tokens += self.count_text(text),
-                    ContentBlock::Image { .. } => tokens += 100,
-                    _ => tokens += 50,
-                }
-            }
-            tokens
-        }
-    }
-
     fn make_msg(role: Role, text: &str) -> ChatMessage {
         ChatMessage {
             role,
@@ -189,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn produces_replaced_with_summary_and_recent() {
         let strategy = Summarize::new(2);
-        let tokenizer = SimpleTokenizer;
+
         let messages = vec![
             make_msg(Role::System, "system prompt"),
             make_msg(Role::User, "msg 1"),
@@ -200,7 +176,7 @@ mod tests {
         ];
 
         match strategy
-            .compress(&messages, &tokenizer, ok_chat("CANNED"))
+            .compress(&messages, ok_chat("CANNED"))
             .await
             .unwrap()
         {
@@ -224,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn chat_error_falls_back_to_truncation() {
         let strategy = Summarize::new(2);
-        let tokenizer = SimpleTokenizer;
+
         let messages = vec![
             make_msg(Role::System, "system"),
             make_msg(Role::User, "msg 1"),
@@ -234,11 +210,7 @@ mod tests {
             make_msg(Role::User, "msg 3"),
         ];
 
-        match strategy
-            .compress(&messages, &tokenizer, err_chat())
-            .await
-            .unwrap()
-        {
+        match strategy.compress(&messages, err_chat()).await.unwrap() {
             CompressOutput::Replaced(new_messages) => {
                 assert_eq!(new_messages.len(), 3);
                 assert_eq!(new_messages[0].role, Role::System);
@@ -257,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn empty_summary_falls_back_to_truncation() {
         let strategy = Summarize::new(2);
-        let tokenizer = SimpleTokenizer;
+
         let messages = vec![
             make_msg(Role::System, "system"),
             make_msg(Role::User, "msg 1"),
@@ -268,7 +240,7 @@ mod tests {
         ];
 
         match strategy
-            .compress(&messages, &tokenizer, ok_chat("   \n  "))
+            .compress(&messages, ok_chat("   \n  "))
             .await
             .unwrap()
         {
@@ -288,18 +260,14 @@ mod tests {
     #[tokio::test]
     async fn no_op_when_under_keep_recent() {
         let strategy = Summarize::new(10);
-        let tokenizer = SimpleTokenizer;
+
         let messages = vec![
             make_msg(Role::System, "system"),
             make_msg(Role::User, "hello"),
             make_msg(Role::Assistant, "hi"),
         ];
 
-        match strategy
-            .compress(&messages, &tokenizer, never_chat())
-            .await
-            .unwrap()
-        {
+        match strategy.compress(&messages, never_chat()).await.unwrap() {
             CompressOutput::NoOp => {}
             _ => panic!("expected NoOp"),
         }
@@ -312,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn no_op_when_pair_cut_collapses_to_zero() {
         let strategy = Summarize::new(1);
-        let tokenizer = SimpleTokenizer;
+
         let tool_use = ChatMessage {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
@@ -336,11 +304,7 @@ mod tests {
             tool_result,
         ];
 
-        match strategy
-            .compress(&messages, &tokenizer, never_chat())
-            .await
-            .unwrap()
-        {
+        match strategy.compress(&messages, never_chat()).await.unwrap() {
             CompressOutput::NoOp => {}
             _ => panic!("expected NoOp"),
         }

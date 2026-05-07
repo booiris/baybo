@@ -249,10 +249,7 @@ impl ContextManager {
         }
 
         let chat_box: crate::strategy::ChatCallback = Box::new(move |req| Box::pin(chat(req)));
-        let plan = self
-            .strategy
-            .compress(&session.messages, &*self.tokenizer, chat_box)
-            .await?;
+        let plan = self.strategy.compress(&session.messages, chat_box).await?;
         let new_messages = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::NoChange),
             CompressOutput::Replaced(messages) => messages,
