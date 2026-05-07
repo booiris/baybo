@@ -405,7 +405,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         skill_registry: Arc::clone(&graph.skill_registry),
         tool_registry: Arc::clone(&graph.tool_registry),
         channel_registry: Arc::clone(&graph.channels_registry),
-        llm_client: graph.llm_client.clone(),
+        llm_client: Arc::clone(&graph.llm_client),
         admin_token: token.clone(),
         log_buffer: Arc::clone(&log_buffer),
         incoming_tx: run_handle.incoming_tx.clone(),
