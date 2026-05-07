@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use aura_llm::LlmCompletion;
+use aura_llm::GuardedLlm;
 use aura_model::TrustLevel;
 use aura_storage::BlobStore;
 
@@ -72,7 +72,7 @@ pub use write::WriteTool;
 /// the embedded browser MCP server connects through the reconciler.
 pub fn default_tools(
     blob_store: Arc<dyn BlobStore>,
-    llm: Option<Arc<dyn LlmCompletion>>,
+    llm: Option<Arc<GuardedLlm>>,
 ) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let web_fetch = match llm {
         Some(llm) => WebFetchTool::default().with_llm(llm),

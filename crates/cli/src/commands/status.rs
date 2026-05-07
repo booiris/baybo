@@ -9,7 +9,7 @@ pub async fn handle(ctx: &CommandContext) -> Result<CommandOutput> {
     let tools_count = ctx.tools.tool_definitions().len();
     let channels_count = ctx.channels.len();
     let (provider, model) = match ctx.llm.as_ref() {
-        Some(c) => (c.model_info().provider.clone(), c.model_id().to_string()),
+        Some(c) => (c.model_info().provider.clone(), c.model_info().id.clone()),
         None => ("(not configured)".into(), "(not configured)".into()),
     };
 

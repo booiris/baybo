@@ -1,224 +1,162 @@
-//! In-loop context compression via LLM summarization.
+//! Bridge between the agent loop and `aura_context::ContextManager`'s
+//! compression callback.
 //!
-//! `LlmSummarizer` is the production [`SummarizeCallback`] implementation
-//! injected into [`aura_context::Summarize`] at runtime. It wraps the
-//! main agent's [`LlmCompletion`] (no separate model — see Q2 of the
-//! original design grilling) so summarization spend is recorded against
-//! the same provider and lands in the same cost ledger as the main
-//! turns.
+//! `aura-context` deliberately doesn't know about `SpanRecorder`,
+//! `CostManager`, or `JobId` — those are agent-layer concerns. The
+//! `ContextManager::maybe_compress` API takes an
+//! `FnOnce(ChatRequest) -> Fut` so the caller can inject all of that
+//! cross-cutting machinery without polluting the context crate.
 //!
-//! Failure handling is deliberately one-sided: any error returned from
-//! here propagates up to `Summarize::compress`, which catches it and
-//! falls back to a Truncate-equivalent slice. We never retry, never
-//! degrade to a different model, never paper over the failure here —
-//! the strategy layer owns the fallback policy.
+//! `CompressionRunner` is that injection: it bundles every dependency
+//! the compression LLM call needs and exposes a single `run(self, req)`
+//! method that the agent loop hands to `maybe_compress` as the chat
+//! closure.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use aura_context::{CompressionLlmCall, ContextError, SummarizeCallback, SummarizeOutput};
-use aura_llm::{ChatRequest, LlmCompletion};
-use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_llm::GuardedLlm;
+use aura_model::JobId;
+use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, StepKind};
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
-const SUMMARIZE_INSTRUCTION: &str = "\
-You are summarizing the older portion of an agent's own conversation \
-so it can continue the same task. Preserve: the user's current request \
-and any constraints; recent tool calls and the key facts they returned \
-(file paths, IDs, error messages); decisions already made; open todos; \
-anything the agent must remember to finish the task. Drop: redundant \
-exchanges, exploratory dead-ends. Output plain prose, no preamble.";
+use crate::cost::CostManager;
+use crate::security::SecurityGateway;
+use crate::trace::SpanRecorder;
 
-/// LLM-backed implementation of [`SummarizeCallback`] used by the
-/// [`aura_context::Summarize`] strategy in the agent runtime.
-pub struct LlmSummarizer {
-    client: Arc<dyn LlmCompletion>,
+/// Agent-side dependencies needed to execute the compression LLM call:
+/// trace recorder, cost ledger, the LLM client, and the identity /
+/// cancel context that pin the call to a specific job + session.
+pub(crate) struct CompressionRunner {
+    pub(crate) llm_client: Arc<GuardedLlm>,
+    pub(crate) recorder: Arc<SpanRecorder>,
+    pub(crate) cost_manager: Option<Arc<CostManager>>,
+    /// Same gateway as the main LLM path. Compression LLM output and
+    /// errors are scrubbed through it before they land in the trace,
+    /// the cost record's joinable content, or the [Conversation
+    /// Summary] re-injected into the session — otherwise a model
+    /// tricked by prompt injection in the messages it's summarizing
+    /// could leak secret-like text into persisted state.
+    pub(crate) security_gateway: Arc<SecurityGateway>,
+    pub(crate) job_id: JobId,
+    pub(crate) user_id: String,
+    pub(crate) session_id: aura_model::SessionId,
+    pub(crate) model_info: aura_llm::ModelInfo,
+    pub(crate) cancel_token: CancellationToken,
 }
 
-impl LlmSummarizer {
-    pub fn new(client: Arc<dyn LlmCompletion>) -> Self {
-        Self { client }
-    }
-}
+impl CompressionRunner {
+    /// Execute the compression LLM call. Brackets it in a
+    /// `StepKind::Compression` step + `LlmCall` span (real lifecycle —
+    /// not a post-hoc placeholder), records the cost row against the
+    /// span_id while the span is open, and returns the trimmed summary
+    /// text. On any error returns `ContextError`; the strategy's
+    /// deterministic `on_failure` slice is then used by
+    /// `maybe_compress` instead.
+    pub(crate) async fn run(
+        self,
+        request: aura_llm::ChatRequest,
+    ) -> std::result::Result<String, aura_context::ContextError> {
+        let CompressionRunner {
+            llm_client,
+            recorder,
+            cost_manager,
+            security_gateway,
+            job_id,
+            user_id,
+            session_id,
+            model_info,
+            cancel_token,
+        } = self;
 
-#[async_trait]
-impl SummarizeCallback for LlmSummarizer {
-    async fn summarize(&self, messages: &[ChatMessage]) -> aura_context::Result<SummarizeOutput> {
-        let mut request_messages: Vec<ChatMessage> = messages.to_vec();
-        request_messages.push(ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text(SUMMARIZE_INSTRUCTION.to_string())],
-        });
-
-        let request = ChatRequest {
-            messages: request_messages,
-            temperature: None,
-            tools: Vec::new(),
+        let cancel_ctx = Some((&cancel_token, aura_job::CancelReason::ParentCancelled));
+        let begin = LlmCallBegin {
+            model_id: model_info.id.clone(),
+            provider: model_info.provider.clone(),
+            provider_config_hash: String::new(),
+            input_messages: request.messages.clone(),
+            temperature: request.temperature,
         };
 
-        let response = self
-            .client
-            .chat(&request)
-            .await
-            .map_err(|e| ContextError::Compression(e.to_string()))?;
+        let recorder_inner = Arc::clone(&recorder);
+        let summary = crate::scope::with_step(
+            recorder.as_ref(),
+            job_id,
+            StepKind::Compression,
+            cancel_ctx,
+            |step| async move {
+                let summary = crate::scope::with_llm_span(
+                    recorder_inner.as_ref(),
+                    &step,
+                    job_id,
+                    begin,
+                    cancel_ctx,
+                    |span| async move {
+                        match llm_client.chat(&request).await {
+                            Ok(mut response) => {
+                                if let Err(e) =
+                                    security_gateway.sanitize_llm_response(&mut response).await
+                                {
+                                    warn!(
+                                        error = %e,
+                                        "failed to sanitize compression LLM response"
+                                    );
+                                }
+                                if let Some(cm) = &cost_manager {
+                                    cm.record_call(
+                                        &user_id,
+                                        session_id.clone(),
+                                        job_id,
+                                        span.span_id,
+                                        &model_info.id,
+                                        response.usage.input_tokens,
+                                        response.usage.output_tokens,
+                                        response.usage.cached_input_tokens,
+                                        response.usage.cache_creation_input_tokens,
+                                    );
+                                }
+                                let summary = response.content.trim().to_string();
+                                let call_result = LlmCallResult {
+                                    output_content: response.content.clone(),
+                                    thinking: response.thinking.clone(),
+                                    tool_calls: vec![],
+                                    input_tokens: response.usage.input_tokens,
+                                    output_tokens: response.usage.output_tokens,
+                                    cached_input_tokens: response.usage.cached_input_tokens,
+                                    cache_creation_input_tokens: response
+                                        .usage
+                                        .cache_creation_input_tokens,
+                                };
+                                (call_result, Ok(summary))
+                            }
+                            Err(e) => {
+                                let raw = e.to_string();
+                                let error_msg =
+                                    security_gateway.sanitize_error(&raw).await.unwrap_or(raw);
+                                let call_result = LlmCallResult {
+                                    output_content: String::new(),
+                                    thinking: None,
+                                    tool_calls: vec![],
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cached_input_tokens: 0,
+                                    cache_creation_input_tokens: 0,
+                                };
+                                (call_result, Err(anyhow::anyhow!(error_msg)))
+                            }
+                        }
+                    },
+                )
+                .await?;
+                Ok((LifecycleOutcome::Ok, summary))
+            },
+        )
+        .await
+        .map_err(|e| aura_context::ContextError::Compression(e.to_string()))?;
 
-        let summary = response.content.trim().to_string();
         if summary.is_empty() {
-            return Err(ContextError::EmptySummary);
+            return Err(aura_context::ContextError::EmptySummary);
         }
-
-        let info = self.client.model_info();
-        let llm_call = CompressionLlmCall {
-            model_id: info.id.clone(),
-            provider: info.provider.clone(),
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            cached_input_tokens: response.usage.cached_input_tokens,
-            cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-        };
-
-        Ok(SummarizeOutput { summary, llm_call })
+        Ok(summary)
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aura_llm::{
-        BlobFetcher, LlmError, LlmResponse, LlmStream, ModelInfo, ModelPricing, TokenUsage,
-    };
-    use aura_model::MicroUsd;
-    use parking_lot::Mutex;
-    use std::sync::Arc;
-
-    fn make_info() -> ModelInfo {
-        ModelInfo {
-            id: "test-model".into(),
-            provider: "test-provider".into(),
-            context_window: 100_000,
-            supports_tools: false,
-            supports_vision: false,
-            pricing: ModelPricing {
-                input_per_1m_tokens: MicroUsd::ZERO,
-                output_per_1m_tokens: MicroUsd::ZERO,
-            },
-        }
-    }
-
-    fn make_response(content: &str) -> LlmResponse {
-        LlmResponse {
-            content: content.to_string(),
-            content_blocks: vec![],
-            tool_calls: vec![],
-            usage: TokenUsage {
-                input_tokens: 1000,
-                output_tokens: 200,
-                cached_input_tokens: 50,
-                cache_creation_input_tokens: 25,
-            },
-            thinking: None,
-        }
-    }
-
-    /// Fake `LlmCompletion`: returns a single canned response or error,
-    /// captures the request that was sent.
-    struct FakeLlm {
-        info: ModelInfo,
-        response: Mutex<Option<aura_llm::Result<LlmResponse>>>,
-        captured: Mutex<Option<ChatRequest>>,
-    }
-
-    impl FakeLlm {
-        fn new(response: aura_llm::Result<LlmResponse>) -> Self {
-            Self {
-                info: make_info(),
-                response: Mutex::new(Some(response)),
-                captured: Mutex::new(None),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LlmCompletion for FakeLlm {
-        async fn chat(&self, request: &ChatRequest) -> aura_llm::Result<LlmResponse> {
-            *self.captured.lock() = Some(request.clone());
-            self.response
-                .lock()
-                .take()
-                .expect("FakeLlm: chat called more than once")
-        }
-
-        async fn chat_stream(&self, _request: &ChatRequest) -> aura_llm::Result<LlmStream> {
-            unimplemented!("FakeLlm does not support streaming")
-        }
-
-        fn model_info(&self) -> &ModelInfo {
-            &self.info
-        }
-    }
-
-    fn user_msg(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text(text.into())],
-        }
-    }
-
-    #[tokio::test]
-    async fn success_populates_summary_and_compression_llm_call() {
-        let fake = Arc::new(FakeLlm::new(Ok(make_response("  condensed summary  "))));
-        let summarizer = LlmSummarizer::new(fake.clone());
-
-        let input = vec![user_msg("a"), user_msg("b")];
-        let out = summarizer.summarize(&input).await.unwrap();
-
-        assert_eq!(out.summary, "condensed summary");
-        assert_eq!(out.llm_call.model_id, "test-model");
-        assert_eq!(out.llm_call.provider, "test-provider");
-        assert_eq!(out.llm_call.input_tokens, 1000);
-        assert_eq!(out.llm_call.output_tokens, 200);
-        assert_eq!(out.llm_call.cached_input_tokens, 50);
-        assert_eq!(out.llm_call.cache_creation_input_tokens, 25);
-
-        let captured = fake.captured.lock().clone().expect("chat was called");
-        assert_eq!(captured.messages.len(), input.len() + 1);
-        assert!(captured.tools.is_empty());
-        assert!(captured.temperature.is_none());
-
-        let trailing = captured.messages.last().unwrap();
-        assert_eq!(trailing.role, Role::User);
-        match &trailing.content[0] {
-            ContentBlock::Text(t) => {
-                assert!(t.contains("summarizing the older portion"));
-                assert!(t.contains("Output plain prose, no preamble."));
-            }
-            _ => panic!("expected text trailing instruction"),
-        }
-    }
-
-    #[tokio::test]
-    async fn empty_response_returns_empty_summary_error() {
-        let fake = Arc::new(FakeLlm::new(Ok(make_response("   \n  "))));
-        let summarizer = LlmSummarizer::new(fake);
-        let err = summarizer.summarize(&[user_msg("x")]).await.unwrap_err();
-        assert!(matches!(err, ContextError::EmptySummary), "got: {err:?}");
-    }
-
-    #[tokio::test]
-    async fn chat_error_propagates_as_compression_error() {
-        let fake = Arc::new(FakeLlm::new(Err(LlmError::Provider("rate-limited".into()))));
-        let summarizer = LlmSummarizer::new(fake);
-        let err = summarizer.summarize(&[user_msg("x")]).await.unwrap_err();
-        match err {
-            ContextError::Compression(msg) => {
-                assert!(msg.contains("rate-limited"), "got: {msg}");
-            }
-            other => panic!("expected Compression error, got: {other:?}"),
-        }
-    }
-
-    // Compile-time check: BlobFetcher trait stays importable from this
-    // crate without dragging in extra symbols. Removable once another
-    // call site uses it.
-    #[allow(dead_code)]
-    fn _blob_fetcher_marker(_: &dyn BlobFetcher) {}
 }

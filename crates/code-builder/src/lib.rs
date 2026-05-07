@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_llm::LlmCompletion;
+use aura_llm::GuardedLlm;
 use aura_sandbox::SandboxRunner;
 use aura_security::{LeakDetector, SecretVault};
 use aura_tools::{Tool, ToolManifest};
@@ -27,7 +27,7 @@ pub use tool::CodeBuilderTool;
 /// already-revealed tool args before the nested planning LLM call) are
 /// resolvable later by `reveal_in_text` against the same vault.
 pub fn agent_tool(
-    llm: Arc<dyn LlmCompletion>,
+    llm: Arc<GuardedLlm>,
     sandbox_runner: Arc<dyn SandboxRunner>,
     leak_detector: Arc<LeakDetector>,
     secret_vault: Arc<SecretVault>,

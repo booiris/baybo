@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use aura_llm::{ChatRequest, LlmCompletion};
+use aura_llm::{ChatRequest, GuardedLlm};
 use aura_model::{ChatMessage, ContentBlock, ResourceAccess, Role};
 use aura_sandbox::{NetworkPolicy, SandboxRunner};
 use aura_security::{LeakDetector, PlaceholderMinter, SecretVault};
@@ -28,7 +28,7 @@ const INLINE_OUTPUT_THRESHOLD: usize = 4 * 1024;
 const PREVIEW_BYTES: usize = 512;
 
 pub struct CodeBuilderTool {
-    llm: Arc<dyn LlmCompletion>,
+    llm: Arc<GuardedLlm>,
     sandbox_runner: Arc<dyn SandboxRunner>,
     leak_detector: Arc<LeakDetector>,
     minter: Arc<PlaceholderMinter>,
@@ -54,7 +54,7 @@ struct Params {
 
 impl CodeBuilderTool {
     pub fn new(
-        llm: Arc<dyn LlmCompletion>,
+        llm: Arc<GuardedLlm>,
         sandbox_runner: Arc<dyn SandboxRunner>,
         leak_detector: Arc<LeakDetector>,
         secret_vault: Arc<SecretVault>,
@@ -788,7 +788,8 @@ mod tests {
         let store = Arc::new(MemorySecretStore::new());
         let vault = Arc::new(SecretVault::new(key, store));
         let detector = Arc::new(LeakDetector::with_default_rules());
-        let tool = CodeBuilderTool::new(stub, runner, detector, Arc::clone(&vault));
+        let llm = GuardedLlm::passthrough(stub as Arc<dyn aura_llm::LlmCompletion>);
+        let tool = CodeBuilderTool::new(llm, runner, detector, Arc::clone(&vault));
         tool.uv_path
             .set(PathBuf::from("/usr/local/bin/uv"))
             .unwrap();

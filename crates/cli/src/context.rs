@@ -6,7 +6,7 @@ use aura_agent::{
 };
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
-use aura_llm::LlmClient;
+use aura_llm::GuardedLlm;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
@@ -35,7 +35,7 @@ pub struct CommandContext {
     pub skills: Arc<SkillRegistry>,
     pub tools: Arc<ToolRegistry>,
     pub channels: Arc<ChannelRegistry>,
-    pub llm: Option<Arc<LlmClient>>,
+    pub llm: Option<Arc<GuardedLlm>>,
     pub workspace: Arc<WorkspaceManager>,
     pub session: Option<Arc<SessionManager>>,
     pub job: Option<Arc<JobLifecycle>>,
@@ -95,7 +95,7 @@ pub struct ContextBuilder {
     skills: Option<Arc<SkillRegistry>>,
     tools: Option<Arc<ToolRegistry>>,
     channels: Option<Arc<ChannelRegistry>>,
-    llm: Option<Arc<LlmClient>>,
+    llm: Option<Arc<GuardedLlm>>,
     workspace: Option<Arc<WorkspaceManager>>,
     session: Option<Arc<SessionManager>>,
     job: Option<Arc<JobLifecycle>>,
@@ -154,7 +154,7 @@ impl ContextBuilder {
         self
     }
 
-    pub fn llm(mut self, llm: Arc<LlmClient>) -> Self {
+    pub fn llm(mut self, llm: Arc<GuardedLlm>) -> Self {
         self.llm = Some(llm);
         self
     }

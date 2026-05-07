@@ -1,7 +1,7 @@
 pub mod summarize;
 pub mod truncate;
 
-use async_trait::async_trait;
+use aura_llm::ChatRequest;
 use aura_model::{ChatMessage, ContentBlock};
 use std::collections::HashSet;
 
@@ -75,50 +75,49 @@ pub(crate) fn pair_preserving_cut(messages: &[ChatMessage], cut: usize) -> usize
 
 /// Strategy for compressing context messages when the token budget is exceeded.
 ///
-/// Implementations receive the full message list and a tokenizer, and return
-/// a (possibly shorter) message list. The `ContextManager` handles the
-/// budget tracking and compression triggering; the strategy only decides
-/// *how* to compress.
-#[async_trait]
+/// Strategies are **pure planners** — they never make LLM calls
+/// themselves. Implementations receive the full message list and a
+/// tokenizer and return a [`CompressOutput`] describing what to do.
+/// `ContextManager` then either applies the plan directly (NoOp /
+/// Replaced) or invokes the caller-supplied chat closure to fulfil
+/// `NeedsLlmCall` and applies the result. This keeps the LLM call's
+/// trace span and cost recording on the agent-loop side, where the
+/// `SpanRecorder` and `CostManager` live.
 pub trait CompressionStrategy: Send + Sync {
-    /// Compress the given messages, returning a reduced message list.
-    async fn compress(
+    /// Plan a compression over `messages`. Returns synchronously
+    /// because no I/O happens inside a strategy.
+    fn compress(
         &self,
         messages: &[ChatMessage],
         tokenizer: &dyn Tokenizer,
     ) -> crate::Result<CompressOutput>;
 }
 
-/// Output of a compression operation.
-pub struct CompressOutput {
-    /// The compressed message list.
-    pub messages: Vec<ChatMessage>,
-    /// Set when the strategy made an LLM call. Propagated upward by
-    /// `ContextManager` so the agent loop can record the call as a
-    /// `SpanKind::LlmCall` after the fact (see `CompressStats::llm_call`).
-    pub llm_call: Option<crate::CompressionLlmCall>,
-}
-
-/// Output of [`SummarizeCallback::summarize`].
+/// Plan returned by [`CompressionStrategy::compress`].
 ///
-/// Carries both the summary text and the provenance/usage of the
-/// underlying LLM call so the strategy can surface it via
-/// `CompressOutput::llm_call`.
-#[derive(Debug, Clone)]
-pub struct SummarizeOutput {
-    pub summary: String,
-    pub llm_call: crate::CompressionLlmCall,
-}
-
-/// Callback for LLM-based summarization of context messages.
-///
-/// Defined in this crate but implemented externally to keep `context`
-/// independent from `llm`. Injected into `Summarize` strategy at construction.
-#[async_trait]
-pub trait SummarizeCallback: Send + Sync {
-    /// Summarize a sequence of messages, returning both the text and
-    /// the LLM call's provenance/usage.
-    async fn summarize(&self, messages: &[ChatMessage]) -> crate::Result<SummarizeOutput>;
+/// The strategy decides *what* to do; `ContextManager` decides *how*
+/// to apply it (and the agent loop fulfils any LLM call). Splitting
+/// the decision from the I/O keeps strategies pure and lets the
+/// agent loop wrap LLM calls in real trace spans.
+pub enum CompressOutput {
+    /// Strategy chose not to compress (e.g. message count already at
+    /// or below the keep threshold). `ContextManager` returns
+    /// `CompressionOutcome::NoChange` without touching `session`.
+    NoOp,
+    /// Strategy produced a new message list without needing an LLM
+    /// call (`Truncate`, or any future deterministic compaction).
+    Replaced(Vec<ChatMessage>),
+    /// Strategy needs the caller to perform `request` and feed the
+    /// summary text into `on_success` to assemble the new message
+    /// list. `on_failure` is the deterministic fallback list to use
+    /// when the call errors — typically a Truncate-equivalent slice
+    /// — so a transient summarizer failure never kills the user's
+    /// turn.
+    NeedsLlmCall {
+        request: ChatRequest,
+        on_success: Box<dyn FnOnce(String) -> Vec<ChatMessage> + Send>,
+        on_failure: Vec<ChatMessage>,
+    },
 }
 
 #[cfg(test)]

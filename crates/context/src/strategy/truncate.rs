@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use aura_model::{ChatMessage, Role};
 
 use super::{CompressOutput, CompressionStrategy, pair_preserving_cut};
@@ -15,7 +14,6 @@ impl Truncate {
         Self { keep_recent }
     }
 
-    /// Partition messages into (system_messages, non_system_messages).
     fn partition_system(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
         let mut system = Vec::new();
         let mut rest = Vec::new();
@@ -30,9 +28,8 @@ impl Truncate {
     }
 }
 
-#[async_trait]
 impl CompressionStrategy for Truncate {
-    async fn compress(
+    fn compress(
         &self,
         messages: &[ChatMessage],
         _tokenizer: &dyn Tokenizer,
@@ -40,17 +37,12 @@ impl CompressionStrategy for Truncate {
         let (system_msgs, non_system) = Self::partition_system(messages);
 
         if non_system.len() <= self.keep_recent {
-            return Ok(CompressOutput {
-                messages: messages.to_vec(),
-                llm_call: None,
-            });
+            return Ok(CompressOutput::NoOp);
         }
 
-        // Initial cut by `keep_recent`, then pull the cut leftward as
-        // needed so every kept `ToolResult` still has its originating
-        // `ToolUse` in the tail. Without this, a cut between
-        // `assistant { tool_use }` and the next `user { tool_result }`
-        // produces an LLM payload providers reject.
+        // Pull the cut leftward as needed so every kept `ToolResult`
+        // still has its originating `ToolUse` in the tail. Otherwise
+        // the LLM payload is malformed.
         let initial_cut = non_system.len().saturating_sub(self.keep_recent);
         let kept_start = pair_preserving_cut(&non_system, initial_cut);
         let kept: Vec<ChatMessage> = non_system[kept_start..].to_vec();
@@ -58,10 +50,7 @@ impl CompressionStrategy for Truncate {
         let mut new_messages = system_msgs;
         new_messages.extend(kept);
 
-        Ok(CompressOutput {
-            messages: new_messages,
-            llm_call: None,
-        })
+        Ok(CompressOutput::Replaced(new_messages))
     }
 }
 
@@ -99,8 +88,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn keeps_system_and_recent() {
+    #[test]
+    fn keeps_system_and_recent() {
         let strategy = Truncate::new(2);
         let tokenizer = SimpleTokenizer;
 
@@ -113,13 +102,17 @@ mod tests {
             make_msg(Role::User, "msg 3"),
         ];
 
-        let output = strategy.compress(&messages, &tokenizer).await.unwrap();
-        assert_eq!(output.messages.len(), 3); // system + 2 recent
-        assert_eq!(output.messages[0].role, Role::System);
+        match strategy.compress(&messages, &tokenizer).unwrap() {
+            CompressOutput::Replaced(new_messages) => {
+                assert_eq!(new_messages.len(), 3);
+                assert_eq!(new_messages[0].role, Role::System);
+            }
+            other => panic!("expected Replaced, got {:?}", variant_name(&other)),
+        }
     }
 
-    #[tokio::test]
-    async fn no_change_when_under_keep_recent() {
+    #[test]
+    fn no_op_when_under_keep_recent() {
         let strategy = Truncate::new(10);
         let tokenizer = SimpleTokenizer;
 
@@ -129,7 +122,17 @@ mod tests {
             make_msg(Role::Assistant, "hi"),
         ];
 
-        let output = strategy.compress(&messages, &tokenizer).await.unwrap();
-        assert_eq!(output.messages.len(), 3);
+        match strategy.compress(&messages, &tokenizer).unwrap() {
+            CompressOutput::NoOp => {}
+            other => panic!("expected NoOp, got {:?}", variant_name(&other)),
+        }
+    }
+
+    fn variant_name(o: &CompressOutput) -> &'static str {
+        match o {
+            CompressOutput::NoOp => "NoOp",
+            CompressOutput::Replaced(_) => "Replaced",
+            CompressOutput::NeedsLlmCall { .. } => "NeedsLlmCall",
+        }
     }
 }

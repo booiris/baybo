@@ -15,5 +15,7 @@ mod security_pipeline;
 mod smoke;
 #[path = "streaming_safety.rs"]
 mod streaming_safety;
+#[path = "token_calibration_e2e.rs"]
+mod token_calibration_e2e;
 #[path = "tool_boundary.rs"]
 mod tool_boundary;

@@ -1,38 +1,42 @@
-use std::sync::Arc;
-
-use async_trait::async_trait;
+use aura_llm::ChatRequest;
 use aura_model::{ChatMessage, ContentBlock, Role};
-use tracing::warn;
 
-use super::{
-    CompressOutput, CompressionStrategy, SummarizeCallback, SummarizeOutput, pair_preserving_cut,
-};
+use super::{CompressOutput, CompressionStrategy, pair_preserving_cut};
 use crate::tokenizer::Tokenizer;
 
-/// Summarize compression: summarizes old non-system messages via an LLM
-/// callback, then keeps the summary plus the most recent `keep_recent`
-/// non-system messages.
+/// Trailing instruction appended to the messages handed to the
+/// summarizer LLM. Lives here rather than in the agent loop because
+/// it's the strategy that decides what shape of summary to ask for —
+/// the agent loop just dispatches the request and returns the text.
+const SUMMARIZE_INSTRUCTION: &str = "\
+You are summarizing the older portion of an agent's own conversation \
+so it can continue the same task. Preserve: the user's current request \
+and any constraints; recent tool calls and the key facts they returned \
+(file paths, IDs, error messages); decisions already made; open todos; \
+anything the agent must remember to finish the task. Drop: redundant \
+exchanges, exploratory dead-ends. Output plain prose, no preamble.";
+
+/// Summarize compression: condenses old non-system messages into a
+/// single `[Conversation Summary]` block and keeps the most recent
+/// `keep_recent` non-system messages alongside it.
 ///
-/// Compared to `Truncate` (which simply drops old messages), `Summarize`
-/// preserves the semantic content of earlier conversation turns in a
-/// condensed form.
+/// The strategy itself never makes an LLM call. Instead it returns a
+/// `CompressOutput::NeedsLlmCall` plan with the prepared `ChatRequest`
+/// and the assembly closures; `ContextManager::maybe_compress` invokes
+/// the caller-supplied chat closure to fulfil the plan, and the agent
+/// loop wraps that closure in a real trace span and cost record.
 pub struct Summarize {
-    callback: Arc<dyn SummarizeCallback>,
     keep_recent: usize,
 }
 
 impl Summarize {
-    pub fn new(callback: Arc<dyn SummarizeCallback>, keep_recent: usize) -> Self {
-        Self {
-            callback,
-            keep_recent,
-        }
+    pub fn new(keep_recent: usize) -> Self {
+        Self { keep_recent }
     }
 }
 
-#[async_trait]
 impl CompressionStrategy for Summarize {
-    async fn compress(
+    fn compress(
         &self,
         messages: &[ChatMessage],
         _tokenizer: &dyn Tokenizer,
@@ -48,62 +52,57 @@ impl CompressionStrategy for Summarize {
         }
 
         if non_system.len() <= self.keep_recent {
-            return Ok(CompressOutput {
-                messages: messages.to_vec(),
-                llm_call: None,
-            });
+            return Ok(CompressOutput::NoOp);
         }
 
-        // Split non-system messages into old (to summarize) and recent
-        // (to keep). The initial split by `keep_recent` may land between
-        // an `assistant { tool_use }` and the following
-        // `user { tool_result }`; pull the boundary left until every
-        // kept `ToolResult` has its `ToolUse` in the recent half so the
-        // LLM payload remains well-formed.
+        // Pull the boundary left if it would sever a tool_use /
+        // tool_result pair, otherwise the LLM payload is malformed.
         let initial_split = non_system.len().saturating_sub(self.keep_recent);
         let split = pair_preserving_cut(&non_system, initial_split);
-        let old = &non_system[..split];
-        let recent = &non_system[split..];
+        // `pair_preserving_cut` can drag the boundary all the way to 0
+        // when the head of the conversation is a single tool_use /
+        // tool_result chain. There's nothing to summarise in that case
+        // — bail before paying for an LLM call on an empty old slice.
+        if split == 0 {
+            return Ok(CompressOutput::NoOp);
+        }
+        let old: Vec<ChatMessage> = non_system[..split].to_vec();
+        let recent: Vec<ChatMessage> = non_system[split..].to_vec();
 
-        // Summarize old messages via the injected callback. On
-        // failure (transport error, rate limit, empty content, …)
-        // degrade silently to a Truncate-equivalent slice rather than
-        // killing the user's turn — compression is infrastructure,
-        // not user-requested work, and a transient summarizer failure
-        // shouldn't surface as a turn error. The result is shape-
-        // identical to a `Truncate` output (no summary message, no
-        // `llm_call`), which the agent loop's compression-cost
-        // wiring already handles as a no-op.
-        let SummarizeOutput { summary, llm_call } = match self.callback.summarize(old).await {
-            Ok(out) => out,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    old_messages = old.len(),
-                    "summarization callback failed; falling back to truncation"
-                );
-                let mut fallback = system_msgs;
-                fallback.extend_from_slice(recent);
-                return Ok(CompressOutput {
-                    messages: fallback,
-                    llm_call: None,
-                });
-            }
+        let mut request_messages = old;
+        request_messages.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text(SUMMARIZE_INSTRUCTION.to_string())],
+        });
+        let request = ChatRequest {
+            messages: request_messages,
+            temperature: None,
+            tools: Vec::new(),
         };
 
-        // Build new message list: system + summary + recent.
-        let mut new_messages = system_msgs;
-        new_messages.push(ChatMessage {
-            role: Role::System,
-            content: vec![ContentBlock::Text(format!(
-                "[Conversation Summary]\n{summary}"
-            ))],
-        });
-        new_messages.extend_from_slice(recent);
+        // Failure fallback: a Truncate-equivalent slice (system + recent)
+        // so a transient summarizer error never kills the user's turn.
+        let mut on_failure = system_msgs.clone();
+        on_failure.extend_from_slice(&recent);
 
-        Ok(CompressOutput {
-            messages: new_messages,
-            llm_call: Some(llm_call),
+        let on_success_system = system_msgs;
+        let on_success_recent = recent;
+        let on_success = Box::new(move |summary: String| {
+            let mut new_messages = on_success_system;
+            new_messages.push(ChatMessage {
+                role: Role::System,
+                content: vec![ContentBlock::Text(format!(
+                    "[Conversation Summary]\n{summary}"
+                ))],
+            });
+            new_messages.extend(on_success_recent);
+            new_messages
+        });
+
+        Ok(CompressOutput::NeedsLlmCall {
+            request,
+            on_success,
+            on_failure,
         })
     }
 }
@@ -111,34 +110,6 @@ impl CompressionStrategy for Summarize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EchoSummarizer;
-
-    #[async_trait]
-    impl SummarizeCallback for EchoSummarizer {
-        async fn summarize(&self, messages: &[ChatMessage]) -> crate::Result<SummarizeOutput> {
-            Ok(SummarizeOutput {
-                summary: format!("Summary of {} messages", messages.len()),
-                llm_call: crate::CompressionLlmCall {
-                    model_id: "test-model".into(),
-                    provider: "test".into(),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                },
-            })
-        }
-    }
-
-    struct ErroringSummarizer;
-
-    #[async_trait]
-    impl SummarizeCallback for ErroringSummarizer {
-        async fn summarize(&self, _messages: &[ChatMessage]) -> crate::Result<SummarizeOutput> {
-            Err(crate::ContextError::EmptySummary)
-        }
-    }
 
     struct SimpleTokenizer;
 
@@ -169,11 +140,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn summarizes_old_messages() {
-        let strategy = Summarize::new(Arc::new(EchoSummarizer), 2);
+    /// Plan for a 6-message conversation with `keep_recent=2` should
+    /// be `NeedsLlmCall` carrying a request that contains the 3 old
+    /// non-system messages + the trailing instruction. `on_success`
+    /// must produce `[system, summary-as-system, recent...]`.
+    #[test]
+    fn produces_needs_llm_call_with_old_messages() {
+        let strategy = Summarize::new(2);
         let tokenizer = SimpleTokenizer;
-
         let messages = vec![
             make_msg(Role::System, "system prompt"),
             make_msg(Role::User, "msg 1"),
@@ -183,132 +157,108 @@ mod tests {
             make_msg(Role::User, "msg 3"),
         ];
 
-        let output = strategy.compress(&messages, &tokenizer).await.unwrap();
+        match strategy.compress(&messages, &tokenizer).unwrap() {
+            CompressOutput::NeedsLlmCall {
+                request,
+                on_success,
+                on_failure,
+            } => {
+                // 3 old non-system messages + 1 instruction message
+                assert_eq!(request.messages.len(), 4);
+                assert!(request.tools.is_empty());
+                assert!(request.temperature.is_none());
 
-        // system + summary + 2 recent non-system
-        assert_eq!(output.messages.len(), 4);
-        assert_eq!(output.messages[0].role, Role::System); // original system
-        assert_eq!(output.messages[1].role, Role::System); // summary
+                let trailing = request.messages.last().unwrap();
+                assert_eq!(trailing.role, Role::User);
+                if let ContentBlock::Text(t) = &trailing.content[0] {
+                    assert!(t.contains("summarizing the older portion"));
+                } else {
+                    panic!("expected text instruction");
+                }
 
-        if let ContentBlock::Text(ref text) = output.messages[1].content[0] {
-            assert!(text.contains("Summary of 3 messages"));
-        } else {
-            panic!("expected text content in summary message");
+                // on_success → system + summary + 2 recent non-system
+                let assembled = on_success("CANNED".into());
+                assert_eq!(assembled.len(), 4);
+                assert_eq!(assembled[0].role, Role::System);
+                assert_eq!(assembled[1].role, Role::System);
+                if let ContentBlock::Text(t) = &assembled[1].content[0] {
+                    assert!(t.contains("[Conversation Summary]"));
+                    assert!(t.contains("CANNED"));
+                } else {
+                    panic!("expected summary text");
+                }
+
+                // on_failure → system + 2 recent non-system, no summary
+                assert_eq!(on_failure.len(), 3);
+                assert_eq!(on_failure[0].role, Role::System);
+                if let ContentBlock::Text(t) = &on_failure[1].content[0] {
+                    assert_eq!(t, "reply 2");
+                } else {
+                    panic!("expected text content");
+                }
+            }
+            other => panic!("expected NeedsLlmCall, got: {:?}", variant_name(&other)),
         }
     }
 
-    #[tokio::test]
-    async fn no_change_when_under_keep_recent() {
-        let strategy = Summarize::new(Arc::new(EchoSummarizer), 10);
+    #[test]
+    fn no_op_when_under_keep_recent() {
+        let strategy = Summarize::new(10);
         let tokenizer = SimpleTokenizer;
-
         let messages = vec![
             make_msg(Role::System, "system"),
             make_msg(Role::User, "hello"),
             make_msg(Role::Assistant, "hi"),
         ];
 
-        let output = strategy.compress(&messages, &tokenizer).await.unwrap();
-        assert_eq!(output.messages.len(), 3);
+        match strategy.compress(&messages, &tokenizer).unwrap() {
+            CompressOutput::NoOp => {}
+            other => panic!("expected NoOp, got: {:?}", variant_name(&other)),
+        }
     }
 
-    #[tokio::test]
-    async fn callback_error_falls_back_to_truncate() {
-        let strategy = Summarize::new(Arc::new(ErroringSummarizer), 2);
+    /// `pair_preserving_cut` can drag the boundary all the way to 0 if
+    /// the head's tool_uses are only resolved by tool_results in the
+    /// tail. The strategy must NoOp instead of paying for a summarizer
+    /// call on an empty old slice.
+    #[test]
+    fn no_op_when_pair_cut_collapses_to_zero() {
+        let strategy = Summarize::new(1);
         let tokenizer = SimpleTokenizer;
-
-        let messages = vec![
-            make_msg(Role::System, "system prompt"),
-            make_msg(Role::User, "msg 1"),
-            make_msg(Role::Assistant, "reply 1"),
-            make_msg(Role::User, "msg 2"),
-            make_msg(Role::Assistant, "reply 2"),
-            make_msg(Role::User, "msg 3"),
-        ];
-
-        let output = strategy.compress(&messages, &tokenizer).await.unwrap();
-
-        // Truncate-equivalent shape: system + 2 most recent non-system,
-        // no summary message inserted, no llm_call recorded.
-        assert_eq!(output.messages.len(), 3);
-        assert_eq!(output.messages[0].role, Role::System);
-        assert!(output.llm_call.is_none());
-
-        // Recent tail must be the last 2 non-system messages, in order.
-        if let ContentBlock::Text(ref t) = output.messages[1].content[0] {
-            assert_eq!(t, "reply 2");
-        } else {
-            panic!("expected text content");
-        }
-        if let ContentBlock::Text(ref t) = output.messages[2].content[0] {
-            assert_eq!(t, "msg 3");
-        } else {
-            panic!("expected text content");
-        }
-    }
-
-    #[tokio::test]
-    async fn callback_error_emits_warn_log() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let captured: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let layer = CaptureLayer {
-            sink: Arc::clone(&captured),
+        let tool_use = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "a".into(),
+                name: "bash".into(),
+                input: serde_json::Value::Null,
+                signature: None,
+            }],
         };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let strategy = Summarize::new(Arc::new(ErroringSummarizer), 1);
-        let tokenizer = SimpleTokenizer;
+        let tool_result = ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "a".into(),
+                content: "ok".into(),
+            }],
+        };
         let messages = vec![
-            make_msg(Role::User, "a"),
-            make_msg(Role::Assistant, "b"),
-            make_msg(Role::User, "c"),
+            make_msg(Role::System, "system"),
+            tool_use,
+            make_msg(Role::User, "interleaved text"),
+            tool_result,
         ];
-        let _ = strategy.compress(&messages, &tokenizer).await.unwrap();
 
-        let events = captured.lock().unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| e.contains("falling back to truncation")),
-            "expected fallback warn event, got: {:?}",
-            events
-        );
+        match strategy.compress(&messages, &tokenizer).unwrap() {
+            CompressOutput::NoOp => {}
+            other => panic!("expected NoOp, got: {:?}", variant_name(&other)),
+        }
     }
 
-    struct CaptureLayer {
-        sink: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Visitor<'a>(&'a mut String);
-            impl tracing::field::Visit for Visitor<'_> {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    use std::fmt::Write;
-                    let _ = write!(self.0, " {}={:?}", field.name(), value);
-                }
-                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                    use std::fmt::Write;
-                    let _ = write!(self.0, " {}={}", field.name(), value);
-                }
-            }
-            let mut buf = String::new();
-            event.record(&mut Visitor(&mut buf));
-            self.sink.lock().unwrap().push(buf);
+    fn variant_name(o: &CompressOutput) -> &'static str {
+        match o {
+            CompressOutput::NoOp => "NoOp",
+            CompressOutput::Replaced(_) => "Replaced",
+            CompressOutput::NeedsLlmCall { .. } => "NeedsLlmCall",
         }
     }
 }

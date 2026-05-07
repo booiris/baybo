@@ -55,7 +55,7 @@ pub async fn handle(ctx: &CommandContext) -> Result<CommandOutput> {
         Some(c) => rows.push(row(
             "llm.client",
             CheckStatus::Ok,
-            format!("{} / {}", c.model_info().provider, c.model_id()),
+            format!("{} / {}", c.model_info().provider, c.model_info().id),
         )),
         None => {
             rows.push(row(

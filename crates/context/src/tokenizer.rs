@@ -46,7 +46,9 @@ const TOOL_USE_OVERHEAD: usize = 20;
 ///
 /// For providers without an official offline tokenizer (Anthropic Claude,
 /// etc.) `cl100k_base` is used as a conservative approximation — counts
-/// are typically within ~10% of the true value.
+/// are typically within ~10% of the true value. `TokenCalibration` (keyed
+/// off the LLM model id passed into `ContextManager::maybe_compress`)
+/// closes that gap at runtime.
 pub struct TiktokenTokenizer {
     bpe: &'static CoreBPE,
 }
@@ -68,13 +70,16 @@ impl TiktokenTokenizer {
     }
 
     /// Pick an encoding suitable for the given model ID. Unknown models
-    /// fall back to `cl100k_base`.
+    /// fall back to `cl100k_base`. The model name is consumed only for
+    /// BPE selection — the LLM model id used as the calibration key is
+    /// passed separately to `ContextManager::maybe_compress`.
     pub fn for_model(model: &str) -> Self {
-        if uses_o200k(model) {
-            Self::o200k_base()
+        let bpe = if uses_o200k(model) {
+            tiktoken_rs::o200k_base_singleton()
         } else {
-            Self::cl100k_base()
-        }
+            tiktoken_rs::cl100k_base_singleton()
+        };
+        Self { bpe }
     }
 }
 
