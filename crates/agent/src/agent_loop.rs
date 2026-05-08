@@ -267,6 +267,35 @@ impl AgentLoop {
         self.context_manager.restore_messages(messages);
     }
 
+    /// Pull the persisted active transcript for `session_id` out of
+    /// the configured `SessionStore` and feed it into
+    /// `ContextManager`. Called by `AgentActor::run` once before the
+    /// mailbox loop starts so a process bounce / actor respawn
+    /// doesn't drop the user's prior turns.
+    ///
+    /// No-ops cleanly when:
+    /// - no store is configured (tests, single-shot harnesses);
+    /// - the session has no persisted rows yet (fresh session, cron
+    ///   fires, subagent spawns — they all share this code path).
+    /// Failures log at warn and fall through to a fresh transcript;
+    /// startup must not be blocked by a transient store error.
+    pub async fn restore_transcript_from_store(&mut self, session_id: &SessionId) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        match store.load_active_session_messages(session_id).await {
+            Ok(messages) if !messages.is_empty() => {
+                self.context_manager.restore_messages(messages);
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to load persisted transcript; starting fresh"
+            ),
+        }
+    }
+
     /// Attach the subagent runtime so LLM-emitted `spawn_subagent`
     /// tool calls route through it instead of the regular tool
     /// catalogue.

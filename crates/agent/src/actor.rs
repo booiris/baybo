@@ -86,6 +86,15 @@ impl AgentActor {
     pub async fn run(mut self, mut mailbox: mpsc::Receiver<AgentMessage>) {
         info!(session_id = %self.session.id, "agent actor started");
 
+        // Cold-start hydration: pull any persisted transcript out of
+        // the store before processing the first message. No-ops for
+        // fresh sessions (cron fires, subagent spawns, brand-new
+        // user sessions) and for test harnesses that don't wire a
+        // store; failures log and fall through to an empty transcript.
+        self.agent_loop
+            .restore_transcript_from_store(&self.session.id)
+            .await;
+
         while let Some(msg) = mailbox.recv().await {
             match msg {
                 AgentMessage::UserInput(incoming) => {

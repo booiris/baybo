@@ -614,7 +614,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let session_store = graph.session_manager.store();
         Arc::new(
             move |session: aura_model::Session,
-                  initial_transcript: Vec<aura_model::ChatMessage>,
                   response_tx: mpsc::Sender<AgentOutput>,
                   parent_token: &CancellationToken| {
                 let mut agent_loop = AgentLoop::new(
@@ -639,9 +638,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 .with_cost_manager(Arc::clone(&cost_manager))
                 .with_session_store(Arc::clone(&session_store));
 
-                if !initial_transcript.is_empty() {
-                    agent_loop.restore_transcript(initial_transcript);
-                }
+                // `AgentActor::run` calls `agent_loop.restore_transcript_from_store`
+                // before its mailbox loop — the spawner just builds
+                // the loop with the store wired in.
 
                 if let Some(rt) = subagent_runtime_slot.get() {
                     agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
@@ -695,11 +694,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         rate_limit_cfg.max_requests,
         std::time::Duration::from_secs(rate_limit_cfg.window_secs),
     )
-    .with_actor_spawner(Box::new(
-        move |session, transcript, response_tx, parent_token| {
-            spawn_actor_for(session, transcript, response_tx, parent_token)
-        },
-    ));
+    .with_actor_spawner(Box::new(move |session, response_tx, parent_token| {
+        spawn_actor_for(session, response_tx, parent_token)
+    }));
 
     // Attach cron triggers eagerly — a caller who forgot to plumb the
     // receiver would silently drop every cron-fired turn.
