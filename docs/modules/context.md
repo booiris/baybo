@@ -47,6 +47,8 @@ self.compress_if_needed(session, span_recorder, job_id, &cancel_token).await?;
 
 `maybe_compress` returns `Result<CompressionOutcome>`, a three-variant enum: `NoOp` (under threshold or strategy couldn't shorten), `NoLlmCall` (compression ran without an LLM call — `Truncate`, or `Summarize` falling back after a callback failure), or `LlmCompressed(CompressionLlmCall)` (LLM-backed compression — the agent loop opens a `StepKind::Compression` step + `SpanKind::LlmCall` span and records the call against the cost ledger). `CompressionLlmCall` is purely an in-process handoff — never serialized.
 
+`force_compress` is the same call without the budget gate, for caller-initiated passes (e.g. a user-typed `/compact` slash command). Strategy NoOp / non-shrinking applies still surface as `NoChange`; only the threshold check is bypassed, so a too-small conversation is still left alone rather than rewritten as a one-line summary.
+
 ## Design Decisions
 
 ### Separation of concerns

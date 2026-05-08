@@ -298,6 +298,38 @@ impl ContextManager {
             return Ok(CompressionOutcome::NoChange);
         }
 
+        self.run_compression(session, chat).await
+    }
+
+    /// Like [`Self::maybe_compress`] but skips the threshold gate.
+    /// Same post-conditions: a strategy NoOp or non-shrinking apply
+    /// still surfaces as `NoChange` so a too-small conversation isn't
+    /// rewritten as a one-line summary. For caller-initiated passes
+    /// (e.g. a user-typed `/compact`).
+    pub async fn force_compress<F, Fut>(
+        &mut self,
+        session: &mut Session,
+        model_id: &str,
+        chat: F,
+    ) -> crate::Result<CompressionOutcome>
+    where
+        F: FnOnce(ChatRequest) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
+    {
+        self.set_current_model(model_id);
+        self.budget.update(self.count_tokens(&session.messages));
+        self.run_compression(session, chat).await
+    }
+
+    async fn run_compression<F, Fut>(
+        &mut self,
+        session: &mut Session,
+        chat: F,
+    ) -> crate::Result<CompressionOutcome>
+    where
+        F: FnOnce(ChatRequest) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
+    {
         let chat_box: crate::strategy::ChatCallback = Box::new(move |req| Box::pin(chat(req)));
         let plan = self.strategy.compress(&session.messages, chat_box).await?;
         let (mut new_messages, replaced_full_history) = match plan {
@@ -682,6 +714,61 @@ mod tests {
 
         let outcome = ctx
             .maybe_compress(&mut session, "test-model", never_chat)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, CompressionOutcome::NoChange));
+        assert_eq!(session.messages.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn force_compress_runs_under_budget() {
+        // Plenty of headroom — `maybe_compress` would skip — but
+        // `force_compress` runs the strategy regardless. With
+        // keep_recent=2 and 3 non-system messages the Truncate
+        // strategy shrinks the slice, so the call returns
+        // `Compressed`.
+        let mut ctx = make_ctx(2, 100_000, 0.75);
+        let mut session = make_session(vec![]);
+
+        ctx.append(&mut session, &make_msg(Role::System, "sys"));
+        ctx.append(&mut session, &make_msg(Role::User, "first"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, "second"));
+        ctx.append(&mut session, &make_msg(Role::User, "third"));
+
+        // Sanity: budget-gated path is a no-op here.
+        let baseline = ctx
+            .maybe_compress(&mut session, "test-model", never_chat)
+            .await
+            .unwrap();
+        assert!(matches!(baseline, CompressionOutcome::NoChange));
+        assert_eq!(session.messages.len(), 4);
+
+        let outcome = ctx
+            .force_compress(&mut session, "test-model", never_chat)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        // system + keep_recent=2 most recent non-system.
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[0].role, Role::System);
+    }
+
+    #[tokio::test]
+    async fn force_compress_noop_when_strategy_cant_shorten() {
+        // keep_recent=5 ≥ non-system count → Truncate returns NoOp,
+        // and `force_compress` reports `NoChange` even though the
+        // budget gate was bypassed.
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        let mut session = make_session(vec![]);
+
+        ctx.append(&mut session, &make_msg(Role::System, "sys"));
+        ctx.append(&mut session, &make_msg(Role::User, "hi"));
+        ctx.append(&mut session, &make_msg(Role::Assistant, "hello"));
+
+        let outcome = ctx
+            .force_compress(&mut session, "test-model", never_chat)
             .await
             .unwrap();
 

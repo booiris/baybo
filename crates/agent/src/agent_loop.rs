@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, OutgoingMessage};
+use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobOutput};
 use aura_llm::{
@@ -1486,9 +1486,23 @@ impl AgentLoop {
         job_id: JobId,
         cancel_token: &CancellationToken,
     ) -> anyhow::Result<()> {
+        let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
+        let model_id = runner.model_info.id.clone();
+        self.context_manager
+            .maybe_compress(session, &model_id, |req| runner.run(req))
+            .await?;
+        Ok(())
+    }
+
+    fn build_compression_runner(
+        &self,
+        session: &Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        cancel_token: &CancellationToken,
+    ) -> CompressionRunner {
         let model_info = self.llm_client.model_info().clone();
-        let model_id = model_info.id.clone();
-        let runner = CompressionRunner {
+        CompressionRunner {
             llm_client: self.llm_client.clone(),
             recorder: Arc::clone(span_recorder),
             cost_manager: self.cost_manager.clone(),
@@ -1498,12 +1512,76 @@ impl AgentLoop {
             session_id: session.id.clone(),
             model_info,
             cancel_token: cancel_token.clone(),
+        }
+    }
+
+    /// Run an on-demand compression pass and return the confirmation
+    /// text for the caller to ship as an `AgentOutput::Notice`.
+    /// Strategy NoOp surfaces as "nothing to compress" rather than an
+    /// error. A fresh job is minted so the compression step + LLM
+    /// span land on a real lifecycle.
+    pub async fn compact_now(
+        &mut self,
+        session: &mut Session,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        parent_job_id: Option<JobId>,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<String> {
+        // Match the session trigger so the JobKind invariant holds for
+        // both user-triggered and spawned sessions. `/compact` is a
+        // user-typed command, so UserChat is the natural default; for
+        // sessions whose root trigger is anything else (Cron / System
+        // / Spawned) we fall back to JobKind::Spawned which is allowed
+        // under every trigger.
+        let job_input = match session.trigger.kind() {
+            aura_model::TriggerKind::User => JobInput::UserChat {
+                content: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
+            },
+            _ => JobInput::Spawned {
+                initial_prompt: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
+            },
+        };
+        let spec = JobSpec {
+            session_id: session.id.clone(),
+            session_trigger_kind: session.trigger.kind(),
+            input: job_input,
+            effective_soul_version: session.bound_soul_version.clone(),
+            parent_job_id,
         };
 
-        self.context_manager
-            .maybe_compress(session, &model_id, |req| runner.run(req))
-            .await?;
-        Ok(())
+        crate::scope::with_job(
+            job_lifecycle,
+            cancel_token.clone(),
+            spec,
+            |job_id| async move {
+                let before = self.context_manager.budget().current();
+                let runner =
+                    self.build_compression_runner(session, span_recorder, job_id, &cancel_token);
+                let model_id = runner.model_info.id.clone();
+                let outcome = self
+                    .context_manager
+                    .force_compress(session, &model_id, |req| runner.run(req))
+                    .await?;
+                let after = self.context_manager.budget().current();
+                let text = match outcome {
+                    aura_context::CompressionOutcome::Compressed => {
+                        format!(
+                            "Context compressed: {before} → {after} tokens ({} freed).",
+                            before.saturating_sub(after)
+                        )
+                    }
+                    aura_context::CompressionOutcome::NoChange => {
+                        "Nothing to compress.".to_string()
+                    }
+                };
+                let output = JobOutput::Message {
+                    content: vec![ContentBlock::Text(text.clone())],
+                };
+                Ok((output, text))
+            },
+        )
+        .await
     }
 
     async fn ensure_system_prompt(&self, session: &mut Session) {
