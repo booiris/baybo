@@ -355,7 +355,7 @@ mod tests {
                 model_id: "claude".into(),
                 provider: "anthropic".into(),
                 provider_config_hash: "h".into(),
-                input_messages: vec![],
+                input_messages: aura_trace::LlmCallInputs::empty(),
                 temperature: None,
             },
             result: None,

@@ -28,7 +28,7 @@ pub use job::JobStore;
 pub use memory::MemoryStore;
 pub use retry::retry_on_busy;
 pub use secret::SecretStore;
-pub use session::SessionStore;
+pub use session::{SessionStore, StoredMessage};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use trace::TraceStore;
 

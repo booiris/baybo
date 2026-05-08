@@ -6,7 +6,16 @@ The `session` crate owns `SessionError` and the `SessionManager` that implements
 
 A `Session` is the top of one trace tree. There is exactly one trace per session — fork and subagent spawn create new sessions with `Lineage` pointers, never new trees rooted in the same session.
 
+The conversation transcript itself is **not** carried on `Session`. It lives in `aura_context::ContextManager` while the actor is alive; the agent loop persists each appended message and each `/compact` apply through `SessionManager::append_session_message` / `apply_session_compaction`, and the router seeds it from `load_active_session_messages` on cold start.
+
 **Design principle**: types and store interface are pushed down into lower crates (`aura-model`, `aura-storage`) so this crate can consume the store without creating a dependency cycle. `SessionManager` itself is the only business-logic resident. Concrete storage implementations live in `storage`; higher-level orchestration (Router, Actor) lives in `agent`, which re-exports `SessionManager` for convenience.
+
+## Manager surface
+
+`SessionManager` wraps `Arc<dyn SessionStore>` and exposes:
+
+- Lifecycle: `create_session` / `create_session_with_trigger` / `create_spawned_session` / `get_or_create` / `get` / `list` / `delete` / `cleanup_expired` / `touch`.
+- Transcript brokerage (thin pass-throughs to `SessionStore`): `append_session_message`, `apply_session_compaction`, `load_active_session_messages`, `latest_session_ordinal`, `load_session_messages_with_supersede`, `history`. The agent loop calls these every turn so the in-memory `ContextManager` stays in sync with `session_messages` rows. The leading system message rides the same log — no separate dedup table.
 
 ## Design Decisions
 
@@ -26,23 +35,33 @@ A spawned session's `trigger` is **inherited from the root** session (so a subag
 
 `Session.root_session_id` is self-referential when the session has no `Lineage` parent, and otherwise transitively points to the topmost ancestor. This lets ancestry queries (cost roll-ups, audit aggregation) hit one row instead of recursing.
 
-### Actor model serialization
+### Actor-model write serialization
 
-Aura uses one Actor per session. All messages targeting the same session (user input, cron, rollback, timeout) are queued through the actor handle and consumed sequentially. Therefore, `SessionStore` implementations do not need to handle write conflicts on the same `session_id` — that guarantee comes from the Actor model.
-
-`UserChat` triggers are **preempted** when a new user message arrives mid-job (current job ends in `Cancelled { UserPreempt, partial_artifacts }`). `Cron` and `System` triggers are **queued** in the actor mailbox. Cancellation propagation is via a `tokio_util::sync::CancellationToken` tree owned by the actor; mailbox `AgentMessage::Cancel { reason }` records the audit event.
-
-### Fork is recorded in lineage, not in a separate table
-
-`UserFork { fork_at_job_id, prefix_state_hash }` is the entire on-disk record of a fork. The new session's job prefix is **not copied** — it is read from the source session via a view-layer UNION (`list_jobs(new_session)` = source jobs up to `fork_at_job_id` ∪ new session's own jobs). API responses tag inherited rows with `is_inherited: true` so UIs can render lineage without rewriting IDs.
+One `AgentActor` per session. All messages targeting the same session (user input, cron, rollback, timeout) are queued through the actor handle and consumed sequentially. Therefore `SessionStore` implementations do not need to defend against concurrent writes on the same `session_id` — that guarantee comes from the actor model and is what lets `append_session_message` use a single `INSERT … SELECT MAX(ordinal)+1` without locking. Re-introducing concurrent paths into the session would invalidate the storage contract.
 
 ### Source deletion is rejected when live forks exist
 
-`SessionStore::delete(source_id)` returns `Err(SessionError::HasLiveForks { fork_session_ids })` when any session has a `Lineage::UserFork` pointing into the source. Callers must delete the forks first or accept the error. There is no materialize-on-delete escape hatch — the case is rare enough to surface as an error rather than silently rewrite snapshots.
+`SessionStore::delete(source_id)` returns `Err(SessionError::HasLiveForks { fork_session_ids })` when any session has a `Lineage::UserFork` pointing into the source. Callers must delete the forks first or accept the error. There is no materialize-on-delete escape hatch — the case is rare enough to surface as an error rather than silently rewrite snapshots. The same delete cascades the session's `session_messages` rows so a stranded transcript can never outlive its parent.
 
-### Subagent parent deletion cascades cancel
+### Subagent parent deletion drains the subtree first
 
-When a session with an in-flight subagent is deleted, the subagent's cancellation token is tripped first (`Cancelled { ParentDeleted }`), then the parent row is removed. This drains the entire descendant subtree before the delete completes.
+When a session with an in-flight subagent is deleted, the subagent's cancellation token is tripped (`Cancelled { ParentDeleted }`) **before** the parent row is removed. This drains the entire descendant subtree before the delete completes, so a parent never disappears while a child is still running tools or holding LLM state.
+
+### Session ID conventions
+
+`SessionId` is a caller-supplied opaque string. Producers prefix a UUID v4 to namespace by channel:
+- CLI: `cli-<uuid>` — one id per process.
+- Cron: `cron-<user>-<channel>` — stable across triggers so repeated firings resume the same session.
+- Subagent / fork: minted by `create_spawned_session` from the parent's id and the lineage kind.
+
+`SessionManager::create_session` generates a bare UUID v4 only when no id is requested. A spawned session's `trigger` must equal its root session's `trigger` — enforced at `create_session` time.
+
+### `SessionState` fields
+
+- `active_skills`: skill names invoked this turn (slash-command or `/mention`, score ≥ 0.9). Repopulated each turn by `AgentLoop` from the active band; pure provenance for trace/CLI display. Tool governance is computed separately as the union of those skills' `allowed_tools` lists. See [`agent.md`](agent.md).
+- `compression_count`: incremented after each successful context compression. Used by monitoring / strategy switching to detect runaway growth.
+- `approved_resources`: tool resources the user has granted permanent approval for in this session, populated on each `ApproveAlways` decision. See [`tools.md`](tools.md).
+- `extra`: reserved extension fields for experimental features or plugin state.
 
 ### Soul-version drift
 
@@ -53,27 +72,14 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 1. Periodic cleanup task triggers `SessionManager::cleanup_expired()`
 2. Compute cutoff time: `now - session_timeout`
 3. `list_expired(cutoff)` returns expired session IDs
-4. For each: send `SessionTimeout` to the corresponding `AgentActor` → cleanup → `delete(session_id)`
-
-### SessionState use cases
-
-- `active_skills`: names of skills explicitly invoked this turn (slash-command or inline `/mention`, score ≥ 0.9). Repopulated every turn by `AgentLoop` from the active band — kept as a `Vec<String>` because multiple skills can be active simultaneously. Pure provenance for trace/CLI display; tool governance is computed separately as the union of those skills' `allowed_tools` lists.
-- `compression_count`: incremented after each context compression, useful for monitoring or strategy switching.
-- `approved_resources`: tool resources the user has granted permanent approval for in this session. Appended on each `ApproveAlways` decision by the approval gate and persisted with the session so restored sessions remember the grants. Matching semantics live in `aura_model::approval`.
-- `extra`: reserved extension fields for experimental features or plugin state.
-
-## Constraints
-
-- Session IDs are caller-supplied opaque strings; typical producers prefix a UUID v4 to namespace by channel (e.g. `cli-<uuid>`, `cron-<user>-<channel>`). `SessionManager::create_session` generates a bare UUID v4 only when no id is requested.
-- `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`, `LineageKind` live in `aura-model`; `SessionStore` lives in `aura-storage`.
-- `SessionManager` owns lifecycle logic; `StorageError` is wrapped into `SessionError::Storage` at the manager boundary; `agent` re-exports the manager for convenience.
-- A spawned session's `trigger` must equal its root session's `trigger`. Enforced at `create_session` time.
-- `delete` must reject when live forks reference the session, and must drain in-flight subagents before completing.
+4. For each: `SessionStore::delete(session_id)` removes the session row and cascades the `session_messages` log.
 
 ## Collaboration
 
-| Module    | Role                                                                                               |
-| --------- | -------------------------------------------------------------------------------------------------- |
-| `model`   | Owns `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `SystemReason`  |
-| `storage` | Defines `SessionStore` trait and provides `LibsqlSessionStore`                                     |
+| Module    | Role                                                                                                |
+| --------- | --------------------------------------------------------------------------------------------------- |
+| `model`   | Defines `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`               |
+| `storage` | Defines `SessionStore` trait + libsql impl; defines `StoredMessage` for transcript replay          |
+| `context` | Owns the in-memory transcript via `ContextManager`; agent loop brokers persistence via this crate  |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
+| `cli` / `gateway` | Operator-facing surfaces consume `aura_agent::SessionManager`                              |

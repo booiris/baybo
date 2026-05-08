@@ -2,10 +2,15 @@
 
 ## Overview
 
-The `context` crate manages Aura's session context window, a central component inside Agent Loop.
+The `context` crate owns the per-actor conversation state: the
+transcript (`messages`), the token budget, and the compression
+strategy. Pure in-memory — persistence is the agent loop's job,
+brokered through `SessionStore` from `storage` (the wrapper lives
+in [`aura-session`](session.md)).
 
 Core responsibilities:
 
+- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `aura-model`) carries only metadata (id, user, channel, lineage, soul binding, …). The agent loop persists each appended message and each compaction through `SessionStore`'s `append_session_message` / `apply_session_compaction`; cold-start hydration via `load_active_session_messages` seeds `ContextManager` so an actor restart preserves the conversation.
 - **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
 - **Pluggable compression strategies**: swap compression algorithms without changing management logic
@@ -103,7 +108,7 @@ Failure handling: if the chat closure errors, `maybe_compress` falls back to the
 Lifecycle:
 
 1. Cold start (no baseline) → `count_tokens` falls back to a full BPE-and-calibrate sweep.
-2. After a main call lands `usage.input_tokens = N` for the slice of length `K` that was sent → `record_call_actual(&sent_messages, N)` anchors the baseline (`actual_tokens=N`, `message_count_at_call=K`) and feeds a `(raw_estimate, N)` sample to `TokenCalibration` keyed by `current_model`.
+2. After a main call lands `usage.input_tokens = N` for the current transcript of length `K` → `record_call_actual(N)` anchors the baseline (`actual_tokens=N`, `message_count_at_call=K`) and feeds a `(raw_estimate, N)` sample to `TokenCalibration` keyed by `current_model`. The slice argument from the previous API is gone — the manager owns the transcript outright now, so the call site has nothing useful to pass in.
 3. Within the turn, each new assistant/tool message is appended; budget grows as `N + tokenize(suffix)`.
 4. Compression mutates the prefix → `maybe_compress` calls `invalidate_baseline()`; next call resets the cycle.
 5. Compression LLM calls are *not* fed into calibration — their input shape (old non-system messages, no tools schema) differs from main-call shape and would set a misleading baseline.

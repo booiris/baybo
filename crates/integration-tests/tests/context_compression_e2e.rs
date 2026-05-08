@@ -157,14 +157,22 @@ async fn compression_call_records_cost_with_matching_span_id() {
         assert_eq!(r.output_tokens, main_usage.output_tokens);
     }
 
-    // The compression LlmCall span now records a real call lifecycle:
-    // the `begin.input_messages` field carries the messages we sent
-    // (not the empty placeholder the old post-hoc span left behind).
+    // The compression LlmCall span now records a real call lifecycle.
+    // Its input is one-off (built ad hoc from the active transcript)
+    // so the span carries `LlmCallInputs::Inline` with the actual
+    // messages — not an `LlmCallInputs::Persisted` ordinal reference,
+    // which is reserved for main agent calls whose input is in the
+    // `session_messages` log.
     if let SpanKind::LlmCall { begin, .. } = &compression_span.kind {
-        assert!(
-            !begin.input_messages.is_empty(),
-            "compression LlmCall span must record real input messages"
-        );
+        match &begin.input_messages {
+            aura_trace::LlmCallInputs::Inline(messages) => {
+                assert!(
+                    !messages.is_empty(),
+                    "compression LlmCall span must record real input messages"
+                );
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
     } else {
         panic!("compression span has unexpected kind");
     }

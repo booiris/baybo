@@ -4,7 +4,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ChatMessage;
 use crate::approval::ApprovedResource;
 use crate::ids::{JobId, SessionId};
 
@@ -174,12 +173,15 @@ pub enum LineageKind {
 /// tree (Job → Step → Span). Trigger and lineage are **orthogonal**:
 /// trigger names the business source of work, lineage names the parent
 /// session relationship.
+///
+/// The conversation transcript itself lives in the `aura-context`
+/// `ContextManager` for the actor handling this session. `Session`
+/// holds only metadata: identifiers, ownership, lineage, soul binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
     pub user: User,
     pub channel: ChannelType,
-    pub messages: Vec<ChatMessage>,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub state: SessionState,

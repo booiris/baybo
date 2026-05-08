@@ -1,8 +1,21 @@
 use async_trait::async_trait;
-use aura_model::{LineageKind, Session, SessionId};
+use aura_model::{ChatMessage, LineageKind, Session, SessionId};
 use chrono::{DateTime, Utc};
 
 use crate::error::StorageError;
+
+/// One row of `session_messages`, paired with its supersede marker.
+/// Yielded by [`SessionStore::load_session_messages_with_supersede`]
+/// so the trace API can replay "active as of ordinal X" filters
+/// without leaking the column shape into call sites.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub ordinal: i64,
+    /// `Some(n)` when a later compaction at ordinal `n` replaced this
+    /// row in the active set; `None` while still active.
+    pub superseded_by: Option<i64>,
+    pub message: ChatMessage,
+}
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -48,4 +61,60 @@ pub trait SessionStore: Send + Sync {
         &self,
         parent_session_id: &SessionId,
     ) -> Result<Vec<(SessionId, LineageKind)>>;
+
+    /// Append one message to the session's transcript log. The store
+    /// assigns the next ordinal; concurrent callers on the same
+    /// session must be serialized by the caller (the actor model
+    /// already does this — one actor per session).
+    async fn append_session_message(
+        &self,
+        session_id: &SessionId,
+        message: &ChatMessage,
+    ) -> Result<()>;
+
+    /// Apply a `/compact`-style compression: mark every currently-
+    /// active row as superseded by the first newly-inserted row, then
+    /// append `new_active` at the next contiguous ordinals. Atomic
+    /// transaction so a partial application can never leave both the
+    /// pre- and post-compaction slices marked active.
+    ///
+    /// `new_active` is what `ContextManager::messages()` returns
+    /// after the strategy applies — i.e. the post-compression active
+    /// transcript, system message included. The caller passes it
+    /// through unfiltered; rows are typed by `role` so the leading
+    /// system row resurfaces on the next `load_active_session_messages`.
+    async fn apply_session_compaction(
+        &self,
+        session_id: &SessionId,
+        new_active: &[ChatMessage],
+    ) -> Result<()>;
+
+    /// Load the active transcript (rows where `superseded_by IS NULL`)
+    /// in ordinal order. Used by the router on actor cold start to
+    /// seed `ContextManager`. Returns empty when the session has no
+    /// turns yet.
+    async fn load_active_session_messages(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ChatMessage>>;
+
+    /// Highest `session_messages.ordinal` ever assigned for this
+    /// session — i.e. the last row inserted, regardless of whether
+    /// it has since been superseded. Used by `aura-trace` to anchor
+    /// `LlmCallInputs::Persisted` so a trace span can recover the
+    /// active set the LLM saw at call time without snapshotting the
+    /// messages inline. Returns `None` for a session with no rows
+    /// yet.
+    async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>>;
+
+    /// Load every message ever appended to the session in ordinal
+    /// order, paired with each row's `superseded_by` marker. Used by
+    /// the trace API to hydrate `LlmCallInputs::Persisted` into the
+    /// flat `Vec<ChatMessage>` shape clients still expect, applying
+    /// the standard "active as of `ordinal == X`" filter on the
+    /// caller's side.
+    async fn load_session_messages_with_supersede(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<StoredMessage>>;
 }

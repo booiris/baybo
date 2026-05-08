@@ -611,6 +611,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let cost_manager = Arc::clone(&cost_manager);
         let token_calibration = Arc::clone(&token_calibration);
 
+        let sessions = Arc::clone(&graph.session_manager);
         Arc::new(
             move |session: aura_model::Session,
                   response_tx: mpsc::Sender<AgentOutput>,
@@ -626,7 +627,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         token_budget.clone(),
                     )
                     .with_calibration(Arc::clone(&token_calibration))
-                    .with_skill_registry(Arc::clone(&skill_registry)),
+                    .with_skill_registry(Arc::clone(&skill_registry))
+                    .with_session(session.id.clone(), Arc::clone(&sessions)),
                     Arc::clone(&memory_manager),
                     policy.clone(),
                     Soul::custom(system_prompt.clone()),

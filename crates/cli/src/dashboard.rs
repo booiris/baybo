@@ -105,7 +105,6 @@ async fn sessions_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
                     vec![
                         s.id.to_string(),
                         s.channel.to_string(),
-                        s.messages.len().to_string(),
                         s.last_active.to_rfc3339(),
                     ]
                 })
@@ -116,12 +115,7 @@ async fn sessions_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
     };
     DashboardSnapshot {
         title: "Sessions".into(),
-        columns: vec![
-            "ID".into(),
-            "CHANNEL".into(),
-            "MESSAGES".into(),
-            "LAST_ACTIVE".into(),
-        ],
+        columns: vec!["ID".into(), "CHANNEL".into(), "LAST_ACTIVE".into()],
         rows,
         footer: None,
     }

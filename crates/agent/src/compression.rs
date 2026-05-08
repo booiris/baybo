@@ -74,7 +74,11 @@ impl CompressionRunner {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
             provider_config_hash: String::new(),
-            input_messages: request.messages.clone(),
+            // Compression LLM input is a one-off slice the caller
+            // built off the active transcript — it never lands in
+            // `session_messages`, so embed inline rather than
+            // referencing an ordinal that doesn't exist.
+            input_messages: aura_trace::LlmCallInputs::Inline(request.messages.clone()),
             temperature: request.temperature,
         };
 
