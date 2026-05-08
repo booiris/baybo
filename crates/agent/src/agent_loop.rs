@@ -343,7 +343,10 @@ impl AgentLoop {
                         cancel_token,
                     )
                     .await?;
-                self.flush_transcript(&session.id).await;
+                // No post-turn flush: every appended message reached
+                // the store individually via `append_context_message`,
+                // and any mid-turn compaction was persisted by
+                // `compress_if_needed`.
                 let output = JobOutput::Message {
                     content: outgoing.content.clone(),
                 };
@@ -351,28 +354,6 @@ impl AgentLoop {
             },
         )
         .await
-    }
-
-    /// Persist the current transcript snapshot to the configured
-    /// session store, if any. Failures are logged at warn and
-    /// swallowed — a flush problem must not block the user-visible
-    /// response. Call at every turn boundary (`run`,
-    /// `compact_now` success branches) so an actor restart doesn't
-    /// drop the conversation.
-    async fn flush_transcript(&self, session_id: &SessionId) {
-        let Some(store) = self.session_store.as_ref() else {
-            return;
-        };
-        if let Err(e) = store
-            .save_context_messages(session_id, self.context_manager.messages())
-            .await
-        {
-            warn!(
-                session_id = %session_id,
-                error = %e,
-                "failed to flush context transcript to store"
-            );
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1152,6 +1133,7 @@ impl AgentLoop {
         message: &ChatMessage,
     ) -> anyhow::Result<()> {
         self.context_manager.append(message);
+        self.persist_appended_message(&session.id, message).await;
         self.write_session_message_log(session, message).await;
         Ok(())
     }
@@ -1163,7 +1145,67 @@ impl AgentLoop {
         message: ChatMessage,
     ) {
         self.context_manager.insert(index, message.clone());
+        // System messages are regenerated from soul config on every
+        // restore (`ensure_system_prompt`), so they're explicitly
+        // *not* persisted. Inserts of any other role at non-tail
+        // positions are not part of the normal append path; we still
+        // skip persistence for them and rely on the next compact to
+        // resync the active set.
+        if !matches!(message.role, Role::System)
+            && index == self.context_manager.message_count() - 1
+        {
+            self.persist_appended_message(&session.id, &message).await;
+        }
         self.write_session_message_log(session, &message).await;
+    }
+
+    /// Append a single message to the persistent transcript log if a
+    /// session store is configured. System messages are skipped — they
+    /// come from the current soul config and are re-injected on every
+    /// restore by `ensure_system_prompt`. Failures are logged at warn
+    /// and swallowed; persistence must never block the user-visible
+    /// turn.
+    async fn persist_appended_message(&self, session_id: &SessionId, message: &ChatMessage) {
+        if matches!(message.role, Role::System) {
+            return;
+        }
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        if let Err(e) = store.append_session_message(session_id, message).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to append message to session_messages log"
+            );
+        }
+    }
+
+    /// Mark the persisted active rows for `session_id` as superseded
+    /// and append the post-compression transcript (filtered to drop
+    /// the soul-derived system message). Called by the agent loop's
+    /// success branches in `compact_now` and `compress_if_needed`.
+    async fn persist_compaction(&self, session_id: &SessionId) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let new_active: Vec<ChatMessage> = self
+            .context_manager
+            .messages()
+            .iter()
+            .filter(|m| !matches!(m.role, Role::System))
+            .cloned()
+            .collect();
+        if let Err(e) = store
+            .apply_session_compaction(session_id, &new_active)
+            .await
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to persist session compaction"
+            );
+        }
     }
 
     async fn write_session_message_log(&self, session: &Session, message: &ChatMessage) {
@@ -1536,9 +1578,13 @@ impl AgentLoop {
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
         let model_id = runner.model_info.id.clone();
-        self.context_manager
+        let outcome = self
+            .context_manager
             .maybe_compress(&model_id, |req| runner.run(req))
             .await?;
+        if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
+            self.persist_compaction(&session.id).await;
+        }
         Ok(())
     }
 
@@ -1613,7 +1659,9 @@ impl AgentLoop {
                     .context_manager
                     .force_compress(&model_id, |req| runner.run(req))
                     .await?;
-                self.flush_transcript(&session.id).await;
+                if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
+                    self.persist_compaction(&session.id).await;
+                }
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
                         "Context compressed.".to_string()

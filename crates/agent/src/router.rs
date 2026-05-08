@@ -355,7 +355,7 @@ impl Router {
                 // user's earlier turns. Empty on first contact.
                 let transcript = self
                     .session_manager
-                    .load_context_messages(&typed_session_id)
+                    .load_active_session_messages(&typed_session_id)
                     .await
                     .unwrap_or_else(|e| {
                         warn!(

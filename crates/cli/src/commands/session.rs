@@ -71,7 +71,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         .map_err(|e| CliError::Manager(format!("get session: {e}")))?
         .ok_or_else(|| CliError::Manager(format!("session {id} not found")))?;
     let messages = mgr
-        .load_context_messages(&typed)
+        .load_active_session_messages(&typed)
         .await
         .map_err(|e| CliError::Manager(format!("load context: {e}")))?;
 

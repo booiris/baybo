@@ -128,8 +128,7 @@ impl LibsqlPool {
                     bound_soul_version    TEXT NOT NULL,
                     created_at            INTEGER NOT NULL,
                     last_active           INTEGER NOT NULL,
-                    data                  TEXT NOT NULL,
-                    context_messages      TEXT
+                    data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
                     ON sessions(root_session_id);
@@ -138,6 +137,26 @@ impl LibsqlPool {
                     WHERE lineage_kind IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_sessions_last_active
                     ON sessions(last_active DESC);
+                -- Append-only per-message log. One row per appended
+                -- ChatMessage; `/compact` does not delete or rewrite
+                -- prior rows — it inserts the summary message(s) at
+                -- the next ordinal and bulk-marks earlier active rows
+                -- with `superseded_by = first_summary_ordinal`. The
+                -- active LLM context is the rows where
+                -- `superseded_by IS NULL` ordered by `ordinal`; the
+                -- full historical transcript ignores the column.
+                CREATE TABLE IF NOT EXISTS session_messages (
+                    session_id    TEXT NOT NULL,
+                    ordinal       INTEGER NOT NULL,
+                    role          TEXT NOT NULL,
+                    content       TEXT NOT NULL,
+                    created_at    INTEGER NOT NULL,
+                    superseded_by INTEGER,
+                    PRIMARY KEY (session_id, ordinal)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_messages_active
+                    ON session_messages(session_id, ordinal)
+                    WHERE superseded_by IS NULL;
 
                 CREATE TABLE IF NOT EXISTS memories (
                     id         TEXT PRIMARY KEY,

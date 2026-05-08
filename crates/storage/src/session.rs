@@ -49,21 +49,38 @@ pub trait SessionStore: Send + Sync {
         parent_session_id: &SessionId,
     ) -> Result<Vec<(SessionId, LineageKind)>>;
 
-    /// Persist the conversation transcript (the messages owned by
-    /// `aura_context::ContextManager`) for a session. Replaces any
-    /// prior snapshot. The session row must already exist; the
-    /// caller is responsible for sequencing this after
-    /// [`SessionStore::save`] when the session is brand-new.
-    async fn save_context_messages(
+    /// Append one message to the session's transcript log. The store
+    /// assigns the next ordinal; concurrent callers on the same
+    /// session must be serialized by the caller (the actor model
+    /// already does this — one actor per session).
+    async fn append_session_message(
         &self,
         session_id: &SessionId,
-        messages: &[ChatMessage],
+        message: &ChatMessage,
     ) -> Result<()>;
 
-    /// Load the persisted conversation transcript for a session.
-    /// Returns an empty vector when no snapshot has been written yet
-    /// (cold start, or session created without a turn). Errors
-    /// distinguish from-the-store I/O failures from "no rows" — the
-    /// latter is mapped to the empty-vector branch.
-    async fn load_context_messages(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>>;
+    /// Apply a `/compact`-style compression: mark every currently-
+    /// active row as superseded by the first newly-inserted row, then
+    /// append `new_active` at the next contiguous ordinals. Atomic
+    /// transaction so a partial application can never leave both the
+    /// pre- and post-compaction slices marked active.
+    ///
+    /// `new_active` is what `ContextManager::messages()` returns
+    /// after the strategy applies — i.e. the post-compression active
+    /// transcript. System messages should be filtered out by the
+    /// caller because they are re-injected from config on restore.
+    async fn apply_session_compaction(
+        &self,
+        session_id: &SessionId,
+        new_active: &[ChatMessage],
+    ) -> Result<()>;
+
+    /// Load the active transcript (rows where `superseded_by IS NULL`)
+    /// in ordinal order. Used by the router on actor cold start to
+    /// seed `ContextManager`. Returns empty when the session has no
+    /// turns yet.
+    async fn load_active_session_messages(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ChatMessage>>;
 }

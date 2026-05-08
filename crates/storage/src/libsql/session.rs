@@ -134,6 +134,18 @@ impl SessionStore for LibsqlSessionStore {
             });
         }
 
+        // Cascade the message log first — there's no FK in sqlite, so
+        // a stranded `session_messages` row would otherwise outlive
+        // its parent.
+        tx.execute(
+            "DELETE FROM session_messages WHERE session_id = ?1",
+            libsql::params![session_id.as_str().to_string()],
+        )
+        .await
+        .map_err(|e| {
+            StorageError::Internal(anyhow::anyhow!("libsql delete session_messages: {e}"))
+        })?;
+
         let affected = tx
             .execute(
                 "DELETE FROM sessions WHERE id = ?1",
@@ -271,56 +283,167 @@ impl SessionStore for LibsqlSessionStore {
         Ok(forks)
     }
 
-    async fn save_context_messages(
+    async fn append_session_message(
         &self,
         session_id: &SessionId,
-        messages: &[ChatMessage],
+        message: &ChatMessage,
     ) -> Result<()> {
         let conn = self.pool.conn();
-        let payload = serde_json::to_string(messages)
-            .map_err(|e| StorageError::Storage(format!("serialize context messages: {e}")))?;
+        let role = role_to_str(&message.role);
+        let content = serde_json::to_string(&message.content)
+            .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
+        let now_us = super::time::to_us(chrono::Utc::now());
+        // `INSERT … SELECT COALESCE(MAX(ordinal),-1)+1` keeps ordinals
+        // contiguous without an explicit sequence. The actor model
+        // serialises writes per session, so there's no concurrent-
+        // append race to defend against here.
         conn.execute(
-            "UPDATE sessions SET context_messages = ?2 WHERE id = ?1",
-            libsql::params![session_id.as_str().to_string(), payload],
+            "INSERT INTO session_messages \
+             (session_id, ordinal, role, content, created_at) \
+             SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4 \
+             FROM session_messages WHERE session_id = ?1",
+            libsql::params![
+                session_id.as_str().to_string(),
+                role.to_string(),
+                content,
+                now_us,
+            ],
         )
         .await
         .map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql update context_messages: {e}"))
+            StorageError::Internal(anyhow::anyhow!("libsql append session_message: {e}"))
         })?;
         Ok(())
     }
 
-    async fn load_context_messages(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
+    async fn apply_session_compaction(
+        &self,
+        session_id: &SessionId,
+        new_active: &[ChatMessage],
+    ) -> Result<()> {
+        let conn = self.pool.conn();
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql begin compaction tx: {e}"))
+            })?;
+
+        // Next ordinal doubles as the supersede pointer: every
+        // existing active row points at it, and the first new active
+        // message lands there.
+        let mut rows = tx
+            .query(
+                "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM session_messages WHERE session_id = ?1",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql max ordinal: {e}")))?;
+        let next_ordinal: i64 = match rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            Some(row) => row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?,
+            None => 0,
+        };
+        drop(rows);
+
+        tx.execute(
+            "UPDATE session_messages SET superseded_by = ?2 \
+             WHERE session_id = ?1 AND superseded_by IS NULL",
+            libsql::params![session_id.as_str().to_string(), next_ordinal],
+        )
+        .await
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql supersede: {e}")))?;
+
+        let now_us = super::time::to_us(chrono::Utc::now());
+        for (offset, msg) in new_active.iter().enumerate() {
+            let role = role_to_str(&msg.role);
+            let content = serde_json::to_string(&msg.content)
+                .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
+            tx.execute(
+                "INSERT INTO session_messages \
+                 (session_id, ordinal, role, content, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                libsql::params![
+                    session_id.as_str().to_string(),
+                    next_ordinal + offset as i64,
+                    role.to_string(),
+                    content,
+                    now_us,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql compaction insert: {e}"))
+            })?;
+        }
+
+        tx.commit().await.map_err(|e| {
+            StorageError::Internal(anyhow::anyhow!("libsql commit compaction: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn load_active_session_messages(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ChatMessage>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT context_messages FROM sessions WHERE id = ?1",
+                "SELECT role, content FROM session_messages \
+                 WHERE session_id = ?1 AND superseded_by IS NULL \
+                 ORDER BY ordinal",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
             .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query context_messages: {e}"))
+                StorageError::Internal(anyhow::anyhow!("libsql query session_messages: {e}"))
             })?;
 
-        let row = rows
+        let mut out = Vec::new();
+        while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
-
-        match row {
-            Some(row) => {
-                let payload: Option<String> = row
-                    .get(0)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                match payload {
-                    Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| {
-                        StorageError::Storage(format!("deserialize context messages: {e}"))
-                    }),
-                    _ => Ok(Vec::new()),
-                }
-            }
-            None => Ok(Vec::new()),
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let role: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
+            let content_json: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
+            let content = serde_json::from_str(&content_json)
+                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
+            out.push(aura_model::ChatMessage {
+                role: role_from_str(&role)?,
+                content,
+            });
         }
+        Ok(out)
+    }
+}
+
+fn role_to_str(role: &aura_model::Role) -> &'static str {
+    match role {
+        aura_model::Role::System => "system",
+        aura_model::Role::User => "user",
+        aura_model::Role::Assistant => "assistant",
+        aura_model::Role::Tool => "tool",
+    }
+}
+
+fn role_from_str(s: &str) -> Result<aura_model::Role> {
+    match s {
+        "system" => Ok(aura_model::Role::System),
+        "user" => Ok(aura_model::Role::User),
+        "assistant" => Ok(aura_model::Role::Assistant),
+        "tool" => Ok(aura_model::Role::Tool),
+        other => Err(StorageError::Storage(format!("unknown role: {other}"))),
     }
 }
 

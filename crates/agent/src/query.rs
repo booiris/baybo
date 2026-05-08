@@ -862,14 +862,21 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
-        async fn save_context_messages(
+        async fn append_session_message(
             &self,
             _id: &SessionId,
-            _messages: &[aura_model::ChatMessage],
+            _message: &aura_model::ChatMessage,
         ) -> std::result::Result<(), StorageError> {
             Ok(())
         }
-        async fn load_context_messages(
+        async fn apply_session_compaction(
+            &self,
+            _id: &SessionId,
+            _new_active: &[aura_model::ChatMessage],
+        ) -> std::result::Result<(), StorageError> {
+            Ok(())
+        }
+        async fn load_active_session_messages(
             &self,
             _id: &SessionId,
         ) -> std::result::Result<Vec<aura_model::ChatMessage>, StorageError> {
