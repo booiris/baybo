@@ -46,41 +46,25 @@ const TOOL_USE_OVERHEAD: usize = 20;
 ///
 /// For providers without an official offline tokenizer (Anthropic Claude,
 /// etc.) `cl100k_base` is used as a conservative approximation — counts
-/// are typically within ~10% of the true value.
+/// are typically within ~10% of the true value. `TokenCalibration` (keyed
+/// off the LLM model id passed into `ContextManager::maybe_compress`)
+/// closes that gap at runtime.
 pub struct TiktokenTokenizer {
     bpe: &'static CoreBPE,
 }
 
 impl TiktokenTokenizer {
-    /// cl100k_base — used by GPT-4, GPT-3.5-turbo, text-embedding-3-*,
-    /// and as a fallback for providers without an official tokenizer.
-    pub fn cl100k_base() -> Self {
-        Self {
-            bpe: tiktoken_rs::cl100k_base_singleton(),
-        }
-    }
-
-    /// o200k_base — used by GPT-4o and the o-series reasoning models.
-    pub fn o200k_base() -> Self {
-        Self {
-            bpe: tiktoken_rs::o200k_base_singleton(),
-        }
-    }
-
     /// Pick an encoding suitable for the given model ID. Unknown models
-    /// fall back to `cl100k_base`.
+    /// fall back to `cl100k_base`. The model name is consumed only for
+    /// BPE selection — the LLM model id used as the calibration key is
+    /// passed separately to `ContextManager::maybe_compress`.
     pub fn for_model(model: &str) -> Self {
-        if uses_o200k(model) {
-            Self::o200k_base()
+        let bpe = if uses_o200k(model) {
+            tiktoken_rs::o200k_base_singleton()
         } else {
-            Self::cl100k_base()
-        }
-    }
-}
-
-impl Default for TiktokenTokenizer {
-    fn default() -> Self {
-        Self::cl100k_base()
+            tiktoken_rs::cl100k_base_singleton()
+        };
+        Self { bpe }
     }
 }
 
@@ -145,13 +129,13 @@ mod tests {
 
     #[test]
     fn count_text_empty_is_zero() {
-        let tok = TiktokenTokenizer::cl100k_base();
+        let tok = TiktokenTokenizer::for_model("gpt-4");
         assert_eq!(tok.count_text(""), 0);
     }
 
     #[test]
     fn count_text_is_nonzero_for_real_input() {
-        let tok = TiktokenTokenizer::cl100k_base();
+        let tok = TiktokenTokenizer::for_model("gpt-4");
         let count = tok.count_text("Hello, world! This is a tokenization test.");
         assert!(count > 0);
         assert!(count < 50);
@@ -159,7 +143,7 @@ mod tests {
 
     #[test]
     fn count_message_includes_structural_overhead() {
-        let tok = TiktokenTokenizer::cl100k_base();
+        let tok = TiktokenTokenizer::for_model("gpt-4");
         let msg = ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text("hi".to_string())],
@@ -174,8 +158,8 @@ mod tests {
         // divergent counts on a string that tokenizes differently under
         // the two encodings.
         let sample = "Astrophysicist 🔭";
-        let cl = TiktokenTokenizer::cl100k_base().count_text(sample);
-        let o2 = TiktokenTokenizer::o200k_base().count_text(sample);
+        let cl = TiktokenTokenizer::for_model("gpt-4").count_text(sample);
+        let o2 = TiktokenTokenizer::for_model("gpt-4o").count_text(sample);
 
         assert_eq!(TiktokenTokenizer::for_model("gpt-4").count_text(sample), cl);
         assert_eq!(
@@ -205,7 +189,7 @@ mod tests {
     fn for_model_unknown_falls_back_to_cl100k() {
         let sample = "unknown model test";
         let fallback = TiktokenTokenizer::for_model("some-novel-model-9000").count_text(sample);
-        let cl = TiktokenTokenizer::cl100k_base().count_text(sample);
+        let cl = TiktokenTokenizer::for_model("gpt-4").count_text(sample);
         assert_eq!(fallback, cl);
     }
 }

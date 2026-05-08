@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use aura_model::{ChatMessage, Role};
 
-use super::{CompressOutput, CompressionStrategy, pair_preserving_cut};
-use crate::tokenizer::Tokenizer;
+use super::{ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut};
 
 /// Truncation compression: keeps system messages and the most recent
 /// `keep_recent` non-system messages, discarding everything in between.
@@ -15,7 +14,6 @@ impl Truncate {
         Self { keep_recent }
     }
 
-    /// Partition messages into (system_messages, non_system_messages).
     fn partition_system(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
         let mut system = Vec::new();
         let mut rest = Vec::new();
@@ -35,22 +33,17 @@ impl CompressionStrategy for Truncate {
     async fn compress(
         &self,
         messages: &[ChatMessage],
-        _tokenizer: &dyn Tokenizer,
+        _chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
         let (system_msgs, non_system) = Self::partition_system(messages);
 
         if non_system.len() <= self.keep_recent {
-            return Ok(CompressOutput {
-                messages: messages.to_vec(),
-                llm_call: None,
-            });
+            return Ok(CompressOutput::NoOp);
         }
 
-        // Initial cut by `keep_recent`, then pull the cut leftward as
-        // needed so every kept `ToolResult` still has its originating
-        // `ToolUse` in the tail. Without this, a cut between
-        // `assistant { tool_use }` and the next `user { tool_result }`
-        // produces an LLM payload providers reject.
+        // Pull the cut leftward as needed so every kept `ToolResult`
+        // still has its originating `ToolUse` in the tail. Otherwise
+        // the LLM payload is malformed.
         let initial_cut = non_system.len().saturating_sub(self.keep_recent);
         let kept_start = pair_preserving_cut(&non_system, initial_cut);
         let kept: Vec<ChatMessage> = non_system[kept_start..].to_vec();
@@ -58,9 +51,9 @@ impl CompressionStrategy for Truncate {
         let mut new_messages = system_msgs;
         new_messages.extend(kept);
 
-        Ok(CompressOutput {
+        Ok(CompressOutput::Replaced {
             messages: new_messages,
-            llm_call: None,
+            replaced_full_history: false,
         })
     }
 }
@@ -70,28 +63,6 @@ mod tests {
     use super::*;
     use aura_model::ContentBlock;
 
-    struct SimpleTokenizer;
-
-    impl Tokenizer for SimpleTokenizer {
-        fn count_text(&self, text: &str) -> usize {
-            text.len() / 4 + 1
-        }
-        fn count_image(&self, _w: u32, _h: u32) -> usize {
-            100
-        }
-        fn count_message(&self, msg: &ChatMessage) -> usize {
-            let mut tokens = 4;
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text(text) => tokens += self.count_text(text),
-                    ContentBlock::Image { .. } => tokens += 100,
-                    _ => tokens += 50,
-                }
-            }
-            tokens
-        }
-    }
-
     fn make_msg(role: Role, text: &str) -> ChatMessage {
         ChatMessage {
             role,
@@ -99,10 +70,20 @@ mod tests {
         }
     }
 
+    /// Truncate ignores the chat callback. Asserts via a panic-on-call
+    /// stub so a future regression that wires Truncate into the LLM
+    /// path can't slip past.
+    fn never_chat() -> ChatCallback {
+        Box::new(|_req| {
+            Box::pin(async move {
+                panic!("Truncate must not invoke the chat callback");
+            })
+        })
+    }
+
     #[tokio::test]
     async fn keeps_system_and_recent() {
         let strategy = Truncate::new(2);
-        let tokenizer = SimpleTokenizer;
 
         let messages = vec![
             make_msg(Role::System, "system prompt"),
@@ -113,15 +94,22 @@ mod tests {
             make_msg(Role::User, "msg 3"),
         ];
 
-        let output = strategy.compress(&messages, &tokenizer).await.unwrap();
-        assert_eq!(output.messages.len(), 3); // system + 2 recent
-        assert_eq!(output.messages[0].role, Role::System);
+        match strategy.compress(&messages, never_chat()).await.unwrap() {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                replaced_full_history,
+            } => {
+                assert_eq!(new_messages.len(), 3);
+                assert_eq!(new_messages[0].role, Role::System);
+                assert!(!replaced_full_history, "Truncate keeps the tail in place");
+            }
+            _ => panic!("expected Replaced"),
+        }
     }
 
     #[tokio::test]
-    async fn no_change_when_under_keep_recent() {
+    async fn no_op_when_under_keep_recent() {
         let strategy = Truncate::new(10);
-        let tokenizer = SimpleTokenizer;
 
         let messages = vec![
             make_msg(Role::System, "system"),
@@ -129,7 +117,9 @@ mod tests {
             make_msg(Role::Assistant, "hi"),
         ];
 
-        let output = strategy.compress(&messages, &tokenizer).await.unwrap();
-        assert_eq!(output.messages.len(), 3);
+        match strategy.compress(&messages, never_chat()).await.unwrap() {
+            CompressOutput::NoOp => {}
+            _ => panic!("expected NoOp"),
+        }
     }
 }

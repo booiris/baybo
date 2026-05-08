@@ -4,12 +4,12 @@ use std::sync::Arc;
 use aura_security::SecretVault;
 use serde::{Deserialize, Serialize};
 
-use crate::LlmClient;
 use crate::providers::{
     anthropic::AnthropicProviderFactory, gemini::GeminiProviderFactory,
     minimax::MiniMaxProviderFactory, openai::OpenAIProviderFactory,
     openai_subscription::OpenAiSubscriptionProviderFactory,
 };
+use crate::{BlobFetcher, GuardedLlm, LlmCallGuard, LlmClient, LlmCompletion};
 
 /// Configuration for creating an LLM provider client.
 #[derive(Clone, Serialize, Deserialize)]
@@ -236,10 +236,39 @@ impl LlmProviderRegistry {
         factory.live_models(config).await
     }
 
-    /// Creates an `LlmClient` using the factory that matches `config.provider`.
-    /// Applies `config.supports_vision` as a post-factory override so each
-    /// individual provider doesn't have to forward the flag.
-    pub fn create_client(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
+    /// **The** public production constructor. Builds the raw client
+    /// internally, attaches an optional blob fetcher, and wraps the
+    /// whole thing in a [`GuardedLlm`] sealed by `guard`. Returns
+    /// `Arc<GuardedLlm>` so callers can fan it out to consumers
+    /// without ever holding a raw `LlmClient` / `Arc<dyn
+    /// LlmCompletion>` at a public boundary.
+    ///
+    /// `blob_fetcher` is optional; passing `None` is correct for
+    /// text-only deployments and one-shot probes. `guard` is supplied
+    /// by the caller — production wires `aura_agent::CostManager`'s
+    /// guard, while CLI / test fixtures pass
+    /// `Arc::new(|| Ok(()))` (or use [`GuardedLlm::passthrough`] /
+    /// [`crate::guard::LlmCallGuard`] directly).
+    pub fn create_client(
+        &self,
+        config: &LlmProviderConfig,
+        blob_fetcher: Option<Arc<dyn BlobFetcher>>,
+        guard: LlmCallGuard,
+    ) -> crate::Result<Arc<GuardedLlm>> {
+        let mut client = self.build_client(config)?;
+        if let Some(fetcher) = blob_fetcher {
+            client = client.with_blob_fetcher(fetcher);
+        }
+        let inner: Arc<dyn LlmCompletion> = Arc::new(client);
+        Ok(GuardedLlm::new(inner, guard))
+    }
+
+    /// Internal raw-client construction. Kept `pub(crate)` because
+    /// every external call should go through [`Self::create_client`]
+    /// (which seals the result in a `GuardedLlm`). The internal tests
+    /// in this crate still use this directly to exercise provider
+    /// factories without dragging the guard layer in.
+    pub(crate) fn build_client(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let factory = self.factories.get(&config.provider).ok_or_else(|| {
             crate::LlmError::ModelNotFound(format!("unknown LLM provider: {}", config.provider))
         })?;

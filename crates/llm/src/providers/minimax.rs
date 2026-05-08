@@ -108,16 +108,17 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
             .bearer_auth(api_key)
             .send()
             .await
-            .map_err(|e| crate::LlmError::Provider(format!("minimax GET /v1/models: {e}")))?;
+            .map_err(|e| crate::reqwest_to_error(e, "minimax GET /v1/models"))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(crate::LlmError::Provider(format!(
-                "minimax GET /v1/models returned {status}: {body}"
-            )));
+            return Err(crate::status_to_error(
+                status.as_u16(),
+                format!("minimax GET /v1/models returned {status}: {body}"),
+            ));
         }
         let payload: ModelListResponse = resp.json().await.map_err(|e| {
-            crate::LlmError::Provider(format!("minimax /v1/models: parse response: {e}"))
+            crate::LlmError::Decode(format!("minimax /v1/models: parse response: {e}"))
         })?;
         let mut out: Vec<LiveModelInfo> = payload
             .data
@@ -230,7 +231,7 @@ mod tests {
         // post-factory override path inside `create_client`.
         let registry = crate::registry::LlmProviderRegistry::with_default_providers();
         let client = registry
-            .create_client(&LlmProviderConfig {
+            .build_client(&LlmProviderConfig {
                 provider: "minimax".into(),
                 api_key: Some("test-key".into()),
                 base_url: None,
@@ -250,7 +251,7 @@ mod tests {
         // image path costs are unwanted).
         let registry = crate::registry::LlmProviderRegistry::with_default_providers();
         let client = registry
-            .create_client(&LlmProviderConfig {
+            .build_client(&LlmProviderConfig {
                 provider: "anthropic".into(),
                 api_key: Some("test-key".into()),
                 base_url: None,

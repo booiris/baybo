@@ -1,6 +1,17 @@
 use async_trait::async_trait;
 use aura_model::ContentBlock;
 
+/// Bare name (no leading `/`) of the compact slash command. Used by
+/// the gateway slash manifest to register the command with sidecars
+/// (Telegram `setMyCommands`, …); paired with [`COMPACT_COMMAND`] for
+/// the form users actually type.
+pub const COMPACT_COMMAND_NAME: &str = "compact";
+
+/// Full leading-slash form of the compact command — what users type
+/// and what the agent actor matches against to short-circuit into a
+/// compression pass.
+pub const COMPACT_COMMAND: &str = "/compact";
+
 /// Outcome of inspecting a `/`-prefixed line.
 ///
 /// Channel adapters call [`SlashHandler::handle`] on any input that starts

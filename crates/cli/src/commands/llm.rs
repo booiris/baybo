@@ -120,7 +120,7 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
         reasoning_effort: entry.reasoning_effort.clone(),
         vault: ctx.secret_vault.clone(),
     };
-    match registry.create_client(&cfg) {
+    match registry.create_client(&cfg, None, std::sync::Arc::new(|| Ok(()))) {
         Err(e) => Err(CliError::Manager(format!(
             "build provider client for {}: {e}",
             entry.name

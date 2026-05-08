@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_llm::{ChatRequest, LlmCompletion};
+use aura_llm::{ChatRequest, GuardedLlm};
 use aura_model::{ChatMessage, ContentBlock, Role};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
@@ -136,7 +136,7 @@ pub struct WebFetchTool {
     /// Optional side LLM for prompt-driven extraction. `None` falls back
     /// to returning the raw rendered markdown verbatim — the prompt is
     /// then silently ignored, matching the pre-LLM behaviour.
-    llm: Option<Arc<dyn LlmCompletion>>,
+    llm: Option<Arc<GuardedLlm>>,
 }
 
 impl WebFetchTool {
@@ -185,7 +185,7 @@ impl WebFetchTool {
     /// fixed extraction system prompt and the model's reply replaces the
     /// raw body in the tool output. Without it the prompt is silently
     /// ignored.
-    pub fn with_llm(mut self, llm: Arc<dyn LlmCompletion>) -> Self {
+    pub fn with_llm(mut self, llm: Arc<GuardedLlm>) -> Self {
         self.llm = Some(llm);
         self
     }
@@ -382,7 +382,7 @@ Usage notes:
             p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()),
         ) {
             let summary_input = truncate_utf8(rendered.as_bytes(), MAX_SUMMARY_INPUT_BYTES);
-            let summary = run_summary(llm.as_ref(), prompt_text, &summary_input, ctx).await;
+            let summary = run_summary(llm, prompt_text, &summary_input, ctx).await;
             return match summary {
                 Ok(text) => {
                     let output = truncate_utf8(text.as_bytes(), MAX_OUTPUT_BYTES);
@@ -421,7 +421,7 @@ Usage notes:
 /// `(prompt, page)` pair. Honours `ctx.cancellation_token` and `ctx.timeout`
 /// so a slow model can't pin the outer deadline.
 async fn run_summary(
-    llm: &dyn LlmCompletion,
+    llm: &GuardedLlm,
     prompt: &str,
     page: &str,
     ctx: &ToolContext,
@@ -527,6 +527,7 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_llm::LlmCompletion;
     use aura_model::{ChannelType, User};
     use axum::{
         Router,
@@ -1059,7 +1060,7 @@ mod tests {
         ))
         .await;
 
-        let llm: Arc<dyn LlmCompletion> = stub.clone();
+        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
         let tool = WebFetchTool::for_testing().with_llm(llm);
         let out = tool
             .execute(
@@ -1111,7 +1112,7 @@ mod tests {
             }),
         ))
         .await;
-        let llm: Arc<dyn LlmCompletion> = stub.clone();
+        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
         let tool = WebFetchTool::for_testing().with_llm(llm);
         let out = tool
             .execute(json!({ "url": url_to(&server, "/") }), &ctx())
@@ -1136,7 +1137,7 @@ mod tests {
             get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "ok") }),
         ))
         .await;
-        let llm: Arc<dyn LlmCompletion> = stub.clone();
+        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
         let tool = WebFetchTool::for_testing().with_llm(llm);
         let out = tool
             .execute(
@@ -1162,14 +1163,14 @@ mod tests {
         use aura_llm::test_support::StubLlm;
 
         let stub = Arc::new(StubLlm::new());
-        stub.push_response_err(LlmError::Provider("boom".into()));
+        stub.push_response_err(LlmError::Transient("boom".into()));
 
         let server = spawn(Router::new().route(
             "/",
             get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "page text") }),
         ))
         .await;
-        let llm: Arc<dyn LlmCompletion> = stub.clone();
+        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
         let tool = WebFetchTool::for_testing().with_llm(llm);
         let out = tool
             .execute(

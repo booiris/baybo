@@ -21,8 +21,9 @@ linux = []
 # Compile-in macOS-specific code paths (currently: launchd installer).
 macos = []
 # Exposes test helpers to downstream crate-level tests. Never enabled in
-# release builds.
-test-support = []
+# release builds. Pulls in `aura-llm/test-support` so the gateway's own
+# test fixtures can construct `GuardedLlm::passthrough`.
+test-support = ["aura-llm/test-support"]
 
 [dependencies]
 aura-agent = { workspace = true }

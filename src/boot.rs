@@ -17,7 +17,7 @@ use aura_config::{
 };
 use aura_context::TokenBudget;
 use aura_llm::credentials::resolve_api_key;
-use aura_llm::{LlmClient, LlmProviderConfig, LlmProviderRegistry};
+use aura_llm::{GuardedLlm, LlmCallGuard, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
 use aura_skills_assessor::AssessmentMode;
 use aura_workspace::WorkspacePaths;
@@ -74,20 +74,36 @@ pub fn resolve_config_path() -> Option<PathBuf> {
     default.exists().then_some(default)
 }
 
-/// Build an `LlmClient` from the `default-llm` entry of an `AuraConfig`,
-/// resolving the api key through env then vault.
+/// Build an [`Arc<GuardedLlm>`] from the `default-llm` entry of an
+/// `AuraConfig`, resolving the api key through env then vault. The
+/// returned handle is sealed: every `chat`/`chat_stream` runs through
+/// `guard` first.
 ///
-/// `blob_store` is optional. When `Some`, the client is wired with a
-/// `BlobFetcher` so vision-capable models actually receive image
-/// bytes; without it, multimodal blocks degrade to a text stub even
-/// on a model that claims `supports_vision: true`. Pass `None` only
-/// for one-shot tooling (e.g. a `probe` subcommand) that never sends
-/// multimodal content.
+/// `registry` is borrowed by the caller so the same instance can be
+/// reused for harvesting `all_known_pricings()` and constructing the
+/// client — `LlmProviderRegistry::with_default_providers()` is cheap
+/// but the runtime needs both anyway, and threading a single registry
+/// makes the "one source of truth for providers" relationship
+/// explicit at the call site.
+///
+/// `blob_store` is optional. When `Some`, the inner client is wired
+/// with a `BlobFetcher` so vision-capable models actually receive
+/// image bytes; without it, multimodal blocks degrade to a text stub
+/// even on a model that claims `supports_vision: true`. Pass `None`
+/// only for one-shot tooling (e.g. a `probe` subcommand) that never
+/// sends multimodal content.
+///
+/// `guard` is the gate the resulting client will run before every
+/// LLM call. Production wiring derives this from `CostManager`; CLI
+/// `aura llm probe` and similar one-shot tools pass an
+/// always-`Ok(())` closure so the probe isn't billed against anyone.
 pub async fn build_llm_client(
     cfg: &AuraConfig,
+    registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
-) -> anyhow::Result<LlmClient> {
+    guard: LlmCallGuard,
+) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
     let entry = cfg.default_llm_entry().ok_or_else(|| {
         if cfg.llm.is_empty() {
             anyhow::anyhow!(
@@ -105,17 +121,20 @@ pub async fn build_llm_client(
             )
         }
     })?;
-    build_llm_client_for_entry(entry, blob_store, vault).await
+    build_llm_client_for_entry(entry, registry, blob_store, vault, guard).await
 }
 
-/// Build an `LlmClient` from a specific entry. Same wiring as
-/// `build_llm_client` but lets callers (CLI tooling: probe, live model
-/// listing) pin a non-default entry.
+/// Same wiring as [`build_llm_client`] but pinned to a specific
+/// non-default entry. Used by CLI tooling (`probe`, live model
+/// listing) and by the runtime when the active entry isn't the
+/// default.
 pub async fn build_llm_client_for_entry(
     entry: &LlmEntry,
+    registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
-) -> anyhow::Result<LlmClient> {
+    guard: LlmCallGuard,
+) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
     let api_key = resolve_api_key(
         &entry.name,
         &entry.provider,
@@ -123,26 +142,24 @@ pub async fn build_llm_client_for_entry(
         vault.as_deref(),
     )
     .await;
-    let registry = LlmProviderRegistry::with_default_providers();
-    let client = registry
-        .create_client(&LlmProviderConfig {
-            provider: entry.provider.clone(),
-            api_key,
-            base_url: entry.base_url.clone(),
-            model: entry.model.clone(),
-            supports_vision: entry.supports_vision,
-            reasoning_effort: entry.reasoning_effort.clone(),
-            vault,
-        })
-        .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))?;
-    Ok(match blob_store {
-        Some(store) => {
-            let fetcher: std::sync::Arc<dyn aura_llm::BlobFetcher> =
-                std::sync::Arc::new(BlobStoreFetcher(store));
-            client.with_blob_fetcher(fetcher)
-        }
-        None => client,
-    })
+    let blob_fetcher: Option<std::sync::Arc<dyn aura_llm::BlobFetcher>> = blob_store.map(|store| {
+        std::sync::Arc::new(BlobStoreFetcher(store)) as std::sync::Arc<dyn aura_llm::BlobFetcher>
+    });
+    registry
+        .create_client(
+            &LlmProviderConfig {
+                provider: entry.provider.clone(),
+                api_key,
+                base_url: entry.base_url.clone(),
+                model: entry.model.clone(),
+                supports_vision: entry.supports_vision,
+                reasoning_effort: entry.reasoning_effort.clone(),
+                vault,
+            },
+            blob_fetcher,
+            guard,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))
 }
 
 /// Bridge `aura_storage::BlobStore` into `aura_llm::BlobFetcher`. Lives
@@ -157,7 +174,7 @@ impl aura_llm::BlobFetcher for BlobStoreFetcher {
         self.0
             .get(blob_id)
             .await
-            .map_err(|e| aura_llm::LlmError::Provider(format!("blob fetch: {e}")))
+            .map_err(|e| aura_llm::LlmError::Transient(format!("blob fetch: {e}")))
     }
 }
 

@@ -100,16 +100,17 @@ impl LlmProviderFactory for AnthropicProviderFactory {
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .send()
             .await
-            .map_err(|e| crate::LlmError::Provider(format!("anthropic GET /v1/models: {e}")))?;
+            .map_err(|e| crate::reqwest_to_error(e, "anthropic GET /v1/models"))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(crate::LlmError::Provider(format!(
-                "anthropic GET /v1/models returned {status}: {body}"
-            )));
+            return Err(crate::status_to_error(
+                status.as_u16(),
+                format!("anthropic GET /v1/models returned {status}: {body}"),
+            ));
         }
         let payload: ModelListResponse = resp.json().await.map_err(|e| {
-            crate::LlmError::Provider(format!("anthropic /v1/models: parse response: {e}"))
+            crate::LlmError::Decode(format!("anthropic /v1/models: parse response: {e}"))
         })?;
         Ok(payload
             .data

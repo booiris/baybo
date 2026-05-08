@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, OutgoingMessage};
+use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobOutput};
 use aura_llm::{
-    ChatRequest, LlmCompletion, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
+    ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
 use aura_model::{ChatMessage, ContentBlock, JobId, Role};
 use futures::StreamExt;
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
 use aura_model::Session;
-use aura_skills::{SkillRegistry, SkillSummary};
+use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_skills_assessor::SkillAssessor;
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
@@ -20,6 +20,7 @@ use aura_trace::{
 };
 use tracing::{debug, info, warn};
 
+use crate::compression::CompressionRunner;
 use crate::error_recovery::ErrorHandler;
 use crate::job::{JobLifecycle, JobSpec};
 use crate::policy::ExecutionPolicy;
@@ -179,7 +180,7 @@ enum IterationOutcome {
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
-    llm_client: Arc<dyn LlmCompletion>,
+    llm_client: Arc<GuardedLlm>,
     tool_registry: Arc<ToolRegistry>,
     skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
@@ -205,19 +206,15 @@ pub struct AgentLoop {
     /// error, latency, model metadata) to
     /// `<workspace>/logs/sessions/<session_id>.jsonl`.
     session_log: Option<Arc<SessionLlmLogger>>,
-    /// Optional cost gate + ledger. When set, [`Self::run_iteration`]
-    /// rejects via [`crate::cost::CostManager::check`] *before*
-    /// dispatching the next LLM call, and [`Self::call_llm`] feeds the
-    /// observed token counts (success or partial-on-error) back via
-    /// [`crate::cost::CostManager::record_call`] so the next iteration's
-    /// gate sees the spend immediately.
+    /// Cost gate + ledger; `record_call` feeds spend back so the
+    /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
     cost_manager: Option<Arc<crate::cost::CostManager>>,
 }
 
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        llm_client: Arc<dyn LlmCompletion>,
+        llm_client: Arc<GuardedLlm>,
         tool_registry: Arc<ToolRegistry>,
         skill_registry: Arc<SkillRegistry>,
         tool_executor: Arc<ToolExecutor>,
@@ -416,13 +413,13 @@ impl AgentLoop {
 
         if let Some((skill_name, args)) = detect_slash_invocation(&user_text, &skills_for_turn) {
             let synthesized_id = format!("synthskill-{}", uuid::Uuid::new_v4());
-            let mut input = serde_json::json!({ "skill": skill_name });
+            let mut input = serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name });
             if !args.is_empty() {
                 input["args"] = serde_json::Value::String(args);
             }
             let tool_use_block = ContentBlock::ToolUse {
                 id: synthesized_id.clone(),
-                name: "Skill".to_string(),
+                name: SKILL_TOOL_NAME.to_string(),
                 input: input.clone(),
                 signature: None,
             };
@@ -454,7 +451,7 @@ impl AgentLoop {
                 move |step| async move {
                     let res = executor_clone
                         .execute(
-                            "Skill",
+                            SKILL_TOOL_NAME,
                             input_clone,
                             &session_id_clone,
                             &user_clone,
@@ -869,13 +866,6 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
-            // Re-check before *every* attempt, not just the first.
-            // Streaming partial-usage is billed via record_call even
-            // when the call ends in Err, so a retry past a cap-breach
-            // would silently keep accumulating spend without this gate.
-            if let Some(cm) = &self.cost_manager {
-                cm.check().map_err(|e| anyhow::anyhow!(e))?;
-            }
             match self.call_llm(session, span_recorder, step, delta_tx).await {
                 Ok(pair) => return Ok(pair),
                 Err(e) => {
@@ -1009,15 +999,12 @@ impl AgentLoop {
                         (finalize, Ok((response, span.span_id)))
                     }
                     Err(e) => {
-                        // Surface the *sanitized* message: this Err
-                        // bubbles into `with_llm_span`, which writes
-                        // `e.to_string()` into the span's
-                        // `Failed { reason }` (via `outcome_for`) and
-                        // from there into persisted trace storage.
-                        // Returning the raw `e` would leak any secrets
-                        // in the upstream provider error text.
+                        // Sanitize the JSONL log; return the raw typed
+                        // `LlmError` so `should_retry` can dispatch on
+                        // the variant. The trace's `Failed` reason
+                        // still carries the provider text.
                         let raw = e.to_string();
-                        let error_msg = self
+                        let log_msg = self
                             .security_gateway
                             .sanitize_error(&raw)
                             .await
@@ -1026,15 +1013,13 @@ impl AgentLoop {
                             session,
                             &request,
                             LlmCallOutcome::Err {
-                                error: error_msg.clone(),
+                                error: log_msg,
                                 latency_ms,
                             },
                         )
                         .await;
                         // Bill the partial-stream tokens so a failed
-                        // LLM call still leaves a `cost_records` row
-                        // — operators see the attempt rather than
-                        // silently under-counting.
+                        // call still leaves a `cost_records` row.
                         let finalize = LlmCallResult {
                             output_content: String::new(),
                             thinking: None,
@@ -1044,7 +1029,7 @@ impl AgentLoop {
                             cached_input_tokens: partial_usage.cached_input_tokens,
                             cache_creation_input_tokens: partial_usage.cache_creation_input_tokens,
                         };
-                        (finalize, Err(anyhow::anyhow!(error_msg)))
+                        (finalize, Err(anyhow::Error::new(e)))
                     }
                 };
 
@@ -1065,6 +1050,13 @@ impl AgentLoop {
                         finalize.cache_creation_input_tokens,
                     );
                 }
+
+                // `record_call_actual` self-skips on zero. Pass
+                // `session.messages` because the assistant message is
+                // inserted later by `insert_session_message`, so the
+                // slice here matches what the provider billed.
+                self.context_manager
+                    .record_call_actual(&session.messages, finalize.input_tokens);
 
                 (finalize, value_result)
             },
@@ -1110,7 +1102,7 @@ impl AgentLoop {
         session: &mut Session,
         message: &ChatMessage,
     ) -> anyhow::Result<()> {
-        self.context_manager.append(session, message).await?;
+        self.context_manager.append(session, message);
         self.write_session_message_log(session, message).await;
         Ok(())
     }
@@ -1481,11 +1473,12 @@ impl AgentLoop {
         }
     }
 
-    /// Compress if the budget calls for it. When the strategy ran an
-    /// LLM call, brackets it in a `StepKind::Compression` step +
-    /// `SpanKind::LlmCall` span so the cost lands in per-step
-    /// aggregation. Strategies that don't call an LLM (e.g. `Truncate`)
-    /// don't open a step.
+    /// Compress if the budget calls for it. The `chat` closure is
+    /// invoked only when the strategy returns `NeedsLlmCall`; pure
+    /// strategies (Truncate, Summarize fallback) skip it entirely. The
+    /// closure brackets the real LLM call in a `Compression` step +
+    /// `LlmCall` span and records cost against that span — budget
+    /// enforcement on the call itself rides on the wrapped client.
     async fn compress_if_needed(
         &mut self,
         session: &mut Session,
@@ -1493,60 +1486,99 @@ impl AgentLoop {
         job_id: JobId,
         cancel_token: &CancellationToken,
     ) -> anyhow::Result<()> {
-        let outcome = self.context_manager.maybe_compress(session).await?;
-        let Some(stats) = outcome else {
-            return Ok(());
+        let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
+        let model_id = runner.model_info.id.clone();
+        self.context_manager
+            .maybe_compress(session, &model_id, |req| runner.run(req))
+            .await?;
+        Ok(())
+    }
+
+    fn build_compression_runner(
+        &self,
+        session: &Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        cancel_token: &CancellationToken,
+    ) -> CompressionRunner {
+        let model_info = self.llm_client.model_info().clone();
+        CompressionRunner {
+            llm_client: self.llm_client.clone(),
+            recorder: Arc::clone(span_recorder),
+            cost_manager: self.cost_manager.clone(),
+            security_gateway: Arc::clone(&self.security_gateway),
+            job_id,
+            user_id: session.user.id.clone(),
+            session_id: session.id.clone(),
+            model_info,
+            cancel_token: cancel_token.clone(),
+        }
+    }
+
+    /// Run an on-demand compression pass and return the confirmation
+    /// text for the caller to ship as an `AgentOutput::Notice`.
+    /// Strategy NoOp surfaces as "nothing to compress" rather than an
+    /// error. A fresh job is minted so the compression step + LLM
+    /// span land on a real lifecycle.
+    pub async fn compact_now(
+        &mut self,
+        session: &mut Session,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        parent_job_id: Option<JobId>,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<String> {
+        // Match the session trigger so the JobKind invariant holds for
+        // both user-triggered and spawned sessions. `/compact` is a
+        // user-typed command, so UserChat is the natural default; for
+        // sessions whose root trigger is anything else (Cron / System
+        // / Spawned) we fall back to JobKind::Spawned which is allowed
+        // under every trigger.
+        let job_input = match session.trigger.kind() {
+            aura_model::TriggerKind::User => JobInput::UserChat {
+                content: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
+            },
+            _ => JobInput::Spawned {
+                initial_prompt: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
+            },
         };
-        debug!(
-            before = stats.before_tokens,
-            after = stats.after_tokens,
-            "compressed context before LLM call"
-        );
-        let Some(call) = stats.llm_call else {
-            return Ok(());
+        let spec = JobSpec {
+            session_id: session.id.clone(),
+            session_trigger_kind: session.trigger.kind(),
+            input: job_input,
+            effective_soul_version: session.bound_soul_version.clone(),
+            parent_job_id,
         };
 
-        // Post-hoc record — `SpanRecorder::end_span` publishes
-        // `LlmSpanEnded` for the cost subscriber regardless of
-        // wall-clock ordering.
-        let llm_call_kind = SpanKind::LlmCall {
-            begin: LlmCallBegin {
-                model_id: call.model_id,
-                provider: call.provider,
-                provider_config_hash: String::new(),
-                input_messages: Vec::new(),
-                temperature: None,
-            },
-            result: None,
-        };
-        let finalize = SpanFinalize::LlmCall(LlmCallResult {
-            output_content: String::new(),
-            thinking: None,
-            tool_calls: vec![],
-            input_tokens: call.input_tokens,
-            output_tokens: call.output_tokens,
-            cached_input_tokens: call.cached_input_tokens,
-            cache_creation_input_tokens: call.cache_creation_input_tokens,
-        });
-        let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
-        let rec = span_recorder.as_ref();
-        crate::scope::with_step(
-            rec,
-            job_id,
-            StepKind::Compression,
-            cancel_ctx,
-            |step| async move {
-                crate::scope::with_span(
-                    rec,
-                    &step,
-                    job_id,
-                    llm_call_kind,
-                    None,
-                    cancel_ctx,
-                    |_span| async move { Ok((finalize, LifecycleOutcome::Ok, ())) },
-                )
-                .await?;
-                Ok((LifecycleOutcome::Ok, ()))
+        crate::scope::with_job(
+            job_lifecycle,
+            cancel_token.clone(),
+            spec,
+            |job_id| async move {
+                let before = self.context_manager.budget().current();
+                let runner =
+                    self.build_compression_runner(session, span_recorder, job_id, &cancel_token);
+                let model_id = runner.model_info.id.clone();
+                let outcome = self
+                    .context_manager
+                    .force_compress(session, &model_id, |req| runner.run(req))
+                    .await?;
+                let after = self.context_manager.budget().current();
+                let text = match outcome {
+                    aura_context::CompressionOutcome::Compressed => {
+                        format!(
+                            "Context compressed: {before} → {after} tokens ({} freed).",
+                            before.saturating_sub(after)
+                        )
+                    }
+                    aura_context::CompressionOutcome::NoChange => {
+                        "Nothing to compress.".to_string()
+                    }
+                };
+                let output = JobOutput::Message {
+                    content: vec![ContentBlock::Text(text.clone())],
+                };
+                Ok((output, text))
             },
         )
         .await
@@ -1584,15 +1616,7 @@ impl AgentLoop {
 /// Uses the skill *name* (the value the model passes as `Skill`'s `skill`
 /// argument), not the slash command — slash commands are a user-input
 /// affordance, while reminders direct the model's tool invocation.
-fn format_skill_body(sk: &SkillSummary) -> String {
-    let mut line = format!("{}: {}", sk.name, sk.description.trim());
-    if let Some(hint) = sk.argument_hint.as_deref() {
-        line.push(' ');
-        line.push_str(hint);
-    }
-    line
-}
-
+///
 /// Compare `current` against `previous` (last turn's `active_skills`
 /// names) and return a `<system-reminder>`-wrapped *full* skill list when
 /// the set has changed, or `None` when it has not.
@@ -1616,23 +1640,7 @@ fn build_skill_reminder_if_changed(
     if prev_set == cur_set {
         return None;
     }
-
-    if current.is_empty() {
-        return Some(String::from(
-            "<system-reminder>\nNo skills are currently available.\n</system-reminder>",
-        ));
-    }
-
-    let mut s = String::from(
-        "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n",
-    );
-    for sk in current {
-        s.push_str("- ");
-        s.push_str(&format_skill_body(sk));
-        s.push('\n');
-    }
-    s.push_str("</system-reminder>");
-    Some(s)
+    Some(aura_skills::render::render_skill_reminder(current))
 }
 
 /// Strip leading/trailing whitespace from the LLM response's text fields.

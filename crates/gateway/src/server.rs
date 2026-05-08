@@ -32,7 +32,7 @@ use aura_agent::{
 };
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_llm::LlmClient;
+use aura_llm::GuardedLlm;
 use aura_pairing::PairingService;
 use aura_security::SecretVault;
 use aura_skills::SkillRegistry;
@@ -74,7 +74,7 @@ pub struct GatewayDeps {
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
-    pub llm_client: Arc<LlmClient>,
+    pub llm_client: Arc<GuardedLlm>,
     /// Bearer token for the admin TCP listener. Stored in the vault as
     /// `gateway.admin_token`.
     pub admin_token: String,
@@ -127,7 +127,7 @@ pub struct AdminState {
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
-    pub llm_client: Arc<LlmClient>,
+    pub llm_client: Arc<GuardedLlm>,
     pub log_buffer: Arc<LogBuffer>,
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
     pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
@@ -165,15 +165,15 @@ impl AdminState {
             job_lifecycle: Arc::clone(&deps.job_lifecycle),
             cron_scheduler: Arc::clone(&deps.cron_scheduler),
             memory_manager: Arc::clone(&deps.memory_manager),
-            trace_store: deps.stores.trace.clone(),
-            cost_store: deps.stores.cost.clone(),
+            trace_store: Arc::clone(&deps.stores.trace),
+            cost_store: Arc::clone(&deps.stores.cost),
             query_api,
             skill_registry: Arc::clone(&deps.skill_registry),
             tool_registry: Arc::clone(&deps.tool_registry),
             channel_registry: Arc::clone(&deps.channel_registry),
             llm_client: Arc::clone(&deps.llm_client),
             log_buffer: Arc::clone(&deps.log_buffer),
-            channel_bot_store: deps.stores.channel_bot.clone(),
+            channel_bot_store: Arc::clone(&deps.stores.channel_bot),
             channel_control: Arc::clone(&deps.channel_control),
             secret_vault: Arc::clone(&deps.secret_vault),
             bind_display: deps.runtime_config.admin_bind.to_string(),
