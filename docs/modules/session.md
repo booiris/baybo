@@ -35,9 +35,33 @@ A spawned session's `trigger` is **inherited from the root** session (so a subag
 
 `Session.root_session_id` is self-referential when the session has no `Lineage` parent, and otherwise transitively points to the topmost ancestor. This lets ancestry queries (cost roll-ups, audit aggregation) hit one row instead of recursing.
 
+### Actor-model write serialization
+
+One `AgentActor` per session. All messages targeting the same session (user input, cron, rollback, timeout) are queued through the actor handle and consumed sequentially. Therefore `SessionStore` implementations do not need to defend against concurrent writes on the same `session_id` — that guarantee comes from the actor model and is what lets `append_session_message` use a single `INSERT … SELECT MAX(ordinal)+1` without locking. Re-introducing concurrent paths into the session would invalidate the storage contract.
+
 ### Source deletion is rejected when live forks exist
 
 `SessionStore::delete(source_id)` returns `Err(SessionError::HasLiveForks { fork_session_ids })` when any session has a `Lineage::UserFork` pointing into the source. Callers must delete the forks first or accept the error. There is no materialize-on-delete escape hatch — the case is rare enough to surface as an error rather than silently rewrite snapshots. The same delete cascades the session's `session_messages` rows so a stranded transcript can never outlive its parent.
+
+### Subagent parent deletion drains the subtree first
+
+When a session with an in-flight subagent is deleted, the subagent's cancellation token is tripped (`Cancelled { ParentDeleted }`) **before** the parent row is removed. This drains the entire descendant subtree before the delete completes, so a parent never disappears while a child is still running tools or holding LLM state.
+
+### Session ID conventions
+
+`SessionId` is a caller-supplied opaque string. Producers prefix a UUID v4 to namespace by channel:
+- CLI: `cli-<uuid>` — one id per process.
+- Cron: `cron-<user>-<channel>` — stable across triggers so repeated firings resume the same session.
+- Subagent / fork: minted by `create_spawned_session` from the parent's id and the lineage kind.
+
+`SessionManager::create_session` generates a bare UUID v4 only when no id is requested. A spawned session's `trigger` must equal its root session's `trigger` — enforced at `create_session` time.
+
+### `SessionState` fields
+
+- `active_skills`: skill names invoked this turn (slash-command or `/mention`, score ≥ 0.9). Repopulated each turn by `AgentLoop` from the active band; pure provenance for trace/CLI display. Tool governance is computed separately as the union of those skills' `allowed_tools` lists. See [`agent.md`](agent.md).
+- `compression_count`: incremented after each successful context compression. Used by monitoring / strategy switching to detect runaway growth.
+- `approved_resources`: tool resources the user has granted permanent approval for in this session, populated on each `ApproveAlways` decision. See [`tools.md`](tools.md).
+- `extra`: reserved extension fields for experimental features or plugin state.
 
 ### Soul-version drift
 

@@ -388,6 +388,19 @@ impl ContextManager {
             } => (messages, replaced_full_history),
         };
 
+        // Refuse to apply an empty replacement: persist would mark
+        // every active row in `session_messages` as superseded with
+        // no successor, leaving the active slice empty until the
+        // next turn re-seeds the system prompt. Currently
+        // unreachable through the in-tree strategies (Summarize and
+        // Truncate both retain at least the system message), so
+        // treat it as a strategy contract violation rather than a
+        // routine outcome.
+        if new_messages.is_empty() {
+            warn!("compression strategy produced an empty replacement; refusing to apply");
+            return Ok(CompressionOutcome::StrategyDeclined);
+        }
+
         // Strategy with `replaced_full_history` discarded the
         // historical skill_reminder / tool_use trail; the manager
         // re-attaches the authoritative reminder + per-skill detail

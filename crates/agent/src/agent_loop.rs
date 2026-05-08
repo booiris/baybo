@@ -929,14 +929,12 @@ impl AgentLoop {
         // original unmerged transcript so each logical entry — reminder,
         // user prompt, assistant turn — stays separately inspectable.
         // Merging is a transport concern, not a storage one.
-        let transcript = self.context_manager.messages();
         let request = ChatRequest {
-            messages: merge_for_llm(transcript),
+            messages: merge_for_llm(self.context_manager.messages()),
             temperature: None,
             tools: tool_defs,
         };
 
-        let _ = transcript;
         let input_messages = self.context_manager.build_call_input_marker().await;
 
         crate::scope::with_llm_span(

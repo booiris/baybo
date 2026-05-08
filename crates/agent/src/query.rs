@@ -876,11 +876,15 @@ mod tests {
         }
     }
 
-    /// Minimal in-memory `SessionStore` for query-API tests — we
-    /// only need `get` + `list_lineage_children` for these.
+    /// Minimal in-memory `SessionStore` for query-API tests. The
+    /// `session_messages` log is a real append-only vector so the
+    /// hydration test can drive the same supersede semantics the
+    /// libsql backend implements.
+    #[derive(Default)]
     struct MemSessionStore {
         sessions: parking_lot::Mutex<HashMap<SessionId, Session>>,
         children: parking_lot::Mutex<HashMap<SessionId, Vec<(SessionId, LineageKind)>>>,
+        messages: parking_lot::Mutex<HashMap<SessionId, Vec<aura_storage::StoredMessage>>>,
     }
 
     #[async_trait::async_trait]
@@ -925,35 +929,72 @@ mod tests {
         }
         async fn append_session_message(
             &self,
-            _id: &SessionId,
-            _message: &aura_model::ChatMessage,
+            id: &SessionId,
+            message: &aura_model::ChatMessage,
         ) -> std::result::Result<(), StorageError> {
+            let mut guard = self.messages.lock();
+            let log = guard.entry(id.clone()).or_default();
+            let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
+            log.push(aura_storage::StoredMessage {
+                ordinal,
+                superseded_by: None,
+                message: message.clone(),
+            });
             Ok(())
         }
         async fn apply_session_compaction(
             &self,
-            _id: &SessionId,
-            _new_active: &[aura_model::ChatMessage],
+            id: &SessionId,
+            new_active: &[aura_model::ChatMessage],
         ) -> std::result::Result<(), StorageError> {
+            let mut guard = self.messages.lock();
+            let log = guard.entry(id.clone()).or_default();
+            let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
+            for entry in log.iter_mut() {
+                if entry.superseded_by.is_none() {
+                    entry.superseded_by = Some(next_ordinal);
+                }
+            }
+            for (offset, msg) in new_active.iter().enumerate() {
+                log.push(aura_storage::StoredMessage {
+                    ordinal: next_ordinal + offset as i64,
+                    superseded_by: None,
+                    message: msg.clone(),
+                });
+            }
             Ok(())
         }
         async fn load_active_session_messages(
             &self,
-            _id: &SessionId,
+            id: &SessionId,
         ) -> std::result::Result<Vec<aura_model::ChatMessage>, StorageError> {
-            Ok(Vec::new())
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .map(|log| {
+                    log.iter()
+                        .filter(|m| m.superseded_by.is_none())
+                        .map(|m| m.message.clone())
+                        .collect()
+                })
+                .unwrap_or_default())
         }
         async fn latest_session_ordinal(
             &self,
-            _id: &SessionId,
+            id: &SessionId,
         ) -> std::result::Result<Option<i64>, StorageError> {
-            Ok(None)
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .and_then(|log| log.iter().map(|m| m.ordinal).max()))
         }
         async fn load_session_messages_with_supersede(
             &self,
-            _id: &SessionId,
+            id: &SessionId,
         ) -> std::result::Result<Vec<aura_storage::StoredMessage>, StorageError> {
-            Ok(Vec::new())
+            Ok(self.messages.lock().get(id).cloned().unwrap_or_default())
         }
     }
 
@@ -987,10 +1028,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_session_returns_session() {
-        let store = Arc::new(MemSessionStore {
-            sessions: parking_lot::Mutex::new(HashMap::new()),
-            children: parking_lot::Mutex::new(HashMap::new()),
-        });
+        let store = Arc::new(MemSessionStore::default());
         let s = make_session("cli-1");
         store.save(&s).await.unwrap();
         let api = make_query_api(store);
@@ -1001,10 +1039,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_session_missing_returns_none() {
-        let store = Arc::new(MemSessionStore {
-            sessions: parking_lot::Mutex::new(HashMap::new()),
-            children: parking_lot::Mutex::new(HashMap::new()),
-        });
+        let store = Arc::new(MemSessionStore::default());
         let api = make_query_api(store);
         assert!(
             api.load_session(&SessionId::from("nope"))
@@ -1016,10 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_recoverable_jobs_filters_to_non_terminal() {
-        let store = Arc::new(MemSessionStore {
-            sessions: parking_lot::Mutex::new(HashMap::new()),
-            children: parking_lot::Mutex::new(HashMap::new()),
-        });
+        let store = Arc::new(MemSessionStore::default());
         let job_store = Arc::new(MemoryJobStore::new());
         let lifecycle = Arc::new(JobLifecycle::new(job_store.clone()));
         let api = QueryApi::new(
@@ -1083,10 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn lineage_tree_walks_two_levels() {
-        let store = Arc::new(MemSessionStore {
-            sessions: parking_lot::Mutex::new(HashMap::new()),
-            children: parking_lot::Mutex::new(HashMap::new()),
-        });
+        let store = Arc::new(MemSessionStore::default());
         let parent = SessionId::from("parent");
         let mid = SessionId::from("mid");
         let leaf = SessionId::from("leaf");
@@ -1110,10 +1139,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_active_subagents_filters_terminal() {
-        let store = Arc::new(MemSessionStore {
-            sessions: parking_lot::Mutex::new(HashMap::new()),
-            children: parking_lot::Mutex::new(HashMap::new()),
-        });
+        let store = Arc::new(MemSessionStore::default());
         let parent = SessionId::from("parent");
         let active_child = SessionId::from("child-active");
         let done_child = SessionId::from("child-done");
@@ -1173,10 +1199,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_returns_jobs_in_chronological_order() {
-        let store = Arc::new(MemSessionStore {
-            sessions: parking_lot::Mutex::new(HashMap::new()),
-            children: parking_lot::Mutex::new(HashMap::new()),
-        });
+        let store = Arc::new(MemSessionStore::default());
         let s = make_session("cli-1");
         store.save(&s).await.unwrap();
         let job_store = Arc::new(MemoryJobStore::new());
@@ -1212,5 +1235,252 @@ mod tests {
         let replay = api.replay(&s.id, None).await.unwrap();
         assert_eq!(replay.jobs.len(), 2);
         assert!(replay.jobs[0].job.created_at <= replay.jobs[1].job.created_at);
+    }
+
+    /// `replay` rehydrates `LlmCallInputs::Persisted { last_ordinal }`
+    /// into the active slice as of that ordinal — including across a
+    /// compaction. This locks the storage / span / hydration triangle
+    /// the PR exists to enable: span storage stays O(1) per call, but
+    /// the replay surface still hands consumers the exact transcript
+    /// the LLM saw.
+    #[tokio::test]
+    async fn replay_hydrates_persisted_inputs_across_compaction() {
+        use aura_model::{ChatMessage, ContentBlock, Role, SpanId, StepId};
+        use aura_storage::TraceStore;
+        use aura_trace::{
+            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind,
+        };
+
+        fn user_msg(text: &str) -> ChatMessage {
+            ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text(text.into())],
+            }
+        }
+        fn system_msg(text: &str) -> ChatMessage {
+            ChatMessage {
+                role: Role::System,
+                content: vec![ContentBlock::Text(text.into())],
+            }
+        }
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let s = make_session("cli-hydrate");
+        session_store.save(&s).await.unwrap();
+
+        // ---- Pre-compaction transcript: [system, user-1] (ordinals 0, 1).
+        session_store
+            .append_session_message(&s.id, &system_msg("sys-v1"))
+            .await
+            .unwrap();
+        session_store
+            .append_session_message(&s.id, &user_msg("hello"))
+            .await
+            .unwrap();
+        let pre_last = session_store
+            .latest_session_ordinal(&s.id)
+            .await
+            .unwrap()
+            .expect("two messages appended");
+        assert_eq!(pre_last, 1);
+        let pre_active = session_store
+            .load_active_session_messages(&s.id)
+            .await
+            .unwrap();
+
+        // First job + step + span. The span's `last_ordinal` anchors
+        // to the transcript at this point in time (ordinals 0..=1).
+        let job_store = Arc::new(MemoryJobStore::new());
+        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        let j1 = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j1.id).await.unwrap();
+
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let step1_id = StepId::new();
+        let now = Utc::now();
+        trace_store
+            .save_step(&Step {
+                id: step1_id,
+                job_id: j1.id,
+                kind: StepKind::LlmIteration,
+                started_at: now,
+                ended_at: None,
+                outcome: LifecycleState::Pending,
+            })
+            .await
+            .unwrap();
+        let span1_id = SpanId::new();
+        trace_store
+            .save_span(&Span {
+                id: span1_id,
+                step_id: step1_id,
+                kind: SpanKind::LlmCall {
+                    begin: LlmCallBegin {
+                        model_id: "claude".into(),
+                        provider: "anthropic".into(),
+                        provider_config_hash: String::new(),
+                        input_messages: LlmCallInputs::Persisted {
+                            last_ordinal: pre_last,
+                        },
+                        temperature: None,
+                    },
+                    result: None,
+                },
+                parallel_group: None,
+                started_at: now,
+                ended_at: None,
+                outcome: LifecycleState::Pending,
+                events: vec![],
+            })
+            .await
+            .unwrap();
+
+        // ---- Compaction: replace [system, user-1] with [system, summary].
+        // Old rows get `superseded_by = 2`; new rows land at ordinals 2, 3.
+        let post_compact_active = vec![system_msg("sys-v2"), user_msg("<summary>S</summary>")];
+        session_store
+            .apply_session_compaction(&s.id, &post_compact_active)
+            .await
+            .unwrap();
+
+        // Append two more turns post-compaction (ordinals 4, 5).
+        session_store
+            .append_session_message(&s.id, &user_msg("follow-up"))
+            .await
+            .unwrap();
+        session_store
+            .append_session_message(&s.id, &user_msg("again"))
+            .await
+            .unwrap();
+
+        let post_last = session_store
+            .latest_session_ordinal(&s.id)
+            .await
+            .unwrap()
+            .expect("post-compaction messages exist");
+        assert_eq!(post_last, 5);
+
+        // Second job + span anchored to the post-compaction transcript.
+        let j2 = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j2.id).await.unwrap();
+
+        let step2_id = StepId::new();
+        trace_store
+            .save_step(&Step {
+                id: step2_id,
+                job_id: j2.id,
+                kind: StepKind::LlmIteration,
+                started_at: Utc::now(),
+                ended_at: None,
+                outcome: LifecycleState::Pending,
+            })
+            .await
+            .unwrap();
+        let span2_id = SpanId::new();
+        trace_store
+            .save_span(&Span {
+                id: span2_id,
+                step_id: step2_id,
+                kind: SpanKind::LlmCall {
+                    begin: LlmCallBegin {
+                        model_id: "claude".into(),
+                        provider: "anthropic".into(),
+                        provider_config_hash: String::new(),
+                        input_messages: LlmCallInputs::Persisted {
+                            last_ordinal: post_last,
+                        },
+                        temperature: None,
+                    },
+                    result: None,
+                },
+                parallel_group: None,
+                started_at: Utc::now(),
+                ended_at: None,
+                outcome: LifecycleState::Pending,
+                events: vec![],
+            })
+            .await
+            .unwrap();
+
+        // ---- Replay and verify hydration.
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let replay = api.replay(&s.id, None).await.unwrap();
+
+        let all_spans: Vec<&Span> = replay
+            .jobs
+            .iter()
+            .flat_map(|j| j.steps.iter())
+            .flat_map(|s| s.spans.iter())
+            .collect();
+        assert_eq!(all_spans.len(), 2, "expected one LlmCall span per job");
+
+        // Every Persisted reference must have collapsed to Inline:
+        // the read surface never leaks the ordinal indirection.
+        for span in &all_spans {
+            if let SpanKind::LlmCall { begin, .. } = &span.kind {
+                assert!(
+                    matches!(&begin.input_messages, LlmCallInputs::Inline(_)),
+                    "Persisted span should be hydrated to Inline; got {:?}",
+                    begin.input_messages
+                );
+            } else {
+                panic!("expected LlmCall span");
+            }
+        }
+
+        let span1 = all_spans.iter().find(|s| s.id == span1_id).unwrap();
+        let span2 = all_spans.iter().find(|s| s.id == span2_id).unwrap();
+        let SpanKind::LlmCall { begin: b1, .. } = &span1.kind else {
+            unreachable!()
+        };
+        let SpanKind::LlmCall { begin: b2, .. } = &span2.kind else {
+            unreachable!()
+        };
+        let LlmCallInputs::Inline(hydrated_pre) = &b1.input_messages else {
+            unreachable!()
+        };
+        let LlmCallInputs::Inline(hydrated_post) = &b2.input_messages else {
+            unreachable!()
+        };
+
+        // Pre-compaction span: the slice the LLM saw at ordinal 1 is
+        // exactly what `load_active_session_messages` returned at the
+        // time. The standard "active as of X" filter must pull
+        // through superseded rows whose `superseded_by` is *later*
+        // than the anchor ordinal — which is the whole point of the
+        // ordinal indirection.
+        assert_eq!(hydrated_pre, &pre_active);
+
+        // Post-compaction span: same shape, anchored to the present.
+        let post_active = api
+            .sessions
+            .load_active_session_messages(&s.id)
+            .await
+            .unwrap();
+        assert_eq!(hydrated_post, &post_active);
+        assert_eq!(hydrated_post.len(), 4); // [sys-v2, summary, follow-up, again]
     }
 }
