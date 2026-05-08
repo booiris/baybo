@@ -6,7 +6,10 @@ use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
 use aura_model::MicroUsd;
 
-pub(crate) const GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+// Host root only — rig's gemini client appends the versioned path
+// (`/v1beta/models/{model}:generateContent`) on every request, so the
+// base URL must NOT include `/v1beta` or we end up with `/v1beta/v1beta/…`.
+pub(crate) const GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
 /// Factory that creates `LlmClient` instances configured for Google Gemini models.
 pub struct GeminiProviderFactory;
@@ -86,11 +89,14 @@ impl LlmProviderFactory for GeminiProviderFactory {
             .as_deref()
             .unwrap_or(GEMINI_DEFAULT_BASE_URL)
             .trim_end_matches('/');
+        // Tolerate stale configs whose base already includes the version
+        // segment — the canonical base is the host root.
+        let host_root = base.strip_suffix("/v1beta").unwrap_or(base);
         // Gemini API keys are alphanumeric — no encoding needed —
         // but we still send the key as a header where supported, so
         // it doesn't land in URL access logs. The header form is
         // documented at <https://ai.google.dev/gemini-api/docs/api-key>.
-        let url = format!("{base}/models?pageSize=1000");
+        let url = format!("{host_root}/v1beta/models?pageSize=1000");
         let resp = reqwest::Client::new()
             .get(&url)
             .header("x-goog-api-key", api_key)
