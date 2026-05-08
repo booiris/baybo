@@ -151,10 +151,6 @@ pub enum LlmCallInputs {
         /// time. The active set as of this ordinal is the slice the
         /// LLM saw.
         last_ordinal: i64,
-        /// Number of messages actually sent (after merging/dedup on
-        /// the wire). Stored explicitly so consumers can show the
-        /// count without paying for hydration.
-        sent_count: u32,
     },
 }
 
@@ -416,21 +412,16 @@ mod tests {
         assert!(json.is_array(), "Inline must serialize as a bare array");
         assert_eq!(json.as_array().unwrap().len(), 1);
 
-        let persisted = LlmCallInputs::Persisted {
-            last_ordinal: 7,
-            sent_count: 3,
-        };
+        let persisted = LlmCallInputs::Persisted { last_ordinal: 7 };
         let json = serde_json::to_value(&persisted).unwrap();
         assert!(json.is_object(), "Persisted must serialize as an object");
         assert_eq!(json["last_ordinal"], 7);
-        assert_eq!(json["sent_count"], 3);
 
         // Round-trip both shapes back through Deserialize.
         let v1: LlmCallInputs = serde_json::from_value(serde_json::json!([])).unwrap();
         assert!(matches!(v1, LlmCallInputs::Inline(_)));
         let v2: LlmCallInputs =
-            serde_json::from_value(serde_json::json!({"last_ordinal": 1, "sent_count": 2}))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({"last_ordinal": 1})).unwrap();
         assert!(matches!(v2, LlmCallInputs::Persisted { .. }));
     }
 }

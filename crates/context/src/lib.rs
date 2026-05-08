@@ -496,24 +496,19 @@ impl ContextManager {
 
     /// Build the `LlmCallInputs` an `LlmCall` trace span should
     /// carry for the *current* transcript. When bound to a session
-    /// and the store has rows, returns
-    /// `Persisted { last_ordinal, sent_count }` — the gateway
-    /// hydrates this back into a flat slice on read, keeping span
-    /// storage constant per call instead of cloning a growing prefix
-    /// every turn. Falls back to `Inline(messages)` when there's no
-    /// store, no rows, or the lookup errors.
+    /// and the store has rows, returns `Persisted { last_ordinal }` —
+    /// the gateway hydrates this back into a flat slice on read,
+    /// keeping span storage constant per call instead of cloning a
+    /// growing prefix every turn. Falls back to `Inline(messages)`
+    /// when there's no store, no rows, or the lookup errors.
     pub async fn build_call_input_marker(&self) -> LlmCallInputs {
         let inline = || LlmCallInputs::Inline(self.messages.clone());
         let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
             return inline();
         };
-        let last_ordinal = match sessions.latest_session_ordinal(session_id).await {
-            Ok(Some(o)) => o,
-            _ => return inline(),
-        };
-        LlmCallInputs::Persisted {
-            last_ordinal,
-            sent_count: self.messages.len() as u32,
+        match sessions.latest_session_ordinal(session_id).await {
+            Ok(Some(last_ordinal)) => LlmCallInputs::Persisted { last_ordinal },
+            _ => inline(),
         }
     }
 
