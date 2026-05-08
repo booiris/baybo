@@ -42,26 +42,27 @@ export const READ_PAGE_TOOL = {
         "content for reading or summarisation; use `take_snapshot` when you need the " +
         "full DOM/accessibility tree for interaction. The page must already be navigated " +
         "to and rendered (call `navigate_page` and `wait_for` first). " +
-        "`pageId` targets a specific tab — required when multiple agents share one " +
-        "browser sidecar so calls don't race each other's navigations. Get a `pageId` " +
-        "from `new_page` or `list_pages`.",
+        "`pageId` is always required — unlike other browser/* tools, this one runs via " +
+        "CDDM's `evaluate_script`, whose handler does not fall back to the selected " +
+        "page. Get a `pageId` from `new_page` or `list_pages`.",
     inputSchema: {
         type: "object",
         properties: {
             pageId: {
                 type: "number",
                 description:
-                    "ID of the tab to read. Required when running with multi-page routing " +
-                    "(every browser/* tool accepts a pageId after sidecar start). Get the " +
-                    "id from new_page or list_pages.",
+                    "ID of the tab to read. Always required: CDDM's `evaluate_script` " +
+                    "handler resolves the page strictly by id and throws `No page found` " +
+                    "when omitted. Get the id from new_page or list_pages.",
             },
         },
+        required: ["pageId"],
         additionalProperties: false,
     },
 } as const;
 
 interface ReadPageArgs {
-    pageId?: number;
+    pageId: number;
 }
 
 interface ArticleFromPage {
@@ -148,15 +149,11 @@ async () => {
     // CDDM 0.23.0 quirk: when experimentalPageIdRouting is on, the
     // `evaluate_script` tool requires a pageId — its own handler does
     // `getPageById(pageId)` without falling back to the selected page
-    // (build/src/tools/script.js). Forward whatever the caller gave us;
-    // if they omitted it, CDDM's "No page found" surfaces back.
-    const evaluateArgs: Record<string, unknown> = { function: inPageScript };
-    if (args.pageId !== undefined) {
-        evaluateArgs.pageId = args.pageId;
-    }
+    // (build/src/tools/script.js). Hence `pageId` is required at the
+    // schema layer.
     const cddmResult = await client.callTool({
         name: "evaluate_script",
-        arguments: evaluateArgs,
+        arguments: { function: inPageScript, pageId: args.pageId },
     });
 
     const article = extractArticleFromCddmResult(cddmResult);

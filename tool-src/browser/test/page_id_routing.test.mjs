@@ -156,7 +156,10 @@ test("experimentalPageIdRouting is on; pageId surfaces on the right tools", asyn
         "evaluate_script exposes pageId (script.js spreads pageIdSchema when routing is on)",
     );
 
-    // Our injected tool: schema must carry the new pageId field.
+    // Our injected tool: schema must carry the new pageId field, and
+    // since we proxy to evaluate_script (which throws without a pageId),
+    // it must also be marked required at the schema layer so the model
+    // doesn't omit it.
     const readPage = get("read_page");
     assert.ok(
         readPage.inputSchema?.properties?.pageId,
@@ -166,5 +169,10 @@ test("experimentalPageIdRouting is on; pageId surfaces on the right tools", asyn
         readPage.inputSchema.properties.pageId.type,
         "number",
         "read_page.pageId typed as number to match CDDM's pageId convention",
+    );
+    assert.deepEqual(
+        readPage.inputSchema.required,
+        ["pageId"],
+        "read_page.pageId is required (evaluate_script handler has no selected-page fallback)",
     );
 });
