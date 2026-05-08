@@ -79,5 +79,33 @@ pub enum Role {
     Tool,
 }
 
+impl Role {
+    /// Canonical lowercase wire/db spelling. Matches the
+    /// `#[serde(rename_all = "snake_case")]` form so JSON, libsql
+    /// rows, and any other string-shaped channel agree.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        }
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "system" => Ok(Role::System),
+            "user" => Ok(Role::User),
+            "assistant" => Ok(Role::Assistant),
+            "tool" => Ok(Role::Tool),
+            other => Err(format!("unknown role: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageMetadata {}

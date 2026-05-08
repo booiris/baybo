@@ -259,8 +259,26 @@ impl SelfImprovementManager {
             }
         };
 
-        // Bake transcript + identity context into the payload.
-        let transcript_text = crate::self_improvement::prompt::render_transcript(&session.messages);
+        // Bake transcript + identity context into the payload. After
+        // master's refactor, messages no longer live on `Session` — load
+        // the active slice via `SessionStore`, dropping superseded rows.
+        let stored = match self
+            .session_store
+            .load_session_messages_with_supersede(&event.session_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "self_improvement: failed to load session messages");
+                return;
+            }
+        };
+        let messages: Vec<aura_model::ChatMessage> = stored
+            .into_iter()
+            .filter(|sm| sm.superseded_by.is_none())
+            .map(|sm| sm.message)
+            .collect();
+        let transcript_text = crate::self_improvement::prompt::render_transcript(&messages);
         let identity_context = self.read_identity_context();
 
         let payload = json!({

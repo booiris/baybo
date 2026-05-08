@@ -20,10 +20,11 @@ use std::time::Instant;
 
 use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::ChatMessage;
-use aura_model::Session;
-use aura_model::{ContentBlock, Role};
+use aura_model::{ContentBlock, Role, SessionId};
+use aura_session::SessionManager;
 use aura_skills::render::{render_skill_block, render_skill_reminder};
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry};
+use aura_trace::LlmCallInputs;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
@@ -67,7 +68,7 @@ struct TokenBaseline {
 /// Hence the outcome carries no LLM-call provenance.
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionOutcome {
-    /// `session.messages` was replaced with a shorter list.
+    /// The transcript was replaced with a shorter list.
     Compressed,
     /// Budget was under the configured compression threshold and the
     /// strategy was not invoked. Only produced by `maybe_compress` —
@@ -79,22 +80,28 @@ pub enum CompressionOutcome {
     StrategyDeclined,
     /// The strategy produced a candidate slice, but its post-tokenise
     /// total was not smaller than the original. The manager refused
-    /// to apply it (so the budget stays honest) and `session.messages`
+    /// to apply it (so the budget stays honest) and the transcript
     /// is unchanged.
     NoSavings,
 }
 
-/// Manages session context: appending messages with automatic compression
-/// and token budget tracking.
+/// Manages a session's context: owns the conversation transcript,
+/// tracks the token budget, and runs compression.
 ///
-/// This is a concrete struct, not a trait. The extension points are the
-/// `CompressionStrategy` injected at construction (the management logic
-/// — append, budget check — is invariant) and the optional
-/// `SkillRegistry` plumbed in via [`Self::with_skill_registry`] which
-/// lets the manager re-broadcast the authoritative skill list and
-/// re-attach per-skill detail blocks after a summary-style compression
-/// has wiped the historical `<skill>` / `<system-reminder>` messages
-/// off the front of the conversation.
+/// This is the **single owner** of `messages` for the actor handling
+/// one session. `Session` (in `aura-model`) carries only metadata.
+/// The split that previously had `Session` own `messages` and
+/// `ContextManager` shadow them via a token cache is folded into one
+/// owner here, eliminating the drift-detection logic.
+///
+/// Extension points are the `CompressionStrategy` injected at
+/// construction (the management logic — append, budget check — is
+/// invariant) and the optional `SkillRegistry` plumbed in via
+/// [`Self::with_skill_registry`] which lets the manager re-broadcast
+/// the authoritative skill list and re-attach per-skill detail blocks
+/// after a summary-style compression has wiped the historical
+/// `<skill>` / `<system-reminder>` messages off the front of the
+/// conversation.
 pub struct ContextManager {
     tokenizer: Arc<dyn Tokenizer>,
     strategy: Box<dyn CompressionStrategy>,
@@ -104,13 +111,17 @@ pub struct ContextManager {
     /// the manager skill-agnostic for callers that don't need the
     /// trailer (Truncate-only flows, isolated tests).
     skill_registry: Option<Arc<SkillRegistry>>,
+    /// Owned conversation transcript — the sole source of truth.
+    messages: Vec<ChatMessage>,
+    /// Per-message token count, kept in lockstep with `messages`.
+    /// Both vectors are mutated together on every append / insert /
+    /// compression apply, so they cannot drift.
+    per_message_tokens: Vec<usize>,
     /// Skills the model has invoked via the `Skill` tool somewhere in
-    /// the current `session.messages`, in first-seen order with
-    /// duplicates collapsed. Maintained incrementally by
-    /// [`Self::append`] and rebuilt on every compression apply so the
-    /// vector always mirrors the current message slice. Plain `Vec`
-    /// (not `RwLock`) because every read/write site is on a
-    /// `&mut self` path; nothing else looks at it.
+    /// the current transcript, in first-seen order with duplicates
+    /// collapsed. Maintained incrementally by [`Self::append`] and
+    /// rebuilt on every compression apply so the vector always
+    /// mirrors the current message slice.
     called_skills: Vec<String>,
     // Interior-mutable: `record_call_actual` runs from the agent
     // loop's `&self`-only `call_llm` path.
@@ -122,24 +133,13 @@ pub struct ContextManager {
     /// the first compression check — cold start passes the raw
     /// tokenizer estimate through unchanged.
     current_model: RwLock<Option<String>>,
-    /// Per-message token count memo, kept in step with the slice
-    /// callers pass to `count_tokens` / `raw_estimate`. Eliminates
-    /// the O(N²) re-tokenization the post-baseline suffix loop and
-    /// post-compression full sweep would otherwise repeat across a
-    /// turn's appends.
-    ///
-    /// In sync when `len() == messages.len()`. We detect drift via
-    /// length mismatch and resync transparently — fast path stays
-    /// O(1) per slot; the slow path collapses to one full retokenize
-    /// (the same cost the cache-free implementation paid every call).
-    ///
-    /// Failure mode the length check can't catch: same length /
-    /// different content. The only producer of that pattern is
-    /// `maybe_compress` apply, which builds its replacement cache
-    /// explicitly during the apply branch instead of going through
-    /// the read path. No other call site mutates `session.messages`
-    /// in place.
-    per_message_tokens: RwLock<Vec<usize>>,
+    /// Session this manager is bound to. When set together with
+    /// [`Self::sessions`] every transcript mutation is mirrored to
+    /// `session_messages` so a process bounce / actor respawn can
+    /// reload via [`Self::restore_from_store`]. Unset → in-memory
+    /// only (tests, single-shot harnesses).
+    session_id: Option<SessionId>,
+    sessions: Option<Arc<SessionManager>>,
 }
 
 impl ContextManager {
@@ -154,11 +154,62 @@ impl ContextManager {
             budget,
             calibration: None,
             skill_registry: None,
+            messages: Vec::new(),
+            per_message_tokens: Vec::new(),
             called_skills: Vec::new(),
             baseline: RwLock::new(None),
             current_model: RwLock::new(None),
-            per_message_tokens: RwLock::new(Vec::new()),
+            session_id: None,
+            sessions: None,
         }
+    }
+
+    /// Bind this manager to a specific session for persistence.
+    /// After this call:
+    /// - [`Self::append`] mirrors every appended message — including
+    ///   system messages at index 0 — to `session_messages`;
+    /// - successful compressions mark the prior active rows as
+    ///   superseded and append the new active set;
+    /// - [`Self::restore_from_store`] hydrates from the same log on
+    ///   actor cold start;
+    /// - [`Self::build_call_input_marker`] returns
+    ///   `LlmCallInputs::Persisted` instead of an inline snapshot.
+    ///
+    /// Without this binding the manager stays in-memory only.
+    pub fn with_session(mut self, session_id: SessionId, sessions: Arc<SessionManager>) -> Self {
+        self.session_id = Some(session_id);
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// Read-only access to the owned transcript.
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    /// Number of messages currently in the transcript.
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Replace the entire transcript. Recomputes the per-message
+    /// token cache, the called-skills vector, and the budget; clears
+    /// any baseline since the prior `actual_tokens` is anchored to a
+    /// slice that no longer exists.
+    ///
+    /// Used by the actor on cold start to seed the manager from a
+    /// persisted snapshot. Don't call this for in-flight mutation —
+    /// `append` / `force_compress` already maintain the invariants
+    /// incrementally.
+    pub fn restore_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.per_message_tokens = messages
+            .iter()
+            .map(|m| self.tokenizer.count_message(m))
+            .collect();
+        self.called_skills = scan_skill_calls(&messages);
+        self.messages = messages;
+        self.invalidate_baseline();
+        self.budget.update(self.calibrate(self.raw_estimate()));
     }
 
     /// Attach a `TokenCalibration` so `count_tokens` scales raw BPE
@@ -183,12 +234,9 @@ impl ContextManager {
     }
 
     /// Settle calibration + baseline post-response from a main LLM
-    /// call. Pass `sent_messages` — the exact slice handed to
-    /// `LlmCompletion::chat`/`chat_stream` — so the calibrator's
-    /// `(estimate, actual)` pair is computed against the same set
-    /// the provider billed. Must be called before any subsequent
-    /// mutation of `session.messages`; the agent loop honours this
-    /// because it sits inside the `with_llm_span` closure that
+    /// call. Anchors against the current transcript length — must be
+    /// called before any subsequent mutation; the agent loop honours
+    /// this because it sits inside the `with_llm_span` closure that
     /// returns before the assistant message is appended.
     ///
     /// Skipped when `actual_input_tokens == 0` — a hard transport
@@ -198,19 +246,19 @@ impl ContextManager {
     /// Only call this for *main* LLM calls. Compression calls
     /// summarise old non-system messages with no tools schema, so
     /// their `(estimate, actual)` ratio doesn't generalise.
-    pub fn record_call_actual(&self, sent_messages: &[ChatMessage], actual_input_tokens: usize) {
+    pub fn record_call_actual(&self, actual_input_tokens: usize) {
         if actual_input_tokens == 0 {
             return;
         }
         if let (Some(cal), Some(model_id)) =
             (&self.calibration, self.current_model.read().as_deref())
         {
-            let raw = self.raw_estimate(sent_messages);
+            let raw = self.raw_estimate();
             cal.observe(model_id, raw, actual_input_tokens);
         }
         *self.baseline.write() = Some(TokenBaseline {
             actual_tokens: actual_input_tokens,
-            message_count_at_call: sent_messages.len(),
+            message_count_at_call: self.messages.len(),
         });
     }
 
@@ -231,34 +279,11 @@ impl ContextManager {
         }
     }
 
-    fn raw_estimate(&self, messages: &[ChatMessage]) -> usize {
-        self.cached_sum(messages, 0..messages.len())
+    fn raw_estimate(&self) -> usize {
+        self.per_message_tokens.iter().copied().sum()
     }
 
-    /// Sum per-message token counts over `range`, using `per_message_tokens`
-    /// when in sync (length matches `messages.len()`). On length mismatch
-    /// the cache has drifted (compression replaced the slice, the caller
-    /// truncated externally, etc.) — re-tokenize the whole slice, install
-    /// it as the new cache, and sum the requested range from the fresh
-    /// vector. The resync cost is exactly what the cache-free path used
-    /// to pay every call; the next call is back on the fast path.
-    fn cached_sum(&self, messages: &[ChatMessage], range: std::ops::Range<usize>) -> usize {
-        {
-            let cache = self.per_message_tokens.read();
-            if cache.len() == messages.len() {
-                return cache[range].iter().copied().sum();
-            }
-        }
-        let fresh: Vec<usize> = messages
-            .iter()
-            .map(|m| self.tokenizer.count_message(m))
-            .collect();
-        let total: usize = fresh[range].iter().copied().sum();
-        *self.per_message_tokens.write() = fresh;
-        total
-    }
-
-    /// Append a message to the session context and update the token
+    /// Append a message to the transcript and update the token
     /// budget. Does **not** trigger compression — the caller (the
     /// agent loop) is responsible for invoking
     /// [`Self::maybe_compress`] at well-defined points where it can
@@ -269,12 +294,26 @@ impl ContextManager {
     /// of every iteration, so any over-budget state from intermediate
     /// `append` calls is resolved before the next LLM request is
     /// built.
-    pub fn append(&mut self, session: &mut Session, msg: &ChatMessage) {
+    pub async fn append(&mut self, msg: &ChatMessage) {
         let count = self.tokenizer.count_message(msg);
         record_skill_calls(&mut self.called_skills, msg);
-        session.messages.push(msg.clone());
-        self.per_message_tokens.write().push(count);
-        self.budget.update(self.count_tokens(&session.messages));
+        self.messages.push(msg.clone());
+        self.per_message_tokens.push(count);
+        self.budget.update(self.count_tokens());
+        self.persist_appended(msg).await;
+    }
+
+    async fn persist_appended(&self, msg: &ChatMessage) {
+        let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
+            return;
+        };
+        if let Err(e) = sessions.append_session_message(session_id, msg).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to append message to session_messages log"
+            );
+        }
     }
 
     /// Check the token budget and compress if the threshold is exceeded.
@@ -297,7 +336,6 @@ impl ContextManager {
     /// entirely.
     pub async fn maybe_compress<F, Fut>(
         &mut self,
-        session: &mut Session,
         model_id: &str,
         chat: F,
     ) -> crate::Result<CompressionOutcome>
@@ -307,13 +345,13 @@ impl ContextManager {
     {
         self.set_current_model(model_id);
 
-        self.budget.update(self.count_tokens(&session.messages));
+        self.budget.update(self.count_tokens());
 
         if !self.budget.needs_compression() {
             return Ok(CompressionOutcome::BelowThreshold);
         }
 
-        self.run_compression(session, chat).await
+        self.run_compression(chat).await
     }
 
     /// Like [`Self::maybe_compress`] but skips the threshold gate.
@@ -323,7 +361,6 @@ impl ContextManager {
     /// (e.g. a user-typed `/compact`).
     pub async fn force_compress<F, Fut>(
         &mut self,
-        session: &mut Session,
         model_id: &str,
         chat: F,
     ) -> crate::Result<CompressionOutcome>
@@ -332,21 +369,17 @@ impl ContextManager {
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
         self.set_current_model(model_id);
-        self.budget.update(self.count_tokens(&session.messages));
-        self.run_compression(session, chat).await
+        self.budget.update(self.count_tokens());
+        self.run_compression(chat).await
     }
 
-    async fn run_compression<F, Fut>(
-        &mut self,
-        session: &mut Session,
-        chat: F,
-    ) -> crate::Result<CompressionOutcome>
+    async fn run_compression<F, Fut>(&mut self, chat: F) -> crate::Result<CompressionOutcome>
     where
         F: FnOnce(ChatRequest) -> Fut + Send + 'static,
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
         let chat_box: crate::strategy::ChatCallback = Box::new(move |req| Box::pin(chat(req)));
-        let plan = self.strategy.compress(&session.messages, chat_box).await?;
+        let plan = self.strategy.compress(&self.messages, chat_box).await?;
         let (mut new_messages, replaced_full_history) = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
             CompressOutput::Replaced {
@@ -354,6 +387,19 @@ impl ContextManager {
                 replaced_full_history,
             } => (messages, replaced_full_history),
         };
+
+        // Refuse to apply an empty replacement: persist would mark
+        // every active row in `session_messages` as superseded with
+        // no successor, leaving the active slice empty until the
+        // next turn re-seeds the system prompt. Currently
+        // unreachable through the in-tree strategies (Summarize and
+        // Truncate both retain at least the system message), so
+        // treat it as a strategy contract violation rather than a
+        // routine outcome.
+        if new_messages.is_empty() {
+            warn!("compression strategy produced an empty replacement; refusing to apply");
+            return Ok(CompressionOutcome::StrategyDeclined);
+        }
 
         // Strategy with `replaced_full_history` discarded the
         // historical skill_reminder / tool_use trail; the manager
@@ -378,9 +424,6 @@ impl ContextManager {
         // a length-only check despite a real token cut. Drop the
         // baseline first — it's anchored to the old slice.
         self.invalidate_baseline();
-        // Tokenize directly: the cache still mirrors the OLD slice,
-        // and we'll install this exact vec as the new cache after
-        // commit, so `cached_sum` would just re-do the work.
         let new_per_message: Vec<usize> = new_messages
             .iter()
             .map(|m| self.tokenizer.count_message(m))
@@ -388,19 +431,18 @@ impl ContextManager {
         let after_tokens = self.calibrate(new_per_message.iter().copied().sum());
 
         if after_tokens >= before_tokens {
-            // Don't apply. `session.messages` and the existing cache
-            // are still in sync; nothing to undo.
+            // Don't apply. The transcript and per-message cache stay
+            // in sync; nothing to undo.
             return Ok(CompressionOutcome::NoSavings);
         }
 
-        session.messages = new_messages;
-        *self.per_message_tokens.write() = new_per_message;
-        // Rebuild called_skills from the freshly-applied slice so the
-        // vector mirrors session.messages: a successful summary leaves
-        // it empty (the trailer carries plain text, no `ToolUse`), and
-        // a Truncate apply scopes it to whatever's still in the kept
-        // tail. Either way, the next compression sees the right set.
-        self.called_skills = scan_skill_calls(&session.messages);
+        self.messages = new_messages;
+        self.per_message_tokens = new_per_message;
+        // Rebuild called_skills from the freshly-applied slice: a
+        // successful summary leaves it empty (the trailer carries
+        // plain text, no `ToolUse`), and a Truncate apply scopes it
+        // to whatever's still in the kept tail.
+        self.called_skills = scan_skill_calls(&self.messages);
         self.budget.update(after_tokens);
 
         if after_tokens > self.budget.max_tokens() {
@@ -418,7 +460,69 @@ impl ContextManager {
             "proactive context compression"
         );
 
+        self.persist_compaction().await;
         Ok(CompressionOutcome::Compressed)
+    }
+
+    async fn persist_compaction(&self) {
+        let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
+            return;
+        };
+        if let Err(e) = sessions
+            .apply_session_compaction(session_id, &self.messages)
+            .await
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to persist session compaction"
+            );
+        }
+    }
+
+    /// Pull the persisted active transcript out of the bound
+    /// `SessionManager` and seed `messages`. Called by the agent
+    /// actor once on cold start so a process bounce / actor respawn
+    /// picks up where the prior actor left off. No-ops cleanly when:
+    /// - no session is bound (tests, single-shot harnesses);
+    /// - the session has no rows yet (fresh session, cron fires,
+    ///   subagent spawns).
+    ///
+    /// Failures log at warn and fall through to a fresh transcript;
+    /// startup must not block on a transient store error.
+    pub async fn restore_from_store(&mut self) {
+        let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
+            return;
+        };
+        match sessions.load_active_session_messages(session_id).await {
+            Ok(messages) if !messages.is_empty() => {
+                self.restore_messages(messages);
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to load persisted transcript; starting fresh"
+            ),
+        }
+    }
+
+    /// Build the `LlmCallInputs` an `LlmCall` trace span should
+    /// carry for the *current* transcript. When bound to a session
+    /// and the store has rows, returns `Persisted { last_ordinal }` —
+    /// the gateway hydrates this back into a flat slice on read,
+    /// keeping span storage constant per call instead of cloning a
+    /// growing prefix every turn. Falls back to `Inline(messages)`
+    /// when there's no store, no rows, or the lookup errors.
+    pub async fn build_call_input_marker(&self) -> LlmCallInputs {
+        let inline = || LlmCallInputs::Inline(self.messages.clone());
+        let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
+            return inline();
+        };
+        match sessions.latest_session_ordinal(session_id).await {
+            Ok(Some(last_ordinal)) => LlmCallInputs::Persisted { last_ordinal },
+            _ => inline(),
+        }
     }
 
     /// Read-only access to the token budget.
@@ -428,18 +532,22 @@ impl ContextManager {
 
     /// Steady-state cost is `O(suffix)`: the bulk of the count is the
     /// provider's authoritative `actual_tokens` from the last main
-    /// call, and only the messages appended since are BPE-encoded.
-    /// Falls back to a full calibrated sweep on cold start, or after
-    /// compression, or if the message list shrank below the anchor.
-    fn count_tokens(&self, messages: &[ChatMessage]) -> usize {
+    /// call, and only the messages appended since are summed from the
+    /// per-message cache. Falls back to a full calibrated sweep on
+    /// cold start, or after compression, or if the message list
+    /// shrank below the anchor.
+    fn count_tokens(&self) -> usize {
         let snapshot = *self.baseline.read();
         if let Some(b) = snapshot
-            && messages.len() >= b.message_count_at_call
+            && self.messages.len() >= b.message_count_at_call
         {
-            let delta_raw = self.cached_sum(messages, b.message_count_at_call..messages.len());
+            let delta_raw: usize = self.per_message_tokens[b.message_count_at_call..]
+                .iter()
+                .copied()
+                .sum();
             return b.actual_tokens + self.calibrate(delta_raw);
         }
-        self.calibrate(self.raw_estimate(messages))
+        self.calibrate(self.raw_estimate())
     }
 
     fn calibrate(&self, raw: usize) -> usize {
@@ -473,7 +581,7 @@ fn record_skill_calls(acc: &mut Vec<String>, msg: &ChatMessage) {
 
 /// Rebuild the called-skills vector from a full message slice.
 /// Used after a compression apply to scope the vector to whatever
-/// `ToolUse` blocks survived in the new `session.messages`.
+/// `ToolUse` blocks survived in the new transcript.
 fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
     let mut out = Vec::new();
     for msg in messages {
@@ -638,27 +746,6 @@ mod tests {
         }
     }
 
-    fn make_session(messages: Vec<ChatMessage>) -> Session {
-        let id = aura_model::SessionId::from("test-session");
-        Session {
-            id: id.clone(),
-            user: aura_model::User {
-                id: "user-1".to_string(),
-                name: None,
-                channel: aura_model::ChannelType::tui(),
-            },
-            channel: aura_model::ChannelType::tui(),
-            messages,
-            created_at: chrono::Utc::now(),
-            last_active: chrono::Utc::now(),
-            state: Default::default(),
-            root_session_id: id,
-            trigger: aura_model::TriggerSource::User,
-            lineage: None,
-            bound_soul_version: "soul-test".into(),
-        }
-    }
-
     /// Chat closure that panics if invoked. Every in-lib test uses
     /// `Truncate`, which never returns `NeedsLlmCall`, so the closure
     /// should never run. Failing loudly here means a future regression
@@ -678,17 +765,14 @@ mod tests {
     #[tokio::test]
     async fn append_adds_message_without_compression() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
 
         let msg = make_msg(Role::User, "hello");
-        ctx.append(&mut session, &msg);
+        ctx.append(&msg).await;
 
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].role, Role::User);
+        assert_eq!(ctx.messages().len(), 1);
+        assert_eq!(ctx.messages()[0].role, Role::User);
         assert!(matches!(
-            ctx.maybe_compress(&mut session, "test-model", never_chat)
-                .await
-                .unwrap(),
+            ctx.maybe_compress("test-model", never_chat).await.unwrap(),
             CompressionOutcome::BelowThreshold
         ));
     }
@@ -697,43 +781,38 @@ mod tests {
     async fn maybe_compress_on_token_threshold() {
         // max=50, threshold=0.5 → compress when > 25 tokens
         let mut ctx = make_ctx(2, 50, 0.5);
-        let mut session = make_session(vec![]);
 
         // Build up messages one by one. `append` no longer
         // auto-compresses; the agent loop is responsible for calling
         // `maybe_compress` at well-defined cost-recording points.
-        ctx.append(&mut session, &make_msg(Role::System, "You are helpful"));
-        ctx.append(&mut session, &make_msg(Role::User, "First message here"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "First reply here"));
-        ctx.append(&mut session, &make_msg(Role::User, "Second message here"));
+        ctx.append(&make_msg(Role::System, "You are helpful")).await;
+        ctx.append(&make_msg(Role::User, "First message here"))
+            .await;
+        ctx.append(&make_msg(Role::Assistant, "First reply here"))
+            .await;
+        ctx.append(&make_msg(Role::User, "Second message here"))
+            .await;
 
-        let outcome = ctx
-            .maybe_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::Compressed));
         // system + 2 most recent non-system
-        assert_eq!(session.messages.len(), 3);
-        assert_eq!(session.messages[0].role, Role::System);
+        assert_eq!(ctx.messages().len(), 3);
+        assert_eq!(ctx.messages()[0].role, Role::System);
     }
 
     #[tokio::test]
     async fn no_compress_under_threshold() {
         let mut ctx = make_ctx(10, 100_000, 0.75);
-        let mut session = make_session(vec![]);
 
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, "hi"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "hello"));
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "hi")).await;
+        ctx.append(&make_msg(Role::Assistant, "hello")).await;
 
-        let outcome = ctx
-            .maybe_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::BelowThreshold));
-        assert_eq!(session.messages.len(), 3);
+        assert_eq!(ctx.messages().len(), 3);
     }
 
     #[tokio::test]
@@ -744,30 +823,23 @@ mod tests {
         // strategy shrinks the slice, so the call returns
         // `Compressed`.
         let mut ctx = make_ctx(2, 100_000, 0.75);
-        let mut session = make_session(vec![]);
 
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, "first"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "second"));
-        ctx.append(&mut session, &make_msg(Role::User, "third"));
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "first")).await;
+        ctx.append(&make_msg(Role::Assistant, "second")).await;
+        ctx.append(&make_msg(Role::User, "third")).await;
 
         // Sanity: budget-gated path is a no-op here.
-        let baseline = ctx
-            .maybe_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let baseline = ctx.maybe_compress("test-model", never_chat).await.unwrap();
         assert!(matches!(baseline, CompressionOutcome::BelowThreshold));
-        assert_eq!(session.messages.len(), 4);
+        assert_eq!(ctx.messages().len(), 4);
 
-        let outcome = ctx
-            .force_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let outcome = ctx.force_compress("test-model", never_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::Compressed));
         // system + keep_recent=2 most recent non-system.
-        assert_eq!(session.messages.len(), 3);
-        assert_eq!(session.messages[0].role, Role::System);
+        assert_eq!(ctx.messages().len(), 3);
+        assert_eq!(ctx.messages()[0].role, Role::System);
     }
 
     #[tokio::test]
@@ -776,19 +848,15 @@ mod tests {
         // and `force_compress` surfaces it as `StrategyDeclined`
         // (the budget gate was bypassed; the strategy itself bowed out).
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
 
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, "hi"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "hello"));
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "hi")).await;
+        ctx.append(&make_msg(Role::Assistant, "hello")).await;
 
-        let outcome = ctx
-            .force_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let outcome = ctx.force_compress("test-model", never_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::StrategyDeclined));
-        assert_eq!(session.messages.len(), 3);
+        assert_eq!(ctx.messages().len(), 3);
     }
 
     #[tokio::test]
@@ -798,29 +866,24 @@ mod tests {
         // Surfaces as `StrategyDeclined`: the budget gate did fire
         // (`BelowThreshold` would mean we never got to the strategy at all).
         let mut ctx = make_ctx(5, 10, 0.1);
-        let mut session = make_session(vec![]);
 
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, "hi"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "hello"));
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "hi")).await;
+        ctx.append(&make_msg(Role::Assistant, "hello")).await;
 
-        let outcome = ctx
-            .maybe_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::StrategyDeclined));
-        assert_eq!(session.messages.len(), 3);
+        assert_eq!(ctx.messages().len(), 3);
     }
 
     #[tokio::test]
     async fn budget_tracks_tokens() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
 
         assert_eq!(ctx.budget().current(), 0);
 
-        ctx.append(&mut session, &make_msg(Role::User, "hello world"));
+        ctx.append(&make_msg(Role::User, "hello world")).await;
 
         assert!(ctx.budget().current() > 0);
         assert!(ctx.budget().remaining() < 100_000);
@@ -832,18 +895,17 @@ mod tests {
     #[tokio::test]
     async fn count_tokens_falls_back_to_full_count_without_baseline() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
-        ctx.append(&mut session, &make_msg(Role::User, "alpha"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "beta"));
-        ctx.append(&mut session, &make_msg(Role::User, "gamma"));
+        ctx.append(&make_msg(Role::User, "alpha")).await;
+        ctx.append(&make_msg(Role::Assistant, "beta")).await;
+        ctx.append(&make_msg(Role::User, "gamma")).await;
 
-        let raw_full: usize = session
-            .messages
+        let raw_full: usize = ctx
+            .messages()
             .iter()
             .map(|m| ctx.tokenizer.count_message(m))
             .sum();
         // No calibration injected → calibrate is identity, full count.
-        assert_eq!(ctx.count_tokens(&session.messages), raw_full);
+        assert_eq!(ctx.count_tokens(), raw_full);
     }
 
     /// After `record_call_actual`, `count_tokens` returns
@@ -852,20 +914,19 @@ mod tests {
     #[tokio::test]
     async fn count_tokens_uses_baseline_plus_delta() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
-        ctx.append(&mut session, &make_msg(Role::User, "old-1"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "old-2"));
-        ctx.append(&mut session, &make_msg(Role::User, "old-3"));
-        ctx.record_call_actual(&session.messages, 5_000);
+        ctx.append(&make_msg(Role::User, "old-1")).await;
+        ctx.append(&make_msg(Role::Assistant, "old-2")).await;
+        ctx.append(&make_msg(Role::User, "old-3")).await;
+        ctx.record_call_actual(5_000);
 
         let new_a = make_msg(Role::Assistant, "new-a");
         let new_b = make_msg(Role::User, "new-b");
-        session.messages.push(new_a.clone());
-        session.messages.push(new_b.clone());
+        ctx.append(&new_a.clone()).await;
+        ctx.append(&new_b.clone()).await;
 
         let expected_delta =
             ctx.tokenizer.count_message(&new_a) + ctx.tokenizer.count_message(&new_b);
-        assert_eq!(ctx.count_tokens(&session.messages), 5_000 + expected_delta);
+        assert_eq!(ctx.count_tokens(), 5_000 + expected_delta);
     }
 
     /// Compression mutates the message prefix in place, so the
@@ -875,62 +936,59 @@ mod tests {
     #[tokio::test]
     async fn compression_invalidates_baseline() {
         let mut ctx = make_ctx(2, 50, 0.5);
-        let mut session = make_session(vec![]);
 
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, "msg-1 with content"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "reply-1 here"));
-        ctx.append(&mut session, &make_msg(Role::User, "msg-2 with content"));
-        ctx.record_call_actual(&session.messages, 9_999);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "msg-1 with content"))
+            .await;
+        ctx.append(&make_msg(Role::Assistant, "reply-1 here")).await;
+        ctx.append(&make_msg(Role::User, "msg-2 with content"))
+            .await;
+        ctx.record_call_actual(9_999);
 
         // Pre-compression: baseline applies → big number.
-        assert_eq!(ctx.count_tokens(&session.messages), 9_999);
+        assert_eq!(ctx.count_tokens(), 9_999);
 
         // Drive compression. With max=50, threshold=0.5 the budget
         // says "compress" once the post-baseline estimate exceeds 25
         // (here it's 9_999 + 0).
-        let _ = ctx
-            .maybe_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let _ = ctx.maybe_compress("test-model", never_chat).await.unwrap();
 
         // Post-compression: baseline cleared → must re-tokenize the
         // (now-shrunken) message list, no 9_999 anywhere.
-        let raw: usize = session
-            .messages
+        let raw: usize = ctx
+            .messages()
             .iter()
             .map(|m| ctx.tokenizer.count_message(m))
             .sum();
-        assert_eq!(ctx.count_tokens(&session.messages), raw);
-        assert!(ctx.count_tokens(&session.messages) < 9_999);
+        assert_eq!(ctx.count_tokens(), raw);
+        assert!(ctx.count_tokens() < 9_999);
     }
 
-    /// `append` keeps the per-message token cache in step with
-    /// `session.messages` so the suffix loop in `count_tokens`
-    /// doesn't re-tokenize across appends. Spot-check by appending
-    /// after a baseline is set: each `count_tokens` call must agree
-    /// with a fresh full retokenize, and the cache vector's length
-    /// must track the slice.
+    /// `append` keeps the per-message token cache in step with the
+    /// transcript so the suffix loop in `count_tokens` doesn't
+    /// re-tokenize across appends. Spot-check by appending after a
+    /// baseline is set: each `count_tokens` call must agree with a
+    /// fresh full retokenize, and the cache vector's length must
+    /// track the slice.
     #[tokio::test]
     async fn cache_stays_in_sync_across_appends() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
-        ctx.append(&mut session, &make_msg(Role::User, "first"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "second"));
-        ctx.record_call_actual(&session.messages, 1_000);
+        ctx.append(&make_msg(Role::User, "first")).await;
+        ctx.append(&make_msg(Role::Assistant, "second")).await;
+        ctx.record_call_actual(1_000);
 
         // Append after baseline: count_tokens uses baseline + cached
         // suffix counts. The expected value is `actual + sum of new
         // message counts`.
         let new_a = make_msg(Role::User, "after-baseline-a");
         let new_b = make_msg(Role::Assistant, "after-baseline-b");
-        ctx.append(&mut session, &new_a);
-        ctx.append(&mut session, &new_b);
+        ctx.append(&new_a).await;
+        ctx.append(&new_b).await;
 
         let expected_delta =
             ctx.tokenizer.count_message(&new_a) + ctx.tokenizer.count_message(&new_b);
-        assert_eq!(ctx.count_tokens(&session.messages), 1_000 + expected_delta);
-        assert_eq!(ctx.per_message_tokens.read().len(), session.messages.len());
+        assert_eq!(ctx.count_tokens(), 1_000 + expected_delta);
+        assert_eq!(ctx.per_message_tokens.len(), ctx.messages().len());
     }
 
     /// After `maybe_compress` applies a new message list, the cache
@@ -941,56 +999,31 @@ mod tests {
     /// having Truncate keep it; in practice Summarize would replace
     /// it with `[system, summary]`, also a same-length scenario when
     /// the input is `[system, big_msg]`. We assert via a sanity
-    /// recount that count_tokens agrees with a fresh tokenize of
-    /// `session.messages`.
+    /// recount that count_tokens agrees with a fresh tokenize of the
+    /// transcript.
     #[tokio::test]
     async fn cache_rebuilt_after_compression_apply() {
         let mut ctx = make_ctx(2, 50, 0.5);
-        let mut session = make_session(vec![]);
-        ctx.append(&mut session, &make_msg(Role::System, "You are helpful"));
-        ctx.append(&mut session, &make_msg(Role::User, "First message here"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, "First reply here"));
-        ctx.append(&mut session, &make_msg(Role::User, "Second message here"));
+        ctx.append(&make_msg(Role::System, "You are helpful")).await;
+        ctx.append(&make_msg(Role::User, "First message here"))
+            .await;
+        ctx.append(&make_msg(Role::Assistant, "First reply here"))
+            .await;
+        ctx.append(&make_msg(Role::User, "Second message here"))
+            .await;
 
-        let outcome = ctx
-            .maybe_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // Cache must be in lockstep with the post-compression slice.
-        assert_eq!(ctx.per_message_tokens.read().len(), session.messages.len());
-        let expected: usize = session
-            .messages
+        assert_eq!(ctx.per_message_tokens.len(), ctx.messages().len());
+        let expected: usize = ctx
+            .messages()
             .iter()
             .map(|m| ctx.tokenizer.count_message(m))
             .sum();
-        let cached: usize = ctx.per_message_tokens.read().iter().copied().sum();
+        let cached: usize = ctx.per_message_tokens.iter().copied().sum();
         assert_eq!(cached, expected);
-    }
-
-    /// If `session.messages.len()` shrinks below the baseline's
-    /// `message_count_at_call` (e.g. the caller mutated messages
-    /// outside the normal append/compress flow), the indexed slice
-    /// would be invalid. `count_tokens` falls back to a full sweep.
-    #[tokio::test]
-    async fn shrunken_message_list_falls_back_to_full_count() {
-        let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
-        for i in 0..5 {
-            ctx.append(&mut session, &make_msg(Role::User, &format!("m{i}")));
-        }
-        ctx.record_call_actual(&session.messages, 1_000);
-
-        // Drop the last two messages — count_at_call (5) is now > len (3).
-        session.messages.truncate(3);
-
-        let raw: usize = session
-            .messages
-            .iter()
-            .map(|m| ctx.tokenizer.count_message(m))
-            .sum();
-        assert_eq!(ctx.count_tokens(&session.messages), raw);
     }
 
     // ---------- Skill-trailer tests ----------
@@ -1043,16 +1076,15 @@ mod tests {
 
     /// `append` records every fresh `Skill` ToolUse it sees, in
     /// first-seen order with insertion-order dedup.
-    #[test]
-    fn append_records_skill_calls_in_order() {
+    #[tokio::test]
+    async fn append_records_skill_calls_in_order() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
 
-        ctx.append(&mut session, &skill_call("foo"));
-        ctx.append(&mut session, &make_msg(Role::User, "u"));
-        ctx.append(&mut session, &skill_call("bar"));
-        ctx.append(&mut session, &skill_call("foo")); // duplicate
-        ctx.append(&mut session, &skill_call("baz"));
+        ctx.append(&skill_call("foo")).await;
+        ctx.append(&make_msg(Role::User, "u")).await;
+        ctx.append(&skill_call("bar")).await;
+        ctx.append(&skill_call("foo")).await; // duplicate
+        ctx.append(&skill_call("baz")).await;
 
         assert_eq!(ctx.called_skills, vec!["foo", "bar", "baz"]);
     }
@@ -1060,10 +1092,9 @@ mod tests {
     /// `record_skill_calls` must ignore `ToolUse` blocks for non-Skill
     /// tools so we don't accidentally render Bash / WebFetch / etc.
     /// detail blocks at compression time.
-    #[test]
-    fn append_ignores_non_skill_tool_uses() {
+    #[tokio::test]
+    async fn append_ignores_non_skill_tool_uses() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let mut session = make_session(vec![]);
         let bash_call = ChatMessage {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
@@ -1073,7 +1104,7 @@ mod tests {
                 signature: None,
             }],
         };
-        ctx.append(&mut session, &bash_call);
+        ctx.append(&bash_call).await;
         assert!(ctx.called_skills.is_empty());
     }
 
@@ -1087,16 +1118,16 @@ mod tests {
             Box::new(crate::strategy::summarize::Summarize::new(2)),
             TokenBudget::new(50, 0.5),
         );
-        let mut session = make_session(vec![]);
         // Long enough that compression with the (real, registry-rendered)
         // trailer still wins on tokens — SimpleTokenizer counts text as
         // `len()/4 + 1`, so a few hundred bytes of user text easily out-
         // weighs the ~120-byte reminder + ~150-byte detail trailer.
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, &"u1 ".repeat(80)));
-        ctx.append(&mut session, &skill_call("foo"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, &"a1 ".repeat(80)));
-        ctx.append(&mut session, &make_msg(Role::User, &"u2 ".repeat(80)));
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, &"u1 ".repeat(80))).await;
+        ctx.append(&skill_call("foo")).await;
+        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(80)))
+            .await;
+        ctx.append(&make_msg(Role::User, &"u2 ".repeat(80))).await;
 
         let chat = |_req: ChatRequest| async move {
             Ok(LlmResponse {
@@ -1107,16 +1138,13 @@ mod tests {
                 thinking: None,
             })
         };
-        let outcome = ctx
-            .maybe_compress(&mut session, "test-model", chat)
-            .await
-            .unwrap();
+        let outcome = ctx.maybe_compress("test-model", chat).await.unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // [system, summary] only — no reminder, no detail.
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].role, Role::System);
-        if let ContentBlock::Text(t) = &session.messages[1].content[0] {
+        assert_eq!(ctx.messages().len(), 2);
+        assert_eq!(ctx.messages()[0].role, Role::System);
+        if let ContentBlock::Text(t) = &ctx.messages()[1].content[0] {
             assert_eq!(t, "<summary>S</summary>");
         } else {
             panic!("expected text content");
@@ -1135,16 +1163,16 @@ mod tests {
             TokenBudget::new(50, 0.5),
         )
         .with_skill_registry(registry);
-        let mut session = make_session(vec![]);
         // Long enough that compression with the (real, registry-rendered)
         // trailer still wins on tokens — SimpleTokenizer counts text as
         // `len()/4 + 1`, so a few hundred bytes of user text easily out-
         // weighs the ~120-byte reminder + ~150-byte detail trailer.
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, &"u1 ".repeat(80)));
-        ctx.append(&mut session, &skill_call("foo"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, &"a1 ".repeat(80)));
-        ctx.append(&mut session, &make_msg(Role::User, &"u2 ".repeat(80)));
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, &"u1 ".repeat(80))).await;
+        ctx.append(&skill_call("foo")).await;
+        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(80)))
+            .await;
+        ctx.append(&make_msg(Role::User, &"u2 ".repeat(80))).await;
 
         let chat = |_req: ChatRequest| async move {
             Ok(LlmResponse {
@@ -1155,16 +1183,13 @@ mod tests {
                 thinking: None,
             })
         };
-        let outcome = ctx
-            .maybe_compress(&mut session, "test-model", chat)
-            .await
-            .unwrap();
+        let outcome = ctx.maybe_compress("test-model", chat).await.unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // [system, summary, reminder, detail]
-        assert_eq!(session.messages.len(), 4);
-        let texts: Vec<&str> = session
-            .messages
+        assert_eq!(ctx.messages().len(), 4);
+        let texts: Vec<&str> = ctx
+            .messages()
             .iter()
             .map(|m| match m.content.first() {
                 Some(ContentBlock::Text(t)) => t.as_str(),
@@ -1192,27 +1217,24 @@ mod tests {
             TokenBudget::new(50, 0.5),
         )
         .with_skill_registry(registry);
-        let mut session = make_session(vec![]);
         // Long enough that compression with the (real, registry-rendered)
         // trailer still wins on tokens — SimpleTokenizer counts text as
         // `len()/4 + 1`, so a few hundred bytes of user text easily out-
         // weighs the ~120-byte reminder + ~150-byte detail trailer.
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, &"u1 ".repeat(80)));
-        ctx.append(&mut session, &skill_call("foo"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, &"a1 ".repeat(80)));
-        ctx.append(&mut session, &make_msg(Role::User, &"u2 ".repeat(80)));
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, &"u1 ".repeat(80))).await;
+        ctx.append(&skill_call("foo")).await;
+        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(80)))
+            .await;
+        ctx.append(&make_msg(Role::User, &"u2 ".repeat(80))).await;
 
-        let outcome = ctx
-            .maybe_compress(&mut session, "test-model", never_chat)
-            .await
-            .unwrap();
+        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // No reminder / detail messages were appended; the result is
         // just system + the kept tail (which itself may still have
         // the original Skill ToolUse).
-        for msg in &session.messages {
+        for msg in ctx.messages() {
             for block in &msg.content {
                 if let ContentBlock::Text(t) = block {
                     assert!(!t.contains("The following skills are available"));
@@ -1234,16 +1256,16 @@ mod tests {
             TokenBudget::new(50, 0.5),
         )
         .with_skill_registry(registry);
-        let mut session = make_session(vec![]);
         // Long enough that compression with the (real, registry-rendered)
         // trailer still wins on tokens — SimpleTokenizer counts text as
         // `len()/4 + 1`, so a few hundred bytes of user text easily out-
         // weighs the ~120-byte reminder + ~150-byte detail trailer.
-        ctx.append(&mut session, &make_msg(Role::System, "sys"));
-        ctx.append(&mut session, &make_msg(Role::User, &"u1 ".repeat(80)));
-        ctx.append(&mut session, &skill_call("foo"));
-        ctx.append(&mut session, &make_msg(Role::Assistant, &"a1 ".repeat(80)));
-        ctx.append(&mut session, &make_msg(Role::User, &"u2 ".repeat(80)));
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, &"u1 ".repeat(80))).await;
+        ctx.append(&skill_call("foo")).await;
+        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(80)))
+            .await;
+        ctx.append(&make_msg(Role::User, &"u2 ".repeat(80))).await;
         assert_eq!(ctx.called_skills, vec!["foo"]);
 
         let chat = |_req: ChatRequest| async move {
@@ -1255,9 +1277,7 @@ mod tests {
                 thinking: None,
             })
         };
-        ctx.maybe_compress(&mut session, "test-model", chat)
-            .await
-            .unwrap();
+        ctx.maybe_compress("test-model", chat).await.unwrap();
         assert!(ctx.called_skills.is_empty());
     }
 

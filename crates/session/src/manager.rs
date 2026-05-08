@@ -97,7 +97,6 @@ impl SessionManager {
             id: id.clone(),
             user,
             channel,
-            messages: Vec::new(),
             created_at: now,
             last_active: now,
             state: aura_model::SessionState::default(),
@@ -130,7 +129,6 @@ impl SessionManager {
             id: id.clone(),
             user,
             channel,
-            messages: Vec::new(),
             created_at: now,
             last_active: now,
             state: SessionState::default(),
@@ -178,13 +176,86 @@ impl SessionManager {
         Ok(sessions)
     }
 
-    /// Return the transcript (`messages`) of the given session. Errors with
-    /// `SessionError::NotFound` if the session does not exist.
+    /// Return the active transcript for the session — non-superseded
+    /// rows of the append-only `session_messages` log, in order.
+    /// Errors with `SessionError::NotFound` if the session itself
+    /// does not exist; an existing session with no turns yet returns
+    /// an empty vector.
     pub async fn history(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
-        match self.store.get(session_id).await.map_err(wrap)? {
-            Some(session) => Ok(session.messages),
-            None => Err(SessionError::NotFound(format!("session {session_id}"))),
+        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
         }
+        self.store
+            .load_active_session_messages(session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Append a single message to the session's transcript log.
+    /// Called by `AgentLoop` from the `&mut self` append paths so
+    /// every turn's worth of messages reaches storage incrementally
+    /// rather than via a per-turn full-blob rewrite.
+    pub async fn append_session_message(
+        &self,
+        session_id: &SessionId,
+        message: &ChatMessage,
+    ) -> Result<()> {
+        self.store
+            .append_session_message(session_id, message)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Mark the currently-active rows for `session_id` as superseded
+    /// by the next ordinal and append `new_active` at the next
+    /// contiguous ordinals. Used by `AgentLoop::compact_now` /
+    /// `compress_if_needed` after a successful compression apply.
+    pub async fn apply_session_compaction(
+        &self,
+        session_id: &SessionId,
+        new_active: &[ChatMessage],
+    ) -> Result<()> {
+        self.store
+            .apply_session_compaction(session_id, new_active)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Load the active transcript for `session_id` — used by the
+    /// router to seed `ContextManager` on actor cold start. Returns
+    /// an empty vector when no turns have been recorded yet.
+    pub async fn load_active_session_messages(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ChatMessage>> {
+        self.store
+            .load_active_session_messages(session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Highest `session_messages.ordinal` ever assigned for the
+    /// session, regardless of supersede status. Used by the trace
+    /// span builder to anchor `LlmCallInputs::Persisted`.
+    pub async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        self.store
+            .latest_session_ordinal(session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Full message log including superseded rows, paired with each
+    /// row's `superseded_by` marker. Used by the trace replay path
+    /// to reconstruct active slices "as of ordinal X" for older
+    /// `LlmCall` spans.
+    pub async fn load_session_messages_with_supersede(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<aura_storage::StoredMessage>> {
+        self.store
+            .load_session_messages_with_supersede(session_id)
+            .await
+            .map_err(wrap)
     }
 
     /// Hard-delete a session by id. Errors with `SessionError::NotFound`
@@ -237,21 +308,33 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use aura_model::{ChannelType, Session, SessionId, User};
+    use aura_model::{ChannelType, ChatMessage, Session, SessionId, User};
     use aura_storage::session::Result as StoreResult;
     use chrono::{DateTime, Duration, Utc};
     use parking_lot::Mutex;
 
     use super::{SessionError, SessionManager, SessionStore};
 
+    /// One stored row in the test fake — mirrors the libsql layout
+    /// closely enough that `apply_session_compaction` can supersede
+    /// rows the same way the real backend does.
+    #[derive(Clone)]
+    struct StoredMessage {
+        ordinal: u64,
+        message: ChatMessage,
+        superseded_by: Option<u64>,
+    }
+
     struct MemorySessionStore {
         data: Mutex<HashMap<SessionId, Session>>,
+        transcripts: Mutex<HashMap<SessionId, Vec<StoredMessage>>>,
     }
 
     impl MemorySessionStore {
         fn new() -> Self {
             Self {
                 data: Mutex::new(HashMap::new()),
+                transcripts: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -268,6 +351,7 @@ mod tests {
         }
 
         async fn delete(&self, session_id: &SessionId) -> StoreResult<bool> {
+            self.transcripts.lock().remove(session_id);
             Ok(self.data.lock().remove(session_id).is_some())
         }
 
@@ -299,6 +383,93 @@ mod tests {
         ) -> StoreResult<Vec<(SessionId, aura_model::LineageKind)>> {
             Ok(Vec::new())
         }
+
+        async fn append_session_message(
+            &self,
+            session_id: &SessionId,
+            message: &ChatMessage,
+        ) -> StoreResult<()> {
+            let mut guard = self.transcripts.lock();
+            let log = guard.entry(session_id.clone()).or_default();
+            let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
+            log.push(StoredMessage {
+                ordinal,
+                message: message.clone(),
+                superseded_by: None,
+            });
+            Ok(())
+        }
+
+        async fn apply_session_compaction(
+            &self,
+            session_id: &SessionId,
+            new_active: &[ChatMessage],
+        ) -> StoreResult<()> {
+            let mut guard = self.transcripts.lock();
+            let log = guard.entry(session_id.clone()).or_default();
+            let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
+            for entry in log.iter_mut() {
+                if entry.superseded_by.is_none() {
+                    entry.superseded_by = Some(next_ordinal);
+                }
+            }
+            for (offset, msg) in new_active.iter().enumerate() {
+                log.push(StoredMessage {
+                    ordinal: next_ordinal + offset as u64,
+                    message: msg.clone(),
+                    superseded_by: None,
+                });
+            }
+            Ok(())
+        }
+
+        async fn load_active_session_messages(
+            &self,
+            session_id: &SessionId,
+        ) -> StoreResult<Vec<ChatMessage>> {
+            Ok(self
+                .transcripts
+                .lock()
+                .get(session_id)
+                .map(|log| {
+                    let mut active: Vec<&StoredMessage> =
+                        log.iter().filter(|m| m.superseded_by.is_none()).collect();
+                    active.sort_by_key(|m| m.ordinal);
+                    active.into_iter().map(|m| m.message.clone()).collect()
+                })
+                .unwrap_or_default())
+        }
+
+        async fn latest_session_ordinal(&self, session_id: &SessionId) -> StoreResult<Option<i64>> {
+            Ok(self
+                .transcripts
+                .lock()
+                .get(session_id)
+                .and_then(|log| log.iter().map(|m| m.ordinal as i64).max()))
+        }
+
+        async fn load_session_messages_with_supersede(
+            &self,
+            session_id: &SessionId,
+        ) -> StoreResult<Vec<aura_storage::StoredMessage>> {
+            Ok(self
+                .transcripts
+                .lock()
+                .get(session_id)
+                .map(|log| {
+                    let mut rows: Vec<_> = log
+                        .iter()
+                        .map(|m| aura_storage::StoredMessage {
+                            ordinal: m.ordinal as i64,
+                            superseded_by: m.superseded_by.map(|v| v as i64),
+                            message: m.message.clone(),
+                        })
+                        .collect();
+                    rows.sort_by_key(|m| m.ordinal);
+                    rows
+                })
+                .unwrap_or_default())
+        }
     }
 
     fn test_user() -> User {
@@ -322,7 +493,6 @@ mod tests {
         assert!(!session.id.as_str().is_empty());
         assert_eq!(session.user.id, "user-1");
         assert_eq!(session.channel, ChannelType::tui());
-        assert!(session.messages.is_empty());
         assert_eq!(session.root_session_id, session.id);
         assert!(session.lineage.is_none());
     }
@@ -507,6 +677,79 @@ mod tests {
 
         assert_eq!(new_session.id, old_id);
         assert!(new_session.created_at > old_created);
-        assert!(new_session.messages.is_empty());
+    }
+
+    /// Regression for the `/compact` summary loss observed when an
+    /// actor was respawned mid-session. Each message round-trips
+    /// through the per-message log, and a compaction supersedes the
+    /// prior rows so the active set seen on restore matches what
+    /// `ContextManager` had in memory after the apply.
+    #[tokio::test]
+    async fn append_then_compact_round_trip() {
+        use aura_model::{ChatMessage, ContentBlock, Role};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let session = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+
+        let user = ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("hi".into())],
+        };
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("hello".into())],
+        };
+        mgr.append_session_message(&session.id, &user)
+            .await
+            .unwrap();
+        mgr.append_session_message(&session.id, &assistant)
+            .await
+            .unwrap();
+
+        let loaded = mgr.load_active_session_messages(&session.id).await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].role, Role::User);
+        assert_eq!(loaded[1].role, Role::Assistant);
+
+        // Compaction supersedes the two prior rows and installs a
+        // single summary as the new active set.
+        let summary = ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("<summary>S</summary>".into())],
+        };
+        mgr.apply_session_compaction(&session.id, std::slice::from_ref(&summary))
+            .await
+            .unwrap();
+
+        let post = mgr.load_active_session_messages(&session.id).await.unwrap();
+        assert_eq!(post.len(), 1);
+        if let ContentBlock::Text(t) = &post[0].content[0] {
+            assert!(t.contains("<summary>"));
+        } else {
+            panic!("expected text");
+        }
+
+        // `history()` exposes the same active slice via the public API.
+        let history = mgr.history(&session.id).await.unwrap();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_active_messages_empty_for_session_without_turns() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let session = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+
+        let loaded = mgr.load_active_session_messages(&session.id).await.unwrap();
+        assert!(loaded.is_empty());
     }
 }

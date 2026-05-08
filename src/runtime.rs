@@ -36,7 +36,7 @@ use aura_agent::{
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_context::{ContextManager, Summarize, TiktokenTokenizer, Tokenizer};
+use aura_context::{ContextManager, Summarize, TiktokenTokenizer, Tokenizer, Truncate};
 use aura_llm::GuardedLlm;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -611,6 +611,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let cost_manager = Arc::clone(&cost_manager);
         let token_calibration = Arc::clone(&token_calibration);
 
+        let sessions = Arc::clone(&graph.session_manager);
         Arc::new(
             move |session: aura_model::Session,
                   response_tx: mpsc::Sender<AgentOutput>,
@@ -626,7 +627,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         token_budget.clone(),
                     )
                     .with_calibration(Arc::clone(&token_calibration))
-                    .with_skill_registry(Arc::clone(&skill_registry)),
+                    .with_skill_registry(Arc::clone(&skill_registry))
+                    .with_session(session.id.clone(), Arc::clone(&sessions)),
                     Arc::clone(&memory_manager),
                     policy.clone(),
                     Soul::custom(system_prompt.clone()),
@@ -740,7 +742,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             // SelfImprovement actor spawner. Mirrors `spawn_actor_for`
             // but swaps the tool registry/executor to the self_improvement
             // pair. Other deps stay the same.
-            let dist_llm: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&graph.llm_client) as _;
+            let dist_llm = guarded_llm.clone();
             let dist_skill_registry = Arc::clone(&graph.skill_registry);
             let dist_memory_manager = Arc::clone(&graph.memory_manager);
             let dist_trace_store = graph.stores.trace.clone();
@@ -754,13 +756,15 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             let dist_policy = policy.clone();
             let dist_system_prompt = system_prompt.clone();
             let dist_cost_manager = Arc::clone(&cost_manager);
+            let dist_token_calibration = Arc::clone(&token_calibration);
+            let dist_sessions = Arc::clone(&graph.session_manager);
 
             let self_improvement_spawner: aura_agent::ActorSpawner = Box::new(
                 move |session: aura_model::Session,
                       response_tx: mpsc::Sender<AgentOutput>,
                       parent_token: &CancellationToken| {
                     let agent_loop = AgentLoop::new(
-                        Arc::clone(&dist_llm),
+                        dist_llm.clone(),
                         Arc::clone(&dist_registry),
                         Arc::clone(&dist_skill_registry),
                         Arc::clone(&dist_executor),
@@ -768,7 +772,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             Arc::clone(&dist_tokenizer),
                             Box::new(Truncate::new(keep_recent)),
                             dist_token_budget.clone(),
-                        ),
+                        )
+                        .with_calibration(Arc::clone(&dist_token_calibration))
+                        .with_skill_registry(Arc::clone(&dist_skill_registry))
+                        .with_session(session.id.clone(), Arc::clone(&dist_sessions)),
                         Arc::clone(&dist_memory_manager),
                         dist_policy.clone(),
                         Soul::custom(dist_system_prompt.clone()),

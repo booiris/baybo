@@ -379,9 +379,22 @@ function LlmCallDetail({ span }: { span: Span }) {
   if (span.kind.kind !== 'llm_call') return null;
   const { begin, result } = span.kind;
   const hint = SanitizeKindHint(span.events);
+  const failureReason =
+    span.outcome.outcome === 'failed' ? span.outcome.reason : null;
 
   return (
     <div className="space-y-6">
+      {failureReason && (
+        <section>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-err pb-1 text-err">
+            Failure reason
+          </h4>
+          <div className="font-mono text-[0.85rem] bg-err/5 border-2 border-err rounded-md p-3 whitespace-pre-wrap break-words text-err">
+            {failureReason}
+          </div>
+        </section>
+      )}
+
       <section>
         <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
           Input messages

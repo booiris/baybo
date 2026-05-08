@@ -201,7 +201,9 @@ impl TraceStore for LibsqlTraceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_trace::{LifecycleState, SpanEventKind, SpanKind, StepKind, ToolCallOrigin};
+    use aura_trace::{
+        LifecycleState, LlmCallInputs, SpanEventKind, SpanKind, StepKind, ToolCallOrigin,
+    };
     use chrono::Utc;
 
     fn make_step(job_id: JobId) -> Step {
@@ -224,7 +226,7 @@ mod tests {
                     model_id: "claude".into(),
                     provider: "anthropic".into(),
                     provider_config_hash: "h".into(),
-                    input_messages: vec![],
+                    input_messages: LlmCallInputs::empty(),
                     temperature: None,
                 },
                 result: None,

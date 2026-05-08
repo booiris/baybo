@@ -42,19 +42,16 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
                 "user": s.user.id,
                 "channel": s.channel.to_string(),
                 "last_active": s.last_active.to_rfc3339(),
-                "messages": s.messages.len(),
             })
         })
         .collect();
 
-    let mut human =
-        String::from("id                                    channel   messages  last_active\n");
+    let mut human = String::from("id                                    channel   last_active\n");
     for s in &sessions {
         human.push_str(&format!(
-            "{:<38}  {:<8}  {:<8}  {}\n",
+            "{:<38}  {:<8}  {}\n",
             s.id,
             s.channel.to_string(),
-            s.messages.len(),
             s.last_active.to_rfc3339(),
         ));
     }
@@ -73,6 +70,10 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         .await
         .map_err(|e| CliError::Manager(format!("get session: {e}")))?
         .ok_or_else(|| CliError::Manager(format!("session {id} not found")))?;
+    let messages = mgr
+        .load_active_session_messages(&typed)
+        .await
+        .map_err(|e| CliError::Manager(format!("load context: {e}")))?;
 
     let value = json!({
         "id": session.id.to_string(),
@@ -83,7 +84,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "channel": session.channel.to_string(),
         "created_at": session.created_at.to_rfc3339(),
         "last_active": session.last_active.to_rfc3339(),
-        "messages": session.messages.len(),
+        "messages": messages.len(),
         "active_skills": session.state.active_skills,
         "compression_count": session.state.compression_count,
     });
@@ -101,7 +102,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         session.channel,
         session.created_at.to_rfc3339(),
         session.last_active.to_rfc3339(),
-        session.messages.len(),
+        messages.len(),
         active_skills_human,
         session.state.compression_count,
     );

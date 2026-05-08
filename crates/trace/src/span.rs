@@ -103,9 +103,70 @@ pub struct LlmCallBegin {
     pub model_id: String,
     pub provider: String,
     pub provider_config_hash: String,
-    pub input_messages: Vec<ChatMessage>,
+    /// What the LLM saw on this call. The two variants split based on
+    /// whether the input is in the per-session append-only log:
+    ///
+    /// - Main agent calls reference `session_messages` by ordinal,
+    ///   keeping span storage constant per call instead of cloning a
+    ///   growing prefix every turn (the prior shape was O(N²) over
+    ///   session length).
+    /// - One-off calls whose input never lands in the session log
+    ///   (compression summarisations, subagent briefings) embed
+    ///   their messages inline because there's nothing to point to.
+    pub input_messages: LlmCallInputs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+}
+
+/// Source of the `input_messages` for an `LlmCall` span.
+///
+/// `Persisted` keeps the span small by referencing a snapshot of the
+/// session message log; the gateway rehydrates this back into a flat
+/// `Vec<ChatMessage>` for clients that want to inspect the exact slice
+/// the LLM saw.
+///
+/// **Wire shape**: `#[serde(untagged)]` so `Inline` rides as a bare
+/// array (matching the long-standing `input_messages: ChatMessage[]`
+/// on-the-wire shape consumed by the web UI) and `Persisted` rides as
+/// a struct. Variant order matters here — array-first means the
+/// deserialiser tries `Inline` before `Persisted`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LlmCallInputs {
+    /// Messages embedded directly. Used when the input is not — and
+    /// should not be — part of the session message log: compression
+    /// LLM calls, subagent briefings, etc. Also the post-hydration
+    /// shape every consumer downstream of `QueryApi::replay` sees.
+    Inline(Vec<ChatMessage>),
+    /// Active set of `session_messages` as of `last_ordinal`. The
+    /// hydrated slice is recovered with the standard "active as of
+    /// ordinal X" filter:
+    /// `WHERE ordinal <= last_ordinal AND
+    ///        (superseded_by IS NULL OR superseded_by > last_ordinal)`.
+    /// System messages live in `session_messages` like any other row,
+    /// so hydration restores the leading `Role::System` (when present)
+    /// directly from the same query — no separate join.
+    Persisted {
+        /// Highest `session_messages.ordinal` that was active at call
+        /// time. The active set as of this ordinal is the slice the
+        /// LLM saw.
+        last_ordinal: i64,
+    },
+}
+
+impl LlmCallInputs {
+    /// Construct an empty inline payload — used as a placeholder when
+    /// deserialising span rows whose body lacks an `input_messages`
+    /// field (e.g. crash-recovered placeholders).
+    pub fn empty() -> Self {
+        Self::Inline(Vec::new())
+    }
+
+    /// True when this call's input is recoverable from
+    /// `session_messages` rather than embedded inline.
+    pub fn is_persisted(&self) -> bool {
+        matches!(self, Self::Persisted { .. })
+    }
 }
 
 /// End-time result for an `LlmCall` span — set when the response is
@@ -230,7 +291,7 @@ mod tests {
                 model_id: "claude-sonnet-4-6".into(),
                 provider: "anthropic".into(),
                 provider_config_hash: "cfg-hash".into(),
-                input_messages: vec![],
+                input_messages: LlmCallInputs::empty(),
                 temperature: Some(0.7),
             },
             result: None,
@@ -334,5 +395,33 @@ mod tests {
     fn span_handle_is_constructible() {
         let h = SpanHandle::new(SpanId::new(), StepId::new(), dummy_llm(), Utc::now(), None);
         assert_eq!(h.span_id, h.clone().span_id);
+    }
+
+    /// Lock the on-the-wire JSON shape of `LlmCallInputs` so a future
+    /// refactor can't accidentally re-introduce the tagged-enum form
+    /// the web UI doesn't grok. `Inline` rides as a bare array (the
+    /// long-standing `input_messages: ChatMessage[]` shape); only
+    /// `Persisted` is an object.
+    #[test]
+    fn llm_call_inputs_serializes_inline_as_bare_array() {
+        let inline = LlmCallInputs::Inline(vec![aura_model::ChatMessage {
+            role: aura_model::Role::User,
+            content: vec![aura_model::ContentBlock::Text("hi".into())],
+        }]);
+        let json = serde_json::to_value(&inline).unwrap();
+        assert!(json.is_array(), "Inline must serialize as a bare array");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+
+        let persisted = LlmCallInputs::Persisted { last_ordinal: 7 };
+        let json = serde_json::to_value(&persisted).unwrap();
+        assert!(json.is_object(), "Persisted must serialize as an object");
+        assert_eq!(json["last_ordinal"], 7);
+
+        // Round-trip both shapes back through Deserialize.
+        let v1: LlmCallInputs = serde_json::from_value(serde_json::json!([])).unwrap();
+        assert!(matches!(v1, LlmCallInputs::Inline(_)));
+        let v2: LlmCallInputs =
+            serde_json::from_value(serde_json::json!({"last_ordinal": 1})).unwrap();
+        assert!(matches!(v2, LlmCallInputs::Persisted { .. }));
     }
 }

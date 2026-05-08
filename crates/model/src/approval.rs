@@ -1,5 +1,5 @@
 //! Approval-related value types shared between `aura-tools` (which produces
-//! them at runtime) and `aura-session` / `aura-model` (which persists
+//! them at runtime) and `aura-context` / `aura-model` (which persists
 //! "approve always" grants on the session).
 //!
 //! Matching semantics (see each enum for details):

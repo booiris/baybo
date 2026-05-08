@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 use super::oauth::{ORIGINATOR, RefreshError, refresh};
 use super::token_bundle::OAuthTokenBundle;
 use super::token_store::VaultTokenStore;
+use crate::tool_name::{sanitize_tool_name, unsanitize_tool_name};
 use crate::{LlmError, LlmStream, StreamEvent, TokenUsage, ToolCallInfo};
 
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -390,33 +391,6 @@ impl OpenAiSubscriptionCompletionModel {
         }
         LlmStream::from_inner(Box::pin(parse_sse_stream(response)))
     }
-}
-
-/// Codex Responses requires `tools[].name` to match
-/// `^[a-zA-Z0-9_-]+$`. Aura's MCP-prefixed tools use `<server>/<tool>`
-/// (e.g. `browser/navigate_page`), so we encode `/` → `__` on the
-/// way out and reverse the substitution on the way back. Any other
-/// forbidden char (rare in practice) is replaced with `_`, which is
-/// lossy but at least produces a valid request — the model's tool
-/// call will round-trip back to a name we don't recognise, surfacing
-/// a clean ToolNotFound rather than a 400 from the server.
-pub(crate) fn sanitize_tool_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() + 2);
-    for ch in name.chars() {
-        match ch {
-            '/' => out.push_str("__"),
-            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => out.push(c),
-            _ => out.push('_'),
-        }
-    }
-    out
-}
-
-/// Reverse of [`sanitize_tool_name`] for echoes coming back from the
-/// server. Only the `/` encoding is reversible — single-`_`
-/// replacements for other forbidden chars are not.
-pub(crate) fn unsanitize_tool_name(name: &str) -> String {
-    name.replace("__", "/")
 }
 
 /// rig `CompletionRequest` → Codex Responses API JSON body. Returns
