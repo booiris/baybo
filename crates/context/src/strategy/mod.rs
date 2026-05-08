@@ -114,8 +114,9 @@ pub trait CompressionStrategy: Send + Sync {
 /// Result of a [`CompressionStrategy::compress`] call.
 pub enum CompressOutput {
     /// Strategy chose not to compress (e.g. message count already at
-    /// or below the keep threshold). `ContextManager` returns
-    /// `CompressionOutcome::NoChange` without touching `session`.
+    /// or below the keep threshold). `ContextManager` surfaces this
+    /// as `CompressionOutcome::StrategyDeclined` without touching
+    /// `session`.
     NoOp,
     /// Strategy produced a new message list.
     ///

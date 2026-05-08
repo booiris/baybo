@@ -54,19 +54,36 @@ struct TokenBaseline {
     message_count_at_call: usize,
 }
 
-/// Result of a [`ContextManager::maybe_compress`] call.
+/// Result of a [`ContextManager::maybe_compress`] /
+/// [`ContextManager::force_compress`] call.
 ///
-/// Cost recording is the caller's responsibility — `maybe_compress`
-/// invokes the supplied chat closure for any LLM call, and that
-/// closure is where the agent loop opens its trace span and records
-/// cost. Hence the outcome carries no LLM-call provenance.
+/// "Nothing changed" is split into three reason-specific variants so
+/// callers (notably the `/compact` notice path in the agent loop) can
+/// surface *why* nothing was applied instead of a generic message.
+///
+/// Cost recording is the caller's responsibility — both entry points
+/// invoke the supplied chat closure for any LLM call, and that closure
+/// is where the agent loop opens its trace span and records cost.
+/// Hence the outcome carries no LLM-call provenance.
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionOutcome {
-    /// Budget was under the threshold, or the strategy chose not to
-    /// shorten the list. `session.messages` is unchanged.
-    NoChange,
-    /// `session.messages` was replaced with a shorter list.
-    Compressed,
+    /// `session.messages` was replaced with a shorter list. `before`
+    /// and `after` are the pre/post token totals — the manager owns
+    /// these numbers, so callers don't have to re-read `budget()`.
+    Compressed { before: usize, after: usize },
+    /// Budget was under the configured compression threshold and the
+    /// strategy was not invoked. Only produced by `maybe_compress` —
+    /// `force_compress` bypasses the threshold by design.
+    BelowThreshold,
+    /// The strategy itself returned `NoOp` without invoking the chat
+    /// closure (e.g. `Truncate` when the non-system message count is
+    /// already at or below `keep_recent`). No LLM call was made.
+    StrategyDeclined,
+    /// The strategy produced a candidate slice, but its post-tokenise
+    /// total was not smaller than the original. The manager refused
+    /// to apply it (so the budget stays honest) and `session.messages`
+    /// is unchanged.
+    NoSavings { before: usize, after: usize },
 }
 
 /// Manages session context: appending messages with automatic compression
@@ -295,15 +312,15 @@ impl ContextManager {
         self.budget.update(self.count_tokens(&session.messages));
 
         if !self.budget.needs_compression() {
-            return Ok(CompressionOutcome::NoChange);
+            return Ok(CompressionOutcome::BelowThreshold);
         }
 
         self.run_compression(session, chat).await
     }
 
     /// Like [`Self::maybe_compress`] but skips the threshold gate.
-    /// Same post-conditions: a strategy NoOp or non-shrinking apply
-    /// still surfaces as `NoChange` so a too-small conversation isn't
+    /// A strategy NoOp surfaces as `StrategyDeclined`; a non-shrinking
+    /// apply surfaces as `NoSavings`, so a too-small conversation isn't
     /// rewritten as a one-line summary. For caller-initiated passes
     /// (e.g. a user-typed `/compact`).
     pub async fn force_compress<F, Fut>(
@@ -333,7 +350,7 @@ impl ContextManager {
         let chat_box: crate::strategy::ChatCallback = Box::new(move |req| Box::pin(chat(req)));
         let plan = self.strategy.compress(&session.messages, chat_box).await?;
         let (mut new_messages, replaced_full_history) = match plan {
-            CompressOutput::NoOp => return Ok(CompressionOutcome::NoChange),
+            CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
             CompressOutput::Replaced {
                 messages,
                 replaced_full_history,
@@ -375,7 +392,10 @@ impl ContextManager {
         if after_tokens >= before_tokens {
             // Don't apply. `session.messages` and the existing cache
             // are still in sync; nothing to undo.
-            return Ok(CompressionOutcome::NoChange);
+            return Ok(CompressionOutcome::NoSavings {
+                before: before_tokens,
+                after: after_tokens,
+            });
         }
 
         session.messages = new_messages;
@@ -403,7 +423,10 @@ impl ContextManager {
             "proactive context compression"
         );
 
-        Ok(CompressionOutcome::Compressed)
+        Ok(CompressionOutcome::Compressed {
+            before: before_tokens,
+            after: after_tokens,
+        })
     }
 
     /// Read-only access to the token budget.
@@ -674,7 +697,7 @@ mod tests {
             ctx.maybe_compress(&mut session, "test-model", never_chat)
                 .await
                 .unwrap(),
-            CompressionOutcome::NoChange
+            CompressionOutcome::BelowThreshold
         ));
     }
 
@@ -697,7 +720,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
         // system + 2 most recent non-system
         assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[0].role, Role::System);
@@ -717,7 +740,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::NoChange));
+        assert!(matches!(outcome, CompressionOutcome::BelowThreshold));
         assert_eq!(session.messages.len(), 3);
     }
 
@@ -741,7 +764,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", never_chat)
             .await
             .unwrap();
-        assert!(matches!(baseline, CompressionOutcome::NoChange));
+        assert!(matches!(baseline, CompressionOutcome::BelowThreshold));
         assert_eq!(session.messages.len(), 4);
 
         let outcome = ctx
@@ -749,17 +772,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
         // system + keep_recent=2 most recent non-system.
         assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[0].role, Role::System);
     }
 
     #[tokio::test]
-    async fn force_compress_noop_when_strategy_cant_shorten() {
+    async fn force_compress_strategy_declined_when_cant_shorten() {
         // keep_recent=5 ≥ non-system count → Truncate returns NoOp,
-        // and `force_compress` reports `NoChange` even though the
-        // budget gate was bypassed.
+        // and `force_compress` surfaces it as `StrategyDeclined`
+        // (the budget gate was bypassed; the strategy itself bowed out).
         let mut ctx = make_ctx(5, 100_000, 0.75);
         let mut session = make_session(vec![]);
 
@@ -772,7 +795,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::NoChange));
+        assert!(matches!(outcome, CompressionOutcome::StrategyDeclined));
         assert_eq!(session.messages.len(), 3);
     }
 
@@ -780,6 +803,8 @@ mod tests {
     async fn no_compress_when_already_at_keep_recent() {
         // Low threshold triggers compression check, but only 2 non-system
         // messages with keep_recent=5 → strategy can't reduce further.
+        // Surfaces as `StrategyDeclined`: the budget gate did fire
+        // (`BelowThreshold` would mean we never got to the strategy at all).
         let mut ctx = make_ctx(5, 10, 0.1);
         let mut session = make_session(vec![]);
 
@@ -792,7 +817,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::NoChange));
+        assert!(matches!(outcome, CompressionOutcome::StrategyDeclined));
         assert_eq!(session.messages.len(), 3);
     }
 
@@ -939,7 +964,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", never_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         // Cache must be in lockstep with the post-compression slice.
         assert_eq!(ctx.per_message_tokens.read().len(), session.messages.len());
@@ -1094,7 +1119,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         // [system, summary] only — no reminder, no detail.
         assert_eq!(session.messages.len(), 2);
@@ -1142,7 +1167,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         // [system, summary, reminder, detail]
         assert_eq!(session.messages.len(), 4);
@@ -1190,7 +1215,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", never_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         // No reminder / detail messages were appended; the result is
         // just system + the kept tail (which itself may still have

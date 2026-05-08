@@ -120,10 +120,15 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
 /// verbatim — that way a non-conforming LLM response still produces a
 /// usable summary instead of paying for the truncation fallback.
 ///
-/// `keep_recent` is used both as the NoOp threshold (skip when there
-/// aren't enough non-system messages to be worth summarising) and to
-/// shape the deterministic fallback used on transport / empty-response
-/// failure.
+/// `keep_recent` shapes the deterministic fallback used on transport /
+/// empty-response failure: how many non-system messages to retain at
+/// the tail when the summarizer can't produce a usable response. It
+/// does **not** gate whether the strategy runs — `ContextManager`'s
+/// budget threshold (`maybe_compress`) is the only "should we compress
+/// now" check, and `/compact` (`force_compress`) deliberately bypasses
+/// even that. A forced summarize on a too-small conversation that
+/// can't actually shrink surfaces as `CompressionOutcome::NoSavings`
+/// via the manager's post-compression token check.
 pub struct Summarize {
     keep_recent: usize,
 }
@@ -202,9 +207,7 @@ impl CompressionStrategy for Summarize {
             }
         }
 
-        if non_system.len() <= self.keep_recent {
-            return Ok(CompressOutput::NoOp);
-        }
+        // Gating lives in `ContextManager`; we always run.
 
         // Send the full conversation as-is, then append the
         // summarisation instruction as a trailing user turn.
@@ -299,14 +302,6 @@ mod tests {
     fn err_chat() -> ChatCallback {
         Box::new(|_req| {
             Box::pin(async move { Err(crate::error::ContextError::Compression("boom".into())) })
-        })
-    }
-
-    fn never_chat() -> ChatCallback {
-        Box::new(|_req| {
-            Box::pin(async move {
-                panic!("chat must not be invoked when strategy NoOps");
-            })
         })
     }
 
@@ -572,8 +567,10 @@ mod tests {
         }
     }
 
+    /// `keep_recent` no longer gates the strategy; a `/compact` on a
+    /// short conversation must still reach the LLM.
     #[tokio::test]
-    async fn no_op_when_under_keep_recent() {
+    async fn runs_even_when_under_keep_recent() {
         let strategy = Summarize::new(10);
 
         let messages = vec![
@@ -582,9 +579,28 @@ mod tests {
             make_msg(Role::Assistant, "hi"),
         ];
 
-        match strategy.compress(&messages, never_chat()).await.unwrap() {
-            CompressOutput::NoOp => {}
-            _ => panic!("expected NoOp"),
+        match strategy
+            .compress(
+                &messages,
+                ok_chat("<analysis>a</analysis><summary>S</summary>"),
+            )
+            .await
+            .unwrap()
+        {
+            CompressOutput::Replaced {
+                messages: new_messages,
+                replaced_full_history,
+            } => {
+                assert!(replaced_full_history);
+                assert_eq!(new_messages.len(), 2);
+                assert_eq!(new_messages[0].role, Role::System);
+                if let ContentBlock::Text(t) = &new_messages[1].content[0] {
+                    assert_eq!(t, "<summary>S</summary>");
+                } else {
+                    panic!("expected text content");
+                }
+            }
+            _ => panic!("expected Replaced — manager owns the budget gate now"),
         }
     }
 

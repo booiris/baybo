@@ -1517,9 +1517,12 @@ impl AgentLoop {
 
     /// Run an on-demand compression pass and return the confirmation
     /// text for the caller to ship as an `AgentOutput::Notice`.
-    /// Strategy NoOp surfaces as "nothing to compress" rather than an
-    /// error. A fresh job is minted so the compression step + LLM
-    /// span land on a real lifecycle.
+    /// The variants of `CompressionOutcome` map to specific user-facing
+    /// messages so the caller (typically a `/compact` notice) can
+    /// distinguish "strategy declined", "no savings", and a real
+    /// compress — instead of one generic "nothing to compress" line.
+    /// A fresh job is minted so the compression step + LLM span land
+    /// on a real lifecycle.
     pub async fn compact_now(
         &mut self,
         session: &mut Session,
@@ -1555,7 +1558,6 @@ impl AgentLoop {
             cancel_token.clone(),
             spec,
             |job_id| async move {
-                let before = self.context_manager.budget().current();
                 let runner =
                     self.build_compression_runner(session, span_recorder, job_id, &cancel_token);
                 let model_id = runner.model_info.id.clone();
@@ -1563,16 +1565,26 @@ impl AgentLoop {
                     .context_manager
                     .force_compress(session, &model_id, |req| runner.run(req))
                     .await?;
-                let after = self.context_manager.budget().current();
                 let text = match outcome {
-                    aura_context::CompressionOutcome::Compressed => {
+                    aura_context::CompressionOutcome::Compressed { before, after } => {
                         format!(
                             "Context compressed: {before} → {after} tokens ({} freed).",
                             before.saturating_sub(after)
                         )
                     }
-                    aura_context::CompressionOutcome::NoChange => {
-                        "Nothing to compress.".to_string()
+                    aura_context::CompressionOutcome::BelowThreshold => {
+                        let current = self.context_manager.budget().current();
+                        format!(
+                            "Context already under the compression threshold ({current} tokens); skipped."
+                        )
+                    }
+                    aura_context::CompressionOutcome::StrategyDeclined => {
+                        "Compression strategy declined: nothing to summarize (conversation too short).".to_string()
+                    }
+                    aura_context::CompressionOutcome::NoSavings { before, after } => {
+                        format!(
+                            "Compression ran but produced no savings ({before} → {after} tokens); kept the original."
+                        )
                     }
                 };
                 let output = JobOutput::Message {
