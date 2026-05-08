@@ -57,6 +57,7 @@ use crate::job::JobLifecycle;
 pub type SubagentActorSpawner = Arc<
     dyn Fn(
             aura_model::Session,
+            Vec<aura_model::ChatMessage>,
             mpsc::Sender<AgentOutput>,
             &CancellationToken,
         ) -> mpsc::Sender<AgentMessage>
@@ -262,7 +263,11 @@ impl SubagentRuntime for LocalSubagentRuntime {
         // `parent_token`; the child actor's `actor_token` is its
         // child, so cascading cancel reaches the child's tools,
         // LLM calls, and nested subagents.
-        let mailbox = (self.spawn_actor)(child_session.clone(), output_tx, &parent_token);
+        // Subagents start with an empty transcript; the parent's
+        // briefing is delivered as the first user message in the
+        // mailbox path below.
+        let mailbox =
+            (self.spawn_actor)(child_session.clone(), Vec::new(), output_tx, &parent_token);
 
         // Subscribe to terminal events *before* dispatching the
         // initial message — a fast child whose `agent_loop.run`

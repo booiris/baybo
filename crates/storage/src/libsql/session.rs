@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use super::LibsqlPool;
 use crate::error::StorageError;
 use crate::session::{Result, SessionStore};
-use aura_model::{Lineage, LineageKind, Session, SessionId};
+use aura_model::{ChatMessage, Lineage, LineageKind, Session, SessionId};
 
 pub struct LibsqlSessionStore {
     pool: LibsqlPool,
@@ -269,6 +269,58 @@ impl SessionStore for LibsqlSessionStore {
             forks.push(SessionId::from(id));
         }
         Ok(forks)
+    }
+
+    async fn save_context_messages(
+        &self,
+        session_id: &SessionId,
+        messages: &[ChatMessage],
+    ) -> Result<()> {
+        let conn = self.pool.conn();
+        let payload = serde_json::to_string(messages)
+            .map_err(|e| StorageError::Storage(format!("serialize context messages: {e}")))?;
+        conn.execute(
+            "UPDATE sessions SET context_messages = ?2 WHERE id = ?1",
+            libsql::params![session_id.as_str().to_string(), payload],
+        )
+        .await
+        .map_err(|e| {
+            StorageError::Internal(anyhow::anyhow!("libsql update context_messages: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn load_context_messages(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT context_messages FROM sessions WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query context_messages: {e}"))
+            })?;
+
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
+
+        match row {
+            Some(row) => {
+                let payload: Option<String> = row
+                    .get(0)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                match payload {
+                    Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| {
+                        StorageError::Storage(format!("deserialize context messages: {e}"))
+                    }),
+                    _ => Ok(Vec::new()),
+                }
+            }
+            None => Ok(Vec::new()),
+        }
     }
 }
 

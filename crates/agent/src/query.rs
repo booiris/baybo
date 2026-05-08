@@ -862,6 +862,19 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+        async fn save_context_messages(
+            &self,
+            _id: &SessionId,
+            _messages: &[aura_model::ChatMessage],
+        ) -> std::result::Result<(), StorageError> {
+            Ok(())
+        }
+        async fn load_context_messages(
+            &self,
+            _id: &SessionId,
+        ) -> std::result::Result<Vec<aura_model::ChatMessage>, StorageError> {
+            Ok(Vec::new())
+        }
     }
 
     fn make_session(id: &str) -> Session {

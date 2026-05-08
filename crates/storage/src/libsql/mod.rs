@@ -128,7 +128,8 @@ impl LibsqlPool {
                     bound_soul_version    TEXT NOT NULL,
                     created_at            INTEGER NOT NULL,
                     last_active           INTEGER NOT NULL,
-                    data                  TEXT NOT NULL
+                    data                  TEXT NOT NULL,
+                    context_messages      TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
                     ON sessions(root_session_id);

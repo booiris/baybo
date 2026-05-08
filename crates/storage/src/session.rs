@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::{LineageKind, Session, SessionId};
+use aura_model::{ChatMessage, LineageKind, Session, SessionId};
 use chrono::{DateTime, Utc};
 
 use crate::error::StorageError;
@@ -48,4 +48,22 @@ pub trait SessionStore: Send + Sync {
         &self,
         parent_session_id: &SessionId,
     ) -> Result<Vec<(SessionId, LineageKind)>>;
+
+    /// Persist the conversation transcript (the messages owned by
+    /// `aura_context::ContextManager`) for a session. Replaces any
+    /// prior snapshot. The session row must already exist; the
+    /// caller is responsible for sequencing this after
+    /// [`SessionStore::save`] when the session is brand-new.
+    async fn save_context_messages(
+        &self,
+        session_id: &SessionId,
+        messages: &[ChatMessage],
+    ) -> Result<()>;
+
+    /// Load the persisted conversation transcript for a session.
+    /// Returns an empty vector when no snapshot has been written yet
+    /// (cold start, or session created without a turn). Errors
+    /// distinguish from-the-store I/O failures from "no rows" — the
+    /// latter is mapped to the empty-vector branch.
+    async fn load_context_messages(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>>;
 }

@@ -70,7 +70,12 @@ impl RateLimiter {
 /// per-job cancel token is passed instead, so admin `cancel_job(parent)`
 /// trips the entire descendant subtree.
 pub type ActorSpawner = Box<
-    dyn Fn(Session, mpsc::Sender<AgentOutput>, &CancellationToken) -> mpsc::Sender<AgentMessage>
+    dyn Fn(
+            Session,
+            Vec<aura_model::ChatMessage>,
+            mpsc::Sender<AgentOutput>,
+            &CancellationToken,
+        ) -> mpsc::Sender<AgentMessage>
         + Send
         + Sync,
 >;
@@ -245,7 +250,9 @@ impl Router {
         );
 
         let response_tx = self.supervisor.response_tx().clone();
-        let sender = spawner(session, response_tx, &self.actor_parent_token);
+        // Cron sessions are minted fresh per fire (`Lineage::Subagent`-
+        // adjacent), so they have no prior transcript to seed.
+        let sender = spawner(session, Vec::new(), response_tx, &self.actor_parent_token);
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
@@ -343,7 +350,22 @@ impl Router {
             if let Some(ref spawner) = self.actor_spawner {
                 info!(session_id = %session_id, "creating new actor for session");
                 let response_tx = self.supervisor.response_tx().clone();
-                let sender = spawner(session, response_tx, &self.actor_parent_token);
+                // Cold-start path: load any persisted transcript so a
+                // process bounce / actor respawn doesn't drop the
+                // user's earlier turns. Empty on first contact.
+                let transcript = self
+                    .session_manager
+                    .load_context_messages(&typed_session_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "failed to load persisted transcript; starting fresh"
+                        );
+                        Vec::new()
+                    });
+                let sender = spawner(session, transcript, response_tx, &self.actor_parent_token);
                 self.supervisor.register(session_id.clone(), sender);
 
                 // Retry routing now that the actor exists.

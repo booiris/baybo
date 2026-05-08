@@ -176,18 +176,46 @@ impl SessionManager {
         Ok(sessions)
     }
 
-    /// Return the transcript (`messages`) of the given session. Errors with
+    /// Return the transcript of the given session. Errors with
     /// `SessionError::NotFound` if the session does not exist.
     ///
-    /// **Phase 1 stub**: the transcript now lives in
-    /// `aura-context::ContextManager`, not on `Session`. Until the
-    /// upcoming context-state store lands, callers see an empty
-    /// transcript even when the session itself exists.
+    /// The transcript itself is owned by
+    /// `aura_context::ContextManager` while the actor is alive; this
+    /// path reads the persisted snapshot the actor flushes after each
+    /// turn, so a freshly-rehydrated session still surfaces its
+    /// history here.
     pub async fn history(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
-        match self.store.get(session_id).await.map_err(wrap)? {
-            Some(_session) => Ok(Vec::new()),
-            None => Err(SessionError::NotFound(format!("session {session_id}"))),
+        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
         }
+        self.store
+            .load_context_messages(session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Persist the current transcript snapshot for `session_id`.
+    /// Called by the agent actor at every turn boundary so a restart
+    /// (process bounce, actor respawn) doesn't drop the conversation.
+    pub async fn save_context_messages(
+        &self,
+        session_id: &SessionId,
+        messages: &[ChatMessage],
+    ) -> Result<()> {
+        self.store
+            .save_context_messages(session_id, messages)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Load the persisted transcript for `session_id`. Returns an
+    /// empty vector when no snapshot has been written yet (cold
+    /// start or session created without a turn).
+    pub async fn load_context_messages(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
+        self.store
+            .load_context_messages(session_id)
+            .await
+            .map_err(wrap)
     }
 
     /// Hard-delete a session by id. Errors with `SessionError::NotFound`
@@ -240,7 +268,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use aura_model::{ChannelType, Session, SessionId, User};
+    use aura_model::{ChannelType, ChatMessage, Session, SessionId, User};
     use aura_storage::session::Result as StoreResult;
     use chrono::{DateTime, Duration, Utc};
     use parking_lot::Mutex;
@@ -249,12 +277,14 @@ mod tests {
 
     struct MemorySessionStore {
         data: Mutex<HashMap<SessionId, Session>>,
+        transcripts: Mutex<HashMap<SessionId, Vec<ChatMessage>>>,
     }
 
     impl MemorySessionStore {
         fn new() -> Self {
             Self {
                 data: Mutex::new(HashMap::new()),
+                transcripts: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -301,6 +331,29 @@ mod tests {
             _parent_session_id: &SessionId,
         ) -> StoreResult<Vec<(SessionId, aura_model::LineageKind)>> {
             Ok(Vec::new())
+        }
+
+        async fn save_context_messages(
+            &self,
+            session_id: &SessionId,
+            messages: &[ChatMessage],
+        ) -> StoreResult<()> {
+            self.transcripts
+                .lock()
+                .insert(session_id.clone(), messages.to_vec());
+            Ok(())
+        }
+
+        async fn load_context_messages(
+            &self,
+            session_id: &SessionId,
+        ) -> StoreResult<Vec<ChatMessage>> {
+            Ok(self
+                .transcripts
+                .lock()
+                .get(session_id)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 
@@ -509,5 +562,60 @@ mod tests {
 
         assert_eq!(new_session.id, old_id);
         assert!(new_session.created_at > old_created);
+    }
+
+    /// Regression for the `/compact` summary loss observed when an
+    /// actor was respawned mid-session. The transcript must round-trip
+    /// through the store, not just live in actor memory.
+    #[tokio::test]
+    async fn context_messages_round_trip_through_store() {
+        use aura_model::{ChatMessage, ContentBlock, Role};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let session = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+
+        let messages = vec![
+            ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text("hi".into())],
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text("hello".into())],
+            },
+        ];
+
+        mgr.save_context_messages(&session.id, &messages)
+            .await
+            .unwrap();
+
+        let loaded = mgr.load_context_messages(&session.id).await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].role, Role::User);
+        assert_eq!(loaded[1].role, Role::Assistant);
+
+        // `history()` walks the same path now, so a freshly-restored
+        // actor would see the same transcript.
+        let history = mgr.history(&session.id).await.unwrap();
+        assert_eq!(history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn load_context_messages_empty_for_session_without_turns() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let session = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+
+        let loaded = mgr.load_context_messages(&session.id).await.unwrap();
+        assert!(loaded.is_empty());
     }
 }

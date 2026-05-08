@@ -11,7 +11,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
-use aura_model::Session;
+use aura_model::{Session, SessionId};
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_skills_assessor::SkillAssessor;
 use aura_tools::{ToolOutput, ToolRegistry};
@@ -209,6 +209,13 @@ pub struct AgentLoop {
     /// Cost gate + ledger; `record_call` feeds spend back so the
     /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
     cost_manager: Option<Arc<crate::cost::CostManager>>,
+    /// Persistence handle for the conversation transcript.
+    /// When set, the loop flushes `context_manager.messages()` to
+    /// the store at the end of every successful turn (`run`,
+    /// `compact_now`) so an actor restart or process bounce
+    /// doesn't drop the conversation. Unset → in-memory only
+    /// (used by tests with no real store).
+    session_store: Option<Arc<dyn aura_storage::SessionStore>>,
 }
 
 impl AgentLoop {
@@ -239,7 +246,25 @@ impl AgentLoop {
             skill_assessor: None,
             session_log: None,
             cost_manager: None,
+            session_store: None,
         }
+    }
+
+    /// Attach the persistence store so the loop can flush the
+    /// `ContextManager` transcript after each successful turn. The
+    /// session row must already exist in the store when this is set
+    /// — flushing is `UPDATE`, not `INSERT`. Without it, the
+    /// transcript stays in process memory only and is lost on actor
+    /// restart.
+    pub fn with_session_store(mut self, store: Arc<dyn aura_storage::SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
+    /// Seed the `ContextManager` transcript on actor cold start.
+    /// Idempotent: replacing with the same vector is a no-op cost.
+    pub fn restore_transcript(&mut self, messages: Vec<ChatMessage>) {
+        self.context_manager.restore_messages(messages);
     }
 
     /// Attach the subagent runtime so LLM-emitted `spawn_subagent`
@@ -318,6 +343,7 @@ impl AgentLoop {
                         cancel_token,
                     )
                     .await?;
+                self.flush_transcript(&session.id).await;
                 let output = JobOutput::Message {
                     content: outgoing.content.clone(),
                 };
@@ -325,6 +351,28 @@ impl AgentLoop {
             },
         )
         .await
+    }
+
+    /// Persist the current transcript snapshot to the configured
+    /// session store, if any. Failures are logged at warn and
+    /// swallowed — a flush problem must not block the user-visible
+    /// response. Call at every turn boundary (`run`,
+    /// `compact_now` success branches) so an actor restart doesn't
+    /// drop the conversation.
+    async fn flush_transcript(&self, session_id: &SessionId) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        if let Err(e) = store
+            .save_context_messages(session_id, self.context_manager.messages())
+            .await
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to flush context transcript to store"
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1565,6 +1613,7 @@ impl AgentLoop {
                     .context_manager
                     .force_compress(&model_id, |req| runner.run(req))
                     .await?;
+                self.flush_transcript(&session.id).await;
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
                         "Context compressed.".to_string()

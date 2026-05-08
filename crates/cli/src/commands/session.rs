@@ -70,6 +70,10 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         .await
         .map_err(|e| CliError::Manager(format!("get session: {e}")))?
         .ok_or_else(|| CliError::Manager(format!("session {id} not found")))?;
+    let messages = mgr
+        .load_context_messages(&typed)
+        .await
+        .map_err(|e| CliError::Manager(format!("load context: {e}")))?;
 
     let value = json!({
         "id": session.id.to_string(),
@@ -80,6 +84,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "channel": session.channel.to_string(),
         "created_at": session.created_at.to_rfc3339(),
         "last_active": session.last_active.to_rfc3339(),
+        "messages": messages.len(),
         "active_skills": session.state.active_skills,
         "compression_count": session.state.compression_count,
     });
@@ -91,12 +96,13 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     };
 
     let human = format!(
-        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nactive_skills:  {}\ncompressions:   {}",
+        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\nactive_skills:  {}\ncompressions:   {}",
         session.id,
         session.user.id,
         session.channel,
         session.created_at.to_rfc3339(),
         session.last_active.to_rfc3339(),
+        messages.len(),
         active_skills_human,
         session.state.compression_count,
     );
