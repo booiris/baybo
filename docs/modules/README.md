@@ -22,7 +22,6 @@ Bottom-up along the dependency graph:
 
 ### Ingress and Security Boundary Layer
 
-- **session** — `SessionError` and `SessionManager` (lifecycle logic). Session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`) live in `model`; the `SessionStore` trait lives in `storage`. A `Session` is the top of one trace tree (1 trace = 1 session); fork and subagent spawn create new sessions linked through `Lineage`. `aura-session` depends on both `model` and `storage`.
 - **channels** — Channel adapter trait, shared message types (Message, IncomingMessage, OutgoingMessage), slash/dashboard trait definitions (`SlashHandler`, `DashboardProvider`, `ViewKind`), and `ChannelRegistry`. No built-in adapters — the terminal UI now lives in its own `aura-tui` crate (see [`tui.md`](./tui.md)).
 - **security** — Cryptographic primitives (EncryptionKey, encrypt/decrypt), leak detection (LeakDetector), error types.
 
@@ -35,7 +34,7 @@ Bottom-up along the dependency graph:
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
 - **workspace** — Identity files and long-running configuration.
 - **cron** — Cron job domain types (`CronJob`, `CronExecution`, `CronStatus`, `CronRunMode`, `CronError`). Standard cron syntax.
-- **context** — Context appending and compression.
+- **context** — Owns the conversation transcript (`ContextManager`), token budget + compression, and the session lifecycle manager (`SessionManager`, `SessionError`). Session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`) live in `model`; the `SessionStore` trait lives in `storage`. A `Session` is the top of one trace tree (1 trace = 1 session); fork and subagent spawn create new sessions linked through `Lineage`.
 
 ### Runtime and Observability Layer
 
@@ -46,7 +45,7 @@ Bottom-up along the dependency graph:
 
 - **storage** — Defines all Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`); implements all via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free. `ChannelPairingStore` defines `ChannelPairingRow` / `PairingStatus` so `aura-pairing` can stay a business-logic crate.
 - **[pairing](pairing.md)** — Per-user pairing gate for sidecar-routed inbound messages. `PairingService` checks the `(channel_type, bot_id, user_id)` triple, mints 6-char codes for unknown senders, and refuses with a `Frame::Notice` until `aura pair approve <code>` flips the row to `approved`. Store trait + row lives in `storage`; `aura-pairing` is the service + code generator.
-- **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, observability facades (`JobLifecycle` for the job state machine, `SpanRecorder` for Step/Span/SpanEvent writes), cost management (`CostTracker` as a `TraceEventStream` subscriber, `CostGuard`), plus all domain managers (SessionManager, MemoryManager, SecretVault, SecurityGateway, CronScheduler). Bridges cron domain types and storage row types.
+- **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, observability facades (`JobLifecycle` for the job state machine, `SpanRecorder` for Step/Span/SpanEvent writes), cost management (`CostTracker` as a `TraceEventStream` subscriber, `CostGuard`), plus all domain managers (MemoryManager, SecretVault, SecurityGateway, CronScheduler). Re-exports `SessionManager` from `aura-context` for callers that pull session lifecycle through this crate. Bridges cron domain types and storage row types.
 - **[setup](setup.md)** — Interactive first-run wizard (`aura-setup`, exposed as `aura setup`). Bootstraps the workspace skeleton, mints the master encryption key under `<root>/.key/encryption.key`, writes a default `aura.json`, opens libsql + the secret vault, then runs Quick / Full step sequences (LLM / channel / browser). Same flow primitives back `aura llm add` / `aura channel add` (`flow::configure_*_step`), so the wizard's per-step UX is structurally identical to the argv path. β2 commit semantics — `aura.json` is the only deferred write.
 - **bootstrap** — Binary entry point (`src/main.rs`) and `boot` submodule. Loads `AuraConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
 - **cli** — Operator-facing command layer (`aura-cli`). One `clap` tree drives both argv-mode commands (`aura config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input that resolves to a CLI command never enters the agent's context. User-invocable skills are the one sanctioned exception: `/<skill>` is forwarded to the agent as a normal chat message so `SkillRegistry::select` can narrow on the exact-match branch.
@@ -75,11 +74,11 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
   └── config (no internal deps; external only)
 
 storage   ──► model, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
-session   ──► model, storage (owns SessionManager; consumes SessionStore from storage)
+context   ──► model, storage, llm, skills (owns ContextManager + SessionManager; consumes SessionStore from storage)
 pairing   ──► model, storage (owns PairingService + code generator; consumes ChannelPairingStore from storage)
 sandbox   ──► (no internal deps; OS sandbox runner consumed by agent)
-agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, sandbox, storage, channels, config
-gateway   ──► agent, channels, config, cron, job, llm, model, pairing, security, session, skills, storage, tools, trace, workspace
+agent     ──► model, llm, tools, workspace, context, trace, job, cron, security, sandbox, storage, channels, config
+gateway   ──► agent, channels, config, cron, job, llm, model, pairing, security, skills, storage, tools, trace, workspace
 tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over HTTP+SSE)
 setup     ──► channels, config, gateway, llm, model, security, storage, workspace (interactive first-run wizard; aura-cli's llm-add/channel-add wrap its flow primitives)
 bootstrap ──► config + all domain crates it assembles (entry point only)
