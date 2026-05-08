@@ -35,7 +35,6 @@ aura-llm = { workspace = true }
 aura-model = { workspace = true }
 aura-pairing = { workspace = true }
 aura-security = { workspace = true }
-aura-session = { workspace = true }
 aura-skills = { workspace = true }
 aura-storage = { workspace = true }
 aura-tools = { workspace = true }

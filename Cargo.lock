@@ -197,7 +197,6 @@ dependencies = [
  "aura-model",
  "aura-sandbox",
  "aura-security",
- "aura-session",
  "aura-setup",
  "aura-skills",
  "aura-skills-assessor",
@@ -234,7 +233,6 @@ dependencies = [
  "aura-model",
  "aura-sandbox",
  "aura-security",
- "aura-session",
  "aura-skills",
  "aura-skills-assessor",
  "aura-storage",
@@ -292,7 +290,6 @@ dependencies = [
  "aura-llm",
  "aura-model",
  "aura-security",
- "aura-session",
  "aura-setup",
  "aura-skills",
  "aura-skills-assessor",
@@ -364,7 +361,9 @@ dependencies = [
  "aura-llm",
  "aura-model",
  "aura-skills",
+ "aura-storage",
  "chrono",
+ "futures",
  "parking_lot",
  "serde",
  "serde_json",
@@ -373,6 +372,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -413,7 +413,6 @@ dependencies = [
  "aura-model",
  "aura-pairing",
  "aura-security",
- "aura-session",
  "aura-skills",
  "aura-storage",
  "aura-tools",
@@ -602,23 +601,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "aura-session"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-model",
- "aura-storage",
- "chrono",
- "futures",
- "parking_lot",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
  "uuid",
 ]
 

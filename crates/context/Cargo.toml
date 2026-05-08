@@ -7,6 +7,7 @@ edition.workspace = true
 aura-model = { workspace = true }
 aura-llm = { workspace = true }
 aura-skills = { workspace = true }
+aura-storage = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
@@ -16,6 +17,8 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 tiktoken-rs = { workspace = true }
 parking_lot = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

@@ -30,11 +30,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::{AgentOutput, IncomingMessage, Message};
+use aura_context::SessionManager;
 use aura_job::JobStatusKind;
 use aura_model::{
     ChannelType, ContentBlock, JobId, Lineage, LineageKind, MessageMetadata, SessionId, User,
 };
-use aura_session::SessionManager;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
