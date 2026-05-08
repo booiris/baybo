@@ -470,61 +470,6 @@ impl SessionStore for LibsqlSessionStore {
         }
     }
 
-    async fn put_system_prompt(&self, content: &str) -> Result<String> {
-        use sha2::{Digest, Sha256};
-        let hash = hex::encode(Sha256::digest(content.as_bytes()));
-        let conn = self.pool.conn();
-        conn.execute(
-            "INSERT OR IGNORE INTO system_prompts (hash, content) VALUES (?1, ?2)",
-            libsql::params![hash.clone(), content.to_string()],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql put system_prompt: {e}")))?;
-        Ok(hash)
-    }
-
-    async fn load_system_prompts(
-        &self,
-        hashes: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
-        if hashes.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        // SELECT … WHERE hash IN (?1, ?2, …) — bind each hash as its
-        // own parameter so the database doesn't see SQL it has to
-        // re-parse for the in-list and we don't need to escape strings.
-        let placeholders = (1..=hashes.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql =
-            format!("SELECT hash, content FROM system_prompts WHERE hash IN ({placeholders})");
-        let params: Vec<libsql::Value> = hashes
-            .iter()
-            .map(|h| libsql::Value::Text(h.clone()))
-            .collect();
-
-        let conn = self.pool.conn();
-        let mut rows = conn.query(&sql, params).await.map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql query system_prompts: {e}"))
-        })?;
-        let mut out = std::collections::HashMap::with_capacity(hashes.len());
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let hash: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get hash: {e}")))?;
-            let content: String = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            out.insert(hash, content);
-        }
-        Ok(out)
-    }
-
     async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,

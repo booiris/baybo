@@ -143,12 +143,9 @@ pub enum LlmCallInputs {
     /// ordinal X" filter:
     /// `WHERE ordinal <= last_ordinal AND
     ///        (superseded_by IS NULL OR superseded_by > last_ordinal)`.
-    /// The system message is **not** in `session_messages` — it sits
-    /// at position 0 of every LLM input, identical across calls
-    /// that share the same soul, so the span carries a content hash
-    /// pointing at the dedup table `system_prompts` rather than the
-    /// text itself. Hydration looks up the row and reconstructs a
-    /// `Role::System` message at index 0.
+    /// System messages live in `session_messages` like any other row,
+    /// so hydration restores the leading `Role::System` (when present)
+    /// directly from the same query — no separate join.
     Persisted {
         /// Highest `session_messages.ordinal` that was active at call
         /// time. The active set as of this ordinal is the slice the
@@ -158,12 +155,6 @@ pub enum LlmCallInputs {
         /// the wire). Stored explicitly so consumers can show the
         /// count without paying for hydration.
         sent_count: u32,
-        /// SHA-256 (hex) of the system prompt at index 0 of the call
-        /// input. Joined back to `system_prompts.content` during
-        /// hydration. `None` only when the call had no system
-        /// message — hydration leaves the active set as-is.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        system_prompt_hash: Option<String>,
     },
 }
 
@@ -428,13 +419,11 @@ mod tests {
         let persisted = LlmCallInputs::Persisted {
             last_ordinal: 7,
             sent_count: 3,
-            system_prompt_hash: Some("deadbeef".into()),
         };
         let json = serde_json::to_value(&persisted).unwrap();
         assert!(json.is_object(), "Persisted must serialize as an object");
         assert_eq!(json["last_ordinal"], 7);
         assert_eq!(json["sent_count"], 3);
-        assert_eq!(json["system_prompt_hash"], "deadbeef");
 
         // Round-trip both shapes back through Deserialize.
         let v1: LlmCallInputs = serde_json::from_value(serde_json::json!([])).unwrap();

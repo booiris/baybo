@@ -157,17 +157,6 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active
                     ON session_messages(session_id, ordinal)
                     WHERE superseded_by IS NULL;
-                -- Content-addressed dedupe table for the leading
-                -- system prompt of each main `LlmCall` span. The
-                -- system prompt is always a single text block at
-                -- position 0 of the LLM input — many calls share the
-                -- exact same prompt across a session, so we hash it
-                -- once and store a row per unique value. Spans
-                -- reference the hash; hydration joins back.
-                CREATE TABLE IF NOT EXISTS system_prompts (
-                    hash    TEXT PRIMARY KEY,
-                    content TEXT NOT NULL
-                );
 
                 CREATE TABLE IF NOT EXISTS memories (
                     id         TEXT PRIMARY KEY,

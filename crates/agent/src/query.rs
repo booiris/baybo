@@ -799,68 +799,40 @@ impl QueryApi {
     ) -> Result<()> {
         use aura_trace::{LlmCallInputs, SpanKind};
 
-        // Collect every Persisted span's referenced hash up front so
-        // we can batch-load `system_prompts` once per replay rather
-        // than per span.
-        let mut sp_hashes: Vec<String> = Vec::new();
-        let mut any_persisted = false;
-        for j in jobs.iter() {
-            for s in j.steps.iter() {
-                for sp in s.spans.iter() {
-                    if let SpanKind::LlmCall { begin, .. } = &sp.kind
-                        && let LlmCallInputs::Persisted {
-                            system_prompt_hash, ..
-                        } = &begin.input_messages
-                    {
-                        any_persisted = true;
-                        if let Some(h) = system_prompt_hash {
-                            sp_hashes.push(h.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let any_persisted = jobs.iter().any(|j| {
+            j.steps.iter().any(|s| {
+                s.spans.iter().any(|sp| {
+                    matches!(
+                        &sp.kind,
+                        SpanKind::LlmCall { begin, .. } if begin.input_messages.is_persisted()
+                    )
+                })
+            })
+        });
         if !any_persisted {
             return Ok(());
         }
-        sp_hashes.sort();
-        sp_hashes.dedup();
 
-        let (log, system_prompts) = tokio::try_join!(
-            self.sessions
-                .load_session_messages_with_supersede(session_id),
-            self.sessions.load_system_prompts(&sp_hashes),
-        )?;
+        let log = self
+            .sessions
+            .load_session_messages_with_supersede(session_id)
+            .await?;
 
         for job in jobs.iter_mut() {
             for step in job.steps.iter_mut() {
                 for span in step.spans.iter_mut() {
                     if let SpanKind::LlmCall { begin, .. } = &mut span.kind
-                        && let LlmCallInputs::Persisted {
-                            last_ordinal,
-                            system_prompt_hash,
-                            ..
-                        } = &begin.input_messages
+                        && let LlmCallInputs::Persisted { last_ordinal, .. } = &begin.input_messages
                     {
                         let last = *last_ordinal;
-                        let mut hydrated: Vec<aura_model::ChatMessage> = Vec::new();
-                        if let Some(text) = system_prompt_hash
-                            .as_deref()
-                            .and_then(|h| system_prompts.get(h))
-                        {
-                            hydrated.push(aura_model::ChatMessage {
-                                role: aura_model::Role::System,
-                                content: vec![aura_model::ContentBlock::Text(text.clone())],
-                            });
-                        }
-                        hydrated.extend(
-                            log.iter()
-                                .filter(|m| {
-                                    m.ordinal <= last
-                                        && m.superseded_by.map(|s| s > last).unwrap_or(true)
-                                })
-                                .map(|m| m.message.clone()),
-                        );
+                        let hydrated: Vec<aura_model::ChatMessage> = log
+                            .iter()
+                            .filter(|m| {
+                                m.ordinal <= last
+                                    && m.superseded_by.map(|s| s > last).unwrap_or(true)
+                            })
+                            .map(|m| m.message.clone())
+                            .collect();
                         begin.input_messages = LlmCallInputs::Inline(hydrated);
                     }
                 }
@@ -982,18 +954,6 @@ mod tests {
             _id: &SessionId,
         ) -> std::result::Result<Vec<aura_storage::StoredMessage>, StorageError> {
             Ok(Vec::new())
-        }
-        async fn put_system_prompt(
-            &self,
-            _content: &str,
-        ) -> std::result::Result<String, StorageError> {
-            Ok(String::new())
-        }
-        async fn load_system_prompts(
-            &self,
-            _hashes: &[String],
-        ) -> std::result::Result<HashMap<String, String>, StorageError> {
-            Ok(HashMap::new())
         }
     }
 

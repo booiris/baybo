@@ -1594,23 +1594,25 @@ impl AgentLoop {
     }
 
     async fn ensure_system_prompt(&mut self, session: &Session) {
-        let has_system = self
+        if self
             .context_manager
             .messages()
             .first()
-            .is_some_and(|m| m.role == Role::System);
-        if has_system {
+            .is_some_and(|m| m.role == Role::System)
+        {
             return;
         }
-        // System prompts are regenerated from soul config on every
-        // actor cold start, so they live only in `ContextManager` —
-        // never in `session_messages`. The JSONL session log still
-        // gets a copy for human-readable replay.
+        // The system prompt is the first thing every session sees, so
+        // appending into an empty transcript lands it at index 0
+        // (and ordinal 0 in `session_messages`). On cold-start
+        // restore the row is already there and the early-return above
+        // fires. Soul updates take effect for new sessions only —
+        // existing sessions keep the prompt they were pinned to.
         let msg = ChatMessage {
             role: Role::System,
             content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
         };
-        self.context_manager.insert(0, msg.clone());
+        self.context_manager.append(&msg).await;
         self.write_session_message_log(session, &msg).await;
     }
 

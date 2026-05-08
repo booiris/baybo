@@ -25,7 +25,7 @@ use aura_session::SessionManager;
 use aura_skills::render::{render_skill_block, render_skill_reminder};
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry};
 use aura_trace::LlmCallInputs;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use tracing::{debug, warn};
 
 /// Maximum tokens the rendered detail block of a single previously
@@ -140,11 +140,6 @@ pub struct ContextManager {
     /// only (tests, single-shot harnesses).
     session_id: Option<SessionId>,
     sessions: Option<Arc<SessionManager>>,
-    /// Memo of the most recently observed `(system_prompt_text →
-    /// hash)` pair. Skips both SHA-256 and the
-    /// `INSERT OR IGNORE` round-trip when subsequent main LLM calls
-    /// see the same soul prompt.
-    cached_system_prompt: Mutex<Option<(String, String)>>,
 }
 
 impl ContextManager {
@@ -166,20 +161,20 @@ impl ContextManager {
             current_model: RwLock::new(None),
             session_id: None,
             sessions: None,
-            cached_system_prompt: Mutex::new(None),
         }
     }
 
     /// Bind this manager to a specific session for persistence.
     /// After this call:
-    /// - [`Self::append`] mirrors non-system messages to
-    ///   `session_messages`;
+    /// - [`Self::append`] mirrors every appended message — including
+    ///   system messages at index 0 — to `session_messages`;
     /// - successful compressions mark the prior active rows as
     ///   superseded and append the new active set;
     /// - [`Self::restore_from_store`] hydrates from the same log on
     ///   actor cold start;
     /// - [`Self::build_call_input_marker`] returns
     ///   `LlmCallInputs::Persisted` instead of an inline snapshot.
+    ///
     /// Without this binding the manager stays in-memory only.
     pub fn with_session(mut self, session_id: SessionId, sessions: Arc<SessionManager>) -> Self {
         self.session_id = Some(session_id);
@@ -305,13 +300,7 @@ impl ContextManager {
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
         self.budget.update(self.count_tokens());
-        // System messages are regenerated from soul config on every
-        // restore (see `build_call_input_marker`'s system_prompts
-        // dedup path), so they're explicitly never persisted to
-        // `session_messages`.
-        if !matches!(msg.role, Role::System) {
-            self.persist_appended(msg).await;
-        }
+        self.persist_appended(msg).await;
     }
 
     async fn persist_appended(&self, msg: &ChatMessage) {
@@ -325,18 +314,6 @@ impl ContextManager {
                 "failed to append message to session_messages log"
             );
         }
-    }
-
-    /// Insert a message at the given index, mirroring `Vec::insert`.
-    /// Used by the agent loop's `ensure_system_prompt` path which
-    /// needs to position the system prompt at index 0 when the
-    /// transcript was seeded without one.
-    pub fn insert(&mut self, index: usize, msg: ChatMessage) {
-        let count = self.tokenizer.count_message(&msg);
-        record_skill_calls(&mut self.called_skills, &msg);
-        self.messages.insert(index, msg);
-        self.per_message_tokens.insert(index, count);
-        self.budget.update(self.count_tokens());
     }
 
     /// Check the token budget and compress if the threshold is exceeded.
@@ -478,14 +455,8 @@ impl ContextManager {
         let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
             return;
         };
-        let new_active: Vec<ChatMessage> = self
-            .messages
-            .iter()
-            .filter(|m| !matches!(m.role, Role::System))
-            .cloned()
-            .collect();
         if let Err(e) = sessions
-            .apply_session_compaction(session_id, &new_active)
+            .apply_session_compaction(session_id, &self.messages)
             .await
         {
             warn!(
@@ -503,6 +474,7 @@ impl ContextManager {
     /// - no session is bound (tests, single-shot harnesses);
     /// - the session has no rows yet (fresh session, cron fires,
     ///   subagent spawns).
+    ///
     /// Failures log at warn and fall through to a fresh transcript;
     /// startup must not block on a transient store error.
     pub async fn restore_from_store(&mut self) {
@@ -525,11 +497,11 @@ impl ContextManager {
     /// Build the `LlmCallInputs` an `LlmCall` trace span should
     /// carry for the *current* transcript. When bound to a session
     /// and the store has rows, returns
-    /// `Persisted { last_ordinal, sent_count, system_prompt_hash }` —
-    /// the gateway hydrates this back into a flat slice on read,
-    /// keeping span storage constant per call instead of cloning a
-    /// growing prefix every turn. Falls back to `Inline(messages)`
-    /// when there's no store, no rows, or the lookup errors.
+    /// `Persisted { last_ordinal, sent_count }` — the gateway
+    /// hydrates this back into a flat slice on read, keeping span
+    /// storage constant per call instead of cloning a growing prefix
+    /// every turn. Falls back to `Inline(messages)` when there's no
+    /// store, no rows, or the lookup errors.
     pub async fn build_call_input_marker(&self) -> LlmCallInputs {
         let inline = || LlmCallInputs::Inline(self.messages.clone());
         let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
@@ -539,49 +511,9 @@ impl ContextManager {
             Ok(Some(o)) => o,
             _ => return inline(),
         };
-        let system_prompt_text = self
-            .messages
-            .first()
-            .filter(|m| matches!(m.role, Role::System))
-            .and_then(|m| {
-                m.content.iter().find_map(|c| match c {
-                    ContentBlock::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-            });
-        let system_prompt_hash = match system_prompt_text {
-            Some(text) => self.dedupe_system_prompt(sessions, text).await,
-            None => None,
-        };
         LlmCallInputs::Persisted {
             last_ordinal,
             sent_count: self.messages.len() as u32,
-            system_prompt_hash,
-        }
-    }
-
-    /// Memoised wrapper over `SessionManager::put_system_prompt`. The
-    /// soul-derived prompt is stable across an actor's lifetime, so
-    /// hits on the cache skip both the SHA-256 and the
-    /// `INSERT OR IGNORE` round-trip.
-    async fn dedupe_system_prompt(&self, sessions: &SessionManager, text: &str) -> Option<String> {
-        if let Some((cached_text, cached_hash)) = self.cached_system_prompt.lock().as_ref()
-            && cached_text == text
-        {
-            return Some(cached_hash.clone());
-        }
-        match sessions.put_system_prompt(text).await {
-            Ok(hash) => {
-                *self.cached_system_prompt.lock() = Some((text.to_string(), hash.clone()));
-                Some(hash)
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "failed to dedupe system prompt; span will hydrate without it"
-                );
-                None
-            }
         }
     }
 
