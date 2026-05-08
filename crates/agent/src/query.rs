@@ -825,17 +825,25 @@ impl QueryApi {
             for step in job.steps.iter_mut() {
                 for span in step.spans.iter_mut() {
                     if let SpanKind::LlmCall { begin, .. } = &mut span.kind
-                        && let LlmCallInputs::Persisted { last_ordinal, .. } = &begin.input_messages
+                        && let LlmCallInputs::Persisted {
+                            last_ordinal,
+                            system_message,
+                            ..
+                        } = &begin.input_messages
                     {
                         let last = *last_ordinal;
-                        let active: Vec<aura_model::ChatMessage> = log
-                            .iter()
-                            .filter(|(ord, sup, _): &&(i64, Option<i64>, _)| {
-                                *ord <= last && sup.map(|s| s > last).unwrap_or(true)
-                            })
-                            .map(|(_, _, m)| m.clone())
-                            .collect();
-                        begin.input_messages = LlmCallInputs::Inline(active);
+                        let mut hydrated: Vec<aura_model::ChatMessage> = Vec::new();
+                        if let Some(sys) = system_message.as_ref() {
+                            hydrated.push(sys.clone());
+                        }
+                        hydrated.extend(
+                            log.iter()
+                                .filter(|(ord, sup, _): &&(i64, Option<i64>, _)| {
+                                    *ord <= last && sup.map(|s| s > last).unwrap_or(true)
+                                })
+                                .map(|(_, _, m)| m.clone()),
+                        );
+                        begin.input_messages = LlmCallInputs::Inline(hydrated);
                     }
                 }
             }

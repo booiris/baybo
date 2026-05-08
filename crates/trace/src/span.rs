@@ -143,8 +143,10 @@ pub enum LlmCallInputs {
     /// ordinal X" filter:
     /// `WHERE ordinal <= last_ordinal AND
     ///        (superseded_by IS NULL OR superseded_by > last_ordinal)`.
-    /// The system message is not in the log; hydration prepends the
-    /// soul-derived system prompt at index 0.
+    /// The system message is **not** in `session_messages` — it's
+    /// regenerated from soul config on every restore — so the
+    /// snapshot at call time is captured here directly and prepended
+    /// during hydration.
     Persisted {
         /// Highest `session_messages.ordinal` that was active at call
         /// time. The active set as of this ordinal is the slice the
@@ -154,6 +156,13 @@ pub enum LlmCallInputs {
         /// the wire). Stored explicitly so consumers can show the
         /// count without paying for hydration.
         sent_count: u32,
+        /// System message in effect at call time. Hydration prepends
+        /// this at index 0 so the web UI sees the same `[system,
+        /// user, assistant, ...]` shape it always has. `None` for
+        /// the rare case where the call had no system message —
+        /// hydration just returns the active set unmodified.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_message: Option<ChatMessage>,
     },
 }
 
@@ -418,11 +427,16 @@ mod tests {
         let persisted = LlmCallInputs::Persisted {
             last_ordinal: 7,
             sent_count: 3,
+            system_message: Some(aura_model::ChatMessage {
+                role: aura_model::Role::System,
+                content: vec![aura_model::ContentBlock::Text("you are aura".into())],
+            }),
         };
         let json = serde_json::to_value(&persisted).unwrap();
         assert!(json.is_object(), "Persisted must serialize as an object");
         assert_eq!(json["last_ordinal"], 7);
         assert_eq!(json["sent_count"], 3);
+        assert!(json["system_message"].is_object());
 
         // Round-trip both shapes back through Deserialize.
         let v1: LlmCallInputs = serde_json::from_value(serde_json::json!([])).unwrap();

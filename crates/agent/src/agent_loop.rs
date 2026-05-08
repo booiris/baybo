@@ -964,11 +964,20 @@ impl AgentLoop {
         // the trace API. Falls back to an inline embed when the store
         // isn't available — tests, single-shot harnesses — so spans
         // remain self-contained in those flows.
+        //
+        // System messages aren't in `session_messages` (regenerated
+        // from soul config on every restore), so capture the in-flight
+        // copy here for hydration to prepend.
+        let system_message = transcript
+            .first()
+            .filter(|m| matches!(m.role, Role::System))
+            .cloned();
         let input_messages = match self.session_store.as_ref() {
             Some(store) => match store.latest_session_ordinal(&session.id).await {
                 Ok(Some(last_ordinal)) => aura_trace::LlmCallInputs::Persisted {
                     last_ordinal,
                     sent_count: transcript.len() as u32,
+                    system_message,
                 },
                 _ => aura_trace::LlmCallInputs::Inline(transcript.to_vec()),
             },
