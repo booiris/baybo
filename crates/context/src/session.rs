@@ -304,6 +304,7 @@ mod tests {
     struct MemorySessionStore {
         data: Mutex<HashMap<SessionId, Session>>,
         transcripts: Mutex<HashMap<SessionId, Vec<StoredMessage>>>,
+        system_prompts: Mutex<HashMap<String, String>>,
     }
 
     impl MemorySessionStore {
@@ -311,6 +312,7 @@ mod tests {
             Self {
                 data: Mutex::new(HashMap::new()),
                 transcripts: Mutex::new(HashMap::new()),
+                system_prompts: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -422,6 +424,32 @@ mod tests {
                 .lock()
                 .get(session_id)
                 .and_then(|log| log.iter().map(|m| m.ordinal as i64).max()))
+        }
+
+        async fn put_system_prompt(&self, content: &str) -> StoreResult<String> {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(content.as_bytes());
+            let mut hash = String::with_capacity(digest.len() * 2);
+            for b in digest.as_slice() {
+                use std::fmt::Write;
+                let _ = write!(hash, "{b:02x}");
+            }
+            self.system_prompts
+                .lock()
+                .entry(hash.clone())
+                .or_insert_with(|| content.to_string());
+            Ok(hash)
+        }
+
+        async fn load_system_prompts(
+            &self,
+            hashes: &[String],
+        ) -> StoreResult<HashMap<String, String>> {
+            let store = self.system_prompts.lock();
+            Ok(hashes
+                .iter()
+                .filter_map(|h| store.get(h).map(|c| (h.clone(), c.clone())))
+                .collect())
         }
 
         async fn load_session_messages_with_supersede(
@@ -715,6 +743,41 @@ mod tests {
         // `history()` exposes the same active slice via the public API.
         let history = mgr.history(&session.id).await.unwrap();
         assert_eq!(history.len(), 1);
+    }
+
+    /// `put_system_prompt` is content-addressed: identical content
+    /// returns the same hash, multiple distinct prompts coexist, and
+    /// `load_system_prompts` resolves a batch in one shot.
+    #[tokio::test]
+    async fn system_prompt_dedup_round_trip() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+        // Same content twice → one row, same hash.
+        let h1 = store.put_system_prompt("you are aura").await.unwrap();
+        let h2 = store.put_system_prompt("you are aura").await.unwrap();
+        let h3 = store
+            .put_system_prompt("you are something else")
+            .await
+            .unwrap();
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+
+        let loaded = store
+            .load_system_prompts(&[h1.clone(), h3.clone()])
+            .await
+            .unwrap();
+        assert_eq!(loaded.get(&h1).map(String::as_str), Some("you are aura"));
+        assert_eq!(
+            loaded.get(&h3).map(String::as_str),
+            Some("you are something else")
+        );
+
+        // Unknown hash is silently absent — hydrators treat that as
+        // "no system prompt was captured for that span".
+        let missing = store
+            .load_system_prompts(&["nope".to_string()])
+            .await
+            .unwrap();
+        assert!(missing.is_empty());
     }
 
     #[tokio::test]

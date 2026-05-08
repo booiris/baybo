@@ -966,19 +966,41 @@ impl AgentLoop {
         // remain self-contained in those flows.
         //
         // System messages aren't in `session_messages` (regenerated
-        // from soul config on every restore), so capture the in-flight
-        // copy here for hydration to prepend.
-        let system_message = transcript
+        // from soul config on every restore). They live in the
+        // content-addressed `system_prompts` table — many spans share
+        // the same soul prompt across a session, so the span only
+        // carries the hash and hydration joins back.
+        let system_prompt_text = transcript
             .first()
             .filter(|m| matches!(m.role, Role::System))
-            .cloned();
+            .and_then(|m| {
+                m.content.iter().find_map(|c| match c {
+                    ContentBlock::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+            });
         let input_messages = match self.session_store.as_ref() {
             Some(store) => match store.latest_session_ordinal(&session.id).await {
-                Ok(Some(last_ordinal)) => aura_trace::LlmCallInputs::Persisted {
-                    last_ordinal,
-                    sent_count: transcript.len() as u32,
-                    system_message,
-                },
+                Ok(Some(last_ordinal)) => {
+                    let system_prompt_hash = match system_prompt_text.as_deref() {
+                        Some(text) => match store.put_system_prompt(text).await {
+                            Ok(hash) => Some(hash),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "failed to dedupe system prompt; span will hydrate without it"
+                                );
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    aura_trace::LlmCallInputs::Persisted {
+                        last_ordinal,
+                        sent_count: transcript.len() as u32,
+                        system_prompt_hash,
+                    }
+                }
                 _ => aura_trace::LlmCallInputs::Inline(transcript.to_vec()),
             },
             None => aura_trace::LlmCallInputs::Inline(transcript.to_vec()),

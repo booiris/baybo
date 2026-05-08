@@ -103,4 +103,19 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<(i64, Option<i64>, ChatMessage)>>;
+
+    /// Idempotent put for the leading system prompt referenced by
+    /// `LlmCallInputs::Persisted.system_prompt_hash`. Hashing
+    /// algorithm is an implementation detail; callers feed back the
+    /// returned hash unmodified to [`load_system_prompts`].
+    async fn put_system_prompt(&self, content: &str) -> Result<String>;
+
+    /// Batch-load the system prompt content for each requested hash.
+    /// Missing rows are simply absent from the returned map — callers
+    /// (the trace hydrator) treat that as "no system prompt was
+    /// captured for that span" and render the rest unchanged.
+    async fn load_system_prompts(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, String>>;
 }

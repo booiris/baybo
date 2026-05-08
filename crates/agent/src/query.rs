@@ -799,27 +799,38 @@ impl QueryApi {
     ) -> Result<()> {
         use aura_trace::{LlmCallInputs, SpanKind};
 
-        let any_persisted = jobs.iter().any(|j| {
-            j.steps.iter().any(|s| {
-                s.spans.iter().any(|sp| {
-                    matches!(
-                        &sp.kind,
-                        SpanKind::LlmCall {
-                            begin,
-                            ..
-                        } if begin.input_messages.is_persisted()
-                    )
-                })
-            })
-        });
+        // Collect every Persisted span's referenced hash up front so
+        // we can batch-load `system_prompts` once per replay rather
+        // than per span.
+        let mut sp_hashes: Vec<String> = Vec::new();
+        let mut any_persisted = false;
+        for j in jobs.iter() {
+            for s in j.steps.iter() {
+                for sp in s.spans.iter() {
+                    if let SpanKind::LlmCall { begin, .. } = &sp.kind
+                        && let LlmCallInputs::Persisted {
+                            system_prompt_hash, ..
+                        } = &begin.input_messages
+                    {
+                        any_persisted = true;
+                        if let Some(h) = system_prompt_hash {
+                            sp_hashes.push(h.clone());
+                        }
+                    }
+                }
+            }
+        }
         if !any_persisted {
             return Ok(());
         }
+        sp_hashes.sort();
+        sp_hashes.dedup();
 
         let log: Vec<(i64, Option<i64>, aura_model::ChatMessage)> = self
             .sessions
             .load_session_messages_with_supersede(session_id)
             .await?;
+        let system_prompts = self.sessions.load_system_prompts(&sp_hashes).await?;
 
         for job in jobs.iter_mut() {
             for step in job.steps.iter_mut() {
@@ -827,14 +838,20 @@ impl QueryApi {
                     if let SpanKind::LlmCall { begin, .. } = &mut span.kind
                         && let LlmCallInputs::Persisted {
                             last_ordinal,
-                            system_message,
+                            system_prompt_hash,
                             ..
                         } = &begin.input_messages
                     {
                         let last = *last_ordinal;
                         let mut hydrated: Vec<aura_model::ChatMessage> = Vec::new();
-                        if let Some(sys) = system_message.as_ref() {
-                            hydrated.push(sys.clone());
+                        if let Some(text) = system_prompt_hash
+                            .as_deref()
+                            .and_then(|h| system_prompts.get(h))
+                        {
+                            hydrated.push(aura_model::ChatMessage {
+                                role: aura_model::Role::System,
+                                content: vec![aura_model::ContentBlock::Text(text.clone())],
+                            });
                         }
                         hydrated.extend(
                             log.iter()
@@ -965,6 +982,18 @@ mod tests {
         ) -> std::result::Result<Vec<(i64, Option<i64>, aura_model::ChatMessage)>, StorageError>
         {
             Ok(Vec::new())
+        }
+        async fn put_system_prompt(
+            &self,
+            _content: &str,
+        ) -> std::result::Result<String, StorageError> {
+            Ok(String::new())
+        }
+        async fn load_system_prompts(
+            &self,
+            _hashes: &[String],
+        ) -> std::result::Result<HashMap<String, String>, StorageError> {
+            Ok(HashMap::new())
         }
     }
 
