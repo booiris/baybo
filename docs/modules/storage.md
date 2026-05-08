@@ -11,7 +11,7 @@ Its job is:
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Domain crates (`model`, `trace`, `security`, `job`) provide only **types**. Business logic (managers, collectors, gateways) lives in `agent` or — for `SessionManager` — in `aura-context`, which depends on `aura-storage` for the `SessionStore` trait.
+Domain crates (`model`, `trace`, `security`, `job`) provide only **types**. Business logic (managers, collectors, gateways) lives in `agent` or — for `SessionManager` — in `aura-session`, which depends on `aura-storage` for the `SessionStore` trait.
 
 ## Design Decisions
 
@@ -33,9 +33,9 @@ channel_bot.rs     → ChannelBotStore      (per-tenant bot metadata; token live
 channel_pairing.rs → ChannelPairingStore  (defines ChannelPairingRow, PairingStatus — consumed by aura-pairing)
 ```
 
-`Session`, `User`, `ChannelType`, and `SessionState` live in `aura-model` (not `aura-context`) so that `storage` can type `SessionStore` on `aura_model::Session` without pulling in `aura-context`. That keeps `aura-context` free to depend on `aura-storage` for the trait it consumes.
+`Session`, `User`, `ChannelType`, and `SessionState` live in `aura-model` (not `aura-session`) so that `storage` can type `SessionStore` on `aura_model::Session` without pulling in `aura-session`. That keeps `aura-session` free to depend on `aura-storage` for the trait it consumes.
 
-The conversation transcript itself is **not** stored on `Session` — it's owned by `aura_context::ContextManager` while the actor is alive and persisted via `SessionStore::save_context_messages` / `load_context_messages` to a `context_messages` JSON column on the `sessions` table. The agent loop flushes after every successful `run` and `compact_now`; the router seeds it from the same column on cold start.
+The conversation transcript itself is **not** stored on `Session` — it's owned by `aura_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for new turns, `apply_session_compaction` for `/compact`, `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
 
 `CostStore` and `SkillRiskStore` are unique in that they also define their own data types: cost has no separate domain crate, and risk types live in storage to keep `aura-skills` LLM-free while still allowing the assessor crate to persist verdicts. `ChannelPairingStore` follows the same pattern: its row + status types (`ChannelPairingRow`, `PairingStatus`) sit next to the trait so `aura-pairing` can depend on `aura-storage` alone rather than owning its own persistence contract.
 
@@ -76,7 +76,7 @@ All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tomb
 
 ## Constraints
 
-- Depends on domain crates for types only (`model`, `trace`, `security`, `job`) — not on `aura-context`, to keep `aura-context → aura-storage` acyclic
+- Depends on domain crates for types only (`model`, `trace`, `security`, `job`) — not on `aura-session`, to keep `aura-session → aura-storage` acyclic
 - Exposes trait objects externally, not concrete backend types
 - Assumes upper layers have already sanitized data before persistence
 
@@ -86,5 +86,6 @@ All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tomb
 | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `storage` (self)                         | Defines all Store traits; provides all libsql implementations; defines cost / risk types  |
 | `model` / `trace` / `security` / `job`   | Provide domain types consumed by Store traits                                             |
-| `context`                                | Owns `ContextManager` and `SessionManager`; depends on `storage` to consume `SessionStore`|
+| `context`                                | Owns `ContextManager`; pure in-memory                                                     |
+| `session`                                | Owns `SessionManager`; depends on `storage` to consume `SessionStore`                     |
 | `agent`                                  | Injects stores into managers (MemoryManager, JobManager, etc.); re-exports SessionManager |

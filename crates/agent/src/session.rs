@@ -1,1 +1,1 @@
-pub use aura_context::SessionManager;
+pub use aura_session::SessionManager;

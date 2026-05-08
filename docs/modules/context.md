@@ -2,18 +2,18 @@
 
 ## Overview
 
-The `context` crate owns everything about a session's conversation
-state: the transcript (`messages`), the token budget, the compression
-strategy, and the lifecycle wrapper (`SessionManager`) that fronts
-`SessionStore` for CRUD and timeout cleanup.
+The `context` crate owns the per-actor conversation state: the
+transcript (`messages`), the token budget, and the compression
+strategy. Pure in-memory — persistence is the agent loop's job,
+brokered through `SessionStore` from `storage` (the wrapper lives
+in [`aura-session`](session.md)).
 
 Core responsibilities:
 
-- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `aura-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Persistence is via `SessionStore::save_context_messages` / `load_context_messages`, flushed by the agent loop after every successful `run` and `compact_now` so an actor restart preserves the conversation.
+- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `aura-model`) carries only metadata (id, user, channel, lineage, soul binding, …). The agent loop persists each appended message and each compaction through `SessionStore`'s `append_session_message` / `apply_session_compaction`; cold-start hydration via `load_active_session_messages` seeds `ContextManager` so an actor restart preserves the conversation.
 - **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
 - **Pluggable compression strategies**: swap compression algorithms without changing management logic
-- **Session lifecycle (`SessionManager`)**: thin wrapper over `SessionStore` for create / get / list / delete / timeout cleanup, plus `save_context_messages` / `load_context_messages` / `history` shortcuts that the router and CLI use.
 
 **Goal**: ensure the context sent to the LLM never exceeds the model's context window while preserving the most valuable information.
 

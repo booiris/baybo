@@ -7,6 +7,7 @@ members = [
     "crates/tools",
     "crates/workspace",
     "crates/context",
+    "crates/session",
     "crates/job",
     "crates/trace",
     "crates/security",
@@ -41,6 +42,7 @@ aura-llm = { path = "crates/llm" }
 aura-tools = { path = "crates/tools" }
 aura-workspace = { path = "crates/workspace", default-features = false }
 aura-context = { path = "crates/context" }
+aura-session = { path = "crates/session" }
 aura-job = { path = "crates/job" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
