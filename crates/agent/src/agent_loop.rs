@@ -285,8 +285,8 @@ impl AgentLoop {
     /// - no store is configured (tests, single-shot harnesses);
     /// - the session has no persisted rows yet (fresh session, cron
     ///   fires, subagent spawns — they all share this code path).
-    /// Failures log at warn and fall through to a fresh transcript;
-    /// startup must not be blocked by a transient store error.
+    ///   Failures log at warn and fall through to a fresh transcript;
+    ///   startup must not be blocked by a transient store error.
     pub async fn restore_transcript_from_store(&mut self, session_id: &SessionId) {
         let Some(store) = self.session_store.as_ref() else {
             return;
