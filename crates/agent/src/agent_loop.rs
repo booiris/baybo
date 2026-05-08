@@ -11,7 +11,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
-use aura_model::{Session, SessionId};
+use aura_model::Session;
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_skills_assessor::SkillAssessor;
 use aura_tools::{ToolOutput, ToolRegistry};
@@ -209,20 +209,6 @@ pub struct AgentLoop {
     /// Cost gate + ledger; `record_call` feeds spend back so the
     /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
     cost_manager: Option<Arc<crate::cost::CostManager>>,
-    /// Persistence handle for the conversation transcript.
-    /// When set, the loop flushes `context_manager.messages()` to
-    /// the store at the end of every successful turn (`run`,
-    /// `compact_now`) so an actor restart or process bounce
-    /// doesn't drop the conversation. Unset → in-memory only
-    /// (used by tests with no real store).
-    session_store: Option<Arc<dyn aura_storage::SessionStore>>,
-    /// Memo of the most recently observed `(system_prompt_text →
-    /// hash)` pair. The soul-derived prompt is stable across an
-    /// actor's lifetime; remembering the last hash skips both the
-    /// SHA-256 and the `INSERT OR IGNORE` round-trip on every
-    /// subsequent main LLM call. Interior-mutable because the call
-    /// site sits behind `&self`.
-    cached_system_prompt: parking_lot::Mutex<Option<(String, String)>>,
 }
 
 impl AgentLoop {
@@ -253,49 +239,15 @@ impl AgentLoop {
             skill_assessor: None,
             session_log: None,
             cost_manager: None,
-            session_store: None,
-            cached_system_prompt: parking_lot::Mutex::new(None),
         }
     }
 
-    /// Attach the persistence store so the loop can flush the
-    /// `ContextManager` transcript after each successful turn. The
-    /// session row must already exist in the store when this is set
-    /// — flushing is `UPDATE`, not `INSERT`. Without it, the
-    /// transcript stays in process memory only and is lost on actor
-    /// restart.
-    pub fn with_session_store(mut self, store: Arc<dyn aura_storage::SessionStore>) -> Self {
-        self.session_store = Some(store);
-        self
-    }
-
-    /// Pull the persisted active transcript for `session_id` out of
-    /// the configured `SessionStore` and feed it into
-    /// `ContextManager`. Called by `AgentActor::run` once before the
-    /// mailbox loop starts so a process bounce / actor respawn
-    /// doesn't drop the user's prior turns.
-    ///
-    /// No-ops cleanly when:
-    /// - no store is configured (tests, single-shot harnesses);
-    /// - the session has no persisted rows yet (fresh session, cron
-    ///   fires, subagent spawns — they all share this code path).
-    ///   Failures log at warn and fall through to a fresh transcript;
-    ///   startup must not be blocked by a transient store error.
-    pub async fn restore_transcript_from_store(&mut self, session_id: &SessionId) {
-        let Some(store) = self.session_store.as_ref() else {
-            return;
-        };
-        match store.load_active_session_messages(session_id).await {
-            Ok(messages) if !messages.is_empty() => {
-                self.context_manager.restore_messages(messages);
-            }
-            Ok(_) => {}
-            Err(e) => warn!(
-                session_id = %session_id,
-                error = %e,
-                "failed to load persisted transcript; starting fresh"
-            ),
-        }
+    /// Delegate to `ContextManager::restore_from_store` — the manager
+    /// is bound to its session at construction time and owns the
+    /// load path. Kept on `AgentLoop` so `AgentActor::run` doesn't
+    /// have to reach inside the loop's private state.
+    pub async fn restore_transcript_from_store(&mut self) {
+        self.context_manager.restore_from_store().await;
     }
 
     /// Attach the subagent runtime so LLM-emitted `spawn_subagent`
@@ -984,7 +936,8 @@ impl AgentLoop {
             tools: tool_defs,
         };
 
-        let input_messages = self.build_main_call_inputs(&session.id, transcript).await;
+        let _ = transcript;
+        let input_messages = self.context_manager.build_call_input_marker().await;
 
         crate::scope::with_llm_span(
             span_recorder.as_ref(),
@@ -1161,131 +1114,9 @@ impl AgentLoop {
         session: &Session,
         message: &ChatMessage,
     ) -> anyhow::Result<()> {
-        self.context_manager.append(message);
-        self.persist_appended_message(&session.id, message).await;
+        self.context_manager.append(message).await;
         self.write_session_message_log(session, message).await;
         Ok(())
-    }
-
-    /// Append a single message to the persistent transcript log if a
-    /// session store is configured. System messages are skipped — they
-    /// come from the current soul config and are re-injected on every
-    /// restore by `ensure_system_prompt`. Failures are logged at warn
-    /// and swallowed; persistence must never block the user-visible
-    /// turn.
-    /// Build the `LlmCallInputs` for a main LLM call's trace span.
-    ///
-    /// `Persisted` shape (one cheap pair of integers + a content
-    /// hash) wins over the legacy `Inline(transcript.to_vec())` snapshot
-    /// when there's a session store to anchor against — the trace
-    /// gateway hydrates the slice back from `session_messages`.
-    /// Falls back to `Inline` when no store is wired (tests, single
-    /// shot harnesses) or the store doesn't yet have rows for this
-    /// session.
-    async fn build_main_call_inputs(
-        &self,
-        session_id: &SessionId,
-        transcript: &[ChatMessage],
-    ) -> aura_trace::LlmCallInputs {
-        let inline = || aura_trace::LlmCallInputs::Inline(transcript.to_vec());
-        let Some(store) = self.session_store.as_ref() else {
-            return inline();
-        };
-        let last_ordinal = match store.latest_session_ordinal(session_id).await {
-            Ok(Some(o)) => o,
-            _ => return inline(),
-        };
-        let system_prompt_text = transcript
-            .first()
-            .filter(|m| matches!(m.role, Role::System))
-            .and_then(|m| {
-                m.content.iter().find_map(|c| match c {
-                    ContentBlock::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-            });
-        let system_prompt_hash = match system_prompt_text {
-            Some(text) => self.dedupe_system_prompt(store.as_ref(), text).await,
-            None => None,
-        };
-        aura_trace::LlmCallInputs::Persisted {
-            last_ordinal,
-            sent_count: transcript.len() as u32,
-            system_prompt_hash,
-        }
-    }
-
-    /// Memoised wrapper over `SessionStore::put_system_prompt`. The
-    /// soul-derived prompt text is stable across an actor's lifetime,
-    /// so a hit on `cached_system_prompt` skips both the SHA-256 and
-    /// the `INSERT OR IGNORE` round-trip; only soul reloads (or the
-    /// rare per-call override) take the slow path.
-    async fn dedupe_system_prompt(
-        &self,
-        store: &dyn aura_storage::SessionStore,
-        text: &str,
-    ) -> Option<String> {
-        if let Some((cached_text, cached_hash)) = self.cached_system_prompt.lock().as_ref()
-            && cached_text == text
-        {
-            return Some(cached_hash.clone());
-        }
-        match store.put_system_prompt(text).await {
-            Ok(hash) => {
-                *self.cached_system_prompt.lock() = Some((text.to_string(), hash.clone()));
-                Some(hash)
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "failed to dedupe system prompt; span will hydrate without it"
-                );
-                None
-            }
-        }
-    }
-
-    async fn persist_appended_message(&self, session_id: &SessionId, message: &ChatMessage) {
-        if matches!(message.role, Role::System) {
-            return;
-        }
-        let Some(store) = self.session_store.as_ref() else {
-            return;
-        };
-        if let Err(e) = store.append_session_message(session_id, message).await {
-            warn!(
-                session_id = %session_id,
-                error = %e,
-                "failed to append message to session_messages log"
-            );
-        }
-    }
-
-    /// Mark the persisted active rows for `session_id` as superseded
-    /// and append the post-compression transcript (filtered to drop
-    /// the soul-derived system message). Called by the agent loop's
-    /// success branches in `compact_now` and `compress_if_needed`.
-    async fn persist_compaction(&self, session_id: &SessionId) {
-        let Some(store) = self.session_store.as_ref() else {
-            return;
-        };
-        let new_active: Vec<ChatMessage> = self
-            .context_manager
-            .messages()
-            .iter()
-            .filter(|m| !matches!(m.role, Role::System))
-            .cloned()
-            .collect();
-        if let Err(e) = store
-            .apply_session_compaction(session_id, &new_active)
-            .await
-        {
-            warn!(
-                session_id = %session_id,
-                error = %e,
-                "failed to persist session compaction"
-            );
-        }
     }
 
     async fn write_session_message_log(&self, session: &Session, message: &ChatMessage) {
@@ -1661,13 +1492,10 @@ impl AgentLoop {
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
         let model_id = runner.model_info.id.clone();
-        let outcome = self
+        let _ = self
             .context_manager
             .maybe_compress(&model_id, |req| runner.run(req))
             .await?;
-        if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-            self.persist_compaction(&session.id).await;
-        }
         Ok(())
     }
 
@@ -1742,9 +1570,6 @@ impl AgentLoop {
                     .context_manager
                     .force_compress(&model_id, |req| runner.run(req))
                     .await?;
-                if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-                    self.persist_compaction(&session.id).await;
-                }
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
                         "Context compressed.".to_string()

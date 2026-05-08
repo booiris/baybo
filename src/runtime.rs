@@ -611,7 +611,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let cost_manager = Arc::clone(&cost_manager);
         let token_calibration = Arc::clone(&token_calibration);
 
-        let session_store = graph.session_manager.store();
+        let sessions = Arc::clone(&graph.session_manager);
         Arc::new(
             move |session: aura_model::Session,
                   response_tx: mpsc::Sender<AgentOutput>,
@@ -627,7 +627,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         token_budget.clone(),
                     )
                     .with_calibration(Arc::clone(&token_calibration))
-                    .with_skill_registry(Arc::clone(&skill_registry)),
+                    .with_skill_registry(Arc::clone(&skill_registry))
+                    .with_session(session.id.clone(), Arc::clone(&sessions)),
                     Arc::clone(&memory_manager),
                     policy.clone(),
                     Soul::custom(system_prompt.clone()),
@@ -635,8 +636,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 )
                 .with_skill_assessor(Arc::clone(&skill_assessor))
                 .with_session_log(Arc::clone(&session_logger))
-                .with_cost_manager(Arc::clone(&cost_manager))
-                .with_session_store(Arc::clone(&session_store));
+                .with_cost_manager(Arc::clone(&cost_manager));
 
                 if let Some(rt) = subagent_runtime_slot.get() {
                     agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));

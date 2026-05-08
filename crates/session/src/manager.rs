@@ -234,6 +234,48 @@ impl SessionManager {
             .map_err(wrap)
     }
 
+    /// Highest `session_messages.ordinal` ever assigned for the
+    /// session, regardless of supersede status. Used by the trace
+    /// span builder to anchor `LlmCallInputs::Persisted`.
+    pub async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        self.store
+            .latest_session_ordinal(session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Full message log including superseded rows, paired with each
+    /// row's `superseded_by` marker. Used by the trace replay path
+    /// to reconstruct active slices "as of ordinal X" for older
+    /// `LlmCall` spans.
+    pub async fn load_session_messages_with_supersede(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<aura_storage::StoredMessage>> {
+        self.store
+            .load_session_messages_with_supersede(session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Idempotent put for the leading system prompt referenced by
+    /// `LlmCallInputs::Persisted.system_prompt_hash`. The hash
+    /// algorithm is an implementation detail of the underlying
+    /// `SessionStore` impl; callers feed back the returned hash
+    /// unmodified to [`Self::load_system_prompts`].
+    pub async fn put_system_prompt(&self, content: &str) -> Result<String> {
+        self.store.put_system_prompt(content).await.map_err(wrap)
+    }
+
+    /// Batch-load the system prompt content for each requested hash.
+    /// Missing hashes are absent from the returned map.
+    pub async fn load_system_prompts(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        self.store.load_system_prompts(hashes).await.map_err(wrap)
+    }
+
     /// Hard-delete a session by id. Errors with `SessionError::NotFound`
     /// if the session did not exist at the time of the call. Surfaces
     /// `StorageError::HasLiveForks` (wrapped) when the session has live

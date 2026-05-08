@@ -91,9 +91,7 @@ impl AgentActor {
         // fresh sessions (cron fires, subagent spawns, brand-new
         // user sessions) and for test harnesses that don't wire a
         // store; failures log and fall through to an empty transcript.
-        self.agent_loop
-            .restore_transcript_from_store(&self.session.id)
-            .await;
+        self.agent_loop.restore_transcript_from_store().await;
 
         while let Some(msg) = mailbox.recv().await {
             match msg {
