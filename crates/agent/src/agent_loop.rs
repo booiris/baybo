@@ -1167,27 +1167,6 @@ impl AgentLoop {
         Ok(())
     }
 
-    async fn insert_session_message(
-        &mut self,
-        session: &Session,
-        index: usize,
-        message: ChatMessage,
-    ) {
-        self.context_manager.insert(index, message.clone());
-        // System messages are regenerated from soul config on every
-        // restore (`ensure_system_prompt`), so they're explicitly
-        // *not* persisted. Inserts of any other role at non-tail
-        // positions are not part of the normal append path; we still
-        // skip persistence for them and rely on the next compact to
-        // resync the active set.
-        if !matches!(message.role, Role::System)
-            && index == self.context_manager.message_count() - 1
-        {
-            self.persist_appended_message(&session.id, &message).await;
-        }
-        self.write_session_message_log(session, &message).await;
-    }
-
     /// Append a single message to the persistent transcript log if a
     /// session store is configured. System messages are skipped — they
     /// come from the current soul config and are re-injected on every
@@ -1795,13 +1774,19 @@ impl AgentLoop {
             .messages()
             .first()
             .is_some_and(|m| m.role == Role::System);
-        if !has_system {
-            let msg = ChatMessage {
-                role: Role::System,
-                content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
-            };
-            self.insert_session_message(session, 0, msg).await;
+        if has_system {
+            return;
         }
+        // System prompts are regenerated from soul config on every
+        // actor cold start, so they live only in `ContextManager` —
+        // never in `session_messages`. The JSONL session log still
+        // gets a copy for human-readable replay.
+        let msg = ChatMessage {
+            role: Role::System,
+            content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
+        };
+        self.context_manager.insert(0, msg.clone());
+        self.write_session_message_log(session, &msg).await;
     }
 
     fn invocable_skills(&self) -> Vec<SkillSummary> {
