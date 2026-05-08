@@ -1,0 +1,9 @@
+{
+  "name": "aura-workspace",
+  "private": true,
+  "pnpm": {
+    "overrides": {
+      "ip-address": "^10.1.1"
+    }
+  }
+}
