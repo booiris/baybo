@@ -67,10 +67,8 @@ struct TokenBaseline {
 /// Hence the outcome carries no LLM-call provenance.
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionOutcome {
-    /// `session.messages` was replaced with a shorter list. `before`
-    /// and `after` are the pre/post token totals — the manager owns
-    /// these numbers, so callers don't have to re-read `budget()`.
-    Compressed { before: usize, after: usize },
+    /// `session.messages` was replaced with a shorter list.
+    Compressed,
     /// Budget was under the configured compression threshold and the
     /// strategy was not invoked. Only produced by `maybe_compress` —
     /// `force_compress` bypasses the threshold by design.
@@ -83,7 +81,7 @@ pub enum CompressionOutcome {
     /// total was not smaller than the original. The manager refused
     /// to apply it (so the budget stays honest) and `session.messages`
     /// is unchanged.
-    NoSavings { before: usize, after: usize },
+    NoSavings,
 }
 
 /// Manages session context: appending messages with automatic compression
@@ -392,10 +390,7 @@ impl ContextManager {
         if after_tokens >= before_tokens {
             // Don't apply. `session.messages` and the existing cache
             // are still in sync; nothing to undo.
-            return Ok(CompressionOutcome::NoSavings {
-                before: before_tokens,
-                after: after_tokens,
-            });
+            return Ok(CompressionOutcome::NoSavings);
         }
 
         session.messages = new_messages;
@@ -423,10 +418,7 @@ impl ContextManager {
             "proactive context compression"
         );
 
-        Ok(CompressionOutcome::Compressed {
-            before: before_tokens,
-            after: after_tokens,
-        })
+        Ok(CompressionOutcome::Compressed)
     }
 
     /// Read-only access to the token budget.
@@ -720,7 +712,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
         // system + 2 most recent non-system
         assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[0].role, Role::System);
@@ -772,7 +764,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
         // system + keep_recent=2 most recent non-system.
         assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[0].role, Role::System);
@@ -964,7 +956,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", never_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // Cache must be in lockstep with the post-compression slice.
         assert_eq!(ctx.per_message_tokens.read().len(), session.messages.len());
@@ -1119,7 +1111,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // [system, summary] only — no reminder, no detail.
         assert_eq!(session.messages.len(), 2);
@@ -1167,7 +1159,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // [system, summary, reminder, detail]
         assert_eq!(session.messages.len(), 4);
@@ -1215,7 +1207,7 @@ mod tests {
             .maybe_compress(&mut session, "test-model", never_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // No reminder / detail messages were appended; the result is
         // just system + the kept tail (which itself may still have

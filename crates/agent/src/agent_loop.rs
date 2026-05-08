@@ -1566,25 +1566,17 @@ impl AgentLoop {
                     .force_compress(session, &model_id, |req| runner.run(req))
                     .await?;
                 let text = match outcome {
-                    aura_context::CompressionOutcome::Compressed { before, after } => {
-                        format!(
-                            "Context compressed: {before} → {after} tokens ({} freed).",
-                            before.saturating_sub(after)
-                        )
+                    aura_context::CompressionOutcome::Compressed => {
+                        "Context compressed.".to_string()
                     }
                     aura_context::CompressionOutcome::BelowThreshold => {
-                        let current = self.context_manager.budget().current();
-                        format!(
-                            "Context already under the compression threshold ({current} tokens); skipped."
-                        )
+                        "Context already under the compression threshold; skipped.".to_string()
                     }
                     aura_context::CompressionOutcome::StrategyDeclined => {
                         "Compression strategy declined: nothing to summarize (conversation too short).".to_string()
                     }
-                    aura_context::CompressionOutcome::NoSavings { before, after } => {
-                        format!(
-                            "Compression ran but produced no savings ({before} → {after} tokens); kept the original."
-                        )
+                    aura_context::CompressionOutcome::NoSavings => {
+                        "Compression ran but produced no savings; kept the original.".to_string()
                     }
                 };
                 let output = JobOutput::Message {
