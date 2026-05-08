@@ -269,12 +269,6 @@ impl AgentLoop {
         self
     }
 
-    /// Seed the `ContextManager` transcript on actor cold start.
-    /// Idempotent: replacing with the same vector is a no-op cost.
-    pub fn restore_transcript(&mut self, messages: Vec<ChatMessage>) {
-        self.context_manager.restore_messages(messages);
-    }
-
     /// Pull the persisted active transcript for `session_id` out of
     /// the configured `SessionStore` and feed it into
     /// `ContextManager`. Called by `AgentActor::run` once before the
