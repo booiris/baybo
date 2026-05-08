@@ -4,6 +4,7 @@ pub mod guard;
 pub mod multimodal;
 pub mod providers;
 pub mod registry;
+mod tool_name;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -300,7 +301,7 @@ fn convert_stream_event<R: GetTokenUsage>(
         StreamedAssistantContent::ToolCall { tool_call, .. } => {
             Some(Ok(StreamEvent::ToolCall(ToolCallInfo {
                 id: tool_call.id,
-                name: tool_call.function.name,
+                name: tool_name::unsanitize_tool_name(&tool_call.function.name),
                 arguments: tool_call.function.arguments,
                 signature: tool_call.signature,
             })))
@@ -566,7 +567,7 @@ impl LlmClient {
                                         id: id.clone(),
                                         call_id: None,
                                         function: completion::message::ToolFunction {
-                                            name: name.clone(),
+                                            name: tool_name::sanitize_tool_name(name),
                                             arguments: input.clone(),
                                         },
                                         signature: signature.clone(),
@@ -632,7 +633,7 @@ impl LlmClient {
             .tools
             .iter()
             .map(|t| ToolDefinition {
-                name: t.name.clone(),
+                name: tool_name::sanitize_tool_name(&t.name),
                 description: t.description.clone(),
                 parameters: t.parameters_schema.clone(),
             })
@@ -808,7 +809,7 @@ impl LlmClient {
                 AssistantContent::ToolCall(tc) => {
                     tool_calls.push(ToolCallInfo {
                         id: tc.id,
-                        name: tc.function.name,
+                        name: tool_name::unsanitize_tool_name(&tc.function.name),
                         arguments: tc.function.arguments,
                         signature: tc.signature,
                     });
