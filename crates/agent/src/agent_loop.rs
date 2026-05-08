@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, OutgoingMessage};
+use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobOutput};
 use aura_llm::{
-    ChatRequest, LlmCompletion, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
+    ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
 use aura_model::{ChatMessage, ContentBlock, JobId, Role};
 use futures::StreamExt;
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::memory::MemoryManager;
 use aura_model::Session;
-use aura_skills::{SkillRegistry, SkillSummary};
+use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_skills_assessor::SkillAssessor;
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
@@ -20,6 +20,7 @@ use aura_trace::{
 };
 use tracing::{debug, info, warn};
 
+use crate::compression::CompressionRunner;
 use crate::error_recovery::ErrorHandler;
 use crate::job::{JobLifecycle, JobSpec};
 use crate::policy::ExecutionPolicy;
@@ -81,6 +82,35 @@ fn safe_flush_boundary(pending: &str) -> usize {
         return pending.len() - 1;
     }
     pending.len()
+}
+
+/// Drop leading whitespace from `chunk` until the first non-whitespace
+/// character has been observed across the stream.
+///
+/// `stripped` is the cross-chunk flag tracking "have we emitted any real
+/// content yet?". While `false`, whitespace at the head of `chunk` is
+/// removed; the first non-whitespace char flips the flag and every
+/// subsequent call is a pass-through (interior whitespace, paragraph
+/// breaks, code-block indentation are all preserved).
+///
+/// Returns `true` when the (possibly trimmed) chunk has content the
+/// caller should emit, `false` when the chunk was pure whitespace and
+/// should be skipped.
+fn skip_leading_whitespace(chunk: &mut String, stripped: &mut bool) -> bool {
+    if *stripped {
+        return !chunk.is_empty();
+    }
+    let after = chunk.trim_start();
+    if after.is_empty() {
+        chunk.clear();
+        return false;
+    }
+    if after.len() != chunk.len() {
+        let kept = after.to_string();
+        *chunk = kept;
+    }
+    *stripped = true;
+    true
 }
 
 /// Append `items` into `dst` while keeping `dst.len() <=
@@ -150,7 +180,7 @@ enum IterationOutcome {
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
-    llm_client: Arc<dyn LlmCompletion>,
+    llm_client: Arc<GuardedLlm>,
     tool_registry: Arc<ToolRegistry>,
     skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
@@ -176,19 +206,15 @@ pub struct AgentLoop {
     /// error, latency, model metadata) to
     /// `<workspace>/logs/sessions/<session_id>.jsonl`.
     session_log: Option<Arc<SessionLlmLogger>>,
-    /// Optional cost gate + ledger. When set, [`Self::run_iteration`]
-    /// rejects via [`crate::cost::CostManager::check`] *before*
-    /// dispatching the next LLM call, and [`Self::call_llm`] feeds the
-    /// observed token counts (success or partial-on-error) back via
-    /// [`crate::cost::CostManager::record_call`] so the next iteration's
-    /// gate sees the spend immediately.
+    /// Cost gate + ledger; `record_call` feeds spend back so the
+    /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
     cost_manager: Option<Arc<crate::cost::CostManager>>,
 }
 
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        llm_client: Arc<dyn LlmCompletion>,
+        llm_client: Arc<GuardedLlm>,
         tool_registry: Arc<ToolRegistry>,
         skill_registry: Arc<SkillRegistry>,
         tool_executor: Arc<ToolExecutor>,
@@ -347,13 +373,6 @@ impl AgentLoop {
             self.append_context_message(session, &memory_msg).await?;
         }
 
-        // Append user message (auto-compresses if over token budget)
-        let user_msg = ChatMessage {
-            role: Role::User,
-            content: user_content.clone(),
-        };
-        self.append_context_message(session, &user_msg).await?;
-
         let user_text = aura_llm::multimodal::extract_text(&user_content);
         let skills_for_turn = if self.skill_registry.is_empty() {
             Vec::new()
@@ -361,9 +380,29 @@ impl AgentLoop {
             self.invocable_skills()
         };
 
-        if let Some(reminder) = build_skill_reminder(&skills_for_turn) {
+        // Append user message (auto-compresses if over token budget)
+        let user_msg = ChatMessage {
+            role: Role::User,
+            content: user_content.clone(),
+        };
+        self.append_context_message(session, &user_msg).await?;
+
+        // Skill reminder is emitted as `Role::User` (some providers reject
+        // `system` outside the leading slot) and injected *before* the user
+        // message so the model sees "tools available → user prompt". The
+        // helper compares against `session.state.active_skills` (last
+        // turn's set): if it changed, the *full* current list is
+        // rebroadcast so the model sees authoritative state without having
+        // to reconcile a delta; if unchanged, no reminder is injected and
+        // the turn pays zero token cost. Consecutive `Role::User` messages
+        // produced this way are coalesced by `merge_for_llm` before
+        // dispatch for providers that require strict user/assistant
+        // alternation.
+        if let Some(reminder) =
+            build_skill_reminder_if_changed(&session.state.active_skills, &skills_for_turn)
+        {
             let reminder_msg = ChatMessage {
-                role: Role::System,
+                role: Role::User,
                 content: vec![ContentBlock::Text(reminder)],
             };
             self.append_context_message(session, &reminder_msg).await?;
@@ -373,13 +412,13 @@ impl AgentLoop {
 
         if let Some((skill_name, args)) = detect_slash_invocation(&user_text, &skills_for_turn) {
             let synthesized_id = format!("synthskill-{}", uuid::Uuid::new_v4());
-            let mut input = serde_json::json!({ "skill": skill_name });
+            let mut input = serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name });
             if !args.is_empty() {
                 input["args"] = serde_json::Value::String(args);
             }
             let tool_use_block = ContentBlock::ToolUse {
                 id: synthesized_id.clone(),
-                name: "Skill".to_string(),
+                name: SKILL_TOOL_NAME.to_string(),
                 input: input.clone(),
                 signature: None,
             };
@@ -411,7 +450,7 @@ impl AgentLoop {
                 move |step| async move {
                     let res = executor_clone
                         .execute(
-                            "Skill",
+                            SKILL_TOOL_NAME,
                             input_clone,
                             &session_id_clone,
                             &user_clone,
@@ -829,13 +868,6 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
-            // Re-check before *every* attempt, not just the first.
-            // Streaming partial-usage is billed via record_call even
-            // when the call ends in Err, so a retry past a cap-breach
-            // would silently keep accumulating spend without this gate.
-            if let Some(cm) = &self.cost_manager {
-                cm.check().map_err(|e| anyhow::anyhow!(e))?;
-            }
             match self.call_llm(session, span_recorder, step, delta_tx).await {
                 Ok(pair) => return Ok(pair),
                 Err(e) => {
@@ -881,8 +913,18 @@ impl AgentLoop {
             })
             .collect();
 
+        // Coalesce adjacent same-role user/assistant messages *only* on the
+        // wire to the LLM. Skill reminders are stored as standalone
+        // `Role::User` entries, which would otherwise produce back-to-back
+        // user messages — accepted by Anthropic / OpenAI but rejected by
+        // providers that require strict user/assistant alternation.
+        //
+        // The trace span (and therefore the web UI / session log) keeps the
+        // original unmerged `session.messages` so each logical entry —
+        // reminder, user prompt, assistant turn — stays separately
+        // inspectable. Merging is a transport concern, not a storage one.
         let request = ChatRequest {
-            messages: session.messages.clone(),
+            messages: merge_for_llm(&session.messages),
             temperature: None,
             tools: tool_defs,
         };
@@ -920,6 +962,15 @@ impl AgentLoop {
                         {
                             warn!(error = %e, "failed to sanitize LLM response");
                         }
+                        // Strip leading/trailing whitespace from text output
+                        // before persisting. Some providers preface their
+                        // first text block with stray newlines (especially
+                        // after a thinking section or right after a tool
+                        // call) which renders as a tall blank gap above the
+                        // assistant message in the web UI. Interior
+                        // whitespace is left intact so markdown paragraphs,
+                        // code blocks, and lists are unaffected.
+                        trim_response_text_edges(&mut response);
                         self.write_session_log(
                             session,
                             &request,
@@ -950,15 +1001,12 @@ impl AgentLoop {
                         (finalize, Ok((response, span.span_id)))
                     }
                     Err(e) => {
-                        // Surface the *sanitized* message: this Err
-                        // bubbles into `with_llm_span`, which writes
-                        // `e.to_string()` into the span's
-                        // `Failed { reason }` (via `outcome_for`) and
-                        // from there into persisted trace storage.
-                        // Returning the raw `e` would leak any secrets
-                        // in the upstream provider error text.
+                        // Sanitize the JSONL log; return the raw typed
+                        // `LlmError` so `should_retry` can dispatch on
+                        // the variant. The trace's `Failed` reason
+                        // still carries the provider text.
                         let raw = e.to_string();
-                        let error_msg = self
+                        let log_msg = self
                             .security_gateway
                             .sanitize_error(&raw)
                             .await
@@ -967,15 +1015,13 @@ impl AgentLoop {
                             session,
                             &request,
                             LlmCallOutcome::Err {
-                                error: error_msg.clone(),
+                                error: log_msg,
                                 latency_ms,
                             },
                         )
                         .await;
                         // Bill the partial-stream tokens so a failed
-                        // LLM call still leaves a `cost_records` row
-                        // — operators see the attempt rather than
-                        // silently under-counting.
+                        // call still leaves a `cost_records` row.
                         let finalize = LlmCallResult {
                             output_content: String::new(),
                             thinking: None,
@@ -985,7 +1031,7 @@ impl AgentLoop {
                             cached_input_tokens: partial_usage.cached_input_tokens,
                             cache_creation_input_tokens: partial_usage.cache_creation_input_tokens,
                         };
-                        (finalize, Err(anyhow::anyhow!(error_msg)))
+                        (finalize, Err(anyhow::Error::new(e)))
                     }
                 };
 
@@ -1006,6 +1052,13 @@ impl AgentLoop {
                         finalize.cache_creation_input_tokens,
                     );
                 }
+
+                // `record_call_actual` self-skips on zero. Pass
+                // `session.messages` because the assistant message is
+                // inserted later by `insert_session_message`, so the
+                // slice here matches what the provider billed.
+                self.context_manager
+                    .record_call_actual(&session.messages, finalize.input_tokens);
 
                 (finalize, value_result)
             },
@@ -1051,7 +1104,7 @@ impl AgentLoop {
         session: &mut Session,
         message: &ChatMessage,
     ) -> anyhow::Result<()> {
-        self.context_manager.append(session, message).await?;
+        self.context_manager.append(session, message);
         self.write_session_message_log(session, message).await;
         Ok(())
     }
@@ -1113,6 +1166,14 @@ impl AgentLoop {
         // it back until a safe boundary is seen.
         let mut pending = String::new();
 
+        // Some providers preface their text with stray newlines (often
+        // right after a thinking section or tool call). Drop them on the
+        // wire so the user doesn't watch the message render with a tall
+        // blank gap above. Once we've seen any non-whitespace char the
+        // flag flips and subsequent chunks pass through verbatim — interior
+        // formatting is preserved.
+        let mut leading_stripped = false;
+
         while let Some(event) = stream.next().await {
             let event = match event {
                 Ok(e) => e,
@@ -1124,7 +1185,10 @@ impl AgentLoop {
 
                     let flush_to = safe_flush_boundary(&pending);
                     if flush_to > 0 {
-                        let flushable: String = pending.drain(..flush_to).collect();
+                        let mut flushable: String = pending.drain(..flush_to).collect();
+                        if !skip_leading_whitespace(&mut flushable, &mut leading_stripped) {
+                            continue;
+                        }
                         self.stream_emit(&flushable, session, &mut content, delta_tx)
                             .await;
                     }
@@ -1138,9 +1202,11 @@ impl AgentLoop {
 
         // Flush any remaining buffered text.
         if !pending.is_empty() {
-            let flushable = std::mem::take(&mut pending);
-            self.stream_emit(&flushable, session, &mut content, delta_tx)
-                .await;
+            let mut flushable = std::mem::take(&mut pending);
+            if skip_leading_whitespace(&mut flushable, &mut leading_stripped) {
+                self.stream_emit(&flushable, session, &mut content, delta_tx)
+                    .await;
+            }
         }
 
         // Build content_blocks: thinking blocks first (providers expect
@@ -1409,11 +1475,12 @@ impl AgentLoop {
         }
     }
 
-    /// Compress if the budget calls for it. When the strategy ran an
-    /// LLM call, brackets it in a `StepKind::Compression` step +
-    /// `SpanKind::LlmCall` span so the cost lands in per-step
-    /// aggregation. Strategies that don't call an LLM (e.g. `Truncate`)
-    /// don't open a step.
+    /// Compress if the budget calls for it. The `chat` closure is
+    /// invoked only when the strategy returns `NeedsLlmCall`; pure
+    /// strategies (Truncate, Summarize fallback) skip it entirely. The
+    /// closure brackets the real LLM call in a `Compression` step +
+    /// `LlmCall` span and records cost against that span — budget
+    /// enforcement on the call itself rides on the wrapped client.
     async fn compress_if_needed(
         &mut self,
         session: &mut Session,
@@ -1421,60 +1488,103 @@ impl AgentLoop {
         job_id: JobId,
         cancel_token: &CancellationToken,
     ) -> anyhow::Result<()> {
-        let outcome = self.context_manager.maybe_compress(session).await?;
-        let Some(stats) = outcome else {
-            return Ok(());
+        let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
+        let model_id = runner.model_info.id.clone();
+        self.context_manager
+            .maybe_compress(session, &model_id, |req| runner.run(req))
+            .await?;
+        Ok(())
+    }
+
+    fn build_compression_runner(
+        &self,
+        session: &Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        cancel_token: &CancellationToken,
+    ) -> CompressionRunner {
+        let model_info = self.llm_client.model_info().clone();
+        CompressionRunner {
+            llm_client: self.llm_client.clone(),
+            recorder: Arc::clone(span_recorder),
+            cost_manager: self.cost_manager.clone(),
+            security_gateway: Arc::clone(&self.security_gateway),
+            job_id,
+            user_id: session.user.id.clone(),
+            session_id: session.id.clone(),
+            model_info,
+            cancel_token: cancel_token.clone(),
+        }
+    }
+
+    /// Run an on-demand compression pass and return the confirmation
+    /// text for the caller to ship as an `AgentOutput::Notice`.
+    /// The variants of `CompressionOutcome` map to specific user-facing
+    /// messages so the caller (typically a `/compact` notice) can
+    /// distinguish "strategy declined", "no savings", and a real
+    /// compress — instead of one generic "nothing to compress" line.
+    /// A fresh job is minted so the compression step + LLM span land
+    /// on a real lifecycle.
+    pub async fn compact_now(
+        &mut self,
+        session: &mut Session,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        parent_job_id: Option<JobId>,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<String> {
+        // Match the session trigger so the JobKind invariant holds for
+        // both user-triggered and spawned sessions. `/compact` is a
+        // user-typed command, so UserChat is the natural default; for
+        // sessions whose root trigger is anything else (Cron / System
+        // / Spawned) we fall back to JobKind::Spawned which is allowed
+        // under every trigger.
+        let job_input = match session.trigger.kind() {
+            aura_model::TriggerKind::User => JobInput::UserChat {
+                content: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
+            },
+            _ => JobInput::Spawned {
+                initial_prompt: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
+            },
         };
-        debug!(
-            before = stats.before_tokens,
-            after = stats.after_tokens,
-            "compressed context before LLM call"
-        );
-        let Some(call) = stats.llm_call else {
-            return Ok(());
+        let spec = JobSpec {
+            session_id: session.id.clone(),
+            session_trigger_kind: session.trigger.kind(),
+            input: job_input,
+            effective_soul_version: session.bound_soul_version.clone(),
+            parent_job_id,
         };
 
-        // Post-hoc record — `SpanRecorder::end_span` publishes
-        // `LlmSpanEnded` for the cost subscriber regardless of
-        // wall-clock ordering.
-        let llm_call_kind = SpanKind::LlmCall {
-            begin: LlmCallBegin {
-                model_id: call.model_id,
-                provider: call.provider,
-                provider_config_hash: String::new(),
-                input_messages: Vec::new(),
-                temperature: None,
-            },
-            result: None,
-        };
-        let finalize = SpanFinalize::LlmCall(LlmCallResult {
-            output_content: String::new(),
-            thinking: None,
-            tool_calls: vec![],
-            input_tokens: call.input_tokens,
-            output_tokens: call.output_tokens,
-            cached_input_tokens: call.cached_input_tokens,
-            cache_creation_input_tokens: call.cache_creation_input_tokens,
-        });
-        let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
-        let rec = span_recorder.as_ref();
-        crate::scope::with_step(
-            rec,
-            job_id,
-            StepKind::Compression,
-            cancel_ctx,
-            |step| async move {
-                crate::scope::with_span(
-                    rec,
-                    &step,
-                    job_id,
-                    llm_call_kind,
-                    None,
-                    cancel_ctx,
-                    |_span| async move { Ok((finalize, LifecycleOutcome::Ok, ())) },
-                )
-                .await?;
-                Ok((LifecycleOutcome::Ok, ()))
+        crate::scope::with_job(
+            job_lifecycle,
+            cancel_token.clone(),
+            spec,
+            |job_id| async move {
+                let runner =
+                    self.build_compression_runner(session, span_recorder, job_id, &cancel_token);
+                let model_id = runner.model_info.id.clone();
+                let outcome = self
+                    .context_manager
+                    .force_compress(session, &model_id, |req| runner.run(req))
+                    .await?;
+                let text = match outcome {
+                    aura_context::CompressionOutcome::Compressed => {
+                        "Context compressed.".to_string()
+                    }
+                    aura_context::CompressionOutcome::BelowThreshold => {
+                        "Context already under the compression threshold; skipped.".to_string()
+                    }
+                    aura_context::CompressionOutcome::StrategyDeclined => {
+                        "Compression strategy declined: nothing to summarize (conversation too short).".to_string()
+                    }
+                    aura_context::CompressionOutcome::NoSavings => {
+                        "Compression ran but produced no savings; kept the original.".to_string()
+                    }
+                };
+                let output = JobOutput::Message {
+                    content: vec![ContentBlock::Text(text.clone())],
+                };
+                Ok((output, text))
             },
         )
         .await
@@ -1505,21 +1615,108 @@ impl AgentLoop {
     }
 }
 
-fn build_skill_reminder(skills: &[SkillSummary]) -> Option<String> {
-    if skills.is_empty() {
+/// Format a single skill's body (`name: description [hint]`), without any
+/// leading bullet/diff marker. Callers prepend `- ` for full listings or
+/// `+ ` for diff additions so the output isn't double-marked.
+///
+/// Uses the skill *name* (the value the model passes as `Skill`'s `skill`
+/// argument), not the slash command — slash commands are a user-input
+/// affordance, while reminders direct the model's tool invocation.
+///
+/// Compare `current` against `previous` (last turn's `active_skills`
+/// names) and return a `<system-reminder>`-wrapped *full* skill list when
+/// the set has changed, or `None` when it has not.
+///
+/// Re-broadcasts the entire list rather than a delta whenever anything
+/// changed: simpler for the model to act on (it sees the authoritative
+/// state, not a patch it has to apply against history) and avoids drift
+/// if an earlier reminder was compressed out of context. The dedupe
+/// against `previous` keeps the steady-state cost at zero.
+///
+/// Wrapped in `<system-reminder>...</system-reminder>` so the model
+/// treats it as out-of-band guidance rather than user-authored content,
+/// matching the convention used by Claude Code's own skill announcements.
+fn build_skill_reminder_if_changed(
+    previous: &[String],
+    current: &[SkillSummary],
+) -> Option<String> {
+    let prev_set: std::collections::HashSet<&str> = previous.iter().map(String::as_str).collect();
+    let cur_set: std::collections::HashSet<&str> =
+        current.iter().map(|s| s.name.as_str()).collect();
+    if prev_set == cur_set {
         return None;
     }
-    let mut s =
-        String::from("Available skills (invoke via the `Skill` tool with `skill: \"<name>\"`):\n");
-    for sk in skills {
-        let cmd = sk.command.as_deref().unwrap_or(sk.name.as_str());
-        s.push_str(&format!("- /{cmd}: {}", sk.description.trim()));
-        if let Some(hint) = sk.argument_hint.as_deref() {
-            s.push_str(&format!(" {hint}"));
-        }
-        s.push('\n');
+    Some(aura_skills::render::render_skill_reminder(current))
+}
+
+/// Strip leading/trailing whitespace from the LLM response's text fields.
+///
+/// `LlmResponse::content` is the flat aggregate string; `content_blocks`
+/// preserves the structured form (text / thinking / tool_use / etc.). For
+/// each text block — and for the aggregate string — leading/trailing
+/// whitespace (including stray `\n` runs) is removed. Interior whitespace
+/// is preserved so paragraph breaks, code blocks, and list formatting
+/// inside the message stay intact.
+///
+/// Non-text blocks (`Thinking`, `ToolUse`, `ToolResult`, `Image`, etc.)
+/// are untouched: their content is structured data the renderer / next
+/// turn relies on verbatim.
+fn trim_response_text_edges(response: &mut LlmResponse) {
+    let trimmed = response.content.trim();
+    if trimmed.len() != response.content.len() {
+        response.content = trimmed.to_string();
     }
-    Some(s)
+    for block in &mut response.content_blocks {
+        if let ContentBlock::Text(t) = block {
+            let trimmed = t.trim();
+            if trimmed.len() != t.len() {
+                *t = trimmed.to_string();
+            }
+        }
+    }
+}
+
+/// Coalesce adjacent same-role user/assistant messages into a single
+/// message so providers that require strict user/assistant alternation
+/// (e.g. some Gemini / Mistral configurations) accept the request.
+///
+/// `Role::System` and `Role::Tool` are passed through untouched — system
+/// messages are typically extracted to a dedicated field by the provider
+/// adapter, and tool-result messages must remain individually addressable
+/// by their `tool_use_id`.
+///
+/// When two adjacent user/assistant messages are merged, the merge also
+/// flattens trailing/leading `ContentBlock::Text` blocks across the
+/// boundary into a single text block (joined with `\n\n`). Non-text
+/// blocks (images, tool_use, tool_result, thinking) are appended as-is so
+/// signatures, IDs, and modality data are preserved verbatim.
+fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let mergeable = matches!(msg.role, Role::User | Role::Assistant);
+        match out.last_mut() {
+            Some(last) if mergeable && last.role == msg.role => {
+                for block in &msg.content {
+                    let folded = matches!(block, ContentBlock::Text(_))
+                        && matches!(last.content.last(), Some(ContentBlock::Text(_)));
+                    if folded {
+                        if let (Some(ContentBlock::Text(prev_t)), ContentBlock::Text(cur_t)) =
+                            (last.content.last_mut(), block)
+                        {
+                            if !prev_t.is_empty() && !cur_t.is_empty() {
+                                prev_t.push_str("\n\n");
+                            }
+                            prev_t.push_str(cur_t);
+                        }
+                    } else {
+                        last.content.push(block.clone());
+                    }
+                }
+            }
+            _ => out.push(msg.clone()),
+        }
+    }
+    out
 }
 
 fn detect_slash_invocation(user_text: &str, skills: &[SkillSummary]) -> Option<(String, String)> {
@@ -1706,5 +1903,386 @@ mod attachment_bound_tests {
             }
             _ => panic!("expected image"),
         }
+    }
+}
+
+#[cfg(test)]
+mod skip_leading_whitespace_tests {
+    use super::skip_leading_whitespace;
+
+    #[test]
+    fn pure_whitespace_first_chunk_is_skipped() {
+        let mut chunk = String::from("\n\n\n");
+        let mut stripped = false;
+        let keep = skip_leading_whitespace(&mut chunk, &mut stripped);
+        assert!(!keep);
+        assert!(chunk.is_empty());
+        assert!(!stripped, "no real content yet, flag must stay false");
+    }
+
+    #[test]
+    fn mixed_first_chunk_strips_only_leading() {
+        let mut chunk = String::from("\n\n  Hello\nworld");
+        let mut stripped = false;
+        let keep = skip_leading_whitespace(&mut chunk, &mut stripped);
+        assert!(keep);
+        assert_eq!(chunk, "Hello\nworld");
+        assert!(stripped);
+    }
+
+    #[test]
+    fn passthrough_after_first_real_content() {
+        let mut stripped = true;
+        let mut chunk = String::from("\n  next paragraph");
+        let keep = skip_leading_whitespace(&mut chunk, &mut stripped);
+        assert!(keep);
+        assert_eq!(chunk, "\n  next paragraph", "interior whitespace preserved");
+    }
+
+    #[test]
+    fn passthrough_empty_chunk_returns_false() {
+        let mut stripped = true;
+        let mut chunk = String::new();
+        assert!(!skip_leading_whitespace(&mut chunk, &mut stripped));
+    }
+
+    #[test]
+    fn sequential_whitespace_chunks_keep_flag_false() {
+        let mut stripped = false;
+        let mut a = String::from("  ");
+        assert!(!skip_leading_whitespace(&mut a, &mut stripped));
+        let mut b = String::from("\n");
+        assert!(!skip_leading_whitespace(&mut b, &mut stripped));
+        let mut c = String::from(" Hello");
+        assert!(skip_leading_whitespace(&mut c, &mut stripped));
+        assert_eq!(c, "Hello");
+        assert!(stripped);
+    }
+}
+
+#[cfg(test)]
+mod trim_response_text_edges_tests {
+    use super::trim_response_text_edges;
+    use aura_llm::{LlmResponse, TokenUsage};
+    use aura_model::ContentBlock;
+
+    fn resp(content: &str, blocks: Vec<ContentBlock>) -> LlmResponse {
+        LlmResponse {
+            content: content.into(),
+            content_blocks: blocks,
+            tool_calls: Vec::new(),
+            usage: TokenUsage::default(),
+            thinking: None,
+        }
+    }
+
+    #[test]
+    fn strips_leading_newlines_on_aggregate_content() {
+        let mut r = resp("\n\n\nHello world", Vec::new());
+        trim_response_text_edges(&mut r);
+        assert_eq!(r.content, "Hello world");
+    }
+
+    #[test]
+    fn strips_both_edges_keeps_interior() {
+        let mut r = resp("\n  Title\n\nBody\n  ", Vec::new());
+        trim_response_text_edges(&mut r);
+        assert_eq!(r.content, "Title\n\nBody");
+    }
+
+    #[test]
+    fn strips_each_text_block() {
+        let mut r = resp(
+            "doesn't matter",
+            vec![
+                ContentBlock::Text("\n\nfirst paragraph".into()),
+                ContentBlock::Text("second paragraph\n\n".into()),
+            ],
+        );
+        trim_response_text_edges(&mut r);
+        match &r.content_blocks[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "first paragraph"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        match &r.content_blocks[1] {
+            ContentBlock::Text(t) => assert_eq!(t, "second paragraph"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leaves_non_text_blocks_alone() {
+        let tool_use = ContentBlock::ToolUse {
+            id: "id1".into(),
+            name: "Foo".into(),
+            input: serde_json::json!({"k": "v"}),
+            signature: None,
+        };
+        let mut r = resp("ignored", vec![tool_use.clone()]);
+        trim_response_text_edges(&mut r);
+        assert_eq!(r.content_blocks[0], tool_use);
+    }
+
+    #[test]
+    fn no_op_when_already_clean() {
+        let mut r = resp("Hello", vec![ContentBlock::Text("Already trimmed".into())]);
+        trim_response_text_edges(&mut r);
+        assert_eq!(r.content, "Hello");
+        match &r.content_blocks[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "Already trimmed"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_interior_code_block_indentation() {
+        let body = "Heading\n\n    indented code line\n    second line";
+        let mut r = resp(
+            &format!("\n\n{body}\n\n"),
+            vec![ContentBlock::Text(format!("\n{body}\n"))],
+        );
+        trim_response_text_edges(&mut r);
+        assert_eq!(r.content, body);
+        match &r.content_blocks[0] {
+            ContentBlock::Text(t) => assert_eq!(t, body),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod skill_reminder_tests {
+    use super::build_skill_reminder_if_changed;
+    use aura_model::TrustLevel;
+    use aura_skills::SkillSummary;
+
+    fn skill(name: &str, command: Option<&str>, desc: &str) -> SkillSummary {
+        SkillSummary {
+            name: name.into(),
+            command: command.map(str::to_string),
+            description: desc.into(),
+            argument_hint: None,
+            agent_invocable: true,
+            trust_level: TrustLevel::Trusted,
+        }
+    }
+
+    #[test]
+    fn empty_state_returns_none() {
+        assert!(build_skill_reminder_if_changed(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn first_turn_lists_full_set() {
+        let cur = vec![skill("foo", Some("foo"), "Foo desc")];
+        let out = build_skill_reminder_if_changed(&[], &cur).expect("should emit");
+        assert!(out.starts_with("<system-reminder>\n"));
+        assert!(out.ends_with("</system-reminder>"));
+        assert!(out.contains("The following skills are available for use with the Skill tool:"));
+        assert!(out.contains("- foo: Foo desc"));
+    }
+
+    #[test]
+    fn unchanged_set_returns_none() {
+        let cur = vec![
+            skill("foo", Some("foo"), "Foo desc"),
+            skill("bar", Some("bar"), "Bar desc"),
+        ];
+        let prev = vec!["foo".to_string(), "bar".to_string()];
+        assert!(build_skill_reminder_if_changed(&prev, &cur).is_none());
+    }
+
+    #[test]
+    fn unchanged_set_is_order_insensitive() {
+        let cur = vec![
+            skill("bar", Some("bar"), "Bar"),
+            skill("foo", Some("foo"), "Foo"),
+        ];
+        let prev = vec!["foo".to_string(), "bar".to_string()];
+        assert!(build_skill_reminder_if_changed(&prev, &cur).is_none());
+    }
+
+    #[test]
+    fn addition_emits_full_set() {
+        let cur = vec![
+            skill("foo", Some("foo"), "Foo desc"),
+            skill("bar", Some("bar"), "Bar desc"),
+        ];
+        let prev = vec!["foo".to_string()];
+        let out = build_skill_reminder_if_changed(&prev, &cur).expect("should emit");
+        assert!(out.contains("The following skills are available for use with the Skill tool:"));
+        assert!(out.contains("- foo: Foo desc"));
+        assert!(out.contains("- bar: Bar desc"));
+        // Re-broadcast, not a delta — no `+`/`-` markers.
+        assert!(!out.contains("\n+ "));
+        assert!(!out.contains("(no longer available)"));
+    }
+
+    #[test]
+    fn removal_emits_full_remaining_set() {
+        let cur = vec![skill("foo", Some("foo"), "Foo desc")];
+        let prev = vec!["foo".to_string(), "bar".to_string()];
+        let out = build_skill_reminder_if_changed(&prev, &cur).expect("should emit");
+        assert!(out.contains("- foo: Foo desc"));
+        assert!(!out.contains("bar"));
+        assert!(!out.contains("(no longer available)"));
+    }
+
+    #[test]
+    fn full_clear_emits_no_skills_marker() {
+        let prev = vec!["foo".to_string()];
+        let out = build_skill_reminder_if_changed(&prev, &[]).expect("should emit");
+        assert!(out.starts_with("<system-reminder>\n"));
+        assert!(out.contains("No skills are currently available."));
+        assert!(out.ends_with("</system-reminder>"));
+    }
+
+    #[test]
+    fn first_turn_uses_name_when_command_missing() {
+        let cur = vec![skill("only-name", None, "Mute desc")];
+        let out = build_skill_reminder_if_changed(&[], &cur).expect("should emit");
+        assert!(out.contains("- only-name: Mute desc"));
+    }
+
+    #[test]
+    fn namespaced_skill_name_preserved() {
+        let cur = vec![skill("codex:rescue", Some("rescue"), "Delegate to Codex")];
+        let out = build_skill_reminder_if_changed(&[], &cur).expect("should emit");
+        assert!(out.contains("- codex:rescue: Delegate to Codex"));
+    }
+}
+
+#[cfg(test)]
+mod merge_for_llm_tests {
+    use super::merge_for_llm;
+    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+
+    fn text(role: Role, body: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: vec![ContentBlock::Text(body.into())],
+        }
+    }
+
+    fn img() -> ContentBlock {
+        ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:abc".into(),
+            },
+            mime_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn passthrough_when_alternating() {
+        let msgs = vec![
+            text(Role::System, "sys"),
+            text(Role::User, "u1"),
+            text(Role::Assistant, "a1"),
+            text(Role::User, "u2"),
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out, msgs);
+    }
+
+    #[test]
+    fn merges_consecutive_user_text() {
+        let msgs = vec![text(Role::User, "reminder"), text(Role::User, "hello")];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::User);
+        assert_eq!(out[0].content.len(), 1);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "reminder\n\nhello"),
+            other => panic!("expected merged text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merges_consecutive_assistant_text() {
+        let msgs = vec![text(Role::Assistant, "a"), text(Role::Assistant, "b")];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "a\n\nb"),
+            other => panic!("expected merged text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_non_text_blocks_separate() {
+        let msgs = vec![
+            ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text("hi".into()), img()],
+            },
+            ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text("more".into())],
+            },
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        // hi, image, more — image keeps the text blocks from folding across it.
+        assert_eq!(out[0].content.len(), 3);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "hi"),
+            other => panic!("unexpected first block {other:?}"),
+        }
+        assert!(matches!(out[0].content[1], ContentBlock::Image { .. }));
+        match &out[0].content[2] {
+            ContentBlock::Text(t) => assert_eq!(t, "more"),
+            other => panic!("unexpected third block {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_merge_system_or_tool() {
+        let msgs = vec![
+            text(Role::System, "s1"),
+            text(Role::System, "s2"),
+            ChatMessage {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "1".into(),
+                    content: "r1".into(),
+                }],
+            },
+            ChatMessage {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "2".into(),
+                    content: "r2".into(),
+                }],
+            },
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn preserves_assistant_tool_use_then_tool_result() {
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Foo".into(),
+                input: serde_json::json!({}),
+                signature: None,
+            }],
+        };
+        let tool = ChatMessage {
+            role: Role::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "ok".into(),
+            }],
+        };
+        let msgs = vec![text(Role::User, "hi"), assistant.clone(), tool.clone()];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1], assistant);
+        assert_eq!(out[2], tool);
     }
 }

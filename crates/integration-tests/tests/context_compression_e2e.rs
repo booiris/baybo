@@ -1,0 +1,173 @@
+//! End-to-end exercise of the LLM context-compression path.
+//!
+//! Drives the live `AgentLoop` through `AgentTestHarness` configured
+//! with a tight token budget and the `Summarize` strategy. The agent
+//! loop's chat closure uses the harness's main `StubLlm` for the
+//! summarizer call too — the strategy itself is now pure (just a
+//! planner), so there is no separate summarizer LLM to inject.
+//!
+//! Asserts:
+//!  1. The agent runs two consecutive turns; compression fires before
+//!     the second turn's main LLM call.
+//!  2. The cost ledger contains all three LLM call cost rows
+//!     (turn 1 main, compression, turn 2 main).
+//!  3. The compression cost row's `span_id` matches the
+//!     `SpanKind::LlmCall` span recorded under a `StepKind::Compression`
+//!     step in the trace store — the cost row joins back to a real
+//!     trace span (real lifecycle, real timing, real input messages),
+//!     not the post-hoc placeholder we used to record.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use aura_context::{CompressionStrategy, Summarize, budget::TokenBudget};
+use aura_integration_tests::AgentTestHarness;
+use aura_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
+use aura_model::MicroUsd;
+use aura_storage::TraceStore;
+use aura_trace::{SpanKind, StepKind};
+
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
+
+#[tokio::test]
+async fn compression_call_records_cost_with_matching_span_id() {
+    // Pricing: nonzero so `record_call` actually moves the meter
+    // and persists. Only one model id now (the harness's stub) —
+    // the summarizer call goes through the same client.
+    let model_id = "stub-model";
+    let mut pricing_map: HashMap<String, ModelPricing> = HashMap::new();
+    pricing_map.insert(
+        model_id.into(),
+        ModelPricing {
+            input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
+            output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
+        },
+    );
+    let pricing = Arc::new(pricing_map);
+
+    let strategy: Box<dyn CompressionStrategy> = Box::new(Summarize::new(1));
+
+    // Tight budget: max=200 tokens, threshold=0.1 → any meaningful
+    // turn easily crosses the gate so `compress_if_needed` fires
+    // before turn 2's LLM call.
+    let mut harness = AgentTestHarness::builder()
+        .with_pricing(pricing)
+        .with_token_budget(TokenBudget::new(200, 0.1))
+        .with_compression_strategy(strategy)
+        .build();
+
+    // Main-loop scripts: each turn streams a small text plus a Usage
+    // event so `record_llm_call` persists a cost row.
+    let main_usage = TokenUsage {
+        input_tokens: 1_000,
+        output_tokens: 50,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+    harness.stub_llm.push_stream_results(vec![
+        Ok(StreamEvent::Text("first reply".into())),
+        Ok(StreamEvent::Usage(main_usage)),
+    ]);
+    harness.stub_llm.push_stream_results(vec![
+        Ok(StreamEvent::Text("second reply".into())),
+        Ok(StreamEvent::Usage(main_usage)),
+    ]);
+
+    // Compression call uses non-streaming `chat`. Push a canned
+    // response on the same stub.
+    harness.stub_llm.push_response(LlmResponse {
+        content: "summary of earlier conversation".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage {
+            input_tokens: 250,
+            output_tokens: 40,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+        thinking: None,
+    });
+
+    // Drive two turns. The second turn's `compress_if_needed`
+    // should pull the canned summarizer response.
+    harness.send_text("hello").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    harness.send_text("again").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // Locate the Compression step + its LlmCall span; that span_id
+    // is the join key the compression cost row must carry.
+    let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
+    let records = harness.cost_store.records();
+    assert_eq!(
+        records.len(),
+        3,
+        "expected 3 cost records (turn1, compression, turn2); got: {records:#?}"
+    );
+
+    // Find a Compression step in any of the recorded jobs. There
+    // should be exactly one across the test run.
+    let job_ids: std::collections::BTreeSet<_> = records.iter().map(|r| r.job_id).collect();
+    let mut compression_steps = Vec::new();
+    for job_id in &job_ids {
+        let steps = trace_store.list_steps_by_job(job_id).await.unwrap();
+        compression_steps.extend(
+            steps
+                .into_iter()
+                .filter(|s| matches!(s.kind, StepKind::Compression)),
+        );
+    }
+    assert_eq!(
+        compression_steps.len(),
+        1,
+        "expected exactly one Compression step across the run; got: {compression_steps:#?}"
+    );
+    let compression_step = &compression_steps[0];
+
+    let spans = trace_store
+        .list_spans_by_step(&compression_step.id)
+        .await
+        .unwrap();
+    let compression_span = spans
+        .iter()
+        .find(|s| matches!(s.kind, SpanKind::LlmCall { .. }))
+        .expect("the compression step contains an LlmCall span");
+
+    // The matching cost row is the one whose span_id == compression_span.id.
+    let compression_record = records
+        .iter()
+        .find(|r| r.span_id == compression_span.id)
+        .expect("a cost record references the compression span_id");
+    assert_eq!(compression_record.input_tokens, 250);
+    assert_eq!(compression_record.output_tokens, 40);
+
+    // The remaining two rows are the main-call cost rows.
+    let main_records: Vec<_> = records
+        .iter()
+        .filter(|r| r.span_id != compression_span.id)
+        .collect();
+    assert_eq!(
+        main_records.len(),
+        2,
+        "expected two main-call cost rows besides the compression one"
+    );
+    for r in &main_records {
+        assert_eq!(r.input_tokens, main_usage.input_tokens);
+        assert_eq!(r.output_tokens, main_usage.output_tokens);
+    }
+
+    // The compression LlmCall span now records a real call lifecycle:
+    // the `begin.input_messages` field carries the messages we sent
+    // (not the empty placeholder the old post-hoc span left behind).
+    if let SpanKind::LlmCall { begin, .. } = &compression_span.kind {
+        assert!(
+            !begin.input_messages.is_empty(),
+            "compression LlmCall span must record real input messages"
+        );
+    } else {
+        panic!("compression span has unexpected kind");
+    }
+
+    harness.shutdown().await;
+}

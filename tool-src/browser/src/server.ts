@@ -56,6 +56,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   Browser,
@@ -94,6 +95,10 @@ const BLOCKED_TOOLS: ReadonlySet<string> = new Set([
   "execute_webmcp_tool",
   "take_memory_snapshot",
 ]);
+
+function proxyToolError(text: string): CallToolResult {
+  return { content: [{ type: "text", text }], isError: true };
+}
 
 type ServerArgs = CreateMcpServerArgs;
 
@@ -789,21 +794,20 @@ async function main(): Promise<void> {
     if (req.params.name === READ_PAGE_TOOL.name) {
       const raw = req.params.arguments ?? {};
       const pageIdRaw = (raw as { pageId?: unknown }).pageId;
-      const pageId = typeof pageIdRaw === "number" ? pageIdRaw : undefined;
-      return await handleReadPage(cddmClient, { pageId });
+      if (typeof pageIdRaw !== "number") {
+        return proxyToolError(
+          "read_page requires a numeric `pageId`. CDDM's evaluate_script " +
+            "handler does not fall back to the selected page; call list_pages " +
+            "to find the page id and pass it in.",
+        );
+      }
+      return await handleReadPage(cddmClient, { pageId: pageIdRaw });
     }
     if (BLOCKED_TOOLS.has(req.params.name)) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Tool '${req.params.name}' is disabled in this Aura build. ` +
-              `It was hidden from tools/list — do not invoke it.`,
-          },
-        ],
-        isError: true,
-      };
+      return proxyToolError(
+        `Tool '${req.params.name}' is disabled in this Aura build. ` +
+          `It was hidden from tools/list — do not invoke it.`,
+      );
     }
     return await cddmClient.callTool({
       name: req.params.name,

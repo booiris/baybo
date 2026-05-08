@@ -66,7 +66,7 @@ pub async fn pkce_login(
     // Bind BEFORE handing the URL to the user — a very fast click can
     // otherwise race the bind and produce "connection refused".
     let listener = bind_local_listener(CALLBACK_PORT).map_err(|e| {
-        LlmError::Provider(format!(
+        LlmError::Config(format!(
             "openai-subscription: cannot bind 127.0.0.1:{CALLBACK_PORT} for OAuth callback ({e}) \
              — close any other Codex / aura login in flight, or pass --device-code"
         ))
@@ -75,7 +75,7 @@ pub async fn pkce_login(
     let authorize_url = build_authorize_url(&redirect_uri, &pkce.code_challenge, &state);
     debug!(authorize_url = %authorize_url, "opening OAuth authorize URL");
     present_url(&authorize_url).map_err(|e| {
-        LlmError::Provider(format!("openai-subscription: failed to present URL: {e}"))
+        LlmError::Config(format!("openai-subscription: failed to present URL: {e}"))
     })?;
 
     // TcpListener::accept is sync — run in spawn_blocking and bound the
@@ -87,13 +87,13 @@ pub async fn pkce_login(
     let callback = match tokio::time::timeout(PKCE_CALLBACK_TIMEOUT, callback_task).await {
         Ok(join_res) => join_res
             .map_err(|e| {
-                LlmError::Provider(format!("openai-subscription: callback task panicked: {e}"))
+                LlmError::Internal(anyhow::anyhow!(
+                    "openai-subscription: callback task panicked: {e}"
+                ))
             })?
-            .map_err(|e| {
-                LlmError::Provider(format!("openai-subscription: callback failed: {e}"))
-            })?,
+            .map_err(|e| LlmError::Auth(format!("openai-subscription: callback failed: {e}")))?,
         Err(_) => {
-            return Err(LlmError::Provider(format!(
+            return Err(LlmError::Auth(format!(
                 "openai-subscription: PKCE callback timed out after {}s — pass --device-code if \
                  you can't open a browser on this host",
                 PKCE_CALLBACK_TIMEOUT.as_secs()
@@ -123,15 +123,11 @@ pub async fn device_code_login(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| {
-            LlmError::Provider(format!(
-                "openai-subscription: device code request failed: {e}"
-            ))
-        })?
+        .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: device code request failed"))?
         .json()
         .await
         .map_err(|e| {
-            LlmError::Provider(format!(
+            LlmError::Decode(format!(
                 "openai-subscription: device code response parse: {e}"
             ))
         })?;
@@ -149,7 +145,7 @@ pub async fn device_code_login(
     let token_url = format!("{api_base}/deviceauth/token");
     let code_resp = loop {
         if start.elapsed() >= max_wait {
-            return Err(LlmError::Provider(
+            return Err(LlmError::Auth(
                 "openai-subscription: device-code authorization timed out (15 min)".into(),
             ));
         }
@@ -162,15 +158,11 @@ pub async fn device_code_login(
             }))
             .send()
             .await
-            .map_err(|e| {
-                LlmError::Provider(format!(
-                    "openai-subscription: device-code poll transport: {e}"
-                ))
-            })?;
+            .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: device-code poll"))?;
         let status = resp.status();
         if status.is_success() {
             break resp.json::<DeviceCodeSuccess>().await.map_err(|e| {
-                LlmError::Provider(format!("openai-subscription: device-code poll parse: {e}"))
+                LlmError::Decode(format!("openai-subscription: device-code poll parse: {e}"))
             })?;
         }
         if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
@@ -179,9 +171,10 @@ pub async fn device_code_login(
             continue;
         }
         let body = resp.text().await.unwrap_or_default();
-        return Err(LlmError::Provider(format!(
-            "openai-subscription: device-code poll failed ({status}): {body}"
-        )));
+        return Err(crate::status_to_error(
+            status.as_u16(),
+            format!("openai-subscription: device-code poll failed ({status}): {body}"),
+        ));
     };
 
     // Step 3: the device-code response gives us a fresh PKCE pair + auth code;
@@ -202,13 +195,13 @@ pub async fn device_code_login(
 /// three being missing as a hard failure with a clear diagnostic.
 fn unpack_token_response(resp: TokenEndpointResponse) -> Result<(String, String, String)> {
     let access = resp.access_token.ok_or_else(|| {
-        LlmError::Provider("openai-subscription: token response missing access_token".into())
+        LlmError::Decode("openai-subscription: token response missing access_token".into())
     })?;
     let refresh = resp.refresh_token.ok_or_else(|| {
-        LlmError::Provider("openai-subscription: token response missing refresh_token".into())
+        LlmError::Decode("openai-subscription: token response missing refresh_token".into())
     })?;
     let id = resp.id_token.ok_or_else(|| {
-        LlmError::Provider("openai-subscription: token response missing id_token".into())
+        LlmError::Decode("openai-subscription: token response missing id_token".into())
     })?;
     Ok((access, refresh, id))
 }
@@ -530,21 +523,18 @@ async fn exchange_code_for_tokens_with_redirect(
         .body(body)
         .send()
         .await
-        .map_err(|e| {
-            LlmError::Provider(format!(
-                "openai-subscription: token exchange transport: {e}"
-            ))
-        })?;
+        .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: token exchange transport"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(LlmError::Provider(format!(
-            "openai-subscription: token exchange returned {status}: {body}"
-        )));
+        return Err(crate::status_to_error(
+            status.as_u16(),
+            format!("openai-subscription: token exchange returned {status}: {body}"),
+        ));
     }
     resp.json::<TokenEndpointResponse>()
         .await
-        .map_err(|e| LlmError::Provider(format!("openai-subscription: token exchange parse: {e}")))
+        .map_err(|e| LlmError::Decode(format!("openai-subscription: token exchange parse: {e}")))
 }
 
 #[cfg(test)]

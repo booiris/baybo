@@ -44,7 +44,7 @@ impl OAuthTokenBundle {
         id_token: String,
     ) -> crate::Result<Self> {
         let claims = parse_jwt_payload(&id_token).map_err(|e| {
-            LlmError::Provider(format!(
+            LlmError::Decode(format!(
                 "openai-subscription: id_token did not parse as a JWT: {e}"
             ))
         })?;
@@ -55,7 +55,7 @@ impl OAuthTokenBundle {
             .map(str::to_owned);
 
         let access_claims = parse_jwt_payload(&access_token).map_err(|e| {
-            LlmError::Provider(format!(
+            LlmError::Decode(format!(
                 "openai-subscription: access_token did not parse as a JWT: {e}"
             ))
         })?;

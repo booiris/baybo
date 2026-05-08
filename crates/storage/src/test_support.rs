@@ -194,6 +194,12 @@ impl MemoryCostStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Snapshot every persisted `CostRecord` in arrival order. Cloned
+    /// on read so callers can iterate without holding the mutex.
+    pub fn records(&self) -> Vec<CostRecord> {
+        self.records.lock().clone()
+    }
 }
 
 fn in_range(record: &CostRecord, range: &TimeRange) -> bool {

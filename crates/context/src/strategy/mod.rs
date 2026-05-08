@@ -1,11 +1,29 @@
 pub mod summarize;
 pub mod truncate;
 
-use async_trait::async_trait;
-use aura_model::{ChatMessage, ContentBlock};
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 
-use crate::tokenizer::Tokenizer;
+use async_trait::async_trait;
+use aura_llm::{ChatRequest, LlmResponse};
+use aura_model::{ChatMessage, ContentBlock};
+
+use crate::error::ContextError;
+
+/// Future returned by a [`ChatCallback`]. Boxed because the callback
+/// is passed through a `dyn`-compatible trait method.
+pub type ChatFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<LlmResponse, ContextError>> + Send>>;
+
+/// One-shot chat invocation handed to a [`CompressionStrategy`].
+///
+/// The strategy calls it at most once. Strategies that don't need an
+/// LLM call (e.g. [`crate::Truncate`]) ignore it; strategies that do
+/// (e.g. [`crate::Summarize`]) drive the call themselves so the chat
+/// → trim → fallback flow stays inside the strategy. `'static` because
+/// the agent loop's runner moves its captures by value.
+pub type ChatCallback = Box<dyn FnOnce(ChatRequest) -> ChatFuture + Send>;
 
 /// Adjust a candidate cut index over `messages` so the kept tail
 /// (`messages[cut..]`) contains every `ToolUse` whose matching
@@ -75,49 +93,46 @@ pub(crate) fn pair_preserving_cut(messages: &[ChatMessage], cut: usize) -> usize
 
 /// Strategy for compressing context messages when the token budget is exceeded.
 ///
-/// Implementations receive the full message list and a tokenizer, and return
-/// a (possibly shorter) message list. The `ContextManager` handles the
-/// budget tracking and compression triggering; the strategy only decides
-/// *how* to compress.
+/// Implementations receive the full message list and a one-shot chat
+/// callback they can invoke if they need to call an LLM (e.g.
+/// `Summarize`). The callback hides trace span / cost / security
+/// wiring on the agent side — the strategy just sees
+/// `request → LlmResponse`. Strategies that don't need an LLM
+/// (e.g. `Truncate`) ignore the callback. Token counting is owned
+/// by `ContextManager` and not exposed here; if a future strategy
+/// needs token-aware decisions, plumb a tokenizer in alongside
+/// `messages` rather than reviving a blanket trait parameter.
 #[async_trait]
 pub trait CompressionStrategy: Send + Sync {
-    /// Compress the given messages, returning a reduced message list.
     async fn compress(
         &self,
         messages: &[ChatMessage],
-        tokenizer: &dyn Tokenizer,
+        chat: ChatCallback,
     ) -> crate::Result<CompressOutput>;
 }
 
-/// Output of a compression operation.
-pub struct CompressOutput {
-    /// The compressed message list.
-    pub messages: Vec<ChatMessage>,
-    /// Set when the strategy made an LLM call. Propagated upward by
-    /// `ContextManager` so the agent loop can record the call as a
-    /// `SpanKind::LlmCall` after the fact (see `CompressStats::llm_call`).
-    pub llm_call: Option<crate::CompressionLlmCall>,
-}
-
-/// Output of [`SummarizeCallback::summarize`].
-///
-/// Carries both the summary text and the provenance/usage of the
-/// underlying LLM call so the strategy can surface it via
-/// `CompressOutput::llm_call`.
-pub struct SummarizeOutput {
-    pub summary: String,
-    pub llm_call: crate::CompressionLlmCall,
-}
-
-/// Callback for LLM-based summarization of context messages.
-///
-/// Defined in this crate but implemented externally to keep `context`
-/// independent from `llm`. Injected into `Summarize` strategy at construction.
-#[async_trait]
-pub trait SummarizeCallback: Send + Sync {
-    /// Summarize a sequence of messages, returning both the text and
-    /// the LLM call's provenance/usage.
-    async fn summarize(&self, messages: &[ChatMessage]) -> crate::Result<SummarizeOutput>;
+/// Result of a [`CompressionStrategy::compress`] call.
+pub enum CompressOutput {
+    /// Strategy chose not to compress (e.g. message count already at
+    /// or below the keep threshold). `ContextManager` surfaces this
+    /// as `CompressionOutcome::StrategyDeclined` without touching
+    /// `session`.
+    NoOp,
+    /// Strategy produced a new message list.
+    ///
+    /// `replaced_full_history` declares whether this output discards
+    /// the prior conversation in favour of an opaque condensation
+    /// (e.g. a summary message that no longer carries the original
+    /// `ToolUse` blocks). `ContextManager` uses the flag to decide
+    /// whether to append a fresh skill trailer (reminder + per-skill
+    /// detail blocks) — necessary after a full-history wipe so the
+    /// model still sees the authoritative skill list, redundant after
+    /// a tail-preserving truncation that already kept the historical
+    /// reminder + tool_use trail in the kept slice.
+    Replaced {
+        messages: Vec<ChatMessage>,
+        replaced_full_history: bool,
+    },
 }
 
 #[cfg(test)]

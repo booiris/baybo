@@ -95,9 +95,9 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     ));
 
     let registry = LlmProviderRegistry::with_default_providers();
-    let llm_client = Arc::new(
-        registry
-            .create_client(&LlmProviderConfig {
+    let llm_client = registry
+        .create_client(
+            &LlmProviderConfig {
                 provider: "openai".into(),
                 api_key: Some("sk-test-placeholder".into()),
                 base_url: None,
@@ -105,9 +105,11 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
                 supports_vision: None,
                 reasoning_effort: None,
                 vault: None,
-            })
-            .expect("stub LLM client"),
-    );
+            },
+            None,
+            Arc::new(|| Ok(())),
+        )
+        .expect("stub LLM client");
 
     let runtime_config = RuntimeGatewayConfig {
         admin_bind,

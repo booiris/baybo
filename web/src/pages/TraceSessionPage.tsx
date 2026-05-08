@@ -756,6 +756,7 @@ function jobTokens(job: ReplayJob): {
   output: number;
   cached: number;
   cacheCreate: number;
+  inputTotal: number;
 } {
   let input = 0;
   let output = 0;
@@ -771,7 +772,7 @@ function jobTokens(job: ReplayJob): {
       }
     }
   }
-  return { input, output, cached, cacheCreate };
+  return { input, output, cached, cacheCreate, inputTotal: input + cached + cacheCreate };
 }
 
 // Derive the user-facing input that kicked off the job: the last user
@@ -836,7 +837,6 @@ function JobSidebar({
   active: string;
   onChange: (id: string) => void;
 }) {
-  if (jobs.length <= 1) return null;
   return (
     <div className="w-[120px] shrink-0 border-r-[3px] border-black bg-white flex flex-col z-10 overflow-y-auto">
       <div className="px-2 py-1.5 border-b-2 border-black font-bold uppercase tracking-wider text-[0.65rem] text-ink-soft bg-canvas">
@@ -845,7 +845,7 @@ function JobSidebar({
       <div className="flex flex-col">
         {jobs.map((j, i) => {
           const isActive = j.job_id === active;
-          const { input, output } = jobTokens(j);
+          const { inputTotal, output } = jobTokens(j);
           return (
             <button
               type="button"
@@ -862,7 +862,7 @@ function JobSidebar({
                 {j.job_status_kind}
               </div>
               <div className="font-mono text-[0.65rem] text-ink-soft mt-0.5">
-                ↓{formatTok(input)} ↑{formatTok(output)}
+                ↑{formatTok(inputTotal)} ↓{formatTok(output)}
               </div>
             </button>
           );
@@ -987,8 +987,8 @@ function JobSummaryPanel({
       </div>
     );
   }
-  const { input, output, cached, cacheCreate } = jobTokens(job);
-  const total = input + output;
+  const { input, output, cached, cacheCreate, inputTotal } = jobTokens(job);
+  const total = inputTotal + output;
   const inputText = jobInputText(job);
   const outputText = jobOutputText(job);
   let llmCount = 0;
@@ -1328,8 +1328,8 @@ export function TraceSessionPage() {
                   const t = jobTokens(activeJob);
                   return (
                     <>
-                      <span className="text-ink">↓ {t.input.toLocaleString()}</span>
-                      <span className="text-ink">↑ {t.output.toLocaleString()}</span>
+                      <span className="text-ink">↑ {t.inputTotal.toLocaleString()}</span>
+                      <span className="text-ink">↓ {t.output.toLocaleString()}</span>
                     </>
                   );
                 })()}

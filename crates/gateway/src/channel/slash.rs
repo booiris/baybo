@@ -7,14 +7,19 @@
 //! so the gateway intercepts them right after the pairing gate and
 //! before [`ChannelSessionResolver::resolve_or_create`].
 //!
-//! Currently only `/new` is wired — it forces a fresh aura session for
-//! the calling user and replies with a confirmation. The trailing
-//! arguments are ignored. Matching is case-insensitive on the command
-//! token.
+//! `/new` is wired here — it forces a fresh aura session for the
+//! calling user and replies with a confirmation. `/compact` is
+//! published in the manifest so sidecars register it natively (e.g.
+//! Telegram's `setMyCommands`) but is **not** intercepted: the
+//! dispatcher returns `PassThrough` so the message flows through to
+//! the agent actor, which recognises the leading-slash token and
+//! drives a compression pass on the live session. Trailing arguments
+//! are ignored. Matching is case-insensitive on the command token.
 //!
 //! Adapter-side commands (TUI's `/clear`, `/quit`, …) live in their
 //! respective channels and never reach the gateway.
 
+use aura_channels::COMPACT_COMMAND_NAME;
 use aura_channels::wire::{Message as WireMessage, SlashCommandSpec};
 use aura_model::ChannelType;
 
@@ -28,10 +33,16 @@ use super::session_resolver::ChannelSessionResolver;
 /// keeping their own hardcoded copy. Adding a new command here is the
 /// single edit needed for the dispatcher + every sidecar to learn it.
 pub(crate) fn manifest() -> Vec<SlashCommandSpec> {
-    vec![SlashCommandSpec {
-        command: "new".to_string(),
-        description: "Start a fresh session".to_string(),
-    }]
+    vec![
+        SlashCommandSpec {
+            command: "new".to_string(),
+            description: "Start a fresh session".to_string(),
+        },
+        SlashCommandSpec {
+            command: COMPACT_COMMAND_NAME.to_string(),
+            description: "Summarize the conversation and free context".to_string(),
+        },
+    ]
 }
 
 pub(crate) enum SlashOutcome {
@@ -238,6 +249,25 @@ mod tests {
 
         let reply = assert_handled(try_handle(&resolver, "  /NeW  whatever", &ct, "tg_1").await);
         assert!(reply.content.contains("fresh session"));
+    }
+
+    #[tokio::test]
+    async fn compact_is_advertised_in_manifest() {
+        let cmds: Vec<String> = manifest().into_iter().map(|c| c.command).collect();
+        assert!(cmds.iter().any(|c| c == COMPACT_COMMAND_NAME));
+        assert!(cmds.iter().any(|c| c == "new"));
+    }
+
+    #[tokio::test]
+    async fn compact_passes_through_to_actor() {
+        // The gateway dispatcher only owns commands that need
+        // server-side state (`/new` repoints the mapping). `/compact`
+        // operates on the live session and is handled by the actor,
+        // so the dispatcher must let it through verbatim.
+        let resolver = build().await;
+        let ct = ChannelType::telegram();
+        assert_passthrough(try_handle(&resolver, "/compact", &ct, "tg_1").await);
+        assert_passthrough(try_handle(&resolver, "/CompAct@MyBot extra", &ct, "tg_1").await);
     }
 
     #[tokio::test]

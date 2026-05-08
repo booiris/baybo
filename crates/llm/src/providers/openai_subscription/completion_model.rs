@@ -306,9 +306,10 @@ impl OpenAiSubscriptionCompletionModel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Provider(format!(
-                "openai-subscription: GET /codex/models returned {status}: {body}"
-            )));
+            return Err(crate::status_to_error(
+                status.as_u16(),
+                format!("openai-subscription: GET /codex/models returned {status}: {body}"),
+            ));
         }
         parse_models_response(resp).await
     }
@@ -321,11 +322,7 @@ impl OpenAiSubscriptionCompletionModel {
         self.authed_request(reqwest::Method::GET, url, bundle)
             .send()
             .await
-            .map_err(|e| {
-                LlmError::Provider(format!(
-                    "openai-subscription: GET /codex/models transport: {e}"
-                ))
-            })
+            .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: GET /codex/models"))
     }
 
     async fn force_refresh(
@@ -374,7 +371,7 @@ impl OpenAiSubscriptionCompletionModel {
             .json(body)
             .send()
             .await
-            .map_err(|e| LlmError::Provider(format!("openai-subscription: HTTP transport: {e}")))
+            .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: HTTP transport"))
     }
 
     fn adapt_response(&self, response: reqwest::Response) -> LlmStream {
@@ -384,9 +381,10 @@ impl OpenAiSubscriptionCompletionModel {
             // provider message rather than an empty stream.
             let stream = stream::once(async move {
                 let body = response.text().await.unwrap_or_default();
-                Err(LlmError::Provider(format!(
-                    "openai-subscription: Codex Responses returned {status}: {body}"
-                )))
+                Err(crate::status_to_error(
+                    status.as_u16(),
+                    format!("openai-subscription: Codex Responses returned {status}: {body}"),
+                ))
             });
             return LlmStream::from_inner(Box::pin(stream));
         }
@@ -507,7 +505,7 @@ async fn parse_models_response(
     resp: reqwest::Response,
 ) -> crate::Result<Vec<crate::LiveModelInfo>> {
     let body: Value = resp.json().await.map_err(|e| {
-        LlmError::Provider(format!(
+        LlmError::Decode(format!(
             "openai-subscription: /codex/models response parse: {e}"
         ))
     })?;
@@ -521,7 +519,7 @@ fn project_models_body(mut body: Value) -> crate::Result<Vec<crate::LiveModelInf
     let raw = match body.get_mut("models").map(Value::take) {
         Some(Value::Array(arr)) => arr,
         _ => {
-            return Err(LlmError::Provider(format!(
+            return Err(LlmError::Decode(format!(
                 "openai-subscription: /codex/models missing `models` array; body: {body}"
             )));
         }
@@ -533,7 +531,7 @@ fn project_models_body(mut body: Value) -> crate::Result<Vec<crate::LiveModelInf
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| {
-                LlmError::Provider(format!(
+                LlmError::Decode(format!(
                     "openai-subscription: model entry missing `slug`: {entry}"
                 ))
             })?;
@@ -747,7 +745,7 @@ fn parse_sse_stream(
             let chunk = match chunk {
                 Ok(b) => b,
                 Err(e) => {
-                    yield Err(LlmError::Provider(format!(
+                    yield Err(LlmError::Transient(format!(
                         "openai-subscription: SSE transport: {e}"
                     )));
                     return;
@@ -761,7 +759,7 @@ fn parse_sse_stream(
                 let raw_str = match std::str::from_utf8(&raw) {
                     Ok(s) => s,
                     Err(e) => {
-                        yield Err(LlmError::Provider(format!(
+                        yield Err(LlmError::Decode(format!(
                             "openai-subscription: SSE non-UTF-8: {e}"
                         )));
                         return;
@@ -976,7 +974,13 @@ fn translate_event(
                 .or_else(|| payload.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("openai-subscription: server-side stream error");
-            out.push(Err(LlmError::Provider(message.to_owned())));
+            // Mid-stream `response.error` / `error` events from Codex
+            // are typically transport / overload signals (the request
+            // was accepted at the HTTP layer but the upstream model
+            // run failed). Mark Transient so the caller's retry path
+            // can re-attempt; non-transient errors usually surface as
+            // non-success HTTP up in `adapt_response`.
+            out.push(Err(LlmError::Transient(message.to_owned())));
         }
         other => {
             // Unknown event type — drop the payload but log the
@@ -1098,7 +1102,7 @@ async fn do_single_flight_refresh(
                     );
                 }
                 Err(e) => {
-                    return Err(LlmError::Provider(format!(
+                    return Err(LlmError::Internal(anyhow::anyhow!(
                         "openai-subscription: vault save still failing for previously \
                          rotated token; refusing to rotate again until disk recovers ({e})"
                     )));
@@ -1129,7 +1133,7 @@ async fn do_single_flight_refresh(
             )));
         }
         Err(RefreshError::Transient(msg)) => {
-            return Err(LlmError::Provider(format!(
+            return Err(LlmError::Transient(format!(
                 "openai-subscription: token refresh transient: {msg}"
             )));
         }
@@ -1190,7 +1194,8 @@ async fn save_with_retries(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| LlmError::Provider("vault save: no attempt was made".into())))
+    Err(last_err
+        .unwrap_or_else(|| LlmError::Internal(anyhow::anyhow!("vault save: no attempt was made"))))
 }
 
 /// One task per provider instance — clones share the same cache. Exits
@@ -1840,8 +1845,8 @@ mod tests {
                 .await
                 .expect_err("should refuse to rotate while disk is broken");
         match err {
-            LlmError::Provider(msg) => assert!(msg.contains("vault save still failing")),
-            other => panic!("expected Provider, got {other:?}"),
+            LlmError::Internal(e) => assert!(e.to_string().contains("vault save still failing")),
+            other => panic!("expected Internal, got {other:?}"),
         }
     }
 
@@ -1895,7 +1900,7 @@ mod tests {
         )
         .unwrap();
         let err = out.into_iter().next().unwrap();
-        assert!(matches!(err, Err(LlmError::Provider(ref m)) if m == "rate limited"));
+        assert!(matches!(err, Err(LlmError::Transient(ref m)) if m == "rate limited"));
     }
 
     #[test]
@@ -1988,8 +1993,8 @@ mod tests {
         let body = serde_json::json!({"oops": "no models field"});
         let err = project_models_body(body).unwrap_err();
         match err {
-            LlmError::Provider(msg) => assert!(msg.contains("missing `models` array")),
-            other => panic!("expected Provider, got {other:?}"),
+            LlmError::Decode(msg) => assert!(msg.contains("missing `models` array")),
+            other => panic!("expected Decode, got {other:?}"),
         }
     }
 
@@ -2000,8 +2005,8 @@ mod tests {
         });
         let err = project_models_body(body).unwrap_err();
         match err {
-            LlmError::Provider(msg) => assert!(msg.contains("missing `slug`")),
-            other => panic!("expected Provider, got {other:?}"),
+            LlmError::Decode(msg) => assert!(msg.contains("missing `slug`")),
+            other => panic!("expected Decode, got {other:?}"),
         }
     }
 }

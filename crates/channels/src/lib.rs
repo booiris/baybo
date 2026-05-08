@@ -13,7 +13,8 @@ pub use error::ChannelError;
 pub use registration::{Prompter, RegistrationResult};
 pub use registry::ChannelRegistry;
 pub use slash::{
-    DashboardProvider, DashboardSnapshot, SlashCommand, SlashHandler, SlashOutcome, ViewKind,
+    COMPACT_COMMAND, COMPACT_COMMAND_NAME, DashboardProvider, DashboardSnapshot, SlashCommand,
+    SlashHandler, SlashOutcome, ViewKind,
 };
 pub use types::{AgentOutput, IncomingMessage, Message, NoticeLevel, OutgoingMessage};
 

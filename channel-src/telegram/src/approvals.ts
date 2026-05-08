@@ -8,7 +8,11 @@ import type { BotRoute, PlatformApprovals } from "@aura/channel-sdk/bot";
 import type { Bot, Context } from "grammy";
 import { InlineKeyboard } from "grammy";
 
-import type { TelegramChat } from "./platform.js";
+import {
+  sendWithMarkdownFallback,
+  threadOpts,
+  type TelegramChat,
+} from "./platform.js";
 
 type PendingEntry = {
   botId: string;
@@ -69,12 +73,16 @@ export class TelegramApprovals
 
     let messageId: number;
     try {
-      const sent = await route.handle.api.sendMessage(route.chat.chatId, text, {
-        reply_markup: keyboard,
-        ...(route.chat.threadId !== undefined
-          ? { message_thread_id: route.chat.threadId }
-          : {}),
-      });
+      const sent = await sendWithMarkdownFallback(
+        text,
+        (msg, parseOpts) =>
+          route.handle.api.sendMessage(route.chat.chatId, msg, {
+            ...parseOpts,
+            reply_markup: keyboard,
+            ...threadOpts(route.chat),
+          }),
+        this.logger,
+      );
       messageId = sent.message_id;
     } catch (err) {
       this.logger.error("send approval prompt failed; auto-denying", err);

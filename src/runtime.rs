@@ -31,13 +31,13 @@ use aura_agent::subagent::{LocalSubagentRuntime, SubagentRuntime};
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
-    CronScheduler, CronTriggerEvent, JobLifecycle, MemoryManager, SecretVault, SecurityGateway,
-    SessionManager, SpanRecorder, TraceEventStream,
+    CostManager, CronScheduler, CronTriggerEvent, JobLifecycle, MemoryManager, SecretVault,
+    SecurityGateway, SessionManager, SpanRecorder, SpendingLimits, TraceEventStream,
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_context::{ContextManager, TiktokenTokenizer, Tokenizer, Truncate};
-use aura_llm::LlmClient;
+use aura_context::{ContextManager, Summarize, TiktokenTokenizer, Tokenizer};
+use aura_llm::GuardedLlm;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
@@ -163,12 +163,22 @@ pub struct ManagerGraph {
     pub skill_assessor: Arc<SkillAssessor>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
-    pub llm_client: Arc<LlmClient>,
+    /// Always already wrapped via `GuardedLlm` — every
+    /// consumer (main loop, side-LLM in tools, code_builder,
+    /// skill_assessor) shares the same budget gate. Constructed in
+    /// [`build_managers`] so a new consumer added downstream can't
+    /// accidentally pull a raw `Arc<LlmClient>` and bypass the gate;
+    /// the type signature alone is enough to refuse a raw
+    /// `Arc<dyn LlmCompletion>` at the call site.
+    pub llm_client: Arc<GuardedLlm>,
+    /// Owner of cost-record persistence and the budget gate used by
+    /// `llm_client` above. Kept on the graph so `wire_router` can
+    /// hand it to `AgentLoop` without reconstructing — and so the
+    /// gate built into `llm_client` and the records the agent loop
+    /// writes are guaranteed to come from the same instance.
+    pub cost_manager: Arc<CostManager>,
     pub workspace: Arc<WorkspaceManager>,
     pub channels_registry: Arc<ChannelRegistry>,
-    /// `CostStore` retained on the graph so external subscribers can
-    /// open their own `TraceEventStream` listeners (e.g. the gateway).
-    pub cost_store: Arc<dyn aura_storage::CostStore>,
     pub secret_vault: Arc<SecretVault>,
     /// Cloneable bundle of every libsql-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
@@ -254,32 +264,58 @@ pub async fn build_managers(
     // store in as a `BlobFetcher` — without it, multimodal user
     // content would degrade to a `[image: …]` text stub even on
     // vision-capable models.
-    let llm_client = {
-        let client = Arc::new(
-            boot::build_llm_client(
-                config.as_ref(),
-                Some(stores.blob.clone()),
-                Some(Arc::clone(&secret_vault)),
-            )
-            .await?,
-        );
-        info!(
-            provider = %client.model_info().provider,
-            model = %client.model_id(),
-            supports_vision = client.model_info().supports_vision,
-            "configured LLM client"
-        );
-        client
+    // Build `CostManager` *before* the LLM client so we have the gate
+    // closure ready when `boot::build_llm_client` constructs and
+    // wraps the raw client. Pricing comes from the registry's static
+    // `all_known_pricings()` only — we no longer overlay the active
+    // model's `info.pricing` (which would have required materialising
+    // the raw client first), accepting the documented caveat that
+    // operator-overridden custom-model pricing won't be reflected
+    // until the registry surfaces it. Mainstream models work as
+    // before since they're already in `all_known_pricings()`.
+    //
+    // Build the provider registry once and thread it into both the
+    // pricing harvest and `boot::build_llm_client` — same source of
+    // truth for both, instead of two independent factory-registration
+    // passes that would be load-bearing identical.
+    let provider_registry = aura_llm::LlmProviderRegistry::with_default_providers();
+    let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> =
+        Arc::new(provider_registry.all_known_pricings());
+    let spending_limits = SpendingLimits {
+        daily_usd: config.cost.spending_limits.daily_usd,
+        monthly_usd: config.cost.spending_limits.monthly_usd,
     };
+    let cost_manager = CostManager::new(stores.cost.clone(), pricing, spending_limits);
+    cost_manager.hydrate().await;
 
-    let mut tool_registry = ToolRegistry::with_defaults(
-        stores.blob.clone(),
-        Some(Arc::clone(&llm_client) as Arc<dyn aura_llm::LlmCompletion>),
+    // One gate covers the main loop, the in-process summarizer, and
+    // every side-LLM consumer below (tool_registry's WebFetchTool,
+    // skill_assessor, code_builder). `boot::build_llm_client` returns
+    // an `Arc<GuardedLlm>` directly — the raw `LlmClient` never
+    // surfaces above the boot boundary, so a future side consumer
+    // can't accidentally pull a raw client and bypass the gate.
+    let llm_client = boot::build_llm_client(
+        config.as_ref(),
+        &provider_registry,
+        Some(stores.blob.clone()),
+        Some(Arc::clone(&secret_vault)),
+        cost_manager.as_guard(),
+    )
+    .await?;
+    let info = llm_client.model_info();
+    info!(
+        provider = %info.provider,
+        model = %info.id,
+        supports_vision = info.supports_vision,
+        "configured LLM client"
     );
+
+    let mut tool_registry =
+        ToolRegistry::with_defaults(stores.blob.clone(), Some(llm_client.clone()));
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
     let skill_assessor = Arc::new(SkillAssessor::with_background_worker(
-        Arc::clone(&llm_client),
+        llm_client.clone(),
         stores.risk.clone(),
         assessment_mode,
     ));
@@ -300,11 +336,6 @@ pub async fn build_managers(
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
     // CostTracker has been retired in favour of a process-wide
-    // `TraceEventStream` subscriber wired once in `wire_router`
-    // against the shared stream that every per-actor `SpanRecorder`
-    // publishes into.
-    let cost_store_for_subscriber = stores.cost.clone();
-
     // --- cron scheduler (built before ToolExecutor so its tools register
     // while `tool_registry` still has a single Arc owner)
     let (cron_trigger_tx, cron_trigger_rx) = mpsc::channel(64);
@@ -386,9 +417,8 @@ pub async fn build_managers(
     // registration if the sandbox is unavailable — CodeBuilder would
     // refuse every call without it.
     if let Some(runner) = sandbox_runner.as_ref() {
-        let llm: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&llm_client) as _;
         let (tool, manifest) = aura_code_builder::agent_tool(
-            llm,
+            llm_client.clone(),
             Arc::clone(runner),
             Arc::clone(&leak_detector),
             Arc::clone(&secret_vault),
@@ -483,9 +513,9 @@ pub async fn build_managers(
         tool_registry,
         tool_executor,
         llm_client,
+        cost_manager,
         workspace,
         channels_registry,
-        cost_store: cost_store_for_subscriber,
         secret_vault,
         stores,
         cron_trigger_rx: Some(cron_trigger_rx),
@@ -520,8 +550,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let session_log_dir = workspace_paths.sessions_log_dir();
     let session_logger = Arc::new(SessionLlmLogger::new(session_log_dir));
 
-    let tokenizer: Arc<dyn Tokenizer> =
-        Arc::new(TiktokenTokenizer::for_model(graph.llm_client.model_id()));
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(TiktokenTokenizer::for_model(
+        graph.llm_client.model_info().id.as_str(),
+    ));
+
+    let token_calibration = Arc::new(aura_context::TokenCalibration::new());
 
     let soul = Soul::from_workspace(&graph.workspace)
         .await
@@ -542,29 +575,14 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // — agent_loop calls it directly with the token counts it
     // already has.
     let trace_event_stream = TraceEventStream::new();
-    let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> = {
-        // Seed with every provider's `known_pricings()`, then layer the
-        // active model's pricing on top so a config-flip mid-flight
-        // doesn't drop spans of the previous model to $0.
-        //
-        // Per-model accuracy caveat: today's publishers report one
-        // flat rate per provider, so e.g. gpt-5-mini attributes at the
-        // same rate as gpt-5. Tracked as a follow-up in
-        // `docs/todo/trace-redesign.md`.
-        let registry = aura_llm::LlmProviderRegistry::with_default_providers();
-        let mut map = registry.all_known_pricings();
-        let info = graph.llm_client.model_info();
-        map.insert(info.id.clone(), info.pricing);
-        Arc::new(map)
-    };
 
-    let spending_limits = aura_agent::SpendingLimits {
-        daily_usd: graph.config.cost.spending_limits.daily_usd,
-        monthly_usd: graph.config.cost.spending_limits.monthly_usd,
-    };
-    let cost_manager =
-        aura_agent::CostManager::new(graph.cost_store.clone(), pricing, spending_limits);
-    cost_manager.hydrate().await;
+    // `cost_manager` and the guarded `llm_client` are both built in
+    // `build_managers` and live on `graph` — every consumer (main
+    // loop, side-LLM in tools, code_builder, skill_assessor) shares
+    // the same gate. Re-binding here just to keep the local name
+    // changes below minimal.
+    let cost_manager = Arc::clone(&graph.cost_manager);
+    let guarded_llm = graph.llm_client.clone();
 
     // Spawner-vs-runtime build cycle: closure captures the slot and is
     // built first, then `LocalSubagentRuntime` patches itself in.
@@ -574,7 +592,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // Single Arc-shared factory: router's `ActorSpawner` and
     // `LocalSubagentRuntime` both spawn the same fully-wired actor.
     let spawn_actor_for: aura_agent::subagent::SubagentActorSpawner = {
-        let llm_client: Arc<dyn aura_llm::LlmCompletion> = Arc::clone(&graph.llm_client) as _;
+        let llm_client = guarded_llm.clone();
         let tool_registry = Arc::clone(&graph.tool_registry);
         let skill_registry = Arc::clone(&graph.skill_registry);
         let tool_executor = Arc::clone(&graph.tool_executor);
@@ -591,21 +609,24 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let policy = policy.clone();
         let system_prompt = system_prompt.clone();
         let cost_manager = Arc::clone(&cost_manager);
+        let token_calibration = Arc::clone(&token_calibration);
 
         Arc::new(
             move |session: aura_model::Session,
                   response_tx: mpsc::Sender<AgentOutput>,
                   parent_token: &CancellationToken| {
                 let mut agent_loop = AgentLoop::new(
-                    Arc::clone(&llm_client),
+                    llm_client.clone(),
                     Arc::clone(&tool_registry),
                     Arc::clone(&skill_registry),
                     Arc::clone(&tool_executor),
                     ContextManager::new(
                         Arc::clone(&tokenizer),
-                        Box::new(Truncate::new(keep_recent)),
+                        Box::new(Summarize::new(keep_recent)),
                         token_budget.clone(),
-                    ),
+                    )
+                    .with_calibration(Arc::clone(&token_calibration))
+                    .with_skill_registry(Arc::clone(&skill_registry)),
                     Arc::clone(&memory_manager),
                     policy.clone(),
                     Soul::custom(system_prompt.clone()),

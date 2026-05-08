@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, IncomingMessage, OutgoingMessage};
+use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
 use aura_job::JobInput;
 use aura_model::{ContentBlock, Session, SystemReason};
 use serde_json::Value;
@@ -45,6 +45,20 @@ pub enum AgentMessage {
     },
     /// Gracefully shut down this actor.
     Shutdown,
+}
+
+/// Mirrors the gateway slash dispatcher's tolerance for casing and
+/// trailing arguments so a user typing `/Compact extra` from any
+/// channel hits the same control path.
+fn is_compact_command(content: &[ContentBlock]) -> bool {
+    let Some(ContentBlock::Text(text)) = content.first() else {
+        return false;
+    };
+    let Some(rest) = text.trim().strip_prefix('/') else {
+        return false;
+    };
+    let token = rest.split_whitespace().next().unwrap_or("");
+    token.eq_ignore_ascii_case(COMPACT_COMMAND.trim_start_matches('/'))
 }
 
 /// One actor per session. Receives messages sequentially through its mailbox.
@@ -220,6 +234,9 @@ impl AgentActor {
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
         let content = incoming.message.content;
+        if is_compact_command(&content) {
+            return self.handle_compact().await;
+        }
         // Pass a clone of the response channel so the loop can stream
         // text deltas as `AgentOutput::Delta` while the final assembled
         // message still flows through the normal path.
@@ -235,6 +252,33 @@ impl AgentActor {
             .await?;
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send response to channel");
+        }
+        Ok(())
+    }
+
+    /// `/compact` is a control command, not an assistant turn, so the
+    /// confirmation goes back as `Notice` (out-of-band, off-transcript)
+    /// rather than `Message`.
+    async fn handle_compact(&mut self) -> anyhow::Result<()> {
+        let text = self
+            .agent_loop
+            .compact_now(
+                &mut self.session,
+                &self.job_lifecycle,
+                &self.span_recorder,
+                None,
+                self.actor_token.child_token(),
+            )
+            .await?;
+        let notice = AgentOutput::Notice {
+            session_id: self.session.id.to_string(),
+            user_id: self.session.user.id.clone(),
+            channel: self.session.channel.clone(),
+            level: NoticeLevel::Info,
+            text,
+        };
+        if let Err(e) = self.response_tx.send(notice).await {
+            warn!(error = %e, "failed to send compact notice to channel");
         }
         Ok(())
     }
@@ -294,5 +338,39 @@ impl AgentActor {
             warn!(error = %e, "failed to send system-trigger response");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(s: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text(s.to_string())]
+    }
+
+    #[test]
+    fn matches_bare_command() {
+        assert!(is_compact_command(&text("/compact")));
+        assert!(is_compact_command(&text("  /compact  ")));
+    }
+
+    #[test]
+    fn is_case_insensitive_and_ignores_trailing_args() {
+        assert!(is_compact_command(&text("/CompAct")));
+        assert!(is_compact_command(&text("/compact whatever extra")));
+    }
+
+    #[test]
+    fn rejects_other_inputs() {
+        assert!(!is_compact_command(&text("compact")));
+        assert!(!is_compact_command(&text("/compaction")));
+        assert!(!is_compact_command(&text("see /compact below")));
+        assert!(!is_compact_command(&text("")));
+        assert!(!is_compact_command(&[]));
+        assert!(!is_compact_command(&[ContentBlock::ToolResult {
+            tool_use_id: "x".into(),
+            content: "/compact".into(),
+        }]));
     }
 }

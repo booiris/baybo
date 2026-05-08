@@ -3,7 +3,8 @@
 //! Push canned `LlmResponse` values and stream-event vectors before
 //! running the agent loop; each `chat()` / `chat_stream()` call pops the
 //! next item. Failing assertions ("queue empty") surface as
-//! `LlmError::Provider` so tests stay on the normal error path.
+//! `LlmError::Internal` so tests stay on the normal error path without
+//! masquerading as a transient/retriable failure.
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -128,16 +129,15 @@ impl LlmCompletion for StubLlm {
         self.chat_queue
             .lock()
             .pop_front()
-            .ok_or_else(|| LlmError::Provider("StubLlm: chat queue empty".into()))?
+            .ok_or_else(|| LlmError::Internal(anyhow::anyhow!("StubLlm: chat queue empty")))?
     }
 
     async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
         self.captured_requests.lock().push(request.clone());
-        let raw = self
-            .stream_queue
-            .lock()
-            .pop_front()
-            .ok_or_else(|| LlmError::Provider("StubLlm: stream queue empty".into()))?;
+        let raw =
+            self.stream_queue.lock().pop_front().ok_or_else(|| {
+                LlmError::Internal(anyhow::anyhow!("StubLlm: stream queue empty"))
+            })?;
         let chunk_size = *self.text_chunk_size.lock();
         let expanded: Vec<crate::Result<StreamEvent>> = match chunk_size {
             None => raw,
@@ -206,9 +206,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_queue_yields_provider_error() {
+    async fn empty_queue_yields_internal_error() {
         let stub = StubLlm::new();
         let err = stub.chat(&req()).await.unwrap_err();
-        assert!(matches!(err, LlmError::Provider(_)));
+        assert!(matches!(err, LlmError::Internal(_)));
     }
 }

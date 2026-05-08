@@ -195,23 +195,10 @@ async fn injection_marker_in_user_input_logs_warn() {
 
 #[tokio::test]
 async fn budget_gate_blocks_retry_after_partial_stream_billing() {
-    // Regression: the budget gate must live INSIDE
-    // `call_llm_with_retry`'s loop, not just at `run_iteration`'s top.
-    // Otherwise streaming-partial billing in attempt N can push past
-    // the cap, but attempt N+1 of the SAME iteration would re-call the
-    // LLM without re-checking — silently spiralling.
-    //
-    // The setup:
-    //  * cap = $0.003
-    //  * pricing for the stub model so a single 1k-input attempt
-    //    bills exactly $0.003 (boundary case, gate is `>=`)
-    //  * stream events `[Usage{input=1000}, Err("timeout: ...")]` —
-    //    chat_streaming captures the Usage, then errors. The Err
-    //    message contains "timeout" so ErrorHandler::should_retry
-    //    returns true and the loop reaches its second `cm.check()`.
-    //
-    // If the gate fires, only one `chat_stream` call lands. If not,
-    // the second push_stream_results below would be consumed too.
+    // Regression: the budget gate must fire on *every* `chat_stream`
+    // invocation, not just the first attempt — otherwise streaming-
+    // partial billing in attempt N can push past the cap and attempt
+    // N+1 silently spirals.
 
     let model = "stub-model";
     let mut pricing_map = HashMap::new();
@@ -243,13 +230,13 @@ async fn budget_gate_blocks_retry_after_partial_stream_billing() {
     // bills $0.003 — exactly the cap.
     harness.stub_llm.push_stream_results(vec![
         Ok(StreamEvent::Usage(usage)),
-        Err(LlmError::Provider("timeout: connection dropped".into())),
+        Err(LlmError::Transient("timeout: connection dropped".into())),
     ]);
     // Attempt 1 should NEVER consume this — it's queued only so we
     // can prove via captured_requests that the gate stopped it.
     harness.stub_llm.push_stream_results(vec![
         Ok(StreamEvent::Usage(usage)),
-        Err(LlmError::Provider("timeout: should not retry".into())),
+        Err(LlmError::Transient("timeout: should not retry".into())),
     ]);
 
     harness.send_text("trigger the LLM").await.unwrap();

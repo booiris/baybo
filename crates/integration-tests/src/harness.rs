@@ -19,9 +19,11 @@ use aura_agent::{
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
-use aura_context::{ContextManager, TiktokenTokenizer, Truncate, budget::TokenBudget};
-use aura_llm::ModelPricing;
+use aura_context::{
+    CompressionStrategy, ContextManager, TiktokenTokenizer, Truncate, budget::TokenBudget,
+};
 use aura_llm::test_support::StubLlm;
+use aura_llm::{LlmCompletion, ModelPricing};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
@@ -59,6 +61,7 @@ pub struct AgentTestHarness {
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
     pub cost_manager: Arc<CostManager>,
+    pub token_calibration: Arc<aura_context::TokenCalibration>,
     pub mailbox: mpsc::Sender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -155,6 +158,8 @@ pub struct AgentTestHarnessBuilder {
     tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
     spending_limits: SpendingLimits,
     pricing: Arc<HashMap<String, ModelPricing>>,
+    compression_strategy: Option<Box<dyn CompressionStrategy>>,
+    token_budget: Option<TokenBudget>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -167,6 +172,8 @@ impl Default for AgentTestHarnessBuilder {
             tools: Vec::new(),
             spending_limits: SpendingLimits::default(),
             pricing: Arc::new(HashMap::new()),
+            compression_strategy: None,
+            token_budget: None,
         }
     }
 }
@@ -212,6 +219,21 @@ impl AgentTestHarnessBuilder {
     /// state visible to budget gates.
     pub fn with_pricing(mut self, pricing: Arc<HashMap<String, ModelPricing>>) -> Self {
         self.pricing = pricing;
+        self
+    }
+
+    /// Override the context compression strategy (default: `Truncate(50)`).
+    /// Use to drive `Summarize`-path tests with a stub `SummarizeCallback`.
+    pub fn with_compression_strategy(mut self, strategy: Box<dyn CompressionStrategy>) -> Self {
+        self.compression_strategy = Some(strategy);
+        self
+    }
+
+    /// Override the token budget handed to `ContextManager` (default:
+    /// `100_000` tokens, threshold `0.95`). Use a tight budget to
+    /// force compression with small canned messages.
+    pub fn with_token_budget(mut self, budget: TokenBudget) -> Self {
+        self.token_budget = Some(budget);
         self
     }
 
@@ -287,20 +309,32 @@ impl AgentTestHarnessBuilder {
             None,
         ));
 
-        let tokenizer = Arc::new(TiktokenTokenizer::default());
-        let context_manager = ContextManager::new(
-            tokenizer,
-            Box::new(Truncate::new(50)),
-            TokenBudget::new(100_000, 0.95),
-        );
+        // Tokenizer model id must match the LLM client's so
+        // `TokenCalibration` keys observe and adjust identically.
+        let stub_model_id = stub_llm.model_info().id.clone();
+        let tokenizer = Arc::new(TiktokenTokenizer::for_model(&stub_model_id));
+        let strategy = self
+            .compression_strategy
+            .unwrap_or_else(|| Box::new(Truncate::new(50)));
+        let token_budget = self
+            .token_budget
+            .unwrap_or_else(|| TokenBudget::new(100_000, 0.95));
+        let token_calibration = Arc::new(aura_context::TokenCalibration::new());
+        let context_manager = ContextManager::new(tokenizer, strategy, token_budget)
+            .with_calibration(Arc::clone(&token_calibration));
 
         let soul_text = self
             .soul_prompt
             .unwrap_or_else(|| "You are Aura, a test assistant.".into());
         let soul = Soul::custom(soul_text);
 
-        let agent_loop = AgentLoop::new(
+        let guarded_llm = aura_llm::GuardedLlm::new(
             stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
+            cost_manager.as_guard(),
+        );
+
+        let agent_loop = AgentLoop::new(
+            guarded_llm,
             tool_registry.clone(),
             skill_registry.clone(),
             tool_executor.clone(),
@@ -338,6 +372,7 @@ impl AgentTestHarnessBuilder {
             tool_registry,
             skill_registry,
             cost_manager,
+            token_calibration,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),

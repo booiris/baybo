@@ -96,17 +96,19 @@ impl LlmProviderFactory for OpenAIProviderFactory {
             .bearer_auth(api_key)
             .send()
             .await
-            .map_err(|e| crate::LlmError::Provider(format!("openai GET /models: {e}")))?;
+            .map_err(|e| crate::reqwest_to_error(e, "openai GET /models"))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(crate::LlmError::Provider(format!(
-                "openai GET /models returned {status}: {body}"
-            )));
+            return Err(crate::status_to_error(
+                status.as_u16(),
+                format!("openai GET /models returned {status}: {body}"),
+            ));
         }
-        let payload: ModelListResponse = resp.json().await.map_err(|e| {
-            crate::LlmError::Provider(format!("openai /models: parse response: {e}"))
-        })?;
+        let payload: ModelListResponse = resp
+            .json()
+            .await
+            .map_err(|e| crate::LlmError::Decode(format!("openai /models: parse response: {e}")))?;
         let mut out: Vec<LiveModelInfo> = payload
             .data
             .into_iter()

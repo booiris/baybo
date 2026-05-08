@@ -24,12 +24,42 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-use crate::SkillDefinition;
+use crate::{SkillDefinition, SkillSummary};
 
 /// Case-insensitive matcher for `<skill` / `</skill` opening tags (with
 /// optional whitespace or null bytes between `<` and the word).
 static SKILL_TAG_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)</?[\s\x00]*skill").expect("hardcoded regex"));
+
+/// Render the per-turn `<system-reminder>` block that lists every
+/// available skill by name + description (+ argument hint when set).
+///
+/// Used both by the agent loop's per-turn reminder injection and by
+/// the context compression path to re-broadcast the authoritative skill
+/// set after a summary replaces the conversation history.
+pub fn render_skill_reminder(summaries: &[SkillSummary]) -> String {
+    if summaries.is_empty() {
+        return String::from(
+            "<system-reminder>\nNo skills are currently available.\n</system-reminder>",
+        );
+    }
+    let mut s = String::from(
+        "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n",
+    );
+    for sk in summaries {
+        s.push_str("- ");
+        s.push_str(&sk.name);
+        s.push_str(": ");
+        s.push_str(sk.description.trim());
+        if let Some(hint) = sk.argument_hint.as_deref() {
+            s.push(' ');
+            s.push_str(hint);
+        }
+        s.push('\n');
+    }
+    s.push_str("</system-reminder>");
+    s
+}
 
 /// Render a skill as `<skill name="…" version="…">body</skill>` with all
 /// untrusted fields escaped.

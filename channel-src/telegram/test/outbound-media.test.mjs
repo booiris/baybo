@@ -44,7 +44,21 @@ test("image kind → sendPhoto with caption + thread", async () => {
   assert.equal(calls[0].chatId, 100);
   assert.ok(calls[0].file instanceof InputFile);
   assert.equal(calls[0].opts.caption, "look at this");
+  assert.equal(calls[0].opts.parse_mode, "MarkdownV2");
   assert.equal(calls[0].opts.message_thread_id, 7);
+});
+
+test("markdown caption is converted to MarkdownV2", async () => {
+  const { bot, calls } = fakeBot();
+  await sendTelegramAttachment(
+    bot,
+    { chatId: 1 },
+    { kind: "image", blob_id: "b", mime_type: "image/jpeg", size: 1 },
+    bytes("..."),
+    "v**1.0.0** released",
+  );
+  assert.equal(calls[0].opts.caption, "v*1\\.0\\.0* released");
+  assert.equal(calls[0].opts.parse_mode, "MarkdownV2");
 });
 
 test("audio kind w/ audio/ogg → sendVoice (voice-note bubble)", async () => {
