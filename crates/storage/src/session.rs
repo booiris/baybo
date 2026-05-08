@@ -83,4 +83,24 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ChatMessage>>;
+
+    /// Highest `session_messages.ordinal` ever assigned for this
+    /// session — i.e. the last row inserted, regardless of whether
+    /// it has since been superseded. Used by `aura-trace` to anchor
+    /// `LlmCallInputs::Persisted` so a trace span can recover the
+    /// active set the LLM saw at call time without snapshotting the
+    /// messages inline. Returns `None` for a session with no rows
+    /// yet.
+    async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>>;
+
+    /// Load every message ever appended to the session in ordinal
+    /// order, paired with each row's `superseded_by` marker. Used by
+    /// the trace API to hydrate `LlmCallInputs::Persisted` into the
+    /// flat `Vec<ChatMessage>` shape clients still expect, applying
+    /// the standard "active as of `ordinal == X`" filter on the
+    /// caller's side.
+    async fn load_session_messages_with_supersede(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(i64, Option<i64>, ChatMessage)>>;
 }

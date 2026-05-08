@@ -957,6 +957,28 @@ impl AgentLoop {
             tools: tool_defs,
         };
 
+        // Reference the persisted transcript by its current high-water
+        // ordinal so the span doesn't snapshot a growing prefix every
+        // turn (the prior shape was O(N²) over session length). The
+        // gateway hydrates this back into a flat list when serving
+        // the trace API. Falls back to an inline embed when the store
+        // isn't available — tests, single-shot harnesses — so spans
+        // remain self-contained in those flows.
+        let input_messages = match self.session_store.as_ref() {
+            Some(store) => match store.latest_session_ordinal(&session.id).await {
+                Ok(Some(last_ordinal)) => aura_trace::LlmCallInputs::Persisted {
+                    last_ordinal,
+                    sent_count: transcript.len() as u32,
+                },
+                _ => aura_trace::LlmCallInputs::Inline {
+                    messages: transcript.to_vec(),
+                },
+            },
+            None => aura_trace::LlmCallInputs::Inline {
+                messages: transcript.to_vec(),
+            },
+        };
+
         crate::scope::with_llm_span(
             span_recorder.as_ref(),
             step,
@@ -965,7 +987,7 @@ impl AgentLoop {
                 model_id: model_info.id.clone(),
                 provider: model_info.provider.clone(),
                 provider_config_hash: String::new(),
-                input_messages: transcript.to_vec(),
+                input_messages,
                 temperature: None,
             },
             None,
@@ -1509,7 +1531,12 @@ impl AgentLoop {
                 model_id: model_info.id.clone(),
                 provider: model_info.provider.clone(),
                 provider_config_hash: String::new(),
-                input_messages: messages.clone(),
+                // Subagent briefing payload is built ad hoc from
+                // parent context — not part of the child's persisted
+                // transcript — so embed inline.
+                input_messages: aura_trace::LlmCallInputs::Inline {
+                    messages: messages.clone(),
+                },
                 temperature: None,
             },
             result: None,

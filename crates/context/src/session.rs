@@ -415,6 +415,39 @@ mod tests {
                 })
                 .unwrap_or_default())
         }
+
+        async fn latest_session_ordinal(&self, session_id: &SessionId) -> StoreResult<Option<i64>> {
+            Ok(self
+                .transcripts
+                .lock()
+                .get(session_id)
+                .and_then(|log| log.iter().map(|m| m.ordinal as i64).max()))
+        }
+
+        async fn load_session_messages_with_supersede(
+            &self,
+            session_id: &SessionId,
+        ) -> StoreResult<Vec<(i64, Option<i64>, ChatMessage)>> {
+            Ok(self
+                .transcripts
+                .lock()
+                .get(session_id)
+                .map(|log| {
+                    let mut rows: Vec<_> = log
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.ordinal as i64,
+                                m.superseded_by.map(|v| v as i64),
+                                m.message.clone(),
+                            )
+                        })
+                        .collect();
+                    rows.sort_by_key(|(o, _, _)| *o);
+                    rows
+                })
+                .unwrap_or_default())
+        }
     }
 
     fn test_user() -> User {

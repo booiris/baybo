@@ -103,9 +103,68 @@ pub struct LlmCallBegin {
     pub model_id: String,
     pub provider: String,
     pub provider_config_hash: String,
-    pub input_messages: Vec<ChatMessage>,
+    /// What the LLM saw on this call. The two variants split based on
+    /// whether the input is in the per-session append-only log:
+    ///
+    /// - Main agent calls reference `session_messages` by ordinal,
+    ///   keeping span storage constant per call instead of cloning a
+    ///   growing prefix every turn (the prior shape was O(N²) over
+    ///   session length).
+    /// - One-off calls whose input never lands in the session log
+    ///   (compression summarisations, subagent briefings) embed
+    ///   their messages inline because there's nothing to point to.
+    pub input_messages: LlmCallInputs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+}
+
+/// Source of the `input_messages` for an `LlmCall` span.
+///
+/// `Persisted` keeps the span small by referencing a snapshot of the
+/// session message log; the gateway rehydrates this back into a flat
+/// `Vec<ChatMessage>` for clients that want to inspect the exact slice
+/// the LLM saw.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LlmCallInputs {
+    /// Active set of `session_messages` as of `last_ordinal`. The
+    /// hydrated slice is recovered with the standard "active as of
+    /// ordinal X" filter:
+    /// `WHERE ordinal <= last_ordinal AND
+    ///        (superseded_by IS NULL OR superseded_by > last_ordinal)`.
+    /// The system message is not in the log; hydration prepends the
+    /// soul-derived system prompt at index 0.
+    Persisted {
+        /// Highest `session_messages.ordinal` that was active at call
+        /// time. The active set as of this ordinal is the slice the
+        /// LLM saw.
+        last_ordinal: i64,
+        /// Number of messages actually sent (after merging/dedup on
+        /// the wire). Stored explicitly so consumers can show the
+        /// count without paying for hydration.
+        sent_count: u32,
+    },
+    /// Messages embedded directly because they are not — and should
+    /// not be — part of the session message log: compression LLM
+    /// calls, subagent briefings, etc.
+    Inline { messages: Vec<ChatMessage> },
+}
+
+impl LlmCallInputs {
+    /// Construct an empty inline payload — used as a placeholder when
+    /// deserialising span rows whose body lacks an `input_messages`
+    /// field (e.g. crash-recovered placeholders).
+    pub fn empty() -> Self {
+        Self::Inline {
+            messages: Vec::new(),
+        }
+    }
+
+    /// True when this call's input is recoverable from
+    /// `session_messages` rather than embedded inline.
+    pub fn is_persisted(&self) -> bool {
+        matches!(self, Self::Persisted { .. })
+    }
 }
 
 /// End-time result for an `LlmCall` span — set when the response is
@@ -230,7 +289,7 @@ mod tests {
                 model_id: "claude-sonnet-4-6".into(),
                 provider: "anthropic".into(),
                 provider_config_hash: "cfg-hash".into(),
-                input_messages: vec![],
+                input_messages: LlmCallInputs::empty(),
                 temperature: Some(0.7),
             },
             result: None,

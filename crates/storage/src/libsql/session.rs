@@ -426,6 +426,75 @@ impl SessionStore for LibsqlSessionStore {
         }
         Ok(out)
     }
+
+    async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT MAX(ordinal) FROM session_messages WHERE session_id = ?1",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql max ordinal: {e}")))?;
+        match rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            Some(row) => row
+                .get::<Option<i64>>(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    async fn load_session_messages_with_supersede(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(i64, Option<i64>, ChatMessage)>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT ordinal, superseded_by, role, content FROM session_messages \
+                 WHERE session_id = ?1 ORDER BY ordinal",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query session_messages: {e}"))
+            })?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let ordinal: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
+            let superseded_by: Option<i64> = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get sup: {e}")))?;
+            let role: String = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
+            let content_json: String = row
+                .get(3)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
+            let content = serde_json::from_str(&content_json)
+                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
+            out.push((
+                ordinal,
+                superseded_by,
+                aura_model::ChatMessage {
+                    role: role_from_str(&role)?,
+                    content,
+                },
+            ));
+        }
+        Ok(out)
+    }
 }
 
 fn role_to_str(role: &aura_model::Role) -> &'static str {

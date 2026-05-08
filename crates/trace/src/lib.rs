@@ -18,8 +18,8 @@ pub use error::TraceError;
 pub use event::{SpanEvent, SpanEventKind};
 pub use outcome::{LifecycleOutcome, LifecycleState};
 pub use span::{
-    LlmCallBegin, LlmCallResult, LlmToolCallRecord, Span, SpanFinalize, SpanHandle, SpanKind,
-    ToolCallBegin, ToolCallOrigin, ToolCallResult,
+    LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolCallRecord, Span, SpanFinalize, SpanHandle,
+    SpanKind, ToolCallBegin, ToolCallOrigin, ToolCallResult,
 };
 pub use step::{Step, StepHandle, StepKind};
 

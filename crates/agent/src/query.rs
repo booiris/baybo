@@ -774,10 +774,73 @@ impl QueryApi {
             }
         }
 
+        // Hydrate any `LlmCallInputs::Persisted` spans into the flat
+        // `Inline` shape the trace API serializes. The session_messages
+        // log is read once per session and reused for every Persisted
+        // span — turn `O(N²)` storage into `O(N)` storage plus one
+        // join on read.
+        self.hydrate_persisted_inputs(session_id, &mut jobs).await?;
+
         Ok(ReplayedConversation {
             session_id: session_id.clone(),
             jobs,
         })
+    }
+
+    /// Walk every span in `jobs`, and for each `LlmCall` whose
+    /// `input_messages` is `Persisted { last_ordinal, .. }` replace
+    /// it with the corresponding `Inline` slice reconstructed from
+    /// `session_messages`. Skips the work entirely if no span needs
+    /// hydration; reads the session log once when at least one does.
+    async fn hydrate_persisted_inputs(
+        &self,
+        session_id: &SessionId,
+        jobs: &mut [ReplayJob],
+    ) -> Result<()> {
+        use aura_trace::{LlmCallInputs, SpanKind};
+
+        let any_persisted = jobs.iter().any(|j| {
+            j.steps.iter().any(|s| {
+                s.spans.iter().any(|sp| {
+                    matches!(
+                        &sp.kind,
+                        SpanKind::LlmCall {
+                            begin,
+                            ..
+                        } if begin.input_messages.is_persisted()
+                    )
+                })
+            })
+        });
+        if !any_persisted {
+            return Ok(());
+        }
+
+        let log: Vec<(i64, Option<i64>, aura_model::ChatMessage)> = self
+            .sessions
+            .load_session_messages_with_supersede(session_id)
+            .await?;
+
+        for job in jobs.iter_mut() {
+            for step in job.steps.iter_mut() {
+                for span in step.spans.iter_mut() {
+                    if let SpanKind::LlmCall { begin, .. } = &mut span.kind
+                        && let LlmCallInputs::Persisted { last_ordinal, .. } = &begin.input_messages
+                    {
+                        let last = *last_ordinal;
+                        let active: Vec<aura_model::ChatMessage> = log
+                            .iter()
+                            .filter(|(ord, sup, _): &&(i64, Option<i64>, _)| {
+                                *ord <= last && sup.map(|s| s > last).unwrap_or(true)
+                            })
+                            .map(|(_, _, m)| m.clone())
+                            .collect();
+                        begin.input_messages = LlmCallInputs::Inline { messages: active };
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -880,6 +943,19 @@ mod tests {
             &self,
             _id: &SessionId,
         ) -> std::result::Result<Vec<aura_model::ChatMessage>, StorageError> {
+            Ok(Vec::new())
+        }
+        async fn latest_session_ordinal(
+            &self,
+            _id: &SessionId,
+        ) -> std::result::Result<Option<i64>, StorageError> {
+            Ok(None)
+        }
+        async fn load_session_messages_with_supersede(
+            &self,
+            _id: &SessionId,
+        ) -> std::result::Result<Vec<(i64, Option<i64>, aura_model::ChatMessage)>, StorageError>
+        {
             Ok(Vec::new())
         }
     }
