@@ -97,7 +97,6 @@ impl SessionManager {
             id: id.clone(),
             user,
             channel,
-            messages: Vec::new(),
             created_at: now,
             last_active: now,
             state: aura_model::SessionState::default(),
@@ -130,7 +129,6 @@ impl SessionManager {
             id: id.clone(),
             user,
             channel,
-            messages: Vec::new(),
             created_at: now,
             last_active: now,
             state: SessionState::default(),
@@ -180,9 +178,14 @@ impl SessionManager {
 
     /// Return the transcript (`messages`) of the given session. Errors with
     /// `SessionError::NotFound` if the session does not exist.
+    ///
+    /// **Phase 1 stub**: the transcript now lives in
+    /// `aura-context::ContextManager`, not on `Session`. Until the
+    /// upcoming context-state store lands, callers see an empty
+    /// transcript even when the session itself exists.
     pub async fn history(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
         match self.store.get(session_id).await.map_err(wrap)? {
-            Some(session) => Ok(session.messages),
+            Some(_session) => Ok(Vec::new()),
             None => Err(SessionError::NotFound(format!("session {session_id}"))),
         }
     }
@@ -322,7 +325,6 @@ mod tests {
         assert!(!session.id.as_str().is_empty());
         assert_eq!(session.user.id, "user-1");
         assert_eq!(session.channel, ChannelType::tui());
-        assert!(session.messages.is_empty());
         assert_eq!(session.root_session_id, session.id);
         assert!(session.lineage.is_none());
     }
@@ -507,6 +509,5 @@ mod tests {
 
         assert_eq!(new_session.id, old_id);
         assert!(new_session.created_at > old_created);
-        assert!(new_session.messages.is_empty());
     }
 }

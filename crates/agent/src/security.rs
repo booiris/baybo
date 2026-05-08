@@ -835,7 +835,6 @@ mod tests {
                 channel: ChannelType::tui(),
             },
             channel: ChannelType::tui(),
-            messages: vec![],
             created_at: Utc::now(),
             last_active: Utc::now(),
             state: Default::default(),

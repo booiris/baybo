@@ -42,19 +42,16 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
                 "user": s.user.id,
                 "channel": s.channel.to_string(),
                 "last_active": s.last_active.to_rfc3339(),
-                "messages": s.messages.len(),
             })
         })
         .collect();
 
-    let mut human =
-        String::from("id                                    channel   messages  last_active\n");
+    let mut human = String::from("id                                    channel   last_active\n");
     for s in &sessions {
         human.push_str(&format!(
-            "{:<38}  {:<8}  {:<8}  {}\n",
+            "{:<38}  {:<8}  {}\n",
             s.id,
             s.channel.to_string(),
-            s.messages.len(),
             s.last_active.to_rfc3339(),
         ));
     }
@@ -83,7 +80,6 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "channel": session.channel.to_string(),
         "created_at": session.created_at.to_rfc3339(),
         "last_active": session.last_active.to_rfc3339(),
-        "messages": session.messages.len(),
         "active_skills": session.state.active_skills,
         "compression_count": session.state.compression_count,
     });
@@ -95,13 +91,12 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     };
 
     let human = format!(
-        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\nactive_skills:  {}\ncompressions:   {}",
+        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nactive_skills:  {}\ncompressions:   {}",
         session.id,
         session.user.id,
         session.channel,
         session.created_at.to_rfc3339(),
         session.last_active.to_rfc3339(),
-        session.messages.len(),
         active_skills_human,
         session.state.compression_count,
     );

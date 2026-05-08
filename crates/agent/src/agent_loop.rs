@@ -918,11 +918,12 @@ impl AgentLoop {
         // providers that require strict user/assistant alternation.
         //
         // The trace span (and therefore the web UI / session log) keeps the
-        // original unmerged `session.messages` so each logical entry —
-        // reminder, user prompt, assistant turn — stays separately
-        // inspectable. Merging is a transport concern, not a storage one.
+        // original unmerged transcript so each logical entry — reminder,
+        // user prompt, assistant turn — stays separately inspectable.
+        // Merging is a transport concern, not a storage one.
+        let transcript = self.context_manager.messages();
         let request = ChatRequest {
-            messages: merge_for_llm(&session.messages),
+            messages: merge_for_llm(transcript),
             temperature: None,
             tools: tool_defs,
         };
@@ -935,7 +936,7 @@ impl AgentLoop {
                 model_id: model_info.id.clone(),
                 provider: model_info.provider.clone(),
                 provider_config_hash: String::new(),
-                input_messages: session.messages.clone(),
+                input_messages: transcript.to_vec(),
                 temperature: None,
             },
             None,
@@ -1051,12 +1052,12 @@ impl AgentLoop {
                     );
                 }
 
-                // `record_call_actual` self-skips on zero. Pass
-                // `session.messages` because the assistant message is
-                // inserted later by `insert_session_message`, so the
-                // slice here matches what the provider billed.
+                // `record_call_actual` self-skips on zero. The
+                // assistant message is appended later by
+                // `append_context_message`, so the transcript at
+                // this point still matches what the provider billed.
                 self.context_manager
-                    .record_call_actual(&session.messages, finalize.input_tokens);
+                    .record_call_actual(finalize.input_tokens);
 
                 (finalize, value_result)
             },
@@ -1099,21 +1100,21 @@ impl AgentLoop {
 
     async fn append_context_message(
         &mut self,
-        session: &mut Session,
+        session: &Session,
         message: &ChatMessage,
     ) -> anyhow::Result<()> {
-        self.context_manager.append(session, message);
+        self.context_manager.append(message);
         self.write_session_message_log(session, message).await;
         Ok(())
     }
 
     async fn insert_session_message(
-        &self,
-        session: &mut Session,
+        &mut self,
+        session: &Session,
         index: usize,
         message: ChatMessage,
     ) {
-        session.messages.insert(index, message.clone());
+        self.context_manager.insert(index, message.clone());
         self.write_session_message_log(session, &message).await;
     }
 
@@ -1383,12 +1384,12 @@ impl AgentLoop {
     /// output — the subagent still launches.
     async fn summarize_for_subagent(
         &self,
-        session: &Session,
+        _session: &Session,
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
     ) -> anyhow::Result<Option<String>> {
-        let has_real_history = session
-            .messages
+        let transcript = self.context_manager.messages();
+        let has_real_history = transcript
             .iter()
             .any(|m| matches!(m.role, Role::Assistant | Role::Tool));
         if !has_real_history {
@@ -1406,8 +1407,7 @@ impl AgentLoop {
                     .to_string(),
             )],
         };
-        let mut messages: Vec<ChatMessage> = session
-            .messages
+        let mut messages: Vec<ChatMessage> = transcript
             .iter()
             .filter(|m| !matches!(m.role, Role::System))
             .cloned()
@@ -1489,7 +1489,7 @@ impl AgentLoop {
         let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
         let model_id = runner.model_info.id.clone();
         self.context_manager
-            .maybe_compress(session, &model_id, |req| runner.run(req))
+            .maybe_compress(&model_id, |req| runner.run(req))
             .await?;
         Ok(())
     }
@@ -1563,7 +1563,7 @@ impl AgentLoop {
                 let model_id = runner.model_info.id.clone();
                 let outcome = self
                     .context_manager
-                    .force_compress(session, &model_id, |req| runner.run(req))
+                    .force_compress(&model_id, |req| runner.run(req))
                     .await?;
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
@@ -1588,9 +1588,10 @@ impl AgentLoop {
         .await
     }
 
-    async fn ensure_system_prompt(&self, session: &mut Session) {
-        let has_system = session
-            .messages
+    async fn ensure_system_prompt(&mut self, session: &Session) {
+        let has_system = self
+            .context_manager
+            .messages()
             .first()
             .is_some_and(|m| m.role == Role::System);
         if !has_system {
