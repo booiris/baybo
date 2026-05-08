@@ -289,7 +289,7 @@ impl SessionStore for LibsqlSessionStore {
         message: &ChatMessage,
     ) -> Result<()> {
         let conn = self.pool.conn();
-        let role = role_to_str(&message.role);
+        let role = message.role.as_str();
         let content = serde_json::to_string(&message.content)
             .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
         let now_us = super::time::to_us(chrono::Utc::now());
@@ -360,24 +360,44 @@ impl SessionStore for LibsqlSessionStore {
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql supersede: {e}")))?;
 
         let now_us = super::time::to_us(chrono::Utc::now());
-        for (offset, msg) in new_active.iter().enumerate() {
-            let role = role_to_str(&msg.role);
-            let content = serde_json::to_string(&msg.content)
-                .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
-            tx.execute(
+        // Multi-row INSERT, batched under SQLite's 999-bind limit.
+        // 5 columns per row → 199 rows per batch leaves 5 spare;
+        // typical Summarize emits ≤4 rows so this is one batch in
+        // practice. Keeps the whole compaction inside one tx and
+        // round-trip count constant (1) instead of O(new_active).
+        const COLS_PER_ROW: usize = 5;
+        const ROWS_PER_BATCH: usize = 999 / COLS_PER_ROW;
+        let session_param = session_id.as_str().to_string();
+        for (chunk_idx, chunk) in new_active.chunks(ROWS_PER_BATCH).enumerate() {
+            let mut sql = String::from(
                 "INSERT INTO session_messages \
-                 (session_id, ordinal, role, content, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                libsql::params![
-                    session_id.as_str().to_string(),
-                    next_ordinal + offset as i64,
-                    role.to_string(),
-                    content,
-                    now_us,
-                ],
-            )
-            .await
-            .map_err(|e| {
+                 (session_id, ordinal, role, content, created_at) VALUES ",
+            );
+            let mut params: Vec<libsql::Value> = Vec::with_capacity(chunk.len() * COLS_PER_ROW);
+            for (i, msg) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                let p = i * COLS_PER_ROW;
+                sql.push_str(&format!(
+                    "(?{}, ?{}, ?{}, ?{}, ?{})",
+                    p + 1,
+                    p + 2,
+                    p + 3,
+                    p + 4,
+                    p + 5
+                ));
+                let ordinal = next_ordinal + (chunk_idx * ROWS_PER_BATCH) as i64 + i as i64;
+                let content = serde_json::to_string(&msg.content).map_err(|e| {
+                    StorageError::Storage(format!("serialize message content: {e}"))
+                })?;
+                params.push(libsql::Value::Text(session_param.clone()));
+                params.push(libsql::Value::Integer(ordinal));
+                params.push(libsql::Value::Text(msg.role.as_str().to_string()));
+                params.push(libsql::Value::Text(content));
+                params.push(libsql::Value::Integer(now_us));
+            }
+            tx.execute(&sql, params).await.map_err(|e| {
                 StorageError::Internal(anyhow::anyhow!("libsql compaction insert: {e}"))
             })?;
         }
@@ -420,7 +440,9 @@ impl SessionStore for LibsqlSessionStore {
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push(aura_model::ChatMessage {
-                role: role_from_str(&role)?,
+                role: role
+                    .parse::<aura_model::Role>()
+                    .map_err(StorageError::Storage)?,
                 content,
             });
         }
@@ -449,7 +471,8 @@ impl SessionStore for LibsqlSessionStore {
     }
 
     async fn put_system_prompt(&self, content: &str) -> Result<String> {
-        let hash = hash_system_prompt(content);
+        use sha2::{Digest, Sha256};
+        let hash = hex::encode(Sha256::digest(content.as_bytes()));
         let conn = self.pool.conn();
         conn.execute(
             "INSERT OR IGNORE INTO system_prompts (hash, content) VALUES (?1, ?2)",
@@ -505,7 +528,7 @@ impl SessionStore for LibsqlSessionStore {
     async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,
-    ) -> Result<Vec<(i64, Option<i64>, ChatMessage)>> {
+    ) -> Result<Vec<crate::session::StoredMessage>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
@@ -538,53 +561,18 @@ impl SessionStore for LibsqlSessionStore {
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push((
+            out.push(crate::session::StoredMessage {
                 ordinal,
                 superseded_by,
-                aura_model::ChatMessage {
-                    role: role_from_str(&role)?,
+                message: aura_model::ChatMessage {
+                    role: role
+                        .parse::<aura_model::Role>()
+                        .map_err(StorageError::Storage)?,
                     content,
                 },
-            ));
+            });
         }
         Ok(out)
-    }
-}
-
-/// SHA-256 of `content`, hex-encoded. Used as the primary key in
-/// `system_prompts` so identical prompts collapse to one row.
-fn hash_system_prompt(content: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(content.as_bytes());
-    hex_encode(&digest)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0xf) as usize] as char);
-    }
-    out
-}
-
-fn role_to_str(role: &aura_model::Role) -> &'static str {
-    match role {
-        aura_model::Role::System => "system",
-        aura_model::Role::User => "user",
-        aura_model::Role::Assistant => "assistant",
-        aura_model::Role::Tool => "tool",
-    }
-}
-
-fn role_from_str(s: &str) -> Result<aura_model::Role> {
-    match s {
-        "system" => Ok(aura_model::Role::System),
-        "user" => Ok(aura_model::Role::User),
-        "assistant" => Ok(aura_model::Role::Assistant),
-        "tool" => Ok(aura_model::Role::Tool),
-        other => Err(StorageError::Storage(format!("unknown role: {other}"))),
     }
 }
 

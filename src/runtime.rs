@@ -638,10 +638,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 .with_cost_manager(Arc::clone(&cost_manager))
                 .with_session_store(Arc::clone(&session_store));
 
-                // `AgentActor::run` calls `agent_loop.restore_transcript_from_store`
-                // before its mailbox loop — the spawner just builds
-                // the loop with the store wired in.
-
                 if let Some(rt) = subagent_runtime_slot.get() {
                     agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
                 }

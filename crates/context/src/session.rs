@@ -455,7 +455,7 @@ mod tests {
         async fn load_session_messages_with_supersede(
             &self,
             session_id: &SessionId,
-        ) -> StoreResult<Vec<(i64, Option<i64>, ChatMessage)>> {
+        ) -> StoreResult<Vec<aura_storage::StoredMessage>> {
             Ok(self
                 .transcripts
                 .lock()
@@ -463,15 +463,13 @@ mod tests {
                 .map(|log| {
                     let mut rows: Vec<_> = log
                         .iter()
-                        .map(|m| {
-                            (
-                                m.ordinal as i64,
-                                m.superseded_by.map(|v| v as i64),
-                                m.message.clone(),
-                            )
+                        .map(|m| aura_storage::StoredMessage {
+                            ordinal: m.ordinal as i64,
+                            superseded_by: m.superseded_by.map(|v| v as i64),
+                            message: m.message.clone(),
                         })
                         .collect();
-                    rows.sort_by_key(|(o, _, _)| *o);
+                    rows.sort_by_key(|m| m.ordinal);
                     rows
                 })
                 .unwrap_or_default())

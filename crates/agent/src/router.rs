@@ -245,9 +245,6 @@ impl Router {
         );
 
         let response_tx = self.supervisor.response_tx().clone();
-        // Cron sessions are minted fresh per fire — `AgentActor::run`
-        // does the load-from-store call uniformly anyway and just
-        // gets back an empty vector here.
         let sender = spawner(session, response_tx, &self.actor_parent_token);
 
         let trigger_msg = AgentMessage::CronTrigger {
@@ -346,9 +343,6 @@ impl Router {
             if let Some(ref spawner) = self.actor_spawner {
                 info!(session_id = %session_id, "creating new actor for session");
                 let response_tx = self.supervisor.response_tx().clone();
-                // Cold-start hydration of any persisted transcript
-                // happens inside `AgentActor::run`, so the router
-                // doesn't need to know about session_messages here.
                 let sender = spawner(session, response_tx, &self.actor_parent_token);
                 self.supervisor.register(session_id.clone(), sender);
 

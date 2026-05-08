@@ -826,11 +826,11 @@ impl QueryApi {
         sp_hashes.sort();
         sp_hashes.dedup();
 
-        let log: Vec<(i64, Option<i64>, aura_model::ChatMessage)> = self
-            .sessions
-            .load_session_messages_with_supersede(session_id)
-            .await?;
-        let system_prompts = self.sessions.load_system_prompts(&sp_hashes).await?;
+        let (log, system_prompts) = tokio::try_join!(
+            self.sessions
+                .load_session_messages_with_supersede(session_id),
+            self.sessions.load_system_prompts(&sp_hashes),
+        )?;
 
         for job in jobs.iter_mut() {
             for step in job.steps.iter_mut() {
@@ -855,10 +855,11 @@ impl QueryApi {
                         }
                         hydrated.extend(
                             log.iter()
-                                .filter(|(ord, sup, _): &&(i64, Option<i64>, _)| {
-                                    *ord <= last && sup.map(|s| s > last).unwrap_or(true)
+                                .filter(|m| {
+                                    m.ordinal <= last
+                                        && m.superseded_by.map(|s| s > last).unwrap_or(true)
                                 })
-                                .map(|(_, _, m)| m.clone()),
+                                .map(|m| m.message.clone()),
                         );
                         begin.input_messages = LlmCallInputs::Inline(hydrated);
                     }
@@ -979,8 +980,7 @@ mod tests {
         async fn load_session_messages_with_supersede(
             &self,
             _id: &SessionId,
-        ) -> std::result::Result<Vec<(i64, Option<i64>, aura_model::ChatMessage)>, StorageError>
-        {
+        ) -> std::result::Result<Vec<aura_storage::StoredMessage>, StorageError> {
             Ok(Vec::new())
         }
         async fn put_system_prompt(

@@ -262,10 +262,10 @@ impl SubagentRuntime for LocalSubagentRuntime {
         // `parent_token`; the child actor's `actor_token` is its
         // child, so cascading cancel reaches the child's tools,
         // LLM calls, and nested subagents.
-        // Subagent's fresh session has nothing in `session_messages`
-        // yet, so `AgentActor::run`'s cold-start load gets back
-        // empty; the parent's briefing is delivered as the first
-        // user message in the mailbox path below.
+        // Briefing is delivered as the first user message via the
+        // mailbox path below, so the child starts with whatever the
+        // store has for `child_session.id` — empty for a freshly
+        // minted child.
         let mailbox = (self.spawn_actor)(child_session.clone(), output_tx, &parent_token);
 
         // Subscribe to terminal events *before* dispatching the

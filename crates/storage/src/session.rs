@@ -4,6 +4,19 @@ use chrono::{DateTime, Utc};
 
 use crate::error::StorageError;
 
+/// One row of `session_messages`, paired with its supersede marker.
+/// Yielded by [`SessionStore::load_session_messages_with_supersede`]
+/// so the trace API can replay "active as of ordinal X" filters
+/// without leaking the column shape into call sites.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub ordinal: i64,
+    /// `Some(n)` when a later compaction at ordinal `n` replaced this
+    /// row in the active set; `None` while still active.
+    pub superseded_by: Option<i64>,
+    pub message: ChatMessage,
+}
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Persistence interface for sessions.
@@ -102,7 +115,7 @@ pub trait SessionStore: Send + Sync {
     async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,
-    ) -> Result<Vec<(i64, Option<i64>, ChatMessage)>>;
+    ) -> Result<Vec<StoredMessage>>;
 
     /// Idempotent put for the leading system prompt referenced by
     /// `LlmCallInputs::Persisted.system_prompt_hash`. Hashing

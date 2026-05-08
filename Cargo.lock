@@ -685,6 +685,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hex",
  "libc",
  "libsql",
  "parking_lot",

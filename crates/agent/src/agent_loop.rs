@@ -216,6 +216,13 @@ pub struct AgentLoop {
     /// doesn't drop the conversation. Unset → in-memory only
     /// (used by tests with no real store).
     session_store: Option<Arc<dyn aura_storage::SessionStore>>,
+    /// Memo of the most recently observed `(system_prompt_text →
+    /// hash)` pair. The soul-derived prompt is stable across an
+    /// actor's lifetime; remembering the last hash skips both the
+    /// SHA-256 and the `INSERT OR IGNORE` round-trip on every
+    /// subsequent main LLM call. Interior-mutable because the call
+    /// site sits behind `&self`.
+    cached_system_prompt: parking_lot::Mutex<Option<(String, String)>>,
 }
 
 impl AgentLoop {
@@ -247,6 +254,7 @@ impl AgentLoop {
             session_log: None,
             cost_manager: None,
             session_store: None,
+            cached_system_prompt: parking_lot::Mutex::new(None),
         }
     }
 
@@ -372,10 +380,6 @@ impl AgentLoop {
                         cancel_token,
                     )
                     .await?;
-                // No post-turn flush: every appended message reached
-                // the store individually via `append_context_message`,
-                // and any mid-turn compaction was persisted by
-                // `compress_if_needed`.
                 let output = JobOutput::Message {
                     content: outgoing.content.clone(),
                 };
@@ -986,54 +990,7 @@ impl AgentLoop {
             tools: tool_defs,
         };
 
-        // Reference the persisted transcript by its current high-water
-        // ordinal so the span doesn't snapshot a growing prefix every
-        // turn (the prior shape was O(N²) over session length). The
-        // gateway hydrates this back into a flat list when serving
-        // the trace API. Falls back to an inline embed when the store
-        // isn't available — tests, single-shot harnesses — so spans
-        // remain self-contained in those flows.
-        //
-        // System messages aren't in `session_messages` (regenerated
-        // from soul config on every restore). They live in the
-        // content-addressed `system_prompts` table — many spans share
-        // the same soul prompt across a session, so the span only
-        // carries the hash and hydration joins back.
-        let system_prompt_text = transcript
-            .first()
-            .filter(|m| matches!(m.role, Role::System))
-            .and_then(|m| {
-                m.content.iter().find_map(|c| match c {
-                    ContentBlock::Text(t) => Some(t.clone()),
-                    _ => None,
-                })
-            });
-        let input_messages = match self.session_store.as_ref() {
-            Some(store) => match store.latest_session_ordinal(&session.id).await {
-                Ok(Some(last_ordinal)) => {
-                    let system_prompt_hash = match system_prompt_text.as_deref() {
-                        Some(text) => match store.put_system_prompt(text).await {
-                            Ok(hash) => Some(hash),
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    "failed to dedupe system prompt; span will hydrate without it"
-                                );
-                                None
-                            }
-                        },
-                        None => None,
-                    };
-                    aura_trace::LlmCallInputs::Persisted {
-                        last_ordinal,
-                        sent_count: transcript.len() as u32,
-                        system_prompt_hash,
-                    }
-                }
-                _ => aura_trace::LlmCallInputs::Inline(transcript.to_vec()),
-            },
-            None => aura_trace::LlmCallInputs::Inline(transcript.to_vec()),
-        };
+        let input_messages = self.build_main_call_inputs(&session.id, transcript).await;
 
         crate::scope::with_llm_span(
             span_recorder.as_ref(),
@@ -1243,6 +1200,78 @@ impl AgentLoop {
     /// restore by `ensure_system_prompt`. Failures are logged at warn
     /// and swallowed; persistence must never block the user-visible
     /// turn.
+    /// Build the `LlmCallInputs` for a main LLM call's trace span.
+    ///
+    /// `Persisted` shape (one cheap pair of integers + a content
+    /// hash) wins over the legacy `Inline(transcript.to_vec())` snapshot
+    /// when there's a session store to anchor against — the trace
+    /// gateway hydrates the slice back from `session_messages`.
+    /// Falls back to `Inline` when no store is wired (tests, single
+    /// shot harnesses) or the store doesn't yet have rows for this
+    /// session.
+    async fn build_main_call_inputs(
+        &self,
+        session_id: &SessionId,
+        transcript: &[ChatMessage],
+    ) -> aura_trace::LlmCallInputs {
+        let inline = || aura_trace::LlmCallInputs::Inline(transcript.to_vec());
+        let Some(store) = self.session_store.as_ref() else {
+            return inline();
+        };
+        let last_ordinal = match store.latest_session_ordinal(session_id).await {
+            Ok(Some(o)) => o,
+            _ => return inline(),
+        };
+        let system_prompt_text = transcript
+            .first()
+            .filter(|m| matches!(m.role, Role::System))
+            .and_then(|m| {
+                m.content.iter().find_map(|c| match c {
+                    ContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+            });
+        let system_prompt_hash = match system_prompt_text {
+            Some(text) => self.dedupe_system_prompt(store.as_ref(), text).await,
+            None => None,
+        };
+        aura_trace::LlmCallInputs::Persisted {
+            last_ordinal,
+            sent_count: transcript.len() as u32,
+            system_prompt_hash,
+        }
+    }
+
+    /// Memoised wrapper over `SessionStore::put_system_prompt`. The
+    /// soul-derived prompt text is stable across an actor's lifetime,
+    /// so a hit on `cached_system_prompt` skips both the SHA-256 and
+    /// the `INSERT OR IGNORE` round-trip; only soul reloads (or the
+    /// rare per-call override) take the slow path.
+    async fn dedupe_system_prompt(
+        &self,
+        store: &dyn aura_storage::SessionStore,
+        text: &str,
+    ) -> Option<String> {
+        if let Some((cached_text, cached_hash)) = self.cached_system_prompt.lock().as_ref()
+            && cached_text == text
+        {
+            return Some(cached_hash.clone());
+        }
+        match store.put_system_prompt(text).await {
+            Ok(hash) => {
+                *self.cached_system_prompt.lock() = Some((text.to_string(), hash.clone()));
+                Some(hash)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "failed to dedupe system prompt; span will hydrate without it"
+                );
+                None
+            }
+        }
+    }
+
     async fn persist_appended_message(&self, session_id: &SessionId, message: &ChatMessage) {
         if matches!(message.role, Role::System) {
             return;
