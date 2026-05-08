@@ -80,8 +80,9 @@ pub trait SessionStore: Send + Sync {
     ///
     /// `new_active` is what `ContextManager::messages()` returns
     /// after the strategy applies — i.e. the post-compression active
-    /// transcript. System messages should be filtered out by the
-    /// caller because they are re-injected from config on restore.
+    /// transcript, system message included. The caller passes it
+    /// through unfiltered; rows are typed by `role` so the leading
+    /// system row resurfaces on the next `load_active_session_messages`.
     async fn apply_session_compaction(
         &self,
         session_id: &SessionId,

@@ -15,8 +15,7 @@ The conversation transcript itself is **not** carried on `Session`. It lives in 
 `SessionManager` wraps `Arc<dyn SessionStore>` and exposes:
 
 - Lifecycle: `create_session` / `create_session_with_trigger` / `create_spawned_session` / `get_or_create` / `get` / `list` / `delete` / `cleanup_expired` / `touch`.
-- Transcript brokerage (thin pass-throughs to `SessionStore`): `append_session_message`, `apply_session_compaction`, `load_active_session_messages`, `history`. The agent loop calls these every turn so the in-memory `ContextManager` stays in sync with `session_messages` rows.
-- System-prompt dedup: `put_system_prompt` / `load_system_prompts`. `LlmCall` trace spans reference a `system_prompt_hash` rather than embedding the soul prompt per call.
+- Transcript brokerage (thin pass-throughs to `SessionStore`): `append_session_message`, `apply_session_compaction`, `load_active_session_messages`, `latest_session_ordinal`, `load_session_messages_with_supersede`, `history`. The agent loop calls these every turn so the in-memory `ContextManager` stays in sync with `session_messages` rows. The leading system message rides the same log — no separate dedup table.
 
 ## Design Decisions
 

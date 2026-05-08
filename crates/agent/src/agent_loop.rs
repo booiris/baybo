@@ -347,7 +347,7 @@ impl AgentLoop {
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
-        self.ensure_system_prompt(session).await;
+        self.ensure_system_prompt(session).await?;
 
         // Bound to the *outer* delta_tx, not iter_delta_tx — notices
         // need to reach the channel on iter-2+ where streaming is
@@ -1593,27 +1593,24 @@ impl AgentLoop {
         .await
     }
 
-    async fn ensure_system_prompt(&mut self, session: &Session) {
+    async fn ensure_system_prompt(&mut self, session: &Session) -> anyhow::Result<()> {
         if self
             .context_manager
             .messages()
             .first()
             .is_some_and(|m| m.role == Role::System)
         {
-            return;
+            return Ok(());
         }
-        // The system prompt is the first thing every session sees, so
-        // appending into an empty transcript lands it at index 0
-        // (and ordinal 0 in `session_messages`). On cold-start
-        // restore the row is already there and the early-return above
-        // fires. Soul updates take effect for new sessions only —
-        // existing sessions keep the prompt they were pinned to.
+        // Soul updates take effect for new sessions only — existing
+        // sessions keep the prompt they were pinned to, because the
+        // restored transcript already carries a Role::System row at
+        // index 0 and the early-return above fires.
         let msg = ChatMessage {
             role: Role::System,
             content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
         };
-        self.context_manager.append(&msg).await;
-        self.write_session_message_log(session, &msg).await;
+        self.append_context_message(session, &msg).await
     }
 
     fn invocable_skills(&self) -> Vec<SkillSummary> {

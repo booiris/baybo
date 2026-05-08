@@ -199,8 +199,8 @@ impl ContextManager {
     ///
     /// Used by the actor on cold start to seed the manager from a
     /// persisted snapshot. Don't call this for in-flight mutation —
-    /// `append` / `insert` / `force_compress` already maintain the
-    /// invariants incrementally.
+    /// `append` / `force_compress` already maintain the invariants
+    /// incrementally.
     pub fn restore_messages(&mut self, messages: Vec<ChatMessage>) {
         self.per_message_tokens = messages
             .iter()
