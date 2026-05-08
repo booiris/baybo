@@ -970,13 +970,9 @@ impl AgentLoop {
                     last_ordinal,
                     sent_count: transcript.len() as u32,
                 },
-                _ => aura_trace::LlmCallInputs::Inline {
-                    messages: transcript.to_vec(),
-                },
+                _ => aura_trace::LlmCallInputs::Inline(transcript.to_vec()),
             },
-            None => aura_trace::LlmCallInputs::Inline {
-                messages: transcript.to_vec(),
-            },
+            None => aura_trace::LlmCallInputs::Inline(transcript.to_vec()),
         };
 
         crate::scope::with_llm_span(
@@ -1534,9 +1530,7 @@ impl AgentLoop {
                 // Subagent briefing payload is built ad hoc from
                 // parent context — not part of the child's persisted
                 // transcript — so embed inline.
-                input_messages: aura_trace::LlmCallInputs::Inline {
-                    messages: messages.clone(),
-                },
+                input_messages: aura_trace::LlmCallInputs::Inline(messages.clone()),
                 temperature: None,
             },
             result: None,

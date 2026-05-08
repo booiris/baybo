@@ -78,9 +78,7 @@ impl CompressionRunner {
             // built off the active transcript — it never lands in
             // `session_messages`, so embed inline rather than
             // referencing an ordinal that doesn't exist.
-            input_messages: aura_trace::LlmCallInputs::Inline {
-                messages: request.messages.clone(),
-            },
+            input_messages: aura_trace::LlmCallInputs::Inline(request.messages.clone()),
             temperature: request.temperature,
         };
 

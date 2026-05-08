@@ -165,7 +165,7 @@ async fn compression_call_records_cost_with_matching_span_id() {
     // `session_messages` log.
     if let SpanKind::LlmCall { begin, .. } = &compression_span.kind {
         match &begin.input_messages {
-            aura_trace::LlmCallInputs::Inline { messages } => {
+            aura_trace::LlmCallInputs::Inline(messages) => {
                 assert!(
                     !messages.is_empty(),
                     "compression LlmCall span must record real input messages"

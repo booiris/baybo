@@ -835,7 +835,7 @@ impl QueryApi {
                             })
                             .map(|(_, _, m)| m.clone())
                             .collect();
-                        begin.input_messages = LlmCallInputs::Inline { messages: active };
+                        begin.input_messages = LlmCallInputs::Inline(active);
                     }
                 }
             }

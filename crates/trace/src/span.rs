@@ -124,9 +124,20 @@ pub struct LlmCallBegin {
 /// session message log; the gateway rehydrates this back into a flat
 /// `Vec<ChatMessage>` for clients that want to inspect the exact slice
 /// the LLM saw.
+///
+/// **Wire shape**: `#[serde(untagged)]` so `Inline` rides as a bare
+/// array (matching the long-standing `input_messages: ChatMessage[]`
+/// on-the-wire shape consumed by the web UI) and `Persisted` rides as
+/// a struct. Variant order matters here — array-first means the
+/// deserialiser tries `Inline` before `Persisted`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum LlmCallInputs {
+    /// Messages embedded directly. Used when the input is not — and
+    /// should not be — part of the session message log: compression
+    /// LLM calls, subagent briefings, etc. Also the post-hydration
+    /// shape every consumer downstream of `QueryApi::replay` sees.
+    Inline(Vec<ChatMessage>),
     /// Active set of `session_messages` as of `last_ordinal`. The
     /// hydrated slice is recovered with the standard "active as of
     /// ordinal X" filter:
@@ -144,10 +155,6 @@ pub enum LlmCallInputs {
         /// count without paying for hydration.
         sent_count: u32,
     },
-    /// Messages embedded directly because they are not — and should
-    /// not be — part of the session message log: compression LLM
-    /// calls, subagent briefings, etc.
-    Inline { messages: Vec<ChatMessage> },
 }
 
 impl LlmCallInputs {
@@ -155,9 +162,7 @@ impl LlmCallInputs {
     /// deserialising span rows whose body lacks an `input_messages`
     /// field (e.g. crash-recovered placeholders).
     pub fn empty() -> Self {
-        Self::Inline {
-            messages: Vec::new(),
-        }
+        Self::Inline(Vec::new())
     }
 
     /// True when this call's input is recoverable from
@@ -393,5 +398,38 @@ mod tests {
     fn span_handle_is_constructible() {
         let h = SpanHandle::new(SpanId::new(), StepId::new(), dummy_llm(), Utc::now(), None);
         assert_eq!(h.span_id, h.clone().span_id);
+    }
+
+    /// Lock the on-the-wire JSON shape of `LlmCallInputs` so a future
+    /// refactor can't accidentally re-introduce the tagged-enum form
+    /// the web UI doesn't grok. `Inline` rides as a bare array (the
+    /// long-standing `input_messages: ChatMessage[]` shape); only
+    /// `Persisted` is an object.
+    #[test]
+    fn llm_call_inputs_serializes_inline_as_bare_array() {
+        let inline = LlmCallInputs::Inline(vec![aura_model::ChatMessage {
+            role: aura_model::Role::User,
+            content: vec![aura_model::ContentBlock::Text("hi".into())],
+        }]);
+        let json = serde_json::to_value(&inline).unwrap();
+        assert!(json.is_array(), "Inline must serialize as a bare array");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+
+        let persisted = LlmCallInputs::Persisted {
+            last_ordinal: 7,
+            sent_count: 3,
+        };
+        let json = serde_json::to_value(&persisted).unwrap();
+        assert!(json.is_object(), "Persisted must serialize as an object");
+        assert_eq!(json["last_ordinal"], 7);
+        assert_eq!(json["sent_count"], 3);
+
+        // Round-trip both shapes back through Deserialize.
+        let v1: LlmCallInputs = serde_json::from_value(serde_json::json!([])).unwrap();
+        assert!(matches!(v1, LlmCallInputs::Inline(_)));
+        let v2: LlmCallInputs =
+            serde_json::from_value(serde_json::json!({"last_ordinal": 1, "sent_count": 2}))
+                .unwrap();
+        assert!(matches!(v2, LlmCallInputs::Persisted { .. }));
     }
 }
