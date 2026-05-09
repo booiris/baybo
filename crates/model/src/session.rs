@@ -136,7 +136,7 @@ pub enum SystemReason {
     /// Side-channel post-completion pass that extracts memory entries
     /// and skill candidates from a finished complex user-chat job. See
     /// `docs/modules/self-improvement.md` for the full design.
-    #[serde(alias = "memory_consolidation", alias = "distillation")]
+    #[serde(alias = "memory_consolidation")]
     SelfImprovement,
 }
 

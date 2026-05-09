@@ -445,6 +445,10 @@ export interface components {
          * @description Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
          *     state machine (Q6) — `final_result` replaces `output`/`error`,
          *     `emitted_span_ids` replaces `trace_span_id`.
+         *
+         *     `system_reason` is populated when `kind == System`; it lets the
+         *     trace-page cross-link badge identify a self_improvement child of a
+         *     user-chat job without exposing the full `JobInput` over the wire.
          */
         Job: {
             /** Format: date-time */
@@ -461,6 +465,7 @@ export interface components {
             /** Format: date-time */
             started_at?: string | null;
             status: components["schemas"]["JobStatus"];
+            system_reason?: null | components["schemas"]["SystemReason"];
         };
         /**
          * @description Wire mirror of [`aura_job::JobKind`].
@@ -580,6 +585,13 @@ export interface components {
             importance?: number | null;
             user_id?: string | null;
         };
+        /**
+         * @description Wire mirror of [`aura_model::SystemReason`]. Surfaced on `Job` so
+         *     frontend can distinguish self_improvement system jobs from
+         *     history-review system jobs without parsing `JobInput.payload`.
+         * @enum {string}
+         */
+        SystemReason: "history_review" | "self_improvement";
         /**
          * @description One row of the trace browser list view. Mirrors
          *     [`aura_agent::SessionSummary`] for the wire.
@@ -1053,6 +1065,7 @@ export interface operations {
                             /** Format: date-time */
                             started_at?: string | null;
                             status: components["schemas"]["JobStatus"];
+                            system_reason?: null | components["schemas"]["SystemReason"];
                         }[];
                         next_cursor?: string | null;
                     };
@@ -1230,6 +1243,7 @@ export interface operations {
                             /** Format: date-time */
                             started_at?: string | null;
                             status: components["schemas"]["JobStatus"];
+                            system_reason?: null | components["schemas"]["SystemReason"];
                         }[];
                         next_cursor?: string | null;
                     };

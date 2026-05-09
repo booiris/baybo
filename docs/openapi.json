@@ -609,7 +609,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
+                        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.\n\n`system_reason` is populated when `kind == System`; it lets the\ntrace-page cross-link badge identify a self_improvement child of a\nuser-chat job without exposing the full `JobInput` over the wire.",
                         "required": [
                           "id",
                           "session_id",
@@ -670,6 +670,16 @@
                           },
                           "status": {
                             "$ref": "#/components/schemas/JobStatus"
+                          },
+                          "system_reason": {
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/components/schemas/SystemReason"
+                              }
+                            ]
                           }
                         }
                       }
@@ -883,7 +893,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
+                        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.\n\n`system_reason` is populated when `kind == System`; it lets the\ntrace-page cross-link badge identify a self_improvement child of a\nuser-chat job without exposing the full `JobInput` over the wire.",
                         "required": [
                           "id",
                           "session_id",
@@ -944,6 +954,16 @@
                           },
                           "status": {
                             "$ref": "#/components/schemas/JobStatus"
+                          },
+                          "system_reason": {
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/components/schemas/SystemReason"
+                              }
+                            ]
                           }
                         }
                       }
@@ -2043,7 +2063,7 @@
       },
       "Job": {
         "type": "object",
-        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
+        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.\n\n`system_reason` is populated when `kind == System`; it lets the\ntrace-page cross-link badge identify a self_improvement child of a\nuser-chat job without exposing the full `JobInput` over the wire.",
         "required": [
           "id",
           "session_id",
@@ -2104,6 +2124,16 @@
           },
           "status": {
             "$ref": "#/components/schemas/JobStatus"
+          },
+          "system_reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SystemReason"
+              }
+            ]
           }
         }
       },
@@ -2427,6 +2457,14 @@
             ]
           }
         }
+      },
+      "SystemReason": {
+        "type": "string",
+        "description": "Wire mirror of [`aura_model::SystemReason`]. Surfaced on `Job` so\nfrontend can distinguish self_improvement system jobs from\nhistory-review system jobs without parsing `JobInput.payload`.",
+        "enum": [
+          "history_review",
+          "self_improvement"
+        ]
       },
       "TraceSessionSummary": {
         "type": "object",

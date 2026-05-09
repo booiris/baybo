@@ -36,7 +36,7 @@ use aura_agent::{
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_context::{ContextManager, Summarize, TiktokenTokenizer, Tokenizer, Truncate};
+use aura_context::{ContextManager, Summarize, TiktokenTokenizer, Tokenizer};
 use aura_llm::GuardedLlm;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -770,7 +770,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         Arc::clone(&dist_executor),
                         ContextManager::new(
                             Arc::clone(&dist_tokenizer),
-                            Box::new(Truncate::new(keep_recent)),
+                            Box::new(Summarize::new(keep_recent)),
                             dist_token_budget.clone(),
                         )
                         .with_calibration(Arc::clone(&dist_token_calibration))
@@ -827,7 +827,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
             router
                 .with_self_improvement_spawner(self_improvement_spawner)
-                .with_job_lifecycle(Arc::clone(&graph.job_lifecycle))
                 .with_system_triggers(system_rx)
         }
     };

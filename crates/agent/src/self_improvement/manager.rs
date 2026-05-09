@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use aura_job::JobKind;
 use aura_model::{ChannelType, JobId, SessionId, SystemReason};
@@ -35,8 +34,15 @@ pub struct SelfImprovementConfig {
     /// Iteration threshold. A `Completed` `JobKind::UserChat` job whose
     /// `iterations > min_iterations` triggers self_improvement.
     pub min_iterations: u32,
-    /// Max successful self_improvements per UTC day, system-wide. Failures
-    /// don't count (Q11).
+    /// Max self_improvement attempts per UTC day, system-wide. Counted
+    /// at attempt time (cheaper than a post-success accounting hand-back);
+    /// `daily_cap` bounds wall-clock LLM API rate / CPU consumption from
+    /// this side-channel, *not* dollar spend (CostManager owns the
+    /// dollar gate independently).
+    ///
+    /// Folding: a single origin user-chat job consumes **one** cap slot
+    /// no matter how many retries fire for it within 24 h. See
+    /// [`SelfImprovementManager::charged_origins`] for the dedupe set.
     pub daily_cap: u32,
     /// Global concurrency cap across all self_improvements (Q9).
     pub max_concurrent: usize,
@@ -82,10 +88,10 @@ pub struct SystemTriggerEvent {
 /// caller-owned task).
 pub struct SelfImprovementManager {
     config: SelfImprovementConfig,
-    job_lifecycle: Arc<JobLifecycle>,
     session_store: Arc<dyn SessionStore>,
     workspace: WorkspacePaths,
     trigger_tx: mpsc::Sender<SystemTriggerEvent>,
+    job_lifecycle: Arc<JobLifecycle>,
 
     // Per-user mutex map — self_improvement acquires this before pushing
     // the trigger event so two self_improvements for the same user can
@@ -105,12 +111,15 @@ pub struct SelfImprovementManager {
     // is acceptable for a soft cap.
     daily_count: Mutex<DailyCap>,
 
-    // Counts only successes (Q11). The cap-check happens at decision
-    // time (before dispatch), but the increment also happens at
-    // decision time — failures are deducted from the count via
-    // `decrement_daily_on_failure` which Router doesn't currently
-    // call. For v1 we live with "counted at attempt time".
-    pending_attempts: AtomicU32,
+    // Set of origin user-chat job ids the cap has already been charged
+    // for, keyed to the time of charge. Same origin showing up again
+    // within 24 h (retry path; broadcast lag re-deliveries; same
+    // terminal event hitting two subscribers) is a cap-free pass-through
+    // — `try_charge_daily_cap` returns `true` without bumping the
+    // counter. Pruned lazily on every charge attempt; bounded by
+    // `daily_cap × 24 h / spawn-rate` so the worst case is ~
+    // `daily_cap` entries (default 100).
+    charged_origins: Mutex<HashMap<JobId, DateTime<Utc>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +155,7 @@ impl SelfImprovementManager {
             user_locks: Mutex::new(HashMap::new()),
             global_slots: Arc::new(Semaphore::new(max_concurrent)),
             daily_count: Mutex::new(DailyCap::new()),
-            pending_attempts: AtomicU32::new(0),
+            charged_origins: Mutex::new(HashMap::new()),
         }
     }
 
@@ -195,26 +204,14 @@ impl SelfImprovementManager {
         if !self.config.enabled {
             return;
         }
-        if !self.passes_predicate(&event) {
+        if !passes_predicate(&self.config, &event) {
             return;
         }
 
-        // Look the originating job up to recover trigger data not in
-        // the event (specifically, the user_id + channel and the
-        // retry_count from any prior attempts).
-        let job = match self.job_lifecycle.get(&event.job_id).await {
-            Ok(Some(j)) => j,
-            Ok(None) => {
-                warn!(job_id = %event.job_id, "self_improvement: originating job vanished before pickup");
-                return;
-            }
-            Err(e) => {
-                warn!(error = %e, "self_improvement: failed to load originating job");
-                return;
-            }
-        };
-
-        // Resolve session for user + channel context.
+        // Resolve session for user + channel context. Originating job
+        // metadata is not loaded — the trigger event already carries
+        // every field we need; `retry_count` is 0 for v1 (the manager
+        // has no retry path yet).
         let session = match self.session_store.get(&event.session_id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
@@ -227,9 +224,9 @@ impl SelfImprovementManager {
             }
         };
 
-        // Per-user serialization — acquire BEFORE the daily-cap check
-        // so two parallel decisions for the same user don't both see
-        // count<cap and both increment.
+        // Per-user serialization — held across the whole prep+dispatch
+        // window so two parallel triggers for the same user don't both
+        // bake the same transcript and race the global slot.
         let user_id = session.user.id.clone();
         let mutex = {
             let mut locks = self.user_locks.lock();
@@ -241,8 +238,14 @@ impl SelfImprovementManager {
         };
         let _user_guard = mutex.lock().await;
 
-        // Daily cap.
-        if !self.try_charge_daily_cap() {
+        // Daily cap (folded per origin job — see field doc).
+        if !try_charge_daily_cap(
+            &self.daily_count,
+            &self.charged_origins,
+            self.config.daily_cap,
+            event.job_id,
+            Utc::now(),
+        ) {
             debug!(
                 user_id = user_id,
                 "self_improvement: daily cap reached; dropping trigger"
@@ -279,7 +282,7 @@ impl SelfImprovementManager {
             .map(|sm| sm.message)
             .collect();
         let transcript_text = crate::self_improvement::prompt::render_transcript(&messages);
-        let identity_context = self.read_identity_context();
+        let identity_context = self.read_identity_context().await;
 
         let payload = json!({
             "trigger_job_id": event.job_id.to_string(),
@@ -290,8 +293,6 @@ impl SelfImprovementManager {
             "transcript_text": transcript_text,
             "identity_context": identity_context,
         });
-
-        let _ = job; // (kept for future expansion — drift checks etc.)
 
         let trig = SystemTriggerEvent {
             reason: SystemReason::SelfImprovement,
@@ -312,41 +313,10 @@ impl SelfImprovementManager {
                 iterations = event.iterations,
                 "self_improvement: dispatched trigger"
             );
-            self.pending_attempts.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn passes_predicate(&self, event: &JobTerminalEvent) -> bool {
-        use aura_job::JobStatusKind;
-        if event.status_kind != JobStatusKind::Completed {
-            return false;
-        }
-        if !matches!(event.job_kind, JobKind::UserChat) {
-            return false;
-        }
-        if event.iterations <= self.config.min_iterations {
-            return false;
-        }
-        true
-    }
-
-    /// Returns `true` if a slot was charged; `false` if the daily cap
-    /// is exhausted. Resets the counter when the UTC day rolls over.
-    fn try_charge_daily_cap(&self) -> bool {
-        let today = today_ordinal(Utc::now());
-        let mut cap = self.daily_count.lock();
-        if cap.day_ordinal != today {
-            cap.day_ordinal = today;
-            cap.count = 0;
-        }
-        if cap.count >= self.config.daily_cap {
-            return false;
-        }
-        cap.count += 1;
-        true
-    }
-
-    fn read_identity_context(&self) -> String {
+    async fn read_identity_context(&self) -> String {
         use aura_workspace::IdentityKind;
         let mut out = String::new();
         for kind in [
@@ -355,122 +325,85 @@ impl SelfImprovementManager {
             IdentityKind::Identity,
         ] {
             let path = self.workspace.identity_file(kind);
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    out.push_str(&format!("## {}\n", kind.file_name()));
-                    out.push_str(content.trim_end());
-                    out.push_str("\n\n");
-                }
-                Err(_) => {
-                    // File may not exist on first-run workspaces;
-                    // dedup-context is best-effort.
-                }
+            // Best-effort: file may not exist on first-run workspaces.
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                out.push_str(&format!("## {}\n", kind.file_name()));
+                out.push_str(content.trim_end());
+                out.push_str("\n\n");
             }
         }
         out
     }
+}
 
-    /// Test / inspection: snapshot of in-memory counter state.
-    #[doc(hidden)]
-    pub fn _test_state_snapshot(&self) -> (u32, u32) {
-        let cap = self.daily_count.lock();
-        (cap.count, self.pending_attempts.load(Ordering::Relaxed))
+/// Predicate the manager applies to every terminal event. Lifted to a
+/// free function so unit tests exercise the same code path as
+/// `process_event` instead of a parallel re-implementation.
+fn passes_predicate(cfg: &SelfImprovementConfig, event: &JobTerminalEvent) -> bool {
+    use aura_job::JobStatusKind;
+    event.status_kind == JobStatusKind::Completed
+        && matches!(event.job_kind, JobKind::UserChat)
+        && event.iterations > cfg.min_iterations
+}
+
+/// Atomically check + bump the daily-cap counter, folding repeated
+/// charges for the same origin user-chat job into a single cap slot
+/// over a 24 h window. Returns `true` if the call is allowed to
+/// proceed (charged, or already-charged within window); `false` if
+/// the cap is exhausted. Resets the daily counter when the UTC day
+/// rolls over.
+///
+/// Lifted to a free function so unit tests can drive it without
+/// standing up the full manager. `now` is injected so tests can
+/// fast-forward across day-rollover and 24 h-prune boundaries
+/// deterministically.
+fn try_charge_daily_cap(
+    daily_count: &Mutex<DailyCap>,
+    charged_origins: &Mutex<HashMap<JobId, DateTime<Utc>>>,
+    daily_cap: u32,
+    origin: JobId,
+    now: DateTime<Utc>,
+) -> bool {
+    {
+        let mut origins = charged_origins.lock();
+        prune_origins(&mut origins, now);
+        if origins.contains_key(&origin) {
+            return true;
+        }
     }
+
+    {
+        let today = today_ordinal(now);
+        let mut cap = daily_count.lock();
+        if cap.day_ordinal != today {
+            cap.day_ordinal = today;
+            cap.count = 0;
+        }
+        if cap.count >= daily_cap {
+            return false;
+        }
+        cap.count += 1;
+    }
+
+    charged_origins.lock().insert(origin, now);
+    true
+}
+
+/// Drop entries older than 24 h. Called from `try_charge_daily_cap`
+/// before every check so the set never grows beyond a day's worth of
+/// origins; no separate sweeper task needed.
+fn prune_origins(origins: &mut HashMap<JobId, DateTime<Utc>>, now: DateTime<Utc>) {
+    let cutoff = now - chrono::Duration::hours(24);
+    origins.retain(|_, t| *t >= cutoff);
 }
 
 fn today_ordinal(now: DateTime<Utc>) -> i32 {
     now.year() * 1000 + now.ordinal() as i32
 }
 
-// Workspace path helper exposed via the agent crate so the manager
-// doesn't have to hold a full `aura_workspace::Workspace` (which would
-// drag in initialization side-effects). Lives in a small sibling
-// module for clarity.
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn predicate_rejects_non_user_chat() {
-        let cfg = SelfImprovementConfig::default();
-        let mgr_state = mk_state(cfg);
-        let mut ev = mk_event();
-        ev.job_kind = JobKind::Cron;
-        assert!(!mgr_state.predicate_only(&ev));
-    }
-
-    #[test]
-    fn predicate_rejects_failed() {
-        let cfg = SelfImprovementConfig::default();
-        let mgr_state = mk_state(cfg);
-        let mut ev = mk_event();
-        ev.status_kind = aura_job::JobStatusKind::Failed;
-        assert!(!mgr_state.predicate_only(&ev));
-    }
-
-    #[test]
-    fn predicate_rejects_too_few_iterations() {
-        let cfg = SelfImprovementConfig::default();
-        let mgr_state = mk_state(cfg);
-        let mut ev = mk_event();
-        ev.iterations = 8; // == min, not >
-        assert!(!mgr_state.predicate_only(&ev));
-        ev.iterations = 9;
-        assert!(mgr_state.predicate_only(&ev));
-    }
-
-    #[test]
-    fn daily_cap_allows_up_to_limit_then_rejects() {
-        let cfg = SelfImprovementConfig {
-            daily_cap: 3,
-            ..Default::default()
-        };
-        let mgr_state = mk_state(cfg);
-        assert!(mgr_state.try_charge_daily_cap());
-        assert!(mgr_state.try_charge_daily_cap());
-        assert!(mgr_state.try_charge_daily_cap());
-        assert!(!mgr_state.try_charge_daily_cap());
-    }
-
-    /// Stripped-down state object for predicate / cap unit tests.
-    /// Building a real `SelfImprovementManager` requires Arc handles to
-    /// `JobLifecycle` + `SessionStore` + a workspace; the predicate
-    /// and daily-cap logic are pure and worth testing in isolation.
-    struct StateOnly {
-        config: SelfImprovementConfig,
-        daily_count: Mutex<DailyCap>,
-    }
-
-    impl StateOnly {
-        fn predicate_only(&self, event: &JobTerminalEvent) -> bool {
-            use aura_job::JobStatusKind;
-            event.status_kind == JobStatusKind::Completed
-                && matches!(event.job_kind, JobKind::UserChat)
-                && event.iterations > self.config.min_iterations
-        }
-
-        fn try_charge_daily_cap(&self) -> bool {
-            let today = today_ordinal(Utc::now());
-            let mut cap = self.daily_count.lock();
-            if cap.day_ordinal != today {
-                cap.day_ordinal = today;
-                cap.count = 0;
-            }
-            if cap.count >= self.config.daily_cap {
-                return false;
-            }
-            cap.count += 1;
-            true
-        }
-    }
-
-    fn mk_state(config: SelfImprovementConfig) -> StateOnly {
-        StateOnly {
-            config,
-            daily_count: Mutex::new(DailyCap::new()),
-        }
-    }
 
     fn mk_event() -> JobTerminalEvent {
         JobTerminalEvent {
@@ -481,5 +414,110 @@ mod tests {
             job_kind: JobKind::UserChat,
             iterations: 12,
         }
+    }
+
+    #[test]
+    fn predicate_rejects_non_user_chat() {
+        let cfg = SelfImprovementConfig::default();
+        let mut ev = mk_event();
+        ev.job_kind = JobKind::Cron;
+        assert!(!passes_predicate(&cfg, &ev));
+    }
+
+    #[test]
+    fn predicate_rejects_failed() {
+        let cfg = SelfImprovementConfig::default();
+        let mut ev = mk_event();
+        ev.status_kind = aura_job::JobStatusKind::Failed;
+        assert!(!passes_predicate(&cfg, &ev));
+    }
+
+    #[test]
+    fn predicate_rejects_too_few_iterations() {
+        let cfg = SelfImprovementConfig::default();
+        let mut ev = mk_event();
+        ev.iterations = 8; // == min, not >
+        assert!(!passes_predicate(&cfg, &ev));
+        ev.iterations = 9;
+        assert!(passes_predicate(&cfg, &ev));
+    }
+
+    #[test]
+    fn daily_cap_allows_up_to_limit_then_rejects() {
+        let daily_count = Mutex::new(DailyCap::new());
+        let origins = Mutex::new(HashMap::new());
+        let now = Utc::now();
+        // Each call is a distinct origin so each one charges a fresh slot.
+        assert!(try_charge_daily_cap(
+            &daily_count,
+            &origins,
+            3,
+            JobId::new(),
+            now,
+        ));
+        assert!(try_charge_daily_cap(
+            &daily_count,
+            &origins,
+            3,
+            JobId::new(),
+            now,
+        ));
+        assert!(try_charge_daily_cap(
+            &daily_count,
+            &origins,
+            3,
+            JobId::new(),
+            now,
+        ));
+        assert!(!try_charge_daily_cap(
+            &daily_count,
+            &origins,
+            3,
+            JobId::new(),
+            now,
+        ));
+    }
+
+    #[test]
+    fn cap_folds_repeated_charges_for_same_origin() {
+        let daily_count = Mutex::new(DailyCap::new());
+        let origins = Mutex::new(HashMap::new());
+        let now = Utc::now();
+        let origin = JobId::new();
+        // First charge consumes a slot.
+        assert!(try_charge_daily_cap(&daily_count, &origins, 1, origin, now));
+        assert_eq!(daily_count.lock().count, 1);
+        // Second charge for the same origin within 24h passes through
+        // without bumping the counter — simulating a retry path or a
+        // re-delivered terminal event.
+        assert!(try_charge_daily_cap(&daily_count, &origins, 1, origin, now));
+        assert_eq!(daily_count.lock().count, 1);
+        // A different origin still hits the cap because the slot is
+        // already consumed.
+        assert!(!try_charge_daily_cap(
+            &daily_count,
+            &origins,
+            1,
+            JobId::new(),
+            now,
+        ));
+    }
+
+    #[test]
+    fn origin_fold_expires_after_24h() {
+        let daily_count = Mutex::new(DailyCap::new());
+        let origins = Mutex::new(HashMap::new());
+        let t0 = Utc::now();
+        let origin = JobId::new();
+        // Charge at t0; counter hits the cap of 1.
+        assert!(try_charge_daily_cap(&daily_count, &origins, 1, origin, t0));
+        assert_eq!(origins.lock().len(), 1);
+        // 25 hours later the prune drops the origin from the dedupe
+        // set; the daily-cap counter has also rolled over to a new day,
+        // so the same origin can charge a fresh slot.
+        let t1 = t0 + chrono::Duration::hours(25);
+        assert!(try_charge_daily_cap(&daily_count, &origins, 1, origin, t1));
+        assert_eq!(daily_count.lock().count, 1);
+        assert_eq!(origins.lock().len(), 1);
     }
 }

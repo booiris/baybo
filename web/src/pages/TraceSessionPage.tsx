@@ -891,15 +891,17 @@ function JobSidebar({
 // displayed job either spawned a self_improvement child or *is* itself a
 // self_improvement system job. Implements the `↘ SelfImprovement` /
 // `↖ Triggered by user-chat job` cross-link from
-// `docs/modules/self-improvement.md` Q12. Lazy-fetches via the new
-// `/v1/jobs/{id}/children` and `/v1/jobs/{id}` admin endpoints.
+// `docs/modules/self-improvement.md` Q12. Lazy-fetches via the
+// `/v1/jobs/{id}/children` and `/v1/jobs/{id}` admin endpoints — the
+// `Job` DTO carries `kind` (`user_chat`/`cron`/`system`/`spawned`) and,
+// for system jobs, `system_reason`, so identifying a self_improvement
+// child is just `kind === 'system' && system_reason === 'self_improvement'`.
 
 interface SelfImprovementLinkInfo {
   /// SelfImprovement child of this user-chat job, if any.
   childSelfImprovementJobId?: string;
   /// Parent (originating) job, if this *is* a self_improvement job.
   parentJobIdIfSelfImprovement?: string;
-  parentSessionId?: string;
 }
 
 function SelfImprovementCrossLink({ jobId }: { jobId: string }) {
@@ -922,24 +924,20 @@ function SelfImprovementCrossLink({ jobId }: { jobId: string }) {
         ]);
         if (cancelled) return;
         const result: SelfImprovementLinkInfo = {};
-        // Find a self_improvement child: kind=system + JobInput.reason=self_improvement.
-        const items =
-          (childResp as { items?: Array<{ job_id?: string; kind?: string; input?: { kind?: string; reason?: string } }> })?.items ?? [];
+        const items = childResp?.items ?? [];
         const distChild = items.find(
-          (j) => j.kind === 'system' && j.input?.reason === 'self_improvement',
+          (j) => j.kind === 'system' && j.system_reason === 'self_improvement',
         );
-        if (distChild?.job_id) result.childSelfImprovementJobId = distChild.job_id;
-        // If the displayed job *is* itself a self_improvement job, link back.
-        const job = jobResp as
-          | { kind?: string; input?: { kind?: string; reason?: string }; parent_job_id?: string | null }
-          | undefined;
-        if (job?.kind === 'system' && job.input?.reason === 'self_improvement' && job.parent_job_id) {
-          result.parentJobIdIfSelfImprovement = job.parent_job_id;
-          // We don't have parent's session id; the trace endpoint is
-          // session-scoped, so the link below uses /traces/<session_id>?job=<jid>
-          // — but we'd need to fetch the parent job first to learn its
-          // session. Skip the parentSessionId lookup for v1; render a
-          // disabled-looking pill showing the parent job id only.
+        if (distChild) result.childSelfImprovementJobId = distChild.id;
+        if (
+          jobResp?.kind === 'system' &&
+          jobResp.system_reason === 'self_improvement' &&
+          jobResp.parent_job_id
+        ) {
+          // Parent's session id isn't on this DTO; rendering the badge
+          // as a non-clickable pill (the trace endpoint is session-
+          // scoped, so we'd need a follow-up fetch to make it linkable).
+          result.parentJobIdIfSelfImprovement = jobResp.parent_job_id;
         }
         setInfo(result);
       } catch {

@@ -8,7 +8,6 @@ use aura_model::{Session, SessionId, TriggerSource, User};
 use aura_cron::CronTriggerEvent;
 
 use crate::cost::CostManager;
-use crate::job::JobLifecycle;
 use crate::security::SecurityGateway;
 use crate::self_improvement::SystemTriggerEvent;
 use crate::session::SessionManager;
@@ -92,11 +91,6 @@ pub struct Router {
     /// `docs/modules/self-improvement.md` Q7 for why this is a separate
     /// constructor from `actor_spawner`.
     self_improvement_spawner: Option<ActorSpawner>,
-    /// Required when `system_trigger_rx` is wired in: used to mint the
-    /// `JobKind::System` Job for self_improvement runs *before* the actor
-    /// is dispatched. Without this, the self_improvement actor would have
-    /// no Job to run under (and `with_job` couldn't tag the trace).
-    job_lifecycle: Option<Arc<JobLifecycle>>,
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
     system_trigger_rx: Option<mpsc::Receiver<SystemTriggerEvent>>,
     /// Cancellation parent passed to every top-level actor the router
@@ -131,7 +125,6 @@ impl Router {
             ),
             actor_spawner: None,
             self_improvement_spawner: None,
-            job_lifecycle: None,
             cron_trigger_rx: None,
             system_trigger_rx: None,
             actor_parent_token: CancellationToken::new(),
@@ -179,13 +172,6 @@ impl Router {
     /// triggers are dropped silently with a warn log.
     pub fn with_self_improvement_spawner(mut self, spawner: ActorSpawner) -> Self {
         self.self_improvement_spawner = Some(spawner);
-        self
-    }
-
-    /// Wire the JobLifecycle so `handle_system_trigger` can mint a
-    /// fresh `JobKind::System` Job for each self_improvement run.
-    pub fn with_job_lifecycle(mut self, lifecycle: Arc<JobLifecycle>) -> Self {
-        self.job_lifecycle = Some(lifecycle);
         self
     }
 
