@@ -422,11 +422,13 @@ async fn run_llm_with_span(
                                     response.usage.cached_input_tokens,
                                     response.usage.cache_creation_input_tokens,
                                 );
-                                cost_micros = cm.cost_micros_for(
-                                    &model_info.id,
-                                    response.usage.input_tokens,
-                                    response.usage.output_tokens,
-                                );
+                                cost_micros = cm
+                                    .cost_usd_for(
+                                        &model_info.id,
+                                        response.usage.input_tokens,
+                                        response.usage.output_tokens,
+                                    )
+                                    .into_micros();
                             }
                             let call_result = LlmCallResult {
                                 output_content: response.content.clone(),

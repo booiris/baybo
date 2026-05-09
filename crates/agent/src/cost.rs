@@ -155,23 +155,6 @@ fn drift_ratio(a: aura_model::MicroUsd, b: aura_model::MicroUsd) -> f64 {
 }
 
 impl CostManager {
-    /// Compute the micro-USD cost the manager would charge for an
-    /// LLM call with the given model + token counts. Pure read of
-    /// the pricing table — does **not** mutate the ledger or
-    /// persist a row. Used by the summary-refresh path to populate
-    /// the `session_summaries.cost_micros` field with the same
-    /// number `record_call` would have charged.
-    pub fn cost_micros_for(
-        &self,
-        model_id: &str,
-        input_tokens: usize,
-        output_tokens: usize,
-    ) -> i64 {
-        compute_cost_usd(&self.pricing, model_id, input_tokens, output_tokens).into_micros()
-    }
-}
-
-impl CostManager {
     pub fn new(
         store: Arc<dyn CostStore>,
         pricing: HashMap<String, ModelPricing>,
