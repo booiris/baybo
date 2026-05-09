@@ -103,7 +103,6 @@ mod tests {
     use super::*;
     use crate::{ModelPricing, TokenUsage};
     use async_trait::async_trait;
-    use aura_model::MicroUsd;
     use parking_lot::Mutex;
 
     fn make_info() -> ModelInfo {
@@ -113,10 +112,7 @@ mod tests {
             context_window: 100_000,
             supports_tools: false,
             supports_vision: false,
-            pricing: ModelPricing {
-                input_per_1m_tokens: MicroUsd::ZERO,
-                output_per_1m_tokens: MicroUsd::ZERO,
-            },
+            pricing: ModelPricing::default(),
         }
     }
 

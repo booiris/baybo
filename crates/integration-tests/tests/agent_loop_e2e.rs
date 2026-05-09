@@ -207,6 +207,7 @@ async fn budget_gate_blocks_retry_after_partial_stream_billing() {
         ModelPricing {
             input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
             output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
+            ..Default::default()
         },
     );
     let pricing = pricing_map;

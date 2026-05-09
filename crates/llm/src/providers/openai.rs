@@ -34,6 +34,7 @@ impl LlmProviderFactory for OpenAIProviderFactory {
         ModelPricing {
             input_per_1m_tokens: MicroUsd::from_usd_decimal(2.50),
             output_per_1m_tokens: MicroUsd::from_usd_decimal(10.0),
+            ..Default::default()
         }
     }
 

@@ -42,6 +42,7 @@ async fn compression_call_records_cost_with_matching_span_id() {
         ModelPricing {
             input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
             output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
+            ..Default::default()
         },
     );
     let pricing = pricing_map;
