@@ -7,10 +7,8 @@ pub mod tokenizer;
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
 pub use error::ContextError;
-pub use strategy::summarize::{Summarize, parse_summary_response};
-pub use strategy::summary_aware::{
-    CONTEXT_SUMMARY_WRAPPER_PREAMBLE, FsSummaryLoader, SummaryAwareWrapper, SummaryLoader,
-};
+pub use strategy::summarize::{SUMMARIZE_INSTRUCTION, Summarize, parse_summary_response};
+pub use strategy::summary_aware::{FsSummaryLoader, SummaryAwareWrapper, SummaryLoader};
 pub use strategy::truncate::Truncate;
 pub use strategy::{CompressOutput, CompressionStrategy};
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
@@ -192,11 +190,9 @@ pub struct ContextManager {
     session_id: Option<SessionId>,
     sessions: Option<Arc<SessionManager>>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
-    /// after every compression apply (so the post-compression slice
-    /// counts as fully covered) and reconstructed from
-    /// `session_summaries.cursor` on cold start. `None` until either
-    /// fires.
-    last_summary_anchor: RwLock<Option<usize>>,
+    /// after every compression apply and reconstructed from
+    /// `session_summaries.cursor` on cold start.
+    last_summary_anchor: Option<usize>,
 }
 
 impl ContextManager {
@@ -218,7 +214,7 @@ impl ContextManager {
             current_model: RwLock::new(None),
             session_id: None,
             sessions: None,
-            last_summary_anchor: RwLock::new(None),
+            last_summary_anchor: None,
         }
     }
 
@@ -268,12 +264,11 @@ impl ContextManager {
         self.messages = messages;
         self.invalidate_baseline();
         self.budget.update(self.calibrate(self.raw_estimate()));
-        // Reset the anchor — the prior position referred to a slice
-        // that's been replaced wholesale. `restore_from_store` will
-        // reconstruct it from `session_summaries.cursor` if available;
-        // for direct callers, the anchor stays `None` until the next
-        // compression apply or explicit `set_summary_anchor`.
-        *self.last_summary_anchor.write() = None;
+        // The prior anchor referred to a slice that's been replaced
+        // wholesale. `restore_from_store` reconstructs it from
+        // `session_summaries.cursor` if available; for direct callers,
+        // it stays `None` until the next compression apply.
+        self.last_summary_anchor = None;
     }
 
     /// Attach a `TokenCalibration` so `count_tokens` scales raw BPE
@@ -508,11 +503,10 @@ impl ContextManager {
         // to whatever's still in the kept tail.
         self.called_skills = scan_skill_calls(&self.messages);
         self.budget.update(after_tokens);
-        // Conservative anchor: post-compression transcript counts as
-        // fully covered. Skipping a fine-grained "post-summary blob"
-        // index also avoids a degenerate retrigger when the skill
-        // trailer's tokens alone would exceed the diff threshold.
-        *self.last_summary_anchor.write() = Some(self.messages.len());
+        // Post-compression transcript counts as fully covered;
+        // anchoring at len() avoids a degenerate retrigger from the
+        // skill trailer alone exceeding the diff threshold.
+        self.last_summary_anchor = Some(self.messages.len());
 
         if after_tokens > self.budget.max_tokens() {
             warn!(
@@ -630,7 +624,7 @@ impl ContextManager {
                     }
                     active_idx += 1;
                 }
-                *self.last_summary_anchor.write() = anchor;
+                self.last_summary_anchor = anchor;
             }
             Err(e) => warn!(
                 session_id = %session_id,
@@ -645,16 +639,20 @@ impl ContextManager {
     /// transcript token count. Cheap — reuses the per-message cache
     /// the budget tracker maintains.
     pub fn tokens_since_anchor(&self) -> usize {
-        let anchor = self.last_summary_anchor.read().unwrap_or(0);
-        let anchor = anchor.min(self.per_message_tokens.len());
+        let anchor = self
+            .last_summary_anchor
+            .unwrap_or(0)
+            .min(self.per_message_tokens.len());
         self.per_message_tokens[anchor..].iter().sum()
     }
 
     /// Number of `ContentBlock::ToolUse` blocks past the anchor.
     /// Used by the trigger gate's disjunctive clause `tool_calls > 3`.
     pub fn tool_calls_since_anchor(&self) -> usize {
-        let anchor = self.last_summary_anchor.read().unwrap_or(0);
-        let anchor = anchor.min(self.messages.len());
+        let anchor = self
+            .last_summary_anchor
+            .unwrap_or(0)
+            .min(self.messages.len());
         self.messages[anchor..]
             .iter()
             .flat_map(|m| m.content.iter())
@@ -666,7 +664,7 @@ impl ContextManager {
     /// tokens / tool-calls through the dedicated accessors above.
     #[cfg(test)]
     pub(crate) fn last_summary_anchor(&self) -> Option<usize> {
-        *self.last_summary_anchor.read()
+        self.last_summary_anchor
     }
 
     /// Build the `LlmCallInputs` an `LlmCall` trace span should

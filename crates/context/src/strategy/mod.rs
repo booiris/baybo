@@ -26,6 +26,22 @@ pub type ChatFuture =
 /// the agent loop's runner moves its captures by value.
 pub type ChatCallback = Box<dyn FnOnce(ChatRequest) -> ChatFuture + Send>;
 
+/// Split `messages` into (system, non-system) cloned vectors. Used by
+/// every strategy that has to pin system messages on the front of the
+/// rebuilt slice while operating on the rest.
+pub(crate) fn partition_system(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
+    let mut system = Vec::new();
+    let mut rest = Vec::new();
+    for msg in messages {
+        if msg.role == aura_model::Role::System {
+            system.push(msg.clone());
+        } else {
+            rest.push(msg.clone());
+        }
+    }
+    (system, rest)
+}
+
 /// Walk backwards from `messages.len()` in atomic units, returning
 /// the cut index where the kept tail satisfies the `min_tokens` and
 /// `min_text_block_msgs` minima without exceeding `max_tokens`.

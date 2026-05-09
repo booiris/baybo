@@ -1,7 +1,11 @@
 use async_trait::async_trait;
-use aura_model::{ChatMessage, Role};
+use aura_model::ChatMessage;
+#[cfg(test)]
+use aura_model::Role;
 
-use super::{ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut};
+use super::{
+    ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut, partition_system,
+};
 
 /// Truncation compression: keeps system messages and the most recent
 /// `keep_recent` non-system messages, discarding everything in between.
@@ -13,19 +17,6 @@ impl Truncate {
     pub fn new(keep_recent: usize) -> Self {
         Self { keep_recent }
     }
-
-    fn partition_system(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
-        let mut system = Vec::new();
-        let mut rest = Vec::new();
-        for msg in messages {
-            if msg.role == Role::System {
-                system.push(msg.clone());
-            } else {
-                rest.push(msg.clone());
-            }
-        }
-        (system, rest)
-    }
 }
 
 #[async_trait]
@@ -35,7 +26,7 @@ impl CompressionStrategy for Truncate {
         messages: &[ChatMessage],
         _chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
-        let (system_msgs, non_system) = Self::partition_system(messages);
+        let (system_msgs, non_system) = partition_system(messages);
 
         if non_system.len() <= self.keep_recent {
             return Ok(CompressOutput::NoOp);

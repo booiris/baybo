@@ -175,7 +175,10 @@ fn digit_dash_to_dot(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
-        if b == b'-' && is_isolated_digit_at(bytes, i.wrapping_sub(1)) && is_isolated_digit_at(bytes, i + 1) {
+        if b == b'-'
+            && is_isolated_digit_at(bytes, i.wrapping_sub(1))
+            && is_isolated_digit_at(bytes, i + 1)
+        {
             out.push('.');
         } else {
             out.push(b as char);
@@ -188,7 +191,9 @@ fn digit_dash_to_dot(s: &str) -> String {
 /// digit on either side. Multi-digit runs (years like `2024`, build
 /// numbers like `1106`) are excluded so dated slugs stay intact.
 fn is_isolated_digit_at(bytes: &[u8], pos: usize) -> bool {
-    let Some(b) = bytes.get(pos) else { return false };
+    let Some(b) = bytes.get(pos) else {
+        return false;
+    };
     if !b.is_ascii_digit() {
         return false;
     }

@@ -14,18 +14,18 @@ use aura_session::SessionManager;
 use aura_skills::SkillRegistry;
 use tracing::{debug, warn};
 
-use super::{ChatCallback, CompressOutput, CompressionStrategy, walk_backward_atomic};
+use super::{
+    ChatCallback, CompressOutput, CompressionStrategy, partition_system, walk_backward_atomic,
+};
 use crate::{
     FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO, RECENT_SLICE_MAX_TOKENS,
     RECENT_SLICE_MIN_TEXT_BLOCK_MSGS, RECENT_SLICE_MIN_TOKENS, Tokenizer,
     estimate_skill_trailer_tokens, scan_skill_calls,
 };
 
-/// Wrapper text injected around the summary content when assembling
-/// the fast-path message list. `Role::User`. The tag does most of
-/// the work; the explicit preamble is there so the LLM weights the
-/// prior summary as established context rather than fresh input.
-pub const CONTEXT_SUMMARY_WRAPPER_PREAMBLE: &str = "The conversation prior to this point has been compressed for context-window \
+/// Preamble framing the summary as established context for the LLM
+/// rather than fresh input.
+const CONTEXT_SUMMARY_WRAPPER_PREAMBLE: &str = "The conversation prior to this point has been compressed for context-window \
 management. The summary below was produced from the full prior conversation and \
 represents its substantive content. Treat it as established context for the user's \
 current request; the recent messages that follow are the only unsummarized exchanges.";
@@ -44,21 +44,21 @@ pub trait SummaryLoader: Send + Sync {
     async fn load(&self, session_id: &SessionId) -> std::io::Result<Option<String>>;
 }
 
+/// Filename under each per-session state directory. Mirrors
+/// `aura_workspace::SUMMARY_FILE`; kept as a local const so this crate
+/// stays free of `aura-workspace`.
+const SUMMARY_FILE_NAME: &str = "summary.md";
+
 /// Filesystem-backed [`SummaryLoader`]. Reads
-/// `<base_dir>/<session_id>/<file_name>` via `tokio::fs`. Construct
-/// `base_dir` from `WorkspacePaths::state_sessions_dir()` and
-/// `file_name` from `aura_workspace::SUMMARY_FILE`.
+/// `<base_dir>/<session_id>/summary.md`. Construct `base_dir` from
+/// `WorkspacePaths::state_sessions_dir()`.
 pub struct FsSummaryLoader {
     base_dir: PathBuf,
-    file_name: String,
 }
 
 impl FsSummaryLoader {
-    pub fn new(base_dir: PathBuf, file_name: impl Into<String>) -> Self {
-        Self {
-            base_dir,
-            file_name: file_name.into(),
-        }
+    pub fn new(base_dir: PathBuf) -> Self {
+        Self { base_dir }
     }
 }
 
@@ -68,7 +68,7 @@ impl SummaryLoader for FsSummaryLoader {
         let path = self
             .base_dir
             .join(session_id.as_str())
-            .join(&self.file_name);
+            .join(SUMMARY_FILE_NAME);
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => Ok(Some(content)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -173,15 +173,7 @@ impl CompressionStrategy for SummaryAwareWrapper {
             }
         };
 
-        let mut system_msgs: Vec<ChatMessage> = Vec::new();
-        let mut non_system: Vec<ChatMessage> = Vec::new();
-        for msg in messages {
-            if msg.role == Role::System {
-                system_msgs.push(msg.clone());
-            } else {
-                non_system.push(msg.clone());
-            }
-        }
+        let (system_msgs, non_system) = partition_system(messages);
 
         let tokenize_msg = |m: &ChatMessage| self.tokenizer.count_message(m);
         let cut = walk_backward_atomic(
@@ -582,7 +574,7 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join("summary.md"), "hello world").unwrap();
 
-        let loader = FsSummaryLoader::new(dir.path().to_path_buf(), "summary.md");
+        let loader = FsSummaryLoader::new(dir.path().to_path_buf());
         assert_eq!(
             loader.load(&session_id).await.unwrap().as_deref(),
             Some("hello world")

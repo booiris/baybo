@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use aura_context::{ContextError, parse_summary_response};
+use aura_context::{ContextError, SUMMARIZE_INSTRUCTION, parse_summary_response};
 use aura_llm::{ChatRequest, GuardedLlm, LlmResponse, ModelInfo};
 use aura_model::{ChatMessage, ContentBlock, JobId, Role, SessionId};
 use aura_session::SessionManager;
@@ -22,6 +22,11 @@ use tracing::{debug, info, warn};
 use crate::cost::CostManager;
 use crate::security::SecurityGateway;
 use crate::trace::SpanRecorder;
+
+/// Synthetic `model_id` recorded against `session_summaries.error_count`
+/// when the orphan reaper bumps a parent's failure count for a
+/// crashed-mid-pass maintenance session.
+const ORPHAN_REAP_MODEL_TAG: &str = "orphan-reap";
 
 /// Payload carried by `JobInput::System { reason: SummaryRefresh, payload }`.
 /// The parent's agent loop builds this at trigger spawn time;
@@ -46,15 +51,15 @@ pub(crate) struct SummaryRefreshOutcome {
     pub cost_micros: i64,
 }
 
-/// The trailing instruction appended to the parent's transcript
-/// before the LLM call. Mirrors today's `SUMMARIZE_INSTRUCTION`
-/// shape (analysis + summary blocks for parsing) with an explicit
-/// preamble that establishes Pattern B's contract: conversation is
-/// authoritative, prior summary is scaffolding, size target ~8-12K.
+/// Trailing instruction appended to the parent's transcript before
+/// the LLM call. Wraps the shared `SUMMARIZE_INSTRUCTION` (so the
+/// analysis/summary contract stays in lockstep with `Summarize`'s
+/// inline path) with a prior-summary preamble for terminology
+/// continuity and a Pattern B size target.
 fn build_summary_prompt(prior_summary: Option<&str>) -> String {
     let prior = match prior_summary {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => "(none — this is the first pass)".to_string(),
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => "(none — this is the first pass)",
     };
 
     format!(
@@ -63,23 +68,7 @@ below for terminology and structural consistency. The conversation transcript ab
 the authoritative source — re-derive every fact from it. Only use the prior summary as \
 a scaffold to keep names, file paths, and concept labels stable across passes.\n\n\
 PRIOR SUMMARY:\n{prior}\n\n---\n\n\
-CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n\
-Your task is to create a detailed summary of the conversation so far, paying close \
-attention to the user's explicit requests and your previous actions. This summary \
-should be thorough in capturing technical details, code patterns, and architectural \
-decisions that would be essential for continuing development work without losing \
-context.\n\n\
-Before providing your final summary, wrap your analysis in <analysis> tags. Then \
-produce a single <summary>...</summary> block with these sections:\n\n\
-1. Primary Request and Intent\n\
-2. Key Technical Concepts\n\
-3. Files and Code Sections\n\
-4. Errors and fixes\n\
-5. Problem Solving\n\
-6. All user messages\n\
-7. Pending Tasks\n\
-8. Current Work\n\
-9. Optional Next Step\n\n\
+{SUMMARIZE_INSTRUCTION}\n\n\
 SIZE TARGET: aim for ~8-12K tokens. Grow when genuinely more substance has \
 accumulated; do not pad."
     )
@@ -259,7 +248,6 @@ impl SummaryRefresher {
             }
         };
 
-        // Step 5: parse, write to disk, update metadata.
         let summary_text = parse_summary_response(&response.content)
             .ok_or_else(|| anyhow::anyhow!("summary response empty after parsing"))?;
 
@@ -508,7 +496,7 @@ pub async fn reap_maintenance_orphans(
         if let Ok(Some(maint)) = sessions.get(id).await
             && let Some(parent_id) = maint.lineage.as_ref().map(|l| l.parent_session_id.clone())
             && let Err(e) = sessions
-                .record_summary_failure(&parent_id, "orphan-reap", "", chrono::Utc::now())
+                .record_summary_failure(&parent_id, ORPHAN_REAP_MODEL_TAG, "", chrono::Utc::now())
                 .await
         {
             warn!(
@@ -534,23 +522,14 @@ pub async fn reap_maintenance_orphans(
         );
     }
 
-    // ---- FS orphans ---------------------------------------------------
-    let known_ids = match sessions
-        .summary_store()
-        .map(|s| async move { s.list_session_ids().await })
+    let Some(summary_store) = sessions.summary_store() else {
+        return;
+    };
+    let known_ids: std::collections::HashSet<String> = match summary_store.list_session_ids().await
     {
-        Some(fut) => match fut.await {
-            Ok(ids) => ids
-                .into_iter()
-                .map(|i| i.as_str().to_string())
-                .collect::<std::collections::HashSet<_>>(),
-            Err(e) => {
-                warn!(error = %e, "orphan reap: list_session_ids failed; FS sweep skipped");
-                return;
-            }
-        },
-        None => {
-            // No summary store wired — nothing to reconcile against.
+        Ok(ids) => ids.into_iter().map(|i| i.as_str().to_string()).collect(),
+        Err(e) => {
+            warn!(error = %e, "orphan reap: list_session_ids failed; FS sweep skipped");
             return;
         }
     };

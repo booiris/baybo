@@ -3,14 +3,21 @@ use aura_llm::ChatRequest;
 use aura_model::{ChatMessage, ContentBlock, Role};
 use tracing::warn;
 
-use super::{ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut};
+use super::{
+    ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut, partition_system,
+};
 
 /// Trailing user prompt appended to the full conversation handed to
 /// the summarizer LLM. The instruction forces a tool-free response
 /// shaped as `<analysis>...</analysis><summary>...</summary>`; we
 /// keep the `<summary>` block verbatim (tags included) and discard
 /// the analysis.
-const SUMMARIZE_INSTRUCTION: &str = r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+///
+/// Shared with `aura_agent::summary_refresh::build_summary_prompt`,
+/// which prepends a prior-summary preamble and appends a SIZE TARGET
+/// footer. Editing the analysis/summary contract here must stay
+/// compatible with both call sites.
+pub const SUMMARIZE_INSTRUCTION: &str = r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
 - You already have all the context you need in the conversation above.
@@ -202,15 +209,7 @@ impl CompressionStrategy for Summarize {
         messages: &[ChatMessage],
         chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
-        let mut system_msgs = Vec::new();
-        let mut non_system = Vec::new();
-        for msg in messages {
-            if msg.role == Role::System {
-                system_msgs.push(msg.clone());
-            } else {
-                non_system.push(msg.clone());
-            }
-        }
+        let (system_msgs, non_system) = partition_system(messages);
 
         // Gating lives in `ContextManager`; we always run.
 
