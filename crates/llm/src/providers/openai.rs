@@ -28,22 +28,13 @@ impl LlmProviderFactory for OpenAIProviderFactory {
         ]
     }
 
-    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
-        // Mirrors `create()`'s flat-per-provider pricing. Per-model
-        // pricing differentiation is a follow-up; today every OpenAI
-        // model attributes spend at the same rate.
-        self.known_models()
-            .iter()
-            .map(|m| {
-                (
-                    (*m).to_string(),
-                    ModelPricing {
-                        input_per_1m_tokens: MicroUsd::from_usd_decimal(2.50),
-                        output_per_1m_tokens: MicroUsd::from_usd_decimal(10.0),
-                    },
-                )
-            })
-            .collect()
+    /// Flagship list price; under-attribution is worse than
+    /// over-attribution since the budget gate is the safety surface.
+    fn flat_default_pricing(&self) -> ModelPricing {
+        ModelPricing {
+            input_per_1m_tokens: MicroUsd::from_usd_decimal(2.50),
+            output_per_1m_tokens: MicroUsd::from_usd_decimal(10.0),
+        }
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
@@ -69,10 +60,7 @@ impl LlmProviderFactory for OpenAIProviderFactory {
             context_window: 128_000,
             supports_tools: true,
             supports_vision: true,
-            pricing: ModelPricing {
-                input_per_1m_tokens: MicroUsd::from_usd_decimal(2.50),
-                output_per_1m_tokens: MicroUsd::from_usd_decimal(10.0),
-            },
+            pricing: self.pricing_for_model(&config.model),
         };
 
         Ok(LlmClient::new(

@@ -44,7 +44,7 @@ async fn compression_call_records_cost_with_matching_span_id() {
             output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
         },
     );
-    let pricing = Arc::new(pricing_map);
+    let pricing = pricing_map;
 
     let strategy: Box<dyn CompressionStrategy> = Box::new(Summarize::new(1));
 

@@ -10,7 +10,6 @@
 //!     bounds.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aura_integration_tests::AgentTestHarness;
@@ -28,7 +27,7 @@ async fn main_call_feeds_sample_into_token_calibration() {
 
     // Pricing is irrelevant here — calibration runs regardless of
     // cost recording — but the harness needs *some* HashMap.
-    let pricing = Arc::new(HashMap::new() as HashMap<String, ModelPricing>);
+    let pricing: HashMap<String, ModelPricing> = HashMap::new();
     let mut harness = AgentTestHarness::builder().with_pricing(pricing).build();
 
     // Force `actual` well above `estimate` so the EMA ratio drifts
@@ -85,7 +84,7 @@ async fn main_call_feeds_sample_into_token_calibration() {
 /// provider's reported number.
 #[tokio::test]
 async fn budget_picks_up_provider_actual_after_first_main_call() {
-    let pricing = Arc::new(HashMap::new() as HashMap<String, ModelPricing>);
+    let pricing: HashMap<String, ModelPricing> = HashMap::new();
     let mut harness = AgentTestHarness::builder().with_pricing(pricing).build();
 
     let actual_input_tokens = 7_500usize;

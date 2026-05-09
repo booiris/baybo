@@ -50,7 +50,9 @@ pub struct SpendingLimits {
 /// [`Router`]: crate::router::Router
 pub struct CostManager {
     store: Arc<dyn CostStore>,
-    pricing: Arc<HashMap<String, ModelPricing>>,
+    /// `RwLock` so the boot-time refresh can overlay rates without
+    /// blocking the LLM-client wiring on the network fetch.
+    pricing: Arc<RwLock<HashMap<String, ModelPricing>>>,
     limits: SpendingLimits,
     state: Arc<RwLock<BudgetState>>,
     metrics: Arc<CostMetrics>,
@@ -136,6 +138,22 @@ fn compute_cost_usd(
         + MicroUsd::cost_for_tokens(p.output_per_1m_tokens, output_tokens as u64)
 }
 
+/// Live rate must drift by this fraction or more vs. the bundled
+/// snapshot before [`CostManager::merge_pricings`] surfaces a
+/// `warn!`. Above the rounding noise that's normal between scrapes
+/// (sub-percent on most prices) but below a tier rename or
+/// list-price cut.
+const PRICING_DRIFT_WARN: f64 = 0.25;
+
+fn drift_ratio(a: aura_model::MicroUsd, b: aura_model::MicroUsd) -> f64 {
+    let a = a.into_micros() as f64;
+    let b = b.into_micros() as f64;
+    if a <= 0.0 {
+        return 1.0;
+    }
+    (a - b).abs() / a
+}
+
 impl CostManager {
     /// Compute the micro-USD cost the manager would charge for an
     /// LLM call with the given model + token counts. Pure read of
@@ -156,7 +174,7 @@ impl CostManager {
 impl CostManager {
     pub fn new(
         store: Arc<dyn CostStore>,
-        pricing: Arc<HashMap<String, ModelPricing>>,
+        pricing: HashMap<String, ModelPricing>,
         limits: SpendingLimits,
     ) -> Arc<Self> {
         Self::with_metrics(store, pricing, limits, CostMetrics::new())
@@ -164,13 +182,13 @@ impl CostManager {
 
     pub fn with_metrics(
         store: Arc<dyn CostStore>,
-        pricing: Arc<HashMap<String, ModelPricing>>,
+        pricing: HashMap<String, ModelPricing>,
         limits: SpendingLimits,
         metrics: Arc<CostMetrics>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            pricing,
+            pricing: Arc::new(RwLock::new(pricing)),
             limits,
             state: Arc::new(RwLock::new(BudgetState::default())),
             metrics,
@@ -189,7 +207,32 @@ impl CostManager {
         input_tokens: usize,
         output_tokens: usize,
     ) -> MicroUsd {
-        compute_cost_usd(&self.pricing, model_id, input_tokens, output_tokens)
+        compute_cost_usd(&self.pricing.read(), model_id, input_tokens, output_tokens)
+    }
+
+    /// Overlay live rates onto the snapshot map; `warn!`s when drift
+    /// vs. the existing rate exceeds [`PRICING_DRIFT_WARN`] so a stale
+    /// bundle is visible without spamming on rounding noise.
+    pub fn merge_pricings(&self, overlay: HashMap<String, ModelPricing>) {
+        if overlay.is_empty() {
+            return;
+        }
+        let mut map = self.pricing.write();
+        for (model_id, live) in overlay {
+            if let Some(prev) = map.get(&model_id) {
+                let drift = drift_ratio(prev.input_per_1m_tokens, live.input_per_1m_tokens).max(
+                    drift_ratio(prev.output_per_1m_tokens, live.output_per_1m_tokens),
+                );
+                if drift >= PRICING_DRIFT_WARN {
+                    warn!(
+                        model = %model_id, drift_ratio = drift,
+                        "openrouter pricing drifted from bundled snapshot — \
+                         run scripts/regen-openrouter-pricings.sh and commit",
+                    );
+                }
+            }
+            map.insert(model_id, live);
+        }
     }
 
     /// Pre-fill in-memory accumulators from persisted `cost_records`
@@ -275,7 +318,7 @@ impl CostManager {
         cache_creation_input_tokens: usize,
     ) {
         let now = Utc::now();
-        let cost = compute_cost_usd(&self.pricing, model_id, input_tokens, output_tokens);
+        let cost = compute_cost_usd(&self.pricing.read(), model_id, input_tokens, output_tokens);
 
         if cost > MicroUsd::ZERO {
             let mut state = self.state.write();
@@ -378,7 +421,7 @@ mod tests {
     use super::*;
     use aura_storage::test_support::MemoryCostStore;
 
-    fn pricing(model: &str, input: f64, output: f64) -> Arc<HashMap<String, ModelPricing>> {
+    fn pricing(model: &str, input: f64, output: f64) -> HashMap<String, ModelPricing> {
         let mut h = HashMap::new();
         h.insert(
             model.to_string(),
@@ -387,7 +430,7 @@ mod tests {
                 output_per_1m_tokens: MicroUsd::from_usd_decimal(output),
             },
         );
-        Arc::new(h)
+        h
     }
 
     #[test]
@@ -407,6 +450,62 @@ mod tests {
             sub.cost_usd_for("unknown", 1_000_000, 1_000_000),
             MicroUsd::ZERO
         );
+    }
+
+    #[test]
+    fn merge_pricings_overlays_live_rate_visible_to_cost_usd_for() {
+        // The async-spawned boot refresh hands an overlay to
+        // `merge_pricings`; the next `cost_usd_for` call must see it.
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let cm = CostManager::new(store, pricing("m1", 3.0, 15.0), SpendingLimits::default());
+        // Before merge: original snapshot rate.
+        assert_eq!(
+            cm.cost_usd_for("m1", 1_000, 0),
+            MicroUsd::from_usd_decimal(0.003),
+        );
+        // Halve the rate live.
+        cm.merge_pricings(pricing("m1", 1.5, 7.5));
+        assert_eq!(
+            cm.cost_usd_for("m1", 1_000, 0),
+            MicroUsd::from_usd_decimal(0.0015),
+        );
+    }
+
+    #[test]
+    fn merge_pricings_inserts_new_models_without_clobbering_existing() {
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let cm = CostManager::new(store, pricing("m1", 3.0, 15.0), SpendingLimits::default());
+        cm.merge_pricings(pricing("m2", 0.5, 2.0));
+        // Original m1 still priced at the snapshot rate.
+        assert_eq!(
+            cm.cost_usd_for("m1", 1_000, 0),
+            MicroUsd::from_usd_decimal(0.003),
+        );
+        // New m2 attribution lands at the merged rate.
+        assert_eq!(
+            cm.cost_usd_for("m2", 1_000_000, 0),
+            MicroUsd::from_usd_decimal(0.5),
+        );
+    }
+
+    #[test]
+    fn drift_ratio_clamps_zero_baseline_and_handles_typical_deltas() {
+        // Identical → no drift.
+        let p = MicroUsd::from_micros(3_000_000);
+        assert_eq!(drift_ratio(p, p), 0.0);
+        // 25% delta → 0.25 ratio (the default warn threshold).
+        assert!(
+            (drift_ratio(
+                MicroUsd::from_micros(4_000_000),
+                MicroUsd::from_micros(3_000_000)
+            ) - 0.25)
+                .abs()
+                < 1e-9,
+        );
+        // Zero baseline doesn't divide-by-zero — returns 1.0 so the warn
+        // surface fires loudly on the first real rate after a misconfigured
+        // snapshot rather than silently treating it as no-drift.
+        assert_eq!(drift_ratio(MicroUsd::ZERO, MicroUsd::from_micros(1)), 1.0);
     }
 
     /// Push a synthetic spend row for `user_id` with `cost`. Timestamp

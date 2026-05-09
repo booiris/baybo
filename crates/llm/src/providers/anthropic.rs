@@ -28,19 +28,13 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         ]
     }
 
-    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
-        self.known_models()
-            .iter()
-            .map(|m| {
-                (
-                    (*m).to_string(),
-                    ModelPricing {
-                        input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
-                        output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
-                    },
-                )
-            })
-            .collect()
+    /// Sonnet flagship list price; over-attribution is the safe
+    /// direction since the budget gate is the safety surface.
+    fn flat_default_pricing(&self) -> ModelPricing {
+        ModelPricing {
+            input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
+            output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
+        }
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
@@ -72,10 +66,7 @@ impl LlmProviderFactory for AnthropicProviderFactory {
             context_window: 200_000,
             supports_tools: true,
             supports_vision: true,
-            pricing: ModelPricing {
-                input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
-                output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
-            },
+            pricing: self.pricing_for_model(&config.model),
         };
 
         Ok(LlmClient::new(

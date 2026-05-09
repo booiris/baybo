@@ -157,7 +157,7 @@ pub struct AgentTestHarnessBuilder {
     output_capacity: usize,
     tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
     spending_limits: SpendingLimits,
-    pricing: Arc<HashMap<String, ModelPricing>>,
+    pricing: HashMap<String, ModelPricing>,
     compression_strategy: Option<Box<dyn CompressionStrategy>>,
     token_budget: Option<TokenBudget>,
 }
@@ -171,7 +171,7 @@ impl Default for AgentTestHarnessBuilder {
             output_capacity: 64,
             tools: Vec::new(),
             spending_limits: SpendingLimits::default(),
-            pricing: Arc::new(HashMap::new()),
+            pricing: HashMap::new(),
             compression_strategy: None,
             token_budget: None,
         }
@@ -217,7 +217,7 @@ impl AgentTestHarnessBuilder {
     /// Override the pricing map handed to `CostManager` (default: empty).
     /// Pair with a `SpendingLimits` cap to make `record_call`-driven
     /// state visible to budget gates.
-    pub fn with_pricing(mut self, pricing: Arc<HashMap<String, ModelPricing>>) -> Self {
+    pub fn with_pricing(mut self, pricing: HashMap<String, ModelPricing>) -> Self {
         self.pricing = pricing;
         self
     }

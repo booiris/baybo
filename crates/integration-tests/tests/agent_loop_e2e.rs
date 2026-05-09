@@ -209,7 +209,7 @@ async fn budget_gate_blocks_retry_after_partial_stream_billing() {
             output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
         },
     );
-    let pricing = Arc::new(pricing_map);
+    let pricing = pricing_map;
     let limits = SpendingLimits {
         daily_usd: Some(MicroUsd::from_usd_decimal(0.003)),
         ..Default::default()
