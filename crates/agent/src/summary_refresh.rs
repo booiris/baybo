@@ -427,6 +427,8 @@ async fn run_llm_with_span(
                                         &model_info.id,
                                         response.usage.input_tokens,
                                         response.usage.output_tokens,
+                                        response.usage.cached_input_tokens,
+                                        response.usage.cache_creation_input_tokens,
                                     )
                                     .into_micros();
                             }
