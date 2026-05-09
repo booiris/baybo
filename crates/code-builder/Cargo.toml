@@ -3,6 +3,9 @@ name = "aura-code-builder"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 aura-model = { workspace = true }
 aura-tools = { workspace = true }

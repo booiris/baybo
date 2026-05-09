@@ -3,6 +3,9 @@ name = "aura-workspace"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 tokio = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }

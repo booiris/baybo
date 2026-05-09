@@ -3,6 +3,9 @@ name = "aura-cron"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [features]
 # Exposes test fixtures (e.g. `NeverShutdown`) to downstream crates' tests.
 # Enable via `aura-cron = { workspace = true, features = ["test-support"] }`

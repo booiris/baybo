@@ -6,6 +6,9 @@ edition.workspace = true
 # tests/*.rs into one binary saves the per-binary link of the CLI graph.
 autotests = false
 
+[lib]
+doctest = false
+
 [[test]]
 name = "all"
 path = "tests/all.rs"

@@ -3,6 +3,9 @@ name = "aura-storage"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [features]
 # Exposes in-memory `SecretStore` (and future `SessionStore`, etc.) fakes
 # to downstream crates' tests. Pull in via:

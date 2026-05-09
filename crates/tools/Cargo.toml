@@ -3,6 +3,9 @@ name = "aura-tools"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [features]
 # Exposes `EchoTool` and `RecordingTool` (test stubs) to downstream
 # crates' tests. Pull in via:

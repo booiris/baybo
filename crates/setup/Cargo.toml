@@ -3,6 +3,9 @@ name = "aura-setup"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 aura-channels = { workspace = true }
 aura-config = { workspace = true }

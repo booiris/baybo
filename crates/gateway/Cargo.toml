@@ -7,6 +7,9 @@ edition.workspace = true
 # graph (200s+ each on debug).
 autotests = false
 
+[lib]
+doctest = false
+
 [[test]]
 name = "all"
 path = "tests/all.rs"

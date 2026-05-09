@@ -3,6 +3,9 @@ name = "aura-skills-assessor"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 aura-skills = { workspace = true }
 aura-storage = { workspace = true }
