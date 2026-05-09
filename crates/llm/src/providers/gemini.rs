@@ -30,19 +30,13 @@ impl LlmProviderFactory for GeminiProviderFactory {
         ]
     }
 
-    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
-        self.known_models()
-            .iter()
-            .map(|m| {
-                (
-                    (*m).to_string(),
-                    ModelPricing {
-                        input_per_1m_tokens: MicroUsd::from_usd_decimal(0.075),
-                        output_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
-                    },
-                )
-            })
-            .collect()
+    /// Gemini 2.5 Flash list price; over-attribution is the safe
+    /// direction since the budget gate is the safety surface.
+    fn flat_default_pricing(&self) -> ModelPricing {
+        ModelPricing {
+            input_per_1m_tokens: MicroUsd::from_usd_decimal(0.075),
+            output_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
+        }
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
@@ -68,10 +62,7 @@ impl LlmProviderFactory for GeminiProviderFactory {
             context_window: 1_000_000,
             supports_tools: true,
             supports_vision: true,
-            pricing: ModelPricing {
-                input_per_1m_tokens: MicroUsd::from_usd_decimal(0.075),
-                output_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
-            },
+            pricing: self.pricing_for_model(&config.model),
         };
 
         Ok(LlmClient::new(

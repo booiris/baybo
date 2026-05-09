@@ -2,6 +2,7 @@ pub mod credentials;
 mod error;
 pub mod guard;
 pub mod multimodal;
+pub mod openrouter;
 pub mod providers;
 pub mod registry;
 mod tool_name;

@@ -72,21 +72,37 @@ pub trait LlmProviderFactory: Send + Sync {
     }
 
     /// Static pricing table for this provider's known models. Used by
-    /// the cost subscriber to attribute spend to non-active models
-    /// (e.g. a session that started under one model and got config-
-    /// flipped mid-flight). Default: empty map — providers that
-    /// haven't been ported to publish pricing fall back to the
-    /// active-model-only path. `(input_per_1m, output_per_1m)` USD.
-    ///
-    /// **Caveat (tracked in `docs/todo/trace-redesign.md`):** today's
-    /// publishing providers report a single flat rate for every
-    /// `known_models` entry — same shape as `create()` always did, just
-    /// mirrored into a map. So `gpt-5-mini` reports the same rate as
-    /// `gpt-5`, etc. Per-model accurate pricing is a follow-up; the
-    /// goal of `known_pricings` itself is "non-active models attribute
-    /// at *some* non-zero rate," not "exactly correct per-model rate."
+    /// `CostManager` to attribute spend to non-active models (e.g. a
+    /// session that started under one model and got config-flipped
+    /// mid-flight). Default impl pairs each `known_models()` entry
+    /// with [`Self::pricing_for_model`].
     fn known_pricings(&self) -> HashMap<String, crate::ModelPricing> {
-        HashMap::new()
+        self.known_models()
+            .iter()
+            .map(|m| ((*m).to_string(), self.pricing_for_model(m)))
+            .collect()
+    }
+
+    /// Per-model rate this factory advertises. Default impl resolves
+    /// against the bundled OpenRouter snapshot via [`Self::provider_name`]
+    /// + `crate::openrouter::pricing_for`, falling back to
+    /// [`Self::flat_default_pricing`] when the slug isn't in the snapshot
+    /// or the provider isn't OpenRouter-routable.
+    fn pricing_for_model(&self, model_id: &str) -> crate::ModelPricing {
+        crate::openrouter::pricing_for(self.provider_name(), model_id)
+            .unwrap_or_else(|| self.flat_default_pricing())
+    }
+
+    /// Per-provider rate kept as the unknown-id fallback in
+    /// [`Self::pricing_for_model`]. Default is zero — fine for
+    /// providers that bill against a flat subscription
+    /// (`openai-subscription`) and for any provider whose factory
+    /// doesn't (yet) ship per-token pricing.
+    fn flat_default_pricing(&self) -> crate::ModelPricing {
+        crate::ModelPricing {
+            input_per_1m_tokens: aura_model::MicroUsd::ZERO,
+            output_per_1m_tokens: aura_model::MicroUsd::ZERO,
+        }
     }
 
     /// Live discovery: ask the provider's catalog endpoint what models the
@@ -314,7 +330,7 @@ mod tests {
     fn all_known_pricings_aggregates_default_providers() {
         // Pin: every default provider that publishes known_pricings()
         // shows up in the aggregate. Used by `runtime::wire_router` to
-        // seed the cost subscriber so non-active models still attribute
+        // seed `CostManager` so non-active models still attribute
         // spend instead of falling to $0.
         let registry = LlmProviderRegistry::with_default_providers();
         let pricings = registry.all_known_pricings();
@@ -334,6 +350,37 @@ mod tests {
                 "model {id} has zero pricing in known_pricings",
             );
         }
+    }
+
+    #[test]
+    fn known_pricings_differentiates_within_provider() {
+        // Pin the snapshot wiring: a regression that puts every
+        // openai model back at the same flat rate would have
+        // `gpt-5-mini` and `gpt-5` matching, defeating the whole
+        // point of `LlmProviderFactory::openrouter_slug`.
+        let registry = LlmProviderRegistry::with_default_providers();
+        let pricings = registry.all_known_pricings();
+        let flagship = pricings.get("gpt-5").expect("gpt-5 published");
+        let mini = pricings.get("gpt-5-mini").expect("gpt-5-mini published");
+        assert!(
+            mini.input_per_1m_tokens < flagship.input_per_1m_tokens,
+            "gpt-5-mini input must be cheaper than gpt-5: mini={:?} flagship={:?}",
+            mini.input_per_1m_tokens,
+            flagship.input_per_1m_tokens,
+        );
+
+        let opus = pricings
+            .get("claude-opus-4-6")
+            .expect("claude-opus-4-6 published");
+        let haiku = pricings
+            .get("claude-haiku-4-5-20251001")
+            .expect("claude-haiku-4-5-20251001 published");
+        assert!(
+            haiku.input_per_1m_tokens < opus.input_per_1m_tokens,
+            "haiku must be cheaper than opus: haiku={:?} opus={:?}",
+            haiku.input_per_1m_tokens,
+            opus.input_per_1m_tokens,
+        );
     }
 
     #[tokio::test]

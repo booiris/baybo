@@ -12,37 +12,48 @@ These specs are authoritative; this file no longer carries the active design.
 
 Tracked here so they don't get lost. Each is a scoped extension, not a redesign.
 
-### TUI live trace stream
+### CostManager cache-tier pricing
 
-`TraceEventStream` flows in-process. Surfacing it across the gateway WS
-protocol to the TUI for live progress display requires a new frame
-variant (`Frame::TraceEvent` or similar) plus a TUI render layer. Scoped
-to whichever PR adds the live-progress view.
+Per-model input/output rates are now sourced from a bundled OpenRouter
+snapshot (`crates/llm/src/providers/openrouter_pricings.json`,
+refreshed via `scripts/regen-openrouter-pricings.sh`).
+`crate::openrouter::slug_for(provider, model_id)` algorithmically maps
+Aura model ids to OpenRouter slugs (no per-provider hand tables);
+`LlmProviderFactory::pricing_for_model` is the trait entry that
+combines the snapshot lookup with each factory's
+`flat_default_pricing()`. At boot, `runtime.rs` spawns a task that
+calls `aura_llm::openrouter::fetch_overlay_for(&entries)` for every
+configured entry then `CostManager::merge_pricings`, looping on
+`openrouter::REFRESH_INTERVAL` (24h) with a
+`tokio::select!` against the shared `ShutdownSignal`. Failures
+silently keep the snapshot value; drift ≥`PRICING_DRIFT_WARN` (25%)
+warns.
 
-### CostSubscriber per-model pricing accuracy
+Still open: the snapshot already carries
+`input_cache_read` / `input_cache_write` rates per model, but
+`ModelPricing` exposes only `input_per_1m_tokens` and
+`output_per_1m_tokens`. Anthropic-cache-heavy workflows therefore
+under-attribute on cache writes (1.25× input) and over-attribute on
+cache reads (~10× the real rate).
 
-`LlmProviderFactory::known_pricings()` (added so `CostSubscriber` can
-attribute spend to non-active models) currently reports one flat rate
-per provider — every model in `OpenAIProviderFactory::known_models()`
-returns `2.50 / 10.0`, every Anthropic model returns `3.0 / 15.0`,
-etc. This mirrors what `create()` always did; the goal of `known_pricings`
-itself was just "non-active models attribute at *some* non-zero rate"
-rather than "exactly correct per-model rate."
+To close this: widen `ModelPricing` with optional
+`cached_input_per_1m_tokens` / `cache_write_per_1m_tokens` fields,
+plumb `TokenUsage::cached_input_tokens` and
+`cache_creation_input_tokens` (already populated end-to-end) through
+`agent::cost::compute_cost_usd`, and surface non-zero values in
+`fetch_overlay_for`. The plumbing crosses `aura-llm` (data shape) →
+`aura-agent` (compute_cost_usd signature) → `cost_records` schema
+(new columns or a JSON bag), which is why it sits behind the
+input/output PR rather than landing with it.
 
-The next step is per-model accurate pricing — `gpt-5-mini` should
-not attribute at `gpt-5`'s rate. Two viable shapes:
-
-- A static `HashMap<&'static str, ModelPricing>` per provider, replacing
-  the flat `2.50 / 10.0` block in `create()` and the flat block in
-  `known_pricings()`. Cheap and self-documenting; the cost subscriber
-  benefits automatically.
-- Pull from a provider catalog endpoint at boot (extending
-  `LiveModelInfo` with a pricing field where the provider exposes
-  one). More accurate but credential- / network-bound.
-
-The `CostSubscriberMetrics.lagged_events` counter (also added in this
-PR) is the canary for "we're undercounting" — when per-model pricing
-lands, the same metric will track it.
+Codex adversarial-review (2026-05-09) flagged a related fail-open
+risk: `merge_pricings` can lower or zero out the bundled rate if
+OpenRouter ever returns 0 for a paid model (placeholder, transition,
+upstream bug). Today only `warn!` fires on drift; the merge proceeds
+unconditionally. Conservative fix: take `max(prev, live)` per field
+in the overlay so a live downward drift can never widen the budget,
+or reject `live <= 0` outright. Worth folding into the cache-tier
+widening PR since both touch `merge_pricings`.
 
 ### Rewrite `cli/tests/dispatch_smoke.rs`
 

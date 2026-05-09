@@ -258,35 +258,46 @@ pub async fn build_managers(
     let master_key = load_master_key(&config.security)?;
     let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
 
-    // Built before the tool registry so `default_tools` can wire the
-    // side-LLM into `WebFetch` for prompt-driven extraction. Also
-    // built after `stores` so `build_llm_client` can wire the blob
-    // store in as a `BlobFetcher` — without it, multimodal user
-    // content would degrade to a `[image: …]` text stub even on
-    // vision-capable models.
-    // Build `CostManager` *before* the LLM client so we have the gate
-    // closure ready when `boot::build_llm_client` constructs and
-    // wraps the raw client. Pricing comes from the registry's static
-    // `all_known_pricings()` only — we no longer overlay the active
-    // model's `info.pricing` (which would have required materialising
-    // the raw client first), accepting the documented caveat that
-    // operator-overridden custom-model pricing won't be reflected
-    // until the registry surfaces it. Mainstream models work as
-    // before since they're already in `all_known_pricings()`.
-    //
-    // Build the provider registry once and thread it into both the
-    // pricing harvest and `boot::build_llm_client` — same source of
-    // truth for both, instead of two independent factory-registration
-    // passes that would be load-bearing identical.
+    // CostManager built before the LLM client so its gate closure is
+    // ready for `boot::build_llm_client` to seal into `GuardedLlm`.
+    // The provider registry is shared between pricing harvest and
+    // `build_llm_client` — single source of truth for factories.
     let provider_registry = aura_llm::LlmProviderRegistry::with_default_providers();
-    let pricing: Arc<std::collections::HashMap<String, aura_llm::ModelPricing>> =
-        Arc::new(provider_registry.all_known_pricings());
+    let pricings = provider_registry.all_known_pricings();
     let spending_limits = SpendingLimits {
         daily_usd: config.cost.spending_limits.daily_usd,
         monthly_usd: config.cost.spending_limits.monthly_usd,
     };
-    let cost_manager = CostManager::new(stores.cost.clone(), pricing, spending_limits);
+    let cost_manager = CostManager::new(stores.cost.clone(), pricings, spending_limits);
     cost_manager.hydrate().await;
+
+    // Refresh pricing for every configured entry (not just default —
+    // subagents and side-LLM consumers pin specific names; missing
+    // one widens the global budget since `cost_records` is keyed by
+    // model id). Spawned so boot doesn't await the network.
+    let configured_for_refresh: Vec<(String, String)> = config
+        .llm
+        .iter()
+        .map(|e| (e.provider.clone(), e.model.clone()))
+        .collect();
+    if !configured_for_refresh.is_empty() {
+        let cm_for_refresh = Arc::clone(&cost_manager);
+        let refresh_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let entries: Vec<(&str, &str)> = configured_for_refresh
+                .iter()
+                .map(|(p, m)| (p.as_str(), m.as_str()))
+                .collect();
+            loop {
+                let overlay = aura_llm::openrouter::fetch_overlay_for(&entries).await;
+                cm_for_refresh.merge_pricings(overlay);
+                tokio::select! {
+                    _ = tokio::time::sleep(aura_llm::openrouter::REFRESH_INTERVAL) => {}
+                    _ = refresh_shutdown.wait() => break,
+                }
+            }
+        });
+    }
 
     // One gate covers the main loop, the in-process summarizer, and
     // every side-LLM consumer below (tool_registry's WebFetchTool,

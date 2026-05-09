@@ -36,19 +36,14 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         ]
     }
 
-    fn known_pricings(&self) -> std::collections::HashMap<String, ModelPricing> {
-        self.known_models()
-            .iter()
-            .map(|m| {
-                (
-                    (*m).to_string(),
-                    ModelPricing {
-                        input_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
-                        output_per_1m_tokens: MicroUsd::from_usd_decimal(1.20),
-                    },
-                )
-            })
-            .collect()
+    /// Roughly M1's list price for unmapped ids (`abab*-chat`,
+    /// custom checkpoints): M2 is cheaper, abab is unpriced on
+    /// OpenRouter — M1's rate is the conservative midline.
+    fn flat_default_pricing(&self) -> ModelPricing {
+        ModelPricing {
+            input_per_1m_tokens: MicroUsd::from_usd_decimal(0.40),
+            output_per_1m_tokens: MicroUsd::from_usd_decimal(2.20),
+        }
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
@@ -78,10 +73,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
             context_window: 200_000,
             supports_tools: true,
             supports_vision: false,
-            pricing: ModelPricing {
-                input_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
-                output_per_1m_tokens: MicroUsd::from_usd_decimal(1.20),
-            },
+            pricing: self.pricing_for_model(&config.model),
         };
 
         Ok(LlmClient::new(
