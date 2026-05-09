@@ -11,6 +11,7 @@ pub mod memory;
 pub mod retry;
 pub mod secret;
 pub mod session;
+pub mod session_summary;
 pub mod skill_risk;
 pub mod trace;
 
@@ -29,6 +30,7 @@ pub use memory::MemoryStore;
 pub use retry::retry_on_busy;
 pub use secret::SecretStore;
 pub use session::{SessionStore, StoredMessage};
+pub use session_summary::{SessionSummaryRow, SessionSummaryStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use trace::TraceStore;
 
@@ -42,6 +44,7 @@ pub use trace::TraceStore;
 #[derive(Clone)]
 pub struct Store {
     pub session: std::sync::Arc<dyn SessionStore>,
+    pub session_summary: std::sync::Arc<dyn SessionSummaryStore>,
     pub memory: std::sync::Arc<dyn MemoryStore>,
     pub trace: std::sync::Arc<dyn TraceStore>,
     pub secret: std::sync::Arc<dyn SecretStore>,
@@ -81,6 +84,9 @@ impl Store {
         let blob = libsql::LibsqlBlobStore::open(pool.clone(), &blob_root).await?;
         Ok(Self {
             session: std::sync::Arc::new(libsql::LibsqlSessionStore::new(pool.clone())),
+            session_summary: std::sync::Arc::new(libsql::LibsqlSessionSummaryStore::new(
+                pool.clone(),
+            )),
             memory: std::sync::Arc::new(libsql::LibsqlMemoryStore::new(pool.clone())),
             trace: std::sync::Arc::new(libsql::LibsqlTraceStore::new(pool.clone())),
             secret: std::sync::Arc::new(libsql::LibsqlSecretStore::new(pool.clone())),

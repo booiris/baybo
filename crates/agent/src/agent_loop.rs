@@ -209,6 +209,24 @@ pub struct AgentLoop {
     /// Cost gate + ledger; `record_call` feeds spend back so the
     /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
     cost_manager: Option<Arc<crate::cost::CostManager>>,
+    /// Resolved workspace paths — used by the async summary-refresh
+    /// path to read / write `<workspace>/state/sessions/<id>/summary.md`.
+    /// `None` keeps the maintenance entry point disabled (test
+    /// harnesses that don't exercise it).
+    workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
+    /// Session manager — needed by the maintenance entry point to
+    /// load parent transcripts, write summary metadata, and look up
+    /// in-flight maintenance siblings. `None` keeps the entry point
+    /// disabled. Distinct from the `SessionManager` plumbed inside
+    /// `ContextManager` because that one is per-session-bound while
+    /// the maintenance flow operates across sessions.
+    sessions: Option<Arc<crate::SessionManager>>,
+    /// Bootstrap-supplied spawner for the parent-side trigger gate.
+    /// When unset, the gate is silently disabled (test harnesses,
+    /// single-shot CLI runs that won't accumulate enough tokens to
+    /// matter). Production wiring constructs an impl with
+    /// `SessionManager` + `ActorSpawner` closed over.
+    summary_spawner: Option<Arc<dyn crate::summary_refresh::MaintenanceSpawner>>,
 }
 
 impl AgentLoop {
@@ -239,6 +257,41 @@ impl AgentLoop {
             skill_assessor: None,
             session_log: None,
             cost_manager: None,
+            workspace_paths: None,
+            sessions: None,
+            summary_spawner: None,
+        }
+    }
+
+    pub fn with_workspace_paths(mut self, paths: Arc<aura_workspace::WorkspacePaths>) -> Self {
+        self.workspace_paths = Some(paths);
+        self
+    }
+
+    pub fn with_sessions(mut self, sessions: Arc<crate::SessionManager>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    pub fn with_summary_spawner(
+        mut self,
+        spawner: Arc<dyn crate::summary_refresh::MaintenanceSpawner>,
+    ) -> Self {
+        self.summary_spawner = Some(spawner);
+        self
+    }
+
+    /// Cancel any in-flight maintenance children for the given
+    /// session. No-op when no spawner is wired (test harness).
+    /// Called by `AgentActor::Shutdown` before tripping its own
+    /// `actor_token` so the cascade reaches the children.
+    pub(crate) async fn cancel_maintenance_children(
+        &self,
+        session_id: &aura_model::SessionId,
+    ) -> anyhow::Result<()> {
+        match &self.summary_spawner {
+            Some(spawner) => spawner.cancel_maintenance_for_parent(session_id).await,
+            None => Ok(()),
         }
     }
 
@@ -529,6 +582,13 @@ impl AgentLoop {
             }
             iterations += 1;
 
+            // Iteration-boundary summary-refresh check. Skip iter 1 —
+            // no work has happened yet to gate against.
+            if iterations > 1 {
+                self.maybe_spawn_summary_refresh(session, job_id, /* job_done */ false)
+                    .await;
+            }
+
             // Proactive compression before building the ChatRequest.
             self.compress_if_needed(session, span_recorder, job_id, &cancel_token)
                 .await?;
@@ -564,7 +624,14 @@ impl AgentLoop {
             .await?;
 
             match outcome {
-                IterationOutcome::Final(msg) => return Ok(msg),
+                IterationOutcome::Final(msg) => {
+                    // End-of-job summary-refresh check. The activity
+                    // disjunct is satisfied by `job_done = true`;
+                    // the tokens / diff conjuncts still apply.
+                    self.maybe_spawn_summary_refresh(session, job_id, /* job_done */ true)
+                        .await;
+                    return Ok(msg);
+                }
                 IterationOutcome::Continue { deferred_subagents } => {
                     // Now that the iteration step is closed, dispatch
                     // any deferred subagent calls as peer steps. Each
@@ -1588,6 +1655,187 @@ impl AgentLoop {
                 Ok((output, text))
             },
         )
+        .await
+    }
+
+    /// Parent-side trigger gate. Fires at iteration boundaries and
+    /// on terminal-state commit. When tokens and activity have
+    /// crossed their thresholds and no maintenance session is
+    /// already in flight for this parent, asks the
+    /// `MaintenanceSpawner` to spawn one. Fire-and-forget — a
+    /// failed spawn never blocks the user's turn.
+    ///
+    /// `job_done = true` is passed at end-of-job (where the
+    /// activity disjunct is trivially satisfied); `false` at
+    /// iteration boundaries (where it relies on
+    /// `tool_calls_since_anchor` exceeding the threshold).
+    async fn maybe_spawn_summary_refresh(
+        &self,
+        session: &Session,
+        current_job_id: aura_model::JobId,
+        job_done: bool,
+    ) {
+        let Some(spawner) = self.summary_spawner.as_ref() else {
+            return;
+        };
+        let Some(sessions) = self.sessions.as_ref() else {
+            return;
+        };
+
+        let max_tokens = self.context_manager.budget().max_tokens();
+        let tokens_now = self.context_manager.budget().current();
+        let tokens_threshold =
+            (max_tokens as f64 * aura_context::SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO) as usize;
+        if tokens_now <= tokens_threshold {
+            return;
+        }
+
+        let tokens_since = self.context_manager.tokens_since_anchor();
+        if tokens_since <= aura_context::SUMMARY_DIFF_TOKEN_THRESHOLD {
+            return;
+        }
+
+        let tool_calls = self.context_manager.tool_calls_since_anchor();
+        if !job_done && tool_calls <= aura_context::SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD {
+            return;
+        }
+
+        // Spawn-serialization (R4): if a maintenance session
+        // already exists for this parent, skip the trigger. The
+        // next iteration will re-evaluate; the in-flight pass will
+        // either land or be reaped on next startup.
+        match sessions.active_maintenance_for_parent(&session.id).await {
+            Ok(active) if !active.is_empty() => {
+                debug!(
+                    parent_session_id = %session.id,
+                    in_flight = active.len(),
+                    "summary trigger: maintenance session already in flight; skipping"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    parent_session_id = %session.id,
+                    error = %e,
+                    "summary trigger: in-flight lookup failed; skipping"
+                );
+                return;
+            }
+        }
+
+        // Pin the snapshot's upper bound at trigger time so
+        // concurrent appends don't bleed into this pass' input.
+        let up_to_ordinal = match sessions.latest_session_ordinal(&session.id).await {
+            Ok(Some(o)) => o,
+            Ok(None) => 0,
+            Err(e) => {
+                warn!(
+                    parent_session_id = %session.id,
+                    error = %e,
+                    "summary trigger: ordinal lookup failed; skipping"
+                );
+                return;
+            }
+        };
+        let payload = crate::summary_refresh::SummaryRefreshPayload {
+            parent_session_id: session.id.clone(),
+            up_to_ordinal,
+        };
+        debug!(
+            parent_session_id = %session.id,
+            tokens_now,
+            tokens_since,
+            tool_calls,
+            job_done,
+            up_to_ordinal,
+            "summary trigger: spawning refresh pass"
+        );
+        if let Err(e) = spawner
+            .spawn_summary_refresh(session.id.clone(), current_job_id, payload)
+            .await
+        {
+            warn!(
+                parent_session_id = %session.id,
+                error = %e,
+                "summary trigger: spawn failed"
+            );
+        }
+    }
+
+    /// Maintenance entry point — runs one async summary-refresh
+    /// pass on behalf of the parent session named in `payload`. The
+    /// surrounding actor (a System session with
+    /// `LineageKind::SystemMaintenance`) invokes this from its
+    /// `AgentMessage::SystemTrigger` mailbox handler, bypassing the
+    /// normal chat-turn `run` cycle entirely. Wraps the LLM call in
+    /// a `JobInput::System { reason: SummaryRefresh }` job so cost
+    /// + trace are properly attributed.
+    ///
+    /// Errors when `workspace_paths` or `sessions` are unwired (test
+    /// harnesses) — production bootstrap always sets both.
+    pub(crate) async fn run_summary_refresh(
+        &mut self,
+        session: &mut Session,
+        payload: crate::summary_refresh::SummaryRefreshPayload,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        cancel_token: CancellationToken,
+    ) -> anyhow::Result<crate::summary_refresh::SummaryRefreshOutcome> {
+        let workspace_paths = self
+            .workspace_paths
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("workspace_paths not configured for summary refresh"))?
+            .clone();
+        let sessions = self
+            .sessions
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("sessions not configured for summary refresh"))?
+            .clone();
+        let llm_client = self.llm_client.clone();
+        let security_gateway = self.security_gateway.clone();
+        let cost_manager = self.cost_manager.clone();
+        let model_info = self.llm_client.model_info().clone();
+        let user_id = session.user.id.clone();
+        let maintenance_session_id = session.id.clone();
+        let recorder = span_recorder.clone();
+
+        let payload_value = serde_json::to_value(&payload)
+            .map_err(|e| anyhow::anyhow!("encode SummaryRefresh payload: {e}"))?;
+        let spec = crate::job::JobSpec {
+            session_id: session.id.clone(),
+            session_trigger_kind: session.trigger.kind(),
+            input: aura_job::JobInput::System {
+                reason: aura_model::SystemReason::SummaryRefresh,
+                payload: payload_value,
+            },
+            effective_soul_version: session.bound_soul_version.clone(),
+            parent_job_id: session.lineage.as_ref().map(|l| l.parent_job_id),
+        };
+
+        crate::scope::with_job(job_lifecycle, cancel_token.clone(), spec, move |job_id| {
+            let payload = payload.clone();
+            let cancel_token = cancel_token.clone();
+            async move {
+                let refresher = crate::summary_refresh::SummaryRefresher {
+                    llm_client,
+                    security_gateway,
+                    cost_manager,
+                    sessions,
+                    workspace_paths,
+                    recorder,
+                    model_info,
+                    maintenance_session_id,
+                    maintenance_user_id: user_id,
+                    job_id,
+                    cancel_token,
+                };
+                let outcome = refresher.run(payload).await?;
+                let value = serde_json::to_value(&outcome)?;
+                let output = aura_job::JobOutput::Structured { value };
+                Ok((output, outcome))
+            }
+        })
         .await
     }
 

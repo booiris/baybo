@@ -1,0 +1,330 @@
+//! End-to-end exercise of the async-summary-refresh storage +
+//! orphan-reaper paths.
+//!
+//! These tests stand up a libsql-backed `Store` and a real
+//! `SessionManager` with the `SessionSummaryStore` wired in, then
+//! drive:
+//!
+//!  1. `record_summary_success` → `summary_metadata` round trip
+//!     across the `SessionManager` API.
+//!  2. `BootstrapMaintenanceSpawner`-style spawn book-keeping —
+//!     verified indirectly by checking that
+//!     `active_maintenance_for_parent` and the cascade-on-delete
+//!     cover the `LineageKind::SystemMaintenance` rows.
+//!  3. `reap_maintenance_orphans` — DB rows deleted, parent's
+//!     `error_count` bumped, on-disk orphan summary directory
+//!     removed.
+//!
+//! The full agent-loop wiring (LLM call, JobLifecycle, SpanRecorder)
+//! is exercised at the unit-test layer in `aura-agent::summary_refresh`
+//! and `aura-context::strategy::summary_aware`; this file focuses on
+//! the storage + filesystem boundary.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aura_agent::SessionManager;
+use aura_agent::summary_refresh::reap_maintenance_orphans;
+use aura_model::{
+    ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, SystemReason,
+    TriggerSource, User,
+};
+use aura_storage::Store;
+use aura_workspace::WorkspacePaths;
+use chrono::{Duration as ChronoDuration, Utc};
+use tempfile::TempDir;
+
+fn user(id: &str) -> User {
+    User {
+        id: id.to_string(),
+        name: None,
+        channel: ChannelType::tui(),
+    }
+}
+
+fn root_session(id: &str) -> Session {
+    let now = Utc::now();
+    Session {
+        id: SessionId::from(id),
+        user: user(&format!("u-{id}")),
+        channel: ChannelType::tui(),
+        created_at: now,
+        last_active: now,
+        state: SessionState::default(),
+        root_session_id: SessionId::from(id),
+        trigger: TriggerSource::User,
+        lineage: None,
+        bound_soul_version: "soul".into(),
+    }
+}
+
+async fn fresh_store_and_paths() -> (Store, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("storage.db");
+    let store = Store::open(&db_path).await.expect("open store");
+    (store, dir)
+}
+
+/// Round-trip a successful summary pass through the `SessionManager`
+/// wrapper layer — the same surface the `SummaryRefresher` uses.
+#[tokio::test]
+async fn record_then_read_summary_metadata_via_session_manager() {
+    let (store, _dir) = fresh_store_and_paths().await;
+    let session = root_session("user-A");
+    store.session.save(&session).await.unwrap();
+
+    let mgr = SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
+        .with_summary_store(store.session_summary.clone());
+
+    // Initially no metadata.
+    let none = mgr.summary_metadata(&session.id).await.unwrap();
+    assert!(none.is_none());
+
+    let now = Utc::now();
+    mgr.record_summary_success(&session.id, 42, 12_345, "claude-opus-4-7", "span-1", now)
+        .await
+        .unwrap();
+
+    let row = mgr.summary_metadata(&session.id).await.unwrap().unwrap();
+    assert_eq!(row.cursor, 42);
+    assert_eq!(row.pass_count, 1);
+    assert_eq!(row.cost_micros, 12_345);
+    assert_eq!(row.model_id, "claude-opus-4-7");
+    assert_eq!(row.span_id, "span-1");
+    assert_eq!(row.error_count, 0);
+
+    // Failure bumps error_count without touching cursor / pass_count.
+    mgr.record_summary_failure(&session.id, "model", "span-err", Utc::now())
+        .await
+        .unwrap();
+    let row = mgr.summary_metadata(&session.id).await.unwrap().unwrap();
+    assert_eq!(row.error_count, 1);
+    assert_eq!(row.cursor, 42);
+    assert_eq!(row.pass_count, 1);
+
+    // Successful pass resets error_count.
+    mgr.record_summary_success(&session.id, 60, 1, "model", "span-2", Utc::now())
+        .await
+        .unwrap();
+    let row = mgr.summary_metadata(&session.id).await.unwrap().unwrap();
+    assert_eq!(row.error_count, 0);
+    assert_eq!(row.cursor, 60);
+    assert_eq!(row.pass_count, 2);
+    assert_eq!(row.cost_micros, 12_346);
+}
+
+/// Maintenance sessions are filtered from default listings; the
+/// dedicated `active_maintenance_for_parent` lookup surfaces them.
+#[tokio::test]
+async fn maintenance_sessions_are_invisible_to_default_listings() {
+    let (store, _dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-1");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
+        .with_summary_store(store.session_summary.clone());
+
+    // Spawn one maintenance session for the parent.
+    let maint = mgr
+        .create_maintenance_session(&parent, JobId::new(), SystemReason::SummaryRefresh)
+        .await
+        .unwrap();
+    assert!(maint.id.as_str().starts_with("maint-"));
+
+    // `list()` (operator-facing) shows only the parent.
+    let listed = mgr.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, parent.id);
+
+    // Lookup by parent surfaces the maintenance row.
+    let active = mgr.active_maintenance_for_parent(&parent.id).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0], maint.id);
+
+    // The maintenance set lookup also surfaces it.
+    let all = mgr.all_maintenance_sessions().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0], maint.id);
+}
+
+/// Orphan reaper end-to-end:
+///   - DB-side: maintenance session row is deleted, parent's
+///     `error_count` is bumped.
+///   - FS-side: a `summary.md` directory whose session has no
+///     metadata row is removed.
+#[tokio::test]
+async fn orphan_reaper_cleans_db_and_fs() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-orphan");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(
+        SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
+            .with_summary_store(store.session_summary.clone()),
+    );
+
+    // Create a maintenance session — represents a pass that was
+    // running when the previous process crashed.
+    let maint = mgr
+        .create_maintenance_session(&parent, JobId::new(), SystemReason::SummaryRefresh)
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.all_maintenance_sessions().await.unwrap().len(),
+        1,
+        "maintenance row must exist before reap"
+    );
+
+    // Set up a workspace dir with one orphan summary file under
+    // `<root>/state/sessions/orphan-abc/summary.md`. No metadata
+    // row for `orphan-abc` exists, so the FS sweep should reap it.
+    let ws_root = dir.path().join("workspace");
+    let paths = WorkspacePaths::new(ws_root.clone());
+    let orphan_dir = paths.session_state_dir("orphan-abc");
+    tokio::fs::create_dir_all(&orphan_dir).await.unwrap();
+    tokio::fs::write(
+        paths.session_summary_file("orphan-abc"),
+        "stale summary body",
+    )
+    .await
+    .unwrap();
+    assert!(paths.session_summary_file("orphan-abc").exists());
+
+    // Set up a *non*-orphan summary too — this one HAS a metadata
+    // row, so the sweep must leave it alone.
+    let kept_id = "still-known";
+    let kept_session = root_session(kept_id);
+    store.session.save(&kept_session).await.unwrap();
+    mgr.record_summary_success(&kept_session.id, 5, 0, "m", "span", Utc::now())
+        .await
+        .unwrap();
+    let kept_dir = paths.session_state_dir(kept_id);
+    tokio::fs::create_dir_all(&kept_dir).await.unwrap();
+    tokio::fs::write(paths.session_summary_file(kept_id), "kept body")
+        .await
+        .unwrap();
+
+    // Run the reaper.
+    reap_maintenance_orphans(&mgr, &paths).await;
+
+    // DB: maintenance session deleted; parent's error_count = 1.
+    assert!(
+        mgr.all_maintenance_sessions().await.unwrap().is_empty(),
+        "maintenance row must be reaped"
+    );
+    assert!(
+        store.session.get(&maint.id).await.unwrap().is_none(),
+        "maintenance row must be hard-deleted"
+    );
+    let parent_meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert_eq!(parent_meta.error_count, 1);
+
+    // FS: orphan dir removed.
+    assert!(
+        !paths.session_summary_file("orphan-abc").exists(),
+        "FS orphan must be deleted"
+    );
+
+    // FS: known dir preserved.
+    assert!(
+        paths.session_summary_file(kept_id).exists(),
+        "non-orphan summary must survive the sweep"
+    );
+}
+
+/// Cascade-on-delete: removing a parent session takes its
+/// `session_summaries` row with it (`ON DELETE CASCADE` FK).
+#[tokio::test]
+async fn parent_delete_cascades_summary_metadata() {
+    let (store, _dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-cascade");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
+        .with_summary_store(store.session_summary.clone());
+
+    mgr.record_summary_success(&parent.id, 1, 1, "m", "span", Utc::now())
+        .await
+        .unwrap();
+    assert!(mgr.summary_metadata(&parent.id).await.unwrap().is_some());
+
+    mgr.delete(&parent.id).await.unwrap();
+    assert!(
+        mgr.summary_metadata(&parent.id).await.unwrap().is_none(),
+        "summary metadata must cascade-delete with parent"
+    );
+}
+
+/// `LineageKind::SystemMaintenance` round-trips through the libsql
+/// `lineage_kind_str` mapping — `list_lineage_children` returns the
+/// new variant. Belt-and-suspenders verification that the
+/// `system_maintenance` SQL string matches both write and read sides.
+#[tokio::test]
+async fn lineage_kind_round_trips_for_system_maintenance() {
+    let (store, _dir) = fresh_store_and_paths().await;
+    let parent = root_session("p-lineage");
+    store.session.save(&parent).await.unwrap();
+
+    let maint = Session {
+        id: SessionId::from("m-1"),
+        user: parent.user.clone(),
+        channel: parent.channel.clone(),
+        created_at: Utc::now(),
+        last_active: Utc::now(),
+        state: SessionState::default(),
+        root_session_id: parent.id.clone(),
+        trigger: TriggerSource::System {
+            reason: SystemReason::SummaryRefresh,
+        },
+        lineage: Some(Lineage {
+            parent_session_id: parent.id.clone(),
+            parent_job_id: JobId::new(),
+            kind: LineageKind::SystemMaintenance,
+        }),
+        bound_soul_version: "soul".into(),
+    };
+    store.session.save(&maint).await.unwrap();
+
+    let kids = store
+        .session
+        .list_lineage_children(&parent.id)
+        .await
+        .unwrap();
+    assert_eq!(kids.len(), 1);
+    assert!(matches!(kids[0].1, LineageKind::SystemMaintenance));
+}
+
+#[tokio::test]
+async fn rapid_record_calls_accumulate_cost_and_pass_count() {
+    let (store, _dir) = fresh_store_and_paths().await;
+    let parent = root_session("rapid");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
+        .with_summary_store(store.session_summary.clone());
+
+    // 5 quick passes — same span_id pattern as production "many
+    // refreshes per session" exercise.
+    for i in 0..5 {
+        mgr.record_summary_success(
+            &parent.id,
+            i as i64,
+            10,
+            "m",
+            &format!("span-{i}"),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert_eq!(row.pass_count, 5);
+    assert_eq!(row.cost_micros, 50);
+    assert_eq!(row.cursor, 4);
+    assert_eq!(row.span_id, "span-4");
+
+    // Sanity: drain timeout is unrelated; tests run synchronously.
+    tokio::time::timeout(Duration::from_millis(10), async {})
+        .await
+        .unwrap();
+}

@@ -17,6 +17,7 @@ pub mod session;
 pub mod session_log;
 pub mod soul;
 pub mod subagent;
+pub mod summary_refresh;
 pub mod supervisor;
 pub mod tool_executor;
 pub mod trace;

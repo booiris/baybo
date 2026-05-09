@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use anyhow::Context as _;
+
 use crate::agent_loop::AgentLoop;
 use crate::job::JobLifecycle;
 use crate::trace::SpanRecorder;
@@ -28,6 +30,16 @@ pub enum AgentMessage {
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
         parent_job_id: aura_model::JobId,
+    },
+    /// A `SystemReason`-tagged maintenance task has been spawned on
+    /// this actor's session. Bypasses the normal chat-turn cycle
+    /// (`agent_loop.run`) and dispatches to a dedicated handler
+    /// based on `reason`. Currently the only wired reason is
+    /// `SystemReason::SummaryRefresh`; other variants log a warning
+    /// and drop until they get implementations.
+    SystemTrigger {
+        reason: aura_model::SystemReason,
+        payload: serde_json::Value,
     },
     /// Gracefully shut down this actor.
     Shutdown,
@@ -139,11 +151,31 @@ impl AgentActor {
                         );
                     }
                 }
+                AgentMessage::SystemTrigger { reason, payload } => {
+                    if let Err(e) = self.handle_system_trigger(reason, payload).await {
+                        error!(
+                            session_id = %self.session.id,
+                            error = %e,
+                            "failed to handle system trigger"
+                        );
+                    }
+                }
                 AgentMessage::Shutdown => {
                     debug!(session_id = %self.session.id, "actor shutting down");
-                    // Trip the actor's lifetime token so any in-flight
-                    // tool / subagent observes the cancel even if the
-                    // mailbox-drain happens while a job is running.
+                    // Cancel maintenance children before tripping our
+                    // own token so the cascade reaches them before
+                    // they observe a closed parent.
+                    if let Err(e) = self
+                        .agent_loop
+                        .cancel_maintenance_children(&self.session.id)
+                        .await
+                    {
+                        warn!(
+                            session_id = %self.session.id,
+                            error = %e,
+                            "failed to cancel maintenance children on parent shutdown"
+                        );
+                    }
                     self.actor_token.cancel();
                     break;
                 }
@@ -282,6 +314,50 @@ impl AgentActor {
             .await?;
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send subagent response");
+        }
+        Ok(())
+    }
+
+    /// Dispatch a `JobInput::System { reason, .. }` to its
+    /// reason-specific handler. Currently only
+    /// `SystemReason::SummaryRefresh` is wired through to
+    /// `agent_loop.run_summary_refresh`; other variants are ignored
+    /// with a warning until they're implemented.
+    async fn handle_system_trigger(
+        &mut self,
+        reason: aura_model::SystemReason,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        match reason {
+            aura_model::SystemReason::SummaryRefresh => {
+                let parsed: crate::summary_refresh::SummaryRefreshPayload =
+                    serde_json::from_value(payload)
+                        .context("decode SystemReason::SummaryRefresh JobInput payload")?;
+                let outcome = self
+                    .agent_loop
+                    .run_summary_refresh(
+                        &mut self.session,
+                        parsed,
+                        &self.job_lifecycle,
+                        &self.span_recorder,
+                        self.actor_token.child_token(),
+                    )
+                    .await?;
+                debug!(
+                    session_id = %self.session.id,
+                    cursor = outcome.cursor,
+                    cost_micros = outcome.cost_micros,
+                    "summary refresh: pass landed"
+                );
+            }
+            aura_model::SystemReason::HistoryReview
+            | aura_model::SystemReason::MemoryConsolidation => {
+                warn!(
+                    session_id = %self.session.id,
+                    ?reason,
+                    "SystemReason variant not yet wired in actor; dropping trigger"
+                );
+            }
         }
         Ok(())
     }

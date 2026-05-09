@@ -7,10 +7,61 @@ pub mod tokenizer;
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
 pub use error::ContextError;
-pub use strategy::summarize::Summarize;
+pub use strategy::summarize::{Summarize, parse_summary_response};
+pub use strategy::summary_aware::{
+    CONTEXT_SUMMARY_WRAPPER_PREAMBLE, FsSummaryLoader, SummaryAwareWrapper, SummaryLoader,
+};
 pub use strategy::truncate::Truncate;
 pub use strategy::{CompressOutput, CompressionStrategy};
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
+
+// ---------------------------------------------------------------------------
+// Configuration constants for the async summary-refresh feature.
+//
+// All triggers and budgets that the agent loop / SummaryAwareWrapper
+// consult live here as named constants, not magic numbers — they're
+// referenced from at least two crates (context + agent) and the design
+// doc treats them as a single configuration surface. See
+// `docs/context-summary-refresh.md` for the full rationale.
+// ---------------------------------------------------------------------------
+
+/// Token threshold (as fraction of `TokenBudget::max_tokens`) above
+/// which a summary refresh becomes eligible. Sized **below** the
+/// compression threshold (typically 0.7-0.85) so summary.md is fresh
+/// by the time compression hits the fast-path swap-in.
+pub const SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO: f64 = 0.5;
+
+/// Minimum new tokens (`tokens_since_anchor`) since the last summary
+/// pass before the trigger gate fires. Quality-first design tolerates
+/// frequent passes; this gate just suppresses spurious refreshes
+/// after barely-anything has changed.
+pub const SUMMARY_DIFF_TOKEN_THRESHOLD: usize = 5_000;
+
+/// Disjunctive clause's tool-call half: how many tool_use blocks
+/// past the anchor before the end-of-iteration trigger fires
+/// (logical-OR'd with `job_done` for the end-of-job trigger).
+pub const SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD: usize = 3;
+
+/// Recent slice's minimum-tokens floor for the backward atomic-pair
+/// walk. Walk doesn't stop until tokens ≥ this value.
+pub const RECENT_SLICE_MIN_TOKENS: usize = 10_000;
+
+/// Recent slice's minimum-text-block-message floor for the walk.
+/// Both this and `RECENT_SLICE_MIN_TOKENS` must be satisfied before
+/// the walk's soft-stop fires.
+pub const RECENT_SLICE_MIN_TEXT_BLOCK_MSGS: usize = 5;
+
+/// Recent slice's hard token cap. The atomic-pair walk never adds a
+/// unit that would push tokens past this — pair preservation must
+/// not extend past the cap (P1 / γ-i).
+pub const RECENT_SLICE_MAX_TOKENS: usize = 40_000;
+
+/// Fall-through threshold (as fraction of `TokenBudget::max_tokens`):
+/// if `summary + skill_trailer` (recent slice **excluded** per user
+/// spec) exceeds this, the wrapper falls through to the inner
+/// `Summarize` strategy. Recent slice is bounded by
+/// `RECENT_SLICE_MAX_TOKENS` and is added on top.
+pub const FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO: f64 = 0.6;
 
 pub type Result<T> = std::result::Result<T, ContextError>;
 
@@ -140,6 +191,12 @@ pub struct ContextManager {
     /// only (tests, single-shot harnesses).
     session_id: Option<SessionId>,
     sessions: Option<Arc<SessionManager>>,
+    /// Boundary the trigger gate measures from. Set to `messages.len()`
+    /// after every compression apply (so the post-compression slice
+    /// counts as fully covered) and reconstructed from
+    /// `session_summaries.cursor` on cold start. `None` until either
+    /// fires.
+    last_summary_anchor: RwLock<Option<usize>>,
 }
 
 impl ContextManager {
@@ -161,6 +218,7 @@ impl ContextManager {
             current_model: RwLock::new(None),
             session_id: None,
             sessions: None,
+            last_summary_anchor: RwLock::new(None),
         }
     }
 
@@ -210,6 +268,12 @@ impl ContextManager {
         self.messages = messages;
         self.invalidate_baseline();
         self.budget.update(self.calibrate(self.raw_estimate()));
+        // Reset the anchor — the prior position referred to a slice
+        // that's been replaced wholesale. `restore_from_store` will
+        // reconstruct it from `session_summaries.cursor` if available;
+        // for direct callers, the anchor stays `None` until the next
+        // compression apply or explicit `set_summary_anchor`.
+        *self.last_summary_anchor.write() = None;
     }
 
     /// Attach a `TokenCalibration` so `count_tokens` scales raw BPE
@@ -444,6 +508,11 @@ impl ContextManager {
         // to whatever's still in the kept tail.
         self.called_skills = scan_skill_calls(&self.messages);
         self.budget.update(after_tokens);
+        // Conservative anchor: post-compression transcript counts as
+        // fully covered. Skipping a fine-grained "post-summary blob"
+        // index also avoids a degenerate retrigger when the skill
+        // trailer's tokens alone would exceed the diff threshold.
+        *self.last_summary_anchor.write() = Some(self.messages.len());
 
         if after_tokens > self.budget.max_tokens() {
             warn!(
@@ -490,21 +559,114 @@ impl ContextManager {
     ///
     /// Failures log at warn and fall through to a fresh transcript;
     /// startup must not block on a transient store error.
+    ///
+    /// Also reconstructs `last_summary_anchor` from
+    /// `session_summaries.cursor` if both the metadata row and a
+    /// matching `session_messages.ordinal` are present in the
+    /// restored active set. When the metadata cursor refers to a
+    /// since-superseded ordinal (compression has rewritten the
+    /// transcript), the anchor stays `None` — the next compression
+    /// apply will set it conservatively to `messages.len()`.
     pub async fn restore_from_store(&mut self) {
-        let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
-            return;
+        // Clone the bound handles up-front so we can call
+        // `&mut self` methods inside the function without holding a
+        // borrow of `self.session_id` / `self.sessions`.
+        let (session_id, sessions) = match (
+            self.session_id.clone(),
+            self.sessions.as_ref().map(Arc::clone),
+        ) {
+            (Some(id), Some(s)) => (id, s),
+            _ => return,
         };
-        match sessions.load_active_session_messages(session_id).await {
+
+        // Step 1: restore the transcript itself.
+        match sessions.load_active_session_messages(&session_id).await {
             Ok(messages) if !messages.is_empty() => {
                 self.restore_messages(messages);
             }
             Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "failed to load persisted transcript; starting fresh"
+                );
+                return;
+            }
+        }
+
+        // Step 2: reconstruct the anchor from summary metadata, if any.
+        // Mapping: walk the supersede log, filter to active rows
+        // (`superseded_by IS NULL`), find the active row whose
+        // `ordinal == metadata.cursor`. The active row's position in
+        // the active sequence is the in-memory anchor index.
+        let metadata = match sessions.summary_metadata(&session_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "failed to load summary metadata on cold start"
+                );
+                return;
+            }
+        };
+        let Some(metadata) = metadata else { return };
+
+        match sessions
+            .load_session_messages_with_supersede(&session_id)
+            .await
+        {
+            Ok(rows) => {
+                let mut active_idx: usize = 0;
+                let mut anchor: Option<usize> = None;
+                for row in rows.iter() {
+                    if row.superseded_by.is_some() {
+                        continue;
+                    }
+                    if row.ordinal == metadata.cursor {
+                        anchor = Some(active_idx);
+                        break;
+                    }
+                    active_idx += 1;
+                }
+                *self.last_summary_anchor.write() = anchor;
+            }
             Err(e) => warn!(
                 session_id = %session_id,
                 error = %e,
-                "failed to load persisted transcript; starting fresh"
+                "failed to load supersede log on cold start; anchor unset"
             ),
         }
+    }
+
+    /// Sum of per-message tokens from the anchor to the end of the
+    /// transcript. When the anchor is `None`, returns the full
+    /// transcript token count. Cheap — reuses the per-message cache
+    /// the budget tracker maintains.
+    pub fn tokens_since_anchor(&self) -> usize {
+        let anchor = self.last_summary_anchor.read().unwrap_or(0);
+        let anchor = anchor.min(self.per_message_tokens.len());
+        self.per_message_tokens[anchor..].iter().sum()
+    }
+
+    /// Number of `ContentBlock::ToolUse` blocks past the anchor.
+    /// Used by the trigger gate's disjunctive clause `tool_calls > 3`.
+    pub fn tool_calls_since_anchor(&self) -> usize {
+        let anchor = self.last_summary_anchor.read().unwrap_or(0);
+        let anchor = anchor.min(self.messages.len());
+        self.messages[anchor..]
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .count()
+    }
+
+    /// Read the anchor index. Test-only: production callers measure
+    /// tokens / tool-calls through the dedicated accessors above.
+    #[cfg(test)]
+    pub(crate) fn last_summary_anchor(&self) -> Option<usize> {
+        *self.last_summary_anchor.read()
     }
 
     /// Build the `LlmCallInputs` an `LlmCall` trace span should
@@ -562,7 +724,7 @@ impl ContextManager {
 /// every freshly-seen skill name (in the order they appear) to `acc`.
 /// Only `ToolUse` blocks for the canonical Skill tool are considered;
 /// insertion-order dedup keeps the post-summary trailer deterministic.
-fn record_skill_calls(acc: &mut Vec<String>, msg: &ChatMessage) {
+pub(crate) fn record_skill_calls(acc: &mut Vec<String>, msg: &ChatMessage) {
     for block in &msg.content {
         let ContentBlock::ToolUse { name, input, .. } = block else {
             continue;
@@ -582,7 +744,7 @@ fn record_skill_calls(acc: &mut Vec<String>, msg: &ChatMessage) {
 /// Rebuild the called-skills vector from a full message slice.
 /// Used after a compression apply to scope the vector to whatever
 /// `ToolUse` blocks survived in the new transcript.
-fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
+pub(crate) fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
     let mut out = Vec::new();
     for msg in messages {
         record_skill_calls(&mut out, msg);
@@ -693,7 +855,7 @@ fn build_skill_detail_payload(
 /// Both ride as `Role::User` text so `merge_for_llm` folds them into
 /// the leading user message before dispatch; the in-storage messages
 /// stay separate for trace clarity.
-fn append_skill_trailer(
+pub(crate) fn append_skill_trailer(
     messages: &mut Vec<ChatMessage>,
     registry: &SkillRegistry,
     tokenizer: &dyn Tokenizer,
@@ -710,6 +872,32 @@ fn append_skill_trailer(
             content: vec![ContentBlock::Text(detail)],
         });
     }
+}
+
+/// Estimate the **token cost** of the skill trailer that
+/// [`append_skill_trailer`] would attach for `called_skills` against
+/// the given registry. Used by the fast-path's pre-assembly threshold
+/// check (`summary + skill_trailer ≤ 0.6 × max_tokens`) without
+/// committing the trailer to the assembled list. Returns the sum of
+/// the rendered reminder + detail payload tokens, or just the
+/// reminder if no called_skills carry a renderable definition.
+pub(crate) fn estimate_skill_trailer_tokens(
+    registry: &SkillRegistry,
+    tokenizer: &dyn Tokenizer,
+    called_skills: &[String],
+) -> usize {
+    let reminder = render_skill_reminder(&registry.all_summaries_sorted());
+    let mut total = tokenizer.count_message(&ChatMessage {
+        role: Role::User,
+        content: vec![ContentBlock::Text(reminder)],
+    });
+    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
+        total += tokenizer.count_message(&ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text(detail)],
+        });
+    }
+    total
 }
 
 #[cfg(test)]
@@ -1414,5 +1602,78 @@ mod tests {
             build_skill_detail_payload(&registry, &SimpleTokenizer, &["ghost".to_string()])
                 .is_none()
         );
+    }
+
+    // ---------- last_summary_anchor / trigger-gate tests ----------
+
+    fn tool_use_msg(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "bash".into(),
+                input: serde_json::Value::Null,
+                signature: None,
+            }],
+        }
+    }
+
+    /// Default anchor is `None`; both `tokens_since_anchor` and
+    /// `tool_calls_since_anchor` therefore measure the entire
+    /// transcript so the *very first* trigger check on a fresh
+    /// session can pass the diff threshold once budget is reached.
+    #[tokio::test]
+    async fn anchor_starts_unset_and_measures_entire_transcript() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        assert_eq!(ctx.last_summary_anchor(), None);
+        assert_eq!(ctx.tokens_since_anchor(), 0);
+        assert_eq!(ctx.tool_calls_since_anchor(), 0);
+
+        ctx.append(&make_msg(Role::User, "hello world")).await;
+        ctx.append(&tool_use_msg("tu-1")).await;
+        ctx.append(&make_msg(Role::Assistant, "ok")).await;
+
+        let total: usize = ctx.per_message_tokens.iter().sum();
+        assert_eq!(ctx.tokens_since_anchor(), total);
+        assert_eq!(ctx.tool_calls_since_anchor(), 1);
+    }
+
+    /// After any compression apply, the anchor moves to
+    /// `messages.len()`, so trigger metrics reset to 0 for the new
+    /// transcript and only re-grow as fresh turns arrive.
+    #[tokio::test]
+    async fn compression_apply_resets_anchor_to_transcript_end() {
+        let mut ctx = make_ctx(2, 50, 0.5);
+        ctx.append(&make_msg(Role::System, "system prompt")).await;
+        ctx.append(&make_msg(Role::User, "first message here"))
+            .await;
+        ctx.append(&make_msg(Role::Assistant, "first reply here"))
+            .await;
+        ctx.append(&make_msg(Role::User, "second message here"))
+            .await;
+
+        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert_eq!(ctx.last_summary_anchor(), Some(ctx.messages().len()));
+        assert_eq!(ctx.tokens_since_anchor(), 0);
+        assert_eq!(ctx.tool_calls_since_anchor(), 0);
+
+        // A fresh tool_use post-compression shows up past the anchor.
+        ctx.append(&tool_use_msg("tu-after-compaction")).await;
+        assert_eq!(ctx.tool_calls_since_anchor(), 1);
+        assert!(ctx.tokens_since_anchor() > 0);
+    }
+
+    /// `restore_messages` drops the anchor — the prior position
+    /// referred to a slice that's been replaced wholesale.
+    #[tokio::test]
+    async fn restore_messages_clears_anchor() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "earlier")).await;
+        // Force a compression apply so anchor lands at messages.len().
+        let _ = ctx.maybe_compress("test-model", never_chat).await;
+
+        ctx.restore_messages(vec![make_msg(Role::User, "fresh slice")]);
+        assert_eq!(ctx.last_summary_anchor(), None);
     }
 }

@@ -21,13 +21,16 @@
 
 use std::sync::Arc;
 
-use aura_agent::actor::AgentActor;
+use aura_agent::actor::{AgentActor, AgentMessage};
 use aura_agent::agent_loop::AgentLoop;
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::soul::Soul;
 use aura_agent::subagent::{LocalSubagentRuntime, SubagentRuntime};
+use aura_agent::summary_refresh::{
+    MaintenanceSpawner as MaintenanceSpawnerTrait, SummaryRefreshPayload,
+};
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
@@ -329,10 +332,28 @@ pub async fn build_managers(
         }
     }
 
-    let session_manager = Arc::new(SessionManager::new(
-        stores.session.clone(),
-        boot::to_session_timeout(&config.session),
-    ));
+    let session_manager = Arc::new(
+        SessionManager::new(
+            stores.session.clone(),
+            boot::to_session_timeout(&config.session),
+        )
+        // Wire the summary metadata store so the async refresh
+        // path's reads (`summary_metadata`) and writes
+        // (`record_summary_success` / `record_summary_failure`)
+        // hit the libsql backend. Without this they no-op.
+        .with_summary_store(stores.session_summary.clone()),
+    );
+
+    // Reap orphans from any maintenance sessions that were
+    // running when the previous process exited. Best-effort —
+    // logged at warn on failure, never blocks boot. Runs before
+    // any actor spawns so newly-created summary refresh actors
+    // don't race against stale rows.
+    aura_agent::summary_refresh::reap_maintenance_orphans(
+        session_manager.as_ref(),
+        &workspace_paths,
+    )
+    .await;
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
     // CostTracker has been retired in favour of a process-wide
@@ -568,6 +589,20 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
+    // Clone the response sender for the maintenance-spawner before
+    // the supervisor moves it. Maintenance actors don't produce
+    // user-visible output, but the actor constructor requires a
+    // response channel; reusing the supervisor's keeps the wiring
+    // identical to the user-actor path.
+    let response_tx_for_maintenance = response_tx.clone();
+
+    // Slot for the maintenance spawner. Same OnceLock pattern as
+    // `subagent_runtime_slot` because the spawner needs
+    // `spawn_actor_for`, which itself wants to inject the spawner
+    // into every AgentLoop it builds — the slot breaks the cycle.
+    let summary_spawner_slot: Arc<std::sync::OnceLock<Arc<dyn MaintenanceSpawnerTrait>>> =
+        Arc::new(std::sync::OnceLock::new());
+
     let supervisor = AgentSupervisor::new(response_tx);
 
     // Process-wide trace event bus. Stays for trace observers
@@ -612,6 +647,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let token_calibration = Arc::clone(&token_calibration);
 
         let sessions = Arc::clone(&graph.session_manager);
+        let workspace_paths_arc = Arc::new(aura_workspace::WorkspacePaths::new(
+            graph.workspace.root.clone(),
+        ));
+        let summary_spawner_slot_inner = Arc::clone(&summary_spawner_slot);
         Arc::new(
             move |session: aura_model::Session,
                   response_tx: mpsc::Sender<AgentOutput>,
@@ -636,10 +675,15 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 )
                 .with_skill_assessor(Arc::clone(&skill_assessor))
                 .with_session_log(Arc::clone(&session_logger))
-                .with_cost_manager(Arc::clone(&cost_manager));
+                .with_cost_manager(Arc::clone(&cost_manager))
+                .with_workspace_paths(Arc::clone(&workspace_paths_arc))
+                .with_sessions(Arc::clone(&sessions));
 
                 if let Some(rt) = subagent_runtime_slot.get() {
                     agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
+                }
+                if let Some(spawner) = summary_spawner_slot_inner.get() {
+                    agent_loop = agent_loop.with_summary_spawner(Arc::clone(spawner));
                 }
 
                 let span_recorder = Arc::new(SpanRecorder::new(
@@ -676,6 +720,22 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let set_ok = subagent_runtime_slot.set(local_subagent_runtime).is_ok();
     debug_assert!(set_ok);
 
+    // Construct the maintenance spawner now that `spawn_actor_for`
+    // exists and the supervisor's response sender has been cloned.
+    // The spawner uses the process-wide actor parent token so its
+    // children's lifetime is bounded by full-process shutdown,
+    // independently of any specific user job's cancel scope.
+    let maintenance_spawner: Arc<dyn MaintenanceSpawnerTrait> =
+        Arc::new(BootstrapMaintenanceSpawner {
+            sessions: Arc::clone(&graph.session_manager),
+            spawn_actor_for: Arc::clone(&spawn_actor_for),
+            parent_token: graph.actor_parent_token.clone(),
+            response_tx: response_tx_for_maintenance,
+            mailboxes: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        });
+    let set_ok = summary_spawner_slot.set(maintenance_spawner).is_ok();
+    debug_assert!(set_ok);
+
     let rate_limit_cfg = &graph.config.cost.rate_limit;
 
     let router = Router::new(
@@ -707,6 +767,99 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         incoming_tx,
         incoming_rx,
         response_rx,
+    }
+}
+
+/// Bootstrap-side `MaintenanceSpawner` impl. Captures the
+/// `SessionManager` (for `create_maintenance_session`), the shared
+/// actor-spawn factory (`spawn_actor_for`), the process-wide actor
+/// parent token (so cancel cascades reach maintenance children on
+/// shutdown), and the response channel (the maintenance actor
+/// constructor needs one even though no human reads its output).
+///
+/// Tracks live mailboxes per parent so [`Self::cancel_maintenance_for_parent`]
+/// can route `AgentMessage::Shutdown` for the C2 propagation rule.
+struct BootstrapMaintenanceSpawner {
+    sessions: Arc<aura_agent::SessionManager>,
+    spawn_actor_for: aura_agent::subagent::SubagentActorSpawner,
+    parent_token: CancellationToken,
+    response_tx: mpsc::Sender<AgentOutput>,
+    mailboxes: parking_lot::Mutex<
+        std::collections::HashMap<aura_model::SessionId, Vec<mpsc::Sender<AgentMessage>>>,
+    >,
+}
+
+#[async_trait::async_trait]
+impl MaintenanceSpawnerTrait for BootstrapMaintenanceSpawner {
+    async fn spawn_summary_refresh(
+        &self,
+        parent_session_id: aura_model::SessionId,
+        parent_job_id: aura_model::JobId,
+        payload: SummaryRefreshPayload,
+    ) -> anyhow::Result<()> {
+        let parent = self
+            .sessions
+            .get(&parent_session_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("parent session {parent_session_id} not found for summary spawn")
+            })?;
+
+        let maint = self
+            .sessions
+            .create_maintenance_session(
+                &parent,
+                parent_job_id,
+                aura_model::SystemReason::SummaryRefresh,
+            )
+            .await?;
+
+        // Spawn the maintenance actor. The mailbox returned is the
+        // only handle into it; cache it for cancel propagation,
+        // pruning closed senders for this parent first so the map
+        // doesn't grow unbounded across many refresh passes.
+        let mailbox_tx =
+            (self.spawn_actor_for)(maint.clone(), self.response_tx.clone(), &self.parent_token);
+        {
+            let mut guard = self.mailboxes.lock();
+            let entry = guard.entry(parent_session_id.clone()).or_default();
+            entry.retain(|tx| !tx.is_closed());
+            entry.push(mailbox_tx.clone());
+        }
+
+        // Drive the actor's `AgentMessage::SystemTrigger` handler.
+        let payload_value = serde_json::to_value(&payload)
+            .map_err(|e| anyhow::anyhow!("encode SummaryRefresh payload: {e}"))?;
+        if let Err(e) = mailbox_tx
+            .send(AgentMessage::SystemTrigger {
+                reason: aura_model::SystemReason::SummaryRefresh,
+                payload: payload_value,
+            })
+            .await
+        {
+            return Err(anyhow::anyhow!(
+                "failed to dispatch SystemTrigger to maintenance actor: {e}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn cancel_maintenance_for_parent(
+        &self,
+        parent_session_id: &aura_model::SessionId,
+    ) -> anyhow::Result<()> {
+        let senders = self
+            .mailboxes
+            .lock()
+            .remove(parent_session_id)
+            .unwrap_or_default();
+        for sender in senders {
+            // Send Shutdown best-effort. A closed channel here just
+            // means the actor already terminated (e.g. its work
+            // already finished); nothing to clean up.
+            let _ = sender.send(AgentMessage::Shutdown).await;
+        }
+        Ok(())
     }
 }
 

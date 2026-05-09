@@ -135,6 +135,12 @@ pub enum SystemReason {
     HistoryReview,
     /// Background memory consolidation / summarization task.
     MemoryConsolidation,
+    /// Async per-session summary refresh — a `SummaryRefresher` actor
+    /// reads its parent's transcript, generates an updated summary, and
+    /// writes `<workspace>/state/sessions/<parent_id>/summary.md` plus
+    /// the `session_summaries` metadata row. Triggered between turns
+    /// from the parent's agent loop. See `docs/context-summary-refresh.md`.
+    SummaryRefresh,
 }
 
 /// Direct parent relationship for sessions spawned from another session.
@@ -159,6 +165,13 @@ pub struct Lineage {
 /// specific job boundary. `fork_at_job_id` and `prefix_state_hash`
 /// together let the read-time view UNION the source's prefix with this
 /// session's own jobs while detecting source mutation.
+///
+/// `SystemMaintenance`: an internal, non-user-facing maintenance session
+/// (e.g. `SystemReason::SummaryRefresh`) doing work on behalf of its
+/// parent. The `Lineage.parent_session_id` pins the session being worked
+/// for; cancellation propagates down on parent shutdown via lookup.
+/// Maintenance sessions get `is_normal_session = 0` on the row, so default
+/// `SessionStore` listings exclude them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LineageKind {
@@ -167,6 +180,7 @@ pub enum LineageKind {
         fork_at_job_id: JobId,
         prefix_state_hash: String,
     },
+    SystemMaintenance,
 }
 
 /// A persisted conversation session — the root container of one trace
@@ -313,5 +327,28 @@ mod tests {
         let s = serde_json::to_string(&l).unwrap();
         let back: Lineage = serde_json::from_str(&s).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn lineage_system_maintenance_round_trip() {
+        let l = Lineage {
+            parent_session_id: SessionId::from("user-parent"),
+            parent_job_id: JobId::new(),
+            kind: LineageKind::SystemMaintenance,
+        };
+        let s = serde_json::to_string(&l).unwrap();
+        let back: Lineage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, l);
+    }
+
+    #[test]
+    fn trigger_source_system_summary_refresh_round_trip() {
+        let t = TriggerSource::System {
+            reason: SystemReason::SummaryRefresh,
+        };
+        let s = serde_json::to_string(&t).unwrap();
+        let back: TriggerSource = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.kind(), TriggerKind::System);
     }
 }

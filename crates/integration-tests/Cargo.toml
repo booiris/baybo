@@ -49,3 +49,4 @@ aura-gateway = { workspace = true }
 aura-setup = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
+tempfile = { workspace = true }

@@ -1,4 +1,5 @@
 pub mod summarize;
+pub mod summary_aware;
 pub mod truncate;
 
 use std::collections::HashSet;
@@ -24,6 +25,57 @@ pub type ChatFuture =
 /// → trim → fallback flow stays inside the strategy. `'static` because
 /// the agent loop's runner moves its captures by value.
 pub type ChatCallback = Box<dyn FnOnce(ChatRequest) -> ChatFuture + Send>;
+
+/// Walk backwards from `messages.len()` in atomic units, returning
+/// the cut index where the kept tail satisfies the `min_tokens` and
+/// `min_text_block_msgs` minima without exceeding `max_tokens`.
+///
+/// An atomic unit is either a single message or a `tool_use` /
+/// `tool_result` pair treated as a unit; pair preservation is
+/// strict — adding the next unit is rejected if it would push past
+/// `max_tokens`, rather than pulling more messages in. Returns
+/// `messages.len()` (empty kept slice) when even the first unit
+/// exceeds the cap.
+pub(crate) fn walk_backward_atomic<F>(
+    messages: &[ChatMessage],
+    min_tokens: usize,
+    min_text_block_msgs: usize,
+    max_tokens: usize,
+    tokenize: F,
+) -> usize
+where
+    F: Fn(&ChatMessage) -> usize,
+{
+    let mut cursor = messages.len();
+    let mut tokens: usize = 0;
+    let mut text_block_msgs: usize = 0;
+
+    while cursor > 0 {
+        // Pair-closing fixed-point: expand backward from cursor-1 to
+        // include any earlier `tool_use` whose `tool_result` is
+        // already in the kept tail.
+        let new_cursor = pair_preserving_cut(messages, cursor - 1);
+        let unit = &messages[new_cursor..cursor];
+        let unit_tokens: usize = unit.iter().map(&tokenize).sum();
+
+        if tokens + unit_tokens > max_tokens {
+            break;
+        }
+
+        cursor = new_cursor;
+        tokens += unit_tokens;
+        text_block_msgs += unit
+            .iter()
+            .filter(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text(_))))
+            .count();
+
+        if tokens >= min_tokens && text_block_msgs >= min_text_block_msgs {
+            break;
+        }
+    }
+
+    cursor
+}
 
 /// Adjust a candidate cut index over `messages` so the kept tail
 /// (`messages[cut..]`) contains every `ToolUse` whose matching
@@ -229,5 +281,99 @@ mod tests {
         assert_eq!(pair_preserving_cut(&msgs, 0), 0);
         assert_eq!(pair_preserving_cut(&msgs, 2), 2);
         assert_eq!(pair_preserving_cut(&msgs, 99), 2);
+    }
+
+    // ---------- walk_backward_atomic tests ----------
+
+    /// Every text message counts as 10 tokens for these tests so the
+    /// arithmetic stays obvious; tool_use / tool_result blocks count
+    /// as 5 each (representing structural overhead).
+    fn flat_tokenize(msg: &ChatMessage) -> usize {
+        msg.content
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text(_) => 10,
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => 5,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn walk_returns_empty_when_message_list_empty() {
+        let msgs: Vec<ChatMessage> = Vec::new();
+        assert_eq!(walk_backward_atomic(&msgs, 10, 1, 100, flat_tokenize), 0);
+    }
+
+    #[test]
+    fn walk_satisfies_both_minima_then_stops() {
+        // 6 text messages × 10 tokens each = 60 tokens total.
+        let msgs: Vec<ChatMessage> = (0..6).map(|i| text(Role::User, &format!("m{i}"))).collect();
+        // min_tokens = 25, min_text_blocks = 3, max = 100.
+        // After 1 msg: 10 / 1 — not yet.
+        // After 2 msgs: 20 / 2 — not yet.
+        // After 3 msgs: 30 / 3 — both satisfied, stop.
+        let cut = walk_backward_atomic(&msgs, 25, 3, 100, flat_tokenize);
+        assert_eq!(cut, 3); // last 3 messages kept
+    }
+
+    #[test]
+    fn walk_keeps_walking_when_only_text_blocks_min_satisfied_but_not_tokens() {
+        // 6 messages; even if 3 messages have text, we keep walking
+        // until tokens ≥ min_tokens too.
+        let msgs: Vec<ChatMessage> = (0..6).map(|i| text(Role::User, &format!("m{i}"))).collect();
+        // min_tokens = 50 (5 msgs needed at 10 each), min_text_blocks = 1.
+        let cut = walk_backward_atomic(&msgs, 50, 1, 100, flat_tokenize);
+        assert_eq!(cut, 1); // last 5 messages
+    }
+
+    #[test]
+    fn walk_hard_cap_drops_unit_that_overflows() {
+        // 5 text messages × 10 tokens = 50.
+        // max_tokens = 25. After accepting 2 messages (20 tokens), the
+        // next unit would push us to 30 > 25 → stop without taking it.
+        let msgs: Vec<ChatMessage> = (0..5).map(|i| text(Role::User, &format!("m{i}"))).collect();
+        let cut = walk_backward_atomic(&msgs, 1000, 1000, 25, flat_tokenize);
+        assert_eq!(cut, 3); // last 2 messages
+    }
+
+    #[test]
+    fn walk_returns_full_length_when_first_unit_exceeds_max() {
+        // Single message at 10 tokens; cap at 5 → can't take it.
+        let msgs = vec![text(Role::User, "big")];
+        let cut = walk_backward_atomic(&msgs, 1, 1, 5, flat_tokenize);
+        assert_eq!(cut, 1); // empty kept slice
+    }
+
+    #[test]
+    fn walk_treats_tool_use_pair_atomically() {
+        // [user "ask", assistant{tool_use:tu1}, user{tool_result:tu1}]
+        // Walking from end: candidate = user{tool_result:tu1}
+        // pair_preserving_cut pulls in tool_use at index 1.
+        // Unit = messages[1..3] = 2 msgs, 5+5=10 tokens.
+        let msgs = vec![text(Role::User, "ask"), tool_use("tu1"), tool_result("tu1")];
+        let cut = walk_backward_atomic(&msgs, 1, 0, 100, flat_tokenize);
+        // Took the pair atomically → cut at index 1, kept slice = [tool_use, tool_result]
+        // min_tokens=1 satisfied at 10 tokens; min_text_blocks=0 satisfied trivially. Stop.
+        assert_eq!(cut, 1);
+    }
+
+    #[test]
+    fn walk_drops_atomic_pair_that_exceeds_cap() {
+        // [user "ask", assistant{tool_use:tu1}, user{tool_result:tu1}]
+        // The pair unit costs 10 tokens; cap = 5 → can't take it.
+        let msgs = vec![text(Role::User, "ask"), tool_use("tu1"), tool_result("tu1")];
+        let cut = walk_backward_atomic(&msgs, 1, 0, 5, flat_tokenize);
+        // Strict cap → empty kept slice, cut = messages.len() = 3.
+        assert_eq!(cut, 3);
+    }
+
+    #[test]
+    fn walk_takes_everything_when_minima_unreachable() {
+        // 3 text messages × 10 tokens = 30. min_tokens = 100 → never
+        // satisfied; loop runs to cursor=0.
+        let msgs: Vec<ChatMessage> = (0..3).map(|i| text(Role::User, &format!("m{i}"))).collect();
+        let cut = walk_backward_atomic(&msgs, 100, 100, 1_000, flat_tokenize);
+        assert_eq!(cut, 0);
     }
 }

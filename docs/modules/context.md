@@ -127,3 +127,7 @@ Wiring contract:
 | -------- | -------------------------------------------------------------------------------------- |
 | `agent`  | `AgentLoop` owns a `ContextManager` instance and calls `append` / `maybe_compress`     |
 | `memory` | Memory context is injected into the context window by `agent`, not by `context` itself |
+
+## See also
+
+- [`context-summary-refresh.md`](../context-summary-refresh.md) — async per-session summary maintenance. Adds `SummaryAwareWrapper` (a `CompressionStrategy` that swaps in a precomputed summary when available) and `last_summary_anchor` tracking on `ContextManager`. The existing `Summarize` strategy stays as the inner fall-through and as the `force_compress` (`/compact`) target.

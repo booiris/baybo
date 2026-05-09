@@ -56,6 +56,7 @@ Bottom-up along the dependency graph:
 ## Cross-Cutting Guides
 
 - [testing.md](../testing.md) — Test pyramid (unit / crate-level / cross-crate), `test-support` gating, fixture inventory, and the six conventions every new test should follow.
+- [context-summary-refresh.md](../context-summary-refresh.md) — Async per-session summary maintenance (`SystemReason::SummaryRefresh` + `LineageKind::SystemMaintenance`). Trigger gates in `agent`, fast-path strategy + summary metadata in `context`, on-disk summary file under `<workspace>/state/sessions/<id>/`, `session_summaries` table in `storage`.
 
 ## Dependency Overview
 

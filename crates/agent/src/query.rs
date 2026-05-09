@@ -927,6 +927,17 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+        async fn list_active_maintenance_for_parent(
+            &self,
+            _parent: &SessionId,
+        ) -> std::result::Result<Vec<SessionId>, StorageError> {
+            Ok(Vec::new())
+        }
+        async fn list_all_maintenance_sessions(
+            &self,
+        ) -> std::result::Result<Vec<SessionId>, StorageError> {
+            Ok(Vec::new())
+        }
         async fn append_session_message(
             &self,
             id: &SessionId,

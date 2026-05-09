@@ -165,7 +165,7 @@ fn strip_analysis_block(text: &str) -> String {
     }
 }
 
-/// Parse the summarizer response per the new contract:
+/// Parse the summarizer response per the contract:
 /// 1. Strip the `<analysis>...</analysis>` block.
 /// 2. If the remainder contains a `<summary>...</summary>` block,
 ///    return it verbatim (tags included).
@@ -174,7 +174,12 @@ fn strip_analysis_block(text: &str) -> String {
 ///
 /// Returns `None` only when the leftover is empty / whitespace, in
 /// which case the caller should fall back to truncation.
-fn parse_summary_response(text: &str) -> Option<String> {
+///
+/// Shared with `aura_agent::summary_refresh` so both `Summarize` and
+/// the async `SummaryRefresher` honour the same `<analysis>` +
+/// `<summary>` contract — diverging parsers would silently corrupt
+/// summaries when one path's prompt is updated without the other's.
+pub fn parse_summary_response(text: &str) -> Option<String> {
     let stripped = strip_analysis_block(text);
     if let Some(range) = find_tagged_block(&stripped, "summary") {
         let block = &stripped[range];

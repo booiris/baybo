@@ -46,13 +46,38 @@ pub trait SessionStore: Send + Sync {
     /// `SessionManager`'s responsibility (cancel propagation through
     /// the actor token tree happens before this call).
     async fn delete(&self, session_id: &SessionId) -> Result<bool>;
+    /// Return session ids whose `last_active` is older than `before`.
+    /// Excludes maintenance sessions (`is_normal_session = 0`) — those
+    /// get reaped through the orphan-marker on startup, not through
+    /// the regular expiry sweep.
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>>;
-    /// Return every live session, ordered by `last_active` descending.
-    /// Operator-facing: drives `aura session list`.
+    /// Return every live **user-facing** session, ordered by
+    /// `last_active` descending. Maintenance sessions (`is_normal_session
+    /// = 0`) are filtered out; use [`Self::list_all_maintenance_sessions`]
+    /// to enumerate those. Operator-facing: drives `aura session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
     /// Return the live forks (sessions with `LineageKind::UserFork`)
     /// whose `parent_session_id` equals the given session.
     async fn list_live_forks(&self, source_session_id: &SessionId) -> Result<Vec<SessionId>>;
+
+    /// Return the session ids of every active maintenance session whose
+    /// `Lineage.parent_session_id` matches `parent_session_id`. Used by
+    /// the parent's agent loop to enforce the at-most-one-in-flight
+    /// `SummaryRefresher` invariant before spawning a new pass — if a
+    /// row is returned, the parent skips this trigger and re-evaluates
+    /// next iteration. Returns the ids regardless of state because the
+    /// "active" determination is whether an actor is running, which the
+    /// store cannot know directly; the caller correlates with the
+    /// `JobStore` for liveness.
+    async fn list_active_maintenance_for_parent(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Result<Vec<SessionId>>;
+
+    /// Return every maintenance session id (`is_normal_session = 0`).
+    /// Used by the startup orphan reaper to terminate sessions whose
+    /// actor isn't running after a process bounce.
+    async fn list_all_maintenance_sessions(&self) -> Result<Vec<SessionId>>;
 
     /// Return every immediate live descendant (Subagent or UserFork)
     /// of the given parent. Powers `lineage_tree` and

@@ -18,7 +18,14 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 tiktoken-rs = { workspace = true }
 parking_lot = { workspace = true }
+# Used by `FsSummaryLoader` for async file reads inside the
+# compression-time fast-path. Filesystem-trait stays in this crate
+# (the trait is the abstraction); `aura-workspace` deps stay one
+# layer up at the bootstrap site.
+tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+aura-storage = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }

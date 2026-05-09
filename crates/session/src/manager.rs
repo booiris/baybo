@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use aura_model::{ChannelType, ChatMessage, Session, SessionId, SessionState, TriggerSource, User};
-use aura_storage::{SessionStore, StorageError};
-use chrono::{Duration, Utc};
+use aura_storage::{SessionStore, SessionSummaryRow, SessionSummaryStore, StorageError};
+use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
 
 use crate::SessionError;
@@ -16,6 +16,13 @@ fn wrap(e: StorageError) -> SessionError {
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
+    /// Optional summary-metadata store. Wired in by the bootstrap
+    /// layer when the async summary-refresh feature is enabled (today
+    /// always — the option exists so test harnesses that don't care
+    /// about summaries can construct a manager without it). Reads
+    /// (`summary_metadata`) and writes (`record_summary_success` /
+    /// `record_summary_failure`) are no-ops / Ok(None) when absent.
+    summary_store: Option<Arc<dyn SessionSummaryStore>>,
     session_timeout: Duration,
     /// Default soul version stamped on new sessions when the caller
     /// does not supply one. The agent layer overrides this via
@@ -27,6 +34,7 @@ impl SessionManager {
     pub fn new(store: Arc<dyn SessionStore>, session_timeout: Duration) -> Self {
         Self {
             store,
+            summary_store: None,
             session_timeout,
             default_soul_version: "soul-default".to_owned(),
         }
@@ -40,11 +48,87 @@ impl SessionManager {
         self
     }
 
+    /// Attach a `SessionSummaryStore` so summary metadata reads /
+    /// writes work. Without this, `summary_metadata` returns
+    /// `Ok(None)` and the record helpers no-op — useful for tests
+    /// that don't exercise the summary path.
+    pub fn with_summary_store(mut self, store: Arc<dyn SessionSummaryStore>) -> Self {
+        self.summary_store = Some(store);
+        self
+    }
+
     /// Read-only view of the underlying `SessionStore`. Used by
     /// callers (CLI / gateway admin) that need to construct
     /// `QueryApi` against the same store the manager writes to.
     pub fn store(&self) -> Arc<dyn SessionStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Optional handle to the underlying `SessionSummaryStore`.
+    /// `None` when summaries aren't wired (test harness path).
+    pub fn summary_store(&self) -> Option<Arc<dyn SessionSummaryStore>> {
+        self.summary_store.as_ref().map(Arc::clone)
+    }
+
+    /// Read this session's summary-metadata row. `Ok(None)` when:
+    /// - no summary store is wired, or
+    /// - the session has never had a summary pass written.
+    pub async fn summary_metadata(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSummaryRow>> {
+        match &self.summary_store {
+            Some(store) => store.get(session_id).await.map_err(wrap),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a successful summary pass: bumps `pass_count`, advances
+    /// `cursor`, accumulates cost, resets `error_count` to 0. No-op
+    /// when no summary store is wired.
+    pub async fn record_summary_success(
+        &self,
+        session_id: &SessionId,
+        cursor: i64,
+        cost_micros_delta: i64,
+        model_id: &str,
+        span_id: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let Some(store) = &self.summary_store else {
+            return Ok(());
+        };
+        store
+            .upsert_success(
+                session_id,
+                cursor,
+                cost_micros_delta,
+                model_id,
+                span_id,
+                updated_at,
+            )
+            .await
+            .map_err(wrap)
+    }
+
+    /// Record a failed summary attempt: bumps `error_count`. Inserts
+    /// a row with cursor=0 / pass_count=0 if absent so failure
+    /// telemetry surfaces even on sessions that have never had a
+    /// successful pass. No-op when no summary store is wired.
+    pub async fn record_summary_failure(
+        &self,
+        session_id: &SessionId,
+        model_id: &str,
+        span_id: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let Some(store) = &self.summary_store else {
+            return Ok(());
+        };
+        store
+            .bump_error_count(session_id, model_id, span_id, updated_at)
+            .await
+            .map_err(wrap)
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
@@ -76,6 +160,85 @@ impl SessionManager {
             .await
     }
 
+    /// Create a `LineageKind::SystemMaintenance` session for
+    /// internal maintenance work on behalf of `parent`. Unlike
+    /// [`Self::create_spawned_session`], the trigger is **not**
+    /// inherited — maintenance work always carries
+    /// `TriggerSource::System { reason }` so cost / trace
+    /// attribution shows it as system-driven, not user-driven.
+    /// `root_session_id` *is* inherited from the parent so
+    /// "all work descended from session X" queries surface
+    /// maintenance work too.
+    ///
+    /// The `is_normal_session = 0` flag is set automatically by the
+    /// `LineageKind::SystemMaintenance` branch in
+    /// `LibsqlSessionStore::save`, so default queries (CLI session
+    /// picker, web UI) skip these rows. `parent_job_id` pins the
+    /// exact moment in the parent's lifeline that the spawn
+    /// happened — same role it plays for subagents.
+    ///
+    /// Used today by the async summary-refresh path
+    /// (`SystemReason::SummaryRefresh`); future maintenance reasons
+    /// can reuse the same constructor without a code change.
+    pub async fn create_maintenance_session(
+        &self,
+        parent: &Session,
+        parent_job_id: aura_model::JobId,
+        reason: aura_model::SystemReason,
+    ) -> Result<Session> {
+        let id = SessionId::from(format!("maint-{}", uuid::Uuid::new_v4()));
+        let now = Utc::now();
+        let session = Session {
+            id: id.clone(),
+            user: parent.user.clone(),
+            channel: parent.channel.clone(),
+            created_at: now,
+            last_active: now,
+            state: aura_model::SessionState::default(),
+            root_session_id: parent.root_session_id.clone(),
+            trigger: TriggerSource::System { reason },
+            lineage: Some(aura_model::Lineage {
+                parent_session_id: parent.id.clone(),
+                parent_job_id,
+                kind: aura_model::LineageKind::SystemMaintenance,
+            }),
+            bound_soul_version: parent.bound_soul_version.clone(),
+        };
+        self.store.save(&session).await.map_err(wrap)?;
+        debug!(
+            session_id = %session.id,
+            parent_session_id = %parent.id,
+            "spawned system maintenance session"
+        );
+        Ok(session)
+    }
+
+    /// Return ids of in-flight maintenance sessions whose lineage
+    /// points at `parent_session_id`. Used by the parent's agent
+    /// loop to enforce the at-most-one-in-flight `SummaryRefresher`
+    /// invariant before spawning a new pass — if any row is
+    /// returned, skip the trigger (the in-flight pass will eventually
+    /// land or be reaped on next startup).
+    pub async fn active_maintenance_for_parent(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Result<Vec<SessionId>> {
+        self.store
+            .list_active_maintenance_for_parent(parent_session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Enumerate every maintenance session id (`is_normal_session
+    /// = 0`). Used by the startup orphan reaper to delete sessions
+    /// whose actor isn't running after a process bounce.
+    pub async fn all_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
+        self.store
+            .list_all_maintenance_sessions()
+            .await
+            .map_err(wrap)
+    }
+
     /// Create a session that descends from `parent` via the given
     /// lineage (subagent or user-fork). The child inherits its
     /// trigger from the parent's root session and gets a fresh
@@ -90,6 +253,7 @@ impl SessionManager {
         let prefix = match lineage.kind {
             aura_model::LineageKind::Subagent => "subagent-",
             aura_model::LineageKind::UserFork { .. } => "fork-",
+            aura_model::LineageKind::SystemMaintenance => "maint-",
         };
         let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
         let now = Utc::now();
@@ -381,6 +545,17 @@ mod tests {
             &self,
             _parent_session_id: &SessionId,
         ) -> StoreResult<Vec<(SessionId, aura_model::LineageKind)>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_active_maintenance_for_parent(
+            &self,
+            _parent_session_id: &SessionId,
+        ) -> StoreResult<Vec<SessionId>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_all_maintenance_sessions(&self) -> StoreResult<Vec<SessionId>> {
             Ok(Vec::new())
         }
 
@@ -751,5 +926,43 @@ mod tests {
 
         let loaded = mgr.load_active_session_messages(&session.id).await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_maintenance_session_carries_system_trigger_and_maintenance_lineage() {
+        use aura_model::{JobId, LineageKind, SystemReason};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Duration::minutes(30));
+
+        let parent = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+        let parent_job = JobId::new();
+
+        let maint = mgr
+            .create_maintenance_session(&parent, parent_job, SystemReason::SummaryRefresh)
+            .await
+            .unwrap();
+
+        // System trigger + reason — not inherited from parent.
+        match &maint.trigger {
+            aura_model::TriggerSource::System { reason } => {
+                assert_eq!(*reason, SystemReason::SummaryRefresh);
+            }
+            other => panic!("expected System trigger, got {other:?}"),
+        }
+        // Lineage points back at the parent through SystemMaintenance.
+        let lineage = maint.lineage.as_ref().expect("maintenance has lineage");
+        assert_eq!(lineage.parent_session_id, parent.id);
+        assert_eq!(lineage.parent_job_id, parent_job);
+        assert!(matches!(lineage.kind, LineageKind::SystemMaintenance));
+        // Root inherits from the parent (not self) so descendant
+        // queries cover maintenance work.
+        assert_eq!(maint.root_session_id, parent.root_session_id);
+        // Maintenance ids carry the `maint-` prefix for log
+        // recognisability.
+        assert!(maint.id.as_str().starts_with("maint-"));
     }
 }
