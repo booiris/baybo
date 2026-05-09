@@ -51,6 +51,7 @@ Aura targets **Unix only** (Linux and macOS — see `default = ["linux", "macos"
 - Adding a new external dep: declare it in the root `[workspace.dependencies]` first, then pull it into the crate with `dep = { workspace = true }` (add per-crate `features = [...]` only when the crate needs extras beyond the workspace default).
 - Internal crates (`aura-*`) are also listed in `[workspace.dependencies]` with `path = "crates/<name>"` and consumed via `{ workspace = true }`.
 - Applies to both `[dependencies]` and `[dev-dependencies]`.
+- Doctests are disabled workspace-wide via `[lib]\ndoctest = false` in every crate's `Cargo.toml` — empty doctest invocations were the dominant cost in `cargo test --workspace`. New crates MUST include this block. If you genuinely need a doctest in some crate, drop the line in just that crate.
 
 ## Architecture
 

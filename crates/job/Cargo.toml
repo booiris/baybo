@@ -3,6 +3,9 @@ name = "aura-job"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 aura-model = { workspace = true }
 anyhow = { workspace = true }

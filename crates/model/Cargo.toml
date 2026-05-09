@@ -3,6 +3,9 @@ name = "aura-model"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [features]
 # Emit ts-rs-generated TypeScript definitions for the wire-visible
 # subset of approval / message types into

@@ -534,15 +534,16 @@ mod tests {
     #[tokio::test]
     async fn touch_updates_last_active() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(store.clone(), Duration::minutes(30));
 
-        let session = mgr
+        let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
             .await
             .unwrap();
+        // Back-date so `touch` produces a strictly newer timestamp without sleeping.
+        session.last_active = Utc::now() - Duration::seconds(5);
+        store.save(&session).await.unwrap();
         let original_active = session.last_active;
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         mgr.touch(&session.id).await.unwrap();
 
@@ -550,7 +551,7 @@ mod tests {
             .get_or_create(&session.id, test_user(), ChannelType::tui())
             .await
             .unwrap();
-        assert!(updated.last_active >= original_active);
+        assert!(updated.last_active > original_active);
     }
 
     #[tokio::test]
@@ -568,13 +569,15 @@ mod tests {
     #[tokio::test]
     async fn cleanup_expired_removes_old_sessions() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::seconds(1));
+        let mgr = SessionManager::new(store.clone(), Duration::seconds(1));
 
-        mgr.create_session(test_user(), ChannelType::tui())
+        let mut session = mgr
+            .create_session(test_user(), ChannelType::tui())
             .await
             .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Back-date past the 1s timeout instead of sleeping.
+        session.last_active = Utc::now() - Duration::seconds(5);
+        store.save(&session).await.unwrap();
 
         let count = mgr.cleanup_expired().await.unwrap();
         assert_eq!(count, 1);
@@ -586,13 +589,15 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_sessions_newest_first() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(store.clone(), Duration::minutes(30));
 
-        let first = mgr
+        let mut first = mgr
             .create_session(test_user(), ChannelType::tui())
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Back-date `first` so the sort order is deterministic without sleeping.
+        first.last_active = Utc::now() - Duration::seconds(5);
+        store.save(&first).await.unwrap();
         let second = mgr
             .create_session(test_user(), ChannelType::telegram())
             .await
@@ -659,16 +664,20 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_replaces_expired_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::seconds(1));
+        let mgr = SessionManager::new(store.clone(), Duration::seconds(1));
 
-        let session = mgr
+        let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
             .await
             .unwrap();
         let old_id = session.id.clone();
+        // Back-date both timestamps so the manager treats it as expired
+        // and the replacement's `created_at` is strictly newer.
+        let backdate = Utc::now() - Duration::seconds(5);
+        session.created_at = backdate;
+        session.last_active = backdate;
+        store.save(&session).await.unwrap();
         let old_created = session.created_at;
-
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let new_session = mgr
             .get_or_create(&old_id, test_user(), ChannelType::tui())

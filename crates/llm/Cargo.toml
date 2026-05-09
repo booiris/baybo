@@ -3,6 +3,9 @@ name = "aura-llm"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [features]
 # Exposes `StubLlm` and the `LlmStream::from_events` constructor for
 # downstream crates' tests. Pull in via:

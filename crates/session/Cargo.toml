@@ -3,6 +3,9 @@ name = "aura-session"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 aura-model = { workspace = true }
 aura-storage = { workspace = true }

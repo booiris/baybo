@@ -3,6 +3,9 @@ name = "aura-agent"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 aura-cron = { workspace = true }
 aura-model = { workspace = true }

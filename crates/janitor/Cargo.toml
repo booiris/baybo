@@ -3,6 +3,9 @@ name = "aura-janitor"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 aura-storage = { workspace = true }
 aura-workspace = { workspace = true }

@@ -153,9 +153,7 @@ fn compute_cost_usd(
     let cached_rate = p
         .cached_input_per_1m_tokens
         .unwrap_or(p.input_per_1m_tokens);
-    let cache_write_rate = p
-        .cache_write_per_1m_tokens
-        .unwrap_or(p.input_per_1m_tokens);
+    let cache_write_rate = p.cache_write_per_1m_tokens.unwrap_or(p.input_per_1m_tokens);
     MicroUsd::cost_for_tokens(p.input_per_1m_tokens, full_rate_input)
         + MicroUsd::cost_for_tokens(cached_rate, cached_input_tokens as u64)
         + MicroUsd::cost_for_tokens(cache_write_rate, cache_creation_input_tokens as u64)

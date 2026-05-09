@@ -3,6 +3,9 @@ name = "aura-channels"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [features]
 # Emits ts-rs-generated TypeScript definitions for `Message` / `Frame`
 # into `sdks/channel-ts/src/generated/`. Kept behind a feature so CI /

@@ -9,6 +9,9 @@ publish = false
 # so the link cost is paid once.
 autotests = false
 
+[lib]
+doctest = false
+
 [[test]]
 name = "all"
 path = "tests/all.rs"
