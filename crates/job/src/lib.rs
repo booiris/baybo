@@ -173,6 +173,17 @@ pub struct Job {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+
+    /// Count of agent-loop iterations executed under this job. Bumped
+    /// from the agent layer at each iteration boundary; persisted
+    /// (along with the rest of the row) on the next `JobStore::save`.
+    /// Stays `0` for jobs that don't run an iterated agent loop
+    /// (cron-direct-tool-call, fresh `Pending` rows that never started).
+    /// Consumed by the self_improvement flow to filter "complex" jobs —
+    /// see `docs/modules/self-improvement.md`. `serde(default)` so rows
+    /// persisted before the field existed deserialize cleanly.
+    #[serde(default)]
+    pub iterations: u32,
 }
 
 impl Job {
@@ -198,7 +209,14 @@ impl Job {
             created_at: Utc::now(),
             started_at: None,
             ended_at: None,
+            iterations: 0,
         }
+    }
+
+    /// Bump the iteration counter. The agent loop calls this once per
+    /// iteration boundary — see `crate::agent_loop::AgentLoop::run`.
+    pub fn record_iteration(&mut self) {
+        self.iterations = self.iterations.saturating_add(1);
     }
 
     pub fn is_terminal(&self) -> bool {

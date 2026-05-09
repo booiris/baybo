@@ -9,6 +9,7 @@ use aura_cron::CronTriggerEvent;
 
 use crate::cost::CostManager;
 use crate::security::SecurityGateway;
+use crate::self_improvement::SystemTriggerEvent;
 use crate::session::SessionManager;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -84,7 +85,14 @@ pub struct Router {
     cost_manager: Option<Arc<CostManager>>,
     rate_limiter: RateLimiter,
     actor_spawner: Option<ActorSpawner>,
+    /// Spawner specifically for self_improvement `JobKind::System` actors.
+    /// MUST be backed by an [`crate::AgentLoop`] that's been
+    /// constructed with the self_improvement tool ceiling — see
+    /// `docs/modules/self-improvement.md` Q7 for why this is a separate
+    /// constructor from `actor_spawner`.
+    self_improvement_spawner: Option<ActorSpawner>,
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    system_trigger_rx: Option<mpsc::Receiver<SystemTriggerEvent>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
     /// each actor derives its `actor_token` as a child of this so
@@ -116,7 +124,9 @@ impl Router {
                 std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
             ),
             actor_spawner: None,
+            self_improvement_spawner: None,
             cron_trigger_rx: None,
+            system_trigger_rx: None,
             actor_parent_token: CancellationToken::new(),
         }
     }
@@ -157,6 +167,21 @@ impl Router {
         self
     }
 
+    /// Set a self_improvement-specific actor spawner (one whose AgentLoop
+    /// uses the self_improvement tool ceiling). Without this, system
+    /// triggers are dropped silently with a warn log.
+    pub fn with_self_improvement_spawner(mut self, spawner: ActorSpawner) -> Self {
+        self.self_improvement_spawner = Some(spawner);
+        self
+    }
+
+    /// Set a receiver for system trigger events (currently:
+    /// self_improvement, see `crate::self_improvement`).
+    pub fn with_system_triggers(mut self, rx: mpsc::Receiver<SystemTriggerEvent>) -> Self {
+        self.system_trigger_rx = Some(rx);
+        self
+    }
+
     /// Start all channels and begin routing messages.
     pub async fn run(
         mut self,
@@ -167,6 +192,7 @@ impl Router {
         info!(channel_count, "router starting");
 
         let mut cron_rx = self.cron_trigger_rx.take();
+        let mut system_rx = self.system_trigger_rx.take();
 
         loop {
             tokio::select! {
@@ -186,6 +212,16 @@ impl Router {
                 } => {
                     if let Err(e) = self.handle_cron_trigger(event).await {
                         error!(error = %e, "failed to handle cron trigger");
+                    }
+                }
+                Some(event) = async {
+                    match system_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Err(e) = self.handle_system_trigger(event).await {
+                        error!(error = %e, "failed to handle system trigger");
                     }
                 }
                 else => {
@@ -260,6 +296,77 @@ impl Router {
                 session_id = %session_id,
                 error = %e,
                 "failed to deliver post-trigger shutdown; actor will still exit when sender drops",
+            );
+        }
+        Ok(())
+    }
+
+    /// Handle a system-side-channel trigger (currently: self_improvement,
+    /// `SystemReason::SelfImprovement`). Symmetric with
+    /// [`handle_cron_trigger`]: mints a fresh `TriggerSource::System`
+    /// session, dispatches `AgentMessage::SystemTrigger` followed by
+    /// `Shutdown` to a one-shot actor spawned by the dedicated
+    /// `self_improvement_spawner`. Pre-flight cost-cap and a missing
+    /// spawner / lifecycle drop the trigger silently with a warn.
+    async fn handle_system_trigger(&mut self, event: SystemTriggerEvent) -> anyhow::Result<()> {
+        // Pre-flight CostManager check (Q16). SelfImprovement is
+        // best-effort; the originating user never sees this drop.
+        if let Some(cost) = self.cost_manager.as_ref()
+            && let Err(e) = cost.check()
+        {
+            warn!(error = ?e, "self_improvement: cost gate rejected trigger");
+            return Ok(());
+        }
+
+        let user = User {
+            id: event.originating_user_id.clone(),
+            name: None,
+            channel: event.originating_user_channel.clone(),
+        };
+
+        let session = self
+            .session_manager
+            .create_session_with_trigger(
+                user,
+                event.originating_user_channel.clone(),
+                TriggerSource::System {
+                    reason: event.reason.clone(),
+                },
+            )
+            .await?;
+        let session_id = session.id.clone();
+
+        let Some(ref spawner) = self.self_improvement_spawner else {
+            warn!(
+                session_id = %session_id,
+                "no self_improvement spawner configured; dropping system trigger"
+            );
+            return Ok(());
+        };
+
+        debug!(
+            session_id = %session_id,
+            trigger_job_id = %event.trigger_job_id,
+            "routing system trigger to fresh session"
+        );
+
+        let response_tx = self.supervisor.response_tx().clone();
+        let sender = spawner(session, response_tx, &self.actor_parent_token);
+
+        let trigger_msg = AgentMessage::SystemTrigger {
+            reason: event.reason,
+            payload: event.payload,
+            parent_job_id: Some(event.trigger_job_id),
+        };
+        if let Err(e) = sender.send(trigger_msg).await {
+            warn!(session_id = %session_id, error = %e, "failed to deliver system trigger");
+            return Ok(());
+        }
+        if let Err(e) = sender.send(AgentMessage::Shutdown).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to deliver post-trigger shutdown for system trigger",
             );
         }
         Ok(())

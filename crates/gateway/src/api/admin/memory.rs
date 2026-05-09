@@ -66,7 +66,7 @@ async fn store_memory(
     let entry = MemoryEntryModel::new(
         req.user_id.unwrap_or_else(|| "http".to_owned()),
         req.content,
-        MemoryCategory::KeyFact,
+        MemoryCategory::User,
         req.importance.unwrap_or(0.5),
     );
     state

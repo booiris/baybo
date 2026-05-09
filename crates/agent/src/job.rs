@@ -27,10 +27,14 @@ const JOB_TERMINAL_EVENT_CAPACITY: usize = 256;
 /// Terminal-state notification published by `JobLifecycle` whenever a
 /// job transitions to `Completed`, `Failed`, or `Cancelled`. Carries
 /// the minimum identifiers a subscriber needs to filter without going
-/// back to the store: the terminating `JobId`, its session, and the
-/// optional parent for hierarchy-scoped waits (subagent path).
+/// back to the store: the terminating `JobId`, its session, the
+/// optional parent for hierarchy-scoped waits (subagent path), the
+/// `JobKind` (so self_improvement can filter to `UserChat` without a
+/// `JobStore::get` round-trip), and the iteration count (so the
+/// self_improvement predicate can apply its `iterations > N` threshold
+/// directly off the event).
 ///
-/// `kind` is always one of the three terminal `JobStatusKind`
+/// `status_kind` is always one of the three terminal `JobStatusKind`
 /// discriminants — non-terminal transitions (`start`, `stuck`,
 /// `recover`) are not published.
 #[derive(Debug, Clone)]
@@ -38,7 +42,9 @@ pub struct JobTerminalEvent {
     pub job_id: JobId,
     pub session_id: SessionId,
     pub parent_job_id: Option<JobId>,
-    pub kind: JobStatusKind,
+    pub status_kind: JobStatusKind,
+    pub job_kind: aura_job::JobKind,
+    pub iterations: u32,
 }
 
 /// Inputs needed to create a new `Job`. Bundled into a struct so
@@ -230,6 +236,16 @@ impl JobLifecycle {
         self.store.list_recoverable().await
     }
 
+    /// List jobs whose `parent_job_id` matches. The reverse of
+    /// `parent_job_id` — used by the web UI to render the
+    /// `↘ SelfImprovement` cross-link on a UserChat job's trace page
+    /// (per `docs/modules/self-improvement.md` Q12). Newest first.
+    pub async fn list_children(&self, parent_job_id: &JobId) -> Result<Vec<Job>> {
+        let mut jobs = self.store.list_children(parent_job_id).await?;
+        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(jobs)
+    }
+
     /// List jobs scoped to one session. Hits the `idx_jobs_session`
     /// index instead of scanning the full table. Newest first.
     pub async fn list_by_session(
@@ -276,10 +292,26 @@ impl JobLifecycle {
             job_id: job.id,
             session_id: job.session_id.clone(),
             parent_job_id: job.parent_job_id,
-            kind: job.status.kind(),
+            status_kind: job.status.kind(),
+            job_kind: job.kind,
+            iterations: job.iterations,
         };
         self.persist(job, transition).await?;
         let _ = self.terminal_events.send(event);
+        Ok(())
+    }
+
+    /// Bump the iteration counter on a job and persist the new value.
+    /// Loads → mutates → saves, relying on the actor model for
+    /// per-job serialization (only one actor mutates a given job at a
+    /// time, so there is no lost-update race within a session).
+    /// Called by `AgentLoop` at each iteration boundary so the
+    /// terminal-event subscribers (notably `SelfImprovementManager`) see
+    /// an accurate count.
+    pub async fn record_iteration(&self, job_id: &JobId) -> Result<()> {
+        let mut job = self.load_job(job_id).await?;
+        job.record_iteration();
+        self.store.save(&job).await?;
         Ok(())
     }
 

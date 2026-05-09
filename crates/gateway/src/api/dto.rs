@@ -209,13 +209,15 @@ pub struct CreateCronRequest {
 // ── MemoryEntry ──────────────────────────────────────────────────────
 
 /// Mirror of [`aura_model::MemoryCategory`]. Serde uses an adjacently
-/// tagged shape where unit variants collapse to `{"type":"KeyFact"}`;
+/// tagged shape where unit variants collapse to `{"type":"User"}`;
 /// utoipa's derive can't express that, so the schema is hand-written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum MemoryCategory {
-    UserPreference,
-    KeyFact,
+    User,
+    Feedback,
+    Project,
+    Reference,
 }
 
 impl utoipa::PartialSchema for MemoryCategory {
@@ -226,7 +228,7 @@ impl utoipa::PartialSchema for MemoryCategory {
                 "type",
                 ObjectBuilder::new()
                     .schema_type(SchemaType::Type(Type::String))
-                    .enum_values(Some(vec!["UserPreference", "KeyFact"])),
+                    .enum_values(Some(vec!["User", "Feedback", "Project", "Reference"])),
             )
             .required("type")
             .build()
@@ -243,8 +245,10 @@ impl utoipa::ToSchema for MemoryCategory {
 impl From<aura_model::MemoryCategory> for MemoryCategory {
     fn from(v: aura_model::MemoryCategory) -> Self {
         match v {
-            aura_model::MemoryCategory::UserPreference => Self::UserPreference,
-            aura_model::MemoryCategory::KeyFact => Self::KeyFact,
+            aura_model::MemoryCategory::User => Self::User,
+            aura_model::MemoryCategory::Feedback => Self::Feedback,
+            aura_model::MemoryCategory::Project => Self::Project,
+            aura_model::MemoryCategory::Reference => Self::Reference,
         }
     }
 }
@@ -394,15 +398,40 @@ impl From<aura_job::JobKind> for JobKind {
     }
 }
 
+/// Wire mirror of [`aura_model::SystemReason`]. Surfaced on `Job` so
+/// frontend can distinguish self_improvement system jobs from
+/// history-review system jobs without parsing `JobInput.payload`.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemReason {
+    HistoryReview,
+    SelfImprovement,
+}
+
+impl From<aura_model::SystemReason> for SystemReason {
+    fn from(v: aura_model::SystemReason) -> Self {
+        match v {
+            aura_model::SystemReason::HistoryReview => Self::HistoryReview,
+            aura_model::SystemReason::SelfImprovement => Self::SelfImprovement,
+        }
+    }
+}
+
 /// Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
 /// state machine (Q6) — `final_result` replaces `output`/`error`,
 /// `emitted_span_ids` replaces `trace_span_id`.
+///
+/// `system_reason` is populated when `kind == System`; it lets the
+/// trace-page cross-link badge identify a self_improvement child of a
+/// user-chat job without exposing the full `JobInput` over the wire.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Job {
     pub id: String,
     pub session_id: String,
     pub parent_job_id: Option<String>,
     pub kind: JobKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_reason: Option<SystemReason>,
     pub status: JobStatus,
     #[schema(value_type = Option<Object>)]
     pub final_result: Option<serde_json::Value>,
@@ -415,11 +444,16 @@ pub struct Job {
 
 impl From<aura_job::Job> for Job {
     fn from(v: aura_job::Job) -> Self {
+        let system_reason = match &v.input {
+            aura_job::JobInput::System { reason, .. } => Some(reason.clone().into()),
+            _ => None,
+        };
         Self {
             id: v.id.to_string(),
             session_id: v.session_id.to_string(),
             parent_job_id: v.parent_job_id.map(|p| p.to_string()),
             kind: v.kind.into(),
+            system_reason,
             status: v.status.into(),
             final_result: v
                 .final_result

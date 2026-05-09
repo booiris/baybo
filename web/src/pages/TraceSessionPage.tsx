@@ -885,6 +885,101 @@ function JobSidebar({
   );
 }
 
+// ── SelfImprovement cross-link ────────────────────────────────────────
+//
+// Renders a small badge in the JobDetailsPanel header when the
+// displayed job either spawned a self_improvement child or *is* itself a
+// self_improvement system job. Implements the `↘ SelfImprovement` /
+// `↖ Triggered by user-chat job` cross-link from
+// `docs/modules/self-improvement.md` Q12. Lazy-fetches via the
+// `/v1/jobs/{id}/children` and `/v1/jobs/{id}` admin endpoints — the
+// `Job` DTO carries `kind` (`user_chat`/`cron`/`system`/`spawned`) and,
+// for system jobs, `system_reason`, so identifying a self_improvement
+// child is just `kind === 'system' && system_reason === 'self_improvement'`.
+
+interface SelfImprovementLinkInfo {
+  /// SelfImprovement child of this user-chat job, if any.
+  childSelfImprovementJobId?: string;
+  /// Parent (originating) job, if this *is* a self_improvement job.
+  parentJobIdIfSelfImprovement?: string;
+}
+
+function SelfImprovementCrossLink({ jobId }: { jobId: string }) {
+  const isMock = useMockMode();
+  const client = useAdminClient();
+  const navigate = useNavigate();
+  const [info, setInfo] = useState<SelfImprovementLinkInfo | null>(null);
+
+  useEffect(() => {
+    if (isMock || !jobId) {
+      setInfo(null);
+      return;
+    }
+    let cancelled = false;
+    async function load() {
+      try {
+        const [{ data: jobResp }, { data: childResp }] = await Promise.all([
+          client.GET('/v1/jobs/{id}', { params: { path: { id: jobId } } }),
+          client.GET('/v1/jobs/{id}/children', { params: { path: { id: jobId } } }),
+        ]);
+        if (cancelled) return;
+        const result: SelfImprovementLinkInfo = {};
+        const items = childResp?.items ?? [];
+        const distChild = items.find(
+          (j) => j.kind === 'system' && j.system_reason === 'self_improvement',
+        );
+        if (distChild) result.childSelfImprovementJobId = distChild.id;
+        if (
+          jobResp?.kind === 'system' &&
+          jobResp.system_reason === 'self_improvement' &&
+          jobResp.parent_job_id
+        ) {
+          // Parent's session id isn't on this DTO; rendering the badge
+          // as a non-clickable pill (the trace endpoint is session-
+          // scoped, so we'd need a follow-up fetch to make it linkable).
+          result.parentJobIdIfSelfImprovement = jobResp.parent_job_id;
+        }
+        setInfo(result);
+      } catch {
+        setInfo(null);
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, isMock, jobId]);
+
+  if (!info || (!info.childSelfImprovementJobId && !info.parentJobIdIfSelfImprovement)) {
+    return null;
+  }
+
+  return (
+    <div className="mt-3 flex flex-wrap gap-2 text-[0.75rem] font-mono">
+      {info.childSelfImprovementJobId && (
+        <button
+          type="button"
+          onClick={() =>
+            navigate(`/traces?job=${encodeURIComponent(info.childSelfImprovementJobId!)}`)
+          }
+          className="px-2 py-1 border-2 border-black bg-white hover:bg-canvas uppercase tracking-wider text-[0.7rem]"
+          title={`self_improvement child job ${info.childSelfImprovementJobId}`}
+        >
+          ↘ self_improvement
+        </button>
+      )}
+      {info.parentJobIdIfSelfImprovement && (
+        <span
+          className="px-2 py-1 border-2 border-black bg-canvas uppercase tracking-wider text-[0.7rem]"
+          title={`triggered by user-chat job ${info.parentJobIdIfSelfImprovement}`}
+        >
+          ↖ triggered by {info.parentJobIdIfSelfImprovement.slice(0, 8)}…
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ── Right panel default: job-level summary ─────────────────────────
 
 function JobSummaryPanel({
@@ -933,6 +1028,7 @@ function JobSummaryPanel({
             </div>
           </div>
         </div>
+        <SelfImprovementCrossLink jobId={job.job_id} />
       </div>
 
       <div className="flex-1 overflow-y-scroll p-5 space-y-6">

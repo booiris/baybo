@@ -545,9 +545,9 @@ pub struct RouterRunHandle {
 pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let buffer = graph.config.channels.message_buffer_size;
 
-    let session_log_dir =
-        aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&graph.config.workspace.path))
-            .sessions_log_dir();
+    let workspace_paths =
+        aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&graph.config.workspace.path));
+    let session_log_dir = workspace_paths.sessions_log_dir();
     let session_logger = Arc::new(SessionLlmLogger::new(session_log_dir));
 
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(TiktokenTokenizer::for_model(
@@ -701,6 +701,135 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         .take()
         .expect("wire_router called twice; cron_trigger_rx already consumed");
     let router = router.with_cron_triggers(cron_trigger_rx);
+
+    // ── SelfImprovement wiring ──────────────────────────────────────────
+    //
+    // The self_improvement flow runs in its own AgentLoop with a *separate*
+    // tool registry containing only the four `self_improvement_tools`.
+    // Registration isolation is the entire protection model for
+    // `MemoryWrite` / `SkillCreate` / `MemoryList` / `SkillList`
+    // (`docs/modules/self-improvement.md` Q7) — they intentionally bypass
+    // the approval gate, which is safe only because they're never
+    // exposed to a user-facing actor.
+    let router = {
+        let dcfg = &graph.config.agent.self_improvement;
+        if !dcfg.enabled {
+            info!("self_improvement disabled by config; skipping wiring");
+            router
+        } else {
+            // SelfImprovement-specific tool registry + executor. Own
+            // `ApprovalGateMap` (empty) is fine — the four tools
+            // declare empty `accessed_resources()` so the gate is
+            // never consulted.
+            let mut dist_registry = aura_tools::ToolRegistry::new();
+            for (tool, manifest) in aura_agent::self_improvement::self_improvement_tools(
+                Arc::clone(&graph.memory_manager),
+                Arc::clone(&graph.skill_registry),
+            ) {
+                dist_registry.register(tool, manifest);
+            }
+            let dist_registry = Arc::new(dist_registry);
+            let dist_gate_map = Arc::new(aura_tools::ApprovalGateMap::new());
+            let dist_executor = Arc::new(aura_agent::ToolExecutor::new(
+                Arc::clone(&dist_registry),
+                dist_gate_map,
+                Arc::clone(&graph.security_gateway),
+                workspace_paths.work_dir(),
+                workspace_paths.clone(),
+                None,
+            ));
+
+            // SelfImprovement actor spawner. Mirrors `spawn_actor_for`
+            // but swaps the tool registry/executor to the self_improvement
+            // pair. Other deps stay the same.
+            let dist_llm = guarded_llm.clone();
+            let dist_skill_registry = Arc::clone(&graph.skill_registry);
+            let dist_memory_manager = Arc::clone(&graph.memory_manager);
+            let dist_trace_store = graph.stores.trace.clone();
+            let dist_job_lifecycle = Arc::clone(&graph.job_lifecycle);
+            let dist_skill_assessor = Arc::clone(&graph.skill_assessor);
+            let dist_security_gateway = Arc::clone(&graph.security_gateway);
+            let dist_session_logger = Arc::clone(&session_logger);
+            let dist_tokenizer = Arc::clone(&tokenizer);
+            let dist_trace_event_stream = trace_event_stream.clone();
+            let dist_token_budget = token_budget.clone();
+            let dist_policy = policy.clone();
+            let dist_system_prompt = system_prompt.clone();
+            let dist_cost_manager = Arc::clone(&cost_manager);
+            let dist_token_calibration = Arc::clone(&token_calibration);
+            let dist_sessions = Arc::clone(&graph.session_manager);
+
+            let self_improvement_spawner: aura_agent::ActorSpawner = Box::new(
+                move |session: aura_model::Session,
+                      response_tx: mpsc::Sender<AgentOutput>,
+                      parent_token: &CancellationToken| {
+                    let agent_loop = AgentLoop::new(
+                        dist_llm.clone(),
+                        Arc::clone(&dist_registry),
+                        Arc::clone(&dist_skill_registry),
+                        Arc::clone(&dist_executor),
+                        ContextManager::new(
+                            Arc::clone(&dist_tokenizer),
+                            Box::new(Summarize::new(keep_recent)),
+                            dist_token_budget.clone(),
+                        )
+                        .with_calibration(Arc::clone(&dist_token_calibration))
+                        .with_skill_registry(Arc::clone(&dist_skill_registry))
+                        .with_session(session.id.clone(), Arc::clone(&dist_sessions)),
+                        Arc::clone(&dist_memory_manager),
+                        dist_policy.clone(),
+                        Soul::custom(dist_system_prompt.clone()),
+                        Arc::clone(&dist_security_gateway),
+                    )
+                    .with_skill_assessor(Arc::clone(&dist_skill_assessor))
+                    .with_session_log(Arc::clone(&dist_session_logger))
+                    .with_cost_manager(Arc::clone(&dist_cost_manager));
+
+                    let span_recorder = Arc::new(SpanRecorder::new(
+                        session.id.clone(),
+                        session.user.id.clone(),
+                        Arc::clone(&dist_trace_store),
+                        dist_trace_event_stream.clone(),
+                    ));
+
+                    let actor = AgentActor::new(
+                        session,
+                        agent_loop,
+                        response_tx,
+                        Arc::clone(&dist_job_lifecycle),
+                        span_recorder,
+                        parent_token,
+                    );
+                    let (sender, mailbox) = mpsc::channel(buffer);
+                    tokio::spawn(async move {
+                        actor.run(mailbox).await;
+                    });
+                    sender
+                },
+            );
+
+            // System trigger mpsc + SelfImprovementManager.
+            let (system_tx, system_rx) = mpsc::channel(64);
+            let dist_config = aura_agent::self_improvement::SelfImprovementConfig {
+                enabled: dcfg.enabled,
+                min_iterations: dcfg.min_iterations,
+                daily_cap: dcfg.daily_cap,
+                max_concurrent: dcfg.max_concurrent,
+            };
+            let manager = Arc::new(aura_agent::self_improvement::SelfImprovementManager::new(
+                dist_config,
+                Arc::clone(&graph.job_lifecycle),
+                graph.stores.session.clone(),
+                workspace_paths.clone(),
+                system_tx,
+            ));
+            let _handle = manager.spawn();
+
+            router
+                .with_self_improvement_spawner(self_improvement_spawner)
+                .with_system_triggers(system_rx)
+        }
+    };
 
     RouterRunHandle {
         router,

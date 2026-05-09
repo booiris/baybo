@@ -5,6 +5,12 @@
       "max_tokens": 120000,
       "compression_threshold": 0.75,
       "keep_recent": 100
+    },
+    "self_improvement": {
+      "enabled": true,
+      "min_iterations": 8,
+      "daily_cap": 100,
+      "max_concurrent": 8
     }
   },
   "session": {

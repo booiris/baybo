@@ -12,6 +12,7 @@ pub mod router;
 pub mod sandbox;
 mod scope;
 pub mod security;
+pub mod self_improvement;
 pub mod service;
 pub mod session;
 pub mod session_log;

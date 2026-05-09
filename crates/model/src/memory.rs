@@ -1,11 +1,32 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Semantic category for a `MemoryEntry`. The four-variant shape mirrors
+/// the design in `docs/modules/self-improvement.md`:
+///
+/// - `User` — facts and self-described preferences about the person
+///   (role, expertise, working style, stack, project context that's
+///   really about *them*, not the project).
+/// - `Feedback` — corrections and validations the user has given the
+///   agent ("don't do X"; "yes that approach was right"). Body should
+///   carry a `Why:` line and a `How to apply:` line.
+/// - `Project` — in-flight work / decisions / deadlines specific to the
+///   current project. Body should carry `Why:` and `How to apply:` lines.
+/// - `Reference` — pointers to where information lives in external
+///   systems (Linear, Slack, dashboards, etc.).
+///
+/// Migration: pre-self_improvement rows used `UserPreference` / `KeyFact`.
+/// Both deserialize to `User` via serde aliases so old rows keep loading
+/// without an in-place SQL rewrite; the next time the entry is rewritten
+/// it gets the new tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum MemoryCategory {
-    UserPreference,
-    KeyFact,
+    #[serde(alias = "UserPreference", alias = "KeyFact")]
+    User,
+    Feedback,
+    Project,
+    Reference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -8,6 +8,10 @@ pub struct AgentConfig {
     pub max_iterations: usize,
     /// Context window configuration.
     pub context: ContextConfig,
+    /// Side-channel memory + skill extraction flow that runs after a
+    /// complex user-chat job completes. See
+    /// `docs/modules/self-improvement.md`.
+    pub self_improvement: SelfImprovementConfig,
 }
 
 impl Default for AgentConfig {
@@ -15,6 +19,34 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 20,
             context: ContextConfig::default(),
+            self_improvement: SelfImprovementConfig::default(),
+        }
+    }
+}
+
+/// Mirror of [`aura_agent::self_improvement::SelfImprovementConfig`]. Lives
+/// here so `aura-config` can stay decoupled from `aura-agent`. The
+/// bootstrap layer in `src/runtime.rs` translates one to the other.
+///
+/// Defaults match the spec in `docs/modules/self-improvement.md`:
+/// enabled, `min_iterations = 8`, `daily_cap = 100`,
+/// `max_concurrent = 8`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SelfImprovementConfig {
+    pub enabled: bool,
+    pub min_iterations: u32,
+    pub daily_cap: u32,
+    pub max_concurrent: usize,
+}
+
+impl Default for SelfImprovementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_iterations: 8,
+            daily_cap: 100,
+            max_concurrent: 8,
         }
     }
 }

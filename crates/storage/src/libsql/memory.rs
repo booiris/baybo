@@ -193,7 +193,7 @@ mod tests {
             id: id.to_string(),
             user_id: user_id.to_string(),
             content: content.to_string(),
-            category: MemoryCategory::KeyFact,
+            category: MemoryCategory::User,
             importance: 0.5,
             embedding: None,
             created_at: now,

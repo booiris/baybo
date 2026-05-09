@@ -55,10 +55,7 @@ mod tests {
         // run on a name that was never sanitized.
         let original = "update_profile";
         assert_eq!(sanitize_tool_name(original), original);
-        assert_eq!(
-            sanitize_tool_name(&sanitize_tool_name(original)),
-            original,
-        );
+        assert_eq!(sanitize_tool_name(&sanitize_tool_name(original)), original,);
     }
 
     #[test]

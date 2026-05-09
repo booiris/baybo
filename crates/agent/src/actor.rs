@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
 use aura_job::JobInput;
-use aura_model::{ContentBlock, Session};
+use aura_model::{ContentBlock, Session, SystemReason};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -28,6 +29,19 @@ pub enum AgentMessage {
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
         parent_job_id: aura_model::JobId,
+    },
+    /// A system subsystem fired a side-channel trigger (currently:
+    /// self_improvement, see `crate::self_improvement`). The actor that
+    /// receives this MUST have been constructed with the right tool
+    /// ceiling for `reason` — Router uses a separate
+    /// `self_improvement_spawner` to ensure that. `payload` carries
+    /// trigger-specific data (e.g. `trigger_job_id`,
+    /// `originating_session_id`, `iterations`, `retry_count`) so the
+    /// handler can reconstruct what to feed the agent.
+    SystemTrigger {
+        reason: SystemReason,
+        payload: Value,
+        parent_job_id: Option<aura_model::JobId>,
     },
     /// Gracefully shut down this actor.
     Shutdown,
@@ -136,6 +150,22 @@ impl AgentActor {
                             session_id = %self.session.id,
                             error = %e,
                             "failed to handle subagent spawn"
+                        );
+                    }
+                }
+                AgentMessage::SystemTrigger {
+                    reason,
+                    payload,
+                    parent_job_id,
+                } => {
+                    if let Err(e) = self
+                        .handle_system_trigger(reason, payload, parent_job_id)
+                        .await
+                    {
+                        error!(
+                            session_id = %self.session.id,
+                            error = %e,
+                            "failed to handle system trigger"
                         );
                     }
                 }
@@ -282,6 +312,37 @@ impl AgentActor {
             .await?;
         if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
             warn!(error = %e, "failed to send subagent response");
+        }
+        Ok(())
+    }
+
+    /// Run the agent loop for a system-triggered side-channel session
+    /// (currently: self_improvement). The actor MUST have been constructed
+    /// by Router's `self_improvement_spawner` so its `AgentLoop` carries the
+    /// right tool ceiling. The synthesized user message is built by
+    /// `crate::self_improvement::prompt::build_self_improvement_prompt`.
+    async fn handle_system_trigger(
+        &mut self,
+        reason: SystemReason,
+        payload: Value,
+        parent_job_id: Option<aura_model::JobId>,
+    ) -> anyhow::Result<()> {
+        debug!(
+            session_id = %self.session.id,
+            reason = ?reason,
+            "received system trigger"
+        );
+        let user_content =
+            crate::self_improvement::prompt::build_initial_user_message(&reason, &payload);
+        let job_input = JobInput::System {
+            reason,
+            payload: payload.clone(),
+        };
+        let response = self
+            .run_agent_loop(job_input, user_content, parent_job_id, None)
+            .await?;
+        if let Err(e) = self.response_tx.send(AgentOutput::Message(response)).await {
+            warn!(error = %e, "failed to send system-trigger response");
         }
         Ok(())
     }

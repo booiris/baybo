@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn input_round_trips_through_serde() {
         let i = JobInput::System {
-            reason: SystemReason::MemoryConsolidation,
+            reason: SystemReason::SelfImprovement,
             payload: serde_json::json!({"target": "user-1"}),
         };
         let s = serde_json::to_string(&i).unwrap();
