@@ -34,6 +34,7 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         ModelPricing {
             input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
             output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
+            ..Default::default()
         }
     }
 

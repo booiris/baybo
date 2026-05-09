@@ -50,14 +50,9 @@ struct SnapshotFile {
 struct RawPricing {
     prompt: String,
     completion: String,
-    // Cache-tier rates are decoded but not yet plumbed through
-    // `compute_cost_usd` — kept in the snapshot so widening
-    // `ModelPricing` later is data-only, not another scrape.
     #[serde(default)]
-    #[allow(dead_code)]
     input_cache_read: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     input_cache_write: Option<String>,
 }
 
@@ -66,6 +61,14 @@ impl RawPricing {
         Some(ModelPricing {
             input_per_1m_tokens: parse_per_token_to_per_million_micros(&self.prompt)?,
             output_per_1m_tokens: parse_per_token_to_per_million_micros(&self.completion)?,
+            cached_input_per_1m_tokens: self
+                .input_cache_read
+                .as_deref()
+                .and_then(parse_per_token_to_per_million_micros),
+            cache_write_per_1m_tokens: self
+                .input_cache_write
+                .as_deref()
+                .and_then(parse_per_token_to_per_million_micros),
         })
     }
 }
@@ -469,6 +472,31 @@ mod tests {
         assert_eq!(
             slug_for("openai", "gpt-4-1106-preview").as_deref(),
             Some("openai/gpt-4-1106-preview"),
+        );
+    }
+
+    #[test]
+    fn snapshot_carries_cache_tier_rates_for_anthropic() {
+        // Anthropic's flagship slugs ship cache_read + cache_write
+        // rates on OpenRouter; the regen script keeps them. If this
+        // ever fires after a snapshot refresh, OpenRouter dropped the
+        // fields upstream — the schema-defaulting in `RawPricing`
+        // would silently leave them as None and Anthropic-cache
+        // workflows would re-regress to the input rate.
+        let p = snapshot_pricing("anthropic/claude-opus-4.6")
+            .expect("anthropic/claude-opus-4.6 priced");
+        assert!(p.cached_input_per_1m_tokens.is_some());
+        assert!(p.cache_write_per_1m_tokens.is_some());
+        let input = p.input_per_1m_tokens;
+        let cached = p.cached_input_per_1m_tokens.unwrap();
+        let write = p.cache_write_per_1m_tokens.unwrap();
+        assert!(
+            cached < input,
+            "cache_read should be cheaper than input: cached={cached:?} input={input:?}",
+        );
+        assert!(
+            write > input,
+            "cache_write should be costlier than input: write={write:?} input={input:?}",
         );
     }
 

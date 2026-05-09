@@ -1,4 +1,5 @@
-//! Query API v1 — the read surface from `docs/todo/trace-redesign.md` §12.
+//! Query API v1 — the read surface over Session / Job / Step / Span,
+//! defined as the union of the read paths in `docs/modules/{session,job,trace}.md`.
 //!
 //! 9 endpoints:
 //!

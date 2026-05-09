@@ -99,10 +99,7 @@ pub trait LlmProviderFactory: Send + Sync {
     /// (`openai-subscription`) and for any provider whose factory
     /// doesn't (yet) ship per-token pricing.
     fn flat_default_pricing(&self) -> crate::ModelPricing {
-        crate::ModelPricing {
-            input_per_1m_tokens: aura_model::MicroUsd::ZERO,
-            output_per_1m_tokens: aura_model::MicroUsd::ZERO,
-        }
+        crate::ModelPricing::default()
     }
 
     /// Live discovery: ask the provider's catalog endpoint what models the

@@ -36,6 +36,7 @@ impl LlmProviderFactory for GeminiProviderFactory {
         ModelPricing {
             input_per_1m_tokens: MicroUsd::from_usd_decimal(0.075),
             output_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
+            ..Default::default()
         }
     }
 

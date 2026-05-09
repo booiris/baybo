@@ -130,14 +130,26 @@ pub struct ModelInfo {
 
 /// Per-token pricing information for a model.
 ///
-/// Both rates are micro-USD per **1M tokens** (so $3.00 / MTok →
+/// All rates are micro-USD per **1M tokens** (so $3.00 / MTok →
 /// `MicroUsd::from_micros(3_000_000)`). Use [`MicroUsd::cost_for_tokens`]
 /// to apply these to a token count — that path keeps everything in
 /// integer math, no float drift.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// `cached_input_per_1m_tokens` and `cache_write_per_1m_tokens` are
+/// `None` when the provider doesn't bill prompt-cache traffic
+/// separately (or the snapshot row pre-dates the field). When set,
+/// `compute_cost_usd` charges the cached portion of `input_tokens`
+/// at the cached rate instead of the full input rate, and bills
+/// `cache_creation_input_tokens` at the write rate. Typical multipliers
+/// vs. the input rate: 0.1× cached read, 1.25× cache write.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ModelPricing {
     pub input_per_1m_tokens: aura_model::MicroUsd,
     pub output_per_1m_tokens: aura_model::MicroUsd,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
 }
 
 /// Unified response structure returned by `LlmClient::chat()`.
@@ -260,6 +272,36 @@ impl LlmStream {
         }
     }
 
+    /// Anthropic-specific variant of [`Self::from_rig_stream`].
+    /// Anthropic's API reports `input_tokens / cache_read /
+    /// cache_creation` as disjoint buckets summing to the total
+    /// prompt; this wrapper folds the cache buckets back into
+    /// `input_tokens` so the field uniformly means "total prompt"
+    /// across providers (matching OpenAI / Gemini). `cached_input_tokens`
+    /// and `cache_creation_input_tokens` stay populated so
+    /// `compute_cost_usd` can split them out at billing rates.
+    fn from_anthropic_stream(
+        rig_stream: streaming::StreamingCompletionResponse<
+            anthropic::streaming::StreamingCompletionResponse,
+        >,
+    ) -> Self {
+        let mapped = rig_stream.filter_map(|result| {
+            futures::future::ready(match result {
+                Err(e) => Some(Err(rig_completion_to_error(e))),
+                Ok(event) => match convert_stream_event(event) {
+                    Some(Ok(StreamEvent::Usage(mut usage))) => {
+                        fold_token_usage_cache_into_total(&mut usage);
+                        Some(Ok(StreamEvent::Usage(usage)))
+                    }
+                    other => other,
+                },
+            })
+        });
+        Self {
+            inner: Box::pin(mapped),
+        }
+    }
+
     /// Gemini-specific variant of [`Self::from_rig_stream`]. rig 0.34's
     /// `GetTokenUsage` impl for Gemini's streaming response leaves
     /// `cached_input_tokens` at 0; this wrapper reads
@@ -292,6 +334,26 @@ impl LlmStream {
             inner: Box::pin(mapped),
         }
     }
+}
+
+/// Anthropic reports `input_tokens / cache_read / cache_creation` as
+/// disjoint buckets summing to the total prompt; OpenAI and Gemini
+/// report `input_tokens = total prompt` with cached as a subset.
+/// Folds the cache buckets back into `input_tokens` so the field
+/// uniformly means "total prompt" downstream — `compute_cost_usd`
+/// can run one billing formula across providers.
+fn fold_anthropic_cache_into_total(usage: &mut completion::Usage) {
+    usage.input_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cached_input_tokens)
+        .saturating_add(usage.cache_creation_input_tokens);
+}
+
+fn fold_token_usage_cache_into_total(usage: &mut TokenUsage) {
+    usage.input_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cached_input_tokens)
+        .saturating_add(usage.cache_creation_input_tokens);
 }
 
 fn convert_stream_event<R: GetTokenUsage>(
@@ -355,9 +417,11 @@ impl AnyCompletionModel {
             }
             Self::Anthropic(m) => {
                 let resp = m.completion(request).await?;
+                let mut usage = resp.usage;
+                fold_anthropic_cache_into_total(&mut usage);
                 Ok(completion::CompletionResponse {
                     choice: resp.choice,
-                    usage: resp.usage,
+                    usage,
                     raw_response: (),
                     message_id: resp.message_id,
                 })
@@ -395,7 +459,7 @@ impl AnyCompletionModel {
             }
             Self::Anthropic(m) => {
                 let stream = m.stream(request).await?;
-                Ok(LlmStream::from_rig_stream(stream))
+                Ok(LlmStream::from_anthropic_stream(stream))
             }
             Self::Gemini(m) => {
                 let stream = m.stream(request).await?;
@@ -1155,5 +1219,43 @@ mod multimodal_dispatch_tests {
             Some(ImageMediaType::JPEG),
         );
         assert_eq!(parse_image_media_type("image/x-fancy"), None);
+    }
+}
+
+#[cfg(test)]
+mod cost_normalization_tests {
+    //! Pin: the Anthropic adapter folds disjoint cache buckets back
+    //! into `input_tokens` so downstream `compute_cost_usd` can use
+    //! one billing formula across providers. If this regresses,
+    //! Anthropic-cache workflows under-bill the cached/cache-write
+    //! portions.
+
+    use super::*;
+
+    #[test]
+    fn fold_token_usage_adds_cache_buckets_into_total() {
+        let mut u = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_input_tokens: 50,
+            cache_creation_input_tokens: 30,
+        };
+        fold_token_usage_cache_into_total(&mut u);
+        assert_eq!(u.input_tokens, 180);
+        assert_eq!(u.cached_input_tokens, 50);
+        assert_eq!(u.cache_creation_input_tokens, 30);
+        assert_eq!(u.output_tokens, 20);
+    }
+
+    #[test]
+    fn fold_token_usage_is_idempotent_on_zero_cache_buckets() {
+        let mut u = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        fold_token_usage_cache_into_total(&mut u);
+        assert_eq!(u.input_tokens, 100);
     }
 }

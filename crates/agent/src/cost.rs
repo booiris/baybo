@@ -125,16 +125,40 @@ impl BudgetState {
     }
 }
 
+/// Bills a single LLM call against the model's per-1M rates.
+///
+/// Convention: `input_tokens` is the **total** prompt token count
+/// (including any cached or cache-write portion). `cached_input_tokens`
+/// and `cache_creation_input_tokens` are subsets — billing splits
+/// `input_tokens` into three buckets (full-rate, cache-read, cache-write)
+/// using `cached_input_per_1m_tokens` / `cache_write_per_1m_tokens`
+/// when present, falling back to `input_per_1m_tokens` when the
+/// model's pricing row hasn't yet exposed cache rates. The Anthropic
+/// adapter (`from_anthropic_*` in `aura-llm`) normalises its native
+/// disjoint buckets to this convention so the formula is uniform
+/// across providers.
 fn compute_cost_usd(
     pricing: &HashMap<String, ModelPricing>,
     model_id: &str,
     input_tokens: usize,
     output_tokens: usize,
+    cached_input_tokens: usize,
+    cache_creation_input_tokens: usize,
 ) -> MicroUsd {
     let Some(p) = pricing.get(model_id) else {
         return MicroUsd::ZERO;
     };
-    MicroUsd::cost_for_tokens(p.input_per_1m_tokens, input_tokens as u64)
+    let cached_subset = cached_input_tokens.saturating_add(cache_creation_input_tokens);
+    let full_rate_input = input_tokens.saturating_sub(cached_subset) as u64;
+    let cached_rate = p
+        .cached_input_per_1m_tokens
+        .unwrap_or(p.input_per_1m_tokens);
+    let cache_write_rate = p
+        .cache_write_per_1m_tokens
+        .unwrap_or(p.input_per_1m_tokens);
+    MicroUsd::cost_for_tokens(p.input_per_1m_tokens, full_rate_input)
+        + MicroUsd::cost_for_tokens(cached_rate, cached_input_tokens as u64)
+        + MicroUsd::cost_for_tokens(cache_write_rate, cache_creation_input_tokens as u64)
         + MicroUsd::cost_for_tokens(p.output_per_1m_tokens, output_tokens as u64)
 }
 
@@ -183,14 +207,24 @@ impl CostManager {
     }
 
     /// Compute spend for the given token counts. Returns
-    /// [`MicroUsd::ZERO`] when the model is unknown.
+    /// [`MicroUsd::ZERO`] when the model is unknown. See
+    /// [`compute_cost_usd`] for the bucket convention.
     pub fn cost_usd_for(
         &self,
         model_id: &str,
         input_tokens: usize,
         output_tokens: usize,
+        cached_input_tokens: usize,
+        cache_creation_input_tokens: usize,
     ) -> MicroUsd {
-        compute_cost_usd(&self.pricing.read(), model_id, input_tokens, output_tokens)
+        compute_cost_usd(
+            &self.pricing.read(),
+            model_id,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        )
     }
 
     /// Overlay live rates onto the snapshot map; `warn!`s when drift
@@ -301,7 +335,14 @@ impl CostManager {
         cache_creation_input_tokens: usize,
     ) {
         let now = Utc::now();
-        let cost = compute_cost_usd(&self.pricing.read(), model_id, input_tokens, output_tokens);
+        let cost = compute_cost_usd(
+            &self.pricing.read(),
+            model_id,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        );
 
         if cost > MicroUsd::ZERO {
             let mut state = self.state.write();
@@ -411,6 +452,7 @@ mod tests {
             ModelPricing {
                 input_per_1m_tokens: MicroUsd::from_usd_decimal(input),
                 output_per_1m_tokens: MicroUsd::from_usd_decimal(output),
+                ..Default::default()
             },
         );
         h
@@ -421,7 +463,7 @@ mod tests {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let sub = CostManager::new(store, pricing("m1", 3.0, 15.0), SpendingLimits::default());
         // 1k input + 2k output → (1000/1e6)*3 + (2000/1e6)*15 = 0.003 + 0.030 = $0.033
-        let cost = sub.cost_usd_for("m1", 1_000, 2_000);
+        let cost = sub.cost_usd_for("m1", 1_000, 2_000, 0, 0);
         assert_eq!(cost, MicroUsd::from_usd_decimal(0.033));
     }
 
@@ -430,7 +472,7 @@ mod tests {
         let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let sub = CostManager::new(store, pricing("m1", 3.0, 15.0), SpendingLimits::default());
         assert_eq!(
-            sub.cost_usd_for("unknown", 1_000_000, 1_000_000),
+            sub.cost_usd_for("unknown", 1_000_000, 1_000_000, 0, 0),
             MicroUsd::ZERO
         );
     }
@@ -443,15 +485,69 @@ mod tests {
         let cm = CostManager::new(store, pricing("m1", 3.0, 15.0), SpendingLimits::default());
         // Before merge: original snapshot rate.
         assert_eq!(
-            cm.cost_usd_for("m1", 1_000, 0),
+            cm.cost_usd_for("m1", 1_000, 0, 0, 0),
             MicroUsd::from_usd_decimal(0.003),
         );
         // Halve the rate live.
         cm.merge_pricings(pricing("m1", 1.5, 7.5));
         assert_eq!(
-            cm.cost_usd_for("m1", 1_000, 0),
+            cm.cost_usd_for("m1", 1_000, 0, 0, 0),
             MicroUsd::from_usd_decimal(0.0015),
         );
+    }
+
+    #[test]
+    fn cost_usd_for_splits_cached_subset_at_cached_rate() {
+        // input_tokens is the TOTAL prompt; cached_input_tokens is a
+        // subset billed at the (cheaper) cached rate. With cached =
+        // 600 of 1000 prompt tokens at full=$3 / cached=$0.30:
+        //   non-cached portion: 400 tokens × $3/M = $0.0012
+        //   cached portion:     600 tokens × $0.30/M = $0.00018
+        //   output:               0
+        //   total = $0.00138
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let mut h = pricing("m1", 3.0, 15.0);
+        if let Some(p) = h.get_mut("m1") {
+            p.cached_input_per_1m_tokens = Some(MicroUsd::from_usd_decimal(0.30));
+        }
+        let cm = CostManager::new(store, h, SpendingLimits::default());
+        assert_eq!(
+            cm.cost_usd_for("m1", 1_000, 0, 600, 0),
+            MicroUsd::from_usd_decimal(0.00138),
+        );
+    }
+
+    #[test]
+    fn cost_usd_for_bills_cache_creation_at_write_rate() {
+        // Anthropic-style: cache_creation portion charged at 1.25× input.
+        // input=1000 (total), cache_creation=200, full=$3, write=$3.75:
+        //   non-cached: 800 × $3/M = $0.0024
+        //   write:      200 × $3.75/M = $0.00075
+        //   total = $0.00315
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let mut h = pricing("m1", 3.0, 15.0);
+        if let Some(p) = h.get_mut("m1") {
+            p.cache_write_per_1m_tokens = Some(MicroUsd::from_usd_decimal(3.75));
+        }
+        let cm = CostManager::new(store, h, SpendingLimits::default());
+        assert_eq!(
+            cm.cost_usd_for("m1", 1_000, 0, 0, 200),
+            MicroUsd::from_usd_decimal(0.00315),
+        );
+    }
+
+    #[test]
+    fn cost_usd_for_falls_back_to_input_rate_when_cache_rates_missing() {
+        // Pricing row without cache rates → cache buckets bill at the
+        // standard input rate. Total cost equals input_tokens × input_rate
+        // regardless of how it splits across buckets — pin that
+        // invariant so a future refactor doesn't accidentally drop the
+        // cached portion to $0.
+        let store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let cm = CostManager::new(store, pricing("m1", 3.0, 15.0), SpendingLimits::default());
+        let with_cache = cm.cost_usd_for("m1", 1_000, 0, 700, 100);
+        let without_cache = cm.cost_usd_for("m1", 1_000, 0, 0, 0);
+        assert_eq!(with_cache, without_cache);
     }
 
     #[test]
@@ -461,12 +557,12 @@ mod tests {
         cm.merge_pricings(pricing("m2", 0.5, 2.0));
         // Original m1 still priced at the snapshot rate.
         assert_eq!(
-            cm.cost_usd_for("m1", 1_000, 0),
+            cm.cost_usd_for("m1", 1_000, 0, 0, 0),
             MicroUsd::from_usd_decimal(0.003),
         );
         // New m2 attribution lands at the merged rate.
         assert_eq!(
-            cm.cost_usd_for("m2", 1_000_000, 0),
+            cm.cost_usd_for("m2", 1_000_000, 0, 0, 0),
             MicroUsd::from_usd_decimal(0.5),
         );
     }

@@ -43,10 +43,7 @@ impl Default for StubLlm {
                 context_window: 8_192,
                 supports_tools: true,
                 supports_vision: false,
-                pricing: ModelPricing {
-                    input_per_1m_tokens: aura_model::MicroUsd::ZERO,
-                    output_per_1m_tokens: aura_model::MicroUsd::ZERO,
-                },
+                pricing: ModelPricing::default(),
             },
             chat_queue: Mutex::new(std::collections::VecDeque::new()),
             stream_queue: Mutex::new(std::collections::VecDeque::new()),

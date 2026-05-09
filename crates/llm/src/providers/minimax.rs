@@ -43,6 +43,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         ModelPricing {
             input_per_1m_tokens: MicroUsd::from_usd_decimal(0.40),
             output_per_1m_tokens: MicroUsd::from_usd_decimal(2.20),
+            ..Default::default()
         }
     }
 
