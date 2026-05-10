@@ -16,11 +16,31 @@ impl LibsqlSessionStore {
     }
 }
 
+/// SQL strings for the `lineage_kind` column, matched by both
+/// `lineage_kind_str` (write side) and `list_lineage_children` /
+/// `list_active_maintenance_for_parent` (read sides). Keeping them
+/// here as named constants prevents drift when a fourth variant lands.
+pub(super) const LINEAGE_KIND_SUBAGENT: &str = "subagent";
+pub(super) const LINEAGE_KIND_USER_FORK: &str = "user_fork";
+pub(super) const LINEAGE_KIND_SYSTEM_MAINTENANCE: &str = "system_maintenance";
+
 fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     s.lineage.as_ref().map(|l| match l.kind {
-        LineageKind::Subagent => "subagent",
-        LineageKind::UserFork { .. } => "user_fork",
+        LineageKind::Subagent => LINEAGE_KIND_SUBAGENT,
+        LineageKind::UserFork { .. } => LINEAGE_KIND_USER_FORK,
+        LineageKind::SystemMaintenance => LINEAGE_KIND_SYSTEM_MAINTENANCE,
     })
+}
+
+/// `is_normal_session` column value: `0` for maintenance sessions
+/// (`LineageKind::SystemMaintenance`), `1` otherwise. Default queries
+/// filter `is_normal_session = 1` so maintenance sessions stay
+/// invisible in regular listings; opt-in helpers query directly.
+fn is_normal_session_flag(s: &Session) -> i64 {
+    match s.lineage.as_ref().map(|l| &l.kind) {
+        Some(LineageKind::SystemMaintenance) => 0,
+        _ => 1,
+    }
 }
 
 #[async_trait]
@@ -72,11 +92,13 @@ impl SessionStore for LibsqlSessionStore {
             .as_ref()
             .map(|l| l.parent_job_id.to_string());
         let lineage_kind = lineage_kind_str(session).map(|s| s.to_string());
+        let is_normal = is_normal_session_flag(session);
         conn.execute(
             "INSERT OR REPLACE INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
-              lineage_kind, bound_soul_version, created_at, last_active, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              lineage_kind, bound_soul_version, created_at, last_active, \
+              is_normal_session, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             libsql::params![
                 session.id.as_str().to_string(),
                 session.root_session_id.as_str().to_string(),
@@ -87,6 +109,7 @@ impl SessionStore for LibsqlSessionStore {
                 session.bound_soul_version.clone(),
                 super::time::to_us(session.created_at),
                 super::time::to_us(session.last_active),
+                is_normal,
                 data,
             ],
         )
@@ -165,9 +188,15 @@ impl SessionStore for LibsqlSessionStore {
 
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>> {
         let conn = self.pool.conn();
+        // Maintenance sessions (`is_normal_session = 0`) are reaped via
+        // the startup orphan-marker, not the regular expiry sweep —
+        // they're short-lived and stateless by design, and a long-tail
+        // expiry from the regular sweep would race with the in-flight
+        // pass that owns the row.
         let mut rows = conn
             .query(
-                "SELECT id FROM sessions WHERE last_active < ?1",
+                "SELECT id FROM sessions \
+                 WHERE last_active < ?1 AND is_normal_session = 1",
                 libsql::params![super::time::to_us(before)],
             )
             .await
@@ -189,8 +218,17 @@ impl SessionStore for LibsqlSessionStore {
 
     async fn list_all(&self) -> Result<Vec<Session>> {
         let conn = self.pool.conn();
+        // Filter `is_normal_session = 1` so maintenance sessions
+        // (e.g. `BackgroundCompression`) stay invisible to user-facing
+        // listings (CLI session picker, web UI). Use
+        // `list_all_maintenance_sessions` for the maintenance set.
         let mut rows = conn
-            .query("SELECT data FROM sessions ORDER BY last_active DESC", ())
+            .query(
+                "SELECT data FROM sessions \
+                 WHERE is_normal_session = 1 \
+                 ORDER BY last_active DESC",
+                (),
+            )
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
@@ -240,17 +278,23 @@ impl SessionStore for LibsqlSessionStore {
             // carry `fork_at_job_id` + `prefix_state_hash` only on
             // the full Lineage struct, which is reconstructable from
             // `data`. Decode `data` only when the kind is UserFork.
-            let kind = if kind_tag == "subagent" {
-                LineageKind::Subagent
-            } else {
-                let data: String = row
-                    .get(2)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let session: Session = serde_json::from_str(&data)
-                    .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
-                match session.lineage {
-                    Some(Lineage { kind, .. }) => kind,
-                    None => continue,
+            // Subagent and SystemMaintenance carry no extra payload
+            // beyond the kind tag, so we can avoid the JSON decode.
+            // Only UserFork's variant has fields, and those are only
+            // recoverable from the full Lineage struct in `data`.
+            let kind = match kind_tag.as_str() {
+                LINEAGE_KIND_SUBAGENT => LineageKind::Subagent,
+                LINEAGE_KIND_SYSTEM_MAINTENANCE => LineageKind::SystemMaintenance,
+                _ => {
+                    let data: String = row
+                        .get(2)
+                        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                    let session: Session = serde_json::from_str(&data)
+                        .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
+                    match session.lineage {
+                        Some(Lineage { kind, .. }) => kind,
+                        None => continue,
+                    }
                 }
             };
             children.push((SessionId::from(id), kind));
@@ -281,6 +325,100 @@ impl SessionStore for LibsqlSessionStore {
             forks.push(SessionId::from(id));
         }
         Ok(forks)
+    }
+
+    async fn list_active_maintenance_for_parent(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Result<Vec<SessionId>> {
+        let conn = self.pool.conn();
+        let sql = format!(
+            "SELECT id FROM sessions \
+             WHERE parent_session_id = ?1 \
+               AND lineage_kind = '{LINEAGE_KIND_SYSTEM_MAINTENANCE}' \
+               AND is_normal_session = 0"
+        );
+        let mut rows = conn
+            .query(
+                &sql,
+                libsql::params![parent_session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            out.push(SessionId::from(id));
+        }
+        Ok(out)
+    }
+
+    async fn list_all_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query("SELECT id FROM sessions WHERE is_normal_session = 0", ())
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            out.push(SessionId::from(id));
+        }
+        Ok(out)
+    }
+
+    async fn list_unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
+        // Maintenance sessions are reaped only when their associated
+        // job is in a non-terminal state — or when there is no job
+        // row at all (the session was created but the process died
+        // before `with_job` ran). Terminal jobs (completed, failed,
+        // cancelled) are kept as audit history so cost reports can
+        // still join `cost_records` back through the maintenance
+        // session row.
+        //
+        // String literals match `JobStatusKind`'s `status_kind_str`
+        // mapping in `crates/storage/src/libsql/job.rs:18`.
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT s.id FROM sessions s \
+                 WHERE s.is_normal_session = 0 \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM jobs j \
+                     WHERE j.session_id = s.id \
+                     AND j.status_kind IN ('completed', 'failed', 'cancelled') \
+                 )",
+                (),
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            out.push(SessionId::from(id));
+        }
+        Ok(out)
     }
 
     async fn append_session_message(
@@ -468,6 +606,114 @@ impl SessionStore for LibsqlSessionStore {
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}"))),
             None => Ok(None),
         }
+    }
+
+    async fn active_index_of_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<Option<usize>> {
+        let conn = self.pool.conn();
+        // Both sub-selects hit `idx_session_messages_active`
+        // (`session_id, ordinal WHERE superseded_by IS NULL`), so this
+        // is two index-only counts — the row content is never read.
+        let mut rows = conn
+            .query(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_messages \
+                    WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal < ?2), \
+                   EXISTS (SELECT 1 FROM session_messages \
+                           WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal = ?2)",
+                libsql::params![session_id.as_str().to_string(), ordinal],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql active_index query: {e}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!("active_index returned no rows"))
+            })?;
+        let count: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get count: {e}")))?;
+        let present: i64 = row
+            .get(1)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get present: {e}")))?;
+        if present == 0 {
+            return Ok(None);
+        }
+        Ok(Some(count as usize))
+    }
+
+    async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM session_messages \
+                 WHERE session_id = ?1 AND superseded_by IS NULL",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql count_active query: {e}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!("count_active returned no rows"))
+            })?;
+        let count: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get count: {e}")))?;
+        Ok(count as usize)
+    }
+
+    async fn load_active_session_messages_up_to(
+        &self,
+        session_id: &SessionId,
+        up_to_ordinal: i64,
+    ) -> Result<Vec<ChatMessage>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT role, content FROM session_messages \
+                 WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal <= ?2 \
+                 ORDER BY ordinal",
+                libsql::params![session_id.as_str().to_string(), up_to_ordinal],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query active up_to: {e}"))
+            })?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let role: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
+            let content_json: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
+            let content = serde_json::from_str(&content_json)
+                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
+            out.push(aura_model::ChatMessage {
+                role: role
+                    .parse::<aura_model::Role>()
+                    .map_err(StorageError::Storage)?,
+                content,
+            });
+        }
+        Ok(out)
     }
 
     async fn load_session_messages_with_supersede(

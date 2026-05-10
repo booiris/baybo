@@ -46,13 +46,57 @@ pub trait SessionStore: Send + Sync {
     /// `SessionManager`'s responsibility (cancel propagation through
     /// the actor token tree happens before this call).
     async fn delete(&self, session_id: &SessionId) -> Result<bool>;
+    /// Return session ids whose `last_active` is older than `before`.
+    /// Excludes maintenance sessions (`is_normal_session = 0`) — those
+    /// get reaped through the orphan-marker on startup, not through
+    /// the regular expiry sweep.
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>>;
-    /// Return every live session, ordered by `last_active` descending.
-    /// Operator-facing: drives `aura session list`.
+    /// Return every live **user-facing** session, ordered by
+    /// `last_active` descending. Maintenance sessions (`is_normal_session
+    /// = 0`) are filtered out; use [`Self::list_all_maintenance_sessions`]
+    /// to enumerate those. Operator-facing: drives `aura session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
     /// Return the live forks (sessions with `LineageKind::UserFork`)
     /// whose `parent_session_id` equals the given session.
     async fn list_live_forks(&self, source_session_id: &SessionId) -> Result<Vec<SessionId>>;
+
+    /// Return the session ids of every active maintenance session whose
+    /// `Lineage.parent_session_id` matches `parent_session_id`. Used by
+    /// the parent's agent loop to enforce the at-most-one-in-flight
+    /// `BackgroundCompressionRunner` invariant before spawning a new pass — if a
+    /// row is returned, the parent skips this trigger and re-evaluates
+    /// next iteration. Returns the ids regardless of state because the
+    /// "active" determination is whether an actor is running, which the
+    /// store cannot know directly; the caller correlates with the
+    /// `JobStore` for liveness.
+    async fn list_active_maintenance_for_parent(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Result<Vec<SessionId>>;
+
+    /// Return every maintenance session id (`is_normal_session = 0`).
+    /// Used by the startup orphan reaper to terminate sessions whose
+    /// actor isn't running after a process bounce.
+    async fn list_all_maintenance_sessions(&self) -> Result<Vec<SessionId>>;
+
+    /// Return only the maintenance session ids whose associated job is
+    /// **not** in a terminal state (`completed` / `failed` /
+    /// `cancelled`). These are passes that were running when the
+    /// previous process crashed; their parents' `error_count` should
+    /// be bumped and their session rows reaped.
+    ///
+    /// Maintenance sessions whose job is terminal are *kept* as audit
+    /// history — joining `cost_records` through them is the only way
+    /// to attribute background-compression spend back to the
+    /// originating parent, and treating them as orphans on every
+    /// restart would silently delete that audit chain.
+    ///
+    /// Sessions with **no** job row at all (a pathological window
+    /// between `create_maintenance_session` and `with_job` that the
+    /// process didn't survive) are also returned — there's no LLM
+    /// spend or audit value to preserve, and leaving them behind
+    /// would accumulate dead rows.
+    async fn list_unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>>;
 
     /// Return every immediate live descendant (Subagent or UserFork)
     /// of the given parent. Powers `lineage_tree` and
@@ -117,4 +161,38 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<StoredMessage>>;
+
+    /// 0-indexed position of the row with `ordinal == ordinal` within
+    /// the session's active sequence (rows where `superseded_by IS
+    /// NULL`, in ordinal order). Returns `None` when no active row has
+    /// that ordinal — either compression has rewritten it away or it
+    /// never existed.
+    ///
+    /// Cheaper than [`Self::load_session_messages_with_supersede`] +
+    /// walking: backed by a `COUNT(*)` + `EXISTS` against the partial
+    /// `idx_session_messages_active` index, so message contents never
+    /// cross the wire. Used by anchor-lookup paths that only need to
+    /// translate a `session_summaries.cursor` into an in-memory index.
+    async fn active_index_of_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<Option<usize>>;
+
+    /// Total number of active rows (`superseded_by IS NULL`) for the
+    /// session. Used by drift-detection paths that compare the
+    /// persisted active count to an in-memory transcript length
+    /// without reading message contents.
+    async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize>;
+
+    /// Active transcript with `ordinal <= up_to_ordinal`, in ordinal
+    /// order. Equivalent to filtering [`Self::load_active_session_messages`]
+    /// by ordinal but pushes the predicate into SQL so the row content
+    /// for newer ordinals never crosses the wire. Used by background
+    /// compression to load the snapshot pinned at trigger time.
+    async fn load_active_session_messages_up_to(
+        &self,
+        session_id: &SessionId,
+        up_to_ordinal: i64,
+    ) -> Result<Vec<ChatMessage>>;
 }

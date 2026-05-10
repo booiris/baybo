@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use aura_model::{ChannelType, ChatMessage, Session, SessionId, SessionState, TriggerSource, User};
-use aura_storage::{SessionStore, StorageError};
-use chrono::{Duration, Utc};
+use aura_storage::{SessionStore, SessionSummaryRow, SessionSummaryStore, StorageError};
+use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
 
 use crate::SessionError;
@@ -16,6 +16,10 @@ fn wrap(e: StorageError) -> SessionError {
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
+    /// Per-session summary-metadata store. Required at construction —
+    /// production wires the libsql backend; tests pass
+    /// `aura_storage::test_support::MemorySessionSummaryStore`.
+    summary_store: Arc<dyn SessionSummaryStore>,
     session_timeout: Duration,
     /// Default soul version stamped on new sessions when the caller
     /// does not supply one. The agent layer overrides this via
@@ -24,9 +28,14 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub fn new(store: Arc<dyn SessionStore>, session_timeout: Duration) -> Self {
+    pub fn new(
+        store: Arc<dyn SessionStore>,
+        summary_store: Arc<dyn SessionSummaryStore>,
+        session_timeout: Duration,
+    ) -> Self {
         Self {
             store,
+            summary_store,
             session_timeout,
             default_soul_version: "soul-default".to_owned(),
         }
@@ -45,6 +54,109 @@ impl SessionManager {
     /// `QueryApi` against the same store the manager writes to.
     pub fn store(&self) -> Arc<dyn SessionStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Read-only handle to the underlying `SessionSummaryStore`. Used
+    /// by callers that need direct access (orphan reaper's FS sweep
+    /// over `list_session_ids`, query-layer joins).
+    pub fn summary_store(&self) -> Arc<dyn SessionSummaryStore> {
+        Arc::clone(&self.summary_store)
+    }
+
+    /// Read this session's summary-metadata row. `Ok(None)` when the
+    /// session has never had a summary pass written.
+    pub async fn summary_metadata(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSummaryRow>> {
+        self.summary_store.get(session_id).await.map_err(wrap)
+    }
+
+    /// Record a successful summary pass: bumps `pass_count`, advances
+    /// `cursor`, accumulates cost, resets `error_count` to 0.
+    pub async fn record_summary_success(
+        &self,
+        session_id: &SessionId,
+        cursor: i64,
+        cost_micros_delta: i64,
+        model_id: &str,
+        span_id: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.summary_store
+            .upsert_success(
+                session_id,
+                cursor,
+                cost_micros_delta,
+                model_id,
+                span_id,
+                updated_at,
+            )
+            .await
+            .map_err(wrap)
+    }
+
+    /// Record a failed summary attempt: bumps `error_count`. Inserts
+    /// a row with cursor=0 / pass_count=0 if absent so failure
+    /// telemetry surfaces even on sessions that have never had a
+    /// successful pass.
+    pub async fn record_summary_failure(
+        &self,
+        session_id: &SessionId,
+        model_id: &str,
+        span_id: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.summary_store
+            .bump_error_count(session_id, model_id, span_id, updated_at)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Mark `session_id` as having an in-flight `BackgroundCompressionRunner`
+    /// pass and stamp `owner` onto the row. The trigger gate calls
+    /// this immediately before emitting a `SystemSpawnRequest`, and
+    /// the next gate iteration on the same parent will see the flag
+    /// and skip. A landed `record_summary_success` /
+    /// `record_summary_failure` clears it automatically; the orphan
+    /// reaper clears it on next boot for sessions whose maintenance
+    /// row was reaped.
+    ///
+    /// `owner` should be a freshly-generated UUID (or any unique
+    /// token) so [`Self::clear_summary_in_flight_if_owned`] can do a
+    /// CAS-style clear without wiping a newer pass' mark.
+    pub async fn mark_summary_in_flight(&self, session_id: &SessionId, owner: &str) -> Result<()> {
+        self.summary_store
+            .set_in_flight(session_id, true, Some(owner), Utc::now())
+            .await
+            .map_err(wrap)
+    }
+
+    /// Compare-and-clear the `in_flight` flag: only clears when the
+    /// row's `in_flight_owner` matches `owner`. Returns `Ok(true)`
+    /// when the caller still owned the mark. Used by the trigger
+    /// gate's `try_send` rollback and the runner's defensive
+    /// post-pass cleanup so a stale Pass A finishing after Pass B
+    /// remarked the parent cannot wipe Pass B's mark.
+    pub async fn clear_summary_in_flight_if_owned(
+        &self,
+        session_id: &SessionId,
+        owner: &str,
+    ) -> Result<bool> {
+        self.summary_store
+            .clear_in_flight_if_owned(session_id, owner, Utc::now())
+            .await
+            .map_err(wrap)
+    }
+
+    /// Reset `in_flight = 0` on every `session_summaries` row. Called
+    /// once at startup by the orphan reaper so the gap between a
+    /// `mark_summary_in_flight` write and a process crash before the
+    /// router could create the corresponding maintenance session row
+    /// (or even before the `try_send` returned) doesn't leave the
+    /// parent permanently blocked.
+    pub async fn clear_all_summary_in_flight(&self) -> Result<()> {
+        self.summary_store.clear_all_in_flight().await.map_err(wrap)
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
@@ -76,6 +188,97 @@ impl SessionManager {
             .await
     }
 
+    /// Create a `LineageKind::SystemMaintenance` session for
+    /// internal maintenance work on behalf of `parent`. Unlike
+    /// [`Self::create_spawned_session`], the trigger is **not**
+    /// inherited — maintenance work always carries
+    /// `TriggerSource::System { reason }` so cost / trace
+    /// attribution shows it as system-driven, not user-driven.
+    /// `root_session_id` *is* inherited from the parent so
+    /// "all work descended from session X" queries surface
+    /// maintenance work too.
+    ///
+    /// The `is_normal_session = 0` flag is set automatically by the
+    /// `LineageKind::SystemMaintenance` branch in
+    /// `LibsqlSessionStore::save`, so default queries (CLI session
+    /// picker, web UI) skip these rows. `parent_job_id` pins the
+    /// exact moment in the parent's lifeline that the spawn
+    /// happened — same role it plays for subagents.
+    ///
+    /// Used today by the async summary-refresh path
+    /// (`SystemReason::BackgroundCompression`); future maintenance reasons
+    /// can reuse the same constructor without a code change.
+    pub async fn create_maintenance_session(
+        &self,
+        parent: &Session,
+        parent_job_id: aura_model::JobId,
+        reason: aura_model::SystemReason,
+    ) -> Result<Session> {
+        let id = SessionId::from(format!("maint-{}", uuid::Uuid::new_v4()));
+        let now = Utc::now();
+        let session = Session {
+            id: id.clone(),
+            user: parent.user.clone(),
+            channel: parent.channel.clone(),
+            created_at: now,
+            last_active: now,
+            state: aura_model::SessionState::default(),
+            root_session_id: parent.root_session_id.clone(),
+            trigger: TriggerSource::System { reason },
+            lineage: Some(aura_model::Lineage {
+                parent_session_id: parent.id.clone(),
+                parent_job_id,
+                kind: aura_model::LineageKind::SystemMaintenance,
+            }),
+            bound_soul_version: parent.bound_soul_version.clone(),
+        };
+        self.store.save(&session).await.map_err(wrap)?;
+        debug!(
+            session_id = %session.id,
+            parent_session_id = %parent.id,
+            "spawned system maintenance session"
+        );
+        Ok(session)
+    }
+
+    /// Return ids of in-flight maintenance sessions whose lineage
+    /// points at `parent_session_id`. Used by the parent's agent
+    /// loop to enforce the at-most-one-in-flight `BackgroundCompressionRunner`
+    /// invariant before spawning a new pass — if any row is
+    /// returned, skip the trigger (the in-flight pass will eventually
+    /// land or be reaped on next startup).
+    pub async fn active_maintenance_for_parent(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Result<Vec<SessionId>> {
+        self.store
+            .list_active_maintenance_for_parent(parent_session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Enumerate every maintenance session id (`is_normal_session
+    /// = 0`). Used by the startup orphan reaper to delete sessions
+    /// whose actor isn't running after a process bounce.
+    pub async fn all_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
+        self.store
+            .list_all_maintenance_sessions()
+            .await
+            .map_err(wrap)
+    }
+
+    /// Maintenance sessions whose associated job is **not** in a
+    /// terminal state (`completed` / `failed` / `cancelled`) — i.e.
+    /// only the ones the startup reaper actually needs to clean up.
+    /// Sessions whose pass landed cleanly are kept as audit history
+    /// (cost-records join lookups depend on them).
+    pub async fn unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
+        self.store
+            .list_unfinished_maintenance_sessions()
+            .await
+            .map_err(wrap)
+    }
+
     /// Create a session that descends from `parent` via the given
     /// lineage (subagent or user-fork). The child inherits its
     /// trigger from the parent's root session and gets a fresh
@@ -90,6 +293,7 @@ impl SessionManager {
         let prefix = match lineage.kind {
             aura_model::LineageKind::Subagent => "subagent-",
             aura_model::LineageKind::UserFork { .. } => "fork-",
+            aura_model::LineageKind::SystemMaintenance => "maint-",
         };
         let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
         let now = Utc::now();
@@ -258,6 +462,43 @@ impl SessionManager {
             .map_err(wrap)
     }
 
+    /// 0-indexed position of `ordinal` within the active message
+    /// sequence; `None` if the row is no longer active. Index-only
+    /// — does not read message content.
+    pub async fn active_index_of_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<Option<usize>> {
+        self.store
+            .active_index_of_ordinal(session_id, ordinal)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Count of active rows for the session. Index-only.
+    pub async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize> {
+        self.store
+            .count_active_messages(session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Active transcript clipped to `ordinal <= up_to_ordinal`. Used
+    /// by background compression to load the snapshot pinned at
+    /// trigger time without dragging the post-snapshot tail across
+    /// the wire.
+    pub async fn load_active_session_messages_up_to(
+        &self,
+        session_id: &SessionId,
+        up_to_ordinal: i64,
+    ) -> Result<Vec<ChatMessage>> {
+        self.store
+            .load_active_session_messages_up_to(session_id, up_to_ordinal)
+            .await
+            .map_err(wrap)
+    }
+
     /// Hard-delete a session by id. Errors with `SessionError::NotFound`
     /// if the session did not exist at the time of the call. Surfaces
     /// `StorageError::HasLiveForks` (wrapped) when the session has live
@@ -304,173 +545,13 @@ impl SessionManager {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use aura_model::{ChannelType, ChatMessage, Session, SessionId, User};
-    use aura_storage::session::Result as StoreResult;
-    use chrono::{DateTime, Duration, Utc};
-    use parking_lot::Mutex;
+    use aura_model::{ChannelType, SessionId, User};
+    use aura_storage::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+    use chrono::{Duration, Utc};
 
     use super::{SessionError, SessionManager, SessionStore};
-
-    /// One stored row in the test fake — mirrors the libsql layout
-    /// closely enough that `apply_session_compaction` can supersede
-    /// rows the same way the real backend does.
-    #[derive(Clone)]
-    struct StoredMessage {
-        ordinal: u64,
-        message: ChatMessage,
-        superseded_by: Option<u64>,
-    }
-
-    struct MemorySessionStore {
-        data: Mutex<HashMap<SessionId, Session>>,
-        transcripts: Mutex<HashMap<SessionId, Vec<StoredMessage>>>,
-    }
-
-    impl MemorySessionStore {
-        fn new() -> Self {
-            Self {
-                data: Mutex::new(HashMap::new()),
-                transcripts: Mutex::new(HashMap::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SessionStore for MemorySessionStore {
-        async fn get(&self, session_id: &SessionId) -> StoreResult<Option<Session>> {
-            Ok(self.data.lock().get(session_id).cloned())
-        }
-
-        async fn save(&self, session: &Session) -> StoreResult<()> {
-            self.data.lock().insert(session.id.clone(), session.clone());
-            Ok(())
-        }
-
-        async fn delete(&self, session_id: &SessionId) -> StoreResult<bool> {
-            self.transcripts.lock().remove(session_id);
-            Ok(self.data.lock().remove(session_id).is_some())
-        }
-
-        async fn list_expired(&self, before: DateTime<Utc>) -> StoreResult<Vec<SessionId>> {
-            Ok(self
-                .data
-                .lock()
-                .values()
-                .filter(|s| s.last_active < before)
-                .map(|s| s.id.clone())
-                .collect())
-        }
-
-        async fn list_all(&self) -> StoreResult<Vec<Session>> {
-            Ok(self.data.lock().values().cloned().collect())
-        }
-
-        async fn list_live_forks(
-            &self,
-            _source_session_id: &SessionId,
-        ) -> StoreResult<Vec<SessionId>> {
-            // Test fake — we never construct lineage children here.
-            Ok(Vec::new())
-        }
-
-        async fn list_lineage_children(
-            &self,
-            _parent_session_id: &SessionId,
-        ) -> StoreResult<Vec<(SessionId, aura_model::LineageKind)>> {
-            Ok(Vec::new())
-        }
-
-        async fn append_session_message(
-            &self,
-            session_id: &SessionId,
-            message: &ChatMessage,
-        ) -> StoreResult<()> {
-            let mut guard = self.transcripts.lock();
-            let log = guard.entry(session_id.clone()).or_default();
-            let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
-            log.push(StoredMessage {
-                ordinal,
-                message: message.clone(),
-                superseded_by: None,
-            });
-            Ok(())
-        }
-
-        async fn apply_session_compaction(
-            &self,
-            session_id: &SessionId,
-            new_active: &[ChatMessage],
-        ) -> StoreResult<()> {
-            let mut guard = self.transcripts.lock();
-            let log = guard.entry(session_id.clone()).or_default();
-            let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
-            for entry in log.iter_mut() {
-                if entry.superseded_by.is_none() {
-                    entry.superseded_by = Some(next_ordinal);
-                }
-            }
-            for (offset, msg) in new_active.iter().enumerate() {
-                log.push(StoredMessage {
-                    ordinal: next_ordinal + offset as u64,
-                    message: msg.clone(),
-                    superseded_by: None,
-                });
-            }
-            Ok(())
-        }
-
-        async fn load_active_session_messages(
-            &self,
-            session_id: &SessionId,
-        ) -> StoreResult<Vec<ChatMessage>> {
-            Ok(self
-                .transcripts
-                .lock()
-                .get(session_id)
-                .map(|log| {
-                    let mut active: Vec<&StoredMessage> =
-                        log.iter().filter(|m| m.superseded_by.is_none()).collect();
-                    active.sort_by_key(|m| m.ordinal);
-                    active.into_iter().map(|m| m.message.clone()).collect()
-                })
-                .unwrap_or_default())
-        }
-
-        async fn latest_session_ordinal(&self, session_id: &SessionId) -> StoreResult<Option<i64>> {
-            Ok(self
-                .transcripts
-                .lock()
-                .get(session_id)
-                .and_then(|log| log.iter().map(|m| m.ordinal as i64).max()))
-        }
-
-        async fn load_session_messages_with_supersede(
-            &self,
-            session_id: &SessionId,
-        ) -> StoreResult<Vec<aura_storage::StoredMessage>> {
-            Ok(self
-                .transcripts
-                .lock()
-                .get(session_id)
-                .map(|log| {
-                    let mut rows: Vec<_> = log
-                        .iter()
-                        .map(|m| aura_storage::StoredMessage {
-                            ordinal: m.ordinal as i64,
-                            superseded_by: m.superseded_by.map(|v| v as i64),
-                            message: m.message.clone(),
-                        })
-                        .collect();
-                    rows.sort_by_key(|m| m.ordinal);
-                    rows
-                })
-                .unwrap_or_default())
-        }
-    }
 
     fn test_user() -> User {
         User {
@@ -483,7 +564,11 @@ mod tests {
     #[tokio::test]
     async fn create_session_returns_valid_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -500,7 +585,11 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_returns_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -518,7 +607,11 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_creates_new_when_missing() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let id = SessionId::from("cli-abc");
         let session = mgr
@@ -534,7 +627,11 @@ mod tests {
     #[tokio::test]
     async fn touch_updates_last_active() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -557,7 +654,11 @@ mod tests {
     #[tokio::test]
     async fn touch_nonexistent_returns_not_found() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let err = mgr
             .touch(&SessionId::from("nonexistent"))
@@ -569,7 +670,11 @@ mod tests {
     #[tokio::test]
     async fn cleanup_expired_removes_old_sessions() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Duration::seconds(1));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::seconds(1),
+        );
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -589,7 +694,11 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_sessions_newest_first() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let mut first = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -612,7 +721,11 @@ mod tests {
     #[tokio::test]
     async fn history_returns_messages_for_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -626,7 +739,11 @@ mod tests {
     #[tokio::test]
     async fn history_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let err = mgr
             .history(&SessionId::from("nonexistent"))
@@ -638,7 +755,11 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -652,7 +773,11 @@ mod tests {
     #[tokio::test]
     async fn delete_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let err = mgr
             .delete(&SessionId::from("nonexistent"))
@@ -664,7 +789,11 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_replaces_expired_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Duration::seconds(1));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::seconds(1),
+        );
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -698,7 +827,11 @@ mod tests {
         use aura_model::{ChatMessage, ContentBlock, Role};
 
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -751,7 +884,11 @@ mod tests {
     #[tokio::test]
     async fn load_active_messages_empty_for_session_without_turns() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Duration::minutes(30));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -760,5 +897,47 @@ mod tests {
 
         let loaded = mgr.load_active_session_messages(&session.id).await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_maintenance_session_carries_system_trigger_and_maintenance_lineage() {
+        use aura_model::{JobId, LineageKind, SystemReason};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Duration::minutes(30),
+        );
+
+        let parent = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+        let parent_job = JobId::new();
+
+        let maint = mgr
+            .create_maintenance_session(&parent, parent_job, SystemReason::BackgroundCompression)
+            .await
+            .unwrap();
+
+        // System trigger + reason — not inherited from parent.
+        match &maint.trigger {
+            aura_model::TriggerSource::System { reason } => {
+                assert_eq!(*reason, SystemReason::BackgroundCompression);
+            }
+            other => panic!("expected System trigger, got {other:?}"),
+        }
+        // Lineage points back at the parent through SystemMaintenance.
+        let lineage = maint.lineage.as_ref().expect("maintenance has lineage");
+        assert_eq!(lineage.parent_session_id, parent.id);
+        assert_eq!(lineage.parent_job_id, parent_job);
+        assert!(matches!(lineage.kind, LineageKind::SystemMaintenance));
+        // Root inherits from the parent (not self) so descendant
+        // queries cover maintenance work.
+        assert_eq!(maint.root_session_id, parent.root_session_id);
+        // Maintenance ids carry the `maint-` prefix for log
+        // recognisability.
+        assert!(maint.id.as_str().starts_with("maint-"));
     }
 }

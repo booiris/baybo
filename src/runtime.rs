@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use aura_agent::actor::AgentActor;
-use aura_agent::agent_loop::AgentLoop;
-use aura_agent::router::Router;
+use aura_agent::agent_loop::{AgentLoop, AgentLoopConfig};
+use aura_agent::router::{Router, SystemSpawnRequest};
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::soul::Soul;
@@ -36,7 +36,7 @@ use aura_agent::{
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_context::{ContextManager, Summarize, TiktokenTokenizer, Tokenizer};
+use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use aura_llm::GuardedLlm;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -160,7 +160,6 @@ pub struct ManagerGraph {
     pub cron_scheduler: Arc<CronScheduler>,
     pub security_gateway: Arc<SecurityGateway>,
     pub skill_registry: Arc<SkillRegistry>,
-    pub skill_assessor: Arc<SkillAssessor>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
     /// Always already wrapped via `GuardedLlm` — every
@@ -193,6 +192,19 @@ pub struct ManagerGraph {
     /// `wire_router` twice panics loudly instead of silently handing
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+
+    /// Sender half of the system-spawn channel. The agent loop's
+    /// trigger gate sends `SystemSpawnRequest` values here; the
+    /// receiving half lives on the router until [`wire_router`]
+    /// `.take()`s it. Cloned into every `AgentLoop` the spawner
+    /// factory builds so any actor can schedule a maintenance task.
+    pub system_spawn_tx: mpsc::Sender<SystemSpawnRequest>,
+
+    /// Receiving half of the system-spawn channel. Same `Option` +
+    /// `take`-on-wire pattern as `cron_trigger_rx` — calling
+    /// `wire_router` twice panics rather than silently dropping
+    /// system-spawn requests.
+    pub system_spawn_rx: Option<mpsc::Receiver<SystemSpawnRequest>>,
 
     /// Process-wide parent token for `AgentActor`s. Bridged to the
     /// shared `ShutdownSignal` in [`build_managers`]; cancelling it
@@ -342,8 +354,17 @@ pub async fn build_managers(
 
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
+        stores.session_summary.clone(),
         boot::to_session_timeout(&config.session),
     ));
+
+    // Reap orphans from any maintenance sessions that were
+    // running when the previous process exited. Best-effort —
+    // logged at warn on failure, never blocks boot. Runs before
+    // any actor spawns so newly-created background-summary actors
+    // don't race against stale rows.
+    aura_agent::compression::reap_maintenance_orphans(session_manager.as_ref(), &workspace_paths)
+        .await;
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
     // CostTracker has been retired in favour of a process-wide
@@ -355,6 +376,21 @@ pub async fn build_managers(
         cron_trigger_tx,
         Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
     ));
+    // System-spawn channel: agent_loop's trigger gate (sender end) ↔
+    // router's `system_trigger_rx` arm (receiver end).
+    //
+    // Per-parent serialization (`active_maintenance_for_parent` check)
+    // caps queue depth at one outstanding request per active parent
+    // session, so the upper bound is roughly the number of parents
+    // that cross the trigger thresholds in the same instant the
+    // router happens to be busy. Each request is ~100–200 B
+    // (`SessionId` + `JobId` + `Arc<CancellationToken>` +
+    // `BackgroundCompressionPayload`); 1024 slots is ~200 KB and gives a
+    // multi-user gateway comfortable headroom over its concurrent
+    // active session count, so a `try_send` failure becomes a real
+    // backpressure alarm rather than routine bursty drops. Bump
+    // further if a deployment regularly trips it.
+    let (system_spawn_tx, system_spawn_rx) = mpsc::channel::<SystemSpawnRequest>(1024);
     for (tool, manifest) in aura_cron::agent_tools(Arc::clone(&cron_scheduler)) {
         tool_registry.register(tool, manifest);
     }
@@ -485,9 +521,10 @@ pub async fn build_managers(
         });
     }
 
-    // --- per-actor parent token. Each `AgentActor::new` derives a child
-    // from this; tripping it on shutdown cascades cancel through every
-    // in-flight tool / subagent across every session.
+    // --- per-actor parent token. The spawner factory derives each
+    // actor's `actor_token` as a child of this; tripping it on
+    // shutdown cascades cancel through every in-flight tool /
+    // subagent across every session.
     let actor_parent_token = CancellationToken::new();
     {
         let signal = shutdown.clone();
@@ -520,7 +557,6 @@ pub async fn build_managers(
         cron_scheduler,
         security_gateway,
         skill_registry,
-        skill_assessor,
         tool_registry,
         tool_executor,
         llm_client,
@@ -530,6 +566,8 @@ pub async fn build_managers(
         secret_vault,
         stores,
         cron_trigger_rx: Some(cron_trigger_rx),
+        system_spawn_tx,
+        system_spawn_rx: Some(system_spawn_rx),
         actor_parent_token,
     })
 }
@@ -610,7 +648,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let memory_manager = Arc::clone(&graph.memory_manager);
         let trace_store = graph.stores.trace.clone();
         let job_lifecycle = Arc::clone(&graph.job_lifecycle);
-        let skill_assessor = Arc::clone(&graph.skill_assessor);
         let security_gateway = Arc::clone(&graph.security_gateway);
         let session_logger = Arc::clone(&session_logger);
         let tokenizer = Arc::clone(&tokenizer);
@@ -623,35 +660,52 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let token_calibration = Arc::clone(&token_calibration);
 
         let sessions = Arc::clone(&graph.session_manager);
+        let workspace_paths_arc = Arc::new(aura_workspace::WorkspacePaths::new(
+            graph.workspace.root.clone(),
+        ));
+        let system_spawn_tx = graph.system_spawn_tx.clone();
         Arc::new(
             move |session: aura_model::Session,
                   response_tx: mpsc::Sender<AgentOutput>,
                   parent_token: &CancellationToken| {
-                let mut agent_loop = AgentLoop::new(
-                    llm_client.clone(),
-                    Arc::clone(&tool_registry),
-                    Arc::clone(&skill_registry),
-                    Arc::clone(&tool_executor),
-                    ContextManager::new(
-                        Arc::clone(&tokenizer),
-                        Box::new(Summarize::new(keep_recent)),
-                        token_budget.clone(),
-                    )
-                    .with_calibration(Arc::clone(&token_calibration))
-                    .with_skill_registry(Arc::clone(&skill_registry))
-                    .with_session(session.id.clone(), Arc::clone(&sessions)),
-                    Arc::clone(&memory_manager),
-                    policy.clone(),
-                    Soul::custom(system_prompt.clone()),
-                    Arc::clone(&security_gateway),
-                )
-                .with_skill_assessor(Arc::clone(&skill_assessor))
-                .with_session_log(Arc::clone(&session_logger))
-                .with_cost_manager(Arc::clone(&cost_manager));
+                // Derive the actor's lifetime token here, threaded
+                // into both the loop (so its summary trigger gate can
+                // clone it into outgoing SystemSpawnRequests) and the
+                // actor itself.
+                let actor_token = parent_token.child_token();
 
-                if let Some(rt) = subagent_runtime_slot.get() {
-                    agent_loop = agent_loop.with_subagent_runtime(Arc::clone(rt));
-                }
+                // `summary_state_dir` connects the compressor's
+                // fast-path to the background refresh runner's output.
+                // Without it the background passes still run and bill
+                // LLM, but their summaries never reach the hot path.
+                // See `docs/background-compression.md`.
+                let agent_loop = AgentLoop::from_config(AgentLoopConfig {
+                    llm_client: llm_client.clone(),
+                    tool_registry: Arc::clone(&tool_registry),
+                    skill_registry: Arc::clone(&skill_registry),
+                    tool_executor: Arc::clone(&tool_executor),
+                    context_manager: ContextManager::from_config(ContextManagerConfig {
+                        tokenizer: Arc::clone(&tokenizer),
+                        workspace: Arc::clone(&workspace_paths_arc),
+                        keep_recent,
+                        budget: token_budget.clone(),
+                        calibration: Arc::clone(&token_calibration),
+                        skill_registry: Arc::clone(&skill_registry),
+                        session_id: session.id.clone(),
+                        sessions: Arc::clone(&sessions),
+                    }),
+                    memory_manager: Arc::clone(&memory_manager),
+                    policy: policy.clone(),
+                    soul: Soul::custom(system_prompt.clone()),
+                    security_gateway: Arc::clone(&security_gateway),
+                    cost_manager: Arc::clone(&cost_manager),
+                    actor_token: actor_token.clone(),
+                    subagent_runtime: subagent_runtime_slot.get().map(Arc::clone),
+                    session_log: Some(Arc::clone(&session_logger)),
+                    system_spawn_tx: Some(system_spawn_tx.clone()),
+                    workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
+                    sessions: Some(Arc::clone(&sessions)),
+                });
 
                 let span_recorder = Arc::new(SpanRecorder::new(
                     session.id.clone(),
@@ -666,7 +720,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     response_tx,
                     Arc::clone(&job_lifecycle),
                     span_recorder,
-                    parent_token,
+                    actor_token,
                 );
                 let (sender, mailbox) = mpsc::channel(buffer);
                 tokio::spawn(async move {
@@ -689,29 +743,34 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     let rate_limit_cfg = &graph.config.cost.rate_limit;
 
-    let router = Router::new(
-        Arc::clone(&graph.session_manager),
-        supervisor,
-        Arc::clone(&graph.channels_registry),
-        Arc::clone(&graph.security_gateway),
-    )
-    .with_actor_parent_token(graph.actor_parent_token.clone())
-    .with_cost_manager(Arc::clone(&cost_manager))
-    .with_rate_limit(
-        rate_limit_cfg.max_requests,
-        std::time::Duration::from_secs(rate_limit_cfg.window_secs),
-    )
-    .with_actor_spawner(Box::new(move |session, response_tx, parent_token| {
-        spawn_actor_for(session, response_tx, parent_token)
-    }));
-
-    // Attach cron triggers eagerly — a caller who forgot to plumb the
-    // receiver would silently drop every cron-fired turn.
+    // `take` cron + system rxs eagerly — a caller who forgot to plumb
+    // either would silently drop every cron-fired turn / maintenance
+    // trigger. Calling `wire_router` twice panics here loudly rather
+    // than silently handing out a dummy receiver.
     let cron_trigger_rx = graph
         .cron_trigger_rx
         .take()
         .expect("wire_router called twice; cron_trigger_rx already consumed");
-    let router = router.with_cron_triggers(cron_trigger_rx);
+    let system_trigger_rx = graph
+        .system_spawn_rx
+        .take()
+        .expect("wire_router called twice; system_spawn_rx already consumed");
+
+    let router = Router::from_config(aura_agent::router::RouterConfig {
+        session_manager: Arc::clone(&graph.session_manager),
+        supervisor,
+        channels: Arc::clone(&graph.channels_registry),
+        security_gateway: Arc::clone(&graph.security_gateway),
+        cost_manager: Arc::clone(&cost_manager),
+        actor_spawner: Box::new(move |session, response_tx, parent_token| {
+            spawn_actor_for(session, response_tx, parent_token)
+        }),
+        cron_trigger_rx,
+        system_trigger_rx,
+        actor_parent_token: graph.actor_parent_token.clone(),
+        rate_limit_max_requests: rate_limit_cfg.max_requests,
+        rate_limit_window: std::time::Duration::from_secs(rate_limit_cfg.window_secs),
+    });
 
     RouterRunHandle {
         router,

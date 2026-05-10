@@ -73,17 +73,10 @@ pub struct JobLifecycle {
 
 impl JobLifecycle {
     pub fn new(store: Arc<dyn JobStore>) -> Self {
-        Self::with_cancellation(store, Arc::new(JobCancellationRegistry::new()))
-    }
-
-    pub fn with_cancellation(
-        store: Arc<dyn JobStore>,
-        cancellation: Arc<JobCancellationRegistry>,
-    ) -> Self {
         let (terminal_events, _rx) = broadcast::channel(JOB_TERMINAL_EVENT_CAPACITY);
         Self {
             store,
-            cancellation,
+            cancellation: Arc::new(JobCancellationRegistry::new()),
             terminal_events,
         }
     }

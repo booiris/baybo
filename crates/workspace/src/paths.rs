@@ -101,6 +101,25 @@ pub const CHANNEL_PORT_FILE: &str = "channel.port";
 /// gets bind-mounted at `/data/profile` inside the container.
 pub const BROWSER_PROFILE_SUBDIR: &str = "browser/profile";
 
+/// Per-session writable state dir lives at
+/// `<STATE_DIR>/<STATE_SESSIONS_SUBDIR>/<session_id>/`. Currently holds
+/// `summary.md` for the async summary-refresh design (see
+/// `docs/background-compression.md`); future per-session writable
+/// artifacts go alongside it. Distinct from `<LOGS_DIR>/sessions/`,
+/// which is the *append-only* per-session LLM call log.
+pub const STATE_SESSIONS_SUBDIR: &str = "sessions";
+
+/// Per-session summary file (markdown). Authoritative content for the
+/// async-refresh fast-path lives at
+/// `<STATE_DIR>/<STATE_SESSIONS_SUBDIR>/<session_id>/<SUMMARY_FILE>`;
+/// the durable metadata index is the `session_summaries` libsql table.
+pub const SUMMARY_FILE: &str = "summary.md";
+
+/// Sibling of [`SUMMARY_FILE`] used by the atomic write path
+/// (write-tempfile + rename). Surfaces only between the write and
+/// rename steps; the orphan reaper deletes `*.tmp` files at startup.
+pub const SUMMARY_FILE_TMP: &str = "summary.md.tmp";
+
 // ---------------------------------------------------------------------------
 // Files inside `work/` (not version-controlled)
 // ---------------------------------------------------------------------------
@@ -366,6 +385,45 @@ impl WorkspacePaths {
         self.state_dir().join(BROWSER_PROFILE_SUBDIR)
     }
 
+    /// Parent dir for per-session writable state:
+    /// `<root>/state/sessions/`. Distinct from `sessions_log_dir()`,
+    /// which holds *append-only* per-session LLM call logs.
+    pub fn state_sessions_dir(&self) -> PathBuf {
+        self.state_dir().join(STATE_SESSIONS_SUBDIR)
+    }
+
+    /// Per-session writable state directory:
+    /// `<root>/state/sessions/<session_id>/`. Contains [`SUMMARY_FILE`]
+    /// (and any future per-session artifacts).
+    pub fn session_state_dir(&self, session_id: &str) -> PathBuf {
+        self.state_sessions_dir().join(session_id)
+    }
+
+    /// Per-session summary file:
+    /// `<root>/state/sessions/<session_id>/summary.md`.
+    pub fn session_summary_file(&self, session_id: &str) -> PathBuf {
+        self.session_state_dir(session_id).join(SUMMARY_FILE)
+    }
+
+    /// Tempfile sibling of [`Self::session_summary_file`] used by the
+    /// atomic write path: write-then-rename guarantees readers either
+    /// see the previous summary or the new one, never a partial.
+    pub fn session_summary_tmp_file(&self, session_id: &str) -> PathBuf {
+        self.session_state_dir(session_id).join(SUMMARY_FILE_TMP)
+    }
+
+    /// Per-session JSONL transcript log:
+    /// `<root>/logs/sessions/<sanitized_session_id>.jsonl`. Sanitization
+    /// matches the writer in [`aura_agent::session_log`] so the path
+    /// resolved here is the one the SessionLlmLogger appends to.
+    pub fn session_log_file(&self, session_id: &str) -> PathBuf {
+        self.sessions_log_dir().join(format!(
+            "{}.{}",
+            sanitize_session_id(session_id),
+            SESSION_LOG_EXTENSION
+        ))
+    }
+
     // -- work/ contents --
 
     pub fn code_builder_dir(&self) -> PathBuf {
@@ -379,6 +437,27 @@ impl WorkspacePaths {
     pub fn tool_spills_dir(&self) -> PathBuf {
         self.work_dir().join(TOOL_SPILLS_SUBDIR)
     }
+}
+
+/// Replace any character that isn't `[A-Za-z0-9_\-.]` with `_`, then
+/// prefix `_` if the result is empty or starts with `.`. Used to map
+/// a `SessionId` onto a safe filename component for the per-session
+/// JSONL transcript log. Both [`WorkspacePaths::session_log_file`]
+/// and `aura-agent`'s `SessionLlmLogger` route through this so the
+/// resolved path is identical on both sides.
+pub fn sanitize_session_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for ch in id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() || out.starts_with('.') {
+        out.insert(0, '_');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -435,6 +514,22 @@ mod tests {
         assert_eq!(
             p.tool_spills_dir(),
             PathBuf::from("/var/aura/work/.aura-tool-spills"),
+        );
+        assert_eq!(
+            p.state_sessions_dir(),
+            PathBuf::from("/var/aura/state/sessions"),
+        );
+        assert_eq!(
+            p.session_state_dir("abc-123"),
+            PathBuf::from("/var/aura/state/sessions/abc-123"),
+        );
+        assert_eq!(
+            p.session_summary_file("abc-123"),
+            PathBuf::from("/var/aura/state/sessions/abc-123/summary.md"),
+        );
+        assert_eq!(
+            p.session_summary_tmp_file("abc-123"),
+            PathBuf::from("/var/aura/state/sessions/abc-123/summary.md.tmp"),
         );
     }
 

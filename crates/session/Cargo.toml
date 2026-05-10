@@ -19,5 +19,6 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+aura-storage = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["full"] }
 sha2 = { workspace = true }

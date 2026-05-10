@@ -8,6 +8,7 @@ mod job;
 mod memory;
 mod secret;
 mod session;
+mod session_summary;
 mod skill_risk;
 mod time;
 mod trace;
@@ -22,6 +23,7 @@ pub use job::LibsqlJobStore;
 pub use memory::LibsqlMemoryStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
+pub use session_summary::LibsqlSessionSummaryStore;
 pub use skill_risk::LibsqlSkillRiskStore;
 pub use trace::LibsqlTraceStore;
 
@@ -128,6 +130,13 @@ impl LibsqlPool {
                     bound_soul_version    TEXT NOT NULL,
                     created_at            INTEGER NOT NULL,
                     last_active           INTEGER NOT NULL,
+                    -- 1 for user-facing sessions (the default); 0 for internal
+                    -- maintenance sessions (e.g. SystemReason::BackgroundCompression).
+                    -- Default `SessionStore` listings filter `is_normal_session = 1`
+                    -- so maintenance sessions stay invisible in CLI / UI session
+                    -- pickers; opt-in helpers exist for the spawn-serialization
+                    -- lookup and the orphan reaper.
+                    is_normal_session     INTEGER NOT NULL DEFAULT 1,
                     data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
@@ -137,6 +146,11 @@ impl LibsqlPool {
                     WHERE lineage_kind IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_sessions_last_active
                     ON sessions(last_active DESC);
+                -- Partial index over normal sessions only — most listings hit
+                -- this path, and excluding maintenance keeps the index narrow.
+                CREATE INDEX IF NOT EXISTS idx_sessions_normal_last_active
+                    ON sessions(last_active DESC)
+                    WHERE is_normal_session = 1;
                 -- Append-only per-message log. One row per appended
                 -- ChatMessage; `/compact` does not delete or rewrite
                 -- prior rows — it inserts the summary message(s) at
@@ -157,6 +171,54 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active
                     ON session_messages(session_id, ordinal)
                     WHERE superseded_by IS NULL;
+
+                -- Per-session summary metadata. Content lives on disk at
+                -- `<workspace>/state/sessions/<session_id>/summary.md`; this
+                -- row is the durable, queryable index. ON DELETE CASCADE
+                -- with sessions so removing a parent removes its summary
+                -- row automatically. The on-disk file is reaped separately
+                -- on startup (orphan FS sweep).
+                --
+                -- See `docs/background-compression.md`.
+                CREATE TABLE IF NOT EXISTS session_summaries (
+                    session_id  TEXT    PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                    -- session_messages.ordinal of the most-recent message
+                    -- included in the last successful summary pass.
+                    cursor      INTEGER NOT NULL,
+                    pass_count  INTEGER NOT NULL DEFAULT 0,
+                    -- Unix µs (matches the rest of the µs schema).
+                    updated_at  INTEGER NOT NULL,
+                    -- Cumulative micro-USD spent on this session's summary
+                    -- passes. INTEGER, never REAL — same `feedback_money_no_float`
+                    -- invariant as `cost_records.cost_usd`.
+                    cost_micros INTEGER NOT NULL DEFAULT 0,
+                    model_id    TEXT    NOT NULL,
+                    span_id     TEXT    NOT NULL,
+                    -- Telemetry only — does NOT gate triggers. A persistent
+                    -- failure burns one LLM call per trigger event until the
+                    -- underlying issue resolves; that's an explicit design
+                    -- choice (no backoff complexity).
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    -- 1 while a `BackgroundCompressionRunner` pass is active for
+                    -- this parent; 0 otherwise. The trigger gate reads this
+                    -- column to enforce the at-most-one-in-flight invariant
+                    -- without inspecting the maintenance session row (which is
+                    -- preserved as audit history). Set by the gate before
+                    -- emitting a `SystemSpawnRequest`; cleared by
+                    -- `record_summary_success`/`record_summary_failure` and by
+                    -- the orphan reaper.
+                    in_flight   INTEGER NOT NULL DEFAULT 0,
+                    -- Opaque owner token (UUID) stamped by the trigger gate
+                    -- when it sets `in_flight = 1`. The runner's defensive
+                    -- post-pass cleanup uses a CAS-style clear (UPDATE
+                    -- `in_flight_owner = ?`) so a Pass A that finishes
+                    -- *after* a Pass B already marked itself in flight
+                    -- cannot wipe Pass B's mark. Reset to NULL by every
+                    -- terminal handler (`upsert_success` /
+                    -- `bump_error_count` / `clear_all_in_flight`) so a
+                    -- newly-started pass starts from a clean slate.
+                    in_flight_owner TEXT
+                );
 
                 CREATE TABLE IF NOT EXISTS memories (
                     id         TEXT PRIMARY KEY,
@@ -363,11 +425,14 @@ impl LibsqlPool {
         for stmt in [
             "ALTER TABLE cost_records ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE cost_records ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN is_normal_session INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE session_summaries ADD COLUMN in_flight INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE session_summaries ADD COLUMN in_flight_owner TEXT",
         ] {
             if let Err(e) = self.conn.execute(stmt, ()).await
                 && !e.to_string().contains("duplicate column name")
             {
-                return Err(anyhow::anyhow!("failed to add cost_records column: {e}"));
+                return Err(anyhow::anyhow!("failed to add column: {e}"));
             }
         }
         Ok(())

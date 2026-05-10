@@ -90,23 +90,18 @@ pub struct TuiAdapter {
     /// into the event loop so key handlers can drain entries.
     approval_queue: ApprovalQueue,
     /// Transport driving the loop: `start` subscribes to its event
-    /// stream and publishes user input via `transport.submit`. Wired in
-    /// before `start` via `with_transport` — `start` errors if absent.
-    transport: Option<Arc<WsTransport>>,
-}
-
-impl Default for TuiAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// stream and publishes user input via `transport.submit`. Required
+    /// at construction.
+    transport: Arc<WsTransport>,
 }
 
 impl TuiAdapter {
-    pub fn new() -> Self {
+    pub fn new(transport: Arc<WsTransport>) -> Self {
         let user_id = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "tui-user".to_string());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(256);
+        let approval_queue = transport.approval_queue();
         Self {
             session_id: format!("tui-{}", Uuid::new_v4()),
             user: User {
@@ -120,27 +115,9 @@ impl TuiAdapter {
             on_exit: None,
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
-            approval_queue: ApprovalQueue::new(),
-            transport: None,
+            approval_queue,
+            transport,
         }
-    }
-
-    /// Attach the transport that drives the TUI.
-    ///
-    /// * [`Self::start`] spawns a task that drives
-    ///   `transport.subscribe(session_id)` into the TUI's own
-    ///   `AppEvent` channel.
-    /// * User input is submitted via `transport.submit`.
-    /// * The approval gate uses the transport's queue, so approval
-    ///   events surfaced by the gateway land in the same UI mirror
-    ///   used by locally-originated ones.
-    ///
-    /// Must be called before `start()`. The transport's approval queue
-    /// replaces the default in-memory one.
-    pub fn with_transport(mut self, transport: Arc<WsTransport>) -> Self {
-        self.approval_queue = transport.approval_queue();
-        self.transport = Some(transport);
-        self
     }
 
     /// Pin the session id. Callers resolve a session by
@@ -185,8 +162,6 @@ impl TuiAdapter {
 
     /// Spawn the TUI event loop. Returns once the loop task has been
     /// spawned; the loop runs until shutdown or user-initiated quit.
-    /// The [`Self::with_transport`] builder must have been called first
-    /// — the loop drives its input and output from the transport.
     pub async fn start(&self) -> Result<()> {
         let event_rx = self
             .event_rx
@@ -194,18 +169,8 @@ impl TuiAdapter {
             .take()
             .ok_or_else(|| ChannelError::Send("TuiAdapter::start called twice".into()))?;
 
-        let transport = self
-            .transport
-            .as_ref()
-            .ok_or_else(|| {
-                ChannelError::Send(
-                    "TuiAdapter requires a transport — call with_transport before start".into(),
-                )
-            })
-            .map(Arc::clone)?;
-
         spawn_transport_pump(
-            Arc::clone(&transport),
+            Arc::clone(&self.transport),
             self.session_id.clone(),
             self.event_tx.clone(),
         )
@@ -215,7 +180,7 @@ impl TuiAdapter {
             session_id: self.session_id.clone(),
             user: self.user.clone(),
             shutdown: Arc::clone(&self.shutdown),
-            input: transport,
+            input: Arc::clone(&self.transport),
             event_tx: self.event_tx.clone(),
             event_rx,
             slash_handler: self.slash_handler.clone(),

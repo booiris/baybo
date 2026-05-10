@@ -128,6 +128,10 @@ pub enum TriggerKind {
 ///
 /// Closed enum — add a variant when a new subsystem needs to attribute
 /// work back to itself. Never use the open-ended `Other` antipattern.
+///
+/// Acts as the discriminator-only label persisted on `Session.trigger`.
+/// The matching payload-bearing event delivered to the maintenance
+/// actor is [`SystemTrigger`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SystemReason {
@@ -135,6 +139,56 @@ pub enum SystemReason {
     HistoryReview,
     /// Background memory consolidation / summarization task.
     MemoryConsolidation,
+    /// Async per-session background summary — a `BackgroundCompressionRunner` actor
+    /// reads its parent's transcript, generates an updated summary, and
+    /// writes `<workspace>/state/sessions/<parent_id>/summary.md` plus
+    /// the `session_summaries` metadata row. Triggered between turns
+    /// from the parent's agent loop. See `docs/background-compression.md`.
+    BackgroundCompression,
+}
+
+/// Payload carried by a `SystemTrigger::BackgroundCompression`. Built
+/// by the parent's agent loop at trigger time and forwarded through
+/// `JobInput::System` and `AgentMessage::SystemTrigger` to the
+/// maintenance actor's `BackgroundCompressionRunner`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundCompressionPayload {
+    pub parent_session_id: SessionId,
+    /// Highest `session_messages.ordinal` to include in this pass'
+    /// input. Pinned at trigger time so concurrent appends to the
+    /// parent don't bleed in mid-pass.
+    pub up_to_ordinal: i64,
+    /// Opaque owner token stamped onto `session_summaries.in_flight_owner`
+    /// when the trigger gate marked the parent in-flight. The runner
+    /// uses it for compare-and-clear cleanup so a stale Pass A
+    /// finishing after Pass B remarked the parent cannot wipe Pass
+    /// B's mark. Generated once per pass at the gate (UUID v4).
+    pub in_flight_owner: String,
+}
+
+/// Strongly-typed system maintenance trigger. Replaces the previous
+/// `(reason: SystemReason, payload: serde_json::Value)` pair carried
+/// in `JobInput::System` and `AgentMessage::SystemTrigger`. Unit
+/// variants exist for reasons whose runners aren't yet wired
+/// (`HistoryReview`, `MemoryConsolidation`); they keep the discriminator
+/// space symmetric with [`SystemReason`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum SystemTrigger {
+    HistoryReview,
+    MemoryConsolidation,
+    BackgroundCompression(BackgroundCompressionPayload),
+}
+
+impl SystemTrigger {
+    /// Discriminator label, matching the `Session.trigger` reason field.
+    pub fn reason(&self) -> SystemReason {
+        match self {
+            SystemTrigger::HistoryReview => SystemReason::HistoryReview,
+            SystemTrigger::MemoryConsolidation => SystemReason::MemoryConsolidation,
+            SystemTrigger::BackgroundCompression(_) => SystemReason::BackgroundCompression,
+        }
+    }
 }
 
 /// Direct parent relationship for sessions spawned from another session.
@@ -159,6 +213,13 @@ pub struct Lineage {
 /// specific job boundary. `fork_at_job_id` and `prefix_state_hash`
 /// together let the read-time view UNION the source's prefix with this
 /// session's own jobs while detecting source mutation.
+///
+/// `SystemMaintenance`: an internal, non-user-facing maintenance session
+/// (e.g. `SystemReason::BackgroundCompression`) doing work on behalf of its
+/// parent. The `Lineage.parent_session_id` pins the session being worked
+/// for; cancellation propagates down on parent shutdown via lookup.
+/// Maintenance sessions get `is_normal_session = 0` on the row, so default
+/// `SessionStore` listings exclude them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LineageKind {
@@ -167,6 +228,7 @@ pub enum LineageKind {
         fork_at_job_id: JobId,
         prefix_state_hash: String,
     },
+    SystemMaintenance,
 }
 
 /// A persisted conversation session — the root container of one trace
@@ -313,5 +375,54 @@ mod tests {
         let s = serde_json::to_string(&l).unwrap();
         let back: Lineage = serde_json::from_str(&s).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn lineage_system_maintenance_round_trip() {
+        let l = Lineage {
+            parent_session_id: SessionId::from("user-parent"),
+            parent_job_id: JobId::new(),
+            kind: LineageKind::SystemMaintenance,
+        };
+        let s = serde_json::to_string(&l).unwrap();
+        let back: Lineage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, l);
+    }
+
+    #[test]
+    fn trigger_source_system_background_compression_round_trip() {
+        let t = TriggerSource::System {
+            reason: SystemReason::BackgroundCompression,
+        };
+        let s = serde_json::to_string(&t).unwrap();
+        let back: TriggerSource = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.kind(), TriggerKind::System);
+    }
+
+    #[test]
+    fn system_trigger_unit_variants_round_trip() {
+        for t in [
+            SystemTrigger::HistoryReview,
+            SystemTrigger::MemoryConsolidation,
+        ] {
+            let s = serde_json::to_string(&t).unwrap();
+            let back: SystemTrigger = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, t);
+            assert_eq!(back.reason(), t.reason());
+        }
+    }
+
+    #[test]
+    fn system_trigger_background_compression_round_trip() {
+        let t = SystemTrigger::BackgroundCompression(BackgroundCompressionPayload {
+            parent_session_id: SessionId::from("user-1"),
+            up_to_ordinal: 42,
+            in_flight_owner: "owner-token".into(),
+        });
+        let s = serde_json::to_string(&t).unwrap();
+        let back: SystemTrigger = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.reason(), SystemReason::BackgroundCompression);
     }
 }

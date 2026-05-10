@@ -1,10 +1,10 @@
 //! End-to-end exercise of the LLM context-compression path.
 //!
 //! Drives the live `AgentLoop` through `AgentTestHarness` configured
-//! with a tight token budget and the `Summarize` strategy. The agent
-//! loop's chat closure uses the harness's main `StubLlm` for the
-//! summarizer call too — the strategy itself is now pure (just a
-//! planner), so there is no separate summarizer LLM to inject.
+//! with a tight token budget. The harness's default empty
+//! `InMemorySummaryLoader` makes the compressor's fast-path stage
+//! fall through, so the live LLM-summary stage runs and bills
+//! through the same `StubLlm`.
 //!
 //! Asserts:
 //!  1. The agent runs two consecutive turns; compression fires before
@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_context::{CompressionStrategy, Summarize, budget::TokenBudget};
+use aura_context::budget::TokenBudget;
 use aura_integration_tests::AgentTestHarness;
 use aura_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
 use aura_model::MicroUsd;
@@ -47,15 +47,14 @@ async fn compression_call_records_cost_with_matching_span_id() {
     );
     let pricing = pricing_map;
 
-    let strategy: Box<dyn CompressionStrategy> = Box::new(Summarize::new(1));
-
     // Tight budget: max=200 tokens, threshold=0.1 → any meaningful
     // turn easily crosses the gate so `compress_if_needed` fires
-    // before turn 2's LLM call.
+    // before turn 2's LLM call. `keep_recent=1` keeps the pre-flight
+    // gate from short-circuiting on the small canned transcript.
     let mut harness = AgentTestHarness::builder()
         .with_pricing(pricing)
         .with_token_budget(TokenBudget::new(200, 0.1))
-        .with_compression_strategy(strategy)
+        .with_keep_recent(1)
         .build();
 
     // Main-loop scripts: each turn streams a small text plus a Usage

@@ -928,6 +928,22 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+        async fn list_active_maintenance_for_parent(
+            &self,
+            _parent: &SessionId,
+        ) -> std::result::Result<Vec<SessionId>, StorageError> {
+            Ok(Vec::new())
+        }
+        async fn list_all_maintenance_sessions(
+            &self,
+        ) -> std::result::Result<Vec<SessionId>, StorageError> {
+            Ok(Vec::new())
+        }
+        async fn list_unfinished_maintenance_sessions(
+            &self,
+        ) -> std::result::Result<Vec<SessionId>, StorageError> {
+            Ok(Vec::new())
+        }
         async fn append_session_message(
             &self,
             id: &SessionId,
@@ -996,6 +1012,45 @@ mod tests {
             id: &SessionId,
         ) -> std::result::Result<Vec<aura_storage::StoredMessage>, StorageError> {
             Ok(self.messages.lock().get(id).cloned().unwrap_or_default())
+        }
+        async fn active_index_of_ordinal(
+            &self,
+            id: &SessionId,
+            ordinal: i64,
+        ) -> std::result::Result<Option<usize>, StorageError> {
+            Ok(self.messages.lock().get(id).and_then(|log| {
+                log.iter()
+                    .filter(|m| m.superseded_by.is_none())
+                    .position(|m| m.ordinal == ordinal)
+            }))
+        }
+        async fn count_active_messages(
+            &self,
+            id: &SessionId,
+        ) -> std::result::Result<usize, StorageError> {
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .map(|log| log.iter().filter(|m| m.superseded_by.is_none()).count())
+                .unwrap_or(0))
+        }
+        async fn load_active_session_messages_up_to(
+            &self,
+            id: &SessionId,
+            up_to_ordinal: i64,
+        ) -> std::result::Result<Vec<aura_model::ChatMessage>, StorageError> {
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .map(|log| {
+                    log.iter()
+                        .filter(|m| m.superseded_by.is_none() && m.ordinal <= up_to_ordinal)
+                        .map(|m| m.message.clone())
+                        .collect()
+                })
+                .unwrap_or_default())
         }
     }
 

@@ -3,4 +3,4 @@
 /**
  * Concrete resource a single tool call touches, derived from its parameters.
  */
-export type ResourceAccess = { "kind": "read_file", path: string, } | { "kind": "write_file", path: string, } | { "kind": "http", host: string, } | { "kind": "exec_command", command: string, };
+export type ResourceAccess = { "kind": "read_file", path: string, } | { "kind": "write_file", path: string, } | { "kind": "http", host: string, } | { "kind": "exec_command", command: string, } | { "kind": "env", vars: Array<string>, };

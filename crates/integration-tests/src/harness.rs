@@ -8,6 +8,7 @@
 //! reach into post-run state without re-wiring anything.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,9 +20,7 @@ use aura_agent::{
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
-use aura_context::{
-    CompressionStrategy, ContextManager, TiktokenTokenizer, Truncate, budget::TokenBudget,
-};
+use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, budget::TokenBudget};
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmCompletion, ModelPricing};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
@@ -62,6 +61,10 @@ pub struct AgentTestHarness {
     pub skill_registry: Arc<SkillRegistry>,
     pub cost_manager: Arc<CostManager>,
     pub token_calibration: Arc<aura_context::TokenCalibration>,
+    /// Session manager backing the wired `ContextManager`. Exposed so
+    /// tests can pre-seed session messages or summary metadata before
+    /// driving the agent loop (e.g. compressor fast-path e2e coverage).
+    pub session_manager: Arc<aura_agent::SessionManager>,
     pub mailbox: mpsc::Sender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -158,7 +161,8 @@ pub struct AgentTestHarnessBuilder {
     tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
     spending_limits: SpendingLimits,
     pricing: HashMap<String, ModelPricing>,
-    compression_strategy: Option<Box<dyn CompressionStrategy>>,
+    workspace: Option<Arc<aura_workspace::WorkspacePaths>>,
+    keep_recent: Option<usize>,
     token_budget: Option<TokenBudget>,
 }
 
@@ -172,7 +176,8 @@ impl Default for AgentTestHarnessBuilder {
             tools: Vec::new(),
             spending_limits: SpendingLimits::default(),
             pricing: HashMap::new(),
-            compression_strategy: None,
+            workspace: None,
+            keep_recent: None,
             token_budget: None,
         }
     }
@@ -222,10 +227,18 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Override the context compression strategy (default: `Truncate(50)`).
-    /// Use to drive `Summarize`-path tests with a stub `SummarizeCallback`.
-    pub fn with_compression_strategy(mut self, strategy: Box<dyn CompressionStrategy>) -> Self {
-        self.compression_strategy = Some(strategy);
+    /// Override the workspace handle the `ContextManager` resolves
+    /// per-session paths through (`summary.md`, JSONL transcript).
+    /// Default: a workspace rooted at a non-existent path so the
+    /// fast-path always falls through.
+    pub fn with_workspace(mut self, workspace: Arc<aura_workspace::WorkspacePaths>) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    /// Override `keep_recent` (default: 50).
+    pub fn with_keep_recent(mut self, keep_recent: usize) -> Self {
+        self.keep_recent = Some(keep_recent);
         self
     }
 
@@ -313,15 +326,37 @@ impl AgentTestHarnessBuilder {
         // `TokenCalibration` keys observe and adjust identically.
         let stub_model_id = stub_llm.model_info().id.clone();
         let tokenizer = Arc::new(TiktokenTokenizer::for_model(&stub_model_id));
-        let strategy = self
-            .compression_strategy
-            .unwrap_or_else(|| Box::new(Truncate::new(50)));
+        // Non-existent root → fast-path read hits NotFound → falls
+        // through. No tempdir to clean up.
+        let workspace = self.workspace.unwrap_or_else(|| {
+            Arc::new(aura_workspace::WorkspacePaths::new(PathBuf::from(
+                "/nonexistent-aura-it-workspace",
+            )))
+        });
+        let keep_recent = self.keep_recent.unwrap_or(50);
         let token_budget = self
             .token_budget
             .unwrap_or_else(|| TokenBudget::new(100_000, 0.95));
         let token_calibration = Arc::new(aura_context::TokenCalibration::new());
-        let context_manager = ContextManager::new(tokenizer, strategy, token_budget)
-            .with_calibration(Arc::clone(&token_calibration));
+        let session_store = Arc::new(aura_storage::test_support::MemorySessionStore::new())
+            as Arc<dyn aura_storage::SessionStore>;
+        let summary_store = Arc::new(aura_storage::test_support::MemorySessionSummaryStore::new())
+            as Arc<dyn aura_storage::SessionSummaryStore>;
+        let session_manager = Arc::new(aura_agent::SessionManager::new(
+            session_store,
+            summary_store,
+            chrono::Duration::minutes(30),
+        ));
+        let context_manager = ContextManager::from_config(ContextManagerConfig {
+            tokenizer,
+            workspace,
+            keep_recent,
+            budget: token_budget,
+            calibration: Arc::clone(&token_calibration),
+            skill_registry: Arc::clone(&skill_registry),
+            session_id: session.id.clone(),
+            sessions: Arc::clone(&session_manager),
+        });
 
         let soul_text = self
             .soul_prompt
@@ -333,29 +368,37 @@ impl AgentTestHarnessBuilder {
             cost_manager.as_guard(),
         );
 
-        let agent_loop = AgentLoop::new(
-            guarded_llm,
-            tool_registry.clone(),
-            skill_registry.clone(),
-            tool_executor.clone(),
+        let actor_parent_token = tokio_util::sync::CancellationToken::new();
+        let actor_token = actor_parent_token.child_token();
+
+        let agent_loop = AgentLoop::from_config(aura_agent::agent_loop::AgentLoopConfig {
+            llm_client: guarded_llm,
+            tool_registry: tool_registry.clone(),
+            skill_registry: skill_registry.clone(),
+            tool_executor: tool_executor.clone(),
             context_manager,
             memory_manager,
-            ExecutionPolicy::default(),
+            policy: ExecutionPolicy::default(),
             soul,
-            gateway.clone(),
-        )
-        .with_cost_manager(Arc::clone(&cost_manager));
+            security_gateway: gateway.clone(),
+            cost_manager: Arc::clone(&cost_manager),
+            actor_token: actor_token.clone(),
+            subagent_runtime: None,
+            session_log: None,
+            system_spawn_tx: None,
+            workspace_paths: None,
+            sessions: None,
+        });
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
-        let actor_parent_token = tokio_util::sync::CancellationToken::new();
         let actor = AgentActor::new(
             session.clone(),
             agent_loop,
             output_tx,
             job_lifecycle,
             span_recorder,
-            &actor_parent_token,
+            actor_token,
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));
 
@@ -373,6 +416,7 @@ impl AgentTestHarnessBuilder {
             skill_registry,
             cost_manager,
             token_calibration,
+            session_manager,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),

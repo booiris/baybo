@@ -33,8 +33,7 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
                     action_payload: serde_json::json!({}),
                 },
                 TriggerKind::System => JobInput::System {
-                    reason: aura_model::SystemReason::HistoryReview,
-                    payload: serde_json::json!({}),
+                    trigger: aura_model::SystemTrigger::HistoryReview,
                 },
                 TriggerKind::Spawned => JobInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
