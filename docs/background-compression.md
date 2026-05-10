@@ -252,7 +252,7 @@ Trait signature unchanged (χ-1: wrapper holds session_id internally).
      hard stop:    tokens + next_unit > 40K
      soft stop:    tokens ≥ 10K AND text_block_msg_count ≥ 5
    ```
-   Then **clamp** the cut to be no later than the cursor's index in the `non_system` frame: `cut = min(walk_cut, cursor_idx_in_non_system)`. Every message after the cursor is unsummarized — it must remain in the recent slice. `RECENT_SLICE_MAX_TOKENS` is a *forward-extension* ceiling for the walk, not a license to drop post-cursor content.
+   Then **clamp** the cut to be no later than the index *one past* the cursor's index in the `non_system` frame: `cut = pair_preserving_cut(non_system, min(walk_cut, cursor_idx_in_non_system + 1))`. Every message *strictly after* the cursor is unsummarized — it must remain in the recent slice — and `pair_preserving_cut` guarantees the slice never starts mid-tool-pair (so a cursor that lands on a tool_use or tool_result, e.g. an iteration-boundary trigger right after a tool exchange, doesn't produce an orphan tool_result blob). `RECENT_SLICE_MAX_TOKENS` is a *forward-extension* ceiling for the walk, not a license to drop post-cursor content.
 4. **Pre-assembly threshold check** (recent slice **included**):
    - `tokens(summary) + tokens(skill_trailer) + tokens(recent_slice) > 0.6 × max_tokens` → fall through to inner. Including the recent slice catches stale-cursor scenarios where the post-cursor span alone overruns the budget.
 5. **Assemble**:

@@ -114,27 +114,37 @@ impl SessionManager {
     }
 
     /// Mark `session_id` as having an in-flight `BackgroundCompressionRunner`
-    /// pass. The trigger gate calls this immediately before emitting a
-    /// `SystemSpawnRequest`, and the next gate iteration on the same
-    /// parent will see the flag and skip. A landed
-    /// `record_summary_success` / `record_summary_failure` clears it
-    /// automatically; the orphan reaper clears it on next boot for
-    /// sessions whose maintenance row was reaped.
-    pub async fn mark_summary_in_flight(&self, session_id: &SessionId) -> Result<()> {
+    /// pass and stamp `owner` onto the row. The trigger gate calls
+    /// this immediately before emitting a `SystemSpawnRequest`, and
+    /// the next gate iteration on the same parent will see the flag
+    /// and skip. A landed `record_summary_success` /
+    /// `record_summary_failure` clears it automatically; the orphan
+    /// reaper clears it on next boot for sessions whose maintenance
+    /// row was reaped.
+    ///
+    /// `owner` should be a freshly-generated UUID (or any unique
+    /// token) so [`Self::clear_summary_in_flight_if_owned`] can do a
+    /// CAS-style clear without wiping a newer pass' mark.
+    pub async fn mark_summary_in_flight(&self, session_id: &SessionId, owner: &str) -> Result<()> {
         self.summary_store
-            .set_in_flight(session_id, true, Utc::now())
+            .set_in_flight(session_id, true, Some(owner), Utc::now())
             .await
             .map_err(wrap)
     }
 
-    /// Clear the `in_flight` flag without recording a success or
-    /// failure. Used by the trigger gate to roll back its own mark when
-    /// `try_send` on the spawn channel fails (so the next iteration
-    /// retries) and as defense in depth for runner exit paths that
-    /// bypass `record_*` (e.g. cancellation).
-    pub async fn clear_summary_in_flight(&self, session_id: &SessionId) -> Result<()> {
+    /// Compare-and-clear the `in_flight` flag: only clears when the
+    /// row's `in_flight_owner` matches `owner`. Returns `Ok(true)`
+    /// when the caller still owned the mark. Used by the trigger
+    /// gate's `try_send` rollback and the runner's defensive
+    /// post-pass cleanup so a stale Pass A finishing after Pass B
+    /// remarked the parent cannot wipe Pass B's mark.
+    pub async fn clear_summary_in_flight_if_owned(
+        &self,
+        session_id: &SessionId,
+        owner: &str,
+    ) -> Result<bool> {
         self.summary_store
-            .set_in_flight(session_id, false, Utc::now())
+            .clear_in_flight_if_owned(session_id, owner, Utc::now())
             .await
             .map_err(wrap)
     }

@@ -584,10 +584,16 @@ impl ContextManager {
 
     /// Walk the bound session's supersede log, filter to active rows
     /// (`superseded_by IS NULL`), find the active row whose `ordinal ==
-    /// cursor`. The active row's position in the active sequence is
-    /// the in-memory anchor index. Returns `None` when the cursor's
-    /// ordinal isn't in the active set (compression has rewritten that
-    /// message away) or the lookup fails.
+    /// cursor`. Returns the index **after** that row in the active
+    /// sequence — i.e. the position of the first message whose ordinal
+    /// is strictly greater than `cursor`. That's the right anchor for
+    /// `tokens_since_anchor` because `cursor` is the highest ordinal
+    /// already covered by the summary; counting it as "new growth"
+    /// would let a single heavy tool_result message immediately blow
+    /// past `SUMMARY_DIFF_TOKEN_THRESHOLD` and retrigger a fresh pass
+    /// after a successful one just landed. Returns `None` when the
+    /// cursor's ordinal isn't in the active set (compression has
+    /// rewritten that message away) or the lookup fails.
     async fn lookup_anchor_index_for_cursor(&self, cursor: i64) -> Option<usize> {
         let rows = match self
             .sessions
@@ -612,7 +618,7 @@ impl ContextManager {
                 continue;
             }
             if row.ordinal == cursor {
-                return Some(active_idx);
+                return Some(active_idx + 1);
             }
             active_idx += 1;
         }
@@ -641,9 +647,7 @@ impl ContextManager {
             );
             return;
         };
-        let advance = self
-            .last_summary_anchor
-            .is_none_or(|current| idx > current);
+        let advance = self.last_summary_anchor.is_none_or(|current| idx > current);
         if advance {
             self.last_summary_anchor = Some(idx);
             debug!(
@@ -1665,9 +1669,11 @@ mod tests {
         assert!(ctx.tokens_since_anchor() > 0);
     }
 
-    /// Background pass settled: cursor maps to an active row's
-    /// position, anchor advances to that index, future
-    /// `tokens_since_anchor` measures only growth past the cursor.
+    /// Background pass settled: cursor maps to *one past* the
+    /// matching active row's position so the cursor message itself —
+    /// already covered by the summary — does not count as new growth.
+    /// Future `tokens_since_anchor` measures only ordinals strictly
+    /// greater than the cursor.
     #[tokio::test]
     async fn sync_anchor_to_cursor_advances_anchor_to_persisted_position() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
@@ -1680,12 +1686,41 @@ mod tests {
         let total: usize = ctx.per_message_tokens.iter().sum();
         assert_eq!(ctx.tokens_since_anchor(), total);
 
-        // Background pass landed at ordinal 1 → anchor moves to
-        // active idx 1, so tokens_since_anchor only counts msg-2.
+        // Background pass landed at ordinal 1 → cursor row sits at
+        // active idx 1, so anchor lands at idx 2 (strictly after the
+        // cursor) and tokens_since_anchor counts only msg-2.
         ctx.sync_anchor_to_cursor(1).await;
-        assert_eq!(ctx.last_summary_anchor(), Some(1));
-        let after = ctx.per_message_tokens[1..].iter().sum::<usize>();
+        assert_eq!(ctx.last_summary_anchor(), Some(2));
+        let after = ctx.per_message_tokens[2..].iter().sum::<usize>();
         assert_eq!(ctx.tokens_since_anchor(), after);
+    }
+
+    /// A heavy cursor message must not, by itself, push
+    /// `tokens_since_anchor` past `SUMMARY_DIFF_TOKEN_THRESHOLD`. The
+    /// cursor message is already covered by the summary, so right
+    /// after a successful background pass the diff measure should be
+    /// 0 — otherwise a single big tool_result re-fires the gate even
+    /// though no new content arrived.
+    #[tokio::test]
+    async fn sync_anchor_to_cursor_excludes_cursor_message_tokens() {
+        let mut ctx = make_ctx(5, 1_000_000, 0.75);
+        ctx.append(&make_msg(Role::User, "msg-0")).await;
+        ctx.append(&make_msg(Role::Assistant, "msg-1")).await;
+        // msg-2 is a fat tool-result-shaped message: if the anchor
+        // landed *on* it, tokens_since_anchor would include it.
+        ctx.append(&make_msg(Role::User, &"x".repeat(50_000))).await;
+
+        // Cursor=2: the just-appended fat message is the most-recent
+        // ordinal included in the summary. Anchor should sit one past
+        // it (i.e. at messages.len()) so diff measures zero growth.
+        ctx.sync_anchor_to_cursor(2).await;
+        assert_eq!(ctx.last_summary_anchor(), Some(ctx.messages().len()));
+        assert_eq!(
+            ctx.tokens_since_anchor(),
+            0,
+            "fat cursor message must not count as new growth"
+        );
+        assert_eq!(ctx.tool_calls_since_anchor(), 0);
     }
 
     /// Cursor that's not in the active set (e.g. an inline

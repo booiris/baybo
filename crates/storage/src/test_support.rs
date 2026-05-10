@@ -838,6 +838,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
                 span_id: String::new(),
                 error_count: 0,
                 in_flight: false,
+                in_flight_owner: None,
             });
         entry.cursor = cursor;
         entry.pass_count += 1;
@@ -847,6 +848,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
         entry.updated_at = updated_at;
         entry.error_count = 0;
         entry.in_flight = false;
+        entry.in_flight_owner = None;
         Ok(())
     }
 
@@ -870,12 +872,14 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
                 span_id: String::new(),
                 error_count: 0,
                 in_flight: false,
+                in_flight_owner: None,
             });
         entry.error_count += 1;
         entry.model_id = model_id.to_string();
         entry.span_id = span_id.to_string();
         entry.updated_at = updated_at;
         entry.in_flight = false;
+        entry.in_flight_owner = None;
         Ok(())
     }
 
@@ -883,6 +887,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
         &self,
         session_id: &SessionId,
         in_flight: bool,
+        owner: Option<&str>,
         updated_at: chrono::DateTime<chrono::Utc>,
     ) -> SessionSummaryResult<()> {
         let mut guard = self.rows.lock();
@@ -898,16 +903,38 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
                 span_id: String::new(),
                 error_count: 0,
                 in_flight: false,
+                in_flight_owner: None,
             });
         entry.in_flight = in_flight;
+        entry.in_flight_owner = owner.map(str::to_string);
         entry.updated_at = updated_at;
         Ok(())
+    }
+
+    async fn clear_in_flight_if_owned(
+        &self,
+        session_id: &SessionId,
+        owner: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> SessionSummaryResult<bool> {
+        let mut guard = self.rows.lock();
+        let Some(entry) = guard.get_mut(session_id) else {
+            return Ok(false);
+        };
+        if entry.in_flight_owner.as_deref() != Some(owner) {
+            return Ok(false);
+        }
+        entry.in_flight = false;
+        entry.in_flight_owner = None;
+        entry.updated_at = updated_at;
+        Ok(true)
     }
 
     async fn clear_all_in_flight(&self) -> SessionSummaryResult<()> {
         let mut guard = self.rows.lock();
         for row in guard.values_mut() {
             row.in_flight = false;
+            row.in_flight_owner = None;
         }
         Ok(())
     }

@@ -1762,9 +1762,15 @@ impl AgentLoop {
                 return;
             }
         };
+        // Fresh owner token per pass. Used as the CAS key for the
+        // runner's defensive in_flight cleanup so a stale Pass A
+        // finishing after Pass B remarked the parent cannot wipe
+        // Pass B's mark.
+        let owner_token = uuid::Uuid::new_v4().to_string();
         let payload = crate::background_compression::BackgroundCompressionPayload {
             parent_session_id: session.id.clone(),
             up_to_ordinal,
+            in_flight_owner: owner_token.clone(),
         };
         debug!(
             parent_session_id = %session.id,
@@ -1773,6 +1779,7 @@ impl AgentLoop {
             tool_calls,
             job_done,
             up_to_ordinal,
+            owner_token = %owner_token,
             "summary trigger: spawning refresh pass"
         );
         let request = crate::background_compression::SystemSpawnRequest::BackgroundCompression {
@@ -1787,7 +1794,10 @@ impl AgentLoop {
         // failure here means we cannot enforce the at-most-one
         // invariant — abort the trigger rather than risk a duplicate
         // pass.
-        if let Err(e) = sessions.mark_summary_in_flight(&session.id).await {
+        if let Err(e) = sessions
+            .mark_summary_in_flight(&session.id, &owner_token)
+            .await
+        {
             warn!(
                 parent_session_id = %session.id,
                 error = %e,
@@ -1801,15 +1811,19 @@ impl AgentLoop {
                 error = %e,
                 "summary trigger: system-spawn channel send failed; rolling back in_flight"
             );
-            // Roll back the mark so the next iteration retries.
-            // Failure here is logged but otherwise tolerated; the
-            // runner side will not clear it and the orphan reaper is
-            // the last line of defense.
-            if let Err(e) = sessions.clear_summary_in_flight(&session.id).await {
+            // Roll back the mark so the next iteration retries. CAS
+            // on owner_token so we don't clobber a mark a *different*
+            // pass landed in the same window. Failure is logged but
+            // otherwise tolerated; the orphan reaper is the last line
+            // of defense.
+            if let Err(e) = sessions
+                .clear_summary_in_flight_if_owned(&session.id, &owner_token)
+                .await
+            {
                 warn!(
                     parent_session_id = %session.id,
                     error = %e,
-                    "summary trigger: clear_summary_in_flight rollback failed"
+                    "summary trigger: clear_summary_in_flight_if_owned rollback failed"
                 );
             }
         }
@@ -1847,9 +1861,13 @@ impl AgentLoop {
         // Held for the post-`with_job` defensive cleanup that
         // guarantees `in_flight` is cleared even when the runner
         // returns Err before reaching `record_summary_*` (cancel,
-        // job-lifecycle rejection, transcript load failure).
+        // job-lifecycle rejection, transcript load failure). The
+        // cleanup is gated on the owner token so a stale Pass A
+        // finishing after Pass B already remarked the parent cannot
+        // wipe Pass B's mark.
         let cleanup_sessions = sessions.clone();
         let parent_id_for_cleanup = payload.parent_session_id.clone();
+        let cleanup_owner = payload.in_flight_owner.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
         let cost_manager = self.cost_manager.clone();
@@ -1897,21 +1915,37 @@ impl AgentLoop {
             })
             .await;
 
-        // Defense in depth: idempotently clear `in_flight` after the
-        // runner returns. Successful and failed passes already clear
-        // the flag via `record_summary_success`/`record_summary_failure`,
-        // but cancellation or an error before either of those calls
-        // would otherwise leave the flag set until the next process
-        // restart (when the orphan reaper would clear it).
-        if let Err(e) = cleanup_sessions
-            .clear_summary_in_flight(&parent_id_for_cleanup)
+        // Defense in depth: CAS-clear `in_flight` after the runner
+        // returns. Successful and failed passes already clear the
+        // flag via `record_summary_success`/`record_summary_failure`
+        // (which also nulls `in_flight_owner`), so this owned-clear
+        // is a no-op on those paths. It only fires for runner exits
+        // that bypass `record_*` (cancellation before the runner
+        // started, job-lifecycle rejection, mid-await drop). The
+        // owner-token gate keeps a stale cleanup from this pass from
+        // wiping a fresher pass' mark.
+        match cleanup_sessions
+            .clear_summary_in_flight_if_owned(&parent_id_for_cleanup, &cleanup_owner)
             .await
         {
-            warn!(
-                parent_session_id = %parent_id_for_cleanup,
-                error = %e,
-                "summary refresh: clear_summary_in_flight after runner failed"
-            );
+            Ok(true) => {
+                debug!(
+                    parent_session_id = %parent_id_for_cleanup,
+                    owner_token = %cleanup_owner,
+                    "summary refresh: defensive in_flight clear fired (runner bypassed record_*)"
+                );
+            }
+            Ok(false) => {
+                // Either record_* already cleared it, or a fresher
+                // pass took ownership — both are correct outcomes.
+            }
+            Err(e) => {
+                warn!(
+                    parent_session_id = %parent_id_for_cleanup,
+                    error = %e,
+                    "summary refresh: clear_summary_in_flight_if_owned after runner failed"
+                );
+            }
         }
 
         result

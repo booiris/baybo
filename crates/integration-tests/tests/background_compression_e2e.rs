@@ -409,8 +409,9 @@ async fn lineage_kind_round_trips_for_system_maintenance() {
 }
 
 /// Trigger-gate `in_flight` lifecycle: marking the parent in-flight
-/// lights up the flag; a recorded success clears it; a separate
-/// `clear_summary_in_flight` is idempotent.
+/// stamps the owner token; a recorded success clears flag and owner
+/// in one UPSERT; a stale CAS clear with the original owner is a
+/// no-op now that the owner is NULL.
 #[tokio::test]
 async fn in_flight_marks_then_clears_on_recorded_pass() {
     let (store, _dir) = fresh_store_and_paths().await;
@@ -427,30 +428,93 @@ async fn in_flight_marks_then_clears_on_recorded_pass() {
     assert!(mgr.summary_metadata(&parent.id).await.unwrap().is_none());
 
     // Gate marks in-flight before emitting the spawn — placeholder row
-    // is created carrying `in_flight = true` and zero-valued counters.
-    mgr.mark_summary_in_flight(&parent.id).await.unwrap();
+    // is created carrying `in_flight = true`, the owner token, and
+    // zero-valued counters.
+    let owner_a = "owner-A";
+    mgr.mark_summary_in_flight(&parent.id, owner_a)
+        .await
+        .unwrap();
     let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
     assert!(row.in_flight);
+    assert_eq!(row.in_flight_owner.as_deref(), Some(owner_a));
     assert_eq!(row.cursor, 0);
     assert_eq!(row.pass_count, 0);
 
     // Runner records success → flag cleared in the same UPSERT that
-    // bumps `pass_count` and advances `cursor`.
+    // bumps `pass_count`, advances `cursor`, and nulls the owner.
     mgr.record_summary_success(&parent.id, 7, 1_000, "m", "span", Utc::now())
         .await
         .unwrap();
     let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
     assert!(!row.in_flight);
+    assert!(row.in_flight_owner.is_none());
     assert_eq!(row.cursor, 7);
     assert_eq!(row.pass_count, 1);
 
-    // Idempotent rollback — clearing again is a no-op on the flag and
-    // doesn't perturb the recorded counters.
-    mgr.clear_summary_in_flight(&parent.id).await.unwrap();
+    // Stale defensive cleanup with the same owner is now a no-op
+    // (the row has owner = NULL after the success). Counters stay put.
+    let cleared = mgr
+        .clear_summary_in_flight_if_owned(&parent.id, owner_a)
+        .await
+        .unwrap();
+    assert!(!cleared, "stale cleanup must not match a NULL owner");
     let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
     assert!(!row.in_flight);
     assert_eq!(row.cursor, 7);
     assert_eq!(row.pass_count, 1);
+}
+
+/// Issue 2 regression: a stale Pass A finishing after Pass B
+/// remarked the parent must NOT wipe Pass B's mark via the
+/// runner's defensive cleanup.
+#[tokio::test]
+async fn defensive_clear_does_not_clobber_newer_pass_mark() {
+    let (store, _dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-cas-race");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    );
+
+    // Pass A marks itself in-flight, then lands a successful summary
+    // (which clears flag + owner in one terminal UPSERT).
+    mgr.mark_summary_in_flight(&parent.id, "owner-A")
+        .await
+        .unwrap();
+    mgr.record_summary_success(&parent.id, 5, 100, "m", "span", Utc::now())
+        .await
+        .unwrap();
+
+    // Pass B picks up the parent (gate sees in_flight=false, marks
+    // again with a fresh token).
+    mgr.mark_summary_in_flight(&parent.id, "owner-B")
+        .await
+        .unwrap();
+
+    // Pass A's stale outer cleanup fires. Pre-fix this would clear
+    // Pass B's mark — with the owner-token CAS it must be a no-op.
+    let cleared = mgr
+        .clear_summary_in_flight_if_owned(&parent.id, "owner-A")
+        .await
+        .unwrap();
+    assert!(!cleared, "stale Pass A cleanup must not match Pass B owner");
+
+    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert!(row.in_flight, "Pass B's mark must survive stale cleanup");
+    assert_eq!(row.in_flight_owner.as_deref(), Some("owner-B"));
+
+    // Pass B's matching cleanup clears as expected.
+    let cleared = mgr
+        .clear_summary_in_flight_if_owned(&parent.id, "owner-B")
+        .await
+        .unwrap();
+    assert!(cleared);
+    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert!(!row.in_flight);
+    assert!(row.in_flight_owner.is_none());
 }
 
 /// Orphan reaper closes the "mark-without-row" gap. Trigger gate
@@ -474,7 +538,9 @@ async fn orphan_reaper_clears_orphan_in_flight_without_maintenance_row() {
 
     // Simulate the gap: gate persisted in_flight = 1, process crashed
     // before the router could call create_maintenance_session.
-    mgr.mark_summary_in_flight(&parent.id).await.unwrap();
+    mgr.mark_summary_in_flight(&parent.id, "owner-orphan-mark")
+        .await
+        .unwrap();
     assert!(
         mgr.summary_metadata(&parent.id)
             .await
@@ -524,7 +590,9 @@ async fn orphan_reaper_clears_in_flight_on_recovered_parent() {
         .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
         .await
         .unwrap();
-    mgr.mark_summary_in_flight(&parent.id).await.unwrap();
+    mgr.mark_summary_in_flight(&parent.id, "owner-stale-flight")
+        .await
+        .unwrap();
     assert!(
         mgr.summary_metadata(&parent.id)
             .await

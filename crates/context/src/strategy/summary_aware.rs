@@ -15,7 +15,8 @@ use aura_skills::SkillRegistry;
 use tracing::{debug, warn};
 
 use super::{
-    ChatCallback, CompressOutput, CompressionStrategy, partition_system, walk_backward_atomic,
+    ChatCallback, CompressOutput, CompressionStrategy, pair_preserving_cut, partition_system,
+    walk_backward_atomic,
 };
 use crate::{
     FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO, RECENT_SLICE_MAX_TOKENS,
@@ -284,15 +285,24 @@ impl CompressionStrategy for SummaryAwareWrapper {
             return self.inner.compress(messages, chat).await;
         };
 
-        // The recent slice must include every message after the
-        // cursor — those are unsummarized originals — and may extend
-        // *past* the cursor when the post-cursor tail alone is too
-        // small to satisfy the structural minimums (atomic-pair
+        // The recent slice must include every message **strictly
+        // after** the cursor — those are unsummarized originals — and
+        // may extend further back when the post-cursor tail alone is
+        // too small to satisfy the structural minimums (atomic-pair
         // preservation, `RECENT_SLICE_MIN_*` thresholds). The walk
         // produces the natural tail; we then clamp the cut to be no
-        // later than the cursor so the post-cursor span is always
-        // covered. `RECENT_SLICE_MAX_TOKENS` is the *forward-extension*
-        // ceiling — it never trims unsummarized content.
+        // later than `cursor_idx_in_non_system + 1` so the strict
+        // post-cursor span is always covered (the cursor message
+        // itself is the last ordinal already in the summary, so we
+        // skip it in the recent slice to avoid silly redundancy).
+        // `RECENT_SLICE_MAX_TOKENS` is the *forward-extension* ceiling
+        // — it never trims unsummarized content. Finally, run
+        // `pair_preserving_cut` on the clamped position so a cursor
+        // that falls between an `assistant{tool_use}` and the matching
+        // `user{tool_result}` (an iteration-boundary trigger right
+        // after a tool call) doesn't leave the recent slice starting
+        // with an orphan ToolResult. Anthropic / OpenAI both reject
+        // payloads with unmatched tool_result blocks.
         let tokenize_msg = |m: &ChatMessage| self.tokenizer.count_message(m);
         let walk_cut = walk_backward_atomic(
             &non_system,
@@ -301,7 +311,8 @@ impl CompressionStrategy for SummaryAwareWrapper {
             RECENT_SLICE_MAX_TOKENS,
             tokenize_msg,
         );
-        let cut = walk_cut.min(cursor_idx_in_non_system);
+        let post_cursor_cut = (cursor_idx_in_non_system + 1).min(non_system.len());
+        let cut = pair_preserving_cut(&non_system, walk_cut.min(post_cursor_cut));
         let recent_slice = non_system[cut..].to_vec();
 
         let summary_msg = self.build_summary_message(&summary_content);
@@ -597,8 +608,9 @@ mod tests {
     /// persisted so the cursor maps cleanly: fast-path applies.
     /// `replaced_full_history = true` so the manager will attach the
     /// skill trailer at the end. Recent slice's left edge is clamped
-    /// to the cursor's in-memory position so cursor-after content is
-    /// always preserved.
+    /// to one past the cursor's in-memory position so every
+    /// strictly-post-cursor message is preserved without redundantly
+    /// repeating the cursor message that the summary already covers.
     #[tokio::test]
     async fn fast_path_assembles_summary_plus_recent_slice() {
         let (wrapper, loader, id, mgr) = wired_wrapper(200_000, 2).await;
@@ -623,9 +635,10 @@ mod tests {
         persist_messages(&mgr, &id, &messages).await;
 
         let store = mgr.summary_store();
-        // Cursor=10 — ordinal of the 10th persisted message (an
-        // assistant reply mid-conversation), so the wrapper's recent
-        // slice must extend back at least to in-memory index 9.
+        // Cursor=10 — ordinal of messages[10] (an assistant reply
+        // mid-conversation). The clamp takes us to index 11 in the
+        // full frame, so the recent slice must extend back at least
+        // to in-memory index 11 (i.e. cover messages[11..]).
         store
             .upsert_success(&id, 10, 100, "m", "span", Utc::now())
             .await
@@ -653,14 +666,15 @@ mod tests {
                 } else {
                     panic!("summary message body must be text");
                 }
-                // Cursor-coverage invariant: recent slice covers
-                // every message after the cursor. The persisted
-                // transcript has 41 entries (1 system + 40 non-system).
-                // Cursor=10 is the 10th total → 9th non-system index.
-                // `messages[10..]` is everything strictly after the
-                // cursor; all of it must appear in the assembled
-                // output, in order.
-                let post_cursor_originals = &messages[10..];
+                // Strict-post-cursor coverage invariant: recent slice
+                // covers every message *strictly after* the cursor.
+                // The persisted transcript has 41 entries (1 system +
+                // 40 non-system); cursor=10 is messages[10], so
+                // messages[11..] is the strict post-cursor span.
+                // The slice may extend further back when the natural
+                // walk pulls more in to satisfy structural minima, so
+                // check that the assembled tail ends with that span.
+                let post_cursor_originals = &messages[11..];
                 let assembled_tail = &m[2..];
                 assert!(
                     assembled_tail.len() >= post_cursor_originals.len(),
@@ -676,6 +690,200 @@ mod tests {
                 );
             }
             _ => panic!("fast-path must succeed when metadata + file present"),
+        }
+    }
+
+    /// Regression guard for issue 3 (orphan tool_result): the
+    /// background trigger fires at iteration boundary right after a
+    /// tool exchange, so the cursor lands on the user message
+    /// carrying the tool_result. With the old "clamp at cursor_idx"
+    /// rule the recent slice would start at that tool_result and
+    /// drop the matching tool_use that lives one ordinal earlier —
+    /// Anthropic / OpenAI both reject orphan tool_result blocks.
+    /// With the post-cursor clamp + `pair_preserving_cut` the slice
+    /// must contain no orphan tool_result blocks.
+    #[tokio::test]
+    async fn fast_path_handles_cursor_on_tool_result() {
+        let (wrapper, loader, id, mgr) = wired_wrapper(200_000, 2).await;
+
+        // Build: system + (text user, text assistant) ×3, then a
+        // tool_use / tool_result pair, then more text turns. Each
+        // text message is fat (~500 tokens) so the natural walk
+        // back from the end satisfies the 10K-token floor without
+        // pulling in the tool exchange.
+        let tu_id = "tu-cursor-on-result";
+        let mut messages = vec![text(Role::System, "soul prompt")];
+        for i in 0..3 {
+            messages.push(text(Role::User, &format!("u{i} {}", "x".repeat(2_000))));
+            messages.push(text(
+                Role::Assistant,
+                &format!("a{i} {}", "y".repeat(2_000)),
+            ));
+        }
+        // Tool exchange — assistant tool_use, then user tool_result.
+        messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: tu_id.into(),
+                name: "bash".into(),
+                input: serde_json::Value::Null,
+                signature: None,
+            }],
+        });
+        messages.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tu_id.into(),
+                content: "ok".into(),
+            }],
+        });
+        // Plenty of text after the tool exchange so the natural
+        // recent-tail walk stops well before reaching the cursor.
+        for i in 0..30 {
+            messages.push(text(
+                Role::User,
+                &format!("post-u{i} {}", "x".repeat(2_000)),
+            ));
+            messages.push(text(
+                Role::Assistant,
+                &format!("post-a{i} {}", "y".repeat(2_000)),
+            ));
+        }
+        persist_messages(&mgr, &id, &messages).await;
+
+        // Cursor sits on the tool_result message (the last persisted
+        // ordinal at iteration boundary right after tools).
+        let cursor_idx = messages.iter().position(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == tu_id))
+        }).expect("tool_result must be present");
+        let cursor_ord = cursor_idx as i64;
+
+        mgr.summary_store()
+            .upsert_success(&id, cursor_ord, 100, "m", "span", Utc::now())
+            .await
+            .unwrap();
+        loader.put(id.as_str(), "PRIOR SUMMARY");
+
+        let out = wrapper.compress(&messages, never_chat()).await.unwrap();
+        let CompressOutput::Replaced { messages: m, .. } = out else {
+            panic!("fast-path must succeed");
+        };
+
+        // Collect all tool_use ids and tool_result tool_use_ids in
+        // the assembled output; every tool_result must have its
+        // matching tool_use earlier in the same payload.
+        let mut seen_uses: std::collections::HashSet<String> = Default::default();
+        for msg in &m {
+            for block in &msg.content {
+                match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        seen_uses.insert(id.clone());
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        assert!(
+                            seen_uses.contains(tool_use_id.as_str()),
+                            "orphan tool_result {tool_use_id} in fast-path output"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // And the strict-post-cursor span must still be at the tail.
+        let post_cursor = &messages[cursor_idx + 1..];
+        let tail = &m[2..];
+        let tail_suffix = &tail[tail.len() - post_cursor.len()..];
+        assert_eq!(tail_suffix, post_cursor);
+    }
+
+    /// Regression guard for the rarer "cursor on tool_use" case
+    /// (iteration cancelled between persisting tool_use and its
+    /// tool_result). The strict post-cursor clamp would land the
+    /// recent slice on the tool_result whose tool_use sits at the
+    /// cursor — orphan unless `pair_preserving_cut` pulls the
+    /// tool_use back in.
+    #[tokio::test]
+    async fn fast_path_handles_cursor_on_tool_use() {
+        let (wrapper, loader, id, mgr) = wired_wrapper(200_000, 2).await;
+
+        let tu_id = "tu-cursor-on-use";
+        let mut messages = vec![text(Role::System, "soul prompt")];
+        for i in 0..3 {
+            messages.push(text(Role::User, &format!("u{i} {}", "x".repeat(2_000))));
+            messages.push(text(
+                Role::Assistant,
+                &format!("a{i} {}", "y".repeat(2_000)),
+            ));
+        }
+        messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: tu_id.into(),
+                name: "bash".into(),
+                input: serde_json::Value::Null,
+                signature: None,
+            }],
+        });
+        messages.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tu_id.into(),
+                content: "ok".into(),
+            }],
+        });
+        for i in 0..30 {
+            messages.push(text(
+                Role::User,
+                &format!("post-u{i} {}", "x".repeat(2_000)),
+            ));
+            messages.push(text(
+                Role::Assistant,
+                &format!("post-a{i} {}", "y".repeat(2_000)),
+            ));
+        }
+        persist_messages(&mgr, &id, &messages).await;
+
+        // Cursor on the tool_use message itself.
+        let cursor_idx = messages
+            .iter()
+            .position(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == tu_id))
+            })
+            .expect("tool_use must be present");
+        let cursor_ord = cursor_idx as i64;
+
+        mgr.summary_store()
+            .upsert_success(&id, cursor_ord, 100, "m", "span", Utc::now())
+            .await
+            .unwrap();
+        loader.put(id.as_str(), "PRIOR SUMMARY");
+
+        let out = wrapper.compress(&messages, never_chat()).await.unwrap();
+        let CompressOutput::Replaced { messages: m, .. } = out else {
+            panic!("fast-path must succeed");
+        };
+
+        let mut seen_uses: std::collections::HashSet<String> = Default::default();
+        for msg in &m {
+            for block in &msg.content {
+                match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        seen_uses.insert(id.clone());
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        assert!(
+                            seen_uses.contains(tool_use_id.as_str()),
+                            "orphan tool_result {tool_use_id} when cursor lands on tool_use"
+                        );
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -809,7 +1017,9 @@ mod tests {
         // refresh "completion" for a couple of (virtual) seconds out.
         // The wrapper's compress() must observe the cleared flag and
         // proceed once the spawned task lands the success record.
-        mgr.mark_summary_in_flight(&id).await.unwrap();
+        mgr.mark_summary_in_flight(&id, "owner-fast-path-wait")
+            .await
+            .unwrap();
         loader.put(id.as_str(), "FRESH SUMMARY");
 
         let mgr_clone = Arc::clone(&mgr);
@@ -866,7 +1076,9 @@ mod tests {
             .upsert_success(&id, 1, 1, "m", "span", Utc::now())
             .await
             .unwrap();
-        mgr.mark_summary_in_flight(&id).await.unwrap();
+        mgr.mark_summary_in_flight(&id, "owner-fast-path-timeout")
+            .await
+            .unwrap();
         loader.put(id.as_str(), "STALE BUT ACCEPTABLE");
 
         let start = tokio::time::Instant::now();

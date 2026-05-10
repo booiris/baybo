@@ -207,7 +207,17 @@ impl LibsqlPool {
                     -- emitting a `SystemSpawnRequest`; cleared by
                     -- `record_summary_success`/`record_summary_failure` and by
                     -- the orphan reaper.
-                    in_flight   INTEGER NOT NULL DEFAULT 0
+                    in_flight   INTEGER NOT NULL DEFAULT 0,
+                    -- Opaque owner token (UUID) stamped by the trigger gate
+                    -- when it sets `in_flight = 1`. The runner's defensive
+                    -- post-pass cleanup uses a CAS-style clear (UPDATE
+                    -- `in_flight_owner = ?`) so a Pass A that finishes
+                    -- *after* a Pass B already marked itself in flight
+                    -- cannot wipe Pass B's mark. Reset to NULL by every
+                    -- terminal handler (`upsert_success` /
+                    -- `bump_error_count` / `clear_all_in_flight`) so a
+                    -- newly-started pass starts from a clean slate.
+                    in_flight_owner TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS memories (
@@ -417,6 +427,7 @@ impl LibsqlPool {
             "ALTER TABLE cost_records ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN is_normal_session INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE session_summaries ADD COLUMN in_flight INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE session_summaries ADD COLUMN in_flight_owner TEXT",
         ] {
             if let Err(e) = self.conn.execute(stmt, ()).await
                 && !e.to_string().contains("duplicate column name")

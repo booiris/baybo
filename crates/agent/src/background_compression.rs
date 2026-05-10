@@ -41,6 +41,12 @@ pub struct BackgroundCompressionPayload {
     /// input. Pinned at trigger time so concurrent appends to the
     /// parent don't bleed in mid-pass.
     pub up_to_ordinal: i64,
+    /// Opaque owner token stamped onto `session_summaries.in_flight_owner`
+    /// when the trigger gate marked the parent in-flight. The runner
+    /// uses it for compare-and-clear cleanup so a stale Pass A
+    /// finishing after Pass B remarked the parent cannot wipe Pass
+    /// B's mark. Generated once per pass at the gate (UUID v4).
+    pub in_flight_owner: String,
 }
 
 /// Result of one refresh pass; carried back as the
@@ -499,11 +505,13 @@ mod tests {
         let p = BackgroundCompressionPayload {
             parent_session_id: SessionId::from("user-1"),
             up_to_ordinal: 42,
+            in_flight_owner: "owner-token-xyz".into(),
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: BackgroundCompressionPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back.parent_session_id, p.parent_session_id);
         assert_eq!(back.up_to_ordinal, p.up_to_ordinal);
+        assert_eq!(back.in_flight_owner, p.in_flight_owner);
     }
 
     #[test]
