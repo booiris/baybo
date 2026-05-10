@@ -1,9 +1,14 @@
+pub mod background_summary;
 pub mod budget;
 pub mod calibration;
 pub mod compressor;
 pub mod error;
 pub mod tokenizer;
 
+pub use background_summary::{
+    BackgroundSummaryCallback, BackgroundSummaryConfig, BackgroundSummaryFuture,
+    BackgroundSummaryOutcome, SummaryChatRun, run_background_summary,
+};
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
 pub use compressor::{CompressOutput, SUMMARIZE_INSTRUCTION, parse_summary_response};
@@ -21,7 +26,7 @@ pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 // ---------------------------------------------------------------------------
 
 /// Token threshold (as fraction of `TokenBudget::max_tokens`) above
-/// which a summary refresh becomes eligible. Sized **below** the
+/// which a background summary becomes eligible. Sized **below** the
 /// compression threshold (typically 0.7-0.85) so summary.md is fresh
 /// by the time compression hits the fast-path swap-in.
 pub const SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO: f64 = 0.5;
@@ -62,13 +67,13 @@ pub const FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO: f64 = 0.6;
 /// reading the parent's `summary_metadata`. Mirrors Claude Code's
 /// `waitForSessionMemoryExtraction` budget. Bounded so a stuck
 /// refresh can't block a user turn indefinitely.
-pub const SUMMARY_REFRESH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub const BACKGROUND_SUMMARY_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Poll interval used while waiting for an in-flight refresh pass to
 /// land. Fast enough that a sub-second pass barely shows up in
 /// latency, slow enough to keep the polling load on the metadata
 /// store negligible.
-pub const SUMMARY_REFRESH_WAIT_POLL_INTERVAL: std::time::Duration =
+pub const BACKGROUND_SUMMARY_WAIT_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(250);
 
 pub type Result<T> = std::result::Result<T, ContextError>;
@@ -78,8 +83,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aura_llm::{ChatRequest, LlmResponse};
-use aura_model::ChatMessage;
-use aura_model::{ContentBlock, Role, SessionId};
+use aura_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId};
 use aura_session::SessionManager;
 use aura_skills::render::{render_skill_block, render_skill_reminder};
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry};
@@ -625,7 +629,7 @@ impl ContextManager {
         }
     }
 
-    /// Notification handler for "background summary refresh just landed
+    /// Notification handler for "background background summary just landed
     /// at `cursor`". Maps the persisted `session_messages.ordinal` to
     /// the corresponding in-memory message index and advances
     /// `last_summary_anchor` so the parent's trigger-gate
@@ -658,7 +662,7 @@ impl ContextManager {
             debug!(
                 session_id = %self.session_id,
                 cursor,
-                "summary settle: cursor not in active set; anchor unchanged"
+                "background-summary settle: cursor not in active set; anchor unchanged"
             );
             return;
         };
@@ -669,7 +673,7 @@ impl ContextManager {
                 session_id = %self.session_id,
                 cursor,
                 anchor_idx = idx,
-                "summary settle: anchor advanced"
+                "background-summary settle: anchor advanced"
             );
         }
     }
@@ -698,6 +702,154 @@ impl ContextManager {
             .flat_map(|m| m.content.iter())
             .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
             .count()
+    }
+
+    /// Trigger-gate decision for the background background summary.
+    ///
+    /// Inspects the in-memory budget, the parent's `session_summaries`
+    /// row (in_flight flag + cursor), and the anchor-relative
+    /// diff/tool-call thresholds. When all gates pass:
+    ///   1. pins `up_to_ordinal` to the latest persisted ordinal
+    ///   2. mints a fresh owner token (UUID v4)
+    ///   3. marks the parent in_flight
+    ///   4. invokes `send` with the freshly-built payload — typically
+    ///      `mpsc::Sender::try_send` against the router's
+    ///      `system_spawn_tx` channel
+    ///   5. on `send` failure, rolls back the in_flight mark via
+    ///      compare-and-clear on the owner token.
+    ///
+    /// Side-effecting steps (`summary_metadata` round-trip,
+    /// `sync_anchor_to_cursor`, `mark_summary_in_flight`) only fire
+    /// after the cheap budget check, so callers can invoke this on
+    /// every iteration without rate-limiting.
+    pub async fn maybe_request_background_summary<F, E>(&mut self, job_done: bool, send: F)
+    where
+        F: FnOnce(BackgroundCompressionPayload) -> std::result::Result<(), E>,
+        E: std::fmt::Display,
+    {
+        let max_tokens = self.budget.max_tokens();
+        let tokens_now = self.budget.current();
+        let tokens_threshold = (max_tokens as f64 * SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO) as usize;
+        if tokens_now <= tokens_threshold {
+            return;
+        }
+
+        // One round-trip to the parent's `session_summaries` row
+        // covers two needs: (a) the `in_flight` gate, (b) the cursor of
+        // the latest successful pass. (b) pulls the in-memory anchor
+        // forward *before* the anchor-relative threshold checks below
+        // — otherwise a session that crossed the 50% mark once would
+        // re-fire the background path on every subsequent job until
+        // inline compression eventually resets the anchor.
+        let metadata = match self.sessions.summary_metadata(&self.session_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    parent_session_id = %self.session_id,
+                    error = %e,
+                    "background-summary trigger: summary_metadata lookup failed; skipping"
+                );
+                return;
+            }
+        };
+        if let Some(meta) = metadata.as_ref() {
+            if meta.in_flight {
+                debug!(
+                    parent_session_id = %self.session_id,
+                    "background-summary trigger: in_flight already set; skipping"
+                );
+                return;
+            }
+            // `sync_anchor_to_cursor` is monotonic and a no-op when
+            // the cursor isn't in the current active set.
+            self.sync_anchor_to_cursor(meta.cursor).await;
+        }
+
+        let tokens_since = self.tokens_since_anchor();
+        if tokens_since <= SUMMARY_DIFF_TOKEN_THRESHOLD {
+            return;
+        }
+
+        let tool_calls = self.tool_calls_since_anchor();
+        if !job_done && tool_calls <= SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD {
+            return;
+        }
+
+        // Pin the snapshot's upper bound at trigger time so concurrent
+        // appends don't bleed into this pass' input.
+        let up_to_ordinal = match self.sessions.latest_session_ordinal(&self.session_id).await {
+            Ok(Some(o)) => o,
+            Ok(None) => 0,
+            Err(e) => {
+                warn!(
+                    parent_session_id = %self.session_id,
+                    error = %e,
+                    "background-summary trigger: ordinal lookup failed; skipping"
+                );
+                return;
+            }
+        };
+        // Fresh owner token per pass. Used as the CAS key for the
+        // runner's defensive in_flight cleanup so a stale Pass A
+        // finishing after Pass B remarked the parent cannot wipe
+        // Pass B's mark.
+        let owner_token = uuid::Uuid::new_v4().to_string();
+        let payload = BackgroundCompressionPayload {
+            parent_session_id: self.session_id.clone(),
+            up_to_ordinal,
+            in_flight_owner: owner_token.clone(),
+        };
+        debug!(
+            parent_session_id = %self.session_id,
+            tokens_now,
+            tokens_since,
+            tool_calls,
+            job_done,
+            up_to_ordinal,
+            owner_token = %owner_token,
+            "background-summary trigger: spawning pass"
+        );
+
+        // Mark in-flight before the send so the next gate iteration on
+        // this parent observes the flag and skips. A persistence
+        // failure here means we cannot enforce the at-most-one
+        // invariant — abort the trigger rather than risk a duplicate
+        // pass.
+        if let Err(e) = self
+            .sessions
+            .mark_summary_in_flight(&self.session_id, &owner_token)
+            .await
+        {
+            warn!(
+                parent_session_id = %self.session_id,
+                error = %e,
+                "background-summary trigger: mark_summary_in_flight failed; skipping"
+            );
+            return;
+        }
+        if let Err(e) = send(payload) {
+            warn!(
+                parent_session_id = %self.session_id,
+                error = %e,
+                "background-summary trigger: system-spawn channel send failed; rolling back in_flight"
+            );
+            // Roll back the mark so the next iteration retries. CAS on
+            // owner_token so we don't clobber a mark a *different* pass
+            // landed in the same window. Failure is logged but
+            // otherwise tolerated; the orphan reaper is the last line
+            // of defense.
+            if let Err(e) = self
+                .sessions
+                .clear_summary_in_flight_if_owned(&self.session_id, &owner_token)
+                .await
+            {
+                warn!(
+                    parent_session_id = %self.session_id,
+                    error = %e,
+                    "background-summary trigger: clear_summary_in_flight_if_owned rollback failed"
+                );
+            }
+        }
     }
 
     /// Read the anchor index. Test-only: production callers measure

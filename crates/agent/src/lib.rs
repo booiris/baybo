@@ -1,8 +1,7 @@
 pub mod actor;
 pub mod agent_loop;
-pub mod background_compression;
 pub mod cancel;
-mod compression;
+pub mod compression;
 pub mod cost;
 pub mod error_recovery;
 pub mod job;

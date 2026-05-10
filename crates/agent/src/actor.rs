@@ -339,7 +339,7 @@ impl AgentActor {
                     session_id = %self.session.id,
                     cursor = outcome.cursor,
                     cost_micros = outcome.cost_micros,
-                    "summary refresh: pass landed"
+                    "background summary: pass landed"
                 );
             }
             other @ (SystemTrigger::HistoryReview | SystemTrigger::MemoryConsolidation) => {

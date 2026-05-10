@@ -139,7 +139,7 @@ pub enum SystemReason {
     HistoryReview,
     /// Background memory consolidation / summarization task.
     MemoryConsolidation,
-    /// Async per-session summary refresh — a `BackgroundCompressionRunner` actor
+    /// Async per-session background summary — a `BackgroundCompressionRunner` actor
     /// reads its parent's transcript, generates an updated summary, and
     /// writes `<workspace>/state/sessions/<parent_id>/summary.md` plus
     /// the `session_summaries` metadata row. Triggered between turns

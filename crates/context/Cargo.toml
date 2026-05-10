@@ -24,6 +24,10 @@ tiktoken-rs = { workspace = true }
 parking_lot = { workspace = true }
 # Used by the fast-path's async `summary.md` read.
 tokio = { workspace = true, features = ["fs"] }
+# Owner token for `session_summaries.in_flight_owner` minted by the
+# trigger gate so a stale Pass A finishing after Pass B remarked the
+# parent cannot CAS-clear Pass B's mark.
+uuid = { workspace = true }
 
 [dev-dependencies]
 aura-storage = { workspace = true, features = ["test-support"] }

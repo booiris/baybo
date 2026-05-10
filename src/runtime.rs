@@ -23,8 +23,7 @@ use std::sync::Arc;
 
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::{AgentLoop, AgentLoopConfig};
-use aura_agent::background_compression::SystemSpawnRequest;
-use aura_agent::router::Router;
+use aura_agent::router::{Router, SystemSpawnRequest};
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::soul::Soul;
@@ -362,13 +361,10 @@ pub async fn build_managers(
     // Reap orphans from any maintenance sessions that were
     // running when the previous process exited. Best-effort —
     // logged at warn on failure, never blocks boot. Runs before
-    // any actor spawns so newly-created summary refresh actors
+    // any actor spawns so newly-created background-summary actors
     // don't race against stale rows.
-    aura_agent::background_compression::reap_maintenance_orphans(
-        session_manager.as_ref(),
-        &workspace_paths,
-    )
-    .await;
+    aura_agent::compression::reap_maintenance_orphans(session_manager.as_ref(), &workspace_paths)
+        .await;
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
     // CostTracker has been retired in favour of a process-wide

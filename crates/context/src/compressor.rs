@@ -29,9 +29,10 @@ use tracing::{debug, warn};
 
 use crate::error::ContextError;
 use crate::{
-    ContextManager, FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO, RECENT_SLICE_MAX_TOKENS,
-    RECENT_SLICE_MIN_TEXT_BLOCK_MSGS, RECENT_SLICE_MIN_TOKENS, SUMMARY_REFRESH_WAIT_POLL_INTERVAL,
-    SUMMARY_REFRESH_WAIT_TIMEOUT, estimate_skill_trailer_tokens, scan_skill_calls,
+    BACKGROUND_SUMMARY_WAIT_POLL_INTERVAL, BACKGROUND_SUMMARY_WAIT_TIMEOUT, ContextManager,
+    FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO, RECENT_SLICE_MAX_TOKENS,
+    RECENT_SLICE_MIN_TEXT_BLOCK_MSGS, RECENT_SLICE_MIN_TOKENS, estimate_skill_trailer_tokens,
+    scan_skill_calls,
 };
 
 /// Intro paragraph framing the summary as continuation of an earlier
@@ -69,10 +70,11 @@ pub enum CompressOutput {
 /// strip the `<analysis>` block entirely and keep the inner body of
 /// `<summary>` (tags removed); see [`parse_summary_response`].
 ///
-/// Shared with `aura_agent::background_compression::build_summary_prompt`,
-/// which prepends a prior-summary preamble and appends a SIZE TARGET
-/// footer. Editing the analysis/summary contract here must stay
-/// compatible with both call sites.
+/// Used by both compression entry points: the inline
+/// `summarize_or_truncate` path appends it as-is, and the
+/// background-summary path wraps it via `build_summary_prompt` with a
+/// prior-summary preamble + SIZE TARGET footer. Editing the
+/// analysis/summary contract must stay compatible with both call sites.
 pub const SUMMARIZE_INSTRUCTION: &str = r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
@@ -191,12 +193,13 @@ fn strip_analysis_block(text: &str) -> String {
 /// `<summary>` block (tags removed) if present, else the non-empty
 /// leftover. `None` only when nothing usable remains.
 ///
-/// Shared with `aura_agent::background_compression` — both call sites
-/// must agree on the tag contract or summaries silently corrupt when
-/// one path's prompt is updated without the other's. Returning inner
-/// body (rather than the verbatim block) keeps `summary.md` clean of
-/// the tags and lets the compressor wrap the body in a fresh
-/// "Summary:" prefix when it lands in the LLM transcript.
+/// Used by both compression flows (inline `summarize_or_truncate`
+/// and `run_background_summary`); both must agree on the tag contract
+/// or summaries silently corrupt when one path's prompt is updated
+/// without the other's. Returning the inner body (rather than the
+/// verbatim block) keeps `summary.md` clean of the tags and lets the
+/// compressor wrap the body in a fresh "Summary:" prefix when it
+/// lands in the LLM transcript.
 pub fn parse_summary_response(text: &str) -> Option<String> {
     let stripped = strip_analysis_block(text);
     if let Some(inner) = find_tagged_inner(&stripped, "summary")
@@ -370,13 +373,13 @@ impl ContextManager {
             loop {
                 match self.sessions.summary_metadata(&self.session_id).await {
                     Ok(Some(meta)) if meta.in_flight => {
-                        tokio::time::sleep(SUMMARY_REFRESH_WAIT_POLL_INTERVAL).await;
+                        tokio::time::sleep(BACKGROUND_SUMMARY_WAIT_POLL_INTERVAL).await;
                     }
                     _ => return,
                 }
             }
         };
-        if tokio::time::timeout(SUMMARY_REFRESH_WAIT_TIMEOUT, wait_future)
+        if tokio::time::timeout(BACKGROUND_SUMMARY_WAIT_TIMEOUT, wait_future)
             .await
             .is_err()
         {

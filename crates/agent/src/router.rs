@@ -3,11 +3,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aura_channels::{AgentOutput, Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
-use aura_model::{Session, SessionId, TriggerSource, User};
+use aura_model::{BackgroundCompressionPayload, JobId, Session, SessionId, TriggerSource, User};
 
 use aura_cron::CronTriggerEvent;
 
-use crate::background_compression::SystemSpawnRequest;
 use crate::cost::CostManager;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
@@ -17,6 +16,28 @@ use tracing::{debug, error, info, warn};
 
 use crate::actor::AgentMessage;
 use crate::supervisor::AgentSupervisor;
+
+/// Request emitted by `AgentLoop`'s parent-side trigger gate and
+/// consumed by `Router`'s `system_trigger_rx` arm. Replaces the old
+/// `MaintenanceSpawner` trait: the gate just sends a value on an
+/// `mpsc::Sender<SystemSpawnRequest>`; the router does the
+/// session-create + actor-spawn + mailbox-dispatch.
+///
+/// `parent_actor_token` is the parent actor's lifetime token. The
+/// router uses it as the new maintenance actor's `parent_token`, so
+/// the maintenance child's `actor_token` derives as a grandchild —
+/// cancelling the parent automatically cascades into the child via
+/// the `tokio_util` token tree, with no explicit `Shutdown` mailbox
+/// dance.
+#[derive(Debug)]
+pub enum SystemSpawnRequest {
+    BackgroundCompression {
+        parent_session_id: SessionId,
+        parent_job_id: JobId,
+        parent_actor_token: CancellationToken,
+        payload: BackgroundCompressionPayload,
+    },
+}
 
 /// Per-user sliding-window rate limiter.
 ///

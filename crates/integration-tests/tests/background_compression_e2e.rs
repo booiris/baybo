@@ -16,15 +16,15 @@
 //!     removed.
 //!
 //! The full agent-loop wiring (LLM call, JobLifecycle, SpanRecorder)
-//! is exercised at the unit-test layer in `aura-agent::background_compression`
-//! and `aura-context::strategy::summary_aware`; this file focuses on
-//! the storage + filesystem boundary.
+//! is exercised at the unit-test layer in `aura-agent::compression`
+//! and `aura-context::compressor`; this file focuses on the
+//! storage + filesystem boundary.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::SessionManager;
-use aura_agent::background_compression::reap_maintenance_orphans;
+use aura_agent::compression::reap_maintenance_orphans;
 use aura_model::{
     BackgroundCompressionPayload, ChannelType, JobId, Lineage, LineageKind, Session, SessionId,
     SessionState, SystemReason, SystemTrigger, TriggerSource, User,

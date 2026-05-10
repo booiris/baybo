@@ -217,14 +217,14 @@ pub struct AgentLoop {
     /// memory consolidation, ...) will share the same channel via
     /// other `SystemSpawnRequest` variants. `None` disables every
     /// system-trigger gate that gates on it.
-    system_spawn_tx: Option<mpsc::Sender<crate::background_compression::SystemSpawnRequest>>,
+    system_spawn_tx: Option<mpsc::Sender<crate::router::SystemSpawnRequest>>,
     /// Resolved workspace paths. Today only the summary-refresh
     /// maintenance handler reads it (to write `summary.md`); other
     /// future system handlers may want it too. `None` in tests that
     /// don't exercise such handlers.
     workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
     /// Cross-session manager — used by handlers that operate across
-    /// sessions (today: summary refresh, for transcript loads,
+    /// sessions (today: background summary, for transcript loads,
     /// in-flight maintenance lookups, summary metadata writes).
     /// Distinct from the `SessionManager` plumbed inside
     /// `ContextManager` because that one is per-session-bound.
@@ -259,8 +259,8 @@ pub struct AgentLoopConfig {
     /// Optional per-session JSONL logger for LLM calls.
     pub session_log: Option<Arc<SessionLlmLogger>>,
     /// Generic system-spawn channel sender (any
-    /// `SystemSpawnRequest` variant — today summary refresh).
-    pub system_spawn_tx: Option<mpsc::Sender<crate::background_compression::SystemSpawnRequest>>,
+    /// `SystemSpawnRequest` variant — today background summary).
+    pub system_spawn_tx: Option<mpsc::Sender<crate::router::SystemSpawnRequest>>,
     /// Workspace paths. Used by system handlers that touch on-disk
     /// state.
     pub workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
@@ -577,7 +577,7 @@ impl AgentLoop {
             // Iteration-boundary summary-refresh check. Skip iter 1 —
             // no work has happened yet to gate against.
             if iterations > 1 {
-                self.maybe_spawn_background_compression(session, job_id, /* job_done */ false)
+                self.maybe_spawn_background_compression(job_id, /* job_done */ false)
                     .await;
             }
 
@@ -620,10 +620,8 @@ impl AgentLoop {
                     // End-of-job summary-refresh check. The activity
                     // disjunct is satisfied by `job_done = true`;
                     // the tokens / diff conjuncts still apply.
-                    self.maybe_spawn_background_compression(
-                        session, job_id, /* job_done */ true,
-                    )
-                    .await;
+                    self.maybe_spawn_background_compression(job_id, /* job_done */ true)
+                        .await;
                     return Ok(msg);
                 }
                 IterationOutcome::Continue { deferred_subagents } => {
@@ -1683,150 +1681,31 @@ impl AgentLoop {
     /// rewritten slice is a no-op.
     async fn maybe_spawn_background_compression(
         &mut self,
-        session: &Session,
         current_job_id: aura_model::JobId,
         job_done: bool,
     ) {
         let Some(tx) = self.system_spawn_tx.as_ref() else {
             return;
         };
-        let Some(sessions) = self.sessions.as_ref() else {
-            return;
-        };
-        let sessions = sessions.clone();
         let tx = tx.clone();
+        let actor_token = self.actor_token.clone();
 
-        let max_tokens = self.context_manager.budget().max_tokens();
-        let tokens_now = self.context_manager.budget().current();
-        let tokens_threshold =
-            (max_tokens as f64 * aura_context::SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO) as usize;
-        if tokens_now <= tokens_threshold {
-            return;
-        }
-
-        // One round-trip to the parent's `session_summaries` row
-        // covers two needs: (a) the `in_flight` gate, (b) the
-        // cursor of the latest successful background pass. We use
-        // (b) to pull the in-memory anchor forward *before* the
-        // anchor-relative threshold checks below — otherwise a
-        // session that crossed the 50% mark once would re-fire the
-        // background path on every subsequent job until inline
-        // compression eventually resets the anchor.
-        let metadata = match sessions.summary_metadata(&session.id).await {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    parent_session_id = %session.id,
-                    error = %e,
-                    "summary trigger: summary_metadata lookup failed; skipping"
-                );
-                return;
-            }
-        };
-        if let Some(meta) = metadata.as_ref() {
-            if meta.in_flight {
-                debug!(
-                    parent_session_id = %session.id,
-                    "summary trigger: in_flight already set; skipping"
-                );
-                return;
-            }
-            // `sync_anchor_to_cursor` is monotonic and a no-op when
-            // the cursor isn't in the current active set.
-            self.context_manager
-                .sync_anchor_to_cursor(meta.cursor)
-                .await;
-        }
-
-        let tokens_since = self.context_manager.tokens_since_anchor();
-        if tokens_since <= aura_context::SUMMARY_DIFF_TOKEN_THRESHOLD {
-            return;
-        }
-
-        let tool_calls = self.context_manager.tool_calls_since_anchor();
-        if !job_done && tool_calls <= aura_context::SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD {
-            return;
-        }
-
-        // Pin the snapshot's upper bound at trigger time so
-        // concurrent appends don't bleed into this pass' input.
-        let up_to_ordinal = match sessions.latest_session_ordinal(&session.id).await {
-            Ok(Some(o)) => o,
-            Ok(None) => 0,
-            Err(e) => {
-                warn!(
-                    parent_session_id = %session.id,
-                    error = %e,
-                    "summary trigger: ordinal lookup failed; skipping"
-                );
-                return;
-            }
-        };
-        // Fresh owner token per pass. Used as the CAS key for the
-        // runner's defensive in_flight cleanup so a stale Pass A
-        // finishing after Pass B remarked the parent cannot wipe
-        // Pass B's mark.
-        let owner_token = uuid::Uuid::new_v4().to_string();
-        let payload = aura_model::BackgroundCompressionPayload {
-            parent_session_id: session.id.clone(),
-            up_to_ordinal,
-            in_flight_owner: owner_token.clone(),
-        };
-        debug!(
-            parent_session_id = %session.id,
-            tokens_now,
-            tokens_since,
-            tool_calls,
-            job_done,
-            up_to_ordinal,
-            owner_token = %owner_token,
-            "summary trigger: spawning refresh pass"
-        );
-        let request = crate::background_compression::SystemSpawnRequest::BackgroundCompression {
-            parent_session_id: session.id.clone(),
-            parent_job_id: current_job_id,
-            parent_actor_token: self.actor_token.clone(),
-            payload,
-        };
-
-        // Mark in-flight before emitting so the next gate iteration on
-        // this parent observes the flag and skips. A persistence
-        // failure here means we cannot enforce the at-most-one
-        // invariant — abort the trigger rather than risk a duplicate
-        // pass.
-        if let Err(e) = sessions
-            .mark_summary_in_flight(&session.id, &owner_token)
-            .await
-        {
-            warn!(
-                parent_session_id = %session.id,
-                error = %e,
-                "summary trigger: mark_summary_in_flight failed; skipping"
-            );
-            return;
-        }
-        if let Err(e) = tx.try_send(request) {
-            warn!(
-                parent_session_id = %session.id,
-                error = %e,
-                "summary trigger: system-spawn channel send failed; rolling back in_flight"
-            );
-            // Roll back the mark so the next iteration retries. CAS
-            // on owner_token so we don't clobber a mark a *different*
-            // pass landed in the same window. Failure is logged but
-            // otherwise tolerated; the orphan reaper is the last line
-            // of defense.
-            if let Err(e) = sessions
-                .clear_summary_in_flight_if_owned(&session.id, &owner_token)
-                .await
-            {
-                warn!(
-                    parent_session_id = %session.id,
-                    error = %e,
-                    "summary trigger: clear_summary_in_flight_if_owned rollback failed"
-                );
-            }
-        }
+        self.context_manager
+            .maybe_request_background_summary(job_done, move |payload| {
+                let request = crate::router::SystemSpawnRequest::BackgroundCompression {
+                    parent_session_id: payload.parent_session_id.clone(),
+                    parent_job_id: current_job_id,
+                    parent_actor_token: actor_token,
+                    payload,
+                };
+                // `TrySendError<SystemSpawnRequest>` carries the
+                // request back as its payload — large enough to trip
+                // clippy's `result_large_err`. The gate only needs the
+                // Display message for its rollback warn, so flatten
+                // here.
+                tx.try_send(request).map_err(|e| e.to_string())
+            })
+            .await;
     }
 
     /// Maintenance entry point — runs one async summary-refresh
@@ -1847,16 +1726,18 @@ impl AgentLoop {
         job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         cancel_token: CancellationToken,
-    ) -> anyhow::Result<crate::background_compression::BackgroundCompressionOutcome> {
+    ) -> anyhow::Result<aura_context::BackgroundSummaryOutcome> {
         let workspace_paths = self
             .workspace_paths
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("workspace_paths not configured for summary refresh"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("workspace_paths not configured for background summary")
+            })?
             .clone();
         let sessions = self
             .sessions
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("sessions not configured for summary refresh"))?
+            .ok_or_else(|| anyhow::anyhow!("sessions not configured for background summary"))?
             .clone();
         // Held for the post-`with_job` defensive cleanup that
         // guarantees `in_flight` is cleared even when the runner
@@ -1891,7 +1772,7 @@ impl AgentLoop {
                 let payload = payload.clone();
                 let cancel_token = cancel_token.clone();
                 async move {
-                    let refresher = crate::background_compression::BackgroundCompressionRunner {
+                    let refresher = crate::compression::BackgroundCompressionRunner {
                         llm_client,
                         security_gateway,
                         cost_manager,
@@ -1929,7 +1810,7 @@ impl AgentLoop {
                 debug!(
                     parent_session_id = %parent_id_for_cleanup,
                     owner_token = %cleanup_owner,
-                    "summary refresh: defensive in_flight clear fired (runner bypassed record_*)"
+                    "background summary: defensive in_flight clear fired (runner bypassed record_*)"
                 );
             }
             Ok(false) => {
@@ -1940,7 +1821,7 @@ impl AgentLoop {
                 warn!(
                     parent_session_id = %parent_id_for_cleanup,
                     error = %e,
-                    "summary refresh: clear_summary_in_flight_if_owned after runner failed"
+                    "background summary: clear_summary_in_flight_if_owned after runner failed"
                 );
             }
         }
