@@ -826,6 +826,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
                 model_id: String::new(),
                 span_id: String::new(),
                 error_count: 0,
+                in_flight: false,
             });
         entry.cursor = cursor;
         entry.pass_count += 1;
@@ -834,6 +835,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
         entry.span_id = span_id.to_string();
         entry.updated_at = updated_at;
         entry.error_count = 0;
+        entry.in_flight = false;
         Ok(())
     }
 
@@ -856,11 +858,46 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
                 model_id: String::new(),
                 span_id: String::new(),
                 error_count: 0,
+                in_flight: false,
             });
         entry.error_count += 1;
         entry.model_id = model_id.to_string();
         entry.span_id = span_id.to_string();
         entry.updated_at = updated_at;
+        entry.in_flight = false;
+        Ok(())
+    }
+
+    async fn set_in_flight(
+        &self,
+        session_id: &SessionId,
+        in_flight: bool,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> SessionSummaryResult<()> {
+        let mut guard = self.rows.lock();
+        let entry = guard
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionSummaryRow {
+                session_id: session_id.clone(),
+                cursor: 0,
+                pass_count: 0,
+                updated_at,
+                cost_micros: 0,
+                model_id: String::new(),
+                span_id: String::new(),
+                error_count: 0,
+                in_flight: false,
+            });
+        entry.in_flight = in_flight;
+        entry.updated_at = updated_at;
+        Ok(())
+    }
+
+    async fn clear_all_in_flight(&self) -> SessionSummaryResult<()> {
+        let mut guard = self.rows.lock();
+        for row in guard.values_mut() {
+            row.in_flight = false;
+        }
         Ok(())
     }
 

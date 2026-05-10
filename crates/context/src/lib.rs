@@ -61,6 +61,20 @@ pub const RECENT_SLICE_MAX_TOKENS: usize = 40_000;
 /// `RECENT_SLICE_MAX_TOKENS` and is added on top.
 pub const FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO: f64 = 0.6;
 
+/// Maximum wall-clock time `SummaryAwareWrapper::compress` will wait
+/// for an in-flight `BackgroundCompressionRunner` pass to settle
+/// before reading the parent's `summary_metadata`. Mirrors Claude
+/// Code's `waitForSessionMemoryExtraction` budget. Bounded so a
+/// stuck refresh can't block a user turn indefinitely.
+pub const SUMMARY_REFRESH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Poll interval used while waiting for an in-flight refresh pass to
+/// land. Fast enough that a sub-second pass barely shows up in
+/// latency, slow enough to keep the polling load on the metadata
+/// store negligible.
+pub const SUMMARY_REFRESH_WAIT_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
 pub type Result<T> = std::result::Result<T, ContextError>;
 
 use std::future::Future;

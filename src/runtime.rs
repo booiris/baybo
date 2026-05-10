@@ -37,7 +37,10 @@ use aura_agent::{
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_context::{ContextManager, Summarize, TiktokenTokenizer, Tokenizer};
+use aura_context::{
+    CompressionStrategy, ContextManager, FsSummaryLoader, Summarize, SummaryAwareWrapper,
+    SummaryLoader, TiktokenTokenizer, Tokenizer,
+};
 use aura_llm::GuardedLlm;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -678,6 +681,30 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // actor itself.
                 let actor_token = parent_token.child_token();
 
+                // Compose the compression strategy: the
+                // `SummaryAwareWrapper` fast-path consumes precomputed
+                // `summary.md` files written by the background
+                // refresh runner; on any miss (no metadata, file
+                // absent, cursor stale, totals over budget) it
+                // delegates to the inner `Summarize`. Without this
+                // wiring the background passes still run and bill
+                // LLM, but their output is never consulted on the
+                // hot path. See `docs/background-compression.md`.
+                let summary_loader: Arc<dyn SummaryLoader> = Arc::new(FsSummaryLoader::new(
+                    workspace_paths_arc.state_sessions_dir(),
+                ));
+                let inner_strategy: Box<dyn CompressionStrategy> =
+                    Box::new(Summarize::new(keep_recent));
+                let strategy: Box<dyn CompressionStrategy> = Box::new(SummaryAwareWrapper::new(
+                    inner_strategy,
+                    summary_loader,
+                    Arc::clone(&sessions),
+                    Arc::clone(&skill_registry),
+                    Arc::clone(&tokenizer),
+                    session.id.clone(),
+                    token_budget.max_tokens(),
+                ));
+
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_client: llm_client.clone(),
                     tool_registry: Arc::clone(&tool_registry),
@@ -685,7 +712,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     tool_executor: Arc::clone(&tool_executor),
                     context_manager: ContextManager::new(
                         Arc::clone(&tokenizer),
-                        Box::new(Summarize::new(keep_recent)),
+                        strategy,
                         token_budget.clone(),
                         Arc::clone(&token_calibration),
                         Arc::clone(&skill_registry),

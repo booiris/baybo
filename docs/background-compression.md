@@ -59,9 +59,12 @@ CREATE TABLE session_summaries (
   cost_micros INTEGER NOT NULL DEFAULT 0, -- per `feedback_money_no_float.md`: integer micro-USD
   model_id    TEXT    NOT NULL,
   span_id     TEXT    NOT NULL,
-  error_count INTEGER NOT NULL DEFAULT 0  -- telemetry only; does NOT gate triggers
+  error_count INTEGER NOT NULL DEFAULT 0, -- telemetry only; does NOT gate triggers
+  in_flight   INTEGER NOT NULL DEFAULT 0  -- 1 while a refresh pass is active for this parent
 );
 ```
+
+`in_flight` is the at-most-one-in-flight gate (see [Spawn serialization](#spawn-serialization)). The maintenance session row in `sessions` is kept as audit history once a pass lands and is **not** consulted by the trigger gate.
 
 ### libsql — new column on `sessions`
 
@@ -124,17 +127,20 @@ fire_summary = tokens_now > 0.5 × max_tokens                  (a)
 
 ### Spawn serialization
 
-At most one in-flight `BackgroundCompressionRunner` per parent session. Before spawning:
+At most one in-flight `BackgroundCompressionRunner` per parent session. The gate consults the parent's `session_summaries.in_flight` flag:
 
 ```sql
-SELECT 1 FROM sessions
-WHERE state = 'Active'
-  AND lineage_for_session_id = ?
-  AND lineage_kind = 'system_maintenance'
-LIMIT 1
+SELECT in_flight FROM session_summaries WHERE session_id = ?
 ```
 
-If a row exists, skip the trigger; the next iteration will re-evaluate.
+If `in_flight = 1`, skip the trigger; the next iteration will re-evaluate. Otherwise, the gate calls `SessionManager::mark_summary_in_flight(parent_id)` (UPSERTs a placeholder row with `in_flight = 1` if needed) before emitting the `SystemSpawnRequest`. If `try_send` fails, the gate rolls back via `clear_summary_in_flight`.
+
+The flag is cleared by:
+- `record_summary_success` / `record_summary_failure` — terminal handlers that the runner calls per pass.
+- `run_background_compression`'s post-`with_job` cleanup — defensive idempotent clear that catches cancellation / panic before the runner reached `record_*`.
+- Startup orphan reaper — for parents whose maintenance row was reaped (via the `bump_error_count` codepath, which also clears the flag).
+
+Maintenance session rows in `sessions` accumulate as audit history and are no longer consulted by the gate.
 
 ## BackgroundCompressionRunner (async path)
 
@@ -233,20 +239,22 @@ Trait signature unchanged (χ-1: wrapper holds session_id internally).
 
 ### `compress` body
 
+0. **Wait for in-flight settle** (mirrors Claude Code's `waitForSessionMemoryExtraction`): poll `session_summaries.in_flight` for up to `SUMMARY_REFRESH_WAIT_TIMEOUT` (15s, see [Configuration](#configuration)) at `SUMMARY_REFRESH_WAIT_POLL_INTERVAL` (250ms). If a background pass lands during the wait, the next step picks up the fresher cursor; on timeout the wrapper proceeds with whatever metadata is on file (stale-by-one tolerated). Bounded so a stuck refresh can't block a user turn indefinitely.
 1. Load `session_summaries` row + `summary.md` content for `session_id`.
-2. **Fast-path eligibility**:
-   - Both summary.md and metadata exist.
-   - `tokens_since_cursor ≤ 40K` (recent slice maxTokens) — ensures the summary actually covers something the recent slice doesn't (ζ-ii staleness guard).
-3. **Recent slice selection** (P1 — atomic-pair backward walk):
+2. **Cursor mapping**: walk `load_session_messages_with_supersede(session_id)` counting active rows (`superseded_by IS NULL`) until ordinal == `metadata.cursor`; the count is the cursor's index in the in-memory `messages` (full frame, including system). Fall through if:
+   - The active row count from the supersede log doesn't equal `messages.len()` (snapshot drift, an unpersisted system prompt, compaction in flight).
+   - The cursor ordinal isn't present in the active log (compression has rewritten it).
+   - The cursor maps inside the system block.
+3. **Recent slice selection** (atomic-pair backward walk):
    ```
-   walk backward from messages.len() in atomic units
+   walk backward from non_system.len() in atomic units
        (single message OR tool_use+tool_result pair):
      hard stop:    tokens + next_unit > 40K
      soft stop:    tokens ≥ 10K AND text_block_msg_count ≥ 5
    ```
-   Pair-preservation is **enforced via atomic units, not by extending past maxTokens** — strict cap honoured.
-4. **Pre-assembly threshold check** (recent slice **excluded** from this budget):
-   - `tokens(summary) + tokens(skill_trailer) > 0.6 × max_tokens` → fall through to inner.
+   Then **clamp** the cut to be no later than the cursor's index in the `non_system` frame: `cut = min(walk_cut, cursor_idx_in_non_system)`. Every message after the cursor is unsummarized — it must remain in the recent slice. `RECENT_SLICE_MAX_TOKENS` is a *forward-extension* ceiling for the walk, not a license to drop post-cursor content.
+4. **Pre-assembly threshold check** (recent slice **included**):
+   - `tokens(summary) + tokens(skill_trailer) + tokens(recent_slice) > 0.6 × max_tokens` → fall through to inner. Including the recent slice catches stale-cursor scenarios where the post-cursor span alone overruns the budget.
 5. **Assemble**:
    ```
    [system messages (all)]
@@ -269,8 +277,10 @@ Trait signature unchanged (χ-1: wrapper holds session_id internally).
 
 Any of the following → `self.inner.compress(messages, chat)`:
 - summary.md missing (first compression on a session)
-- metadata cursor stale beyond the recent slice's coverage
-- assembled `summary + skill_trailer` exceeds 0.6 × max_tokens
+- supersede-log lookup fails or its active count disagrees with `messages.len()`
+- the cursor ordinal isn't in the active log (compaction has rewritten it)
+- the cursor maps inside the system block
+- assembled `summary + recent_slice + skill_trailer` exceeds 0.6 × max_tokens
 - file read / parse error
 
 The first compression on every session pays a one-time synchronous-Summarize latency cost; subsequent compressions use the fast-path.
@@ -286,9 +296,9 @@ The first compression on every session pays a one-time synchronous-Summarize lat
 | Compression fires while refresh in-flight | Use last-successful summary (stale-by-one tolerated) |
 | Compression fires before any summary written | Fall through to inner `Summarize` |
 | Refresh writes summary.md while compression reads | Atomic tempfile+rename — never partial |
-| Two refreshes interleave on same parent | Pre-spawn lookup-query rejects second |
-| Stale cursor (covers very old prefix) | If `tokens_since_cursor > 40K` → fall through |
-| Cold-start orphans (process crash mid-pass) | Startup query marks `Active` maintenance sessions as `Failed`; parent's `error_count++` |
+| Two refreshes interleave on same parent | `session_summaries.in_flight` flag rejects the second; gate cleared by `record_summary_*` or runner cleanup |
+| Stale cursor (covers very old prefix) | Recent slice must cover everything after cursor; if `summary + recent + skill_trailer > 0.6 × max_tokens`, fall through |
+| Cold-start orphans (process crash mid-pass) | Startup reaper deletes leftover maintenance rows, calls `record_summary_failure` (which clears `in_flight`) on each parent |
 
 ## Cold-Start Recovery (parent side)
 
@@ -346,6 +356,8 @@ WHERE sessions.lineage_for_session_id = ?
 | `RECENT_SLICE_MIN_TEXT_BLOCK_MSGS` | `5` | `aura-context` |
 | `RECENT_SLICE_MAX_TOKENS` | `40_000` | `aura-context` |
 | `FAST_PATH_FALLTHROUGH_THRESHOLD` | `0.6 × max_tokens` | `aura-context` |
+| `SUMMARY_REFRESH_WAIT_TIMEOUT` | `15s` | `aura-context` |
+| `SUMMARY_REFRESH_WAIT_POLL_INTERVAL` | `250ms` | `aura-context` |
 | `STATE_SESSIONS_DIR` | `"state/sessions"` | `aura-workspace` |
 | `SUMMARY_FILE_NAME` | `"summary.md"` | `aura-workspace` |
 

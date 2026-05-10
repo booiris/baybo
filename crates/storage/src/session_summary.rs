@@ -33,6 +33,14 @@ pub struct SessionSummaryRow {
     pub model_id: String,
     pub span_id: String,
     pub error_count: i64,
+    /// `true` while a `BackgroundCompressionRunner` pass is active for
+    /// this parent. Set by the trigger gate before emitting a
+    /// `SystemSpawnRequest` and cleared by
+    /// `record_summary_success`/`record_summary_failure`. The gate
+    /// reads this flag to enforce the at-most-one-in-flight invariant
+    /// without consulting the maintenance session row (which is kept
+    /// as audit history).
+    pub in_flight: bool,
 }
 
 /// Per-session summary metadata persistence.
@@ -77,6 +85,25 @@ pub trait SessionSummaryStore: Send + Sync {
         span_id: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<()>;
+
+    /// Set the `in_flight` flag for `session_id`. UPSERTs a placeholder
+    /// row (cursor=0, pass_count=0, model_id="", span_id="") if none
+    /// exists, so the gate can mark a session in-flight before its
+    /// first successful pass has ever recorded. Other columns on an
+    /// existing row are left untouched.
+    async fn set_in_flight(
+        &self,
+        session_id: &SessionId,
+        in_flight: bool,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Reset `in_flight` to 0 across the entire table. Called once at
+    /// startup by the orphan reaper: a process that just started has
+    /// no in-flight passes by definition, so any leftover `in_flight = 1`
+    /// from a crash mid-mark (between `set_in_flight(true)` and the
+    /// router's `create_maintenance_session`) is stale.
+    async fn clear_all_in_flight(&self) -> Result<()>;
 
     /// Hard-delete the row. Idempotent; returns `Ok(false)` if the
     /// row did not exist. Cascade from `sessions` is the normal path;

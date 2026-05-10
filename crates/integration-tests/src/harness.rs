@@ -62,6 +62,11 @@ pub struct AgentTestHarness {
     pub skill_registry: Arc<SkillRegistry>,
     pub cost_manager: Arc<CostManager>,
     pub token_calibration: Arc<aura_context::TokenCalibration>,
+    /// Session manager backing the wired `ContextManager`. Exposed so
+    /// tests can pre-seed session messages or summary metadata before
+    /// driving the agent loop (e.g. `SummaryAwareWrapper` fast-path
+    /// e2e coverage).
+    pub session_manager: Arc<aura_agent::SessionManager>,
     pub mailbox: mpsc::Sender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -159,8 +164,17 @@ pub struct AgentTestHarnessBuilder {
     spending_limits: SpendingLimits,
     pricing: HashMap<String, ModelPricing>,
     compression_strategy: Option<Box<dyn CompressionStrategy>>,
+    compression_strategy_factory: Option<CompressionStrategyFactory>,
     token_budget: Option<TokenBudget>,
 }
+
+/// Factory that builds the harness's compression strategy after the
+/// `SessionManager` has been constructed. Use when the strategy needs
+/// a handle to the same manager the wired `ContextManager` will see —
+/// e.g. `SummaryAwareWrapper` reads `session_summaries` and the
+/// supersede log to map its cursor.
+pub type CompressionStrategyFactory =
+    Box<dyn FnOnce(&Arc<aura_agent::SessionManager>) -> Box<dyn CompressionStrategy>>;
 
 impl Default for AgentTestHarnessBuilder {
     fn default() -> Self {
@@ -173,6 +187,7 @@ impl Default for AgentTestHarnessBuilder {
             spending_limits: SpendingLimits::default(),
             pricing: HashMap::new(),
             compression_strategy: None,
+            compression_strategy_factory: None,
             token_budget: None,
         }
     }
@@ -226,6 +241,21 @@ impl AgentTestHarnessBuilder {
     /// Use to drive `Summarize`-path tests with a stub `SummarizeCallback`.
     pub fn with_compression_strategy(mut self, strategy: Box<dyn CompressionStrategy>) -> Self {
         self.compression_strategy = Some(strategy);
+        self
+    }
+
+    /// Late-bind the compression strategy: the closure runs inside
+    /// `build()` after the harness's `SessionManager` is constructed,
+    /// receiving an `Arc` to it. Use when the strategy needs to share
+    /// that same manager — e.g. `SummaryAwareWrapper` reads
+    /// `session_summaries` and the supersede log to map its cursor.
+    /// Mutually exclusive with `with_compression_strategy`; when both
+    /// are set the factory wins.
+    pub fn with_compression_strategy_factory(
+        mut self,
+        factory: CompressionStrategyFactory,
+    ) -> Self {
+        self.compression_strategy_factory = Some(factory);
         self
     }
 
@@ -329,6 +359,14 @@ impl AgentTestHarnessBuilder {
             summary_store,
             chrono::Duration::minutes(30),
         ));
+        // Factory takes precedence: it constructs the strategy with a
+        // live handle to the harness's `SessionManager`, which is
+        // necessary for any wrapper that consults the same metadata
+        // tables the rest of the loop writes.
+        let strategy = match self.compression_strategy_factory {
+            Some(factory) => factory(&session_manager),
+            None => strategy,
+        };
         let context_manager = ContextManager::new(
             tokenizer,
             strategy,
@@ -336,7 +374,7 @@ impl AgentTestHarnessBuilder {
             Arc::clone(&token_calibration),
             Arc::clone(&skill_registry),
             session.id.clone(),
-            session_manager,
+            Arc::clone(&session_manager),
         );
 
         let soul_text = self
@@ -397,6 +435,7 @@ impl AgentTestHarnessBuilder {
             skill_registry,
             cost_manager,
             token_calibration,
+            session_manager,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),

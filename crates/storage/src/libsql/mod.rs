@@ -198,7 +198,16 @@ impl LibsqlPool {
                     -- failure burns one LLM call per trigger event until the
                     -- underlying issue resolves; that's an explicit design
                     -- choice (no backoff complexity).
-                    error_count INTEGER NOT NULL DEFAULT 0
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    -- 1 while a `BackgroundCompressionRunner` pass is active for
+                    -- this parent; 0 otherwise. The trigger gate reads this
+                    -- column to enforce the at-most-one-in-flight invariant
+                    -- without inspecting the maintenance session row (which is
+                    -- preserved as audit history). Set by the gate before
+                    -- emitting a `SystemSpawnRequest`; cleared by
+                    -- `record_summary_success`/`record_summary_failure` and by
+                    -- the orphan reaper.
+                    in_flight   INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS memories (
@@ -407,6 +416,7 @@ impl LibsqlPool {
             "ALTER TABLE cost_records ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE cost_records ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN is_normal_session INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE session_summaries ADD COLUMN in_flight INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(e) = self.conn.execute(stmt, ()).await
                 && !e.to_string().contains("duplicate column name")

@@ -1698,16 +1698,17 @@ impl AgentLoop {
             return;
         }
 
-        // Spawn-serialization (R4): if a maintenance session
-        // already exists for this parent, skip the trigger. The
-        // next iteration will re-evaluate; the in-flight pass will
-        // either land or be reaped on next startup.
-        match sessions.active_maintenance_for_parent(&session.id).await {
-            Ok(active) if !active.is_empty() => {
+        // Spawn-serialization (R4): the parent's `session_summaries.in_flight`
+        // flag is the canonical "a refresh pass is already running"
+        // signal. Maintenance session rows are kept as audit history
+        // and are no longer consulted here — the flag is set by the
+        // gate below before `try_send` and cleared by the runner's
+        // `record_summary_success` / `record_summary_failure` calls.
+        match sessions.summary_metadata(&session.id).await {
+            Ok(Some(meta)) if meta.in_flight => {
                 debug!(
                     parent_session_id = %session.id,
-                    in_flight = active.len(),
-                    "summary trigger: maintenance session already in flight; skipping"
+                    "summary trigger: in_flight already set; skipping"
                 );
                 return;
             }
@@ -1716,7 +1717,7 @@ impl AgentLoop {
                 warn!(
                     parent_session_id = %session.id,
                     error = %e,
-                    "summary trigger: in-flight lookup failed; skipping"
+                    "summary trigger: in_flight lookup failed; skipping"
                 );
                 return;
             }
@@ -1755,12 +1756,37 @@ impl AgentLoop {
             parent_actor_token: self.actor_token.clone(),
             payload,
         };
+
+        // Mark in-flight before emitting so the next gate iteration on
+        // this parent observes the flag and skips. A persistence
+        // failure here means we cannot enforce the at-most-one
+        // invariant — abort the trigger rather than risk a duplicate
+        // pass.
+        if let Err(e) = sessions.mark_summary_in_flight(&session.id).await {
+            warn!(
+                parent_session_id = %session.id,
+                error = %e,
+                "summary trigger: mark_summary_in_flight failed; skipping"
+            );
+            return;
+        }
         if let Err(e) = tx.try_send(request) {
             warn!(
                 parent_session_id = %session.id,
                 error = %e,
-                "summary trigger: system-spawn channel send failed"
+                "summary trigger: system-spawn channel send failed; rolling back in_flight"
             );
+            // Roll back the mark so the next iteration retries.
+            // Failure here is logged but otherwise tolerated; the
+            // runner side will not clear it and the orphan reaper is
+            // the last line of defense.
+            if let Err(e) = sessions.clear_summary_in_flight(&session.id).await {
+                warn!(
+                    parent_session_id = %session.id,
+                    error = %e,
+                    "summary trigger: clear_summary_in_flight rollback failed"
+                );
+            }
         }
     }
 
@@ -1793,6 +1819,12 @@ impl AgentLoop {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sessions not configured for summary refresh"))?
             .clone();
+        // Held for the post-`with_job` defensive cleanup that
+        // guarantees `in_flight` is cleared even when the runner
+        // returns Err before reaching `record_summary_*` (cancel,
+        // job-lifecycle rejection, transcript load failure).
+        let cleanup_sessions = sessions.clone();
+        let parent_id_for_cleanup = payload.parent_session_id.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
         let cost_manager = self.cost_manager.clone();
@@ -1814,30 +1846,50 @@ impl AgentLoop {
             parent_job_id: session.lineage.as_ref().map(|l| l.parent_job_id),
         };
 
-        crate::scope::with_job(job_lifecycle, cancel_token.clone(), spec, move |job_id| {
-            let payload = payload.clone();
-            let cancel_token = cancel_token.clone();
-            async move {
-                let refresher = crate::background_compression::BackgroundCompressionRunner {
-                    llm_client,
-                    security_gateway,
-                    cost_manager,
-                    sessions,
-                    workspace_paths,
-                    recorder,
-                    model_info,
-                    maintenance_session_id,
-                    maintenance_user_id: user_id,
-                    job_id,
-                    cancel_token,
-                };
-                let outcome = refresher.run(payload).await?;
-                let value = serde_json::to_value(&outcome)?;
-                let output = aura_job::JobOutput::Structured { value };
-                Ok((output, outcome))
-            }
-        })
-        .await
+        let result =
+            crate::scope::with_job(job_lifecycle, cancel_token.clone(), spec, move |job_id| {
+                let payload = payload.clone();
+                let cancel_token = cancel_token.clone();
+                async move {
+                    let refresher = crate::background_compression::BackgroundCompressionRunner {
+                        llm_client,
+                        security_gateway,
+                        cost_manager,
+                        sessions,
+                        workspace_paths,
+                        recorder,
+                        model_info,
+                        maintenance_session_id,
+                        maintenance_user_id: user_id,
+                        job_id,
+                        cancel_token,
+                    };
+                    let outcome = refresher.run(payload).await?;
+                    let value = serde_json::to_value(&outcome)?;
+                    let output = aura_job::JobOutput::Structured { value };
+                    Ok((output, outcome))
+                }
+            })
+            .await;
+
+        // Defense in depth: idempotently clear `in_flight` after the
+        // runner returns. Successful and failed passes already clear
+        // the flag via `record_summary_success`/`record_summary_failure`,
+        // but cancellation or an error before either of those calls
+        // would otherwise leave the flag set until the next process
+        // restart (when the orphan reaper would clear it).
+        if let Err(e) = cleanup_sessions
+            .clear_summary_in_flight(&parent_id_for_cleanup)
+            .await
+        {
+            warn!(
+                parent_session_id = %parent_id_for_cleanup,
+                error = %e,
+                "summary refresh: clear_summary_in_flight after runner failed"
+            );
+        }
+
+        result
     }
 
     async fn ensure_system_prompt(&mut self, session: &Session) -> anyhow::Result<()> {

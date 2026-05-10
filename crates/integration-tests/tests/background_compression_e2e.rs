@@ -304,6 +304,142 @@ async fn lineage_kind_round_trips_for_system_maintenance() {
     assert!(matches!(kids[0].1, LineageKind::SystemMaintenance));
 }
 
+/// Trigger-gate `in_flight` lifecycle: marking the parent in-flight
+/// lights up the flag; a recorded success clears it; a separate
+/// `clear_summary_in_flight` is idempotent.
+#[tokio::test]
+async fn in_flight_marks_then_clears_on_recorded_pass() {
+    let (store, _dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-in-flight");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    );
+
+    // Initially no metadata row at all.
+    assert!(mgr.summary_metadata(&parent.id).await.unwrap().is_none());
+
+    // Gate marks in-flight before emitting the spawn — placeholder row
+    // is created carrying `in_flight = true` and zero-valued counters.
+    mgr.mark_summary_in_flight(&parent.id).await.unwrap();
+    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert!(row.in_flight);
+    assert_eq!(row.cursor, 0);
+    assert_eq!(row.pass_count, 0);
+
+    // Runner records success → flag cleared in the same UPSERT that
+    // bumps `pass_count` and advances `cursor`.
+    mgr.record_summary_success(&parent.id, 7, 1_000, "m", "span", Utc::now())
+        .await
+        .unwrap();
+    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert!(!row.in_flight);
+    assert_eq!(row.cursor, 7);
+    assert_eq!(row.pass_count, 1);
+
+    // Idempotent rollback — clearing again is a no-op on the flag and
+    // doesn't perturb the recorded counters.
+    mgr.clear_summary_in_flight(&parent.id).await.unwrap();
+    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert!(!row.in_flight);
+    assert_eq!(row.cursor, 7);
+    assert_eq!(row.pass_count, 1);
+}
+
+/// Orphan reaper closes the "mark-without-row" gap. Trigger gate
+/// marks `in_flight = true` *before* emitting the SystemSpawnRequest;
+/// if the process dies after the mark but before the router creates
+/// the maintenance session row, no maintenance row exists for the
+/// next boot's reaper to walk. Without an explicit sweep the parent
+/// would stay blocked. The reaper's `clear_all_summary_in_flight`
+/// step handles exactly this case.
+#[tokio::test]
+async fn orphan_reaper_clears_orphan_in_flight_without_maintenance_row() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-mark-only");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    ));
+
+    // Simulate the gap: gate persisted in_flight = 1, process crashed
+    // before the router could call create_maintenance_session.
+    mgr.mark_summary_in_flight(&parent.id).await.unwrap();
+    assert!(
+        mgr.summary_metadata(&parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .in_flight
+    );
+    assert!(
+        mgr.all_maintenance_sessions().await.unwrap().is_empty(),
+        "this scenario specifically has no maintenance session row to walk"
+    );
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+    reap_maintenance_orphans(&mgr, &paths).await;
+
+    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert!(
+        !row.in_flight,
+        "reaper's clear_all_summary_in_flight must recover orphaned in_flight \
+         even when no maintenance session row exists for it to walk"
+    );
+    // No spurious error_count bump: the orphan-without-row path doesn't
+    // know which model to attribute the failure to, so the sweep just
+    // clears the flag silently.
+    assert_eq!(row.error_count, 0);
+}
+
+/// Orphan reaper recovery: a parent left with `in_flight = true`
+/// after a process crash gets its flag cleared on next boot via
+/// `record_summary_failure` (which the reaper invokes per reaped
+/// maintenance session).
+#[tokio::test]
+async fn orphan_reaper_clears_in_flight_on_recovered_parent() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-stale-flight");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    ));
+
+    // Simulate the crash mid-pass: maintenance row exists, parent's
+    // `in_flight` is still set.
+    let _maint = mgr
+        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
+        .await
+        .unwrap();
+    mgr.mark_summary_in_flight(&parent.id).await.unwrap();
+    assert!(
+        mgr.summary_metadata(&parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .in_flight
+    );
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+    reap_maintenance_orphans(&mgr, &paths).await;
+
+    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert!(
+        !row.in_flight,
+        "orphan reaper must clear in_flight on the parent so the gate can emit again"
+    );
+    assert_eq!(row.error_count, 1);
+}
+
 #[tokio::test]
 async fn rapid_record_calls_accumulate_cost_and_pass_count() {
     let (store, _dir) = fresh_store_and_paths().await;

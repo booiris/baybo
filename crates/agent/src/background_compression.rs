@@ -357,6 +357,22 @@ pub async fn reap_maintenance_orphans(
     sessions: &SessionManager,
     workspace_paths: &aura_workspace::WorkspacePaths,
 ) {
+    // ---- Stale in_flight sweep ----------------------------------------
+    // A process that just started has no in-flight pass by definition,
+    // so any `session_summaries.in_flight = 1` left from the previous
+    // boot is stale. The maintenance-session sweep below also clears
+    // `in_flight` (via `record_summary_failure` → `bump_error_count`)
+    // for parents whose maintenance row survived, but cannot recover
+    // the case where the trigger gate marked `in_flight = 1` *before*
+    // the router created the maintenance session row and the process
+    // died in that window. Run this first, idempotent.
+    if let Err(e) = sessions.clear_all_summary_in_flight().await {
+        warn!(
+            error = %e,
+            "orphan reap: clear_all_summary_in_flight failed"
+        );
+    }
+
     // ---- DB orphans ---------------------------------------------------
     let maintenance_ids = match sessions.all_maintenance_sessions().await {
         Ok(ids) => ids,

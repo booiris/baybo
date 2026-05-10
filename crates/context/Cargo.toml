@@ -30,5 +30,8 @@ tokio = { workspace = true, features = ["fs"] }
 [dev-dependencies]
 aura-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+# `test-util` enables `tokio::time::pause` / `start_paused = true`
+# attribute used by the wrapper's `wait_for_in_flight` tests so the
+# 15s wall-clock timeout stays virtual.
+tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber = { workspace = true }

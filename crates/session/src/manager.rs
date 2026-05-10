@@ -113,6 +113,42 @@ impl SessionManager {
             .map_err(wrap)
     }
 
+    /// Mark `session_id` as having an in-flight `BackgroundCompressionRunner`
+    /// pass. The trigger gate calls this immediately before emitting a
+    /// `SystemSpawnRequest`, and the next gate iteration on the same
+    /// parent will see the flag and skip. A landed
+    /// `record_summary_success` / `record_summary_failure` clears it
+    /// automatically; the orphan reaper clears it on next boot for
+    /// sessions whose maintenance row was reaped.
+    pub async fn mark_summary_in_flight(&self, session_id: &SessionId) -> Result<()> {
+        self.summary_store
+            .set_in_flight(session_id, true, Utc::now())
+            .await
+            .map_err(wrap)
+    }
+
+    /// Clear the `in_flight` flag without recording a success or
+    /// failure. Used by the trigger gate to roll back its own mark when
+    /// `try_send` on the spawn channel fails (so the next iteration
+    /// retries) and as defense in depth for runner exit paths that
+    /// bypass `record_*` (e.g. cancellation).
+    pub async fn clear_summary_in_flight(&self, session_id: &SessionId) -> Result<()> {
+        self.summary_store
+            .set_in_flight(session_id, false, Utc::now())
+            .await
+            .map_err(wrap)
+    }
+
+    /// Reset `in_flight = 0` on every `session_summaries` row. Called
+    /// once at startup by the orphan reaper so the gap between a
+    /// `mark_summary_in_flight` write and a process crash before the
+    /// router could create the corresponding maintenance session row
+    /// (or even before the `try_send` returned) doesn't leave the
+    /// parent permanently blocked.
+    pub async fn clear_all_summary_in_flight(&self) -> Result<()> {
+        self.summary_store.clear_all_in_flight().await.map_err(wrap)
+    }
+
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
         self.create_session_with_trigger(user, channel, TriggerSource::User)
             .await
