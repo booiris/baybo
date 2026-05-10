@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use aura_context::{SUMMARIZE_INSTRUCTION, parse_summary_response};
 use aura_llm::{ChatRequest, GuardedLlm, ModelInfo};
-use aura_model::{ChatMessage, ContentBlock, JobId, Role, SessionId};
+use aura_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, JobId, Role, SessionId};
 use aura_session::SessionManager;
 use aura_workspace::WorkspacePaths;
 use chrono::Utc;
@@ -29,25 +29,6 @@ use crate::trace::SpanRecorder;
 /// when the orphan reaper bumps a parent's failure count for a
 /// crashed-mid-pass maintenance session.
 const ORPHAN_REAP_MODEL_TAG: &str = "orphan-reap";
-
-/// Payload carried by `JobInput::System { reason: BackgroundCompression, payload }`.
-/// The parent's agent loop builds this at trigger spawn time;
-/// the maintenance session's actor parses it via `serde_json::from_value`
-/// before invoking the refresher.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackgroundCompressionPayload {
-    pub parent_session_id: SessionId,
-    /// Highest `session_messages.ordinal` to include in this pass'
-    /// input. Pinned at trigger time so concurrent appends to the
-    /// parent don't bleed in mid-pass.
-    pub up_to_ordinal: i64,
-    /// Opaque owner token stamped onto `session_summaries.in_flight_owner`
-    /// when the trigger gate marked the parent in-flight. The runner
-    /// uses it for compare-and-clear cleanup so a stale Pass A
-    /// finishing after Pass B remarked the parent cannot wipe Pass
-    /// B's mark. Generated once per pass at the gate (UUID v4).
-    pub in_flight_owner: String,
-}
 
 /// Result of one refresh pass; carried back as the
 /// `JobOutput::Structured.value`.
@@ -487,20 +468,6 @@ mod tests {
     fn parse_returns_none_when_only_analysis() {
         let s = "<analysis>x</analysis>";
         assert!(parse_summary_response(s).is_none());
-    }
-
-    #[test]
-    fn payload_round_trips_through_value() {
-        let p = BackgroundCompressionPayload {
-            parent_session_id: SessionId::from("user-1"),
-            up_to_ordinal: 42,
-            in_flight_owner: "owner-token-xyz".into(),
-        };
-        let v = serde_json::to_value(&p).unwrap();
-        let back: BackgroundCompressionPayload = serde_json::from_value(v).unwrap();
-        assert_eq!(back.parent_session_id, p.parent_session_id);
-        assert_eq!(back.up_to_ordinal, p.up_to_ordinal);
-        assert_eq!(back.in_flight_owner, p.in_flight_owner);
     }
 
     #[test]

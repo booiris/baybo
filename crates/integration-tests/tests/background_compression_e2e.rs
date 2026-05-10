@@ -26,8 +26,8 @@ use std::time::Duration;
 use aura_agent::SessionManager;
 use aura_agent::background_compression::reap_maintenance_orphans;
 use aura_model::{
-    ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, SystemReason,
-    TriggerSource, User,
+    BackgroundCompressionPayload, ChannelType, JobId, Lineage, LineageKind, Session, SessionId,
+    SessionState, SystemReason, SystemTrigger, TriggerSource, User,
 };
 use aura_storage::Store;
 use aura_workspace::WorkspacePaths;
@@ -264,8 +264,11 @@ async fn orphan_reaper_preserves_completed_maintenance_sessions() {
     let mut completed_job = aura_job::Job::new(
         completed_maint.id.clone(),
         aura_job::JobInput::System {
-            reason: SystemReason::BackgroundCompression,
-            payload: serde_json::Value::Null,
+            trigger: SystemTrigger::BackgroundCompression(BackgroundCompressionPayload {
+                parent_session_id: parent.id.clone(),
+                up_to_ordinal: 0,
+                in_flight_owner: "test-owner-completed".into(),
+            }),
         },
         "soul-v1",
         None,
@@ -288,8 +291,11 @@ async fn orphan_reaper_preserves_completed_maintenance_sessions() {
     let mut in_flight_job = aura_job::Job::new(
         in_flight_maint.id.clone(),
         aura_job::JobInput::System {
-            reason: SystemReason::BackgroundCompression,
-            payload: serde_json::Value::Null,
+            trigger: SystemTrigger::BackgroundCompression(BackgroundCompressionPayload {
+                parent_session_id: parent.id.clone(),
+                up_to_ordinal: 0,
+                in_flight_owner: "test-owner-in-flight".into(),
+            }),
         },
         "soul-v1",
         None,

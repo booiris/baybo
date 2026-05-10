@@ -2,12 +2,10 @@ use std::sync::Arc;
 
 use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
 use aura_job::JobInput;
-use aura_model::{ContentBlock, Session};
+use aura_model::{ContentBlock, Session, SystemTrigger};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
-use anyhow::Context as _;
 
 use crate::agent_loop::AgentLoop;
 use crate::job::JobLifecycle;
@@ -31,16 +29,13 @@ pub enum AgentMessage {
         initial_message: Box<IncomingMessage>,
         parent_job_id: aura_model::JobId,
     },
-    /// A `SystemReason`-tagged maintenance task has been spawned on
-    /// this actor's session. Bypasses the normal chat-turn cycle
-    /// (`agent_loop.run`) and dispatches to a dedicated handler
-    /// based on `reason`. Currently the only wired reason is
-    /// `SystemReason::BackgroundCompression`; other variants log a warning
-    /// and drop until they get implementations.
-    SystemTrigger {
-        reason: aura_model::SystemReason,
-        payload: serde_json::Value,
-    },
+    /// A maintenance task has been spawned on this actor's session.
+    /// Bypasses the normal chat-turn cycle (`agent_loop.run`) and
+    /// dispatches to a dedicated handler based on the carried
+    /// [`SystemTrigger`] variant. Currently the only wired variant is
+    /// `SystemTrigger::BackgroundCompression`; other variants log a
+    /// warning and drop until they get implementations.
+    SystemTrigger(SystemTrigger),
     /// Gracefully shut down this actor.
     Shutdown,
 }
@@ -159,8 +154,8 @@ impl AgentActor {
                         );
                     }
                 }
-                AgentMessage::SystemTrigger { reason, payload } => {
-                    if let Err(e) = self.handle_system_trigger(reason, payload).await {
+                AgentMessage::SystemTrigger(trigger) => {
+                    if let Err(e) = self.handle_system_trigger(trigger).await {
                         error!(
                             session_id = %self.session.id,
                             error = %e,
@@ -323,26 +318,18 @@ impl AgentActor {
         }
     }
 
-    /// Dispatch a `JobInput::System { reason, .. }` to its
-    /// reason-specific handler. Currently only
-    /// `SystemReason::BackgroundCompression` is wired through to
-    /// `agent_loop.run_background_compression`; other variants are ignored
-    /// with a warning until they're implemented.
-    async fn handle_system_trigger(
-        &mut self,
-        reason: aura_model::SystemReason,
-        payload: serde_json::Value,
-    ) -> anyhow::Result<()> {
-        match reason {
-            aura_model::SystemReason::BackgroundCompression => {
-                let parsed: crate::background_compression::BackgroundCompressionPayload =
-                    serde_json::from_value(payload)
-                        .context("decode SystemReason::BackgroundCompression JobInput payload")?;
+    /// Dispatch a `SystemTrigger` to its variant-specific handler.
+    /// Currently only `SystemTrigger::BackgroundCompression` is wired
+    /// through to `agent_loop.run_background_compression`; the other
+    /// variants are ignored with a warning until they're implemented.
+    async fn handle_system_trigger(&mut self, trigger: SystemTrigger) -> anyhow::Result<()> {
+        match trigger {
+            SystemTrigger::BackgroundCompression(payload) => {
                 let outcome = self
                     .agent_loop
                     .run_background_compression(
                         &mut self.session,
-                        parsed,
+                        payload,
                         &self.job_lifecycle,
                         &self.span_recorder,
                         self.actor_token.child_token(),
@@ -355,12 +342,11 @@ impl AgentActor {
                     "summary refresh: pass landed"
                 );
             }
-            aura_model::SystemReason::HistoryReview
-            | aura_model::SystemReason::MemoryConsolidation => {
+            other @ (SystemTrigger::HistoryReview | SystemTrigger::MemoryConsolidation) => {
                 warn!(
                     session_id = %self.session.id,
-                    ?reason,
-                    "SystemReason variant not yet wired in actor; dropping trigger"
+                    reason = ?other.reason(),
+                    "SystemTrigger variant not yet wired in actor; dropping trigger"
                 );
             }
         }

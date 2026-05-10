@@ -1767,7 +1767,7 @@ impl AgentLoop {
         // finishing after Pass B remarked the parent cannot wipe
         // Pass B's mark.
         let owner_token = uuid::Uuid::new_v4().to_string();
-        let payload = crate::background_compression::BackgroundCompressionPayload {
+        let payload = aura_model::BackgroundCompressionPayload {
             parent_session_id: session.id.clone(),
             up_to_ordinal,
             in_flight_owner: owner_token.clone(),
@@ -1843,7 +1843,7 @@ impl AgentLoop {
     pub(crate) async fn run_background_compression(
         &mut self,
         session: &mut Session,
-        payload: crate::background_compression::BackgroundCompressionPayload,
+        payload: aura_model::BackgroundCompressionPayload,
         job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         cancel_token: CancellationToken,
@@ -1876,14 +1876,11 @@ impl AgentLoop {
         let maintenance_session_id = session.id.clone();
         let recorder = span_recorder.clone();
 
-        let payload_value = serde_json::to_value(&payload)
-            .map_err(|e| anyhow::anyhow!("encode BackgroundCompression payload: {e}"))?;
         let spec = crate::job::JobSpec {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
             input: aura_job::JobInput::System {
-                reason: aura_model::SystemReason::BackgroundCompression,
-                payload: payload_value,
+                trigger: aura_model::SystemTrigger::BackgroundCompression(payload.clone()),
             },
             effective_soul_version: session.bound_soul_version.clone(),
             parent_job_id: session.lineage.as_ref().map(|l| l.parent_job_id),

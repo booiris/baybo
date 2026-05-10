@@ -262,13 +262,10 @@ impl Router {
         let response_tx = self.supervisor.response_tx().clone();
         let mailbox = (self.actor_spawner)(maint, response_tx, &parent_actor_token);
 
-        let payload_value = serde_json::to_value(&payload)
-            .map_err(|e| anyhow::anyhow!("encode BackgroundCompression payload: {e}"))?;
         if let Err(e) = mailbox
-            .send(AgentMessage::SystemTrigger {
-                reason: aura_model::SystemReason::BackgroundCompression,
-                payload: payload_value,
-            })
+            .send(AgentMessage::SystemTrigger(
+                aura_model::SystemTrigger::BackgroundCompression(payload),
+            ))
             .await
         {
             warn!(

@@ -15,6 +15,6 @@ pub use message::{BlobRef, ChatMessage, ContentBlock, MessageMetadata, Role, Thi
 pub use money::{MicroUsd, usd_decimal_option};
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
-    ChannelType, Lineage, LineageKind, Session, SessionState, SystemReason, TriggerKind,
-    TriggerSource, User,
+    BackgroundCompressionPayload, ChannelType, Lineage, LineageKind, Session, SessionState,
+    SystemReason, SystemTrigger, TriggerKind, TriggerSource, User,
 };

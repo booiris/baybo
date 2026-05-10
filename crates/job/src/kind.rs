@@ -10,7 +10,7 @@
 //! | `System`        | `JobKind::System`           |
 //! | (any)           | `JobKind::Spawned` is also valid in any session — spawned jobs inherit their parent context regardless of root trigger |
 
-use aura_model::{ContentBlock, SystemReason, TriggerKind};
+use aura_model::{ContentBlock, SystemTrigger, TriggerKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,9 +54,11 @@ pub enum JobInput {
     Cron {
         action_payload: Value,
     },
+    /// A maintenance task — see [`SystemTrigger`] for the variants.
+    /// The trigger carries its payload directly; no opaque
+    /// `serde_json::Value` blob.
     System {
-        reason: SystemReason,
-        payload: Value,
+        trigger: SystemTrigger,
     },
     Spawned {
         initial_prompt: Vec<ContentBlock>,
@@ -119,8 +121,7 @@ mod tests {
         assert_eq!(i.kind(), JobKind::Cron);
 
         let i = JobInput::System {
-            reason: SystemReason::HistoryReview,
-            payload: serde_json::json!({}),
+            trigger: SystemTrigger::HistoryReview,
         };
         assert_eq!(i.kind(), JobKind::System);
 
@@ -133,8 +134,7 @@ mod tests {
     #[test]
     fn input_round_trips_through_serde() {
         let i = JobInput::System {
-            reason: SystemReason::MemoryConsolidation,
-            payload: serde_json::json!({"target": "user-1"}),
+            trigger: SystemTrigger::MemoryConsolidation,
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: JobInput = serde_json::from_str(&s).unwrap();
