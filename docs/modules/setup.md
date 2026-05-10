@@ -81,8 +81,10 @@ Before showing any picker, `bootstrap_workspace_if_needed`:
 5. Opens libsql at `<root>/state/storage.db` and builds the
    `SecretVault`.
 
-The result is a `SetupContext { paths, config_path, config, vault,
-stores }` handed to every flow primitive. Steps mutate `config` in
+The result is a `SetupContext { config_path, config, vault, stores }`
+handed to every flow primitive. `WorkspacePaths` is a local inside
+`bootstrap_workspace_if_needed` — flow primitives derive paths from
+`config_path` or build their own as needed. Steps mutate `config` in
 memory; the runner commits exactly once at the end.
 
 ### β2 — single `aura.json` write at the end
@@ -196,7 +198,7 @@ pub mod flow {
     pub fn run_registration(...) -> Result<RegistrationResult>;  // sidecar driver
 }
 
-pub struct SetupContext { /* paths, config, vault, stores, … */ }
+pub struct SetupContext { /* config_path, config, vault, stores */ }
 pub async fn bootstrap_workspace_if_needed(workspace_root) -> Result<SetupContext>;
 
 pub async fn run(prompter, ctx) -> Result<SetupOutcome>;          // mode picker → quick/full

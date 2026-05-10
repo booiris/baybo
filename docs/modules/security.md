@@ -122,7 +122,7 @@ through the tool-argument reveal boundary described above, never via
 
 ### Network decision boundary
 
-Security only decides allow/deny. It does not execute network access. The chain is: manifest + admin config + runtime request → `NetworkPolicyDecider::decide()` → tool executes. This separates permission decisions from execution.
+Security only decides allow/deny. It does not execute network access. There is no central network-policy decider — the SSRF guard is inline in `WebFetch::validate_url_with` (parse-time literal-IP rejection via `aura_security::is_blocked_ip`) plus the per-fetch `SafeResolver` (DNS-time resolved-IP filter). Process-level network containment for sandboxed tools comes from `aura_sandbox::NetworkPolicy::{None, All}` at spec-build time. This separates permission decisions from execution.
 
 ## Constraints
 

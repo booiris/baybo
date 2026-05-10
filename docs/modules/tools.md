@@ -33,7 +33,7 @@ permission rules.
 | `SkillUninstall`                                                                                                                                                                                                                                                      | implemented | symmetric counterpart to `SkillInstall`. Looks up the skill by name, refuses if it has no on-disk source or its canonicalized `source_path` doesn't sit under the workspace skills dir (so registry-only or third-party-mounted skills aren't deletable), removes the directory recursively, then triggers `SkillRegistry::reload()`. Same `WriteFile` capability scoping. |
 | `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `Task*`/`TodoWrite`, `ToolSearch`, `WebSearch`, `Team*`                                                                   | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed |
 
-`ToolRegistry::with_defaults(blob_store)` registers the implemented set with
+`ToolRegistry::with_defaults(blob_store, llm)` registers the implemented set with
 `TrustLevel::Trusted` manifests declaring their capabilities
 (`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). `SendFile` is part of this
 default set and uses the supplied `BlobStore` to stage channel attachments.
@@ -145,7 +145,7 @@ Typical rules:
 
 ### User-approval gate
 
-`ToolExecutor` holds an `Arc<ApprovalGateMap>` shared with `ChannelRegistry`. At execution time it calls `gate_map.get(user.channel)` to resolve the right gate for the session's channel; if no gate is registered, `AutoDenyGate` (fail-closed) is returned. Matching:
+`ToolExecutor` holds an `Arc<ApprovalGateMap>` shared with `ChannelRegistry`. At execution time it calls `gate_map.get(channel, session_id)` to resolve the right gate for the session's channel; if no gate is registered, `AutoDenyGate` (fail-closed) is returned. Matching:
 
 - `ReadFile` / `WriteFile` — component-aware path prefix (`Path::starts_with`). Approving `/tmp/a` covers `/tmp/a/b` but not `/tmp/ab`. Read and write are independent (an approved read does not cover a write). `ReadFile` is unconditionally bypassed by `ToolExecutor` (read is non-destructive; per-path prompting is friction without a safety win), but the matching rule is still defined for tools that gate writes via this mechanism.
 - `Http` — `HostPattern::Exact` is case-insensitive equality; `HostPattern::Wildcard("foo.com")` covers `foo.com` and any subdomain but not `barfoo.com`. `ResourceAccess::to_approved()` produces `Exact` only — wildcards are operator-authored.
@@ -174,7 +174,7 @@ Cross-host redirects are still rejected inside the redirect policy (with a "re-i
 
 `ChannelApprovalGate` + `ApprovalQueue` (`crates/tools/src/approval.rs`) extract the common queue-and-oneshot pattern so each channel only supplies a sync waker callback (e.g. `|| event_tx.try_send(WakeUp)`). The queue exposes `peek_head` / `resolve_head` / `len` so the channel's event loop can render and dismiss inline prompts without touching oneshot internals.
 
-`ApprovalGateMap` is a sync `HashMap<ChannelType, Arc<dyn ApprovalGate>>` behind a `std::sync::RwLock`. `ChannelRegistry` populates it at `register()` time by reading `Channel::approval_gate()` on the newly-registered handle and evicts the entry on `unregister()`; `ToolExecutor` reads it per-call. Both hold an `Arc` to the same map, so gates registered after `ToolExecutor` construction are visible immediately. Adding a new channel with approval support requires only wiring an `Arc<dyn ApprovalGate>` into the `Channel` at construction time — no changes to `ToolExecutor` or bootstrap code.
+`ApprovalGateMap` keeps two `DashMap`s — `type_level: DashMap<ChannelType, Arc<dyn ApprovalGate>>` for sidecar registrations and `session_level: DashMap<(ChannelType, SessionId), Arc<dyn ApprovalGate>>` for session-scoped clients. `get(channel, session_id)` tries the session-level entry first and falls back to the type-level gate, returning `AutoDenyGate` when neither is present. `ChannelRegistry` populates entries at `register()` time and evicts on `unregister()`; `ToolExecutor` reads per-call. Both sides hold an `Arc` to the same map, so gates registered after `ToolExecutor` construction are visible immediately. Adding a new channel with approval support requires only wiring an `Arc<dyn ApprovalGate>` into the `Channel` at construction time — no changes to `ToolExecutor` or bootstrap code.
 
 ### LLM visibility boundary
 
@@ -200,8 +200,8 @@ Tool output should prefer structured `Json`, use `LargeText` for long text with 
 
 ## Constraints
 
-- Depends on `model`, `session`, `registry`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
-- Does not install third-party artifacts (that's `registry`)
+- Depends on `aura-llm`, `aura-model`, `aura-security`, `aura-storage`, `aura-workspace`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
+- Does not install third-party artifacts
 - Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-connection gate is built by the gateway's WS sidecar (`ChannelApprovalGate` backed by an `ApprovalQueue`), and the TUI renders the resulting prompts inline in its scrollback
 - `artifact_hash` must be recorded in `trace::ExecutionProvenance`
 
@@ -211,7 +211,6 @@ Tool output should prefer structured `Json`, use `LargeText` for long text with 
 | ---------- | -------------------------------------------------------------------------------------------------- |
 | `agent`    | `ToolExecutor` validates trust/capability, executes tools, records observability                   |
 | `security` | Upper layers inject secrets and network policy (no direct dependency)                              |
-| `registry` | Provides verified third-party tool artifacts; `TrustLevel` will govern MCP tools once reintroduced |
 | `trace`    | Records tool parameters, results, artifact hash, and source                                        |
 | `llm`      | Consumes tool definitions for function calling                                                     |
-| `rmcp`     | (Removed) External SDK for MCP client transports — to be restored with MCP support                 |
+| `rmcp`     | External SDK for MCP client transports                                                             |

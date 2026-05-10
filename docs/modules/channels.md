@@ -49,8 +49,8 @@ only tracks live handles.
 
 ### Single outbound entrypoint
 
-All outbound traffic goes through one method: `Channel::send(output:
-AgentOutput) -> Result<()>` forwards onto the outbound mpsc. The
+All outbound traffic goes through one method: `async fn Channel::send(&self,
+output: AgentOutput) -> Result<()>` forwards onto the outbound mpsc. The
 transport decides how to serialise each variant (`Delta`, `Message`,
 `Notice`) onto the wire. The router just looks up the channel by
 `ChannelType` and pushes events through.
@@ -340,8 +340,8 @@ Design rules:
 
 ## Constraints
 
-- `channels` stays independent of `agent`, `llm`, `tools`, and all other
-  business crates (depends only on `model` and `session`; `aura-tools`
+- `channels` stays independent of `agent`, `llm`, and other business
+  crates (depends only on `aura-model` and `aura-tools`; `aura-tools`
   is pulled in only for the `ApprovalGate` + `ApprovalGateMap` types)
 - Transports own framing and encoding. This crate only defines the
   neutral `wire::{Frame, Message}` shapes (MessagePack-named) and the
@@ -352,8 +352,7 @@ Design rules:
 
 | Module     | Role                                                                           |
 | ---------- | ------------------------------------------------------------------------------ |
-| `model`    | Provides `ContentBlock`, `ChatMessage`, `ChannelType`, `ResourceAccess`        |
-| `session`  | Provides `User`                                                                |
+| `model`    | Provides `ContentBlock`, `ChatMessage`, `ChannelType`, `ResourceAccess`, `User` |
 | `agent`    | Router owns the registry and dispatches `AgentOutput` by `ChannelType`         |
 | `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry             |
 | `gateway`  | Hosts the only in-tree transport (`/v1/channel-ws`); builds and registers `Arc<Channel>` per connection |

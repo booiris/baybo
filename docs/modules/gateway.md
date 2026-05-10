@@ -11,7 +11,7 @@ by side against the same manager graph:
    chat content or session data flows here.
 2. **Channel listener** — loopback TCP (`127.0.0.1:<ephemeral>`),
    authenticated by either the TUI pre-shared key or a per-subprocess
-   token. The chosen port is published to `<workspace>/channel.port`
+   token. The chosen port is published to `<workspace>/state/channel.port`
    (mode `0o600`) so the TUI and spawned sidecars discover it without
    a config roundtrip. The listener hosts a single
    `GET /v1/channel-ws` endpoint that upgrades authed requests to a
@@ -38,9 +38,9 @@ intercepts `Commands::Gateway` in `src/main.rs` before the CLI dispatcher
 and routes it to `src/gateway_cmd.rs` — same pattern as `Commands::Tui`.
 
 Configuration lives in `aura_config::GatewayConfig` (a new section on
-`AuraConfig`). The stub `HttpChannelConfig` at
-`crates/config/src/channels.rs:60` is kept for one release for backwards
-compatibility but is no longer read; the gateway owns its own settings.
+`AuraConfig`). The stub `HttpChannelConfig` is kept for one release for
+backwards compatibility but is no longer read; the gateway owns its own
+settings.
 
 ## Design Decisions
 
@@ -117,7 +117,7 @@ a defence against a same-UID hostile process.
 
 *Designed to reject*
 - connections from a different Unix user — the libsql vault file is
-  `0o600` and `<workspace>/channel.port` is also `0o600`, so another
+  `0o600` and `<workspace>/state/channel.port` is also `0o600`, so another
   UID can't even locate the listener's port, let alone read the
   freshly-rotated TUI token;
 - cross-workspace mix-ups — every workspace has its own libsql
@@ -353,7 +353,7 @@ development still compiles.
 slow, so for UI iteration run the two sides separately:
 
 ```bash
-# terminal 1 — debug gateway, admin listener on 127.0.0.1:8889
+# terminal 1 — debug gateway, admin listener on 127.0.0.1:8888
 cargo run -- gateway start
 
 # terminal 2 — Vite dev server with HMR on http://localhost:5173
@@ -361,7 +361,7 @@ cd web && npm run dev
 ```
 
 `web/vite.config.ts` proxies `/v1`, `/healthz`, and `/readyz` to
-`127.0.0.1:8889`, so the browser only talks to the Vite origin. This
+`127.0.0.1:8888`, so the browser only talks to the Vite origin. This
 avoids the CORS path entirely — `AdminAuthProvider` keeps `baseUrl =
 window.location.origin` (the Vite origin), and bearer-token auth
 still works end-to-end because the proxy forwards the `Authorization`
@@ -446,10 +446,10 @@ returns `UnknownCommand` from the normal dispatcher because
 
 The handler lives in `src/gateway_cmd.rs` and uses the `boot::` helpers
 to build a throwaway `SecretVault` when a subcommand needs it. `start`
-is currently a stub that returns an informative error pointing at
-`docs/modules/gateway.md` — the long-lived server boot is pending the
-runtime extraction tracked in the follow-up todo
-(`docs/todo/gateway-runtime-extraction.md`).
+acquires the per-workspace singleton, opens the vault to read the admin
+token and mint a fresh TUI token, builds the manager graph via
+`runtime::build_managers` + `wire_router`, binds the admin and channel
+listeners, and drives them under a shared `ShutdownSignal`.
 
 ## HTTP API
 
@@ -486,6 +486,10 @@ GET    /v1/skills
 GET    /v1/tools
 GET    /v1/channels                     read-only registry list
 GET    /v1/llm
+
+GET    /v1/analytics                    aggregated tokens / cost / sessions over a time range
+GET    /v1/logs                         paged snapshot from LogBuffer
+GET    /v1/logs/stream                  SSE tail of the same buffer
 
 GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin surface
 ```
@@ -544,10 +548,10 @@ endpoints return `400 Bad Request`.
 ## Runtime Assembly
 
 `start` builds the full manager graph — `SessionManager`,
-`JobManager`, `CronScheduler`, `MemoryManager`, `TraceStore`,
+`JobLifecycle`, `CronScheduler`, `MemoryManager`, `TraceStore`,
 `SecurityGateway`, `SkillRegistry`, `ToolRegistry`, `ToolExecutor`,
 `SkillAssessor`, `LlmClient`, `WorkspaceManager`, `LeakDetector`,
-`ChannelRegistry`, `CostTracker` — plus a `ShutdownSignal` and a
+`ChannelRegistry`, `CostManager` — plus a `ShutdownSignal` and a
 `TaskTracker` for graceful teardown. The wiring lives in
 `src/runtime.rs`:
 
@@ -568,7 +572,7 @@ holds no manager graph of its own. The gateway builds a
 and a second loopback `TcpListener` (127.0.0.1:0) for the channel
 WS, and drives them in parallel with the router via `tokio::select!`
 on `shutdown.wait`. The channel listener publishes its chosen port
-to `<workspace>/channel.port` (mode `0o600`) and the file is
+to `<workspace>/state/channel.port` (mode `0o600`) and the file is
 unlinked on shutdown (plus a `Drop` guard covers panic exits).
 `graph.channels_registry` starts empty at boot — every
 registered channel (including the bundled TUI) arrives later as a
@@ -591,7 +595,7 @@ subcommands use it for the same reason.
   never echo header values.
 - **Channel listener is loopback + same-UID.** The listener binds
   `127.0.0.1:0` and publishes the chosen port to
-  `<workspace>/channel.port` at mode `0o600`, so a different local
+  `<workspace>/state/channel.port` at mode `0o600`, so a different local
   user can't even discover the port. The vault-token layer above is
   a *workspace binding*, not a defence against same-UID hostile
   processes — see the threat-model note under "Channel auth" for the
@@ -642,7 +646,7 @@ crates/gateway/
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
 │   │   └── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
-│   │       └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm}.rs
+│   │       └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm,analytics,logs}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start

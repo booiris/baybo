@@ -196,9 +196,9 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 
 ## Constraints
 
-- Depends only on `registry`
+- Depends on `aura-model` and `aura-tools`
 - Does not call `llm` or execute tools directly
-- Does not install extensions (that's `registry`)
+- Does not install extensions
 - Every skill execution must record `skill_name`, `skill_version`, `source`, `trust_level` in Trace
 
 ## Collaboration
@@ -207,7 +207,6 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 |--------|------|
 | `agent` | `AgentLoop` calls `SkillRegistry.select()` and executes skills |
 | `tools` | Skills declare allowed tool sets but don't execute tools directly. The `Skill` builtin (registered from `aura-skills::tools`, parallel to `aura-cron::tools`) is the LLM's single entry point for invoking them. |
-| `registry` | Supplies source, version, and hash metadata for installed skills |
 | `trace` | Records skill version, source, and execution results |
 | `workspace` | Provides trusted local skill directories for hot reload |
 

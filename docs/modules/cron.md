@@ -1,8 +1,8 @@
-# cron - Cron Job Domain Types
+# cron - Cron Jobs and Scheduler
 
 ## Overview
 
-The `cron` crate defines domain types for scheduled recurring work: `CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `TriggerAction`, `ExecutionStatus`, and `CronError`. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs.
+The `cron` crate owns scheduled recurring work end-to-end: domain types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`, `CronError`), the `CronScheduler` (`scheduler.rs`) that ticks them, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and the LLM-invocable cron tools exposed by `agent_tools` (`tools.rs`). It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. `aura-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
 
 CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Each fire mints a brand-new session in the agent layer — one trigger = one session — so the run sees a clean transcript and fresh `SessionState`. A `CronJob` also records its `origin_session_id` — the session that created it — purely for traceability; trigger-time session creation is unaffected.
 
@@ -26,31 +26,30 @@ Each `CronJob` carries an IANA `timezone` field (e.g. `"Asia/Shanghai"`, `"UTC"`
 
 ### Schedule as a typed enum
 
-The `schedule` field is `CronSchedule`, a tagged enum with two variants: `Cron { expr: String }` for recurring jobs and `At { time: DateTime<Utc> }` for one-shot jobs. The variant alone determines recurrence — there is no separate "run mode". Cron-expression parsing and validation happen at creation time in `CronScheduler` (in the `agent` crate), not at the type level.
+The `schedule` field is `CronSchedule`, a tagged enum with two variants: `Cron { expr: String }` for recurring jobs and `At { time: DateTime<Utc> }` for one-shot jobs. The variant alone determines recurrence — there is no separate "run mode". Cron-expression parsing and validation happen at creation time in `CronScheduler`, not at the type level.
 
-### Trigger action: `Prompt` only
+### Trigger payload: prompt only
 
-`TriggerAction` is a tagged enum (`#[serde(tag = "kind")]`) with a single `Prompt { prompt }` variant — every fire feeds `prompt` through the full agent loop, and the LLM decides what tools (if any) to invoke. The enum shape is preserved (rather than collapsed to a bare string) so the wire format is stable and future trigger modes can be added without re-shaping every persisted row. The same enum is stored on `CronExecution` as an immutable snapshot of what was actually executed at fire time.
+`CronJob` carries `prompt: String` directly — every fire feeds `prompt` through the full agent loop and the LLM decides what tools (if any) to invoke. `CronExecution` records the same `prompt` as an immutable snapshot of what was actually executed at fire time.
 
-### Domain crate, not business logic
+### LLM-invocable cron tools
 
-Like `aura-job` and `aura-session`, this crate only defines types and errors. The scheduler/manager business logic lives in `aura-agent::cron::CronScheduler`.
+`agent_tools` (`crates/cron/src/tools.rs`) returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` `Tool` implementations. They live here (rather than in `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot pull in `aura-cron` without creating a circular dependency.
 
 ### Storage decoupling
 
-The `CronStore` trait in `storage` operates on opaque row types (`CronJobRow`, `CronExecutionRow`) with string fields — it does not depend on this crate. The `data` column holds a JSON blob that only `agent::cron` knows how to serialize/deserialize. The agent layer bridges between domain types and storage rows via conversion functions.
+The `CronStore` trait in `storage` operates on opaque row types (`CronJobRow`, `CronExecutionRow`) with string fields — it does not depend on this crate. The `data` column holds a JSON blob that only `aura-cron` knows how to serialize/deserialize.
 
 ## Constraints
 
-- No dependencies on `agent`, `storage`, or other business crates
-- Depends only on: `aura-model` (for `ChannelType`, `ApprovedResource`, `HostPattern`), `chrono`, `serde`, `thiserror`, `anyhow`
-- Does not schedule or execute anything
+- No dependency on `agent`
+- Depends on: `aura-model`, `aura-storage`, `aura-tools`, `chrono`, `chrono-tz`, `cron`, `tokio`, `parking_lot`, `serde`, `serde_json`, `uuid`, `async-trait`, `thiserror`, `anyhow`, `tracing`
 
 ## Collaboration
 
 | Module | Role |
 |--------|------|
-| `storage` | `CronStore` trait persists opaque row types (`CronJobRow`, `CronExecutionRow`) |
-| `agent` | `CronScheduler` manages lifecycle, converts between domain and row types, runs background tick loop, fires triggers |
-| `agent::router` | Consumes `CronTriggerEvent`, resolves sessions, routes `AgentMessage::CronTrigger` to actors |
+| `storage` | `CronStore` trait persists opaque row types (`CronJobRow`, `CronExecutionRow`); `CronScheduler` consumes it |
+| `tools` | `CronCreateTool` / `CronDeleteTool` / `CronListTool` implement `aura_tools::Tool` so the agent registry can dispatch them |
+| `agent` | Re-exports `CronScheduler` / `CronTriggerEvent`; `Router` consumes the event stream, resolves sessions, and routes `AgentMessage::CronTrigger` to actors |
 | `job` | `OperationKind::CronExecution` tracks cron-triggered operations |

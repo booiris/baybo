@@ -19,8 +19,10 @@ What the crate provides:
   and the permissive "host RW + denylist" model used by `BashTool`.
 - `cfg`-free `args.rs` that renders the bwrap argv and the SBPL profile,
   so spec → invocation is unit-testable on any developer host.
-- A `bootstrap::probe()` entry point so callers (the gateway) can detect a
-  missing backend at startup and react cleanly.
+- An `aura_sandbox::probe()` entry point so callers (the gateway) can detect
+  a missing backend at startup and react cleanly. The `bootstrap` module
+  exports the `SandboxAvailability` struct that `probe()` returns; the
+  function itself sits at the crate root.
 
 What gets wrapped:
 
@@ -265,7 +267,7 @@ workspace_root" check, since the writable surface is now wider than
 build time so bwrap never sees a `--tmpfs <missing>` line.
 
 Default Bash denylist (built by
-`crate::tool_executor::default_sensitive_denylist`):
+`aura_sandbox::default_sensitive_denylist`):
 
 - `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg` — credentials and keys
 - `~/.config/gh`, `~/.config/gcloud` — cloud CLI tokens
@@ -396,7 +398,7 @@ backend binary is absent.
 |--------------|-----------------------------------------------------------------------------------------------|
 | `tools`      | Defines `ExecSandbox` trait + `SandboxedOutput` and adds `sandbox` / `workspace_root` to `ToolContext`. `BashTool` opts in to routing.   |
 | `agent`      | Builds `SandboxAdapter` per call; passes the runner into `ToolExecutor::new`; refuses ExecCommand tools when no runner is configured. |
-| `security`   | The decision layer (e.g. `NetworkPolicyDecider`, when added) sits above the sandbox; the sandbox is the enforcement layer that makes the decision real. |
+| `security`   | Hosts the decision-layer primitives (SSRF resolution in `WebFetch::validate_url_with`, leak detection, secret vault). The sandbox is the enforcement layer that makes those decisions real for ExecCommand tools. |
 | `bootstrap`  | `src/runtime.rs` calls `current_platform_runner()` at startup and threads the result into `ToolExecutor`.                              |
 
 ## Deferred (post-v1)

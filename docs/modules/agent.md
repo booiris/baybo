@@ -8,10 +8,10 @@ Core responsibilities:
 
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
-- **Business logic managers**: `SessionManager`, `MemoryManager`, `TraceCollector`, `JobManager`, `SecretVault`, `SecurityGateway` — all domain managers live here
+- **Business logic managers**: `SessionManager`, `MemoryManager`, `SpanRecorder`, `JobLifecycle`, `SecretVault`, `SecurityGateway` — all domain managers live here
 - **Long-running execution**: cron scheduling, background notifications
-- **Unified observability**: wrapping Job, Trace, and Cost through `ObservabilityRecorder`
-- **Cost management**: `CostTracker` for recording, `CostGuard` for spending limits (in `agent::cost`)
+- **Unified observability**: `SpanRecorder` (Step / Span / SpanEvent) and `JobLifecycle` (Job state machine)
+- **Cost management**: `CostManager` records LLM-call cost and gates spend; `CostGuardError`, `CostMetrics`, `SpendingLimits` round out `agent::cost`
 - **Runtime logic**: error recovery, timeout control
 
 It does not own low-level storage or backend implementation — it consumes Store traits from `storage` through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
@@ -27,16 +27,13 @@ One Actor per session: natural serialization within a session (no context races)
 1. Build system prompt, Soul, identity injection from `workspace` — `Soul` reads the three identity files (`profile/{SOUL,USER,IDENTITY}.md`) once here and bakes them into a single `system_prompt` `String`. Mid-session writes (e.g. via the `UpdateProfile` tool) are **not** picked up by this session; see [`docs/todo/profile-hot-reload.md`](../todo/profile-hot-reload.md).
 2. Recall long-term memory
 3. Append current user message to Context
-4. Skill selection (derived from `SkillRegistry::select`):
-   - An exact `/<cmd>` message returns just that one skill; any other message returns the full registered set. No scoring or mention-scanning happens — narrowing is handled upstream by the slash-equality check, not by heuristic ranking.
-   - Every returned candidate runs through `SkillAssessor` (`aura-skills-assessor`). `Dangerous` verdicts drop the skill *and* emit `AgentOutput::Notice { level: Error }`; `Suspicious` verdicts keep the skill and emit `Notice { level: Warn }`; `Safe` verdicts pass silently.
-   - Admitted skills have their `prompt_template` rendered via `aura_skills::render::render_skill_block` and injected as a system message, their names recorded on `session.state.active_skills`, and their `allowed_tools` unioned into this turn's tool ceiling.
+4. Skill selection (`AgentLoop::invocable_skills`): `SkillRegistry::all_summaries_sorted()` filtered by `agent_invocable && trust_level != Untrusted`. Risk assessment fires later, inside `SkillTool` at invocation time (see `crates/skills/src/tools.rs`), not during selection. Selected skill names are recorded on `session.state.active_skills`; when the set has changed since last turn the full list is rebroadcast as a `Role::User` skill reminder before the user message.
 5. Loop: `maybe_compress()` → build `ChatRequest` → call `LlmClient` → parse response → dispatch tool execution
 6. Emit `OutgoingMessage` and persist Job, Trace, and Cost state
 
-### ObservabilityRecorder lock strategy
+### SpanRecorder lock strategy
 
-`ObservabilityRecorder` exposes short-lived `begin/succeed/fail`. `AgentLoop` and `ToolExecutor` must never hold locks while waiting for LLM calls or tool execution.
+`SpanRecorder` exposes short-lived `begin/succeed/fail`. `AgentLoop` and `ToolExecutor` must never hold locks while waiting for LLM calls or tool execution.
 
 ### ToolExecutor responsibility
 
@@ -72,10 +69,7 @@ Parallel tool calls within a turn each go through the gate independently; the ga
 
 Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentSupervisor` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; sessions are resolved dynamically at trigger time.
 
-`AgentMessage::CronTrigger` carries a `TriggerAction` (from `aura-cron`). The `AgentActor` branches on the variant:
-
-- `TriggerAction::Prompt { prompt }` — dispatches `prompt` through the normal `AgentLoop` path.
-- `TriggerAction::ToolCall { tool_name, params, approved_resources }` — the actor invokes `ToolExecutor::execute` directly with the pre-approved resources seeded into the approval-gate snapshot. The `ToolOutput` is emitted as an `AgentOutput::Message`. If the direct call fails, the actor synthesizes a diagnostic prompt and falls back to `dispatch_prompt` so the LLM can explain the failure to the user. This requires `AgentActor` to hold an `Arc<ToolExecutor>` alongside its other dependencies.
+`AgentMessage::CronTrigger { job_id, prompt }` carries the cron job id and the prompt string directly. `AgentActor` dispatches `prompt` through `dispatch_prompt` with `JobInput::Cron`, which runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke.
 
 ### LLM-invocable cron tools
 
@@ -87,7 +81,7 @@ Not implemented yet — see `docs/modules/job.md` "Restart recovery" and `docs/m
 
 ### Router's upstream responsibilities
 
-Before a message enters an actor, Router completes: session identification/creation, user-level rate limiting, quota check via `CostGuard`, select/create target `AgentActor`.
+Before a message enters an actor, Router completes: session identification/creation, user-level rate limiting, quota check via `CostManager::check`, select/create target `AgentActor`.
 
 ### Actor-side slash commands
 
@@ -107,13 +101,13 @@ Before a message enters an actor, Router completes: session identification/creat
 | `llm` | `AgentLoop` initiates model calls |
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
-| `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager` |
+| `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager`; session domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
 | `workspace` | Identity files for system prompt |
-| `cron` | Provides `CronJob`, `CronExecution` domain types; `CronScheduler` in agent manages lifecycle, converts between domain and storage row types |
+| `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |
 | `job` | Provides domain types (`Job`, `JobStatus`, `JobKind`) used by `agent::job::JobLifecycle` |
-| `trace` | Provides domain types and tree/fork utilities used by `agent::trace::TraceCollector` |
-| `session` | Provides domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
+| `trace` | Provides domain types and tree/fork utilities used by `agent::trace::SpanRecorder` |
+| `session` | Provides `SessionManager` and its error type (domain types live in `aura-model`) |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |
 | `storage` | Provides all Store traits and libsql implementations; injected into managers |
