@@ -1,25 +1,20 @@
-//! End-to-end coverage for the `SummaryAwareWrapper` fast-path when
-//! it is wired into the live agent loop the way the production
-//! runtime wires it.
+//! End-to-end coverage for the compressor's fast-path stage when it
+//! is wired into the live agent loop the way the production runtime
+//! wires it.
 //!
-//! Drives the harness with the wrapper installed as the compression
-//! strategy, pre-seeds a `summary.md` + cursor metadata after the
-//! first turn lands real `session_messages` rows, then sends a second
-//! turn that crosses the compression budget. The fast-path must skip
-//! the inner Summarize's chat callback entirely — proven by absence
+//! Drives the harness with an `FsSummaryLoader` pointing at a
+//! per-test tempdir, pre-seeds a `summary.md` + cursor metadata after
+//! the first turn lands real `session_messages` rows, then sends a
+//! second turn that crosses the compression budget. The fast-path
+//! must skip the live LLM-summary stage entirely — proven by absence
 //! of `SUMMARIZE_INSTRUCTION` in any captured `ChatRequest`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use aura_context::{
-    CompressionStrategy, FsSummaryLoader, SUMMARIZE_INSTRUCTION, Summarize, SummaryAwareWrapper,
-    SummaryLoader, TiktokenTokenizer, Tokenizer, budget::TokenBudget,
-};
+use aura_context::{SUMMARIZE_INSTRUCTION, budget::TokenBudget};
 use aura_integration_tests::AgentTestHarness;
 use aura_llm::{StreamEvent, TokenUsage};
 use aura_model::ContentBlock;
-use aura_skills::SkillRegistry;
 use chrono::Utc;
 use tempfile::TempDir;
 
@@ -60,32 +55,10 @@ async fn fast_path_skips_chat_callback_when_summary_md_present() {
     // threshold=0.05 (= 20 tokens), even a short reply pushes us over.
     let budget = TokenBudget::new(400, 0.05);
 
-    // Captured by the factory closure: we need the same skill
-    // registry the harness's ContextManager will see, the harness's
-    // tokenizer (model id matches `StubLlm::default()`), and the
-    // session id from the harness's default `SessionBuilder`.
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(TiktokenTokenizer::for_model("stub-model"));
-    let registry = Arc::new(SkillRegistry::new());
-    let session_id = aura_model::SessionId::from("sess-it");
-    let max_tokens = budget.max_tokens();
-
-    let summary_root_for_factory = summary_root_path.clone();
     let mut harness = AgentTestHarness::builder()
         .with_token_budget(budget)
-        .with_compression_strategy_factory(Box::new(move |session_manager| {
-            let inner: Box<dyn CompressionStrategy> = Box::new(Summarize::new(2));
-            let loader: Arc<dyn SummaryLoader> =
-                Arc::new(FsSummaryLoader::new(summary_root_for_factory.clone()));
-            Box::new(SummaryAwareWrapper::new(
-                inner,
-                loader,
-                Arc::clone(session_manager),
-                Arc::clone(&registry),
-                Arc::clone(&tokenizer),
-                session_id.clone(),
-                max_tokens,
-            ))
-        }))
+        .with_summary_state_dir(summary_root_path.clone())
+        .with_keep_recent(2)
         .build();
 
     // --- Turn 1 ---------------------------------------------------------

@@ -37,10 +37,7 @@ use aura_agent::{
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
-use aura_context::{
-    CompressionStrategy, ContextManager, FsSummaryLoader, Summarize, SummaryAwareWrapper,
-    SummaryLoader, TiktokenTokenizer, Tokenizer,
-};
+use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use aura_llm::GuardedLlm;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -681,44 +678,26 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // actor itself.
                 let actor_token = parent_token.child_token();
 
-                // Compose the compression strategy: the
-                // `SummaryAwareWrapper` fast-path consumes precomputed
-                // `summary.md` files written by the background
-                // refresh runner; on any miss (no metadata, file
-                // absent, cursor stale, totals over budget) it
-                // delegates to the inner `Summarize`. Without this
-                // wiring the background passes still run and bill
-                // LLM, but their output is never consulted on the
-                // hot path. See `docs/background-compression.md`.
-                let summary_loader: Arc<dyn SummaryLoader> = Arc::new(FsSummaryLoader::new(
-                    workspace_paths_arc.state_sessions_dir(),
-                ));
-                let inner_strategy: Box<dyn CompressionStrategy> =
-                    Box::new(Summarize::new(keep_recent));
-                let strategy: Box<dyn CompressionStrategy> = Box::new(SummaryAwareWrapper::new(
-                    inner_strategy,
-                    summary_loader,
-                    Arc::clone(&sessions),
-                    Arc::clone(&skill_registry),
-                    Arc::clone(&tokenizer),
-                    session.id.clone(),
-                    token_budget.max_tokens(),
-                ));
-
+                // `summary_state_dir` connects the compressor's
+                // fast-path to the background refresh runner's output.
+                // Without it the background passes still run and bill
+                // LLM, but their summaries never reach the hot path.
+                // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_client: llm_client.clone(),
                     tool_registry: Arc::clone(&tool_registry),
                     skill_registry: Arc::clone(&skill_registry),
                     tool_executor: Arc::clone(&tool_executor),
-                    context_manager: ContextManager::new(
-                        Arc::clone(&tokenizer),
-                        strategy,
-                        token_budget.clone(),
-                        Arc::clone(&token_calibration),
-                        Arc::clone(&skill_registry),
-                        session.id.clone(),
-                        Arc::clone(&sessions),
-                    ),
+                    context_manager: ContextManager::from_config(ContextManagerConfig {
+                        tokenizer: Arc::clone(&tokenizer),
+                        summary_state_dir: workspace_paths_arc.state_sessions_dir(),
+                        keep_recent,
+                        budget: token_budget.clone(),
+                        calibration: Arc::clone(&token_calibration),
+                        skill_registry: Arc::clone(&skill_registry),
+                        session_id: session.id.clone(),
+                        sessions: Arc::clone(&sessions),
+                    }),
                     memory_manager: Arc::clone(&memory_manager),
                     policy: policy.clone(),
                     soul: Soul::custom(system_prompt.clone()),

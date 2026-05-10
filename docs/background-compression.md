@@ -1,6 +1,6 @@
 # Background Compression — Design
 
-A cross-cutting feature that runs the existing compression operation in a second, **background** mode in addition to the original **inline** one. The inline path (`ContextManager::maybe_compress`, driven by the `Summarize` strategy) blocks the user's turn for one synchronous LLM round-trip whenever the budget threshold trips. The background path (a maintenance actor running between turns) precomputes the same kind of summary asynchronously and persists it per-session; at compression time `SummaryAwareWrapper` swaps it into the output deterministically, so the inline LLM call is skipped whenever the precomputed summary is available. Both paths share `compression::CompressionRunner` for the actual LLM dispatch (cost / span attribution differs by which session / user the call is billed against).
+A cross-cutting feature that runs the existing compression operation in a second, **background** mode in addition to the original **inline** one. The inline path (`ContextManager::maybe_compress`'s 3-stage compressor — summary.md fast-path → live LLM summary → truncate fallback) blocks the user's turn for one synchronous LLM round-trip whenever the budget threshold trips and stage 1 misses. The background path (a maintenance actor running between turns) precomputes the summary asynchronously and persists it per-session; at compression time the inline compressor's stage-1 fast-path swaps it into the output deterministically, so the inline LLM call is skipped whenever the precomputed summary is available. Both paths share `compression::CompressionRunner` for the actual LLM dispatch (cost / span attribution differs by which session / user the call is billed against).
 
 Affected crates: `aura-model`, `aura-storage`, `aura-session`, `aura-context`, `aura-agent`, `aura-workspace`.
 
@@ -8,7 +8,7 @@ See also: [`docs/modules/context.md`](modules/context.md), [`docs/modules/sessio
 
 ## Goal
 
-Quality-first, latency-second. Today's `Summarize` strategy fires synchronously inside the agent loop, blocking the user's turn for one LLM round-trip every time the budget threshold trips. The new design moves summary generation to a background path so:
+Quality-first, latency-second. Without precomputed summaries, the compressor's stage-2 LLM call fires synchronously inside the agent loop, blocking the user's turn for one LLM round-trip every time the budget threshold trips. The new design moves summary generation to a background path so:
 
 1. **Quality**: each summary pass refines the previous one with full transcript access; terminology stays consistent across passes; detail can grow as conversation accumulates.
 2. **Latency**: at compression time, the parent assembles `[system + summary + recent + skill_trailer]` from the precomputed `summary.md` — no LLM call on the hot path.
@@ -22,9 +22,11 @@ Parent session (TriggerKind::User|Cron)
   AgentActor → AgentLoop
     ├─ end-of-iteration check  ──→ maybe spawn BackgroundCompressionRunner
     ├─ end-of-job check        ──→ maybe spawn BackgroundCompressionRunner
-    └─ compress_if_needed → SummaryAwareWrapper (CompressionStrategy)
-                              ├─ fast-path: load summary.md → assemble → return
-                              └─ fall-through: inner Summarize (existing)
+    └─ compress_if_needed → ContextManager::run_compression_flow
+                              ├─ stage 1: load summary.md → assemble → return
+                              ├─ pre-flight gate: NoOp if non_system ≤ keep_recent
+                              ├─ stage 2: live LLM summary
+                              └─ stage 3: truncate fallback (LLM error/empty)
 
 BackgroundCompressionRunner (TriggerKind::System, LineageKind::SystemMaintenance)
   fresh AgentActor per pass → bypasses agent_loop.run → dedicated handler:
@@ -119,9 +121,9 @@ fire_summary = tokens_now > 0.5 × max_tokens                  (a)
 
 | Compression kind | New anchor |
 |---|---|
-| Fast-path (`SummaryAwareWrapper`) | `system.len() + 1 (summary blob) = recent slice start index` |
-| Full `Summarize` | `system.len() + 1 (summary blob)` (no recent slice) |
-| `Truncate` | `min(prev_anchor, new_messages.len())` |
+| Stage 1 fast-path (summary.md hit) | `system.len() + 1 (summary blob) = recent slice start index` |
+| Stage 2 LLM summary | `system.len() + 1 (summary blob)` (no recent slice) |
+| Stage 3 truncate fallback | `min(prev_anchor, new_messages.len())` |
 
 `tool_calls_since_anchor` measures `ToolUse` blocks in `messages[anchor..]`. Fresh-installed and post-compression turns both legitimately accumulate beyond the anchor.
 
@@ -222,22 +224,11 @@ No explicit "Shutdown the maintenance children" step is required — and no per-
 
 `error_count` is **telemetry only** — it does not gate future triggers. Acceptable cost: a persistent failure burns one LLM call per trigger event until conditions self-resolve.
 
-## SummaryAwareWrapper (compression-time path)
+## Compressor stage 1 (summary.md fast-path)
 
-### Construction
+The fast-path lives as a private `try_summary_fast_path` method on `ContextManager` (see `crates/context/src/compressor.rs`). It uses the manager's existing fields — `summary_loader: FsSummaryLoader`, `sessions: Arc<SessionManager>`, `skill_registry: Arc<SkillRegistry>`, `session_id: SessionId`, `tokenizer: Arc<dyn Tokenizer>`, plus `budget.max_tokens()` for the fall-through threshold.
 
-```rust
-pub struct SummaryAwareWrapper {
-    inner: Box<dyn CompressionStrategy>,    // typically Summarize
-    summary_loader: Arc<dyn SummaryLoader>,
-    skill_registry: Arc<SkillRegistry>,
-    session_id: SessionId,
-}
-```
-
-Trait signature unchanged (χ-1: wrapper holds session_id internally).
-
-### `compress` body
+### Body
 
 0. **Wait for in-flight settle** (mirrors Claude Code's `waitForSessionMemoryExtraction`): poll `session_summaries.in_flight` for up to `SUMMARY_REFRESH_WAIT_TIMEOUT` (15s, see [Configuration](#configuration)) at `SUMMARY_REFRESH_WAIT_POLL_INTERVAL` (250ms). If a background pass lands during the wait, the next step picks up the fresher cursor; on timeout the wrapper proceeds with whatever metadata is on file (stale-by-one tolerated). Bounded so a stuck refresh can't block a user turn indefinitely.
 1. Load `session_summaries` row + `summary.md` content for `session_id`.
@@ -261,7 +252,7 @@ Trait signature unchanged (χ-1: wrapper holds session_id internally).
    [user(<context-summary>...summary content...</context-summary>)]
    [recent slice]
    ```
-6. Return `CompressOutput::Replaced { messages, replaced_full_history: true }` — `ContextManager::run_compression` (`crates/context/src/lib.rs:410`) auto-attaches the skill trailer at the end (σ-A).
+6. Return `CompressOutput::Replaced { messages, summarized: true }` — `ContextManager::run_compression` (`crates/context/src/lib.rs:410`) auto-attaches the skill trailer at the end (σ-A).
 
 ### Final transcript after fast-path apply
 
@@ -275,7 +266,7 @@ Trait signature unchanged (χ-1: wrapper holds session_id internally).
 
 ### Fall-through cases
 
-Any of the following → `self.inner.compress(messages, chat)`:
+Any of the following → fall through to stage 2 (LLM summary) / stage 3 (truncate fallback):
 - summary.md missing (first compression on a session)
 - supersede-log lookup fails or its active count disagrees with `messages.len()`
 - the cursor ordinal isn't in the active log (compaction has rewritten it)
@@ -283,11 +274,11 @@ Any of the following → `self.inner.compress(messages, chat)`:
 - assembled `summary + recent_slice + skill_trailer` exceeds 0.6 × max_tokens
 - file read / parse error
 
-The first compression on every session pays a one-time synchronous-Summarize latency cost; subsequent compressions use the fast-path.
+The first compression on every session pays a one-time synchronous-LLM-summary latency cost; subsequent compressions use the fast-path.
 
 ### `force_compress` (`/compact`)
 
-`force_compress` always **bypasses the wrapper's fast-path** and goes straight to the inner `Summarize` (τ-1). User-typed `/compact` is a deliberate quality signal — not amortized cost.
+`force_compress` runs the same 3-stage flow but skips the budget threshold gate. The fast-path stage still applies when summary.md is fresh, so a user-typed `/compact` after a successful background pass reuses the cached summary instead of burning a fresh LLM call.
 
 ## Race / Concurrency Handling
 

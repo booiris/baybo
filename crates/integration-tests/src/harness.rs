@@ -8,6 +8,7 @@
 //! reach into post-run state without re-wiring anything.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,9 +20,7 @@ use aura_agent::{
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
-use aura_context::{
-    CompressionStrategy, ContextManager, TiktokenTokenizer, Truncate, budget::TokenBudget,
-};
+use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, budget::TokenBudget};
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmCompletion, ModelPricing};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
@@ -64,8 +63,7 @@ pub struct AgentTestHarness {
     pub token_calibration: Arc<aura_context::TokenCalibration>,
     /// Session manager backing the wired `ContextManager`. Exposed so
     /// tests can pre-seed session messages or summary metadata before
-    /// driving the agent loop (e.g. `SummaryAwareWrapper` fast-path
-    /// e2e coverage).
+    /// driving the agent loop (e.g. compressor fast-path e2e coverage).
     pub session_manager: Arc<aura_agent::SessionManager>,
     pub mailbox: mpsc::Sender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
@@ -163,18 +161,10 @@ pub struct AgentTestHarnessBuilder {
     tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
     spending_limits: SpendingLimits,
     pricing: HashMap<String, ModelPricing>,
-    compression_strategy: Option<Box<dyn CompressionStrategy>>,
-    compression_strategy_factory: Option<CompressionStrategyFactory>,
+    summary_state_dir: Option<PathBuf>,
+    keep_recent: Option<usize>,
     token_budget: Option<TokenBudget>,
 }
-
-/// Factory that builds the harness's compression strategy after the
-/// `SessionManager` has been constructed. Use when the strategy needs
-/// a handle to the same manager the wired `ContextManager` will see —
-/// e.g. `SummaryAwareWrapper` reads `session_summaries` and the
-/// supersede log to map its cursor.
-pub type CompressionStrategyFactory =
-    Box<dyn FnOnce(&Arc<aura_agent::SessionManager>) -> Box<dyn CompressionStrategy>>;
 
 impl Default for AgentTestHarnessBuilder {
     fn default() -> Self {
@@ -186,8 +176,8 @@ impl Default for AgentTestHarnessBuilder {
             tools: Vec::new(),
             spending_limits: SpendingLimits::default(),
             pricing: HashMap::new(),
-            compression_strategy: None,
-            compression_strategy_factory: None,
+            summary_state_dir: None,
+            keep_recent: None,
             token_budget: None,
         }
     }
@@ -237,25 +227,17 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Override the context compression strategy (default: `Truncate(50)`).
-    /// Use to drive `Summarize`-path tests with a stub `SummarizeCallback`.
-    pub fn with_compression_strategy(mut self, strategy: Box<dyn CompressionStrategy>) -> Self {
-        self.compression_strategy = Some(strategy);
+    /// Override the directory the compressor's fast-path reads
+    /// `<dir>/<session_id>/summary.md` from. Default: a non-existent
+    /// path so the fast-path always falls through.
+    pub fn with_summary_state_dir(mut self, dir: PathBuf) -> Self {
+        self.summary_state_dir = Some(dir);
         self
     }
 
-    /// Late-bind the compression strategy: the closure runs inside
-    /// `build()` after the harness's `SessionManager` is constructed,
-    /// receiving an `Arc` to it. Use when the strategy needs to share
-    /// that same manager — e.g. `SummaryAwareWrapper` reads
-    /// `session_summaries` and the supersede log to map its cursor.
-    /// Mutually exclusive with `with_compression_strategy`; when both
-    /// are set the factory wins.
-    pub fn with_compression_strategy_factory(
-        mut self,
-        factory: CompressionStrategyFactory,
-    ) -> Self {
-        self.compression_strategy_factory = Some(factory);
+    /// Override `keep_recent` (default: 50).
+    pub fn with_keep_recent(mut self, keep_recent: usize) -> Self {
+        self.keep_recent = Some(keep_recent);
         self
     }
 
@@ -343,9 +325,12 @@ impl AgentTestHarnessBuilder {
         // `TokenCalibration` keys observe and adjust identically.
         let stub_model_id = stub_llm.model_info().id.clone();
         let tokenizer = Arc::new(TiktokenTokenizer::for_model(&stub_model_id));
-        let strategy = self
-            .compression_strategy
-            .unwrap_or_else(|| Box::new(Truncate::new(50)));
+        // Non-existent path → loader returns Ok(None) → fast-path
+        // falls through. No tempdir to clean up.
+        let summary_state_dir = self
+            .summary_state_dir
+            .unwrap_or_else(|| PathBuf::from("/nonexistent-aura-it-summary-dir"));
+        let keep_recent = self.keep_recent.unwrap_or(50);
         let token_budget = self
             .token_budget
             .unwrap_or_else(|| TokenBudget::new(100_000, 0.95));
@@ -359,23 +344,16 @@ impl AgentTestHarnessBuilder {
             summary_store,
             chrono::Duration::minutes(30),
         ));
-        // Factory takes precedence: it constructs the strategy with a
-        // live handle to the harness's `SessionManager`, which is
-        // necessary for any wrapper that consults the same metadata
-        // tables the rest of the loop writes.
-        let strategy = match self.compression_strategy_factory {
-            Some(factory) => factory(&session_manager),
-            None => strategy,
-        };
-        let context_manager = ContextManager::new(
+        let context_manager = ContextManager::from_config(ContextManagerConfig {
             tokenizer,
-            strategy,
-            token_budget,
-            Arc::clone(&token_calibration),
-            Arc::clone(&skill_registry),
-            session.id.clone(),
-            Arc::clone(&session_manager),
-        );
+            summary_state_dir,
+            keep_recent,
+            budget: token_budget,
+            calibration: Arc::clone(&token_calibration),
+            skill_registry: Arc::clone(&skill_registry),
+            session_id: session.id.clone(),
+            sessions: Arc::clone(&session_manager),
+        });
 
         let soul_text = self
             .soul_prompt
