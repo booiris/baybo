@@ -302,7 +302,11 @@ pub async fn build_managers(
                 .collect();
             loop {
                 let overlay = aura_llm::openrouter::fetch_overlay_for(&entries).await;
-                cm_for_refresh.merge_pricings(overlay);
+                let pricings = overlay
+                    .into_iter()
+                    .map(|(model, (pricing, _caps))| (model, pricing))
+                    .collect();
+                cm_for_refresh.merge_pricings(pricings);
                 tokio::select! {
                     _ = tokio::time::sleep(aura_llm::openrouter::REFRESH_INTERVAL) => {}
                     _ = refresh_shutdown.wait() => break,

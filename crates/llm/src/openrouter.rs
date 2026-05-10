@@ -1,10 +1,18 @@
-//! Bundled OpenRouter pricing snapshot + a one-shot live-fetch path.
+//! Bundled OpenRouter pricing + capability snapshot, plus a one-shot
+//! live-fetch path.
 //!
 //! `CostManager` seeds itself from `LlmProviderRegistry::all_known_pricings()`
 //! at boot. Per-factory `known_pricings()` consults the snapshot below,
 //! so every advertised model attributes spend at the rate OpenRouter
 //! had cached the last time someone ran `scripts/regen-openrouter-pricings.sh`,
 //! not at a flat per-provider guess.
+//!
+//! Each snapshot entry also carries the model's `top_provider`
+//! capability profile (max context window, max completion tokens) and
+//! the multimodal `input_modalities` list. Provider factories consult
+//! [`capabilities_for`] when populating `ModelInfo`, so per-model
+//! context limits and vision support track OpenRouter's catalog
+//! rather than hardcoded per-provider constants.
 //!
 //! At boot the runtime additionally calls [`fetch_overlay_for`] to
 //! pick up any drift since the snapshot was cut, then loops on
@@ -41,9 +49,25 @@ const LIVE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// inside a working day rather than only at the next process restart.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
+/// Modality strings OpenRouter advertises in `architecture.input_modalities`
+/// that imply a model can natively consume image bytes. Anything else
+/// (text, code, embedding-only) falls back to text-only.
+const VISION_INPUT_MODALITIES: &[&str] = &["image"];
+
 #[derive(Debug, Deserialize)]
 struct SnapshotFile {
-    models: HashMap<String, RawPricing>,
+    models: HashMap<String, RawModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawModelEntry {
+    pricing: RawPricing,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +97,50 @@ impl RawPricing {
     }
 }
 
+/// Per-model capability profile harvested from OpenRouter's
+/// `top_provider` and `architecture` blocks. Factories consult this to
+/// populate `ModelInfo.context_window` and `supports_vision` instead of
+/// hardcoded per-provider constants.
+///
+/// Every field is optional so a snapshot row that's missing the data
+/// leaves the factory's fallback in place rather than silently
+/// truncating context to 0 or flipping vision off.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelCapabilities {
+    /// `top_provider.context_length` — the maximum prompt+completion
+    /// the model's primary provider accepts. Used as `ModelInfo.context_window`.
+    pub context_window: Option<usize>,
+    /// `top_provider.max_completion_tokens` — upper bound on a single
+    /// completion. Surfaced separately because `context_window` already
+    /// includes the prompt; a 1M-context model often caps completions
+    /// at ~128k.
+    pub max_completion_tokens: Option<usize>,
+    /// True iff `architecture.input_modalities` advertises an image
+    /// input mode. Other modalities (audio, video, file) imply richer
+    /// multimodal support but the LLM-side dispatch only branches on
+    /// vision today, so we collapse to a single bool.
+    pub supports_vision: Option<bool>,
+}
+
+impl RawModelEntry {
+    fn to_capabilities(&self) -> ModelCapabilities {
+        let supports_vision = if self.input_modalities.is_empty() {
+            None
+        } else {
+            Some(
+                self.input_modalities
+                    .iter()
+                    .any(|m| VISION_INPUT_MODALITIES.contains(&m.as_str())),
+            )
+        };
+        ModelCapabilities {
+            context_window: self.context_length.map(|n| n as usize),
+            max_completion_tokens: self.max_completion_tokens.map(|n| n as usize),
+            supports_vision,
+        }
+    }
+}
+
 fn parse_per_token_to_per_million_micros(s: &str) -> Option<MicroUsd> {
     let v: f64 = s.parse().ok()?;
     if !v.is_finite() || v < 0.0 {
@@ -81,13 +149,29 @@ fn parse_per_token_to_per_million_micros(s: &str) -> Option<MicroUsd> {
     Some(MicroUsd::from_usd_decimal(v * 1_000_000.0))
 }
 
-static SNAPSHOT: LazyLock<HashMap<String, ModelPricing>> =
+#[derive(Debug, Clone, Copy, Default)]
+struct SnapshotEntry {
+    pricing: ModelPricing,
+    capabilities: ModelCapabilities,
+}
+
+static SNAPSHOT: LazyLock<HashMap<String, SnapshotEntry>> =
     LazyLock::new(
         || match serde_json::from_str::<SnapshotFile>(SNAPSHOT_JSON) {
             Ok(raw) => raw
                 .models
                 .into_iter()
-                .filter_map(|(slug, p)| p.to_model_pricing().map(|mp| (slug, mp)))
+                .filter_map(|(slug, entry)| {
+                    let pricing = entry.pricing.to_model_pricing()?;
+                    let capabilities = entry.to_capabilities();
+                    Some((
+                        slug,
+                        SnapshotEntry {
+                            pricing,
+                            capabilities,
+                        },
+                    ))
+                })
                 .collect(),
             Err(e) => {
                 tracing::error!(
@@ -103,7 +187,11 @@ static SNAPSHOT: LazyLock<HashMap<String, ModelPricing>> =
     );
 
 pub(crate) fn snapshot_pricing(slug: &str) -> Option<ModelPricing> {
-    SNAPSHOT.get(slug).copied()
+    SNAPSHOT.get(slug).map(|e| e.pricing)
+}
+
+pub(crate) fn snapshot_capabilities(slug: &str) -> Option<ModelCapabilities> {
+    SNAPSHOT.get(slug).map(|e| e.capabilities)
 }
 
 /// Composes [`slug_for`] + [`snapshot_pricing`] so factories' default
@@ -113,6 +201,13 @@ pub(crate) fn snapshot_pricing(slug: &str) -> Option<ModelPricing> {
 /// default.
 pub(crate) fn pricing_for(provider: &str, model_id: &str) -> Option<ModelPricing> {
     snapshot_pricing(&slug_for(provider, model_id)?)
+}
+
+/// Snapshot capabilities for an Aura `(provider, model_id)` pair.
+/// `None` when the slug isn't OpenRouter-routable or isn't in the
+/// bundled snapshot — caller keeps its hardcoded default.
+pub fn capabilities_for(provider: &str, model_id: &str) -> Option<ModelCapabilities> {
+    snapshot_capabilities(&slug_for(provider, model_id)?)
 }
 
 /// Map an Aura `(provider, model_id)` pair to its OpenRouter catalog
@@ -214,12 +309,45 @@ struct ApiResponse {
 struct ApiEntry {
     id: String,
     pricing: RawPricing,
+    #[serde(default)]
+    top_provider: ApiTopProvider,
+    #[serde(default)]
+    architecture: ApiArchitecture,
 }
 
-/// One-shot live fetch + slug-resolve for a list of configured
-/// `(provider, model_id)` entries. Returns a `model_id → live pricing`
-/// overlay suitable for merging into [`crate::ModelPricing`] consumers
-/// (typically `aura_agent::CostManager::merge_pricings`).
+#[derive(Deserialize, Default)]
+struct ApiTopProvider {
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct ApiArchitecture {
+    #[serde(default)]
+    input_modalities: Vec<String>,
+}
+
+impl ApiEntry {
+    fn capabilities(&self) -> ModelCapabilities {
+        RawModelEntry {
+            pricing: RawPricing {
+                prompt: String::new(),
+                completion: String::new(),
+                input_cache_read: None,
+                input_cache_write: None,
+            },
+            context_length: self.top_provider.context_length,
+            max_completion_tokens: self.top_provider.max_completion_tokens,
+            input_modalities: self.architecture.input_modalities.clone(),
+        }
+        .to_capabilities()
+    }
+}
+
+/// Live-fetch overlay covering both pricing and capability drift since
+/// the bundled snapshot was cut. Returns `model_id → (pricing, caps)`.
 ///
 /// Single OpenRouter round-trip via [`fetch_catalog`] regardless of
 /// how many entries are passed. Caller-tolerant: any failure
@@ -229,7 +357,9 @@ struct ApiEntry {
 /// Each entry's slug is computed via [`slug_for`]; entries whose
 /// provider isn't OpenRouter-routable (`openai-subscription`, custom
 /// providers) are silently skipped.
-pub async fn fetch_overlay_for(entries: &[(&str, &str)]) -> HashMap<String, ModelPricing> {
+pub async fn fetch_overlay_for(
+    entries: &[(&str, &str)],
+) -> HashMap<String, (ModelPricing, ModelCapabilities)> {
     let mut wanted: Vec<(String, String)> = Vec::new();
     for (provider, model) in entries {
         let Some(slug) = slug_for(provider, model) else {
@@ -252,27 +382,37 @@ pub async fn fetch_overlay_for(entries: &[(&str, &str)]) -> HashMap<String, Mode
     };
     let mut overlay = HashMap::new();
     for (slug, model) in wanted {
-        if let Some(live) = catalog.get(&slug).copied() {
-            overlay.insert(model, live);
+        if let Some(entry) = catalog.get(&slug).copied() {
+            overlay.insert(model, (entry.pricing, entry.capabilities));
         }
     }
     overlay
 }
 
 /// One-shot fetch of OpenRouter's full `/api/v1/models` catalog,
-/// reduced to the slug → [`ModelPricing`] map this crate cares about.
-/// Single network round-trip — callers refreshing many configured
-/// models should batch through [`fetch_overlay_for`].
+/// reduced to slug → pricing + capability map. Single network
+/// round-trip — callers refreshing many configured models should
+/// batch through [`fetch_overlay_for`].
 ///
 /// Bounded by [`LIVE_FETCH_TIMEOUT`] so a sluggish OpenRouter doesn't
 /// extend boot. Failures are caller-tolerant; the overlay paths
 /// swallow them and keep the bundled snapshot.
-pub async fn fetch_catalog() -> crate::Result<HashMap<String, ModelPricing>> {
+async fn fetch_catalog() -> crate::Result<HashMap<String, SnapshotEntry>> {
     let body = fetch_models_response().await?;
     Ok(body
         .data
         .into_iter()
-        .filter_map(|e| e.pricing.to_model_pricing().map(|p| (e.id, p)))
+        .filter_map(|e| {
+            let pricing = e.pricing.to_model_pricing()?;
+            let capabilities = e.capabilities();
+            Some((
+                e.id,
+                SnapshotEntry {
+                    pricing,
+                    capabilities,
+                },
+            ))
+        })
         .collect())
 }
 
@@ -372,6 +512,7 @@ mod tests {
     #[test]
     fn unknown_slug_returns_none() {
         assert!(snapshot_pricing("openai/does-not-exist-2099").is_none());
+        assert!(snapshot_capabilities("openai/does-not-exist-2099").is_none());
     }
 
     #[test]
@@ -556,5 +697,36 @@ mod tests {
         assert!(p.output_per_1m_tokens > MicroUsd::ZERO);
         // Subscription provider returns None even for an otherwise-known id.
         assert!(pricing_for("openai-subscription", "gpt-5").is_none());
+    }
+
+    #[test]
+    fn capabilities_for_resolves_context_window_and_vision() {
+        // Pin: Aura's canonical Anthropic flagship resolves to the
+        // 1M-context vision-capable profile via the snapshot. If this
+        // regresses after a refresh, the factory's hardcoded fallback
+        // still works but operators lose per-model context tracking.
+        let caps = capabilities_for("anthropic", "claude-opus-4-6")
+            .expect("anthropic capabilities present");
+        let ctx = caps
+            .context_window
+            .expect("opus-4.6 must publish context_length");
+        assert!(
+            ctx >= 200_000,
+            "claude-opus-4.6 context_window unexpectedly small: {ctx}",
+        );
+        assert_eq!(caps.supports_vision, Some(true));
+
+        // openai-subscription is account-tier dependent; OpenRouter has
+        // no equivalent route, so capabilities are unresolved.
+        assert!(capabilities_for("openai-subscription", "gpt-5").is_none());
+    }
+
+    #[test]
+    fn capabilities_for_marks_text_only_models_non_vision() {
+        // MiniMax-M2 is text-first; the snapshot's input_modalities
+        // must collapse to supports_vision=false so the factory sets
+        // the right ModelInfo flag.
+        let caps = capabilities_for("minimax", "MiniMax-M2").expect("minimax-m2 capabilities");
+        assert_eq!(caps.supports_vision, Some(false));
     }
 }

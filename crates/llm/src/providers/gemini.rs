@@ -57,12 +57,13 @@ impl LlmProviderFactory for GeminiProviderFactory {
 
         let model = client.completion_model(&config.model);
 
+        let caps = crate::openrouter::capabilities_for(self.provider_name(), &config.model);
         let model_info = ModelInfo {
             id: config.model.clone(),
             provider: "gemini".to_string(),
-            context_window: 1_000_000,
+            context_window: caps.and_then(|c| c.context_window).unwrap_or(1_000_000),
             supports_tools: true,
-            supports_vision: true,
+            supports_vision: caps.and_then(|c| c.supports_vision).unwrap_or(true),
             pricing: self.pricing_for_model(&config.model),
         };
 

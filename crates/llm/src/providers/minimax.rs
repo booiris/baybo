@@ -68,12 +68,13 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
 
         let model = client.completion_model(&config.model);
 
+        let caps = crate::openrouter::capabilities_for(self.provider_name(), &config.model);
         let model_info = ModelInfo {
             id: config.model.clone(),
             provider: "minimax".to_string(),
-            context_window: 200_000,
+            context_window: caps.and_then(|c| c.context_window).unwrap_or(200_000),
             supports_tools: true,
-            supports_vision: false,
+            supports_vision: caps.and_then(|c| c.supports_vision).unwrap_or(false),
             pricing: self.pricing_for_model(&config.model),
         };
 

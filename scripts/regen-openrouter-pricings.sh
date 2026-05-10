@@ -20,10 +20,18 @@
 #     happens to be configured against the free tier).
 #   * Drop entries where both prompt and completion are 0 (likely
 #     demos / placeholders).
-#   * Keep only `prompt` / `completion` / `input_cache_read` /
-#     `input_cache_write` — the four fields `ModelPricing` actually
-#     consumes. Image / audio / web_search / internal_reasoning
-#     prices are not yet wired through `compute_cost_usd`.
+#   * Under `pricing`, keep only `prompt` / `completion` /
+#     `input_cache_read` / `input_cache_write` — the four fields
+#     `ModelPricing` actually consumes. Image / audio / web_search /
+#     internal_reasoning prices are not yet wired through
+#     `compute_cost_usd`.
+#   * Lift `top_provider.context_length` /
+#     `top_provider.max_completion_tokens` to top-level
+#     `context_length` / `max_completion_tokens`, and
+#     `architecture.input_modalities` to `input_modalities` —
+#     factories read these via `openrouter::capabilities_for` to
+#     populate `ModelInfo.context_window` and `supports_vision`
+#     instead of hardcoded per-provider constants.
 #
 # Run after a model add or whenever upstream prices drift; commit the
 # resulting JSON change alongside the slug-table update.
@@ -55,10 +63,15 @@ jq --arg t "$fetched_at" --arg src "$SOURCE_URL" '
         | select(.id | test(":free$") | not)
         | select((.pricing.prompt | tonumber) > 0 or (.pricing.completion | tonumber) > 0)
         | { (.id): {
-              prompt:            .pricing.prompt,
-              completion:        .pricing.completion,
-              input_cache_read:  (.pricing.input_cache_read  // null),
-              input_cache_write: (.pricing.input_cache_write // null),
+              pricing: {
+                prompt:            .pricing.prompt,
+                completion:        .pricing.completion,
+                input_cache_read:  (.pricing.input_cache_read  // null),
+                input_cache_write: (.pricing.input_cache_write // null),
+              },
+              context_length:        (.top_provider.context_length        // null),
+              max_completion_tokens: (.top_provider.max_completion_tokens // null),
+              input_modalities:      (.architecture.input_modalities      // []),
             } }
       ] | add
     )
