@@ -210,61 +210,57 @@ impl CompressionStrategy for SummaryAwareWrapper {
         // its position in the in-memory active list. Without this
         // mapping the recent slice could be cut to a position later
         // than the cursor, silently dropping unsummarized middle
-        // history. Walk the supersede log identically to the
-        // cold-start anchor reconstruction in `restore_from_store`:
-        // count active rows in ordinal order until we hit the cursor
-        // ordinal, that count is the in-memory index. Any mismatch
-        // between the live active row count and the in-memory
-        // `messages.len()` (compaction in flight, snapshot drift,
-        // unpersisted system prompt) collapses the fast-path safely
-        // — we cannot prove cursor coverage so we hand off to inner.
+        // history. Two cheap index-only counts (cursor's position +
+        // total active count) replace the full supersede log walk —
+        // the partial `idx_session_messages_active` index covers
+        // both. Any mismatch between the live active row count and
+        // the in-memory `messages.len()` (compaction in flight,
+        // snapshot drift, unpersisted system prompt) collapses the
+        // fast-path safely — we cannot prove cursor coverage so we
+        // hand off to inner.
         let cursor_idx_in_active = match self
             .sessions
-            .load_session_messages_with_supersede(&self.session_id)
+            .active_index_of_ordinal(&self.session_id, metadata.cursor)
             .await
         {
-            Ok(rows) => {
-                let mut active_count: usize = 0;
-                let mut cursor_idx: Option<usize> = None;
-                for row in &rows {
-                    if row.superseded_by.is_some() {
-                        continue;
-                    }
-                    if row.ordinal == metadata.cursor && cursor_idx.is_none() {
-                        cursor_idx = Some(active_count);
-                    }
-                    active_count += 1;
-                }
-                if active_count != messages.len() {
-                    debug!(
-                        session_id = %self.session_id,
-                        active_count,
-                        in_memory_len = messages.len(),
-                        "fast-path: active log / in-memory length mismatch; falling through"
-                    );
-                    return self.inner.compress(messages, chat).await;
-                }
-                match cursor_idx {
-                    Some(idx) => idx,
-                    None => {
-                        debug!(
-                            session_id = %self.session_id,
-                            cursor = metadata.cursor,
-                            "fast-path: cursor ordinal not present in active log; falling through"
-                        );
-                        return self.inner.compress(messages, chat).await;
-                    }
-                }
+            Ok(Some(idx)) => idx,
+            Ok(None) => {
+                debug!(
+                    session_id = %self.session_id,
+                    cursor = metadata.cursor,
+                    "fast-path: cursor ordinal not present in active log; falling through"
+                );
+                return self.inner.compress(messages, chat).await;
             }
             Err(e) => {
                 warn!(
                     session_id = %self.session_id,
                     error = %e,
-                    "fast-path: supersede log read failed; falling through"
+                    "fast-path: cursor index lookup failed; falling through"
                 );
                 return self.inner.compress(messages, chat).await;
             }
         };
+        match self.sessions.count_active_messages(&self.session_id).await {
+            Ok(active_count) if active_count == messages.len() => {}
+            Ok(active_count) => {
+                debug!(
+                    session_id = %self.session_id,
+                    active_count,
+                    in_memory_len = messages.len(),
+                    "fast-path: active log / in-memory length mismatch; falling through"
+                );
+                return self.inner.compress(messages, chat).await;
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "fast-path: active count lookup failed; falling through"
+                );
+                return self.inner.compress(messages, chat).await;
+            }
+        }
 
         let (system_msgs, non_system) = partition_system(messages);
 

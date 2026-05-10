@@ -608,6 +608,114 @@ impl SessionStore for LibsqlSessionStore {
         }
     }
 
+    async fn active_index_of_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<Option<usize>> {
+        let conn = self.pool.conn();
+        // Both sub-selects hit `idx_session_messages_active`
+        // (`session_id, ordinal WHERE superseded_by IS NULL`), so this
+        // is two index-only counts — the row content is never read.
+        let mut rows = conn
+            .query(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_messages \
+                    WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal < ?2), \
+                   EXISTS (SELECT 1 FROM session_messages \
+                           WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal = ?2)",
+                libsql::params![session_id.as_str().to_string(), ordinal],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql active_index query: {e}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!("active_index returned no rows"))
+            })?;
+        let count: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get count: {e}")))?;
+        let present: i64 = row
+            .get(1)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get present: {e}")))?;
+        if present == 0 {
+            return Ok(None);
+        }
+        Ok(Some(count as usize))
+    }
+
+    async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM session_messages \
+                 WHERE session_id = ?1 AND superseded_by IS NULL",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql count_active query: {e}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!("count_active returned no rows"))
+            })?;
+        let count: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get count: {e}")))?;
+        Ok(count as usize)
+    }
+
+    async fn load_active_session_messages_up_to(
+        &self,
+        session_id: &SessionId,
+        up_to_ordinal: i64,
+    ) -> Result<Vec<ChatMessage>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT role, content FROM session_messages \
+                 WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal <= ?2 \
+                 ORDER BY ordinal",
+                libsql::params![session_id.as_str().to_string(), up_to_ordinal],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query active up_to: {e}"))
+            })?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let role: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
+            let content_json: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
+            let content = serde_json::from_str(&content_json)
+                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
+            out.push(aura_model::ChatMessage {
+                role: role
+                    .parse::<aura_model::Role>()
+                    .map_err(StorageError::Storage)?,
+                content,
+            });
+        }
+        Ok(out)
+    }
+
     async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,

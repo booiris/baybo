@@ -792,6 +792,48 @@ impl SessionStore for MemorySessionStore {
             })
             .unwrap_or_default())
     }
+
+    async fn active_index_of_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> SessionStoreResult<Option<usize>> {
+        Ok(self.transcripts.lock().get(session_id).and_then(|log| {
+            let mut active: Vec<&StoredMessageRow> =
+                log.iter().filter(|m| m.superseded_by.is_none()).collect();
+            active.sort_by_key(|m| m.ordinal);
+            active.iter().position(|m| (m.ordinal as i64) == ordinal)
+        }))
+    }
+
+    async fn count_active_messages(&self, session_id: &SessionId) -> SessionStoreResult<usize> {
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .map(|log| log.iter().filter(|m| m.superseded_by.is_none()).count())
+            .unwrap_or(0))
+    }
+
+    async fn load_active_session_messages_up_to(
+        &self,
+        session_id: &SessionId,
+        up_to_ordinal: i64,
+    ) -> SessionStoreResult<Vec<ChatMessage>> {
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .map(|log| {
+                let mut active: Vec<&StoredMessageRow> = log
+                    .iter()
+                    .filter(|m| m.superseded_by.is_none() && (m.ordinal as i64) <= up_to_ordinal)
+                    .collect();
+                active.sort_by_key(|m| m.ordinal);
+                active.into_iter().map(|m| m.message.clone()).collect()
+            })
+            .unwrap_or_default())
+    }
 }
 
 /// In-memory `SessionSummaryStore` for tests across the workspace.

@@ -208,6 +208,18 @@ pub struct ContextManager {
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
     last_summary_anchor: Option<usize>,
+    /// Last cursor value resolved through [`Self::lookup_anchor_index_for_cursor`].
+    /// Skips the index lookup when [`Self::sync_anchor_to_cursor`] is
+    /// invoked with the same cursor again. Cleared by
+    /// [`Self::restore_messages`] (the active set has been replaced
+    /// wholesale, so any prior resolution is stale).
+    ///
+    /// Safe because for a fixed cursor, the lookup result can only
+    /// transition `Some(idx) → None` (when inline compaction
+    /// supersedes the row). The inline path *also* sets
+    /// `last_summary_anchor = Some(messages.len())`, so skipping the
+    /// now-`None` lookup preserves the more-conservative anchor.
+    last_synced_cursor: Option<i64>,
 }
 
 impl ContextManager {
@@ -234,6 +246,7 @@ impl ContextManager {
             session_id,
             sessions,
             last_summary_anchor: None,
+            last_synced_cursor: None,
         }
     }
 
@@ -270,6 +283,9 @@ impl ContextManager {
         // `session_summaries.cursor` if available; for direct callers,
         // it stays `None` until the next compression apply.
         self.last_summary_anchor = None;
+        // Cached cursor → idx resolution belonged to the old slice.
+        // Any subsequent `sync_anchor_to_cursor` must re-resolve.
+        self.last_synced_cursor = None;
     }
 
     /// Settle calibration + baseline post-response from a main LLM
@@ -580,49 +596,40 @@ impl ContextManager {
         let Some(metadata) = metadata else { return };
 
         self.last_summary_anchor = self.lookup_anchor_index_for_cursor(metadata.cursor).await;
+        // Prime the cache so the first trigger-gate iteration after
+        // cold start doesn't re-issue the same lookup.
+        self.last_synced_cursor = Some(metadata.cursor);
     }
 
-    /// Walk the bound session's supersede log, filter to active rows
-    /// (`superseded_by IS NULL`), find the active row whose `ordinal ==
-    /// cursor`. Returns the index **after** that row in the active
-    /// sequence — i.e. the position of the first message whose ordinal
-    /// is strictly greater than `cursor`. That's the right anchor for
-    /// `tokens_since_anchor` because `cursor` is the highest ordinal
-    /// already covered by the summary; counting it as "new growth"
-    /// would let a single heavy tool_result message immediately blow
-    /// past `SUMMARY_DIFF_TOKEN_THRESHOLD` and retrigger a fresh pass
+    /// Resolve `cursor` (a `session_messages.ordinal`) to the index
+    /// **after** its row in the active sequence — i.e. the position
+    /// of the first message whose ordinal is strictly greater than
+    /// `cursor`. That's the right anchor for `tokens_since_anchor`
+    /// because `cursor` is the highest ordinal already covered by
+    /// the summary; counting it as "new growth" would let a single
+    /// heavy tool_result message immediately blow past
+    /// `SUMMARY_DIFF_TOKEN_THRESHOLD` and retrigger a fresh pass
     /// after a successful one just landed. Returns `None` when the
     /// cursor's ordinal isn't in the active set (compression has
     /// rewritten that message away) or the lookup fails.
     async fn lookup_anchor_index_for_cursor(&self, cursor: i64) -> Option<usize> {
-        let rows = match self
+        match self
             .sessions
-            .load_session_messages_with_supersede(&self.session_id)
+            .active_index_of_ordinal(&self.session_id, cursor)
             .await
         {
-            Ok(rows) => rows,
+            Ok(Some(idx)) => Some(idx + 1),
+            Ok(None) => None,
             Err(e) => {
                 warn!(
                     session_id = %self.session_id,
                     error = %e,
                     cursor,
-                    "failed to load supersede log; anchor lookup aborted"
+                    "failed to resolve cursor → active index; anchor lookup aborted"
                 );
-                return None;
+                None
             }
-        };
-
-        let mut active_idx: usize = 0;
-        for row in rows.iter() {
-            if row.superseded_by.is_some() {
-                continue;
-            }
-            if row.ordinal == cursor {
-                return Some(active_idx + 1);
-            }
-            active_idx += 1;
         }
-        None
     }
 
     /// Notification handler for "background summary refresh just landed
@@ -638,8 +645,23 @@ impl ContextManager {
     /// When the cursor's ordinal is no longer in the active set (an
     /// inline compression has rewritten the transcript past it), the
     /// anchor stays where the inline path put it.
+    ///
+    /// Caches `cursor` so repeated calls with the same value (the
+    /// trigger gate's hot path: every iteration past 50% budget hits
+    /// this until either the cursor advances or in-flight is set)
+    /// short-circuit before the store round-trip.
     pub async fn sync_anchor_to_cursor(&mut self, cursor: i64) {
-        let Some(idx) = self.lookup_anchor_index_for_cursor(cursor).await else {
+        if self.last_synced_cursor == Some(cursor) {
+            return;
+        }
+        let lookup = self.lookup_anchor_index_for_cursor(cursor).await;
+        // Mark the cursor processed regardless of outcome — the
+        // result for a fixed cursor only ever transitions
+        // `Some(idx) → None` (inline compaction supersedes the row),
+        // and that transition is already handled by the inline path
+        // pushing `last_summary_anchor` to `messages.len()` directly.
+        self.last_synced_cursor = Some(cursor);
+        let Some(idx) = lookup else {
             debug!(
                 session_id = %self.session_id,
                 cursor,

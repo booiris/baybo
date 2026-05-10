@@ -303,24 +303,13 @@ async fn load_parent_transcript_up_to(
     parent_id: &SessionId,
     up_to_ordinal: i64,
 ) -> anyhow::Result<Vec<ChatMessage>> {
-    // The active-only loader doesn't surface ordinals, so we use the
-    // supersede-aware loader and filter for active + within ordinal
-    // bound here.
-    let rows = sessions
-        .load_session_messages_with_supersede(parent_id)
+    // SQL pushes both the supersede filter and the ordinal upper
+    // bound, so neither superseded rows nor the post-snapshot tail
+    // cross the wire.
+    let out = sessions
+        .load_active_session_messages_up_to(parent_id, up_to_ordinal)
         .await
-        .with_context(|| format!("load_session_messages_with_supersede({parent_id})"))?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        if row.superseded_by.is_some() {
-            continue;
-        }
-        if row.ordinal > up_to_ordinal {
-            continue;
-        }
-        out.push(row.message);
-    }
+        .with_context(|| format!("load_active_session_messages_up_to({parent_id})"))?;
     debug!(
         parent_session_id = %parent_id,
         up_to_ordinal,

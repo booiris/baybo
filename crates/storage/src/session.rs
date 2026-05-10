@@ -161,4 +161,38 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<StoredMessage>>;
+
+    /// 0-indexed position of the row with `ordinal == ordinal` within
+    /// the session's active sequence (rows where `superseded_by IS
+    /// NULL`, in ordinal order). Returns `None` when no active row has
+    /// that ordinal — either compression has rewritten it away or it
+    /// never existed.
+    ///
+    /// Cheaper than [`Self::load_session_messages_with_supersede`] +
+    /// walking: backed by a `COUNT(*)` + `EXISTS` against the partial
+    /// `idx_session_messages_active` index, so message contents never
+    /// cross the wire. Used by anchor-lookup paths that only need to
+    /// translate a `session_summaries.cursor` into an in-memory index.
+    async fn active_index_of_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<Option<usize>>;
+
+    /// Total number of active rows (`superseded_by IS NULL`) for the
+    /// session. Used by drift-detection paths that compare the
+    /// persisted active count to an in-memory transcript length
+    /// without reading message contents.
+    async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize>;
+
+    /// Active transcript with `ordinal <= up_to_ordinal`, in ordinal
+    /// order. Equivalent to filtering [`Self::load_active_session_messages`]
+    /// by ordinal but pushes the predicate into SQL so the row content
+    /// for newer ordinals never crosses the wire. Used by background
+    /// compression to load the snapshot pinned at trigger time.
+    async fn load_active_session_messages_up_to(
+        &self,
+        session_id: &SessionId,
+        up_to_ordinal: i64,
+    ) -> Result<Vec<ChatMessage>>;
 }

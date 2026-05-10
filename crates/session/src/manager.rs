@@ -462,6 +462,43 @@ impl SessionManager {
             .map_err(wrap)
     }
 
+    /// 0-indexed position of `ordinal` within the active message
+    /// sequence; `None` if the row is no longer active. Index-only
+    /// — does not read message content.
+    pub async fn active_index_of_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<Option<usize>> {
+        self.store
+            .active_index_of_ordinal(session_id, ordinal)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Count of active rows for the session. Index-only.
+    pub async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize> {
+        self.store
+            .count_active_messages(session_id)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Active transcript clipped to `ordinal <= up_to_ordinal`. Used
+    /// by background compression to load the snapshot pinned at
+    /// trigger time without dragging the post-snapshot tail across
+    /// the wire.
+    pub async fn load_active_session_messages_up_to(
+        &self,
+        session_id: &SessionId,
+        up_to_ordinal: i64,
+    ) -> Result<Vec<ChatMessage>> {
+        self.store
+            .load_active_session_messages_up_to(session_id, up_to_ordinal)
+            .await
+            .map_err(wrap)
+    }
+
     /// Hard-delete a session by id. Errors with `SessionError::NotFound`
     /// if the session did not exist at the time of the call. Surfaces
     /// `StorageError::HasLiveForks` (wrapped) when the session has live
