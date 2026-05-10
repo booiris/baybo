@@ -219,7 +219,7 @@ impl SessionStore for LibsqlSessionStore {
     async fn list_all(&self) -> Result<Vec<Session>> {
         let conn = self.pool.conn();
         // Filter `is_normal_session = 1` so maintenance sessions
-        // (e.g. `SummaryRefresh`) stay invisible to user-facing
+        // (e.g. `BackgroundCompression`) stay invisible to user-facing
         // listings (CLI session picker, web UI). Use
         // `list_all_maintenance_sessions` for the maintenance set.
         let mut rows = conn

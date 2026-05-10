@@ -135,12 +135,12 @@ pub enum SystemReason {
     HistoryReview,
     /// Background memory consolidation / summarization task.
     MemoryConsolidation,
-    /// Async per-session summary refresh — a `SummaryRefresher` actor
+    /// Async per-session summary refresh — a `BackgroundCompressionRunner` actor
     /// reads its parent's transcript, generates an updated summary, and
     /// writes `<workspace>/state/sessions/<parent_id>/summary.md` plus
     /// the `session_summaries` metadata row. Triggered between turns
-    /// from the parent's agent loop. See `docs/context-summary-refresh.md`.
-    SummaryRefresh,
+    /// from the parent's agent loop. See `docs/background-compression.md`.
+    BackgroundCompression,
 }
 
 /// Direct parent relationship for sessions spawned from another session.
@@ -167,7 +167,7 @@ pub struct Lineage {
 /// session's own jobs while detecting source mutation.
 ///
 /// `SystemMaintenance`: an internal, non-user-facing maintenance session
-/// (e.g. `SystemReason::SummaryRefresh`) doing work on behalf of its
+/// (e.g. `SystemReason::BackgroundCompression`) doing work on behalf of its
 /// parent. The `Lineage.parent_session_id` pins the session being worked
 /// for; cancellation propagates down on parent shutdown via lookup.
 /// Maintenance sessions get `is_normal_session = 0` on the row, so default
@@ -342,9 +342,9 @@ mod tests {
     }
 
     #[test]
-    fn trigger_source_system_summary_refresh_round_trip() {
+    fn trigger_source_system_background_compression_round_trip() {
         let t = TriggerSource::System {
-            reason: SystemReason::SummaryRefresh,
+            reason: SystemReason::BackgroundCompression,
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: TriggerSource = serde_json::from_str(&s).unwrap();

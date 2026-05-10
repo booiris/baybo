@@ -131,7 +131,7 @@ impl LibsqlPool {
                     created_at            INTEGER NOT NULL,
                     last_active           INTEGER NOT NULL,
                     -- 1 for user-facing sessions (the default); 0 for internal
-                    -- maintenance sessions (e.g. SystemReason::SummaryRefresh).
+                    -- maintenance sessions (e.g. SystemReason::BackgroundCompression).
                     -- Default `SessionStore` listings filter `is_normal_session = 1`
                     -- so maintenance sessions stay invisible in CLI / UI session
                     -- pickers; opt-in helpers exist for the spawn-serialization
@@ -179,7 +179,7 @@ impl LibsqlPool {
                 -- row automatically. The on-disk file is reaped separately
                 -- on startup (orphan FS sweep).
                 --
-                -- See `docs/context-summary-refresh.md`.
+                -- See `docs/background-compression.md`.
                 CREATE TABLE IF NOT EXISTS session_summaries (
                     session_id  TEXT    PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                     -- session_messages.ordinal of the most-recent message

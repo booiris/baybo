@@ -13,7 +13,6 @@ use tokio::sync::mpsc;
 use crate::memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
-use aura_skills_assessor::SkillAssessor;
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, StepHandle, StepKind,
@@ -190,6 +189,16 @@ pub struct AgentLoop {
     soul: Soul,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
+    /// Cost gate + ledger; `record_call` feeds spend back so the
+    /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
+    cost_manager: Arc<crate::cost::CostManager>,
+    /// Lifetime token for the surrounding `AgentActor`. The spawner
+    /// factory derives the token once and threads it into both this
+    /// loop and the actor. The summary-refresh trigger gate clones it
+    /// into outgoing `SystemSpawnRequest`s so cancellation cascades
+    /// from the parent actor into its maintenance children
+    /// automatically.
+    actor_token: CancellationToken,
     /// Optional subagent runtime. When set, LLM `tool_use` calls
     /// targeting `spawn_subagent` short-circuit the regular
     /// tool_executor path and route through here. Unset →
@@ -197,51 +206,89 @@ pub struct AgentLoop {
     /// `SubagentExitStatus::Failed("no subagent runtime registered")`
     /// tool result.
     subagent_runtime: Option<Arc<dyn SubagentRuntime>>,
-    /// Optional LLM risk assessor. When set, every skill candidate is
-    /// checked before injection: `Dangerous` verdicts veto the skill,
-    /// `Suspicious` verdicts log a warning but allow it through.
-    skill_assessor: Option<Arc<SkillAssessor>>,
     /// Optional per-session JSONL logger for LLM calls. When set, every
     /// `call_llm` invocation appends a record (request, response or
     /// error, latency, model metadata) to
     /// `<workspace>/logs/sessions/<session_id>.jsonl`.
     session_log: Option<Arc<SessionLlmLogger>>,
-    /// Cost gate + ledger; `record_call` feeds spend back so the
-    /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
-    cost_manager: Option<Arc<crate::cost::CostManager>>,
-    /// Resolved workspace paths — used by the async summary-refresh
-    /// path to read / write `<workspace>/state/sessions/<id>/summary.md`.
-    /// `None` keeps the maintenance entry point disabled (test
-    /// harnesses that don't exercise it).
+    /// Sender half of the generic system-spawn channel. The router
+    /// consumes the receiving half. Today only the summary-refresh
+    /// trigger gate emits on it; future system tasks (history review,
+    /// memory consolidation, ...) will share the same channel via
+    /// other `SystemSpawnRequest` variants. `None` disables every
+    /// system-trigger gate that gates on it.
+    system_spawn_tx: Option<mpsc::Sender<crate::background_compression::SystemSpawnRequest>>,
+    /// Resolved workspace paths. Today only the summary-refresh
+    /// maintenance handler reads it (to write `summary.md`); other
+    /// future system handlers may want it too. `None` in tests that
+    /// don't exercise such handlers.
     workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
-    /// Session manager — needed by the maintenance entry point to
-    /// load parent transcripts, write summary metadata, and look up
-    /// in-flight maintenance siblings. `None` keeps the entry point
-    /// disabled. Distinct from the `SessionManager` plumbed inside
-    /// `ContextManager` because that one is per-session-bound while
-    /// the maintenance flow operates across sessions.
+    /// Cross-session manager — used by handlers that operate across
+    /// sessions (today: summary refresh, for transcript loads,
+    /// in-flight maintenance lookups, summary metadata writes).
+    /// Distinct from the `SessionManager` plumbed inside
+    /// `ContextManager` because that one is per-session-bound.
     sessions: Option<Arc<crate::SessionManager>>,
-    /// Bootstrap-supplied spawner for the parent-side trigger gate.
-    /// When unset, the gate is silently disabled (test harnesses,
-    /// single-shot CLI runs that won't accumulate enough tokens to
-    /// matter). Production wiring constructs an impl with
-    /// `SessionManager` + `ActorSpawner` closed over.
-    summary_spawner: Option<Arc<dyn crate::summary_refresh::MaintenanceSpawner>>,
+}
+
+/// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
+/// field on the loop; required deps are bare, optional deps are
+/// `Option<T>`. Callers populate it via struct-literal syntax and pass
+/// it to [`AgentLoop::from_config`] — no chained setters, no
+/// post-construction mutability.
+pub struct AgentLoopConfig {
+    pub llm_client: Arc<GuardedLlm>,
+    pub tool_registry: Arc<ToolRegistry>,
+    pub skill_registry: Arc<SkillRegistry>,
+    pub tool_executor: Arc<ToolExecutor>,
+    pub context_manager: ContextManager,
+    pub memory_manager: Arc<MemoryManager>,
+    pub policy: ExecutionPolicy,
+    pub soul: Soul,
+    pub security_gateway: Arc<SecurityGateway>,
+    /// Cost gate + ledger.
+    pub cost_manager: Arc<crate::cost::CostManager>,
+    /// Lifetime token for the surrounding `AgentActor`. The spawner
+    /// factory derives the actor token once and threads the same
+    /// handle into both this loop and the actor.
+    pub actor_token: CancellationToken,
+    /// Optional subagent runtime. When set, LLM `tool_use` calls
+    /// targeting `spawn_subagent` short-circuit the regular
+    /// tool_executor path and route through here.
+    pub subagent_runtime: Option<Arc<dyn SubagentRuntime>>,
+    /// Optional per-session JSONL logger for LLM calls.
+    pub session_log: Option<Arc<SessionLlmLogger>>,
+    /// Generic system-spawn channel sender (any
+    /// `SystemSpawnRequest` variant — today summary refresh).
+    pub system_spawn_tx: Option<mpsc::Sender<crate::background_compression::SystemSpawnRequest>>,
+    /// Workspace paths. Used by system handlers that touch on-disk
+    /// state.
+    pub workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
+    /// Cross-session manager. Used by system handlers that operate
+    /// across sessions.
+    pub sessions: Option<Arc<crate::SessionManager>>,
 }
 
 impl AgentLoop {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        llm_client: Arc<GuardedLlm>,
-        tool_registry: Arc<ToolRegistry>,
-        skill_registry: Arc<SkillRegistry>,
-        tool_executor: Arc<ToolExecutor>,
-        context_manager: ContextManager,
-        memory_manager: Arc<MemoryManager>,
-        policy: ExecutionPolicy,
-        soul: Soul,
-        security_gateway: Arc<SecurityGateway>,
-    ) -> Self {
+    pub fn from_config(config: AgentLoopConfig) -> Self {
+        let AgentLoopConfig {
+            llm_client,
+            tool_registry,
+            skill_registry,
+            tool_executor,
+            context_manager,
+            memory_manager,
+            policy,
+            soul,
+            security_gateway,
+            cost_manager,
+            actor_token,
+            subagent_runtime,
+            session_log,
+            system_spawn_tx,
+            workspace_paths,
+            sessions,
+        } = config;
         Self {
             llm_client,
             tool_registry,
@@ -253,45 +300,13 @@ impl AgentLoop {
             soul,
             security_gateway,
             error_handler: ErrorHandler::default(),
-            subagent_runtime: None,
-            skill_assessor: None,
-            session_log: None,
-            cost_manager: None,
-            workspace_paths: None,
-            sessions: None,
-            summary_spawner: None,
-        }
-    }
-
-    pub fn with_workspace_paths(mut self, paths: Arc<aura_workspace::WorkspacePaths>) -> Self {
-        self.workspace_paths = Some(paths);
-        self
-    }
-
-    pub fn with_sessions(mut self, sessions: Arc<crate::SessionManager>) -> Self {
-        self.sessions = Some(sessions);
-        self
-    }
-
-    pub fn with_summary_spawner(
-        mut self,
-        spawner: Arc<dyn crate::summary_refresh::MaintenanceSpawner>,
-    ) -> Self {
-        self.summary_spawner = Some(spawner);
-        self
-    }
-
-    /// Cancel any in-flight maintenance children for the given
-    /// session. No-op when no spawner is wired (test harness).
-    /// Called by `AgentActor::Shutdown` before tripping its own
-    /// `actor_token` so the cascade reaches the children.
-    pub(crate) async fn cancel_maintenance_children(
-        &self,
-        session_id: &aura_model::SessionId,
-    ) -> anyhow::Result<()> {
-        match &self.summary_spawner {
-            Some(spawner) => spawner.cancel_maintenance_for_parent(session_id).await,
-            None => Ok(()),
+            cost_manager,
+            actor_token,
+            subagent_runtime,
+            session_log,
+            system_spawn_tx,
+            workspace_paths,
+            sessions,
         }
     }
 
@@ -301,29 +316,6 @@ impl AgentLoop {
     /// have to reach inside the loop's private state.
     pub async fn restore_transcript_from_store(&mut self) {
         self.context_manager.restore_from_store().await;
-    }
-
-    /// Attach the subagent runtime so LLM-emitted `spawn_subagent`
-    /// tool calls route through it instead of the regular tool
-    /// catalogue.
-    pub fn with_subagent_runtime(mut self, rt: Arc<dyn SubagentRuntime>) -> Self {
-        self.subagent_runtime = Some(rt);
-        self
-    }
-
-    pub fn with_skill_assessor(mut self, assessor: Arc<SkillAssessor>) -> Self {
-        self.skill_assessor = Some(assessor);
-        self
-    }
-
-    pub fn with_session_log(mut self, logger: Arc<SessionLlmLogger>) -> Self {
-        self.session_log = Some(logger);
-        self
-    }
-
-    pub fn with_cost_manager(mut self, manager: Arc<crate::cost::CostManager>) -> Self {
-        self.cost_manager = Some(manager);
-        self
     }
 
     /// Run the main conversation loop for a single user message.
@@ -585,7 +577,7 @@ impl AgentLoop {
             // Iteration-boundary summary-refresh check. Skip iter 1 —
             // no work has happened yet to gate against.
             if iterations > 1 {
-                self.maybe_spawn_summary_refresh(session, job_id, /* job_done */ false)
+                self.maybe_spawn_background_compression(session, job_id, /* job_done */ false)
                     .await;
             }
 
@@ -628,8 +620,10 @@ impl AgentLoop {
                     // End-of-job summary-refresh check. The activity
                     // disjunct is satisfied by `job_done = true`;
                     // the tokens / diff conjuncts still apply.
-                    self.maybe_spawn_summary_refresh(session, job_id, /* job_done */ true)
-                        .await;
+                    self.maybe_spawn_background_compression(
+                        session, job_id, /* job_done */ true,
+                    )
+                    .await;
                     return Ok(msg);
                 }
                 IterationOutcome::Continue { deferred_subagents } => {
@@ -1114,19 +1108,17 @@ impl AgentLoop {
                 // updates synchronously here so the next iteration's
                 // `check()` sees this spend; persistence is fire-and-
                 // forget inside record_call.
-                if let Some(cm) = &self.cost_manager {
-                    cm.record_call(
-                        &session.user.id,
-                        session.id.clone(),
-                        step.job_id,
-                        span.span_id,
-                        &model_info.id,
-                        finalize.input_tokens,
-                        finalize.output_tokens,
-                        finalize.cached_input_tokens,
-                        finalize.cache_creation_input_tokens,
-                    );
-                }
+                self.cost_manager.record_call(
+                    &session.user.id,
+                    session.id.clone(),
+                    step.job_id,
+                    span.span_id,
+                    &model_info.id,
+                    finalize.input_tokens,
+                    finalize.output_tokens,
+                    finalize.cached_input_tokens,
+                    finalize.cache_creation_input_tokens,
+                );
 
                 // `record_call_actual` self-skips on zero. The
                 // assistant message is appended later by
@@ -1559,7 +1551,9 @@ impl AgentLoop {
         let model_id = runner.model_info.id.clone();
         let _ = self
             .context_manager
-            .maybe_compress(&model_id, |req| runner.run(req))
+            .maybe_compress(&model_id, |req| async move {
+                runner.run(req).await.map(|run| run.response)
+            })
             .await?;
         Ok(())
     }
@@ -1633,7 +1627,9 @@ impl AgentLoop {
                 let model_id = runner.model_info.id.clone();
                 let outcome = self
                     .context_manager
-                    .force_compress(&model_id, |req| runner.run(req))
+                    .force_compress(&model_id, |req| async move {
+                        runner.run(req).await.map(|run| run.response)
+                    })
                     .await?;
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
@@ -1661,21 +1657,23 @@ impl AgentLoop {
     /// Parent-side trigger gate. Fires at iteration boundaries and
     /// on terminal-state commit. When tokens and activity have
     /// crossed their thresholds and no maintenance session is
-    /// already in flight for this parent, asks the
-    /// `MaintenanceSpawner` to spawn one. Fire-and-forget — a
-    /// failed spawn never blocks the user's turn.
+    /// already in flight for this parent, sends a
+    /// `SystemSpawnRequest::BackgroundCompression` on the system-spawn
+    /// channel for the router to materialise into a maintenance
+    /// session + actor. Fire-and-forget — a full or closed channel
+    /// never blocks the user's turn.
     ///
     /// `job_done = true` is passed at end-of-job (where the
     /// activity disjunct is trivially satisfied); `false` at
     /// iteration boundaries (where it relies on
     /// `tool_calls_since_anchor` exceeding the threshold).
-    async fn maybe_spawn_summary_refresh(
+    async fn maybe_spawn_background_compression(
         &self,
         session: &Session,
         current_job_id: aura_model::JobId,
         job_done: bool,
     ) {
-        let Some(spawner) = self.summary_spawner.as_ref() else {
+        let Some(tx) = self.system_spawn_tx.as_ref() else {
             return;
         };
         let Some(sessions) = self.sessions.as_ref() else {
@@ -1738,7 +1736,7 @@ impl AgentLoop {
                 return;
             }
         };
-        let payload = crate::summary_refresh::SummaryRefreshPayload {
+        let payload = crate::background_compression::BackgroundCompressionPayload {
             parent_session_id: session.id.clone(),
             up_to_ordinal,
         };
@@ -1751,14 +1749,17 @@ impl AgentLoop {
             up_to_ordinal,
             "summary trigger: spawning refresh pass"
         );
-        if let Err(e) = spawner
-            .spawn_summary_refresh(session.id.clone(), current_job_id, payload)
-            .await
-        {
+        let request = crate::background_compression::SystemSpawnRequest::BackgroundCompression {
+            parent_session_id: session.id.clone(),
+            parent_job_id: current_job_id,
+            parent_actor_token: self.actor_token.clone(),
+            payload,
+        };
+        if let Err(e) = tx.try_send(request) {
             warn!(
                 parent_session_id = %session.id,
                 error = %e,
-                "summary trigger: spawn failed"
+                "summary trigger: system-spawn channel send failed"
             );
         }
     }
@@ -1769,19 +1770,19 @@ impl AgentLoop {
     /// `LineageKind::SystemMaintenance`) invokes this from its
     /// `AgentMessage::SystemTrigger` mailbox handler, bypassing the
     /// normal chat-turn `run` cycle entirely. Wraps the LLM call in
-    /// a `JobInput::System { reason: SummaryRefresh }` job so cost
+    /// a `JobInput::System { reason: BackgroundCompression }` job so cost
     /// + trace are properly attributed.
     ///
     /// Errors when `workspace_paths` or `sessions` are unwired (test
     /// harnesses) — production bootstrap always sets both.
-    pub(crate) async fn run_summary_refresh(
+    pub(crate) async fn run_background_compression(
         &mut self,
         session: &mut Session,
-        payload: crate::summary_refresh::SummaryRefreshPayload,
+        payload: crate::background_compression::BackgroundCompressionPayload,
         job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         cancel_token: CancellationToken,
-    ) -> anyhow::Result<crate::summary_refresh::SummaryRefreshOutcome> {
+    ) -> anyhow::Result<crate::background_compression::BackgroundCompressionOutcome> {
         let workspace_paths = self
             .workspace_paths
             .as_ref()
@@ -1801,12 +1802,12 @@ impl AgentLoop {
         let recorder = span_recorder.clone();
 
         let payload_value = serde_json::to_value(&payload)
-            .map_err(|e| anyhow::anyhow!("encode SummaryRefresh payload: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("encode BackgroundCompression payload: {e}"))?;
         let spec = crate::job::JobSpec {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
             input: aura_job::JobInput::System {
-                reason: aura_model::SystemReason::SummaryRefresh,
+                reason: aura_model::SystemReason::BackgroundCompression,
                 payload: payload_value,
             },
             effective_soul_version: session.bound_soul_version.clone(),
@@ -1817,7 +1818,7 @@ impl AgentLoop {
             let payload = payload.clone();
             let cancel_token = cancel_token.clone();
             async move {
-                let refresher = crate::summary_refresh::SummaryRefresher {
+                let refresher = crate::background_compression::BackgroundCompressionRunner {
                     llm_client,
                     security_gateway,
                     cost_manager,

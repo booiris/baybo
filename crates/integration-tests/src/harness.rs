@@ -320,8 +320,21 @@ impl AgentTestHarnessBuilder {
             .token_budget
             .unwrap_or_else(|| TokenBudget::new(100_000, 0.95));
         let token_calibration = Arc::new(aura_context::TokenCalibration::new());
-        let context_manager = ContextManager::new(tokenizer, strategy, token_budget)
-            .with_calibration(Arc::clone(&token_calibration));
+        let session_store = Arc::new(aura_storage::test_support::MemorySessionStore::new())
+            as Arc<dyn aura_storage::SessionStore>;
+        let session_manager = Arc::new(aura_agent::SessionManager::new(
+            session_store,
+            chrono::Duration::minutes(30),
+        ));
+        let context_manager = ContextManager::new(
+            tokenizer,
+            strategy,
+            token_budget,
+            Arc::clone(&token_calibration),
+            Arc::clone(&skill_registry),
+            session.id.clone(),
+            session_manager,
+        );
 
         let soul_text = self
             .soul_prompt
@@ -333,29 +346,37 @@ impl AgentTestHarnessBuilder {
             cost_manager.as_guard(),
         );
 
-        let agent_loop = AgentLoop::new(
-            guarded_llm,
-            tool_registry.clone(),
-            skill_registry.clone(),
-            tool_executor.clone(),
+        let actor_parent_token = tokio_util::sync::CancellationToken::new();
+        let actor_token = actor_parent_token.child_token();
+
+        let agent_loop = AgentLoop::from_config(aura_agent::agent_loop::AgentLoopConfig {
+            llm_client: guarded_llm,
+            tool_registry: tool_registry.clone(),
+            skill_registry: skill_registry.clone(),
+            tool_executor: tool_executor.clone(),
             context_manager,
             memory_manager,
-            ExecutionPolicy::default(),
+            policy: ExecutionPolicy::default(),
             soul,
-            gateway.clone(),
-        )
-        .with_cost_manager(Arc::clone(&cost_manager));
+            security_gateway: gateway.clone(),
+            cost_manager: Arc::clone(&cost_manager),
+            actor_token: actor_token.clone(),
+            subagent_runtime: None,
+            session_log: None,
+            system_spawn_tx: None,
+            workspace_paths: None,
+            sessions: None,
+        });
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
-        let actor_parent_token = tokio_util::sync::CancellationToken::new();
         let actor = AgentActor::new(
             session.clone(),
             agent_loop,
             output_tx,
             job_lifecycle,
             span_recorder,
-            &actor_parent_token,
+            actor_token,
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));
 

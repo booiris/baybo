@@ -178,7 +178,7 @@ impl SessionManager {
     /// happened — same role it plays for subagents.
     ///
     /// Used today by the async summary-refresh path
-    /// (`SystemReason::SummaryRefresh`); future maintenance reasons
+    /// (`SystemReason::BackgroundCompression`); future maintenance reasons
     /// can reuse the same constructor without a code change.
     pub async fn create_maintenance_session(
         &self,
@@ -215,7 +215,7 @@ impl SessionManager {
 
     /// Return ids of in-flight maintenance sessions whose lineage
     /// points at `parent_session_id`. Used by the parent's agent
-    /// loop to enforce the at-most-one-in-flight `SummaryRefresher`
+    /// loop to enforce the at-most-one-in-flight `BackgroundCompressionRunner`
     /// invariant before spawning a new pass — if any row is
     /// returned, skip the trigger (the in-flight pass will eventually
     /// land or be reaped on next startup).
@@ -468,184 +468,13 @@ impl SessionManager {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use aura_model::{ChannelType, ChatMessage, Session, SessionId, User};
-    use aura_storage::session::Result as StoreResult;
-    use chrono::{DateTime, Duration, Utc};
-    use parking_lot::Mutex;
+    use aura_model::{ChannelType, SessionId, User};
+    use aura_storage::test_support::MemorySessionStore;
+    use chrono::{Duration, Utc};
 
     use super::{SessionError, SessionManager, SessionStore};
-
-    /// One stored row in the test fake — mirrors the libsql layout
-    /// closely enough that `apply_session_compaction` can supersede
-    /// rows the same way the real backend does.
-    #[derive(Clone)]
-    struct StoredMessage {
-        ordinal: u64,
-        message: ChatMessage,
-        superseded_by: Option<u64>,
-    }
-
-    struct MemorySessionStore {
-        data: Mutex<HashMap<SessionId, Session>>,
-        transcripts: Mutex<HashMap<SessionId, Vec<StoredMessage>>>,
-    }
-
-    impl MemorySessionStore {
-        fn new() -> Self {
-            Self {
-                data: Mutex::new(HashMap::new()),
-                transcripts: Mutex::new(HashMap::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SessionStore for MemorySessionStore {
-        async fn get(&self, session_id: &SessionId) -> StoreResult<Option<Session>> {
-            Ok(self.data.lock().get(session_id).cloned())
-        }
-
-        async fn save(&self, session: &Session) -> StoreResult<()> {
-            self.data.lock().insert(session.id.clone(), session.clone());
-            Ok(())
-        }
-
-        async fn delete(&self, session_id: &SessionId) -> StoreResult<bool> {
-            self.transcripts.lock().remove(session_id);
-            Ok(self.data.lock().remove(session_id).is_some())
-        }
-
-        async fn list_expired(&self, before: DateTime<Utc>) -> StoreResult<Vec<SessionId>> {
-            Ok(self
-                .data
-                .lock()
-                .values()
-                .filter(|s| s.last_active < before)
-                .map(|s| s.id.clone())
-                .collect())
-        }
-
-        async fn list_all(&self) -> StoreResult<Vec<Session>> {
-            Ok(self.data.lock().values().cloned().collect())
-        }
-
-        async fn list_live_forks(
-            &self,
-            _source_session_id: &SessionId,
-        ) -> StoreResult<Vec<SessionId>> {
-            // Test fake — we never construct lineage children here.
-            Ok(Vec::new())
-        }
-
-        async fn list_lineage_children(
-            &self,
-            _parent_session_id: &SessionId,
-        ) -> StoreResult<Vec<(SessionId, aura_model::LineageKind)>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_active_maintenance_for_parent(
-            &self,
-            _parent_session_id: &SessionId,
-        ) -> StoreResult<Vec<SessionId>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_all_maintenance_sessions(&self) -> StoreResult<Vec<SessionId>> {
-            Ok(Vec::new())
-        }
-
-        async fn append_session_message(
-            &self,
-            session_id: &SessionId,
-            message: &ChatMessage,
-        ) -> StoreResult<()> {
-            let mut guard = self.transcripts.lock();
-            let log = guard.entry(session_id.clone()).or_default();
-            let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
-            log.push(StoredMessage {
-                ordinal,
-                message: message.clone(),
-                superseded_by: None,
-            });
-            Ok(())
-        }
-
-        async fn apply_session_compaction(
-            &self,
-            session_id: &SessionId,
-            new_active: &[ChatMessage],
-        ) -> StoreResult<()> {
-            let mut guard = self.transcripts.lock();
-            let log = guard.entry(session_id.clone()).or_default();
-            let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
-            for entry in log.iter_mut() {
-                if entry.superseded_by.is_none() {
-                    entry.superseded_by = Some(next_ordinal);
-                }
-            }
-            for (offset, msg) in new_active.iter().enumerate() {
-                log.push(StoredMessage {
-                    ordinal: next_ordinal + offset as u64,
-                    message: msg.clone(),
-                    superseded_by: None,
-                });
-            }
-            Ok(())
-        }
-
-        async fn load_active_session_messages(
-            &self,
-            session_id: &SessionId,
-        ) -> StoreResult<Vec<ChatMessage>> {
-            Ok(self
-                .transcripts
-                .lock()
-                .get(session_id)
-                .map(|log| {
-                    let mut active: Vec<&StoredMessage> =
-                        log.iter().filter(|m| m.superseded_by.is_none()).collect();
-                    active.sort_by_key(|m| m.ordinal);
-                    active.into_iter().map(|m| m.message.clone()).collect()
-                })
-                .unwrap_or_default())
-        }
-
-        async fn latest_session_ordinal(&self, session_id: &SessionId) -> StoreResult<Option<i64>> {
-            Ok(self
-                .transcripts
-                .lock()
-                .get(session_id)
-                .and_then(|log| log.iter().map(|m| m.ordinal as i64).max()))
-        }
-
-        async fn load_session_messages_with_supersede(
-            &self,
-            session_id: &SessionId,
-        ) -> StoreResult<Vec<aura_storage::StoredMessage>> {
-            Ok(self
-                .transcripts
-                .lock()
-                .get(session_id)
-                .map(|log| {
-                    let mut rows: Vec<_> = log
-                        .iter()
-                        .map(|m| aura_storage::StoredMessage {
-                            ordinal: m.ordinal as i64,
-                            superseded_by: m.superseded_by.map(|v| v as i64),
-                            message: m.message.clone(),
-                        })
-                        .collect();
-                    rows.sort_by_key(|m| m.ordinal);
-                    rows
-                })
-                .unwrap_or_default())
-        }
-    }
 
     fn test_user() -> User {
         User {
@@ -951,14 +780,14 @@ mod tests {
         let parent_job = JobId::new();
 
         let maint = mgr
-            .create_maintenance_session(&parent, parent_job, SystemReason::SummaryRefresh)
+            .create_maintenance_session(&parent, parent_job, SystemReason::BackgroundCompression)
             .await
             .unwrap();
 
         // System trigger + reason — not inherited from parent.
         match &maint.trigger {
             aura_model::TriggerSource::System { reason } => {
-                assert_eq!(*reason, SystemReason::SummaryRefresh);
+                assert_eq!(*reason, SystemReason::BackgroundCompression);
             }
             other => panic!("expected System trigger, got {other:?}"),
         }

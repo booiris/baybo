@@ -39,6 +39,8 @@ RUST_LOG=aura::agent=debug cargo run         # agent module only
   - Same-crate tests only → `#[cfg(test)]`.
   - Consumed by another crate's tests → gate with `#[cfg(any(test, feature = "test-support"))]` and add a `test-support = []` feature in `Cargo.toml`. Downstream crates pull them in via `aura-<crate> = { workspace = true, features = ["test-support"] }` in `[dev-dependencies]`.
   - Never leave a test-only item plain `pub` — "it's named `Never...`" is not a gate.
+- Required dependencies belong in the constructor, NOT behind a `with_*` setter. If a struct ends up with many required fields, define a sibling `XxxConfig` struct with `pub` fields and a single `pub fn from_config(config: XxxConfig) -> Self` constructor — callers populate it via struct literal so every required field shows up at the call site by name. `with_*` is reserved for: (a) **genuine config knobs** with a real default that some callers rationally leave alone (`with_rate_limit`, `with_timeout`); (b) **incremental builders** that append to a collection (`with_tool`, `add_rule`); (c) **truly optional deps** where some real production paths legitimately leave them unset (not just tests).
+- Don't make a field `Option<T>` to accommodate tests. If every production caller passes `Some(...)` and the field is `Option` solely so a test fixture can skip wiring it, the field belongs as `T` (required). Tests that need a stripped-down loop should provide a real value or use a smaller dedicated fixture, not push `Option` onto the production type.
 
 ## Platform Support
 

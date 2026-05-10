@@ -3,7 +3,7 @@
 //! are available, falling through to the inner [`CompressionStrategy`]
 //! (typically [`crate::Summarize`]) when they aren't or when the
 //! assembled total would still be too large. See
-//! `docs/context-summary-refresh.md`.
+//! `docs/background-compression.md`.
 
 use std::path::PathBuf;
 use std::sync::Arc;

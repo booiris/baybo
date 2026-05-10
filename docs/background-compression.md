@@ -1,6 +1,6 @@
-# Context Summary Refresh — Design
+# Background Compression — Design
 
-A cross-cutting feature that decouples summary *generation* from compression. Summaries are produced asynchronously between turns and persisted per-session; compression-time replaces a synchronous LLM call with a deterministic swap-in of the precomputed summary.
+A cross-cutting feature that runs the existing compression operation in a second, **background** mode in addition to the original **inline** one. The inline path (`ContextManager::maybe_compress`, driven by the `Summarize` strategy) blocks the user's turn for one synchronous LLM round-trip whenever the budget threshold trips. The background path (a maintenance actor running between turns) precomputes the same kind of summary asynchronously and persists it per-session; at compression time `SummaryAwareWrapper` swaps it into the output deterministically, so the inline LLM call is skipped whenever the precomputed summary is available. Both paths share `compression::CompressionRunner` for the actual LLM dispatch (cost / span attribution differs by which session / user the call is billed against).
 
 Affected crates: `aura-model`, `aura-storage`, `aura-session`, `aura-context`, `aura-agent`, `aura-workspace`.
 
@@ -20,13 +20,13 @@ Two paths, decoupled:
 ```
 Parent session (TriggerKind::User|Cron)
   AgentActor → AgentLoop
-    ├─ end-of-iteration check  ──→ maybe spawn SummaryRefresher
-    ├─ end-of-job check        ──→ maybe spawn SummaryRefresher
+    ├─ end-of-iteration check  ──→ maybe spawn BackgroundCompressionRunner
+    ├─ end-of-job check        ──→ maybe spawn BackgroundCompressionRunner
     └─ compress_if_needed → SummaryAwareWrapper (CompressionStrategy)
                               ├─ fast-path: load summary.md → assemble → return
                               └─ fall-through: inner Summarize (existing)
 
-SummaryRefresher (TriggerKind::System, LineageKind::SystemMaintenance)
+BackgroundCompressionRunner (TriggerKind::System, LineageKind::SystemMaintenance)
   fresh AgentActor per pass → bypasses agent_loop.run → dedicated handler:
     1. load parent's session_messages (active, ordinal ≤ N)
     2. read summary.md (if exists)
@@ -80,7 +80,7 @@ ALTER TABLE sessions ADD COLUMN is_normal_session BOOLEAN NOT NULL DEFAULT 1;
 pub enum SystemReason {
     HistoryReview,
     MemoryConsolidation,
-    SummaryRefresh,         // NEW
+    BackgroundCompression,         // NEW
 }
 
 pub enum LineageKind {
@@ -124,7 +124,7 @@ fire_summary = tokens_now > 0.5 × max_tokens                  (a)
 
 ### Spawn serialization
 
-At most one in-flight `SummaryRefresher` per parent session. Before spawning:
+At most one in-flight `BackgroundCompressionRunner` per parent session. Before spawning:
 
 ```sql
 SELECT 1 FROM sessions
@@ -136,28 +136,35 @@ LIMIT 1
 
 If a row exists, skip the trigger; the next iteration will re-evaluate.
 
-## SummaryRefresher (async path)
+## BackgroundCompressionRunner (async path)
 
-### Spawn (parent's `AgentLoop`)
+### Spawn (parent's `AgentLoop` → `Router`)
+
+The trigger gate does not own session creation or actor spawning. It only emits a request on a process-wide `mpsc::Sender<SystemSpawnRequest>` injected at construction time. The router's main `select!` loop owns the system-spawn arm and converts the request into a maintenance session + actor + dispatched mailbox message.
 
 ```rust
-let payload = json!({
-    "parent_session_id": session.id,
-    "up_to_ordinal": latest_session_ordinal,
-    "previous_summary_cursor": metadata.cursor /* or null */,
-});
-let lineage = Lineage {
+// In AgentLoop::maybe_spawn_background_compression, after the gate passes:
+let request = SystemSpawnRequest::BackgroundCompression {
     parent_session_id: session.id.clone(),
     parent_job_id: current_job_id,
-    kind: LineageKind::SystemMaintenance,
+    parent_actor_token: self.actor_token.clone(),  // see Cancellation below
+    payload: BackgroundCompressionPayload { parent_session_id, up_to_ordinal },
 };
-let system_session = sessions.create_system_session(
-    SystemReason::SummaryRefresh,
-    Some(lineage),
-).await?;
-let job = JobInput::System { reason: SystemReason::SummaryRefresh, payload };
-router.spawn_actor(system_session, job).await?;  // fire-and-forget
+system_spawn_tx.try_send(request);  // fire-and-forget
 ```
+
+```rust
+// In Router::handle_system_spawn:
+let maint = sessions.create_maintenance_session(&parent, parent_job_id, BackgroundCompression).await?;
+let response_tx = supervisor.response_tx().clone();
+let mailbox = (actor_spawner)(maint, response_tx, &parent_actor_token);
+mailbox.send(AgentMessage::SystemTrigger { reason: BackgroundCompression, payload }).await;
+// Sender drops; mailbox closes after the queued message is processed.
+```
+
+The one task-specific knob distinguishing this from cron is the cancel parent: the request carries the originating parent actor's `actor_token`, and the spawned maintenance child's `actor_token` derives as `parent_actor_token.child_token()`, making it a *grandchild* of the originating parent's `actor_token`. See *Cancellation* below.
+
+`response_tx` is reused from the supervisor for constructor-shape parity. `handle_system_trigger` does not construct any `AgentOutput`, so nothing ever flows down it — the "internal-only" property is a property of the maintenance handler's body, not enforced at the type level.
 
 ### `AgentMessage::SystemTrigger`
 
@@ -166,14 +173,14 @@ pub enum AgentMessage {
     UserInput(...),
     CronTrigger { ... },
     SubagentSpawned { ... },
-    SystemTrigger { job_input: JobInput },   // NEW
+    SystemTrigger { reason: SystemReason, payload: serde_json::Value },
     Shutdown,
 }
 ```
 
-The actor's handler for `SystemTrigger` dispatches to `SummaryRefresher::run` directly — `agent_loop.run` is **not** invoked. The maintenance session's transcript stays empty.
+The actor's handler for `SystemTrigger` dispatches to `BackgroundCompressionRunner::run` directly — `agent_loop.run` is **not** invoked. The maintenance session's transcript stays empty.
 
-### `SummaryRefresher::run`
+### `BackgroundCompressionRunner::run`
 
 1. Parse payload: `(parent_session_id, up_to_ordinal, previous_summary_cursor)`.
 2. Load parent's messages: `sessions.load_session_messages_with_cursor(parent_id, up_to_ordinal, active_only=true)`.
@@ -195,7 +202,11 @@ The actor's handler for `SystemTrigger` dispatches to `SummaryRefresher::run` di
 
 ### Cancellation (C2)
 
-Parent's `actor_token` cancellation propagates to its maintenance children: at parent shutdown, look up active maintenance sessions via the lineage filter above, signal `Shutdown` on each.
+Parent's `actor_token` cancellation propagates to its maintenance children automatically via the `tokio_util` `CancellationToken` tree.
+
+The trigger gate carries a **clone of the parent's `actor_token`** in every `SystemSpawnRequest`. The router passes that token to the actor spawner factory as the new maintenance actor's `parent_token`. `AgentActor::new` then derives the maintenance actor's own `actor_token` as a `child_token()` of that. Because cancellation in `tokio_util` cascades through the tree, calling `parent.actor_token.cancel()` (which the parent's `Shutdown` handler does) automatically trips the maintenance child's `actor_token`, which in turn trips every nested job/tool token derived from it.
+
+No explicit "Shutdown the maintenance children" step is required — and no per-parent mailbox map needs to be maintained on the spawner side. The parent simply cancels its own token; the cascade reaches every descendant.
 
 ### Failure handling (linear retry, no backoff)
 
@@ -305,7 +316,7 @@ When a maintenance session is marked `Failed` on startup, increment `session_sum
 
 ## Cost Recording
 
-Each `SummaryRefresher` pass:
+Each `BackgroundCompressionRunner` pass:
 
 - Wrapped in real `StepKind::Compression` + `SpanKind::LlmCall` span (same machinery as existing `CompressionRunner`).
 - `CostManager::record_call(span_id, ...)` charged against the **System session** (not the parent).
@@ -342,7 +353,7 @@ WHERE sessions.lineage_for_session_id = ?
 
 ### Pattern A creep after first compression
 
-After a fast-path or full-`Summarize` compression, the parent's *active* `session_messages` no longer contains the original conversation — it contains the compressed list. Subsequent `SummaryRefresher` passes load active messages only (`superseded_by IS NULL`), so they see the embedded prior summary blob as just-another-message rather than re-deriving from original turns.
+After a fast-path or full-`Summarize` compression, the parent's *active* `session_messages` no longer contains the original conversation — it contains the compressed list. Subsequent `BackgroundCompressionRunner` passes load active messages only (`superseded_by IS NULL`), so they see the embedded prior summary blob as just-another-message rather than re-deriving from original turns.
 
 **Net effect**: Pattern B (authoritative rewrite from original transcript) is achieved on **pre-compression** passes only. Post-first-compression passes are effectively Pattern A (refine from prior summary + new turns). The summary prompt's "conversation is authoritative" instruction still helps because the prior summary appears verbatim in the messages and the LLM is told to use it as scaffolding — but the original transcript is unrecoverable from the active slice.
 

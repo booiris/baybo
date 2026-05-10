@@ -7,16 +7,16 @@
 //!
 //!  1. `record_summary_success` → `summary_metadata` round trip
 //!     across the `SessionManager` API.
-//!  2. `BootstrapMaintenanceSpawner`-style spawn book-keeping —
-//!     verified indirectly by checking that
-//!     `active_maintenance_for_parent` and the cascade-on-delete
+//!  2. Maintenance-session row management — verified indirectly by
+//!     checking that `active_maintenance_for_parent` (the gate the
+//!     in-flight serialization rule reads) and the cascade-on-delete
 //!     cover the `LineageKind::SystemMaintenance` rows.
 //!  3. `reap_maintenance_orphans` — DB rows deleted, parent's
 //!     `error_count` bumped, on-disk orphan summary directory
 //!     removed.
 //!
 //! The full agent-loop wiring (LLM call, JobLifecycle, SpanRecorder)
-//! is exercised at the unit-test layer in `aura-agent::summary_refresh`
+//! is exercised at the unit-test layer in `aura-agent::background_compression`
 //! and `aura-context::strategy::summary_aware`; this file focuses on
 //! the storage + filesystem boundary.
 
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::SessionManager;
-use aura_agent::summary_refresh::reap_maintenance_orphans;
+use aura_agent::background_compression::reap_maintenance_orphans;
 use aura_model::{
     ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, SystemReason,
     TriggerSource, User,
@@ -66,7 +66,7 @@ async fn fresh_store_and_paths() -> (Store, TempDir) {
 }
 
 /// Round-trip a successful summary pass through the `SessionManager`
-/// wrapper layer — the same surface the `SummaryRefresher` uses.
+/// wrapper layer — the same surface the `BackgroundCompressionRunner` uses.
 #[tokio::test]
 async fn record_then_read_summary_metadata_via_session_manager() {
     let (store, _dir) = fresh_store_and_paths().await;
@@ -126,7 +126,7 @@ async fn maintenance_sessions_are_invisible_to_default_listings() {
 
     // Spawn one maintenance session for the parent.
     let maint = mgr
-        .create_maintenance_session(&parent, JobId::new(), SystemReason::SummaryRefresh)
+        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
         .await
         .unwrap();
     assert!(maint.id.as_str().starts_with("maint-"));
@@ -166,7 +166,7 @@ async fn orphan_reaper_cleans_db_and_fs() {
     // Create a maintenance session — represents a pass that was
     // running when the previous process crashed.
     let maint = mgr
-        .create_maintenance_session(&parent, JobId::new(), SystemReason::SummaryRefresh)
+        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
         .await
         .unwrap();
     assert_eq!(
@@ -274,7 +274,7 @@ async fn lineage_kind_round_trips_for_system_maintenance() {
         state: SessionState::default(),
         root_session_id: parent.id.clone(),
         trigger: TriggerSource::System {
-            reason: SystemReason::SummaryRefresh,
+            reason: SystemReason::BackgroundCompression,
         },
         lineage: Some(Lineage {
             parent_session_id: parent.id.clone(),

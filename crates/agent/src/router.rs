@@ -7,6 +7,7 @@ use aura_model::{Session, SessionId, TriggerSource, User};
 
 use aura_cron::CronTriggerEvent;
 
+use crate::background_compression::SystemSpawnRequest;
 use crate::cost::CostManager;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
@@ -66,9 +67,12 @@ impl RateLimiter {
 /// `actor_token` is derived from. Tripping the parent cascades cancel
 /// down through every job / tool / nested subagent the child runs. For
 /// top-level user / cron sessions the router passes a process-wide
-/// token bridged to `ShutdownSignal`. For subagent dispatch the parent's
-/// per-job cancel token is passed instead, so admin `cancel_job(parent)`
-/// trips the entire descendant subtree.
+/// token bridged to `ShutdownSignal`. For maintenance spawns the
+/// originating parent actor's `actor_token` is passed (carried in the
+/// `SystemSpawnRequest`), so cancelling the parent cascades into its
+/// maintenance children automatically. For subagent dispatch the
+/// parent's per-job cancel token is passed instead, so admin
+/// `cancel_job(parent)` trips the entire descendant subtree.
 pub type ActorSpawner = Box<
     dyn Fn(Session, mpsc::Sender<AgentOutput>, &CancellationToken) -> mpsc::Sender<AgentMessage>
         + Send
@@ -81,80 +85,70 @@ pub struct Router {
     supervisor: AgentSupervisor,
     channels: Arc<ChannelRegistry>,
     security_gateway: Arc<SecurityGateway>,
-    cost_manager: Option<Arc<CostManager>>,
+    cost_manager: Arc<CostManager>,
     rate_limiter: RateLimiter,
-    actor_spawner: Option<ActorSpawner>,
+    actor_spawner: ActorSpawner,
+    /// Stored as `Option<Receiver>` so `run()` can `take()` them out of
+    /// `self` to drive in `select!` arms; populated unconditionally
+    /// from `RouterConfig` at construction.
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    system_trigger_rx: Option<mpsc::Receiver<SystemSpawnRequest>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
     /// each actor derives its `actor_token` as a child of this so
-    /// process shutdown cascades into every in-flight job. Defaults
-    /// to a fresh standalone token if `with_actor_parent_token` was
-    /// never called.
+    /// process shutdown cascades into every in-flight job.
     actor_parent_token: CancellationToken,
 }
 
-/// Default rate limit: 30 requests per 60 seconds per user.
-const DEFAULT_RATE_LIMIT_REQUESTS: usize = 30;
-const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// Construction bundle for [`Router`]. Every field is required — call
+/// sites populate it via struct literal and pass to
+/// [`Router::from_config`].
+pub struct RouterConfig {
+    pub session_manager: Arc<SessionManager>,
+    pub supervisor: AgentSupervisor,
+    pub channels: Arc<ChannelRegistry>,
+    pub security_gateway: Arc<SecurityGateway>,
+    pub cost_manager: Arc<CostManager>,
+    pub actor_spawner: ActorSpawner,
+    pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
+    pub system_trigger_rx: mpsc::Receiver<SystemSpawnRequest>,
+    /// Cancellation parent passed to every top-level actor the router
+    /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
+    pub actor_parent_token: CancellationToken,
+    /// Per-user sliding-window rate limit. Both fields are required
+    /// (no default) — production wiring sources them from the user
+    /// config; tests pass whatever they want.
+    pub rate_limit_max_requests: usize,
+    pub rate_limit_window: std::time::Duration,
+}
 
 impl Router {
-    pub fn new(
-        session_manager: Arc<SessionManager>,
-        supervisor: AgentSupervisor,
-        channels: Arc<ChannelRegistry>,
-        security_gateway: Arc<SecurityGateway>,
-    ) -> Self {
+    pub fn from_config(config: RouterConfig) -> Self {
+        let RouterConfig {
+            session_manager,
+            supervisor,
+            channels,
+            security_gateway,
+            cost_manager,
+            actor_spawner,
+            cron_trigger_rx,
+            system_trigger_rx,
+            actor_parent_token,
+            rate_limit_max_requests,
+            rate_limit_window,
+        } = config;
         Self {
             session_manager,
             supervisor,
             channels,
             security_gateway,
-            cost_manager: None,
-            rate_limiter: RateLimiter::new(
-                DEFAULT_RATE_LIMIT_REQUESTS,
-                std::time::Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
-            ),
-            actor_spawner: None,
-            cron_trigger_rx: None,
-            actor_parent_token: CancellationToken::new(),
+            cost_manager,
+            rate_limiter: RateLimiter::new(rate_limit_max_requests, rate_limit_window),
+            actor_spawner,
+            cron_trigger_rx: Some(cron_trigger_rx),
+            system_trigger_rx: Some(system_trigger_rx),
+            actor_parent_token,
         }
-    }
-
-    /// Set the cancellation parent passed to every top-level actor the
-    /// router spawns. Wired upstream to `ShutdownSignal` so process
-    /// shutdown cascades into every in-flight job. Without this, the
-    /// router uses a fresh standalone token and shutdown does not
-    /// reach in-flight LLM / tool calls.
-    pub fn with_actor_parent_token(mut self, token: CancellationToken) -> Self {
-        self.actor_parent_token = token;
-        self
-    }
-
-    /// Attach the [`CostManager`] so the router can pre-flight reject
-    /// over-budget messages before they enter an actor — same gate the
-    /// agent loop uses before each LLM call, just at message ingress.
-    pub fn with_cost_manager(mut self, manager: Arc<CostManager>) -> Self {
-        self.cost_manager = Some(manager);
-        self
-    }
-
-    /// Override the default rate limiter settings.
-    pub fn with_rate_limit(mut self, max_requests: usize, window: std::time::Duration) -> Self {
-        self.rate_limiter = RateLimiter::new(max_requests, window);
-        self
-    }
-
-    /// Set an actor spawner for on-demand actor creation.
-    pub fn with_actor_spawner(mut self, spawner: ActorSpawner) -> Self {
-        self.actor_spawner = Some(spawner);
-        self
-    }
-
-    /// Set a receiver for cron trigger events.
-    pub fn with_cron_triggers(mut self, rx: mpsc::Receiver<CronTriggerEvent>) -> Self {
-        self.cron_trigger_rx = Some(rx);
-        self
     }
 
     /// Start all channels and begin routing messages.
@@ -167,6 +161,7 @@ impl Router {
         info!(channel_count, "router starting");
 
         let mut cron_rx = self.cron_trigger_rx.take();
+        let mut system_rx = self.system_trigger_rx.take();
 
         loop {
             tokio::select! {
@@ -188,6 +183,16 @@ impl Router {
                         error!(error = %e, "failed to handle cron trigger");
                     }
                 }
+                Some(request) = async {
+                    match system_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Err(e) = self.handle_system_spawn(request).await {
+                        error!(error = %e, "failed to handle system-spawn request");
+                    }
+                }
                 else => {
                     info!("router channels closed, shutting down");
                     break;
@@ -196,6 +201,84 @@ impl Router {
         }
 
         self.supervisor.shutdown_all().await;
+    }
+
+    /// Materialise a [`SystemSpawnRequest`] into a maintenance session
+    /// + actor + dispatched mailbox message.
+    ///
+    /// Symmetric to [`Self::handle_cron_trigger`] but with two
+    /// task-specific knobs:
+    ///   - **Session**: created via `create_maintenance_session` so the
+    ///     row is `is_normal_session = 0` and lineaged to the parent.
+    ///   - **Cancel parent**: the request carries the originating
+    ///     parent actor's `actor_token`; the spawned maintenance
+    ///     child's `actor_token` derives as a grandchild. Cancelling
+    ///     the parent therefore cascades into the child via the
+    ///     `tokio_util` token tree, with no Shutdown mailbox dance.
+    ///
+    /// The maintenance actor reuses the supervisor's `response_tx` for
+    /// constructor-shape parity with user/cron actors. Its
+    /// `handle_system_trigger` doesn't construct any `AgentOutput`, so
+    /// nothing ever flows down it.
+    ///
+    /// As with cron, the spawned actor is not registered with the
+    /// supervisor — maintenance is one-shot and registering would just
+    /// accumulate dangling handles.
+    async fn handle_system_spawn(&mut self, request: SystemSpawnRequest) -> anyhow::Result<()> {
+        let SystemSpawnRequest::BackgroundCompression {
+            parent_session_id,
+            parent_job_id,
+            parent_actor_token,
+            payload,
+        } = request;
+
+        let parent = self
+            .session_manager
+            .get(&parent_session_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("parent session {parent_session_id} not found for summary spawn")
+            })?;
+
+        let maint = self
+            .session_manager
+            .create_maintenance_session(
+                &parent,
+                parent_job_id,
+                aura_model::SystemReason::BackgroundCompression,
+            )
+            .await?;
+        let maint_session_id = maint.id.clone();
+
+        debug!(
+            parent_session_id = %parent_session_id,
+            maint_session_id = %maint_session_id,
+            "routing system-spawn request to fresh maintenance session"
+        );
+
+        // `&parent_actor_token` becomes the cancel parent so the new
+        // actor's `actor_token` is a grandchild of the originating
+        // parent — Shutdown of the parent cascades automatically.
+        let response_tx = self.supervisor.response_tx().clone();
+        let mailbox = (self.actor_spawner)(maint, response_tx, &parent_actor_token);
+
+        let payload_value = serde_json::to_value(&payload)
+            .map_err(|e| anyhow::anyhow!("encode BackgroundCompression payload: {e}"))?;
+        if let Err(e) = mailbox
+            .send(AgentMessage::SystemTrigger {
+                reason: aura_model::SystemReason::BackgroundCompression,
+                payload: payload_value,
+            })
+            .await
+        {
+            warn!(
+                parent_session_id = %parent_session_id,
+                maint_session_id = %maint_session_id,
+                error = %e,
+                "failed to deliver SystemTrigger to maintenance actor mailbox"
+            );
+        }
+        Ok(())
     }
 
     /// Handle a cron trigger by minting a fresh session and routing a
@@ -233,11 +316,6 @@ impl Router {
             .await?;
         let session_id = session.id.clone();
 
-        let Some(ref spawner) = self.actor_spawner else {
-            warn!(session_id = %session_id, "no actor spawner configured for cron trigger");
-            return Ok(());
-        };
-
         debug!(
             session_id = %session_id,
             job_id = %event.job_id,
@@ -245,7 +323,7 @@ impl Router {
         );
 
         let response_tx = self.supervisor.response_tx().clone();
-        let sender = spawner(session, response_tx, &self.actor_parent_token);
+        let sender = (self.actor_spawner)(session, response_tx, &self.actor_parent_token);
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
@@ -293,17 +371,15 @@ impl Router {
         // In-memory budget gate: same call agent_loop makes before
         // each LLM call, fired here too so an over-cap user never even
         // gets an actor spun up.
-        if let Some(ref cm) = self.cost_manager {
-            cm.check().map_err(|e| {
-                warn!(
-                    user_id = %user.id,
-                    session_id = %session_id,
-                    error = %e,
-                    "cost manager rejected request"
-                );
-                anyhow::anyhow!(e)
-            })?;
-        }
+        self.cost_manager.check().map_err(|e| {
+            warn!(
+                user_id = %user.id,
+                session_id = %session_id,
+                error = %e,
+                "cost manager rejected request"
+            );
+            anyhow::anyhow!(e)
+        })?;
 
         // Get or create session
         let typed_session_id = SessionId::from(session_id.as_str());
@@ -340,25 +416,18 @@ impl Router {
             .await;
 
         if !routed {
-            if let Some(ref spawner) = self.actor_spawner {
-                info!(session_id = %session_id, "creating new actor for session");
-                let response_tx = self.supervisor.response_tx().clone();
-                let sender = spawner(session, response_tx, &self.actor_parent_token);
-                self.supervisor.register(session_id.clone(), sender);
+            info!(session_id = %session_id, "creating new actor for session");
+            let response_tx = self.supervisor.response_tx().clone();
+            let sender = (self.actor_spawner)(session, response_tx, &self.actor_parent_token);
+            self.supervisor.register(session_id.clone(), sender);
 
-                // Retry routing now that the actor exists.
-                let re_routed = self
-                    .supervisor
-                    .route(&session_id, AgentMessage::UserInput(Box::new(incoming)))
-                    .await;
-                if !re_routed {
-                    warn!(session_id = %session_id, "failed to route after actor creation");
-                }
-            } else {
-                warn!(
-                    session_id = %session_id,
-                    "no actor found and no actor spawner configured"
-                );
+            // Retry routing now that the actor exists.
+            let re_routed = self
+                .supervisor
+                .route(&session_id, AgentMessage::UserInput(Box::new(incoming)))
+                .await;
+            if !re_routed {
+                warn!(session_id = %session_id, "failed to route after actor creation");
             }
         }
 

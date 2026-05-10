@@ -10,8 +10,9 @@ use std::io::Cursor;
 
 use async_trait::async_trait;
 use aura_job::{Job, JobStatusKind, JobTransition};
-use aura_model::{BlobRef, JobId, MemoryEntry, SessionId, SpanId, StepId};
+use aura_model::{BlobRef, ChatMessage, JobId, MemoryEntry, Session, SessionId, SpanId, StepId};
 use aura_trace::{Span, SpanEvent, Step};
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -24,6 +25,7 @@ use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 use crate::job::{JobStore, Result as JobStoreResult};
 use crate::memory::{MemoryStore, Result as MemoryStoreResult};
 use crate::secret::{Result as SecretResult, SecretStore};
+use crate::session::{Result as SessionStoreResult, SessionStore, StoredMessage};
 use crate::trace::{Result as TraceStoreResult, TraceStore};
 
 /// In-memory `SecretStore` for tests. Stores raw `(name, encrypted_value)`
@@ -602,4 +604,178 @@ fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
         .ok_or_else(|| StorageError::NotFound(format!("invalid blob_id {blob_id}")))?;
     let (hex, token) = hex_all.split_once('.').unwrap_or((hex_all, ""));
     Ok((hex, token))
+}
+
+/// One stored row in the in-memory session transcript log — mirrors
+/// the libsql layout closely enough that `apply_session_compaction`
+/// can supersede rows the same way the real backend does.
+#[derive(Clone)]
+struct StoredMessageRow {
+    ordinal: u64,
+    message: ChatMessage,
+    superseded_by: Option<u64>,
+}
+
+/// In-memory `SessionStore` for tests across the workspace. Lineage /
+/// fork columns are stubbed (`list_live_forks` /
+/// `list_lineage_children` / `list_active_maintenance_for_parent` /
+/// `list_all_maintenance_sessions` all return empty) — tests that
+/// need that surface should use the real libsql store via
+/// `aura_storage::Store::open` against a tempfile.
+#[derive(Default)]
+pub struct MemorySessionStore {
+    data: Mutex<HashMap<SessionId, Session>>,
+    transcripts: Mutex<HashMap<SessionId, Vec<StoredMessageRow>>>,
+}
+
+impl MemorySessionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl SessionStore for MemorySessionStore {
+    async fn get(&self, session_id: &SessionId) -> SessionStoreResult<Option<Session>> {
+        Ok(self.data.lock().get(session_id).cloned())
+    }
+
+    async fn save(&self, session: &Session) -> SessionStoreResult<()> {
+        self.data.lock().insert(session.id.clone(), session.clone());
+        Ok(())
+    }
+
+    async fn delete(&self, session_id: &SessionId) -> SessionStoreResult<bool> {
+        self.transcripts.lock().remove(session_id);
+        Ok(self.data.lock().remove(session_id).is_some())
+    }
+
+    async fn list_expired(&self, before: DateTime<Utc>) -> SessionStoreResult<Vec<SessionId>> {
+        Ok(self
+            .data
+            .lock()
+            .values()
+            .filter(|s| s.last_active < before)
+            .map(|s| s.id.clone())
+            .collect())
+    }
+
+    async fn list_all(&self) -> SessionStoreResult<Vec<Session>> {
+        Ok(self.data.lock().values().cloned().collect())
+    }
+
+    async fn list_live_forks(
+        &self,
+        _source_session_id: &SessionId,
+    ) -> SessionStoreResult<Vec<SessionId>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_lineage_children(
+        &self,
+        _parent_session_id: &SessionId,
+    ) -> SessionStoreResult<Vec<(SessionId, aura_model::LineageKind)>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_active_maintenance_for_parent(
+        &self,
+        _parent_session_id: &SessionId,
+    ) -> SessionStoreResult<Vec<SessionId>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_all_maintenance_sessions(&self) -> SessionStoreResult<Vec<SessionId>> {
+        Ok(Vec::new())
+    }
+
+    async fn append_session_message(
+        &self,
+        session_id: &SessionId,
+        message: &ChatMessage,
+    ) -> SessionStoreResult<()> {
+        let mut guard = self.transcripts.lock();
+        let log = guard.entry(session_id.clone()).or_default();
+        let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
+        log.push(StoredMessageRow {
+            ordinal,
+            message: message.clone(),
+            superseded_by: None,
+        });
+        Ok(())
+    }
+
+    async fn apply_session_compaction(
+        &self,
+        session_id: &SessionId,
+        new_active: &[ChatMessage],
+    ) -> SessionStoreResult<()> {
+        let mut guard = self.transcripts.lock();
+        let log = guard.entry(session_id.clone()).or_default();
+        let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
+        for entry in log.iter_mut() {
+            if entry.superseded_by.is_none() {
+                entry.superseded_by = Some(next_ordinal);
+            }
+        }
+        for (offset, msg) in new_active.iter().enumerate() {
+            log.push(StoredMessageRow {
+                ordinal: next_ordinal + offset as u64,
+                message: msg.clone(),
+                superseded_by: None,
+            });
+        }
+        Ok(())
+    }
+
+    async fn load_active_session_messages(
+        &self,
+        session_id: &SessionId,
+    ) -> SessionStoreResult<Vec<ChatMessage>> {
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .map(|log| {
+                let mut active: Vec<&StoredMessageRow> =
+                    log.iter().filter(|m| m.superseded_by.is_none()).collect();
+                active.sort_by_key(|m| m.ordinal);
+                active.into_iter().map(|m| m.message.clone()).collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn latest_session_ordinal(
+        &self,
+        session_id: &SessionId,
+    ) -> SessionStoreResult<Option<i64>> {
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .and_then(|log| log.iter().map(|m| m.ordinal as i64).max()))
+    }
+
+    async fn load_session_messages_with_supersede(
+        &self,
+        session_id: &SessionId,
+    ) -> SessionStoreResult<Vec<StoredMessage>> {
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .map(|log| {
+                let mut rows: Vec<_> = log
+                    .iter()
+                    .map(|m| StoredMessage {
+                        ordinal: m.ordinal as i64,
+                        superseded_by: m.superseded_by.map(|v| v as i64),
+                        message: m.message.clone(),
+                    })
+                    .collect();
+                rows.sort_by_key(|m| m.ordinal);
+                rows
+            })
+            .unwrap_or_default())
+    }
 }

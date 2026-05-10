@@ -20,7 +20,7 @@ pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 // consult live here as named constants, not magic numbers — they're
 // referenced from at least two crates (context + agent) and the design
 // doc treats them as a single configuration surface. See
-// `docs/context-summary-refresh.md` for the full rationale.
+// `docs/background-compression.md` for the full rationale.
 // ---------------------------------------------------------------------------
 
 /// Token threshold (as fraction of `TokenBudget::max_tokens`) above
@@ -145,21 +145,20 @@ pub enum CompressionOutcome {
 ///
 /// Extension points are the `CompressionStrategy` injected at
 /// construction (the management logic — append, budget check — is
-/// invariant) and the optional `SkillRegistry` plumbed in via
-/// [`Self::with_skill_registry`] which lets the manager re-broadcast
-/// the authoritative skill list and re-attach per-skill detail blocks
-/// after a summary-style compression has wiped the historical
-/// `<skill>` / `<system-reminder>` messages off the front of the
-/// conversation.
+/// invariant) and the `SkillRegistry` (also at construction) which
+/// lets the manager re-broadcast the authoritative skill list and
+/// re-attach per-skill detail blocks after a summary-style
+/// compression has wiped the historical `<skill>` /
+/// `<system-reminder>` messages off the front of the conversation.
 pub struct ContextManager {
     tokenizer: Arc<dyn Tokenizer>,
     strategy: Box<dyn CompressionStrategy>,
     budget: TokenBudget,
-    calibration: Option<Arc<TokenCalibration>>,
+    calibration: Arc<TokenCalibration>,
     /// Used to render the post-compression skill trailer. `None` keeps
     /// the manager skill-agnostic for callers that don't need the
     /// trailer (Truncate-only flows, isolated tests).
-    skill_registry: Option<Arc<SkillRegistry>>,
+    skill_registry: Arc<SkillRegistry>,
     /// Owned conversation transcript — the sole source of truth.
     messages: Vec<ChatMessage>,
     /// Per-message token count, kept in lockstep with `messages`.
@@ -184,11 +183,13 @@ pub struct ContextManager {
     current_model: RwLock<Option<String>>,
     /// Session this manager is bound to. When set together with
     /// [`Self::sessions`] every transcript mutation is mirrored to
-    /// `session_messages` so a process bounce / actor respawn can
-    /// reload via [`Self::restore_from_store`]. Unset → in-memory
-    /// only (tests, single-shot harnesses).
-    session_id: Option<SessionId>,
-    sessions: Option<Arc<SessionManager>>,
+    /// Identity of the session this manager mirrors to in
+    /// `session_messages`, so a process bounce / actor respawn can
+    /// reload via [`Self::restore_from_store`].
+    session_id: SessionId,
+    /// Cross-session manager for transcript persistence + summary
+    /// metadata reads.
+    sessions: Arc<SessionManager>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -200,40 +201,26 @@ impl ContextManager {
         tokenizer: Arc<dyn Tokenizer>,
         strategy: Box<dyn CompressionStrategy>,
         budget: TokenBudget,
+        calibration: Arc<TokenCalibration>,
+        skill_registry: Arc<SkillRegistry>,
+        session_id: SessionId,
+        sessions: Arc<SessionManager>,
     ) -> Self {
         Self {
             tokenizer,
             strategy,
             budget,
-            calibration: None,
-            skill_registry: None,
+            calibration,
+            skill_registry,
             messages: Vec::new(),
             per_message_tokens: Vec::new(),
             called_skills: Vec::new(),
             baseline: RwLock::new(None),
             current_model: RwLock::new(None),
-            session_id: None,
-            sessions: None,
+            session_id,
+            sessions,
             last_summary_anchor: None,
         }
-    }
-
-    /// Bind this manager to a specific session for persistence.
-    /// After this call:
-    /// - [`Self::append`] mirrors every appended message — including
-    ///   system messages at index 0 — to `session_messages`;
-    /// - successful compressions mark the prior active rows as
-    ///   superseded and append the new active set;
-    /// - [`Self::restore_from_store`] hydrates from the same log on
-    ///   actor cold start;
-    /// - [`Self::build_call_input_marker`] returns
-    ///   `LlmCallInputs::Persisted` instead of an inline snapshot.
-    ///
-    /// Without this binding the manager stays in-memory only.
-    pub fn with_session(mut self, session_id: SessionId, sessions: Arc<SessionManager>) -> Self {
-        self.session_id = Some(session_id);
-        self.sessions = Some(sessions);
-        self
     }
 
     /// Read-only access to the owned transcript.
@@ -271,27 +258,6 @@ impl ContextManager {
         self.last_summary_anchor = None;
     }
 
-    /// Attach a `TokenCalibration` so `count_tokens` scales raw BPE
-    /// estimates by the per-model `actual / estimate` ratio fed back
-    /// from the agent loop after each main LLM call. Without this, the
-    /// budget tracks the unscaled estimate (still correct, just less
-    /// accurate vs real `usage.input_tokens`).
-    pub fn with_calibration(mut self, calibration: Arc<TokenCalibration>) -> Self {
-        self.calibration = Some(calibration);
-        self
-    }
-
-    /// Attach a `SkillRegistry` so the manager can append a fresh
-    /// skill trailer (authoritative `<system-reminder>` skill list +
-    /// per-skill detail blocks for skills called during the now-wiped
-    /// history) after any compression that flagged
-    /// `replaced_full_history`. Without this, the post-compression
-    /// message list is whatever the strategy produced, unmodified.
-    pub fn with_skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
-        self.skill_registry = Some(registry);
-        self
-    }
-
     /// Settle calibration + baseline post-response from a main LLM
     /// call. Anchors against the current transcript length — must be
     /// called before any subsequent mutation; the agent loop honours
@@ -309,11 +275,9 @@ impl ContextManager {
         if actual_input_tokens == 0 {
             return;
         }
-        if let (Some(cal), Some(model_id)) =
-            (&self.calibration, self.current_model.read().as_deref())
-        {
+        if let Some(model_id) = self.current_model.read().as_deref() {
             let raw = self.raw_estimate();
-            cal.observe(model_id, raw, actual_input_tokens);
+            self.calibration.observe(model_id, raw, actual_input_tokens);
         }
         *self.baseline.write() = Some(TokenBaseline {
             actual_tokens: actual_input_tokens,
@@ -363,12 +327,13 @@ impl ContextManager {
     }
 
     async fn persist_appended(&self, msg: &ChatMessage) {
-        let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
-            return;
-        };
-        if let Err(e) = sessions.append_session_message(session_id, msg).await {
+        if let Err(e) = self
+            .sessions
+            .append_session_message(&self.session_id, msg)
+            .await
+        {
             warn!(
-                session_id = %session_id,
+                session_id = %self.session_id,
                 error = %e,
                 "failed to append message to session_messages log"
             );
@@ -466,10 +431,10 @@ impl ContextManager {
         // blocks so the next LLM call still sees the skill set the
         // user expects. `called_skills` was tracked incrementally on
         // every `append` and tells us which skills' details to ship.
-        if replaced_full_history && let Some(registry) = &self.skill_registry {
+        if replaced_full_history {
             append_skill_trailer(
                 &mut new_messages,
-                registry.as_ref(),
+                self.skill_registry.as_ref(),
                 self.tokenizer.as_ref(),
                 &self.called_skills,
             );
@@ -528,15 +493,13 @@ impl ContextManager {
     }
 
     async fn persist_compaction(&self) {
-        let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
-            return;
-        };
-        if let Err(e) = sessions
-            .apply_session_compaction(session_id, &self.messages)
+        if let Err(e) = self
+            .sessions
+            .apply_session_compaction(&self.session_id, &self.messages)
             .await
         {
             warn!(
-                session_id = %session_id,
+                session_id = %self.session_id,
                 error = %e,
                 "failed to persist session compaction"
             );
@@ -565,13 +528,8 @@ impl ContextManager {
         // Clone the bound handles up-front so we can call
         // `&mut self` methods inside the function without holding a
         // borrow of `self.session_id` / `self.sessions`.
-        let (session_id, sessions) = match (
-            self.session_id.clone(),
-            self.sessions.as_ref().map(Arc::clone),
-        ) {
-            (Some(id), Some(s)) => (id, s),
-            _ => return,
-        };
+        let session_id = self.session_id.clone();
+        let sessions = Arc::clone(&self.sessions);
 
         // Step 1: restore the transcript itself.
         match sessions.load_active_session_messages(&session_id).await {
@@ -668,20 +626,16 @@ impl ContextManager {
     }
 
     /// Build the `LlmCallInputs` an `LlmCall` trace span should
-    /// carry for the *current* transcript. When bound to a session
-    /// and the store has rows, returns `Persisted { last_ordinal }` —
-    /// the gateway hydrates this back into a flat slice on read,
-    /// keeping span storage constant per call instead of cloning a
-    /// growing prefix every turn. Falls back to `Inline(messages)`
-    /// when there's no store, no rows, or the lookup errors.
+    /// carry for the *current* transcript. When the bound session has
+    /// rows, returns `Persisted { last_ordinal }` — the gateway
+    /// hydrates this back into a flat slice on read, keeping span
+    /// storage constant per call instead of cloning a growing prefix
+    /// every turn. Falls back to `Inline(messages)` when the store
+    /// has no rows yet (fresh session) or the lookup errors.
     pub async fn build_call_input_marker(&self) -> LlmCallInputs {
-        let inline = || LlmCallInputs::Inline(self.messages.clone());
-        let (Some(session_id), Some(sessions)) = (&self.session_id, &self.sessions) else {
-            return inline();
-        };
-        match sessions.latest_session_ordinal(session_id).await {
+        match self.sessions.latest_session_ordinal(&self.session_id).await {
             Ok(Some(last_ordinal)) => LlmCallInputs::Persisted { last_ordinal },
-            _ => inline(),
+            _ => LlmCallInputs::Inline(self.messages.clone()),
         }
     }
 
@@ -711,9 +665,9 @@ impl ContextManager {
     }
 
     fn calibrate(&self, raw: usize) -> usize {
-        match (&self.calibration, self.current_model.read().as_deref()) {
-            (Some(cal), Some(model_id)) => cal.adjust(model_id, raw),
-            _ => raw,
+        match self.current_model.read().as_deref() {
+            Some(model_id) => self.calibration.adjust(model_id, raw),
+            None => raw,
         }
     }
 }
@@ -940,11 +894,28 @@ mod tests {
         panic!("Truncate-only tests must not invoke the chat closure");
     }
 
+    fn test_session_id() -> SessionId {
+        SessionId::from("test-session")
+    }
+
+    fn test_sessions() -> Arc<aura_session::SessionManager> {
+        let store = Arc::new(aura_storage::test_support::MemorySessionStore::new())
+            as Arc<dyn aura_storage::SessionStore>;
+        Arc::new(aura_session::SessionManager::new(
+            store,
+            chrono::Duration::minutes(30),
+        ))
+    }
+
     fn make_ctx(keep_recent: usize, max_tokens: usize, threshold: f64) -> ContextManager {
         ContextManager::new(
             Arc::new(SimpleTokenizer),
             Box::new(Truncate::new(keep_recent)),
             TokenBudget::new(max_tokens, threshold),
+            Arc::new(TokenCalibration::new()),
+            Arc::new(SkillRegistry::new()),
+            test_session_id(),
+            test_sessions(),
         )
     }
 
@@ -1294,49 +1265,6 @@ mod tests {
         assert!(ctx.called_skills.is_empty());
     }
 
-    /// Without a skill registry, a `replaced_full_history: true`
-    /// compression apply leaves the message vector exactly as the
-    /// strategy returned it — no trailer is invented out of thin air.
-    #[tokio::test]
-    async fn no_skill_registry_means_no_trailer() {
-        let mut ctx = ContextManager::new(
-            Arc::new(SimpleTokenizer),
-            Box::new(crate::strategy::summarize::Summarize::new(2)),
-            TokenBudget::new(50, 0.5),
-        );
-        // Long enough that compression with the (real, registry-rendered)
-        // trailer still wins on tokens — SimpleTokenizer counts text as
-        // `len()/4 + 1`, so a few hundred bytes of user text easily out-
-        // weighs the ~120-byte reminder + ~150-byte detail trailer.
-        ctx.append(&make_msg(Role::System, "sys")).await;
-        ctx.append(&make_msg(Role::User, &"u1 ".repeat(80))).await;
-        ctx.append(&skill_call("foo")).await;
-        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(80)))
-            .await;
-        ctx.append(&make_msg(Role::User, &"u2 ".repeat(80))).await;
-
-        let chat = |_req: ChatRequest| async move {
-            Ok(LlmResponse {
-                content: "<analysis>x</analysis><summary>S</summary>".into(),
-                content_blocks: vec![],
-                tool_calls: vec![],
-                usage: Default::default(),
-                thinking: None,
-            })
-        };
-        let outcome = ctx.maybe_compress("test-model", chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
-
-        // [system, summary] only — no reminder, no detail.
-        assert_eq!(ctx.messages().len(), 2);
-        assert_eq!(ctx.messages()[0].role, Role::System);
-        if let ContentBlock::Text(t) = &ctx.messages()[1].content[0] {
-            assert_eq!(t, "<summary>S</summary>");
-        } else {
-            panic!("expected text content");
-        }
-    }
-
     /// With a skill registry attached, after a Summarize compression
     /// the manager appends `[reminder, detail]` (when there are
     /// previously-called skills the registry can render).
@@ -1347,8 +1275,11 @@ mod tests {
             Arc::new(SimpleTokenizer),
             Box::new(crate::strategy::summarize::Summarize::new(2)),
             TokenBudget::new(50, 0.5),
-        )
-        .with_skill_registry(registry);
+            Arc::new(TokenCalibration::new()),
+            registry,
+            test_session_id(),
+            test_sessions(),
+        );
         // Long enough that compression with the (real, registry-rendered)
         // trailer still wins on tokens — SimpleTokenizer counts text as
         // `len()/4 + 1`, so a few hundred bytes of user text easily out-
@@ -1401,8 +1332,11 @@ mod tests {
             Arc::new(SimpleTokenizer),
             Box::new(Truncate::new(2)),
             TokenBudget::new(50, 0.5),
-        )
-        .with_skill_registry(registry);
+            Arc::new(TokenCalibration::new()),
+            registry,
+            test_session_id(),
+            test_sessions(),
+        );
         // Long enough that compression with the (real, registry-rendered)
         // trailer still wins on tokens — SimpleTokenizer counts text as
         // `len()/4 + 1`, so a few hundred bytes of user text easily out-
@@ -1440,8 +1374,11 @@ mod tests {
             Arc::new(SimpleTokenizer),
             Box::new(crate::strategy::summarize::Summarize::new(2)),
             TokenBudget::new(50, 0.5),
-        )
-        .with_skill_registry(registry);
+            Arc::new(TokenCalibration::new()),
+            registry,
+            test_session_id(),
+            test_sessions(),
+        );
         // Long enough that compression with the (real, registry-rendered)
         // trailer still wins on tokens — SimpleTokenizer counts text as
         // `len()/4 + 1`, so a few hundred bytes of user text easily out-

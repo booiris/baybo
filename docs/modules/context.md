@@ -4,15 +4,17 @@
 
 The `context` crate owns the per-actor conversation state: the
 transcript (`messages`), the token budget, and the compression
-strategy. Persistence is wired in directly — when bound to a
-`SessionManager` via [`ContextManager::with_session`], `append` and
-the compression apply mirror to `session_messages` through the
-`SessionManager` wrapper in [`aura-session`](session.md). Unbound
-managers (tests, single-shot harnesses) stay in-memory only.
+strategy. Persistence is wired in directly — every `ContextManager`
+takes a bound `SessionId` + `Arc<SessionManager>` at construction;
+`append` and the compression apply mirror to `session_messages`
+through the `SessionManager` wrapper in
+[`aura-session`](session.md). Tests construct an in-memory store via
+`aura_storage::test_support::MemorySessionStore` and pass it through
+the same constructor — no separate "in-memory mode" exists.
 
 Core responsibilities:
 
-- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `aura-model`) carries only metadata (id, user, channel, lineage, soul binding, …). When a `SessionManager` is bound via `with_session`, every `append` calls `persist_appended` (→ `SessionManager::append_session_message`) and every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation.
+- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `aura-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Every `append` calls `persist_appended` (→ `SessionManager::append_session_message`) and every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation.
 - **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
 - **Pluggable compression strategies**: swap compression algorithms without changing management logic
@@ -27,7 +29,7 @@ ContextManager (struct)
 ├── Tokenizer         — trait, counts tokens (no model id — calibration
 │                       is keyed by the model_id passed into maybe_compress)
 │   └── TiktokenTokenizer — BPE impl via `tiktoken-rs` (cl100k_base / o200k_base)
-├── TokenCalibration  — optional, per-model EMA ratio of actual/estimate
+├── TokenCalibration  — required, per-model EMA ratio of actual/estimate
 │                       fed back from `AgentLoop::call_llm`
 ├── current_model     — Option<String>; written by maybe_compress, used as
 │                       calibration key + baseline-invalidation trigger
@@ -89,7 +91,7 @@ The context sent to the LLM is organized in descending priority:
 
 - Depends on `aura-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. Strategies do not construct an LLM client themselves; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
 - Does **not** depend on `memory` (memory context injected by `agent`).
-- Does **not** depend on `trace` or `storage` directly — the chat callback is what opens the trace span and records cost; `context` only sees its `Result<LlmResponse, ContextError>`. Persistence of the transcript is brokered through an optional `Arc<SessionManager>` (from `aura-session`), bound via `with_session`.
+- Does **not** depend on `trace` or `storage` directly — the chat callback is what opens the trace span and records cost; `context` only sees its `Result<LlmResponse, ContextError>`. Persistence of the transcript is brokered through the `Arc<SessionManager>` (from `aura-session`) supplied at construction.
 
 ## Constraints
 
@@ -128,9 +130,9 @@ Wiring contract:
 | Module   | Role                                                                                   |
 | -------- | -------------------------------------------------------------------------------------- |
 | `agent`   | `AgentLoop` owns a `ContextManager` instance and calls `append` / `maybe_compress`     |
-| `session` | Optional `Arc<SessionManager>` bound via `with_session`; mirrors transcript mutations to `session_messages` |
+| `session` | Required `Arc<SessionManager>` supplied to `ContextManager::new`; mirrors transcript mutations to `session_messages` |
 | `memory`  | Memory context is injected into the context window by `agent`, not by `context` itself |
 
 ## See also
 
-- [`context-summary-refresh.md`](../context-summary-refresh.md) — async per-session summary maintenance. Adds `SummaryAwareWrapper` (a `CompressionStrategy` that swaps in a precomputed summary when available) and `last_summary_anchor` tracking on `ContextManager`. The existing `Summarize` strategy stays as the inner fall-through and as the `force_compress` (`/compact`) target.
+- [`background-compression.md`](../background-compression.md) — async per-session summary maintenance. Adds `SummaryAwareWrapper` (a `CompressionStrategy` that swaps in a precomputed summary when available) and `last_summary_anchor` tracking on `ContextManager`. The existing `Summarize` strategy stays as the inner fall-through and as the `force_compress` (`/compact`) target.

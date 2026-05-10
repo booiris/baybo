@@ -1,23 +1,25 @@
-//! Async per-session summary refresh handler invoked by the
-//! maintenance actor's `AgentMessage::SystemTrigger` path. A single
-//! tool-free LLM call wrapped in a `StepKind::Compression` +
-//! `LlmCall` span; cost is recorded against the maintenance session.
-//! See `docs/context-summary-refresh.md`.
+//! Async per-session background-compression handler invoked by the
+//! maintenance actor's `AgentMessage::SystemTrigger` path. The actual
+//! LLM call goes through [`crate::compression::CompressionRunner`],
+//! the same helper the inline (`maybe_compress`) path uses; this
+//! module owns the pre/post bookkeeping (transcript load, prompt
+//! build, atomic file write, metadata update, orphan reaper).
+//! See `docs/background-compression.md`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context as _;
-use aura_context::{ContextError, SUMMARIZE_INSTRUCTION, parse_summary_response};
-use aura_llm::{ChatRequest, GuardedLlm, LlmResponse, ModelInfo};
+use aura_context::{SUMMARIZE_INSTRUCTION, parse_summary_response};
+use aura_llm::{ChatRequest, GuardedLlm, ModelInfo};
 use aura_model::{ChatMessage, ContentBlock, JobId, Role, SessionId};
 use aura_session::SessionManager;
-use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallInputs, LlmCallResult, StepKind};
 use aura_workspace::WorkspacePaths;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+use anyhow::Context as _;
 
 use crate::cost::CostManager;
 use crate::security::SecurityGateway;
@@ -28,12 +30,12 @@ use crate::trace::SpanRecorder;
 /// crashed-mid-pass maintenance session.
 const ORPHAN_REAP_MODEL_TAG: &str = "orphan-reap";
 
-/// Payload carried by `JobInput::System { reason: SummaryRefresh, payload }`.
+/// Payload carried by `JobInput::System { reason: BackgroundCompression, payload }`.
 /// The parent's agent loop builds this at trigger spawn time;
 /// the maintenance session's actor parses it via `serde_json::from_value`
 /// before invoking the refresher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SummaryRefreshPayload {
+pub struct BackgroundCompressionPayload {
     pub parent_session_id: SessionId,
     /// Highest `session_messages.ordinal` to include in this pass'
     /// input. Pinned at trigger time so concurrent appends to the
@@ -44,7 +46,7 @@ pub struct SummaryRefreshPayload {
 /// Result of one refresh pass; carried back as the
 /// `JobOutput::Structured.value`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct SummaryRefreshOutcome {
+pub(crate) struct BackgroundCompressionOutcome {
     pub cursor: i64,
     pub model_id: String,
     pub span_id: String,
@@ -92,47 +94,35 @@ async fn atomic_write_summary(
     Ok(target)
 }
 
-/// Bootstrap-supplied callback that creates a new maintenance
-/// session lineaged to `parent` and spawns an actor for it,
-/// then sends an `AgentMessage::SystemTrigger` carrying
-/// `JobInput::System { reason: SummaryRefresh, payload }` to the
-/// new actor's mailbox. Fire-and-forget — the parent's gate just
-/// records the intent; the spawner handles the rest. Returns once
-/// the actor has been spawned and the message dispatched (not when
-/// the refresh completes).
+/// Request emitted by `AgentLoop`'s parent-side trigger gate and
+/// consumed by `Router`'s `system_trigger_rx` arm. Replaces the old
+/// `MaintenanceSpawner` trait: the gate just sends a value on an
+/// `mpsc::Sender<SystemSpawnRequest>`; the router does the
+/// session-create + actor-spawn + mailbox-dispatch.
 ///
-/// Implemented by the bootstrap layer where `SessionManager` +
-/// `ActorSpawner` converge. `AgentLoop` holds an
-/// `Arc<dyn MaintenanceSpawner>` injected at construction; the
-/// trigger gate just reads it and calls `spawn_summary_refresh`
-/// when the conjunction of conditions is satisfied.
-#[async_trait::async_trait]
-pub trait MaintenanceSpawner: Send + Sync {
-    async fn spawn_summary_refresh(
-        &self,
+/// `parent_actor_token` is the parent actor's lifetime token. The
+/// router uses it as the new maintenance actor's `parent_token`, so
+/// the maintenance child's `actor_token` derives as a grandchild —
+/// cancelling the parent automatically cascades into the child via
+/// the `tokio_util` token tree, with no explicit `Shutdown` mailbox
+/// dance.
+#[derive(Debug)]
+pub enum SystemSpawnRequest {
+    BackgroundCompression {
         parent_session_id: SessionId,
         parent_job_id: JobId,
-        payload: SummaryRefreshPayload,
-    ) -> anyhow::Result<()>;
-
-    /// Send `AgentMessage::Shutdown` to every in-flight maintenance
-    /// session lineaged to `parent_session_id`. Invoked by the
-    /// parent's `AgentActor::Shutdown` handler before tripping its
-    /// own `actor_token`, so the cascade reaches the children.
-    /// Errors are logged at the call site; shutdown still proceeds.
-    async fn cancel_maintenance_for_parent(
-        &self,
-        parent_session_id: &SessionId,
-    ) -> anyhow::Result<()>;
+        parent_actor_token: CancellationToken,
+        payload: BackgroundCompressionPayload,
+    },
 }
 
 /// Inputs for one refresh pass — all the agent-layer machinery the
 /// dedicated handler needs without dragging the entire `AgentLoop`
 /// surface in.
-pub(crate) struct SummaryRefresher {
+pub(crate) struct BackgroundCompressionRunner {
     pub llm_client: Arc<GuardedLlm>,
     pub security_gateway: Arc<SecurityGateway>,
-    pub cost_manager: Option<Arc<CostManager>>,
+    pub cost_manager: Arc<CostManager>,
     pub sessions: Arc<SessionManager>,
     pub workspace_paths: Arc<WorkspacePaths>,
     pub recorder: Arc<SpanRecorder>,
@@ -143,15 +133,15 @@ pub(crate) struct SummaryRefresher {
     pub cancel_token: CancellationToken,
 }
 
-impl SummaryRefresher {
+impl BackgroundCompressionRunner {
     /// Execute one summary refresh pass. Returns the structured
     /// outcome on success; on failure, increments the parent's
     /// `error_count` and returns the underlying error.
     pub async fn run(
         self,
-        payload: SummaryRefreshPayload,
-    ) -> anyhow::Result<SummaryRefreshOutcome> {
-        let SummaryRefresher {
+        payload: BackgroundCompressionPayload,
+    ) -> anyhow::Result<BackgroundCompressionOutcome> {
+        let BackgroundCompressionRunner {
             llm_client,
             security_gateway,
             cost_manager,
@@ -191,7 +181,7 @@ impl SummaryRefresher {
                 parent_session_id = %parent_id,
                 "summary refresh: parent transcript is empty after load — skipping pass"
             );
-            return Ok(SummaryRefreshOutcome {
+            return Ok(BackgroundCompressionOutcome {
                 cursor: up_to_ordinal,
                 model_id: model_info.id.clone(),
                 span_id: String::new(),
@@ -224,22 +214,24 @@ impl SummaryRefresher {
             tools: Vec::new(),
         };
 
-        let span_outcome = run_llm_with_span(
-            &llm_client,
-            &recorder,
-            &security_gateway,
-            cost_manager.clone(),
-            &model_info,
-            &maintenance_session_id,
-            &maintenance_user_id,
+        let runner = crate::compression::CompressionRunner {
+            llm_client,
+            recorder,
+            cost_manager,
+            security_gateway,
             job_id,
-            &cancel_token,
-            request,
-        )
-        .await;
+            user_id: maintenance_user_id,
+            session_id: maintenance_session_id,
+            model_info: model_info.clone(),
+            cancel_token,
+        };
 
-        let (response, span_id, cost_micros) = match span_outcome {
-            Ok(t) => t,
+        let crate::compression::CompressionRun {
+            response,
+            span_id,
+            cost_micros,
+        } = match runner.run(request).await {
+            Ok(run) => run,
             Err(e) => {
                 let _ = sessions
                     .record_summary_failure(&parent_id, &model_info.id, "", Utc::now())
@@ -291,7 +283,7 @@ impl SummaryRefresher {
             "summary refresh: pass succeeded"
         );
 
-        Ok(SummaryRefreshOutcome {
+        Ok(BackgroundCompressionOutcome {
             cursor: up_to_ordinal,
             model_id: model_info.id,
             span_id,
@@ -342,121 +334,6 @@ async fn read_existing_summary(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
-}
-
-/// Mirrors `CompressionRunner::run` but charges cost against the
-/// maintenance session and returns the cost it billed (so the
-/// caller can write it to `session_summaries`).
-#[allow(clippy::too_many_arguments)]
-async fn run_llm_with_span(
-    llm_client: &Arc<GuardedLlm>,
-    recorder: &Arc<SpanRecorder>,
-    security_gateway: &Arc<SecurityGateway>,
-    cost_manager: Option<Arc<CostManager>>,
-    model_info: &ModelInfo,
-    maintenance_session_id: &SessionId,
-    maintenance_user_id: &str,
-    job_id: JobId,
-    cancel_token: &CancellationToken,
-    request: ChatRequest,
-) -> Result<(LlmResponse, String, i64), ContextError> {
-    let cancel_ctx = Some((cancel_token, aura_job::CancelReason::ParentCancelled));
-    let begin = LlmCallBegin {
-        model_id: model_info.id.clone(),
-        provider: model_info.provider.clone(),
-        provider_config_hash: String::new(),
-        input_messages: LlmCallInputs::Inline(request.messages.clone()),
-        temperature: request.temperature,
-    };
-
-    let llm_client = Arc::clone(llm_client);
-    let recorder_inner = Arc::clone(recorder);
-    let security_gateway = Arc::clone(security_gateway);
-    let model_info = model_info.clone();
-    let maintenance_session_id = maintenance_session_id.clone();
-    let maintenance_user_id = maintenance_user_id.to_string();
-
-    crate::scope::with_step(
-        recorder.as_ref(),
-        job_id,
-        StepKind::Compression,
-        cancel_ctx,
-        |step| async move {
-            let response = crate::scope::with_llm_span(
-                recorder_inner.as_ref(),
-                &step,
-                job_id,
-                begin,
-                cancel_ctx,
-                |span| async move {
-                    let span_id_str = span.span_id.to_string();
-                    match llm_client.chat(&request).await {
-                        Ok(mut response) => {
-                            if let Err(e) =
-                                security_gateway.sanitize_llm_response(&mut response).await
-                            {
-                                warn!(error = %e, "failed to sanitize summary refresh response");
-                            }
-                            let mut cost_micros: i64 = 0;
-                            if let Some(cm) = &cost_manager {
-                                cm.record_call(
-                                    &maintenance_user_id,
-                                    maintenance_session_id.clone(),
-                                    job_id,
-                                    span.span_id,
-                                    &model_info.id,
-                                    response.usage.input_tokens,
-                                    response.usage.output_tokens,
-                                    response.usage.cached_input_tokens,
-                                    response.usage.cache_creation_input_tokens,
-                                );
-                                cost_micros = cm
-                                    .cost_usd_for(
-                                        &model_info.id,
-                                        response.usage.input_tokens,
-                                        response.usage.output_tokens,
-                                        response.usage.cached_input_tokens,
-                                        response.usage.cache_creation_input_tokens,
-                                    )
-                                    .into_micros();
-                            }
-                            let call_result = LlmCallResult {
-                                output_content: response.content.clone(),
-                                thinking: response.thinking.clone(),
-                                tool_calls: vec![],
-                                input_tokens: response.usage.input_tokens,
-                                output_tokens: response.usage.output_tokens,
-                                cached_input_tokens: response.usage.cached_input_tokens,
-                                cache_creation_input_tokens: response
-                                    .usage
-                                    .cache_creation_input_tokens,
-                            };
-                            (call_result, Ok((response, span_id_str, cost_micros)))
-                        }
-                        Err(e) => {
-                            let raw = e.to_string();
-                            let error_msg =
-                                security_gateway.sanitize_error(&raw).await.unwrap_or(raw);
-                            let call_result = LlmCallResult {
-                                output_content: String::new(),
-                                thinking: None,
-                                tool_calls: vec![],
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                cached_input_tokens: 0,
-                                cache_creation_input_tokens: 0,
-                            };
-                            (call_result, Err(anyhow::anyhow!(error_msg)))
-                        }
-                    }
-                },
-            )
-            .await?;
-            Ok((LifecycleOutcome::Ok, response))
-        },
-    )
-    .await
-    .map_err(|e| ContextError::Compression(e.to_string()))
 }
 
 /// Startup orphan reaper. Runs once per process boot, *before* the
@@ -600,12 +477,12 @@ mod tests {
 
     #[test]
     fn payload_round_trips_through_value() {
-        let p = SummaryRefreshPayload {
+        let p = BackgroundCompressionPayload {
             parent_session_id: SessionId::from("user-1"),
             up_to_ordinal: 42,
         };
         let v = serde_json::to_value(&p).unwrap();
-        let back: SummaryRefreshPayload = serde_json::from_value(v).unwrap();
+        let back: BackgroundCompressionPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back.parent_session_id, p.parent_session_id);
         assert_eq!(back.up_to_ordinal, p.up_to_ordinal);
     }

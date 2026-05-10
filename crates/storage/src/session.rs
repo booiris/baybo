@@ -63,7 +63,7 @@ pub trait SessionStore: Send + Sync {
     /// Return the session ids of every active maintenance session whose
     /// `Lineage.parent_session_id` matches `parent_session_id`. Used by
     /// the parent's agent loop to enforce the at-most-one-in-flight
-    /// `SummaryRefresher` invariant before spawning a new pass — if a
+    /// `BackgroundCompressionRunner` invariant before spawning a new pass — if a
     /// row is returned, the parent skips this trigger and re-evaluates
     /// next iteration. Returns the ids regardless of state because the
     /// "active" determination is whether an actor is running, which the

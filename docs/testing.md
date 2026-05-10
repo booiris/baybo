@@ -48,7 +48,7 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 | Crate              | Helper                                                                  | Purpose                                                                                       |
 | ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `aura-storage`     | `MemorySecretStore`                                                     | In-memory `SecretStore` impl with `len()` / `is_empty()` for vault-state assertions.          |
-| `aura-storage`     | `MemoryJobStore`, `MemoryCostStore`, `MemoryTraceStore`, `MemoryMemoryStore` | In-memory backends for the remaining `Store` traits. Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. |
+| `aura-storage`     | `MemoryJobStore`, `MemoryCostStore`, `MemoryTraceStore`, `MemoryMemoryStore`, `MemorySessionStore` | In-memory backends for the remaining `Store` traits. Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. `MemorySessionStore` stubs out lineage / fork / maintenance lookups (returning empty); tests that need that surface should use the real libsql store via `Store::open` against a tempfile. |
 | `aura-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
 | `aura-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
 

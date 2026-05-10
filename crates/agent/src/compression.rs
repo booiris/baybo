@@ -30,7 +30,7 @@ use crate::trace::SpanRecorder;
 pub(crate) struct CompressionRunner {
     pub(crate) llm_client: Arc<GuardedLlm>,
     pub(crate) recorder: Arc<SpanRecorder>,
-    pub(crate) cost_manager: Option<Arc<CostManager>>,
+    pub(crate) cost_manager: Arc<CostManager>,
     /// Same gateway as the main LLM path. Compression LLM output and
     /// errors are scrubbed through it before they land in the trace,
     /// the cost record's joinable content, or the [Conversation
@@ -45,18 +45,34 @@ pub(crate) struct CompressionRunner {
     pub(crate) cancel_token: CancellationToken,
 }
 
+/// Result of one [`CompressionRunner::run`] pass: the sanitized LLM
+/// response plus the span id + post-pricing cost the call billed.
+/// Inline (`compress_if_needed`) callers usually only need
+/// `response`; the background-compression path persists `span_id` +
+/// `cost_micros` to `session_summaries` so per-pass telemetry is
+/// available without re-querying the trace store.
+pub(crate) struct CompressionRun {
+    pub response: aura_llm::LlmResponse,
+    pub span_id: String,
+    pub cost_micros: i64,
+}
+
 impl CompressionRunner {
     /// Execute the compression LLM call. Brackets it in a
     /// `StepKind::Compression` step + `LlmCall` span (real lifecycle —
     /// not a post-hoc placeholder), records the cost row against the
     /// span_id while the span is open, and returns the sanitized
-    /// `LlmResponse`. `maybe_compress` then trims the content and
-    /// applies the strategy's `on_failure` slice if the response is
-    /// empty or this method returns `Err`.
+    /// `LlmResponse` along with the span id + billed cost. The inline
+    /// (`maybe_compress`) closure typically discards the metadata; the
+    /// background-compression path consumes both.
+    ///
+    /// `maybe_compress` then trims the content and applies the
+    /// strategy's `on_failure` slice if the response is empty or this
+    /// method returns `Err`.
     pub(crate) async fn run(
         self,
         request: aura_llm::ChatRequest,
-    ) -> Result<aura_llm::LlmResponse, aura_context::ContextError> {
+    ) -> Result<CompressionRun, aura_context::ContextError> {
         let CompressionRunner {
             llm_client,
             recorder,
@@ -89,13 +105,14 @@ impl CompressionRunner {
             StepKind::Compression,
             cancel_ctx,
             |step| async move {
-                let response = crate::scope::with_llm_span(
+                let result = crate::scope::with_llm_span(
                     recorder_inner.as_ref(),
                     &step,
                     job_id,
                     begin,
                     cancel_ctx,
                     |span| async move {
+                        let span_id_str = span.span_id.to_string();
                         match llm_client.chat(&request).await {
                             Ok(mut response) => {
                                 if let Err(e) =
@@ -106,19 +123,26 @@ impl CompressionRunner {
                                         "failed to sanitize compression LLM response"
                                     );
                                 }
-                                if let Some(cm) = &cost_manager {
-                                    cm.record_call(
-                                        &user_id,
-                                        session_id.clone(),
-                                        job_id,
-                                        span.span_id,
+                                cost_manager.record_call(
+                                    &user_id,
+                                    session_id.clone(),
+                                    job_id,
+                                    span.span_id,
+                                    &model_info.id,
+                                    response.usage.input_tokens,
+                                    response.usage.output_tokens,
+                                    response.usage.cached_input_tokens,
+                                    response.usage.cache_creation_input_tokens,
+                                );
+                                let cost_micros = cost_manager
+                                    .cost_usd_for(
                                         &model_info.id,
                                         response.usage.input_tokens,
                                         response.usage.output_tokens,
                                         response.usage.cached_input_tokens,
                                         response.usage.cache_creation_input_tokens,
-                                    );
-                                }
+                                    )
+                                    .into_micros();
                                 let call_result = LlmCallResult {
                                     output_content: response.content.clone(),
                                     thinking: response.thinking.clone(),
@@ -130,7 +154,14 @@ impl CompressionRunner {
                                         .usage
                                         .cache_creation_input_tokens,
                                 };
-                                (call_result, Ok(response))
+                                (
+                                    call_result,
+                                    Ok(CompressionRun {
+                                        response,
+                                        span_id: span_id_str,
+                                        cost_micros,
+                                    }),
+                                )
                             }
                             Err(e) => {
                                 let raw = e.to_string();
@@ -151,7 +182,7 @@ impl CompressionRunner {
                     },
                 )
                 .await?;
-                Ok((LifecycleOutcome::Ok, response))
+                Ok((LifecycleOutcome::Ok, result))
             },
         )
         .await

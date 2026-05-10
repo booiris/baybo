@@ -104,7 +104,7 @@ pub const BROWSER_PROFILE_SUBDIR: &str = "browser/profile";
 /// Per-session writable state dir lives at
 /// `<STATE_DIR>/<STATE_SESSIONS_SUBDIR>/<session_id>/`. Currently holds
 /// `summary.md` for the async summary-refresh design (see
-/// `docs/context-summary-refresh.md`); future per-session writable
+/// `docs/background-compression.md`); future per-session writable
 /// artifacts go alongside it. Distinct from `<LOGS_DIR>/sessions/`,
 /// which is the *append-only* per-session LLM call log.
 pub const STATE_SESSIONS_SUBDIR: &str = "sessions";

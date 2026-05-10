@@ -3,7 +3,7 @@
 //! On-disk content lives at `<workspace>/state/sessions/<session_id>/summary.md`;
 //! the row in `session_summaries` is the durable, queryable index that pairs
 //! each summary with the message-ordinal cursor it covers. See
-//! [`docs/context-summary-refresh.md`](../../../docs/context-summary-refresh.md)
+//! [`docs/background-compression.md`](../../../docs/background-compression.md)
 //! for the full design.
 
 use async_trait::async_trait;
