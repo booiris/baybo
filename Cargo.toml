@@ -212,7 +212,9 @@ panic = "abort"
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
+incremental = false
 
 [profile.test]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
+incremental = false
