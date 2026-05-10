@@ -1667,8 +1667,22 @@ impl AgentLoop {
     /// activity disjunct is trivially satisfied); `false` at
     /// iteration boundaries (where it relies on
     /// `tool_calls_since_anchor` exceeding the threshold).
+    ///
+    /// **Anchor-cursor sync (lazy pull).** The in-memory
+    /// `last_summary_anchor` is only advanced by inline-compression
+    /// applies. A successful background pass writes a fresh
+    /// `session_summaries.cursor` but doesn't touch this loop's
+    /// state — without intervention `tokens_since_anchor` would keep
+    /// reporting the same delta and the gate would re-spawn a fresh
+    /// pass on every later job. The fix is to read the metadata
+    /// **once per evaluation** (we already need the same row for
+    /// the `in_flight` check) and use its cursor to advance the
+    /// in-memory anchor before measuring `tokens_since_anchor` /
+    /// `tool_calls_since_anchor`. `sync_anchor_to_cursor` is
+    /// monotonic, so a stale cursor or one already inside a
+    /// rewritten slice is a no-op.
     async fn maybe_spawn_background_compression(
-        &self,
+        &mut self,
         session: &Session,
         current_job_id: aura_model::JobId,
         job_done: bool,
@@ -1679,6 +1693,8 @@ impl AgentLoop {
         let Some(sessions) = self.sessions.as_ref() else {
             return;
         };
+        let sessions = sessions.clone();
+        let tx = tx.clone();
 
         let max_tokens = self.context_manager.budget().max_tokens();
         let tokens_now = self.context_manager.budget().current();
@@ -1686,6 +1702,40 @@ impl AgentLoop {
             (max_tokens as f64 * aura_context::SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO) as usize;
         if tokens_now <= tokens_threshold {
             return;
+        }
+
+        // One round-trip to the parent's `session_summaries` row
+        // covers two needs: (a) the `in_flight` gate, (b) the
+        // cursor of the latest successful background pass. We use
+        // (b) to pull the in-memory anchor forward *before* the
+        // anchor-relative threshold checks below — otherwise a
+        // session that crossed the 50% mark once would re-fire the
+        // background path on every subsequent job until inline
+        // compression eventually resets the anchor.
+        let metadata = match sessions.summary_metadata(&session.id).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    parent_session_id = %session.id,
+                    error = %e,
+                    "summary trigger: summary_metadata lookup failed; skipping"
+                );
+                return;
+            }
+        };
+        if let Some(meta) = metadata.as_ref() {
+            if meta.in_flight {
+                debug!(
+                    parent_session_id = %session.id,
+                    "summary trigger: in_flight already set; skipping"
+                );
+                return;
+            }
+            // `sync_anchor_to_cursor` is monotonic and a no-op when
+            // the cursor isn't in the current active set.
+            self.context_manager
+                .sync_anchor_to_cursor(meta.cursor)
+                .await;
         }
 
         let tokens_since = self.context_manager.tokens_since_anchor();
@@ -1696,31 +1746,6 @@ impl AgentLoop {
         let tool_calls = self.context_manager.tool_calls_since_anchor();
         if !job_done && tool_calls <= aura_context::SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD {
             return;
-        }
-
-        // Spawn-serialization (R4): the parent's `session_summaries.in_flight`
-        // flag is the canonical "a refresh pass is already running"
-        // signal. Maintenance session rows are kept as audit history
-        // and are no longer consulted here — the flag is set by the
-        // gate below before `try_send` and cleared by the runner's
-        // `record_summary_success` / `record_summary_failure` calls.
-        match sessions.summary_metadata(&session.id).await {
-            Ok(Some(meta)) if meta.in_flight => {
-                debug!(
-                    parent_session_id = %session.id,
-                    "summary trigger: in_flight already set; skipping"
-                );
-                return;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(
-                    parent_session_id = %session.id,
-                    error = %e,
-                    "summary trigger: in_flight lookup failed; skipping"
-                );
-                return;
-            }
         }
 
         // Pin the snapshot's upper bound at trigger time so

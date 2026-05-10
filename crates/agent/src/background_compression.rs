@@ -339,12 +339,15 @@ async fn read_existing_summary(
 /// Startup orphan reaper. Runs once per process boot, *before* the
 /// supervisor starts spawning actors. Two responsibilities:
 ///
-/// 1. **DB-side** — delete every existing maintenance session row
-///    (`is_normal_session = 0`). These represent in-flight passes
-///    that were running when the previous process crashed; their
-///    actors are gone, their state is stateless by design, and
-///    their parents' `error_count` should reflect the failed pass
-///    so operators see the trace.
+/// 1. **DB-side** — delete only the maintenance session rows
+///    (`is_normal_session = 0`) whose associated job is **not** in a
+///    terminal state. Those represent in-flight passes that were
+///    running when the previous process crashed; their actors are
+///    gone, their state is stateless by design, and their parents'
+///    `error_count` should reflect the failed pass so operators see
+///    the trace. Maintenance sessions whose pass landed cleanly
+///    (`jobs.status_kind` ∈ {`completed`, `failed`, `cancelled`})
+///    are kept as audit history — cost-records joins depend on them.
 /// 2. **FS-side** — scan
 ///    `<workspace>/state/sessions/*/summary.md` and delete any file
 ///    whose `session_id` has no corresponding row in
@@ -374,10 +377,12 @@ pub async fn reap_maintenance_orphans(
     }
 
     // ---- DB orphans ---------------------------------------------------
-    let maintenance_ids = match sessions.all_maintenance_sessions().await {
+    // `unfinished_maintenance_sessions()` excludes rows whose job
+    // reached a terminal state — those are kept as audit history.
+    let maintenance_ids = match sessions.unfinished_maintenance_sessions().await {
         Ok(ids) => ids,
         Err(e) => {
-            warn!(error = %e, "orphan reap: list_all_maintenance_sessions failed");
+            warn!(error = %e, "orphan reap: list_unfinished_maintenance_sessions failed");
             Vec::new()
         }
     };
@@ -411,7 +416,7 @@ pub async fn reap_maintenance_orphans(
     if !maintenance_ids.is_empty() {
         info!(
             reaped = maintenance_ids.len(),
-            "orphan reap: deleted in-flight maintenance sessions from previous boot"
+            "orphan reap: deleted unfinished maintenance sessions from previous boot"
         );
     }
 

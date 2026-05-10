@@ -239,6 +239,110 @@ async fn orphan_reaper_cleans_db_and_fs() {
     );
 }
 
+/// Reaper preserves maintenance sessions whose job reached a
+/// terminal state — they are kept as audit history for the
+/// cost-records join. Only sessions whose job is still pending /
+/// in_progress / stuck (or has no job at all) get reaped.
+#[tokio::test]
+async fn orphan_reaper_preserves_completed_maintenance_sessions() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-mixed");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    ));
+
+    // (a) A maintenance session whose pass *succeeded* — its job is
+    //     `Completed`. Reaper must keep it.
+    let completed_maint = mgr
+        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
+        .await
+        .unwrap();
+    let mut completed_job = aura_job::Job::new(
+        completed_maint.id.clone(),
+        aura_job::JobInput::System {
+            reason: SystemReason::BackgroundCompression,
+            payload: serde_json::Value::Null,
+        },
+        "soul-v1",
+        None,
+    );
+    store.job.create(&completed_job).await.unwrap();
+    let _ = completed_job.start().unwrap();
+    let _ = completed_job
+        .complete(aura_job::JobOutput::Structured {
+            value: serde_json::json!({"cursor": 1}),
+        })
+        .unwrap();
+    store.job.save(&completed_job).await.unwrap();
+
+    // (b) A maintenance session whose job stayed `InProgress` — a
+    //     crash mid-pass. Reaper must delete it.
+    let in_flight_maint = mgr
+        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
+        .await
+        .unwrap();
+    let mut in_flight_job = aura_job::Job::new(
+        in_flight_maint.id.clone(),
+        aura_job::JobInput::System {
+            reason: SystemReason::BackgroundCompression,
+            payload: serde_json::Value::Null,
+        },
+        "soul-v1",
+        None,
+    );
+    store.job.create(&in_flight_job).await.unwrap();
+    let _ = in_flight_job.start().unwrap();
+    store.job.save(&in_flight_job).await.unwrap();
+
+    // (c) A maintenance session with **no** job row — also reaped
+    //     (process died between session create and `with_job`).
+    let no_job_maint = mgr
+        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
+        .await
+        .unwrap();
+
+    let ws_root = dir.path().join("workspace");
+    let paths = WorkspacePaths::new(ws_root.clone());
+    reap_maintenance_orphans(&mgr, &paths).await;
+
+    // The completed maintenance session survives.
+    assert!(
+        store
+            .session
+            .get(&completed_maint.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "completed maintenance session must be preserved as audit history"
+    );
+
+    // The in-flight and no-job ones get deleted.
+    assert!(
+        store
+            .session
+            .get(&in_flight_maint.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "in-flight maintenance session must be reaped"
+    );
+    assert!(
+        store.session.get(&no_job_maint.id).await.unwrap().is_none(),
+        "maintenance session without a job row must be reaped"
+    );
+
+    // Parent's error_count reflects exactly the two reaped passes.
+    let parent_meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert_eq!(
+        parent_meta.error_count, 2,
+        "error_count must bump only for reaped (unfinished) passes, not for completed ones"
+    );
+}
+
 /// Cascade-on-delete: removing a parent session takes its
 /// `session_summaries` row with it (`ON DELETE CASCADE` FK).
 #[tokio::test]

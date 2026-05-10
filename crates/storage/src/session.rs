@@ -79,6 +79,25 @@ pub trait SessionStore: Send + Sync {
     /// actor isn't running after a process bounce.
     async fn list_all_maintenance_sessions(&self) -> Result<Vec<SessionId>>;
 
+    /// Return only the maintenance session ids whose associated job is
+    /// **not** in a terminal state (`completed` / `failed` /
+    /// `cancelled`). These are passes that were running when the
+    /// previous process crashed; their parents' `error_count` should
+    /// be bumped and their session rows reaped.
+    ///
+    /// Maintenance sessions whose job is terminal are *kept* as audit
+    /// history — joining `cost_records` through them is the only way
+    /// to attribute background-compression spend back to the
+    /// originating parent, and treating them as orphans on every
+    /// restart would silently delete that audit chain.
+    ///
+    /// Sessions with **no** job row at all (a pathological window
+    /// between `create_maintenance_session` and `with_job` that the
+    /// process didn't survive) are also returned — there's no LLM
+    /// spend or audit value to preserve, and leaving them behind
+    /// would accumulate dead rows.
+    async fn list_unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>>;
+
     /// Return every immediate live descendant (Subagent or UserFork)
     /// of the given parent. Powers `lineage_tree` and
     /// `list_active_subagents`. Order is unspecified.

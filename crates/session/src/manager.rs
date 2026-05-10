@@ -257,6 +257,18 @@ impl SessionManager {
             .map_err(wrap)
     }
 
+    /// Maintenance sessions whose associated job is **not** in a
+    /// terminal state (`completed` / `failed` / `cancelled`) — i.e.
+    /// only the ones the startup reaper actually needs to clean up.
+    /// Sessions whose pass landed cleanly are kept as audit history
+    /// (cost-records join lookups depend on them).
+    pub async fn unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
+        self.store
+            .list_unfinished_maintenance_sessions()
+            .await
+            .map_err(wrap)
+    }
+
     /// Create a session that descends from `parent` via the given
     /// lineage (subagent or user-fork). The child inherits its
     /// trigger from the parent's root session and gets a fresh

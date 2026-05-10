@@ -692,6 +692,17 @@ impl SessionStore for MemorySessionStore {
         Ok(Vec::new())
     }
 
+    /// In-memory mock has no `jobs` table, so it cannot do the
+    /// cross-table check the libsql backend performs. Conservative:
+    /// reuse `list_all_maintenance_sessions` semantics (treat every
+    /// maintenance session as unfinished). Tests that need to assert
+    /// the "completed pass survives reap" path must run against the
+    /// libsql in-memory backend, where the SQL implementation
+    /// genuinely joins `jobs.status_kind`.
+    async fn list_unfinished_maintenance_sessions(&self) -> SessionStoreResult<Vec<SessionId>> {
+        self.list_all_maintenance_sessions().await
+    }
+
     async fn append_session_message(
         &self,
         session_id: &SessionId,

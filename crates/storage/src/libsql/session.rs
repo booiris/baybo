@@ -381,6 +381,46 @@ impl SessionStore for LibsqlSessionStore {
         Ok(out)
     }
 
+    async fn list_unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
+        // Maintenance sessions are reaped only when their associated
+        // job is in a non-terminal state — or when there is no job
+        // row at all (the session was created but the process died
+        // before `with_job` ran). Terminal jobs (completed, failed,
+        // cancelled) are kept as audit history so cost reports can
+        // still join `cost_records` back through the maintenance
+        // session row.
+        //
+        // String literals match `JobStatusKind`'s `status_kind_str`
+        // mapping in `crates/storage/src/libsql/job.rs:18`.
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT s.id FROM sessions s \
+                 WHERE s.is_normal_session = 0 \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM jobs j \
+                     WHERE j.session_id = s.id \
+                     AND j.status_kind IN ('completed', 'failed', 'cancelled') \
+                 )",
+                (),
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            out.push(SessionId::from(id));
+        }
+        Ok(out)
+    }
+
     async fn append_session_message(
         &self,
         session_id: &SessionId,

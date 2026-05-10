@@ -939,6 +939,11 @@ mod tests {
         ) -> std::result::Result<Vec<SessionId>, StorageError> {
             Ok(Vec::new())
         }
+        async fn list_unfinished_maintenance_sessions(
+            &self,
+        ) -> std::result::Result<Vec<SessionId>, StorageError> {
+            Ok(Vec::new())
+        }
         async fn append_session_message(
             &self,
             id: &SessionId,

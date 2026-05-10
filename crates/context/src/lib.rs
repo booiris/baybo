@@ -579,30 +579,79 @@ impl ContextManager {
         };
         let Some(metadata) = metadata else { return };
 
-        match sessions
-            .load_session_messages_with_supersede(&session_id)
+        self.last_summary_anchor = self.lookup_anchor_index_for_cursor(metadata.cursor).await;
+    }
+
+    /// Walk the bound session's supersede log, filter to active rows
+    /// (`superseded_by IS NULL`), find the active row whose `ordinal ==
+    /// cursor`. The active row's position in the active sequence is
+    /// the in-memory anchor index. Returns `None` when the cursor's
+    /// ordinal isn't in the active set (compression has rewritten that
+    /// message away) or the lookup fails.
+    async fn lookup_anchor_index_for_cursor(&self, cursor: i64) -> Option<usize> {
+        let rows = match self
+            .sessions
+            .load_session_messages_with_supersede(&self.session_id)
             .await
         {
-            Ok(rows) => {
-                let mut active_idx: usize = 0;
-                let mut anchor: Option<usize> = None;
-                for row in rows.iter() {
-                    if row.superseded_by.is_some() {
-                        continue;
-                    }
-                    if row.ordinal == metadata.cursor {
-                        anchor = Some(active_idx);
-                        break;
-                    }
-                    active_idx += 1;
-                }
-                self.last_summary_anchor = anchor;
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    cursor,
+                    "failed to load supersede log; anchor lookup aborted"
+                );
+                return None;
             }
-            Err(e) => warn!(
-                session_id = %session_id,
-                error = %e,
-                "failed to load supersede log on cold start; anchor unset"
-            ),
+        };
+
+        let mut active_idx: usize = 0;
+        for row in rows.iter() {
+            if row.superseded_by.is_some() {
+                continue;
+            }
+            if row.ordinal == cursor {
+                return Some(active_idx);
+            }
+            active_idx += 1;
+        }
+        None
+    }
+
+    /// Notification handler for "background summary refresh just landed
+    /// at `cursor`". Maps the persisted `session_messages.ordinal` to
+    /// the corresponding in-memory message index and advances
+    /// `last_summary_anchor` so the parent's trigger-gate
+    /// `tokens_since_anchor` / `tool_calls_since_anchor` measure
+    /// growth *since* the latest successful pass — preventing the same
+    /// 50%-budget session from re-spawning a fresh background pass on
+    /// every later job.
+    ///
+    /// Monotonic: only advances; never moves the anchor backwards.
+    /// When the cursor's ordinal is no longer in the active set (an
+    /// inline compression has rewritten the transcript past it), the
+    /// anchor stays where the inline path put it.
+    pub async fn sync_anchor_to_cursor(&mut self, cursor: i64) {
+        let Some(idx) = self.lookup_anchor_index_for_cursor(cursor).await else {
+            debug!(
+                session_id = %self.session_id,
+                cursor,
+                "summary settle: cursor not in active set; anchor unchanged"
+            );
+            return;
+        };
+        let advance = self
+            .last_summary_anchor
+            .is_none_or(|current| idx > current);
+        if advance {
+            self.last_summary_anchor = Some(idx);
+            debug!(
+                session_id = %self.session_id,
+                cursor,
+                anchor_idx = idx,
+                "summary settle: anchor advanced"
+            );
         }
     }
 
@@ -1614,6 +1663,73 @@ mod tests {
         ctx.append(&tool_use_msg("tu-after-compaction")).await;
         assert_eq!(ctx.tool_calls_since_anchor(), 1);
         assert!(ctx.tokens_since_anchor() > 0);
+    }
+
+    /// Background pass settled: cursor maps to an active row's
+    /// position, anchor advances to that index, future
+    /// `tokens_since_anchor` measures only growth past the cursor.
+    #[tokio::test]
+    async fn sync_anchor_to_cursor_advances_anchor_to_persisted_position() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        // Three messages → ordinals 0, 1, 2 in the in-memory store.
+        ctx.append(&make_msg(Role::User, "msg-0")).await;
+        ctx.append(&make_msg(Role::Assistant, "msg-1")).await;
+        ctx.append(&make_msg(Role::User, "msg-2")).await;
+
+        // Default: anchor unset, tokens_since_anchor = full transcript.
+        let total: usize = ctx.per_message_tokens.iter().sum();
+        assert_eq!(ctx.tokens_since_anchor(), total);
+
+        // Background pass landed at ordinal 1 → anchor moves to
+        // active idx 1, so tokens_since_anchor only counts msg-2.
+        ctx.sync_anchor_to_cursor(1).await;
+        assert_eq!(ctx.last_summary_anchor(), Some(1));
+        let after = ctx.per_message_tokens[1..].iter().sum::<usize>();
+        assert_eq!(ctx.tokens_since_anchor(), after);
+    }
+
+    /// Cursor that's not in the active set (e.g. an inline
+    /// compression has rewritten the row away) is a no-op — the
+    /// anchor stays where it was.
+    #[tokio::test]
+    async fn sync_anchor_to_cursor_noop_when_cursor_missing() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "msg-0")).await;
+        ctx.append(&make_msg(Role::Assistant, "msg-1")).await;
+
+        // Anchor pre-positioned at end-of-transcript (mirrors a fresh
+        // inline compression apply).
+        let pre_len = ctx.messages().len();
+        ctx.last_summary_anchor = Some(pre_len);
+
+        // ordinal 999 isn't in the supersede log — stale cursor.
+        ctx.sync_anchor_to_cursor(999).await;
+        assert_eq!(
+            ctx.last_summary_anchor(),
+            Some(pre_len),
+            "anchor must not move when cursor is unmapped"
+        );
+    }
+
+    /// Sync is monotonic — it never moves the anchor backward, so a
+    /// late-arriving notification from an earlier pass cannot undo a
+    /// fresher inline compression apply.
+    #[tokio::test]
+    async fn sync_anchor_to_cursor_does_not_retreat() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "msg-0")).await;
+        ctx.append(&make_msg(Role::Assistant, "msg-1")).await;
+        ctx.append(&make_msg(Role::User, "msg-2")).await;
+
+        // Anchor already past where cursor 0 would land (e.g. a more
+        // recent pass landed first).
+        ctx.last_summary_anchor = Some(2);
+        ctx.sync_anchor_to_cursor(0).await;
+        assert_eq!(
+            ctx.last_summary_anchor(),
+            Some(2),
+            "monotonic: stale cursor must not retreat the anchor"
+        );
     }
 
     /// `restore_messages` drops the anchor — the prior position
