@@ -73,8 +73,11 @@ async fn record_then_read_summary_metadata_via_session_manager() {
     let session = root_session("user-A");
     store.session.save(&session).await.unwrap();
 
-    let mgr = SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
-        .with_summary_store(store.session_summary.clone());
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    );
 
     // Initially no metadata.
     let none = mgr.summary_metadata(&session.id).await.unwrap();
@@ -121,8 +124,11 @@ async fn maintenance_sessions_are_invisible_to_default_listings() {
     let parent = root_session("parent-1");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
-        .with_summary_store(store.session_summary.clone());
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    );
 
     // Spawn one maintenance session for the parent.
     let maint = mgr
@@ -158,10 +164,11 @@ async fn orphan_reaper_cleans_db_and_fs() {
     let parent = root_session("parent-orphan");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = Arc::new(
-        SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
-            .with_summary_store(store.session_summary.clone()),
-    );
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    ));
 
     // Create a maintenance session — represents a pass that was
     // running when the previous process crashed.
@@ -240,8 +247,11 @@ async fn parent_delete_cascades_summary_metadata() {
     let parent = root_session("parent-cascade");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
-        .with_summary_store(store.session_summary.clone());
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    );
 
     mgr.record_summary_success(&parent.id, 1, 1, "m", "span", Utc::now())
         .await
@@ -300,8 +310,11 @@ async fn rapid_record_calls_accumulate_cost_and_pass_count() {
     let parent = root_session("rapid");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(store.session.clone(), ChronoDuration::minutes(30))
-        .with_summary_store(store.session_summary.clone());
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        ChronoDuration::minutes(30),
+    );
 
     // 5 quick passes — same span_id pattern as production "many
     // refreshes per session" exercise.

@@ -399,9 +399,7 @@ pub async fn reap_maintenance_orphans(
         );
     }
 
-    let Some(summary_store) = sessions.summary_store() else {
-        return;
-    };
+    let summary_store = sessions.summary_store();
     let known_ids: std::collections::HashSet<String> = match summary_store.list_session_ids().await
     {
         Ok(ids) => ids.into_iter().map(|i| i.as_str().to_string()).collect(),

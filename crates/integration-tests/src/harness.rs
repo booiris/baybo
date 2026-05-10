@@ -322,8 +322,11 @@ impl AgentTestHarnessBuilder {
         let token_calibration = Arc::new(aura_context::TokenCalibration::new());
         let session_store = Arc::new(aura_storage::test_support::MemorySessionStore::new())
             as Arc<dyn aura_storage::SessionStore>;
+        let summary_store = Arc::new(aura_storage::test_support::MemorySessionSummaryStore::new())
+            as Arc<dyn aura_storage::SessionSummaryStore>;
         let session_manager = Arc::new(aura_agent::SessionManager::new(
             session_store,
+            summary_store,
             chrono::Duration::minutes(30),
         ));
         let context_manager = ContextManager::new(

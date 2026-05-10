@@ -142,8 +142,12 @@ mod tests {
     async fn build() -> ChannelSessionResolver {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let session_store = Arc::new(LibsqlSessionStore::new(pool.clone()));
+        let summary_store = Arc::new(aura_storage::libsql::LibsqlSessionSummaryStore::new(
+            pool.clone(),
+        ));
         let session_mgr = Arc::new(SessionManager::new(
             session_store,
+            summary_store,
             chrono::Duration::seconds(300),
         ));
         let channel_store = Arc::new(LibsqlChannelSessionStore::new(pool));

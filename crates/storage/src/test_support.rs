@@ -26,6 +26,9 @@ use crate::job::{JobStore, Result as JobStoreResult};
 use crate::memory::{MemoryStore, Result as MemoryStoreResult};
 use crate::secret::{Result as SecretResult, SecretStore};
 use crate::session::{Result as SessionStoreResult, SessionStore, StoredMessage};
+use crate::session_summary::{
+    Result as SessionSummaryResult, SessionSummaryRow, SessionSummaryStore,
+};
 use crate::trace::{Result as TraceStoreResult, TraceStore};
 
 /// In-memory `SecretStore` for tests. Stores raw `(name, encrypted_value)`
@@ -777,5 +780,95 @@ impl SessionStore for MemorySessionStore {
                 rows
             })
             .unwrap_or_default())
+    }
+}
+
+/// In-memory `SessionSummaryStore` for tests across the workspace.
+/// Mirrors the libsql backend's behaviour for the trait surface
+/// (`upsert_success` resets `error_count`, `bump_error_count` inserts
+/// a zero row when missing) so unit tests can assert against the same
+/// invariants production exercises.
+#[derive(Default)]
+pub struct MemorySessionSummaryStore {
+    rows: Mutex<HashMap<SessionId, SessionSummaryRow>>,
+}
+
+impl MemorySessionSummaryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl SessionSummaryStore for MemorySessionSummaryStore {
+    async fn get(&self, session_id: &SessionId) -> SessionSummaryResult<Option<SessionSummaryRow>> {
+        Ok(self.rows.lock().get(session_id).cloned())
+    }
+
+    async fn upsert_success(
+        &self,
+        session_id: &SessionId,
+        cursor: i64,
+        cost_micros_delta: i64,
+        model_id: &str,
+        span_id: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> SessionSummaryResult<()> {
+        let mut guard = self.rows.lock();
+        let entry = guard
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionSummaryRow {
+                session_id: session_id.clone(),
+                cursor: 0,
+                pass_count: 0,
+                updated_at,
+                cost_micros: 0,
+                model_id: String::new(),
+                span_id: String::new(),
+                error_count: 0,
+            });
+        entry.cursor = cursor;
+        entry.pass_count += 1;
+        entry.cost_micros += cost_micros_delta;
+        entry.model_id = model_id.to_string();
+        entry.span_id = span_id.to_string();
+        entry.updated_at = updated_at;
+        entry.error_count = 0;
+        Ok(())
+    }
+
+    async fn bump_error_count(
+        &self,
+        session_id: &SessionId,
+        model_id: &str,
+        span_id: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> SessionSummaryResult<()> {
+        let mut guard = self.rows.lock();
+        let entry = guard
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionSummaryRow {
+                session_id: session_id.clone(),
+                cursor: 0,
+                pass_count: 0,
+                updated_at,
+                cost_micros: 0,
+                model_id: String::new(),
+                span_id: String::new(),
+                error_count: 0,
+            });
+        entry.error_count += 1;
+        entry.model_id = model_id.to_string();
+        entry.span_id = span_id.to_string();
+        entry.updated_at = updated_at;
+        Ok(())
+    }
+
+    async fn delete(&self, session_id: &SessionId) -> SessionSummaryResult<bool> {
+        Ok(self.rows.lock().remove(session_id).is_some())
+    }
+
+    async fn list_session_ids(&self) -> SessionSummaryResult<Vec<SessionId>> {
+        Ok(self.rows.lock().keys().cloned().collect())
     }
 }

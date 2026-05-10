@@ -364,10 +364,11 @@ mod tests {
         let session_store: Arc<dyn SessionStore> = Arc::new(LibsqlSessionStore::new(pool.clone()));
         let summary_store: Arc<dyn SessionSummaryStore> =
             Arc::new(LibsqlSessionSummaryStore::new(pool));
-        let manager = Arc::new(
-            SessionManager::new(session_store.clone(), chrono::Duration::minutes(30))
-                .with_summary_store(summary_store),
-        );
+        let manager = Arc::new(SessionManager::new(
+            session_store.clone(),
+            summary_store,
+            chrono::Duration::minutes(30),
+        ));
 
         let session = make_session("ctx-test");
         session_store.save(&session).await.unwrap();
@@ -418,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn falls_through_when_file_missing_despite_metadata() {
         let (wrapper, _loader, id, mgr) = wired_wrapper(200_000, 2).await;
-        let store = mgr.summary_store().unwrap();
+        let store = mgr.summary_store();
         store
             .upsert_success(&id, 5, 100, "m", "span", Utc::now())
             .await
@@ -460,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn fast_path_assembles_summary_plus_recent_slice() {
         let (wrapper, loader, id, mgr) = wired_wrapper(200_000, 2).await;
-        let store = mgr.summary_store().unwrap();
+        let store = mgr.summary_store();
         store
             .upsert_success(&id, 10, 100, "m", "span", Utc::now())
             .await
@@ -522,7 +523,7 @@ mod tests {
         // max=1000 → fall-through budget = 600 tokens. A summary
         // body of ~3000 chars (~750 tokens) blows past it.
         let (wrapper, loader, id, mgr) = wired_wrapper(1_000, 2).await;
-        let store = mgr.summary_store().unwrap();
+        let store = mgr.summary_store();
         store
             .upsert_success(&id, 5, 1, "m", "span", Utc::now())
             .await

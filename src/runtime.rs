@@ -353,17 +353,11 @@ pub async fn build_managers(
         }
     }
 
-    let session_manager = Arc::new(
-        SessionManager::new(
-            stores.session.clone(),
-            boot::to_session_timeout(&config.session),
-        )
-        // Wire the summary metadata store so the async refresh
-        // path's reads (`summary_metadata`) and writes
-        // (`record_summary_success` / `record_summary_failure`)
-        // hit the libsql backend. Without this they no-op.
-        .with_summary_store(stores.session_summary.clone()),
-    );
+    let session_manager = Arc::new(SessionManager::new(
+        stores.session.clone(),
+        stores.session_summary.clone(),
+        boot::to_session_timeout(&config.session),
+    ));
 
     // Reap orphans from any maintenance sessions that were
     // running when the previous process exited. Best-effort —
