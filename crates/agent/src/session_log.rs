@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::ChatMessage;
-use aura_workspace::paths::SESSION_LOG_EXTENSION;
+use aura_workspace::paths::{SESSION_LOG_EXTENSION, sanitize_session_id};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -192,25 +192,6 @@ fn typed_record_line<T: Serialize>(record_type: &'static str, record: &T) -> io:
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
-
-/// Map a session id to a filesystem-safe stem. Path separators, NULs,
-/// leading dots, and any character outside `[A-Za-z0-9_.-]` are replaced
-/// with `_` so a hostile or unusual id can never escape `base_dir`.
-fn sanitize_session_id(id: &str) -> String {
-    let mut out = String::with_capacity(id.len());
-    for ch in id.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() || out.starts_with('.') {
-        out.insert(0, '_');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -690,7 +690,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     tool_executor: Arc::clone(&tool_executor),
                     context_manager: ContextManager::from_config(ContextManagerConfig {
                         tokenizer: Arc::clone(&tokenizer),
-                        summary_state_dir: workspace_paths_arc.state_sessions_dir(),
+                        workspace: Arc::clone(&workspace_paths_arc),
                         keep_recent,
                         budget: token_budget.clone(),
                         calibration: Arc::clone(&token_calibration),

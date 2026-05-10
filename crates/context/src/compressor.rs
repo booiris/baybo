@@ -34,10 +34,13 @@ use crate::{
     SUMMARY_REFRESH_WAIT_TIMEOUT, estimate_skill_trailer_tokens, scan_skill_calls,
 };
 
-const CONTEXT_SUMMARY_WRAPPER_PREAMBLE: &str = "The conversation prior to this point has been compressed for context-window \
-management. The summary below was produced from the full prior conversation and \
-represents its substantive content. Treat it as established context for the user's \
-current request; the recent messages that follow are the only unsummarized exchanges.";
+/// Intro paragraph framing the summary as continuation of an earlier
+/// session. Mirrors Claude Code's compaction prompt.
+const CONTINUATION_INTRO: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the\nearlier portion of the conversation.";
+
+/// Closing paragraph instructing the model to resume work directly,
+/// without acknowledging the summary or prefacing the reply.
+const CONTINUATION_FOOTER: &str = "Recent messages are preserved verbatim.\nContinue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.";
 
 pub type ChatFuture =
     Pin<Box<dyn Future<Output = std::result::Result<LlmResponse, ContextError>> + Send>>;
@@ -62,9 +65,9 @@ pub enum CompressOutput {
 
 /// Trailing user prompt appended to the full conversation handed to
 /// the summarizer LLM. The instruction forces a tool-free response
-/// shaped as `<analysis>...</analysis><summary>...</summary>`; we
-/// keep the `<summary>` block verbatim (tags included) and discard
-/// the analysis.
+/// shaped as `<analysis>...</analysis><summary>...</summary>`. We
+/// strip the `<analysis>` block entirely and keep the inner body of
+/// `<summary>` (tags removed); see [`parse_summary_response`].
 ///
 /// Shared with `aura_agent::background_compression::build_summary_prompt`,
 /// which prepends a prior-summary preamble and appends a SIZE TARGET
@@ -184,20 +187,22 @@ fn strip_analysis_block(text: &str) -> String {
     }
 }
 
-/// Strip the `<analysis>` block, then return the `<summary>` block
-/// verbatim if present, else the non-empty leftover. `None` only when
-/// the leftover is empty / whitespace.
+/// Strip the `<analysis>` block, then return the inner body of the
+/// `<summary>` block (tags removed) if present, else the non-empty
+/// leftover. `None` only when nothing usable remains.
 ///
 /// Shared with `aura_agent::background_compression` — both call sites
 /// must agree on the tag contract or summaries silently corrupt when
-/// one path's prompt is updated without the other's.
+/// one path's prompt is updated without the other's. Returning inner
+/// body (rather than the verbatim block) keeps `summary.md` clean of
+/// the tags and lets the compressor wrap the body in a fresh
+/// "Summary:" prefix when it lands in the LLM transcript.
 pub fn parse_summary_response(text: &str) -> Option<String> {
     let stripped = strip_analysis_block(text);
-    if let Some(range) = find_tagged_block(&stripped, "summary") {
-        let block = &stripped[range];
-        if !block.trim().is_empty() {
-            return Some(block.to_string());
-        }
+    if let Some(inner) = find_tagged_inner(&stripped, "summary")
+        && !inner.trim().is_empty()
+    {
+        return Some(inner.trim().to_string());
     }
     let leftover = stripped.trim();
     if leftover.is_empty() {
@@ -205,6 +210,16 @@ pub fn parse_summary_response(text: &str) -> Option<String> {
     } else {
         Some(leftover.to_string())
     }
+}
+
+/// Like [`find_tagged_block`] but returns the inner body (between the
+/// open and close tags), not the wrapped block.
+fn find_tagged_inner<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let close_offset = text[start..].find(&close)?;
+    Some(&text[start..start + close_offset])
 }
 
 pub(crate) fn partition_system(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
@@ -390,9 +405,12 @@ impl ContextManager {
                 return None;
             }
         };
-        let summary_content = match self.summary_loader.load(&self.session_id).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
+        let summary_path = self
+            .workspace
+            .session_summary_file(self.session_id.as_str());
+        let summary_content = match tokio::fs::read_to_string(&summary_path).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
                     session_id = %self.session_id,
                     cursor = metadata.cursor,
@@ -496,7 +514,12 @@ impl ContextManager {
         let cut = pair_preserving_cut(&non_system, walk_cut.min(post_cursor_cut));
         let recent_slice = non_system[cut..].to_vec();
 
-        let summary_msg = build_summary_message(&summary_content);
+        let transcript_path = self.workspace.session_log_file(self.session_id.as_str());
+        let summary_msg = build_summary_message(
+            &summary_content,
+            &transcript_path,
+            /* prefix_summary_label */ false,
+        );
         let summary_tokens = self.tokenizer.count_message(&summary_msg);
         let called = scan_skill_calls(&recent_slice);
         let skill_trailer_tokens = estimate_skill_trailer_tokens(
@@ -573,14 +596,16 @@ impl ContextManager {
             CompressOutput::Replaced { messages: out }
         };
 
+        let transcript_path = self.workspace.session_log_file(self.session_id.as_str());
         match chat(request).await {
             Ok(response) => match parse_summary_response(&response.content) {
                 Some(content) => {
                     let mut new_messages = system_msgs;
-                    new_messages.push(ChatMessage {
-                        role: Role::User,
-                        content: vec![ContentBlock::Text(content)],
-                    });
+                    new_messages.push(build_summary_message(
+                        &content,
+                        &transcript_path,
+                        /* prefix_summary_label */ true,
+                    ));
                     CompressOutput::Replaced {
                         messages: new_messages,
                     }
@@ -600,15 +625,34 @@ impl ContextManager {
     }
 }
 
-fn build_summary_message(summary_content: &str) -> ChatMessage {
-    let body = format!(
-        "<context-summary>\n{}\n\n{}\n</context-summary>",
-        CONTEXT_SUMMARY_WRAPPER_PREAMBLE,
-        summary_content.trim()
+/// Build a continuation-style summary message.
+///
+/// The fast-path passes the precomputed `summary.md` body directly;
+/// the LLM-summary path passes the parsed inner body and sets
+/// `prefix_summary_label = true` so the model sees an explicit
+/// `Summary:` header. `transcript_path` points at the per-session
+/// JSONL the agent loop appends to so the model can request specific
+/// pre-compaction details if needed.
+fn build_summary_message(
+    body: &str,
+    transcript_path: &std::path::Path,
+    prefix_summary_label: bool,
+) -> ChatMessage {
+    let body_block = if prefix_summary_label {
+        format!("Summary:\n{}", body.trim())
+    } else {
+        body.trim().to_string()
+    };
+    let text = format!(
+        "{intro}\n\n{body}\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: {transcript}\n\n{footer}",
+        intro = CONTINUATION_INTRO,
+        body = body_block,
+        transcript = transcript_path.display(),
+        footer = CONTINUATION_FOOTER,
     );
     ChatMessage {
         role: Role::User,
-        content: vec![ContentBlock::Text(body)],
+        content: vec![ContentBlock::Text(text)],
     }
 }
 
@@ -769,10 +813,7 @@ mod tests {
     fn parse_summary_response_picks_first_summary_after_stripping_analysis() {
         let text =
             "<analysis>a</analysis><summary>FIRST</summary> trailing <summary>SECOND</summary>";
-        assert_eq!(
-            parse_summary_response(text).as_deref(),
-            Some("<summary>FIRST</summary>")
-        );
+        assert_eq!(parse_summary_response(text).as_deref(), Some("FIRST"));
     }
 
     #[test]
@@ -787,10 +828,7 @@ mod tests {
     #[test]
     fn parse_summary_response_handles_no_analysis_block() {
         let text = "<summary>S</summary>";
-        assert_eq!(
-            parse_summary_response(text).as_deref(),
-            Some("<summary>S</summary>")
-        );
+        assert_eq!(parse_summary_response(text).as_deref(), Some("S"));
 
         let text = "no tags whatsoever";
         assert_eq!(

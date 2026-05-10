@@ -9,6 +9,7 @@
 //! must skip the live LLM-summary stage entirely — proven by absence
 //! of `SUMMARIZE_INSTRUCTION` in any captured `ChatRequest`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aura_context::{SUMMARIZE_INSTRUCTION, budget::TokenBudget};
@@ -44,11 +45,13 @@ fn any_request_invoked_summarizer(requests: &[aura_llm::ChatRequest]) -> bool {
 /// summarizer instruction fingerprint.
 #[tokio::test]
 async fn fast_path_skips_chat_callback_when_summary_md_present() {
-    // Tempdir hosts the `<state>/sessions/<session_id>/summary.md`
-    // payload the wrapper's `FsSummaryLoader` will read on the second
-    // turn. Held until the test ends.
-    let summary_root = TempDir::new().expect("tempdir");
-    let summary_root_path = summary_root.path().to_path_buf();
+    // Tempdir is the workspace root. The fast-path will read
+    // `<root>/state/sessions/<session_id>/summary.md` from it on the
+    // second turn. Held until the test ends.
+    let workspace_root = TempDir::new().expect("tempdir");
+    let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
+        workspace_root.path().to_path_buf(),
+    ));
 
     // Tight budget so the second turn definitely trips the
     // compression gate inside `compress_if_needed`. With max=400 and
@@ -57,7 +60,7 @@ async fn fast_path_skips_chat_callback_when_summary_md_present() {
 
     let mut harness = AgentTestHarness::builder()
         .with_token_budget(budget)
-        .with_summary_state_dir(summary_root_path.clone())
+        .with_workspace(Arc::clone(&workspace))
         .with_keep_recent(2)
         .build();
 
@@ -84,16 +87,13 @@ async fn fast_path_skips_chat_callback_when_summary_md_present() {
     // reply (=3). Cursor=2 places the wrapper's coverage boundary at
     // the user message so the post-cursor span is exactly the
     // assistant reply plus whatever turn 2 appends.
-    let session_summary_dir = summary_root_path.join(harness.session.id.as_str());
-    tokio::fs::create_dir_all(&session_summary_dir)
+    let summary_path = workspace.session_summary_file(harness.session.id.as_str());
+    tokio::fs::create_dir_all(summary_path.parent().expect("summary dir"))
         .await
         .expect("session summary dir");
-    tokio::fs::write(
-        session_summary_dir.join("summary.md"),
-        "PRECOMPUTED SUMMARY OF EARLIER CONVERSATION",
-    )
-    .await
-    .expect("write summary.md");
+    tokio::fs::write(&summary_path, "PRECOMPUTED SUMMARY OF EARLIER CONVERSATION")
+        .await
+        .expect("write summary.md");
     harness
         .session_manager
         .record_summary_success(

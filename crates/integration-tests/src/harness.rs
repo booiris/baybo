@@ -161,7 +161,7 @@ pub struct AgentTestHarnessBuilder {
     tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
     spending_limits: SpendingLimits,
     pricing: HashMap<String, ModelPricing>,
-    summary_state_dir: Option<PathBuf>,
+    workspace: Option<Arc<aura_workspace::WorkspacePaths>>,
     keep_recent: Option<usize>,
     token_budget: Option<TokenBudget>,
 }
@@ -176,7 +176,7 @@ impl Default for AgentTestHarnessBuilder {
             tools: Vec::new(),
             spending_limits: SpendingLimits::default(),
             pricing: HashMap::new(),
-            summary_state_dir: None,
+            workspace: None,
             keep_recent: None,
             token_budget: None,
         }
@@ -227,11 +227,12 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Override the directory the compressor's fast-path reads
-    /// `<dir>/<session_id>/summary.md` from. Default: a non-existent
-    /// path so the fast-path always falls through.
-    pub fn with_summary_state_dir(mut self, dir: PathBuf) -> Self {
-        self.summary_state_dir = Some(dir);
+    /// Override the workspace handle the `ContextManager` resolves
+    /// per-session paths through (`summary.md`, JSONL transcript).
+    /// Default: a workspace rooted at a non-existent path so the
+    /// fast-path always falls through.
+    pub fn with_workspace(mut self, workspace: Arc<aura_workspace::WorkspacePaths>) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 
@@ -325,11 +326,13 @@ impl AgentTestHarnessBuilder {
         // `TokenCalibration` keys observe and adjust identically.
         let stub_model_id = stub_llm.model_info().id.clone();
         let tokenizer = Arc::new(TiktokenTokenizer::for_model(&stub_model_id));
-        // Non-existent path → loader returns Ok(None) → fast-path
-        // falls through. No tempdir to clean up.
-        let summary_state_dir = self
-            .summary_state_dir
-            .unwrap_or_else(|| PathBuf::from("/nonexistent-aura-it-summary-dir"));
+        // Non-existent root → fast-path read hits NotFound → falls
+        // through. No tempdir to clean up.
+        let workspace = self.workspace.unwrap_or_else(|| {
+            Arc::new(aura_workspace::WorkspacePaths::new(PathBuf::from(
+                "/nonexistent-aura-it-workspace",
+            )))
+        });
         let keep_recent = self.keep_recent.unwrap_or(50);
         let token_budget = self
             .token_budget
@@ -346,7 +349,7 @@ impl AgentTestHarnessBuilder {
         ));
         let context_manager = ContextManager::from_config(ContextManagerConfig {
             tokenizer,
-            summary_state_dir,
+            workspace,
             keep_recent,
             budget: token_budget,
             calibration: Arc::clone(&token_calibration),

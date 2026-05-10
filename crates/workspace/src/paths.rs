@@ -412,6 +412,18 @@ impl WorkspacePaths {
         self.session_state_dir(session_id).join(SUMMARY_FILE_TMP)
     }
 
+    /// Per-session JSONL transcript log:
+    /// `<root>/logs/sessions/<sanitized_session_id>.jsonl`. Sanitization
+    /// matches the writer in [`aura_agent::session_log`] so the path
+    /// resolved here is the one the SessionLlmLogger appends to.
+    pub fn session_log_file(&self, session_id: &str) -> PathBuf {
+        self.sessions_log_dir().join(format!(
+            "{}.{}",
+            sanitize_session_id(session_id),
+            SESSION_LOG_EXTENSION
+        ))
+    }
+
     // -- work/ contents --
 
     pub fn code_builder_dir(&self) -> PathBuf {
@@ -425,6 +437,27 @@ impl WorkspacePaths {
     pub fn tool_spills_dir(&self) -> PathBuf {
         self.work_dir().join(TOOL_SPILLS_SUBDIR)
     }
+}
+
+/// Replace any character that isn't `[A-Za-z0-9_\-.]` with `_`, then
+/// prefix `_` if the result is empty or starts with `.`. Used to map
+/// a `SessionId` onto a safe filename component for the per-session
+/// JSONL transcript log. Both [`WorkspacePaths::session_log_file`]
+/// and `aura-agent`'s `SessionLlmLogger` route through this so the
+/// resolved path is identical on both sides.
+pub fn sanitize_session_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for ch in id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() || out.starts_with('.') {
+        out.insert(0, '_');
+    }
+    out
 }
 
 #[cfg(test)]

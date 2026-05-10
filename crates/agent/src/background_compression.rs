@@ -452,10 +452,7 @@ mod tests {
     #[test]
     fn parse_extracts_summary_block_after_stripping_analysis() {
         let s = "<analysis>thinking</analysis><summary>S</summary>";
-        assert_eq!(
-            parse_summary_response(s).as_deref(),
-            Some("<summary>S</summary>")
-        );
+        assert_eq!(parse_summary_response(s).as_deref(), Some("S"));
     }
 
     #[test]

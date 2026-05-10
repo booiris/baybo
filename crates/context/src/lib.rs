@@ -2,7 +2,6 @@ pub mod budget;
 pub mod calibration;
 pub mod compressor;
 pub mod error;
-mod summary_loader;
 pub mod tokenizer;
 
 pub use budget::TokenBudget;
@@ -157,7 +156,10 @@ pub enum CompressionOutcome {
 /// owner here, eliminating the drift-detection logic.
 pub struct ContextManager {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    pub(crate) summary_loader: summary_loader::FsSummaryLoader,
+    /// Source of truth for per-session paths the compressor needs:
+    /// `summary.md` for the fast-path stage, and the JSONL transcript
+    /// referenced from the continuation-summary message.
+    pub(crate) workspace: Arc<aura_workspace::WorkspacePaths>,
     /// Tail size for the truncate fallback and the pre-flight gate.
     pub(crate) keep_recent: usize,
     pub(crate) budget: TokenBudget,
@@ -214,11 +216,10 @@ pub struct ContextManager {
 /// struct literal at the call site keeps every field visible by name.
 pub struct ContextManagerConfig {
     pub tokenizer: Arc<dyn Tokenizer>,
-    /// Per-session state directory; the compressor reads
-    /// `<summary_state_dir>/<session_id>/summary.md`. Production
-    /// wires this from `WorkspacePaths::state_sessions_dir()`; tests
-    /// can pass a non-existent path to skip the fast-path.
-    pub summary_state_dir: std::path::PathBuf,
+    /// Workspace paths handle. Used to resolve `summary.md` for the
+    /// fast-path read and the JSONL transcript path referenced from
+    /// the continuation-summary message.
+    pub workspace: Arc<aura_workspace::WorkspacePaths>,
     pub keep_recent: usize,
     pub budget: TokenBudget,
     pub calibration: Arc<TokenCalibration>,
@@ -231,7 +232,7 @@ impl ContextManager {
     pub fn from_config(config: ContextManagerConfig) -> Self {
         Self {
             tokenizer: config.tokenizer,
-            summary_loader: summary_loader::FsSummaryLoader::new(config.summary_state_dir),
+            workspace: config.workspace,
             keep_recent: config.keep_recent,
             budget: config.budget,
             calibration: config.calibration,
@@ -1018,16 +1019,19 @@ mod tests {
         ))
     }
 
-    /// Non-existent path → loader returns `Ok(None)` → fast-path
-    /// falls through. No tempdir to clean up.
-    fn empty_summary_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from("/nonexistent-aura-test-summary-dir")
+    /// Workspace rooted at a non-existent path so the fast-path read
+    /// hits `NotFound` and falls through cleanly. No tempdir to
+    /// clean up.
+    fn test_workspace() -> Arc<aura_workspace::WorkspacePaths> {
+        Arc::new(aura_workspace::WorkspacePaths::new(
+            "/nonexistent-aura-test-workspace",
+        ))
     }
 
     fn make_ctx(keep_recent: usize, max_tokens: usize, threshold: f64) -> ContextManager {
         ContextManager::from_config(ContextManagerConfig {
             tokenizer: Arc::new(SimpleTokenizer),
-            summary_state_dir: empty_summary_dir(),
+            workspace: test_workspace(),
             keep_recent,
             budget: TokenBudget::new(max_tokens, threshold),
             calibration: Arc::new(TokenCalibration::new()),
@@ -1391,7 +1395,7 @@ mod tests {
     ) -> ContextManager {
         ContextManager::from_config(ContextManagerConfig {
             tokenizer: Arc::new(SimpleTokenizer),
-            summary_state_dir: empty_summary_dir(),
+            workspace: test_workspace(),
             keep_recent,
             budget: TokenBudget::new(max_tokens, threshold),
             calibration: Arc::new(TokenCalibration::new()),
@@ -1426,11 +1430,11 @@ mod tests {
         // `len()/4 + 1`, so a few hundred bytes of user text easily out-
         // weighs the ~120-byte reminder + ~150-byte detail trailer.
         ctx.append(&make_msg(Role::System, "sys")).await;
-        ctx.append(&make_msg(Role::User, &"u1 ".repeat(80))).await;
+        ctx.append(&make_msg(Role::User, &"u1 ".repeat(800))).await;
         ctx.append(&skill_call("foo")).await;
-        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(80)))
+        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(800)))
             .await;
-        ctx.append(&make_msg(Role::User, &"u2 ".repeat(80))).await;
+        ctx.append(&make_msg(Role::User, &"u2 ".repeat(800))).await;
 
         let outcome = ctx
             .maybe_compress("test-model", ok_summary_chat)
@@ -1453,7 +1457,12 @@ mod tests {
         assert!(texts[1].contains("- foo: desc for foo"));
         assert!(texts[2].contains("<skill name=\"foo\" version=\"0.1.0\">"));
         assert!(texts[2].contains("FOO_BODY"));
-        assert_eq!(texts[3], "<summary>S</summary>");
+        // The summary message is the continuation-style block: the
+        // intro + the parsed summary body (label-prefixed for the LLM
+        // path) + the transcript pointer + the footer.
+        assert!(texts[3].contains("This session is being continued"));
+        assert!(texts[3].contains("Summary:\nS"));
+        assert!(texts[3].contains("read the full transcript at:"));
     }
 
     /// After a successful LLM-summary apply the called_skills vector
@@ -1464,11 +1473,11 @@ mod tests {
         let registry = registry_with(&[("foo", "FOO_BODY")]);
         let mut ctx = make_ctx_with_registry(registry, 2, 50, 0.5);
         ctx.append(&make_msg(Role::System, "sys")).await;
-        ctx.append(&make_msg(Role::User, &"u1 ".repeat(80))).await;
+        ctx.append(&make_msg(Role::User, &"u1 ".repeat(800))).await;
         ctx.append(&skill_call("foo")).await;
-        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(80)))
+        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(800)))
             .await;
-        ctx.append(&make_msg(Role::User, &"u2 ".repeat(80))).await;
+        ctx.append(&make_msg(Role::User, &"u2 ".repeat(800))).await;
         assert_eq!(ctx.called_skills, vec!["foo"]);
 
         ctx.maybe_compress("test-model", ok_summary_chat)

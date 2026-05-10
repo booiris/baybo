@@ -260,9 +260,12 @@ The fast-path lives as a private `try_summary_fast_path` method on `ContextManag
 [system messages]
 [user(skill reminder)]                  ← inserted by ContextManager
 [user(skill detail block, optional)]
-[user(<context-summary>summary.md content</context-summary>)]
+[user(continuation-summary message)]    ← intro + summary.md body +
+                                          transcript pointer + footer
 [recent messages, pair-preserved]
 ```
+
+The continuation-summary message follows Claude Code's compaction format: a fixed `This session is being continued ...` intro, the body verbatim from `summary.md` (fast-path) or `Summary:\n<parsed body>` (stage 2), a `read the full transcript at: <path>` pointer to `<root>/logs/sessions/<session_id>.jsonl`, and a closing paragraph telling the model to resume directly without acknowledging the summary.
 
 ### Fall-through cases
 
