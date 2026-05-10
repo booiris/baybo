@@ -1752,6 +1752,7 @@ impl AgentLoop {
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
         let cost_manager = self.cost_manager.clone();
+        let tokenizer = Arc::clone(self.context_manager.tokenizer());
         let model_info = self.llm_client.model_info().clone();
         let user_id = session.user.id.clone();
         let maintenance_session_id = session.id.clone();
@@ -1778,6 +1779,7 @@ impl AgentLoop {
                         cost_manager,
                         sessions,
                         workspace_paths,
+                        tokenizer,
                         recorder,
                         model_info,
                         maintenance_session_id,

@@ -29,7 +29,9 @@
 
 use std::sync::Arc;
 
-use aura_context::{BackgroundSummaryConfig, BackgroundSummaryOutcome, run_background_summary};
+use aura_context::{
+    BackgroundSummaryConfig, BackgroundSummaryOutcome, Tokenizer, run_background_summary,
+};
 use aura_llm::{GuardedLlm, ModelInfo};
 use aura_model::{BackgroundCompressionPayload, JobId, SessionId};
 use aura_session::SessionManager;
@@ -212,6 +214,7 @@ pub(crate) struct BackgroundCompressionRunner {
     pub cost_manager: Arc<CostManager>,
     pub sessions: Arc<SessionManager>,
     pub workspace_paths: Arc<WorkspacePaths>,
+    pub tokenizer: Arc<dyn Tokenizer>,
     pub recorder: Arc<SpanRecorder>,
     pub model_info: ModelInfo,
     pub maintenance_session_id: SessionId,
@@ -234,6 +237,7 @@ impl BackgroundCompressionRunner {
             cost_manager,
             sessions,
             workspace_paths,
+            tokenizer,
             recorder,
             model_info,
             maintenance_session_id,
@@ -241,27 +245,44 @@ impl BackgroundCompressionRunner {
             job_id,
             cancel_token,
         } = self;
+        let model_id = model_info.id.clone();
+        // Hand a clone to the context's tool loop so a parent cancel
+        // cascades into in-flight `Read`/`Edit`. The original token
+        // moves into the chat-callback closure below, where each
+        // per-iteration `CompressionRunner` clones it again for the
+        // LLM-call cancel.
+        let tool_cancel = cancel_token.clone();
 
-        let runner = CompressionRunner {
-            llm_client,
-            recorder,
-            cost_manager,
-            security_gateway,
-            job_id,
-            user_id: maintenance_user_id,
-            session_id: maintenance_session_id,
-            model_info: model_info.clone(),
-            cancel_token,
-        };
-        let chat: aura_context::BackgroundSummaryCallback =
-            Box::new(move |req| Box::pin(async move { runner.run(req).await }));
+        // FnMut closure: each iteration of the background-summary
+        // tool-loop fires its own LLM call, so we can't move a single
+        // `CompressionRunner` into the closure (its `run` consumes
+        // self). Capture the agent-layer `Arc`s + cheap `Clone` fields
+        // outside; the closure rebuilds a fresh runner per call. The
+        // runner's per-call `Compression` step + `LlmCall` span are
+        // each treated as one iteration in telemetry.
+        let chat: aura_context::BackgroundSummaryCallback = Box::new(move |req| {
+            let runner = CompressionRunner {
+                llm_client: llm_client.clone(),
+                recorder: recorder.clone(),
+                cost_manager: cost_manager.clone(),
+                security_gateway: security_gateway.clone(),
+                job_id,
+                user_id: maintenance_user_id.clone(),
+                session_id: maintenance_session_id.clone(),
+                model_info: model_info.clone(),
+                cancel_token: cancel_token.clone(),
+            };
+            Box::pin(async move { runner.run(req).await })
+        });
 
         let config = BackgroundSummaryConfig {
             workspace: workspace_paths,
             sessions,
+            tokenizer,
             parent_session_id: payload.parent_session_id,
             up_to_ordinal: payload.up_to_ordinal,
-            model_id: model_info.id,
+            model_id,
+            cancel_token: tool_cancel,
         };
         run_background_summary(config, chat)
             .await

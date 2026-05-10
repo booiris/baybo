@@ -263,6 +263,15 @@ impl ContextManager {
         self.messages.len()
     }
 
+    /// Read-only access to the bound tokenizer. Lets agent-side code
+    /// reuse the same tokenizer for one-off counts (e.g. the
+    /// background-summary prompt's per-section / total budget checks)
+    /// without having to wire a separate `Arc<dyn Tokenizer>` through
+    /// every layer.
+    pub fn tokenizer(&self) -> &Arc<dyn Tokenizer> {
+        &self.tokenizer
+    }
+
     /// Replace the entire transcript. Recomputes the per-message
     /// token cache, the called-skills vector, and the budget; clears
     /// any baseline since the prior `actual_tokens` is anchored to a
