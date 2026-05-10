@@ -252,16 +252,16 @@ The fast-path lives as a private `try_summary_fast_path` method on `ContextManag
    [user(<context-summary>...summary content...</context-summary>)]
    [recent slice]
    ```
-6. Return `CompressOutput::Replaced { messages, summarized: true }` — `ContextManager::run_compression` (`crates/context/src/lib.rs:410`) auto-attaches the skill trailer at the end (σ-A).
+6. Return `CompressOutput::Replaced { messages }` — `ContextManager::run_compression` then inserts the skill trailer right after the system block via `insert_skill_trailer` (σ-A).
 
 ### Final transcript after fast-path apply
 
 ```
 [system messages]
+[user(skill reminder)]                  ← inserted by ContextManager
+[user(skill detail block, optional)]
 [user(<context-summary>summary.md content</context-summary>)]
 [recent messages, pair-preserved]
-[user(skill reminder)]                  ← appended by ContextManager
-[user(skill detail block, optional)]
 ```
 
 ### Fall-through cases

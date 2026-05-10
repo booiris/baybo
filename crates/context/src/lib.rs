@@ -432,38 +432,35 @@ impl ContextManager {
     {
         let chat_box: compressor::ChatCallback = Box::new(move |req| Box::pin(chat(req)));
         let plan = self.run_compression_flow(chat_box).await?;
-        let (mut new_messages, summarized) = match plan {
+        let mut new_messages = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
-            CompressOutput::Replaced {
-                messages,
-                summarized,
-            } => (messages, summarized),
+            CompressOutput::Replaced { messages } => messages,
         };
 
         // Refuse to apply an empty replacement: persist would mark
         // every active row in `session_messages` as superseded with
         // no successor, leaving the active slice empty until the
-        // next turn re-seeds the system prompt. Currently unreachable
-        // (the LLM-summary stage always retains the system messages,
-        // and the truncate fallback also keeps them), so treat it as
-        // a contract violation rather than a routine outcome.
+        // next turn re-seeds the system prompt. Unreachable today
+        // (every Replaced branch keeps at least the system block),
+        // so treat it as a contract violation rather than a routine
+        // outcome.
         if new_messages.is_empty() {
             warn!("compression produced an empty replacement; refusing to apply");
             return Ok(CompressionOutcome::StrategyDeclined);
         }
 
-        // The summary blob replaced the historical reminder /
-        // tool_use trail; re-attach the authoritative reminder +
-        // per-skill detail blocks so the next LLM call still sees
-        // the skill set the user expects.
-        if summarized {
-            append_skill_trailer(
-                &mut new_messages,
-                self.skill_registry.as_ref(),
-                self.tokenizer.as_ref(),
-                &self.called_skills,
-            );
-        }
+        // Re-broadcast the authoritative skill list right after the
+        // system block. The summary stages discard the historical
+        // `<system-reminder>` by construction; the truncate fallback
+        // can drop it too when it lands in the dropped middle.
+        // Cheaper to always re-insert than to track whether the kept
+        // slice still carries one.
+        insert_skill_trailer(
+            &mut new_messages,
+            self.skill_registry.as_ref(),
+            self.tokenizer.as_ref(),
+            &self.called_skills,
+        );
 
         let before_tokens = self.budget.current();
         let start = Instant::now();
@@ -885,33 +882,48 @@ fn build_skill_detail_payload(
     Some(out)
 }
 
-/// Append the post-summary skill trailer to `messages`: always the
-/// authoritative reminder, plus a detail block when at least one
-/// previously-called skill survives the per-skill / total token caps.
-/// Both ride as `Role::User` text so `merge_for_llm` folds them into
-/// the leading user message before dispatch; the in-storage messages
-/// stay separate for trace clarity.
-pub(crate) fn append_skill_trailer(
+/// Insert the skill trailer right after the system block of
+/// `messages`: always the authoritative reminder, plus a detail
+/// block when at least one previously-called skill survives the
+/// per-skill / total token caps. Slotting it after the system prompt
+/// (rather than at the tail) keeps the model's "what tools are
+/// available" context adjacent to its instructions and lines up
+/// better with prompt caching.
+///
+/// Both blocks ride as `Role::User` text so `merge_for_llm` folds
+/// them into the leading user message before dispatch; the
+/// in-storage messages stay separate for trace clarity.
+pub(crate) fn insert_skill_trailer(
     messages: &mut Vec<ChatMessage>,
     registry: &SkillRegistry,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
 ) {
+    let mut insert_at = 0;
+    while insert_at < messages.len() && messages[insert_at].role == Role::System {
+        insert_at += 1;
+    }
     let reminder = render_skill_reminder(&registry.all_summaries_sorted());
-    messages.push(ChatMessage {
-        role: Role::User,
-        content: vec![ContentBlock::Text(reminder)],
-    });
-    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
-        messages.push(ChatMessage {
+    messages.insert(
+        insert_at,
+        ChatMessage {
             role: Role::User,
-            content: vec![ContentBlock::Text(detail)],
-        });
+            content: vec![ContentBlock::Text(reminder)],
+        },
+    );
+    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
+        messages.insert(
+            insert_at + 1,
+            ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text(detail)],
+            },
+        );
     }
 }
 
 /// Estimate the **token cost** of the skill trailer that
-/// [`append_skill_trailer`] would attach for `called_skills` against
+/// [`insert_skill_trailer`] would attach for `called_skills` against
 /// the given registry. Used by the fast-path's pre-assembly threshold
 /// check (`summary + skill_trailer ≤ 0.6 × max_tokens`) without
 /// committing the trailer to the assembled list. Returns the sum of
@@ -968,6 +980,12 @@ mod tests {
             role,
             content: vec![ContentBlock::Text(text.to_string())],
         }
+    }
+
+    /// Padded message body so the truncate fallback's savings beat the
+    /// post-compression skill trailer overhead in budget-gated tests.
+    fn padded(prefix: &str) -> String {
+        format!("{prefix} {}", "x".repeat(120))
     }
 
     /// Chat closure that panics if invoked. Use in tests where
@@ -1036,29 +1054,26 @@ mod tests {
 
     #[tokio::test]
     async fn maybe_compress_on_token_threshold() {
-        // max=50, threshold=0.5 → compress when > 25 tokens
-        let mut ctx = make_ctx(2, 50, 0.5);
+        // max=200, threshold=0.25 → compress when > 50 tokens
+        let mut ctx = make_ctx(2, 200, 0.25);
 
         // Build up messages one by one. `append` no longer
         // auto-compresses; the agent loop is responsible for calling
         // `maybe_compress` at well-defined cost-recording points.
         ctx.append(&make_msg(Role::System, "You are helpful")).await;
-        ctx.append(&make_msg(Role::User, "First message here"))
+        ctx.append(&make_msg(Role::User, &padded("First"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("Reply 1")))
             .await;
-        ctx.append(&make_msg(Role::Assistant, "First reply here"))
-            .await;
-        ctx.append(&make_msg(Role::User, "Second message here"))
-            .await;
+        ctx.append(&make_msg(Role::User, &padded("Second"))).await;
 
         // `err_chat` makes the LLM-summary stage fail, so the
-        // compressor falls through to truncate. The truncate fallback
-        // keeps `system + last keep_recent` non-system messages
-        // (no skill trailer — the system block already carries it).
+        // compressor falls through to truncate, then `ContextManager`
+        // appends the skill trailer (system + 2 tail + trailer).
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::Compressed));
-        // system + 2 most recent non-system
-        assert_eq!(ctx.messages().len(), 3);
+        // system + 2 most recent non-system + trailer reminder.
+        assert_eq!(ctx.messages().len(), 4);
         assert_eq!(ctx.messages()[0].role, Role::System);
     }
 
@@ -1086,9 +1101,10 @@ mod tests {
         let mut ctx = make_ctx(2, 100_000, 0.75);
 
         ctx.append(&make_msg(Role::System, "sys")).await;
-        ctx.append(&make_msg(Role::User, "first")).await;
-        ctx.append(&make_msg(Role::Assistant, "second")).await;
-        ctx.append(&make_msg(Role::User, "third")).await;
+        ctx.append(&make_msg(Role::User, &padded("first"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("second")))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("third"))).await;
 
         // Sanity: budget-gated path is a no-op here.
         let baseline = ctx.maybe_compress("test-model", never_chat).await.unwrap();
@@ -1099,8 +1115,8 @@ mod tests {
         let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::Compressed));
-        // system + keep_recent=2 most recent non-system.
-        assert_eq!(ctx.messages().len(), 3);
+        // system + reminder + keep_recent=2 most recent non-system.
+        assert_eq!(ctx.messages().len(), 4);
         assert_eq!(ctx.messages()[0].role, Role::System);
     }
 
@@ -1198,14 +1214,13 @@ mod tests {
     /// `count_tokens` falls back to a full sweep.
     #[tokio::test]
     async fn compression_invalidates_baseline() {
-        let mut ctx = make_ctx(2, 50, 0.5);
+        let mut ctx = make_ctx(2, 200, 0.25);
 
         ctx.append(&make_msg(Role::System, "sys")).await;
-        ctx.append(&make_msg(Role::User, "msg-1 with content"))
+        ctx.append(&make_msg(Role::User, &padded("msg-1"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("reply-1")))
             .await;
-        ctx.append(&make_msg(Role::Assistant, "reply-1 here")).await;
-        ctx.append(&make_msg(Role::User, "msg-2 with content"))
-            .await;
+        ctx.append(&make_msg(Role::User, &padded("msg-2"))).await;
         ctx.record_call_actual(9_999);
 
         // Pre-compression: baseline applies → big number.
@@ -1263,14 +1278,12 @@ mod tests {
     /// same-prefix replacement branch.
     #[tokio::test]
     async fn cache_rebuilt_after_compression_apply() {
-        let mut ctx = make_ctx(2, 50, 0.5);
+        let mut ctx = make_ctx(2, 200, 0.25);
         ctx.append(&make_msg(Role::System, "You are helpful")).await;
-        ctx.append(&make_msg(Role::User, "First message here"))
+        ctx.append(&make_msg(Role::User, &padded("First"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("Reply 1")))
             .await;
-        ctx.append(&make_msg(Role::Assistant, "First reply here"))
-            .await;
-        ctx.append(&make_msg(Role::User, "Second message here"))
-            .await;
+        ctx.append(&make_msg(Role::User, &padded("Second"))).await;
 
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
@@ -1401,11 +1414,11 @@ mod tests {
     }
 
     /// With a skill registry attached, after the LLM-summary stage
-    /// produces a usable response the manager appends `[reminder,
-    /// detail]` (when there are previously-called skills the registry
-    /// can render).
+    /// produces a usable response the manager inserts `[reminder,
+    /// detail]` right after the system block (when there are
+    /// previously-called skills the registry can render).
     #[tokio::test]
-    async fn summarize_apply_appends_skill_trailer() {
+    async fn summarize_apply_inserts_skill_trailer_after_system() {
         let registry = registry_with(&[("foo", "FOO_BODY")]);
         let mut ctx = make_ctx_with_registry(registry, 2, 50, 0.5);
         // Long enough that compression with the (real, registry-rendered)
@@ -1425,7 +1438,7 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));
 
-        // [system, summary, reminder, detail]
+        // [system, reminder, detail, summary]
         assert_eq!(ctx.messages().len(), 4);
         let texts: Vec<&str> = ctx
             .messages()
@@ -1436,11 +1449,11 @@ mod tests {
             })
             .collect();
         assert_eq!(texts[0], "sys");
-        assert_eq!(texts[1], "<summary>S</summary>");
-        assert!(texts[2].contains("The following skills are available"));
-        assert!(texts[2].contains("- foo: desc for foo"));
-        assert!(texts[3].contains("<skill name=\"foo\" version=\"0.1.0\">"));
-        assert!(texts[3].contains("FOO_BODY"));
+        assert!(texts[1].contains("The following skills are available"));
+        assert!(texts[1].contains("- foo: desc for foo"));
+        assert!(texts[2].contains("<skill name=\"foo\" version=\"0.1.0\">"));
+        assert!(texts[2].contains("FOO_BODY"));
+        assert_eq!(texts[3], "<summary>S</summary>");
     }
 
     /// After a successful LLM-summary apply the called_skills vector
@@ -1638,14 +1651,12 @@ mod tests {
     /// transcript and only re-grow as fresh turns arrive.
     #[tokio::test]
     async fn compression_apply_resets_anchor_to_transcript_end() {
-        let mut ctx = make_ctx(2, 50, 0.5);
+        let mut ctx = make_ctx(2, 200, 0.25);
         ctx.append(&make_msg(Role::System, "system prompt")).await;
-        ctx.append(&make_msg(Role::User, "first message here"))
+        ctx.append(&make_msg(Role::User, &padded("first"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("reply 1")))
             .await;
-        ctx.append(&make_msg(Role::Assistant, "first reply here"))
-            .await;
-        ctx.append(&make_msg(Role::User, "second message here"))
-            .await;
+        ctx.append(&make_msg(Role::User, &padded("second"))).await;
 
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
         assert!(matches!(outcome, CompressionOutcome::Compressed));

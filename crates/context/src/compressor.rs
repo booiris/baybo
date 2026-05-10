@@ -51,15 +51,13 @@ pub enum CompressOutput {
     /// the truncate fallback couldn't shrink. Surfaces as
     /// `CompressionOutcome::StrategyDeclined`.
     NoOp,
-    /// `summarized: true` means the output contains a summary
-    /// message in place of the historical tool_use trail (LLM summary
-    /// or fast-path); `false` means the tail was preserved verbatim
-    /// (truncate fallback). The flag gates whether `ContextManager`
-    /// re-attaches the skill trailer.
-    Replaced {
-        messages: Vec<ChatMessage>,
-        summarized: bool,
-    },
+    /// Compressor produced a new transcript. `ContextManager` always
+    /// re-attaches the skill trailer here, since every Replaced
+    /// branch can drop the historical `<system-reminder>` carrying
+    /// the skill list — summary stages by construction, and the
+    /// truncate fallback whenever the reminder lands in the dropped
+    /// middle.
+    Replaced { messages: Vec<ChatMessage> },
 }
 
 /// Trailing user prompt appended to the full conversation handed to
@@ -547,15 +545,12 @@ impl ContextManager {
 
         Some(CompressOutput::Replaced {
             messages: new_messages,
-            summarized: true,
         })
     }
 
     /// Stages 2 + 3. Always returns `Replaced` — the pre-flight gate
     /// already filtered the "nothing to shrink" case, and the
     /// truncate fallback is guaranteed to shorten when reached.
-    /// `summarized` is `true` on LLM-summary success, `false` on the
-    /// truncate fallback.
     async fn summarize_or_truncate(&self, chat: ChatCallback) -> CompressOutput {
         let (system_msgs, non_system) = partition_system(&self.messages);
 
@@ -575,10 +570,7 @@ impl ContextManager {
             let initial_split = non_system.len().saturating_sub(self.keep_recent);
             let split = pair_preserving_cut(&non_system, initial_split);
             out.extend_from_slice(&non_system[split..]);
-            CompressOutput::Replaced {
-                messages: out,
-                summarized: false,
-            }
+            CompressOutput::Replaced { messages: out }
         };
 
         match chat(request).await {
@@ -591,7 +583,6 @@ impl ContextManager {
                     });
                     CompressOutput::Replaced {
                         messages: new_messages,
-                        summarized: true,
                     }
                 }
                 None => {

@@ -82,10 +82,12 @@ self.compress_if_needed(session, span_recorder, job_id, &cancel_token).await?;
 
 `ContextManager::run_compression_flow` (in `compressor.rs`) is `async` and receives a one-shot `ChatCallback`. It runs the three stages in order:
 
-1. **Stage 1 — `try_summary_fast_path`**: read `<state>/<session_id>/summary.md` via the injected `SummaryLoader`, look up the summary's cursor in the persisted active log, and assemble `[system + summary blob + recent slice]`. Falls through on any of: no metadata, file missing, cursor stale, length mismatch, or assembled total > `0.6 × max_tokens`. Returns `Replaced { summarized: true, .. }` on success — the manager re-attaches the skill trailer.
+1. **Stage 1 — `try_summary_fast_path`**: read `<state>/<session_id>/summary.md` via the owned `FsSummaryLoader`, look up the summary's cursor in the persisted active log, and assemble `[system + summary blob + recent slice]`. Falls through on any of: no metadata, file missing, cursor stale, length mismatch, or assembled total > `0.6 × max_tokens`. Returns `Replaced { messages }` on success.
 2. **Pre-flight gate**: if `non_system.len() ≤ keep_recent`, return `NoOp` without firing the LLM. Mirrors the old `Truncate` strategy's NoOp exit so a `/compact` on a tiny conversation doesn't burn tokens producing a single-line summary.
-3. **Stage 2 — LLM summary** (`summarize_or_truncate`): send the full conversation + `SUMMARIZE_INSTRUCTION` to the model via the `ChatCallback`. On success, replace with `[system + parsed summary]` and return `Replaced { summarized: true, .. }`.
-4. **Stage 3 — truncate fallback**: only reached when Stage 2 returns an error or empty content. Keep `system + last keep_recent non-system` messages (pair-preserving so tool_use / tool_result stays intact) and return `Replaced { summarized: false, .. }`. The `false` flag tells the manager not to re-attach the skill trailer — the system block already carries the original reminder.
+3. **Stage 2 — LLM summary** (`summarize_or_truncate`): send the full conversation + `SUMMARIZE_INSTRUCTION` to the model via the `ChatCallback`. On success, replace with `[system + parsed summary]` and return `Replaced { messages }`.
+4. **Stage 3 — truncate fallback**: only reached when Stage 2 returns an error or empty content. Keep `system + last keep_recent non-system` messages (pair-preserving so tool_use / tool_result stays intact) and return `Replaced { messages }`.
+
+Every `Replaced` return triggers `ContextManager` to insert the skill trailer right after the system block (`insert_skill_trailer`). The historical `<system-reminder>` carrying the skill list lives in a `User` message — the summary stages discard it by construction, and the truncate fallback can drop it whenever the reminder lands in the dropped middle. Re-inserting unconditionally is cheaper than tracking whether the kept slice still carries one. Putting it adjacent to the system prompt also keeps the "what tools are available" context lined up for prompt caching.
 
 ### Context priority structure
 
