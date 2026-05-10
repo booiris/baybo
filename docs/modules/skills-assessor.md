@@ -139,7 +139,7 @@ Owned by `storage::risk` (see [storage.md](storage.md)):
 ## Integration points
 
 - **`aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. JSON output includes `scope` and `background_pending`.
-- **`AgentLoop::assess_skill_risk`** — gates per-skill system-message injection. `Dangerous` verdicts drop the skill silently (logged with `scope` and `background_pending`) so the model is never shown the prompt body. Lazy: no work until the skill is actually reached.
+- **`Skill` builtin tool** (`aura-skills::tools`) — calls `Arc<dyn SkillRiskCheck>::assess` per invocation. `Block` aborts the call with `ToolError::Denied`; `PassWithWarning` returns the body with a `risk_warning` field and emits a `NoticeLevel::Warn` notice; `Pass` runs silently. Risk is checked once per call, not once per turn.
 - **`main.rs`** — constructs the assessor with `with_background_worker(llm, store, mode)`, mapping `config.skills.risk_check` via `boot::to_assessment_mode`, then calls `recover_pending_jobs` once after the skill registry is populated. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
 
 ## Constraints
@@ -155,5 +155,5 @@ Owned by `storage::risk` (see [storage.md](storage.md)):
 | `skills`  | Owns `SkillDefinition`, `source_path`, and the registry the assessor hashes. |
 | `storage` | Defines `SkillRiskStore`, `RiskVerdict`, `AssessmentJob`; owns the libsql backend. |
 | `llm`     | Provides the `LlmClient` used for the classifier call. |
-| `agent`   | `AgentLoop` consumes `AssessedSkill` to gate skill injection. |
+| `agent`   | Hosts the `Skill` builtin tool that consults `SkillRiskCheck` per invocation. |
 | `cli`     | `aura skills check` renders `AssessedSkill` for operator review. |

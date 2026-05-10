@@ -2,11 +2,11 @@
 
 ## Overview
 
-The `storage` crate is the single source of truth for all persistence interfaces and implementations. It defines **all** Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`) and implements them via **libsql** as the sole backend.
+The `storage` crate is the single source of truth for all persistence interfaces and implementations. It defines **all** Store traits (`SessionStore`, `MemoryStore`, `TraceStore`, `SecretStore`, `JobStore`, `CostStore`, `CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `BlobStore`) and implements them via **libsql** as the sole backend.
 
 Its job is:
 
-- Define all Store traits (each in its own submodule: `session`, `memory`, `trace`, `secret`, `job`, `cost`, `cron`, `risk`, `channel_session`, `channel_bot`, `channel_pairing`)
+- Define all Store traits (each in its own submodule: `session`, `memory`, `trace`, `secret`, `job`, `cost`, `cron`, `skill_risk`, `channel_session`, `channel_bot`, `channel_pairing`, `blob`)
 - Implement all Store traits via libsql
 - Provide `Store` for dependency injection
 - Manage database schema initialization
@@ -27,10 +27,11 @@ secret.rs          → SecretStore          (uses aura_security types)
 job.rs             → JobStore             (uses aura_job types)
 cost.rs            → CostStore            (defines its own types: CostRecord, CostSummary, TimeRange)
 cron.rs            → CronStore            (opaque row types: CronJobRow, CronExecutionRow — no dep on aura_cron)
-risk.rs            → SkillRiskStore       (defines RiskVerdict, RiskLevel, AssessmentJob, AssessmentJobStatus — consumed by aura-skills-assessor)
+skill_risk.rs      → SkillRiskStore       (defines RiskVerdict, RiskLevel, AssessmentJob, AssessmentJobStatus — consumed by aura-skills-assessor)
 channel_session.rs → ChannelSessionStore  (maps (channel_type, user_id) → aura session_id for sidecars)
 channel_bot.rs     → ChannelBotStore      (per-tenant bot metadata; token lives in the vault)
 channel_pairing.rs → ChannelPairingStore  (defines ChannelPairingRow, PairingStatus — consumed by aura-pairing)
+blob.rs            → BlobStore            (defines BlobMeta; libsql metadata + filesystem payload at `<state>/blobs/`)
 ```
 
 `Session`, `User`, `ChannelType`, and `SessionState` live in `aura-model` (not `aura-session`) so that `storage` can type `SessionStore` on `aura_model::Session` without pulling in `aura-session`. That keeps `aura-session` free to depend on `aura-storage` for the trait it consumes.

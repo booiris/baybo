@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `trace` crate defines domain types for the four-tier observability model (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `LlmToolCallRecord`, `ToolCallOrigin`, `DriftRecord`) and provides the recovery scan utility for half-open spans.
+The `trace` crate defines domain types for the four-tier observability model (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `LlmToolCallRecord`, `ToolCallOrigin`) and provides the recovery scan utility for half-open spans.
 
 Business logic (`SpanRecorder` — span lifecycle management, persistence, and `TraceEvent` emission) lives in `agent::trace`. The `TraceStore` trait is defined in `storage::trace`.
 
@@ -33,8 +33,14 @@ pub enum StepKind {
 }
 
 pub enum SpanKind {
-    LlmCall { model_id, provider, provider_config_hash, input_messages, output_content, thinking, tool_calls, input_tokens, output_tokens, ... },
-    ToolCall { tool_name, tool_artifact_hash, triggered_by: ToolCallOrigin, params, output, success, ... },
+    LlmCall {
+        begin: LlmCallBegin,            // model_id, provider, provider_config_hash, input_messages, temperature
+        result: Option<LlmCallResult>,  // output_content, thinking, tool_calls, *_tokens (None while Pending)
+    },
+    ToolCall {
+        begin: ToolCallBegin,           // tool_name, tool_artifact_hash, triggered_by, params
+        result: Option<ToolCallResult>, // output, success (None while Pending)
+    },
     SubagentStub { child_session_id },
 }
 ```
@@ -61,7 +67,7 @@ pub enum SpanEventKind {
 ```
 
 - `SanitizeHit` is emitted **only when sanitize actually modified content**. Misses are not recorded — the trace records what happened, not what ran.
-- `Approval` records **every** decision (including `ApproveOnce`). The audit trail of "what did the user approve and when" is complete.
+- `Approval` records **every** decision (`Approve`, `ApproveAlways`, `Deny`). The audit trail of "what did the user approve and when" is complete.
 
 ### Sanitization constraints
 
@@ -93,7 +99,7 @@ When listing jobs / steps / spans for a session whose `Lineage` is `UserFork { f
 - Depends on `aura-job` (for `JobId`, `CancelReason`, `DriftRecord`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.)
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
 - Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
-- Soft-delete protocol applies to all main tables
+- All deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete))
 - `SpanRecorder` (in `agent::trace`) holds locks only for short critical sections, never across `await`
 
 ## Collaboration

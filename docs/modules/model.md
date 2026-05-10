@@ -7,6 +7,7 @@
 Contents:
 
 - **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage`, `Role`, `MessageMetadata`
+- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`
 - **Memory types**: `MemoryEntry`, `MemoryCategory`
 - **Governance types**: `TrustLevel`, `ArtifactSource`, `ExtensionManifest`, `ExtensionKind`
 
@@ -14,7 +15,7 @@ Contents:
 
 ### Minimal scope
 
-`model` retains only the content primitives that are genuinely used by both the channel layer and the LLM layer and cannot naturally belong to either. Session/user types live in `session`, message types in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `AURA_CONFIG_PATH`) live in `aura-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
+`model` retains only the content primitives that are genuinely used by both the channel layer and the LLM layer and cannot naturally belong to either. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `aura-session` re-uses them via `aura_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `AURA_CONFIG_PATH`) live in `aura-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
 
 ### Media by reference, not inline
 
@@ -26,7 +27,7 @@ All `model` types are `Send + Sync + Serialize + Deserialize + Clone`.
 
 ### Memory types
 
-`model` also houses the long-term memory domain types (`MemoryEntry`, `MemoryCategory`). These are pure data definitions consumed by `storage` (for `MemoryStore`) and `agent` (for `MemoryManager`). No memory-specific error type lives here — storage failures surface through `StorageError`, and business-level memory errors (embedding, dedup) are defined in `agent::memory`. Business logic (recall, store, dedup, expiration) lives in `agent::memory`.
+`model` also houses the long-term memory domain types (`MemoryEntry`, `MemoryCategory`). These are pure data definitions consumed by `storage` (for `MemoryStore`) and `agent` (for `MemoryManager`). No memory-specific error type lives here — storage failures surface through `StorageError`, and business-level memory errors (embedding, dedup) are defined in `agent::memory`. Business logic (recall, store, dedup, eviction) lives in `agent::memory`.
 
 #### Recall strategy
 
@@ -43,14 +44,9 @@ Common post-processing: limit count to avoid context overflow, prioritize import
 
 Check for semantically similar existing memories before inserting. Update the existing entry if similarity is high enough. Use vector similarity with embedder, text matching without.
 
-#### Expiration management
+#### Eviction
 
-Two dimensions:
-
-- **Time-based**: `expires_at` computed from `auto_forget_days`; `forget_expired()` removes expired entries
-- **Count-based**: `max_entries_per_user` limit; evict by lowest importance, then oldest `last_accessed`
-
-Cleanup is triggered externally (cron); memory exposes methods but does not own a scheduler.
+`MemoryEntry` carries an `expires_at: Option<DateTime<Utc>>` slot, but no time-based sweeper is wired today. The active policy is count-based: `MemoryManager::enforce_user_limit` clamps each user to `max_entries_per_user` (default 1000), evicting by lowest importance and then oldest `last_accessed`. Eviction runs after every `store()`.
 
 #### Memory categories
 
@@ -58,7 +54,7 @@ Cleanup is triggered externally (cron); memory exposes methods but does not own 
 
 #### Vector embeddings
 
-Integrated through `rig::embeddings::EmbeddingModel`, injected by the `agent` assembly layer. Embeddings stored as `Vec<f32>` in `MemoryEntry.embedding`.
+The `EmbeddingModel` trait is `pub(crate)` inside `aura-agent::memory` and not exported by `model`. `MemoryManager` holds an optional `Box<dyn EmbeddingModel>` injected by the assembly layer. Embeddings stored as `Vec<f32>` in `MemoryEntry.embedding`.
 
 ## Constraints
 
@@ -72,7 +68,7 @@ Integrated through `rig::embeddings::EmbeddingModel`, injected by the `agent` as
 
 | Module | Role |
 |--------|------|
-| `agent` | `agent::memory::MemoryManager` owns recall/store/dedup logic; `AgentLoop` calls it; `EmbeddingModel` trait defined here |
+| `agent` | `agent::memory::MemoryManager` owns recall/store/dedup/eviction logic; `AgentLoop` calls it; `EmbeddingModel` trait is `pub(crate)` inside `agent::memory` |
 | `storage` | Defines `MemoryStore` trait using memory types; provides libsql implementation |
 | `workspace` | Complements with identity/strategy files (no overlap) |
 | `context` | Memory context is injected into the context window by `agent` |

@@ -4,13 +4,15 @@
 
 The `context` crate owns the per-actor conversation state: the
 transcript (`messages`), the token budget, and the compression
-strategy. Pure in-memory — persistence is the agent loop's job,
-brokered through `SessionStore` from `storage` (the wrapper lives
-in [`aura-session`](session.md)).
+strategy. Persistence is wired in directly — when bound to a
+`SessionManager` via [`ContextManager::with_session`], `append` and
+the compression apply mirror to `session_messages` through the
+`SessionManager` wrapper in [`aura-session`](session.md). Unbound
+managers (tests, single-shot harnesses) stay in-memory only.
 
 Core responsibilities:
 
-- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `aura-model`) carries only metadata (id, user, channel, lineage, soul binding, …). The agent loop persists each appended message and each compaction through `SessionStore`'s `append_session_message` / `apply_session_compaction`; cold-start hydration via `load_active_session_messages` seeds `ContextManager` so an actor restart preserves the conversation.
+- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `aura-model`) carries only metadata (id, user, channel, lineage, soul binding, …). When a `SessionManager` is bound via `with_session`, every `append` calls `persist_appended` (→ `SessionManager::append_session_message`) and every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation.
 - **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
 - **Pluggable compression strategies**: swap compression algorithms without changing management logic
@@ -44,15 +46,15 @@ This trade-off — losing the "impossible to forget" property of auto-compressio
 
 ```rust
 // Append in any number of places without cost-recording overhead.
-self.context_manager.append(session, &user_msg);
+self.context_manager.append(&user_msg).await;
 
 // Single explicit compression site at the top of each iteration.
 self.compress_if_needed(session, span_recorder, job_id, &cancel_token).await?;
 ```
 
-`maybe_compress` returns `Result<CompressionOutcome>`, a three-variant enum: `NoOp` (under threshold or strategy couldn't shorten), `NoLlmCall` (compression ran without an LLM call — `Truncate`, or `Summarize` falling back after a callback failure), or `LlmCompressed(CompressionLlmCall)` (LLM-backed compression — the agent loop opens a `StepKind::Compression` step + `SpanKind::LlmCall` span and records the call against the cost ledger). `CompressionLlmCall` is purely an in-process handoff — never serialized.
+`maybe_compress` returns `Result<CompressionOutcome>`, a four-variant enum: `Compressed` (the transcript was replaced with a shorter list), `BelowThreshold` (budget under the configured compression threshold; only produced by `maybe_compress`), `StrategyDeclined` (the strategy itself returned `NoOp` without invoking the chat closure — e.g. `Truncate` when the message count is already at or below `keep_recent`), or `NoSavings` (the strategy produced a candidate slice but its post-tokenise total wasn't smaller than the original). The chat closure supplied by the agent loop is what opens the `StepKind::Compression` step + `SpanKind::LlmCall` span and records the call against the cost ledger.
 
-`force_compress` is the same call without the budget gate, for caller-initiated passes (e.g. a user-typed `/compact` slash command). Strategy NoOp / non-shrinking applies still surface as `NoChange`; only the threshold check is bypassed, so a too-small conversation is still left alone rather than rewritten as a one-line summary.
+`force_compress` is the same call without the budget gate, for caller-initiated passes (e.g. a user-typed `/compact` slash command). Strategy NoOp / non-shrinking applies still surface as `StrategyDeclined` / `NoSavings`; only the threshold check is bypassed, so a too-small conversation is still left alone rather than rewritten as a one-line summary.
 
 ## Design Decisions
 
@@ -68,10 +70,10 @@ self.compress_if_needed(session, span_recorder, job_id, &cancel_token).await?;
 
 ### Two compression strategies
 
-Both strategies are **pure planners**: `compress` is sync, returns a [`CompressOutput`], and never performs I/O. The agent loop fulfils the plan (and brackets any LLM call in a real trace span / cost row).
+`CompressionStrategy::compress` is `async` and receives the full message slice plus a one-shot `ChatCallback`. Strategies that don't need an LLM call ignore the callback; strategies that do (e.g. `Summarize`) drive the call themselves so the chat → trim → fallback flow stays inside the strategy. `CompressOutput` has two variants: `NoOp` and `Replaced { messages, replaced_full_history }`.
 
-- **Summarize** (default in production): condenses old non-system messages into a single `[Conversation Summary]` block via an LLM call and keeps the most recent `keep_recent` non-system messages alongside it. Returns `CompressOutput::NeedsLlmCall` carrying the prepared `ChatRequest`, an `on_success` closure that assembles `[system, summary-as-system, recent...]` from the response text, and an `on_failure` truncate-equivalent slice the caller falls back to when the LLM call errors.
-- **Truncate**: keeps only the most recent N non-system messages plus all system messages. Returns `CompressOutput::Replaced(messages)` directly. Simple, zero latency, predictable — but discards early context. Used as the explicit choice in test harnesses where deterministic behavior matters more than semantic preservation, and as the shape of `Summarize`'s `on_failure` fallback.
+- **Summarize** (default in production): condenses old non-system messages into a single summary block via the supplied `ChatCallback` and keeps the most recent `keep_recent` non-system messages alongside it. Returns `CompressOutput::Replaced { replaced_full_history: true, .. }`. On callback failure or empty content, falls back to a Truncate-equivalent slice (still as `Replaced`) so a transient summarizer failure doesn't kill the user's turn.
+- **Truncate**: keeps only the most recent N non-system messages plus all system messages. Ignores `ChatCallback` and returns `CompressOutput::Replaced { replaced_full_history: false, .. }`. Simple, zero latency, predictable — but discards early context. Used as the explicit choice in test harnesses where deterministic behavior matters more than semantic preservation, and as the shape of `Summarize`'s failure fallback.
 
 ### Context priority structure
 
@@ -85,9 +87,9 @@ The context sent to the LLM is organized in descending priority:
 
 ### Dependency boundaries
 
-- Depends on `aura-llm` for the `ChatRequest` shape used in `CompressOutput::NeedsLlmCall` and for the chat closure's response type. Strategies do not call any LLM client themselves; the closure is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
+- Depends on `aura-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. Strategies do not construct an LLM client themselves; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
 - Does **not** depend on `memory` (memory context injected by `agent`).
-- Does **not** depend on `trace` or `storage` — the chat closure is what opens the trace span and records cost; `context` only knows about the closure's `Result<String, ContextError>`.
+- Does **not** depend on `trace` or `storage` directly — the chat callback is what opens the trace span and records cost; `context` only sees its `Result<LlmResponse, ContextError>`. Persistence of the transcript is brokered through an optional `Arc<SessionManager>` (from `aura-session`), bound via `with_session`.
 
 ## Constraints
 
@@ -97,9 +99,9 @@ The context sent to the LLM is organized in descending priority:
 
 ## Cost recording
 
-Strategies are pure planners: they return a [`CompressOutput`] describing the work, never making LLM calls themselves. `ContextManager::maybe_compress` takes a chat closure from the caller and invokes it only when the strategy returns `NeedsLlmCall`. The agent loop's chat closure brackets the real LLM call in a `StepKind::Compression` step + `SpanKind::LlmCall` span (real lifecycle — start/end times, real `input_messages`) and calls `CostManager::record_call` with the span's id while the span is still open. The cost row's `span_id` is therefore a join key into a real trace span. `context` itself takes no `CostManager` or trace dependency.
+`ContextManager::maybe_compress` takes a chat closure from the caller and forwards it to the strategy as a `ChatCallback`. The agent loop's chat closure brackets the real LLM call in a `StepKind::Compression` step + `SpanKind::LlmCall` span (real lifecycle — start/end times, real `input_messages`) and calls `CostManager::record_call` with the span's id while the span is still open. The cost row's `span_id` is therefore a join key into a real trace span. `context` itself takes no `CostManager` or trace dependency.
 
-Failure handling: if the chat closure errors, `maybe_compress` falls back to the strategy's deterministic `on_failure` slice (typically a Truncate-equivalent — `system_msgs + recent`). A transient summarizer failure logs `warn!` and continues the user's turn rather than killing it.
+Failure handling: when `Summarize`'s callback errors or returns empty content, the strategy itself falls back to a Truncate-equivalent slice (still returned as `CompressOutput::Replaced`). A transient summarizer failure logs `warn!` and continues the user's turn rather than killing it.
 
 ## Token-count estimation: baseline + delta
 
@@ -117,7 +119,7 @@ Lifecycle:
 
 Wiring contract:
 
-- `maybe_compress(session, model_id)` is the single point that sets the calibration key. Pass `LlmCompletion::model_info().id` so `observe` and `adjust` key into the same bucket. Switching `model_id` between calls invalidates the baseline (the prior `actual_tokens` was tokenised by the old provider).
+- `maybe_compress(model_id, chat)` is the single point that sets the calibration key. Pass `LlmCompletion::model_info().id` so `observe` and `adjust` key into the same bucket. Switching `model_id` between calls invalidates the baseline (the prior `actual_tokens` was tokenised by the old provider).
 - `TiktokenTokenizer::for_model(model)` only picks the BPE family — it stores no model id. Calibration granularity is decided by what the agent loop passes into `maybe_compress`, not by how the tokenizer was constructed.
 - Calibration state is in-memory only; cold start re-calibrates from scratch each process. The baseline is reset on every compression and re-anchored by the next main call.
 
@@ -125,5 +127,6 @@ Wiring contract:
 
 | Module   | Role                                                                                   |
 | -------- | -------------------------------------------------------------------------------------- |
-| `agent`  | `AgentLoop` owns a `ContextManager` instance and calls `append` / `maybe_compress`     |
-| `memory` | Memory context is injected into the context window by `agent`, not by `context` itself |
+| `agent`   | `AgentLoop` owns a `ContextManager` instance and calls `append` / `maybe_compress`     |
+| `session` | Optional `Arc<SessionManager>` bound via `with_session`; mirrors transcript mutations to `session_messages` |
+| `memory`  | Memory context is injected into the context window by `agent`, not by `context` itself |

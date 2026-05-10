@@ -4,7 +4,7 @@
 
 The `workspace` crate is the single source of truth for Aura's workspace layout. It owns:
 
-- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for every workspace-relative file/dir name (`profile/`, `skills/`, `state/`, `work/`, `logs/`, `aura.json`, `.mcp.json`, `storage.db`, `aura.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `code-builder/runs/`), the `AURA_CONFIG_PATH` env-var name, and the `default_workspace_root` / `default_config_file` / `aura_cache_root` resolvers.
+- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for every workspace-relative file/dir name (`profile/`, `skills/`, `state/`, `work/`, `logs/`, `aura.json`, `.mcp.json`, `storage.db`, `aura.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.code-builder/`), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `AURA_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `aura_cache_root` resolvers.
 - **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
 
 Pure-data consumers (e.g. `aura-config`, `aura-tools`, `aura-code-builder`) take this crate with `default-features = false` so they never inherit a transitive `tokio`/`anyhow` dependency just to read a path constant. Crates that actually drive workspace I/O (`aura-agent`, `aura-cli`, `aura-gateway`, the binary) depend on it with `features = ["io"]`.
@@ -18,7 +18,7 @@ The workspace root is the single **project root** for the entire runtime: every 
   profile/         # standalone git repo: aura.json, .mcp.json, identity .md files
   skills/          # standalone git repo: workspace-local skill definitions
   state/           # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
-  work/            # not version-controlled: code-builder/runs/<uuid>/, future scratch
+  work/            # not version-controlled: .code-builder/<uuid>/, future scratch
   logs/            # not version-controlled: aura.log.<date>, channel/<type>.log.<date>, sessions/<id>.jsonl
 ```
 
@@ -41,7 +41,7 @@ checkout rather than polluting the real user home.
 | singleton lock   | `<workspace.path>/state/aura.lock`         |
 | channel port     | `<workspace.path>/state/channel.port`      |
 | browser profile  | `<workspace.path>/state/browser/profile/`  |
-| code-builder     | `<workspace.path>/work/code-builder/runs/<uuid>/` |
+| code-builder     | `<workspace.path>/work/.code-builder/<uuid>/` |
 | gateway logs     | `<workspace.path>/logs/aura.log.<date>`    |
 | channel logs     | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
 | session logs     | `<workspace.path>/logs/sessions/<session_id>.jsonl` |
@@ -59,7 +59,7 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 ## Config file resolution
 
-`AURA_CONFIG_PATH` overrides everything. When unset, the loader falls back to `default_config_file()` = `<default_workspace_root>/config/aura.json`. Missing-file behaviour:
+The `ENV_CONFIG_PATH` constant holds the env-var name `AURA_CONFIG_PATH`; setting that env var overrides everything. When unset, the loader falls back to `default_config_file()` = `<default_workspace_root>/config/aura.json`. Missing-file behaviour:
 
 - explicit `AURA_CONFIG_PATH` pointing at a non-existent file → hard error.
 - default path absent → silently fall back to `AuraConfig::default()` and log the resolved path that was checked.

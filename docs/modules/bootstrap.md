@@ -2,16 +2,22 @@
 
 ## Overview
 
-The `aura` binary crate (`src/main.rs` + `src/boot.rs`) is the sole runtime entry point. It loads `AuraConfig`, translates each section into the corresponding domain type, wires all `Arc`-shared components together, and drives the router until shutdown.
+The `aura` binary crate is the sole runtime entry point. It loads `AuraConfig`, translates each section into the corresponding domain type, wires all `Arc`-shared components together, and drives the router until shutdown.
 
-It is **not** a reusable library. Alternative entry points (e.g. integration test harnesses) should either reuse `boot::*` directly or graduate the assembly graph into its own crate when a second consumer actually appears — not before.
+It is **not** a reusable library. Alternative entry points (e.g. integration test harnesses) should either reuse `boot::*` / `runtime::*` directly or graduate the assembly graph into its own crate when a second consumer actually appears — not before.
 
 ## Layout
 
 | File | Role |
 |------|------|
-| `src/main.rs` | Startup choreography: storage → managers → registries → router → signal handling. Holds all `Arc` wiring and closures. |
+| `src/main.rs` | Argv-mode dispatch. Parses the CLI, promotes `--config` into `AURA_CONFIG_PATH`, then either short-circuits to a subcommand entry (`gateway_cmd::run`, `setup_cmd::run`, `tui_cmd::run`) or builds a lightweight `CommandContext` and runs `aura_cli::dispatch::run`. |
 | `src/boot.rs` | Config → domain translation layer. Pure mappings and small loaders, unit-tested. No `Arc`, no channels, no actor spawning. |
+| `src/runtime.rs` | Shared chat-loop assembly: `build_managers`, `wire_router`, `install_signal_handler`, `build_secret_vault`, `load_master_key` (with the `AURA_ALLOW_DEV_ENCRYPTION_KEY` fallback), `force_exit_watchdog`. Used by both the gateway boot path and the TUI's auto-spawn helper. |
+| `src/gateway_cmd.rs` | Long-running entry point for `aura gateway start` and the supporting installer / token / status subcommands. |
+| `src/setup_cmd.rs` | First-run wizard (`aura setup`). |
+| `src/tui_cmd.rs` | Interactive `aura tui` entry point: connects to a running gateway over the channel WS. |
+| `src/singleton.rs` | Per-workspace `flock` lock acquired by `gateway_cmd::start`. |
+| `src/tracing_init.rs` / `src/tui_log.rs` | Tracing setup variants (stdout, file, TUI) plus the in-memory `LogBuffer` and TUI mirror sink. |
 
 ## The `boot` module
 
@@ -24,8 +30,9 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 | `to_execution_policy` | `AgentConfig` → `aura_agent::ExecutionPolicy` |
 | `to_token_budget` | `ContextConfig` → `aura_context::TokenBudget` |
 | `to_session_timeout` | `SessionConfig` → `chrono::Duration` |
+| `to_assessment_mode` | `RiskCheckConfig` → `aura_skills_assessor::AssessmentMode` |
 | `build_leak_detector` | `SecurityConfig` → `aura_security::LeakDetector` |
-| `storage_db_path` | `WorkspaceConfig` → `PathBuf` at `<workspace.path>/storage.db` (the workspace root is itself the aura data directory) |
+| `storage_db_path` | `WorkspaceConfig` → `PathBuf` at `<workspace.path>/state/storage.db` (the workspace root is itself the aura data directory) |
 
 Each has a unit test in `boot::tests` that pins the mapping. These act as drift detectors: if a config field is renamed or a domain constructor's signature changes, the test fails at compile time.
 
@@ -33,73 +40,83 @@ Each has a unit test in `boot::tests` that pins the mapping. These act as drift 
 
 | Function | Source | Notes |
 |----------|--------|-------|
-| `load_config` | `AURA_CONFIG_PATH` → `./aura.json` → `Default` | Explicit path that doesn't exist is a hard error; implicit fallback is silent. |
-| `build_llm_client` | `LlmConfig` + env var | Uses `LlmProviderRegistry::with_default_providers()`. |
-| `resolve_llm_api_key` | `cfg.api_key_env`, else `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Returns `None` when nothing is set; the provider factory decides whether that's acceptable. |
-| `load_encryption_key` | `security.encryption_key_file` (hex) or `security.encryption_key_env` (hex) | Rejects non-hex input and any length ≠ 32 bytes. |
+| `load_config` | `AURA_CONFIG_PATH` → `<default_workspace_root>/config/aura.json` → `Default` | Explicit path that doesn't exist is a hard error; implicit fallback is silent. `default_workspace_root()` is `~/.aura` in release / `./.aura` in debug. |
+| `resolve_config_path` | Same precedence as `load_config`, returning the path that was used (or `None` for a pure-default boot). | Used by mutation endpoints that need to write `aura.json` back. |
+| `build_llm_client` | `default-llm` entry of `AuraConfig`, plus `LlmProviderRegistry`, optional `BlobStore`, optional `SecretVault`, and an `LlmCallGuard` | Delegates credential resolution to `aura_llm::credentials::resolve_api_key`. Returns an `Arc<GuardedLlm>` so every consumer shares the same budget gate. |
+| `build_llm_client_for_entry` | Same wiring pinned to a specific non-default `LlmEntry`. | Used by `aura llm probe` / live-model listing. |
+| `load_encryption_key` | `security.encryption_key_file` (hex) or `security.encryption_key_env` (hex) | Rejects non-hex input and any length ≠ 32 bytes. The dev fallback (`AURA_ALLOW_DEV_ENCRYPTION_KEY=1`) is **not** in `boot` — it lives in `runtime::load_master_key`, which wraps `boot::load_encryption_key`. |
 
 Loaders return `anyhow::Result` because they surface I/O and format errors that `ConfigError` deliberately does not model.
 
-## Startup sequence (main.rs)
+## Startup sequence
+
+`src/main.rs` is short and dispatches to subcommand-specific entries:
 
 ```
-init_tracing()
+Cli::parse()
   │
-  ▼
-boot::load_config()                          ── AURA_CONFIG_PATH / aura.json / default
-  │
-  ▼
-Store::open(boot::storage_db_path(…))        ── persistent libsql at <workspace>/storage.db
-  │
-  ▼
-SessionManager / JobManager / CostTracker / TraceCollector / ObservabilityRecorder
-  │
-  ▼
-boot::load_encryption_key  →  SecretVault    ── dev-only fallback gated on AURA_ALLOW_DEV_ENCRYPTION_KEY=1
-  │
-  ▼
-ToolRegistry / ToolExecutor / MemoryManager / LlmClient
-  │
-  ▼
-WorkspaceManager / Soul / ExecutionPolicy / LeakDetector / SecurityGateway
-  │
-  ▼
-ChannelRegistry::new()            ── empty at boot; populated by WS sidecars
-  │
-  ▼
-Router::new(…).with_actor_spawner(closure).with_cron_triggers(…)
-  │
-  ▼
-tokio::select! { router.run(…), shutdown.wait() }
+  ├─ Commands::Completion       → print_completion(), exit
+  ├─ Commands::Gateway { cmd }  → gateway_cmd::run(cmd)
+  ├─ Commands::Setup            → setup_cmd::run()
+  ├─ Commands::Tui { … }        → tui_cmd::run(config, …)
+  └─ everything else            → argv dispatch (lightweight CommandContext + aura_cli::dispatch::run)
 ```
 
-The closure passed to `with_actor_spawner` captures clones of all `Arc`-shared state (llm client, tool registry, skill registry, recorder, policy, tokenizer, token budget, keep-recent, system prompt, mailbox buffer size). Any new actor-level dependency must be added to the capture list.
+Long-running paths (`gateway_cmd::start`, `tui_cmd::run`) build their own runtime through `runtime::*`. The chat-loop assembly used by the gateway is:
+
+```
+runtime::build_secret_vault            ── opens libsql + master key only
+  │
+  ▼
+mint admin token + fresh TUI token, register on ChannelTokenTable
+  │
+  ▼
+runtime::build_leak_detector(security, gateway_tokens)
+init_tracing(File { log_dir, leak_detector })
+  │
+  ▼
+runtime::build_managers(config, shutdown, leak_detector, embedded_mcp_servers)
+  │   ── Store::open at <workspace>/state/storage.db
+  │   ── SessionManager / JobLifecycle / MemoryManager / CronScheduler / SecurityGateway
+  │   ── SkillRegistry / SkillAssessor / ToolRegistry / ToolExecutor / GuardedLlm / CostManager
+  │   ── McpReconciler::spawn (re-reads <workspace>/config/.mcp.json on a tick)
+  │
+  ▼
+runtime::wire_router(&mut graph)
+  │   ── Router with cron triggers + per-session AgentActor spawner
+  │
+  ▼
+GatewayServer + ChannelServer bound; tokio::select! { admin, channel, router, shutdown }
+```
+
+`tui_cmd::run` instead reads the per-start TUI token from the vault, opens a `WsTransport` against the gateway's channel listener, and runs the `TuiAdapter` until shutdown — it does **not** build a manager graph of its own.
+
+The actor-spawner closure passed to `Router::with_actor_spawner` captures clones of all `Arc`-shared state (llm client, tool registry, skill registry, span recorder, policy, tokenizer, token budget, keep-recent, system prompt, mailbox buffer size, cost manager, subagent runtime slot). Any new actor-level dependency must be added to the capture list in `runtime::wire_router`.
 
 ## Error handling at boot
 
 | Failure | Outcome |
 |---------|---------|
 | `AURA_CONFIG_PATH` set but file missing | `bail!` — startup aborts. |
-| `aura.json` missing with no env | `info!` + `AuraConfig::default()`. |
+| `<default_workspace_root>/config/aura.json` missing with no env | `info!` + `AuraConfig::default()`. |
 | `load_from_file` parse/validate error | `bail!` with full `ConfigError::Validation` list. |
-| `load_encryption_key` failure | `bail!` unless `AURA_ALLOW_DEV_ENCRYPTION_KEY=1` is set. With the flag, `error!` + dev-only `b"aura-dev-master-key-32-bytes-ok!"` fallback. Must not ship to production. |
-| `build_llm_client` failure | `bail!` — unrecoverable, there's no sensible default. |
+| `runtime::load_master_key` failure | `bail!` unless `AURA_ALLOW_DEV_ENCRYPTION_KEY=1` is set. With the flag, `error!` + dev-only `b"aura-dev-master-key-32-bytes-ok!"` fallback. Must not ship to production. |
+| `build_llm_client` failure on a chat-loop boot path | `bail!` — unrecoverable, there's no sensible default. Argv-mode commands that don't need the LLM (`channel add`, `config get`, …) downgrade the failure to a `warn!`. |
 | Any other `?` at boot | Propagates up, process exits non-zero. |
 
-The dev fallback for the encryption key is intentional but explicit: a fresh checkout runs with `AURA_ALLOW_DEV_ENCRYPTION_KEY=1 cargo run`. Without the flag, a missing or mistyped key source aborts startup rather than silently encrypting secrets with a publicly-known key. When the flag is honoured, an `error!` line fires on every boot so it cannot be mistaken for a working setup.
+The dev fallback for the encryption key is intentional but explicit: a fresh checkout runs with `AURA_ALLOW_DEV_ENCRYPTION_KEY=1 cargo run`. Without the flag, a missing or mistyped key source aborts startup rather than silently encrypting secrets with a publicly-known key. When the flag is honoured, an `error!` line fires on every boot so it cannot be mistaken for a working setup. The gate lives on `runtime::load_master_key` so every chat-loop boot path (gateway start, gateway vault-only subcommands, the TUI's auto-spawn helper) hits the same policy.
 
 ## What boot does NOT do
 
-- **No bootstrap-time MCP wiring beyond launching the reconciler.** MCP servers themselves are configured in `<workspace>/.mcp.json`, owned by `aura-tools::mcp` (not `aura-config`). `runtime::build_managers` only spawns the `McpReconciler`; the reconciler reads `.mcp.json` itself on each tick and connects/disconnects servers + registers their tools dynamically.
-- **No compiled-in channel adapters.** `ChannelRegistry` starts empty. Every channel — the bundled TUI and any sidecar plugin — arrives at runtime as a `/v1/channel-ws` client and registers itself from the gateway's route task. `channels.{http, telegram, discord}` in `aura.json` are validated but not yet wired.
-- **No cost guard or rate limiter** — `cost.*` is validated but not yet consumed by the running router.
+- **No bootstrap-time MCP wiring beyond launching the reconciler.** MCP servers themselves are configured in `<workspace>/config/.mcp.json`, owned by `aura-tools::mcp` (not `aura-config`). `runtime::build_managers` only spawns the `McpReconciler`; the reconciler reads `.mcp.json` itself on each tick and connects/disconnects servers + registers their tools dynamically.
+- **No compiled-in channel adapters.** `ChannelRegistry` starts empty. Every channel — the bundled TUI and any sidecar plugin — arrives at runtime as a `/v1/channel-ws` client and registers itself from the gateway's route task. The legacy `channels.{http, telegram, discord}` sections in `aura.json` are validated but no longer drive in-process adapter wiring; channel bots are managed via `aura channel add/remove` and a `ChannelBotReconciler` running inside the gateway.
 
 These are spec'd in `config.md` and are future wiring work; `validate()` already rejects inconsistent configurations for them so later wiring can trust the shapes.
 
 ## Constraints
 
 - `boot` depends on `aura-config` and the domain crates it translates into — nothing else.
-- `main.rs` owns `Arc` lifetime management; `boot` must not hold shared state.
+- `runtime` and the per-subcommand entrypoints own `Arc` lifetime management; `boot` must not hold shared state.
 - Pure-mapping functions must be pure: no allocations the caller can't see, no env reads, no filesystem access.
 - Every new config field that flows into runtime state must go through `boot::*` and gain a unit test covering the mapping.
 
@@ -108,6 +125,6 @@ These are spec'd in `config.md` and are future wiring work; `validate()` already
 | Module | Role |
 |--------|------|
 | `config` | Provides `AuraConfig` and section types. `boot` consumes them. |
-| `agent` | Consumes `ExecutionPolicy`, `SessionManager`, `TraceCollector`, `CostTracker`, `SecretVault`, etc. assembled by `main.rs`. |
+| `agent` | Consumes `ExecutionPolicy`, `SessionManager`, `JobLifecycle`, `CostManager`, `SecretVault`, etc. assembled by `runtime::build_managers`. |
 | `llm`, `context`, `security` | Each exposes the constructor that a `boot::to_*` or `boot::build_*` function targets. |
-| Other crates | Never called from `boot` directly; they are assembled by `main.rs` after `boot` has produced the required primitives. |
+| Other crates | Never called from `boot` directly; they are assembled by `runtime` after `boot` has produced the required primitives. |

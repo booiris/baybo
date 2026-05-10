@@ -6,32 +6,18 @@ The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `val
 
 A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consumers (`main.rs` and `aura-agent`) map each section into the corresponding domain type.
 
-Top-level sections: `llm`, `agent`, `session`, `channels`, `security`, `skills`, `cost`, `workspace`.
+Top-level sections: `llm` (a `Vec<LlmEntry>`) plus `default-llm: String`, `agent`, `session`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`.
 
 > **MCP status note.** MCP server records do **not** live in `aura.json`.
-> They live in `<workspace>/.mcp.json`, owned by `aura-tools::mcp` (config
-> shape: `McpFile`, `McpServerEntry`, `McpTransportConfig`, `OAuthConfig`).
-> Per-tool execution timeouts are declared by each tool itself via
-> `Tool::max_timeout` (defaults to 30 s). See
-> `docs/modules/tools.md` for the MCP client architecture and per-tool
-> timeout overrides, and `docs/modules/cli.md` for the
-> `aura mcp {add,list,get,remove}` surface.
+> They live in `<workspace>/config/.mcp.json`, owned by `aura-tools::mcp`
+> (config shape: `McpFile`, `McpServerEntry`, `McpTransportConfig`,
+> `OAuthConfig`, plus its own `TrustLevelConfig`). Per-tool execution
+> timeouts are declared by each tool itself via `Tool::max_timeout`
+> (defaults to 30 s). See `docs/modules/tools.md` for the MCP client
+> architecture and per-tool timeout overrides, and `docs/modules/cli.md`
+> for the `aura mcp {add,list,get,remove}` surface.
 
 There is no `storage` section. Storage paths are **derived** from the project root (`workspace.path`) — operators choose a project root, not individual data-file locations.
-
-## Current status
-
-`AuraConfig` is implemented and unit-tested, but bootstrap does not yet consume it. `src/main.rs` still builds `LlmClient` directly from environment variables (`AURA_LLM_PROVIDER`, `OPENAI_API_KEY`, …) and hardcodes session timeout, tool timeout, mpsc buffer sizes, context budget, and the dev master key. The remaining wiring work:
-
-- Load `AuraConfig` in `main.rs` and map each section to its domain type.
-- Replace `build_llm_client_from_env()` with a `LlmConfig → LlmProviderConfig` mapping (see §"Section boundaries" for `fallback_model` orchestration).
-- Route secrets through the config indirection rather than reading env vars ad hoc.
-
-Known surface gaps that should be closed before or alongside the wiring:
-
-- `SecretRequirementConfig.access: String` and `McpServerEntry.capabilities: Vec<String>` should become mirror enums (`SecretAccessConfig` = `ReadOnly | ReadWrite`, `CapabilityConfig` = `ReadWorkspace | WriteWorkspace | Http(..) | SpawnProcess | BrowserAutomation`). Current stringly-typed form violates the project's "prefer strong types over strings" rule and defers validation to bootstrap. (These mirrors are removed alongside MCP; they return with the MCP re-add.)
-
-Until these land, the spec below describes target state; deviations are flagged inline.
 
 ## Design Decisions
 
@@ -43,7 +29,7 @@ The crate depends on external libraries only — `serde`, `serde_json`, `tokio`,
 - Keeps `config` buildable in isolation
 - Prevents circular dependencies when `agent` wants to read configuration
 
-To compensate, `config` defines **mirror structs** for domain types it references (e.g., `TrustLevelConfig` mirrors `aura_model::TrustLevel`). Mapping between mirror and domain types happens at the consumer (startup code in `main.rs` or `agent` bootstrap). See §"Mirror maintenance contract" for drift prevention. (MCP-specific mirrors like `McpTransportConfig` were removed with MCP support and will return when it's reintroduced.)
+To compensate, `config` defines **mirror structs** for domain types it references (e.g., `TrustLevelConfig` in `aura-config::tools` mirrors `aura_model::TrustLevel`). Mapping between mirror and domain types happens at the consumer (startup code or `agent` bootstrap). See §"Mirror maintenance contract" for drift prevention. The MCP-specific mirrors (`McpServerEntry`, `McpTransportConfig`, `OAuthConfig`, plus a second `TrustLevelConfig`) live in `aura-tools::mcp::config` because MCP server records are persisted in `<workspace>/config/.mcp.json` rather than `aura.json`.
 
 ### Defaults-first serde strategy (top-level only)
 
@@ -59,7 +45,7 @@ This does **not** extend uniformly into nested structs. The following nested typ
   runtime effect — use `gateway.enabled` and run `aura gateway start`.
 - `TelegramChannelConfig` (`enabled`, `bot_token_env`) — under `channels.telegram`
 - `DiscordChannelConfig` (`enabled`, `bot_token_env`) — under `channels.discord`
-- (`McpServerEntry` and `SecretRequirementConfig` required-field notes are removed alongside MCP support.)
+- `LlmEntry` (`name`, `provider`, `model`) — every element of the top-level `llm` array
 
 Required-ness beyond serde (non-empty strings, numeric ranges, URL schemes) is enforced by `validate()`.
 
@@ -81,7 +67,7 @@ Sections that must not accept typos (security-sensitive or governance-sensitive 
 
 Config does **not** store live secret values; it stores references:
 
-- `LlmConfig::api_key_env` is a reference to an env-var name (e.g., `"OPENAI_API_KEY"`), not raw key material. `llm.md` §Constraints prohibits inline keys.
+- `LlmEntry::api_key_env` is a reference to an env-var name (e.g., `"OPENAI_API_KEY"`), not raw key material. `llm.md` §Constraints prohibits inline keys. When absent, `aura_llm::credentials::resolve_api_key` falls back to the per-entry vault key (`llm.entry.<name>.api_key`) and then to provider-specific defaults (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MINIMAX_API_KEY`).
 - `SecurityConfig::encryption_key_file` and `encryption_key_env` are filesystem and environment indirections; the key bytes are loaded at startup by `agent::security`.
 
 ### Section boundaries
@@ -90,14 +76,16 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 
 | Section    | Maps to                                                     | Notes                                                                                                                                                                                                |
 | ---------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `llm`      | `aura_llm::LlmProviderConfig`                               | `fallback_model` is an orchestration concern, consumed by `agent` (not by `LlmProviderConfig`). Until wiring lands, the field is carried by `LlmConfig` for forward compatibility.                   |
+| `llm`      | `Vec<LlmEntry>` + `default-llm: String` → `aura_llm::LlmProviderConfig` | Each `LlmEntry` is a `{name, provider, model, api_key_env?, base_url?, supports_vision?, reasoning_effort?}` record. `default-llm` names the entry the agent loop uses by default; the field is serde-renamed to `default-llm`. Multiple entries can target the same provider with distinct credentials. |
 | `agent`    | `ExecutionPolicy` + `TokenBudget` + `Truncate::keep_recent` | Carries `max_iterations` and the context-window budget. Per-tool timeouts are not configured here — each `Tool` impl declares its own ceiling via `Tool::max_timeout` (default 30 s).                |
 | `session`  | `SessionManager` timeout + cleanup cadence                  | `timeout_minutes` sets idle expiry; `cleanup_interval_minutes` sets sweep cadence (`0` disables cleanup).                                                                                            |
 | `channels` | `ChannelRegistry` adapter enablement + mpsc buffer sizes    | See §"Channel enablement model".                                                                                                                                                                     |
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
 | `skills`   | `aura_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
 | `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
-| `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/storage.db`).                                                                      |
+| `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/state/storage.db`).                                                                |
+| `gateway`  | `aura_gateway::RuntimeGatewayConfig`                        | Admin bind address + port, CORS allowlist, shutdown grace. See [`gateway.md`](gateway.md).                                                                                                          |
+| `browser`  | `aura_tools::browser` configuration                         | Browser sidecar launch settings (docker mode, profile path).                                                                                                                                         |
 
 `registry` and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
 
@@ -116,7 +104,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 
 ## Mirror maintenance contract
 
-`aura-config` holds mirrors of selected domain types (today just `TrustLevelConfig`; `McpTransportConfig`, `SecretAccessConfig`, and `CapabilityConfig` will return with MCP support) to stay decoupled. Drift prevention:
+`aura-config` holds mirrors of selected domain types (today, `TrustLevelConfig` in `aura-config::tools` mirrors `aura_model::TrustLevel`). The MCP-specific mirrors (`McpServerEntry`, `McpTransportConfig`, `OAuthConfig`, plus a second `TrustLevelConfig`) live in `aura-tools::mcp::config`, not here, because `.mcp.json` is owned by `aura-tools`. Drift prevention applies to both crates:
 
 1. **Ownership** — mirrors live in `aura-config`. Whenever the upstream domain type (e.g. `aura_model::TrustLevel`) changes shape, the same PR updates the mirror and the conversion between them.
 2. **Contract tests** — each mirror has a round-trip test (`From<DomainType> for MirrorType` and `TryFrom<MirrorType> for DomainType`) in `aura-config`'s integration tests. These act as the drift detector: adding a variant upstream without a mirror update breaks match exhaustiveness and fails CI.
@@ -140,10 +128,12 @@ When hot reload is implemented, the following contract must be in place **before
 
 | Section                               | Rule                                                 |
 | ------------------------------------- | ---------------------------------------------------- |
-| `llm.provider`                        | non-empty                                            |
-| `llm.model`                           | non-empty                                            |
-| `llm.base_url`                        | if set, scheme is `http://` or `https://`            |
-| `llm.fallback_model`                  | if set, non-empty                                    |
+| `llm[i].name`                         | non-empty; unique within `llm`                       |
+| `llm[i].provider`                     | non-empty                                            |
+| `llm[i].model`                        | non-empty                                            |
+| `llm[i].base_url`                     | if set, scheme is `http://` or `https://`            |
+| `llm[i].api_key_env`                  | if set, valid env-var identifier                     |
+| `default-llm`                         | when `llm` is non-empty, must name an existing entry |
 | `agent.max_iterations`                | in `1..=1000`                                        |
 | `agent.context.max_tokens`            | ≥ 1                                                  |
 | `agent.context.compression_threshold` | in `(0.0, 1.0]`, finite                              |
@@ -166,11 +156,11 @@ Field-level checks catch syntax errors; cross-section checks catch policy incons
 
 | Rule                                                                                                                                                                             | Sections involved  |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| When `llm.provider` is set, at least one secret source is resolvable: `llm.api_key_env` (env-var reference), or a provider-specific fallback env var documented for that provider | `llm`, `security`  |
+| `default-llm` (when `llm` is non-empty) must reference an existing `llm[i].name`                                                                                                 | `llm`              |
 | Each `channels.*` with `enabled: false` is rejected (enablement-model self-consistency)                                                                                          | `channels`         |
-| `security.encryption_key_file` and `encryption_key_env` cannot both be unset when any downstream consumer requires an encryption key                                             | `security`         |
+| `security.encryption_key_file` and `encryption_key_env` cannot both be unset                                                                                                     | `security`         |
 
-(The two MCP-specific cross-section rules — host-allowlist/loopback and the trust/capability matrix — were removed with MCP support. They'll return with the MCP re-add.)
+The MCP-specific trust/capability rules (stdio requires `trusted`, `installed`/`untrusted` may not declare `WriteFile`/`ExecCommand`) live with the MCP file in `aura-tools::mcp::config` since `.mcp.json` is owned there.
 
 Cross-section rules are part of the default `validate()` pass. A future strict-load flag will also enforce advisory hygiene (e.g. key-file extension hints, env-var name syntax); today those are handled case-by-case in bootstrap.
 
