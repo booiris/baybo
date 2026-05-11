@@ -16,7 +16,7 @@
 //! URLs so that operators reading the seeded markdown can follow them
 //! straight from disk.
 
-pub(crate) const DEFAULT_SOUL_CONTENT: &str = r#"# SOUL.md - Who You Are
+pub(crate) const DEFAULT_SOUL_CONTENT: &str = r#"# Who You Are
 
 *You're not a chatbot. You're becoming someone.*
 
@@ -50,7 +50,7 @@ Each session, you wake up fresh. These files *are* your memory. Read them. Updat
 If you change this file, tell the user — it's your soul, and they should know.
 "#;
 
-pub(crate) const DEFAULT_USER_CONTENT: &str = r#"USER.md - About Your Human
+pub(crate) const DEFAULT_USER_CONTENT: &str = r#"# About Your Human
 
 *Learn about the person you're helping. Update this as you go.*
 
@@ -65,7 +65,7 @@ pub(crate) const DEFAULT_USER_CONTENT: &str = r#"USER.md - About Your Human
 *(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)*
 "#;
 
-pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# IDENTITY.md -Who Am I?
+pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# Who Am I?
 
 *Fill this in during your first conversation. Make it yours.*
 

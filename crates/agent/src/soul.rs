@@ -1,7 +1,16 @@
 use std::path::{Path, PathBuf};
 
-use aura_workspace::{WorkspaceManager, WorkspacePaths};
+use aura_workspace::{IdentityKind, WorkspaceManager, WorkspacePaths};
 use tracing::debug;
+
+/// Framing preamble prepended to every runtime system prompt. Sets the
+/// agent role and operating context before the user-editable identity
+/// files set the voice — soul/identity/user_profile own personality
+/// and preferences; this const owns structural facts about the system
+/// the agent is running inside.
+const TOP_HINT: &str = r#"You are an intelligent AI assistant. The following are your core attributes.
+    
+    "#;
 
 /// The Soul system loads personality and identity from workspace files
 /// and produces the system prompt for LLM conversations.
@@ -10,33 +19,41 @@ pub struct Soul {
 }
 
 impl Soul {
-    /// Build a Soul from workspace identity files. Always appends an
+    /// Build a Soul from workspace identity files. Always prepends a
+    /// fixed top hint (agent role + structural facts) and appends an
     /// environment block describing the workspace layout — the LLM
-    /// uses this to construct absolute paths inside the working
-    /// directory so tool calls land where the OS sandbox is rooted.
-    /// The env block goes last so the identity files set the voice up
-    /// front and the runtime details are the freshest piece of context
-    /// before the user message.
+    /// uses the env block to construct absolute paths inside the
+    /// working directory so tool calls land where the OS sandbox is
+    /// rooted. The env block goes last so the identity files set the
+    /// voice up front and the runtime details are the freshest piece
+    /// of context before the user message.
     pub async fn from_workspace(workspace: &WorkspaceManager) -> anyhow::Result<Self> {
         let identity = workspace.load_identity_files().await?;
-        let mut parts = vec![];
+        let paths = WorkspacePaths::new(workspace.root.clone());
+        let mut parts = vec![TOP_HINT.to_string()];
 
         if let Some(soul_text) = &identity.soul {
-            parts.push(soul_text.clone());
+            parts.push(wrap_section(
+                "soul",
+                &paths.identity_file(IdentityKind::Soul),
+                soul_text,
+            ));
         }
         if let Some(identity_text) = &identity.identity {
-            parts.push(identity_text.clone());
+            parts.push(wrap_section(
+                "identity",
+                &paths.identity_file(IdentityKind::Identity),
+                identity_text,
+            ));
         }
         if let Some(user) = &identity.user {
-            parts.push(user.clone());
+            parts.push(wrap_section(
+                "user_profile",
+                &paths.identity_file(IdentityKind::User),
+                user,
+            ));
         }
         parts.push(build_env_block(workspace));
-
-        if parts.len() == 1 {
-            // Only the env block — no identity files were present. Add
-            // a minimal default so the prompt isn't pure-environment.
-            parts.push("You are Aura, an intelligent assistant.".to_string());
-        }
 
         let system_prompt = parts.join("\n\n");
 
@@ -60,6 +77,20 @@ impl Soul {
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
+}
+
+/// Wrap an identity-file body in an XML tag carrying the absolute
+/// on-disk path. Explicit boundaries keep arbitrary user-authored
+/// markdown inside one file from bleeding into a sibling section, and
+/// surfacing the path lets the agent re-read or update the source file
+/// without re-deriving its location.
+fn wrap_section(tag: &str, path: &Path, body: &str) -> String {
+    let abs = absolutise(path);
+    format!(
+        "<{tag} path=\"{path}\">\n{body}\n</{tag}>",
+        path = abs.display(),
+        body = body.trim_end_matches('\n'),
+    )
 }
 
 /// Render the agent-facing environment block. Mirrors what `runtime.rs`
@@ -114,7 +145,7 @@ mod tests {
     use aura_workspace::IdentityKind;
 
     #[tokio::test]
-    async fn from_workspace_prepends_env_block_with_no_identity_files() {
+    async fn from_workspace_emits_top_hint_and_env_with_no_identity_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = WorkspaceManager::new(dir.path().to_path_buf());
         let soul = Soul::from_workspace(&workspace).await.expect("soul");
@@ -126,8 +157,14 @@ mod tests {
                 .to_string();
         let expected_workspace_root = absolutise(dir.path()).display().to_string();
         assert!(
-            prompt.starts_with("# Environment"),
-            "env block must come first: {prompt}"
+            prompt.starts_with("You are an intelligent AI assistant."),
+            "top hint must come first: {prompt}"
+        );
+        let hint_pos = 0;
+        let env_pos = prompt.find("# Environment").expect("env block present");
+        assert!(
+            hint_pos < env_pos,
+            "top hint must precede env block: {prompt}"
         );
         assert!(
             prompt.contains(&expected_work_dir),
@@ -140,10 +177,6 @@ mod tests {
         assert!(
             prompt.contains(std::env::consts::OS),
             "missing platform in: {prompt}"
-        );
-        assert!(
-            prompt.contains("You are Aura"),
-            "fallback identity must follow env block when no identity files exist: {prompt}"
         );
     }
 
@@ -198,13 +231,29 @@ mod tests {
         let env_pos = prompt.find("# Environment").expect("env block present");
         let soul_pos = prompt.find("I am thoughtful.").expect("soul text present");
         let identity_pos = prompt.find("Name: Aura.").expect("identity text present");
+        let hint_pos = prompt
+            .find("You are an intelligent AI assistant.")
+            .expect("top hint present");
+        assert_eq!(hint_pos, 0, "top hint must be at offset 0: {prompt}");
         assert!(
-            soul_pos < identity_pos && identity_pos < env_pos,
-            "expected soul < identity < env, got positions soul={soul_pos} identity={identity_pos} env={env_pos}"
+            hint_pos < soul_pos && soul_pos < identity_pos && identity_pos < env_pos,
+            "expected hint < soul < identity < env, got positions hint={hint_pos} soul={soul_pos} identity={identity_pos} env={env_pos}"
+        );
+
+        let paths = WorkspacePaths::new(dir.path().to_path_buf());
+        let soul_path = absolutise(&paths.identity_file(IdentityKind::Soul));
+        let identity_path = absolutise(&paths.identity_file(IdentityKind::Identity));
+        assert!(
+            prompt.contains(&format!("<soul path=\"{}\">", soul_path.display())),
+            "soul section must be wrapped with absolute path: {prompt}"
         );
         assert!(
-            !prompt.contains("You are Aura, an intelligent assistant."),
-            "fallback identity must NOT appear when real identity files load: {prompt}"
+            prompt.contains("</soul>") && prompt.contains("</identity>"),
+            "wrapped sections must close their tags: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("<identity path=\"{}\">", identity_path.display())),
+            "identity section must be wrapped with absolute path: {prompt}"
         );
     }
 
