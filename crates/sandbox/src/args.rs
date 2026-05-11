@@ -1174,9 +1174,7 @@ mod tests {
         let bind_idx = strs
             .windows(3)
             .position(|w| {
-                w[0] == "--bind"
-                    && w[1] == "/home/u/.aura/work"
-                    && w[2] == "/home/u/.aura/work"
+                w[0] == "--bind" && w[1] == "/home/u/.aura/work" && w[2] == "/home/u/.aura/work"
             })
             .expect("workspace bind must be present");
         let tmpfs_idx = strs

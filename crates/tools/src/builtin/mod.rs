@@ -26,6 +26,7 @@ use std::sync::Arc;
 use aura_llm::GuardedLlm;
 use aura_model::TrustLevel;
 use aura_storage::BlobStore;
+use aura_workspace::WorkspacePaths;
 
 use crate::{Tool, ToolCapability, ToolManifest};
 
@@ -38,7 +39,6 @@ pub(crate) mod paths;
 pub mod read;
 pub mod send_local_file;
 pub mod todo;
-pub mod update_profile;
 pub mod web_fetch;
 pub mod write;
 
@@ -53,7 +53,6 @@ pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use now::NowTool;
 pub use read::ReadTool;
-pub use update_profile::UpdateProfileTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
 
@@ -73,6 +72,7 @@ pub use write::WriteTool;
 pub fn default_tools(
     blob_store: Arc<dyn BlobStore>,
     llm: Option<Arc<GuardedLlm>>,
+    workspace_paths: WorkspacePaths,
 ) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let web_fetch = match llm {
         Some(llm) => WebFetchTool::default().with_llm(llm),
@@ -86,7 +86,7 @@ pub fn default_tools(
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
-            EditTool,
+            EditTool::new(workspace_paths),
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(BashTool, vec![ToolCapability::ExecCommand]),
@@ -94,7 +94,6 @@ pub fn default_tools(
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
         trusted(web_fetch, vec![ToolCapability::Http]),
         send_local_file::tool(blob_store.clone()),
-        trusted(UpdateProfileTool, vec![ToolCapability::WriteFile]),
         trusted(NowTool, vec![]),
     ];
     #[cfg(debug_assertions)]

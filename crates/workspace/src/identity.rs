@@ -3,21 +3,36 @@ use std::path::{Path, PathBuf};
 pub use crate::paths::IdentityKind;
 use crate::paths::WorkspacePaths;
 
-/// Contents of the workspace identity files.
-#[derive(Debug, Clone, Default)]
+/// Contents of the workspace identity files. Every field is always
+/// populated: [`load_identity_files`] seeds any missing file from its
+/// [`IdentityKind::default_content`] before returning, so callers
+/// never have to branch on a `None`.
+#[derive(Debug, Clone)]
 pub struct IdentityFiles {
     /// SOUL.md - personality, tone, and preferences.
-    pub soul: Option<String>,
+    pub soul: String,
     /// USER.md - long-term user profile.
-    pub user: Option<String>,
+    pub user: String,
     /// IDENTITY.md - system or instance identity description.
-    pub identity: Option<String>,
+    pub identity: String,
 }
 
-async fn read_optional_file(path: &Path) -> anyhow::Result<Option<String>> {
+/// Read `path`; if it is missing, seed it with `default` and return
+/// the same default. The write is staged via a sibling `.tmp` file and
+/// renamed so a concurrent reader observes either the previous state
+/// or the full default — never a partial.
+async fn read_or_seed(path: &Path, default: &str) -> anyhow::Result<String> {
     match tokio::fs::read_to_string(path).await {
-        Ok(content) => Ok(Some(content)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(content) => Ok(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let tmp = path.with_extension("md.tmp");
+            tokio::fs::write(&tmp, default).await?;
+            tokio::fs::rename(&tmp, path).await?;
+            Ok(default.to_string())
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -41,17 +56,25 @@ pub async fn write_identity_file(
     Ok(target)
 }
 
-/// Loads all identity files from the workspace `profile/` directory.
+/// Load the three identity files from `<root>/profile/`. Any missing
+/// file is atomically seeded with its
+/// [`IdentityKind::default_content`] before being returned, so the
+/// caller is guaranteed a fully-populated [`IdentityFiles`].
+///
+/// Auto-seeding here means a deleted identity file is recreated on the
+/// next session boot. That matches what we want for runtime correctness
+/// (the Soul prompt is never half-formed), but it does mean
+/// "delete to disable" is not a way to opt out of identity injection —
+/// edit the file to be empty instead.
 pub async fn load_identity_files(root: &Path) -> anyhow::Result<IdentityFiles> {
     let paths = WorkspacePaths::new(root.to_path_buf());
     let soul_path = paths.identity_file(IdentityKind::Soul);
     let user_path = paths.identity_file(IdentityKind::User);
     let identity_path = paths.identity_file(IdentityKind::Identity);
-
     let (soul, user, identity) = tokio::try_join!(
-        read_optional_file(&soul_path),
-        read_optional_file(&user_path),
-        read_optional_file(&identity_path),
+        read_or_seed(&soul_path, IdentityKind::Soul.default_content()),
+        read_or_seed(&user_path, IdentityKind::User.default_content()),
+        read_or_seed(&identity_path, IdentityKind::Identity.default_content()),
     )?;
 
     Ok(IdentityFiles {
@@ -79,19 +102,19 @@ mod tests {
         assert_eq!(path, dir.join("profile").join("SOUL.md"));
 
         let loaded = load_identity_files(&dir).await.unwrap();
-        assert_eq!(loaded.soul.as_deref(), Some("You are helpful."));
+        assert_eq!(loaded.soul, "You are helpful.");
 
         write_identity_file(&dir, IdentityKind::Soul, "You are concise.")
             .await
             .expect("overwrite soul");
         let loaded = load_identity_files(&dir).await.unwrap();
-        assert_eq!(loaded.soul.as_deref(), Some("You are concise."));
+        assert_eq!(loaded.soul, "You are concise.");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
-    async fn test_load_from_temp_dir() {
+    async fn load_seeds_missing_files_with_defaults() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test_tmp")
@@ -99,14 +122,53 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let profile = dir.join("profile");
         tokio::fs::create_dir_all(&profile).await.unwrap();
+        // Only SOUL.md is hand-written; USER.md and IDENTITY.md are absent.
         tokio::fs::write(profile.join("SOUL.md"), "You are helpful.")
             .await
             .unwrap();
 
         let files = load_identity_files(&dir).await.unwrap();
-        assert_eq!(files.soul.as_deref(), Some("You are helpful."));
-        assert!(files.user.is_none());
-        assert!(files.identity.is_none());
+        assert_eq!(files.soul, "You are helpful.");
+        assert_eq!(files.user, IdentityKind::User.default_content());
+        assert_eq!(files.identity, IdentityKind::Identity.default_content());
+
+        // After load, the missing files must exist on disk so subsequent
+        // direct readers (e.g. the Edit tool) see the same content.
+        assert_eq!(
+            tokio::fs::read_to_string(profile.join("USER.md"))
+                .await
+                .unwrap(),
+            IdentityKind::User.default_content(),
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(profile.join("IDENTITY.md"))
+                .await
+                .unwrap(),
+            IdentityKind::Identity.default_content(),
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn load_on_fresh_workspace_seeds_all_three() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_tmp")
+            .join("identity_fresh_seed_test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+
+        // No `profile/` dir at all yet — load must create it and seed
+        // every file.
+        let files = load_identity_files(&dir).await.unwrap();
+        assert_eq!(files.soul, IdentityKind::Soul.default_content());
+        assert_eq!(files.user, IdentityKind::User.default_content());
+        assert_eq!(files.identity, IdentityKind::Identity.default_content());
+
+        let profile = dir.join("profile");
+        for kind in IdentityKind::all() {
+            assert!(profile.join(kind.file_name()).exists());
+        }
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

@@ -84,7 +84,7 @@ pub enum AgentOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
     /// Action fully succeeded, surfaced as an out-of-band confirmation
-    /// (e.g. `UpdateProfile` reporting that an identity file changed).
+    /// the LLM might not echo back into the conversation.
     Info,
     /// Action proceeded with a caveat worth seeing (e.g. suspicious
     /// skill still injected; profile write succeeded but git commit

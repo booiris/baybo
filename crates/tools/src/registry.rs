@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aura_llm::GuardedLlm;
 use aura_storage::BlobStore;
+use aura_workspace::WorkspacePaths;
 use parking_lot::RwLock;
 use serde_json::Value;
 
@@ -40,9 +41,16 @@ impl ToolRegistry {
     /// `WebFetch` so prompt-driven extraction works when a model is
     /// available; pass `None` from boot paths that have no LLM
     /// configured (argv-mode `aura llm/doctor/status`, tests).
-    pub fn with_defaults(blob_store: Arc<dyn BlobStore>, llm: Option<Arc<GuardedLlm>>) -> Self {
+    /// `workspace_paths` is forwarded to `Edit` so its approval-gate
+    /// bypass for `profile/` writes can bind to the real workspace
+    /// rather than a heuristic on the path string.
+    pub fn with_defaults(
+        blob_store: Arc<dyn BlobStore>,
+        llm: Option<Arc<GuardedLlm>>,
+        workspace_paths: WorkspacePaths,
+    ) -> Self {
         let mut registry = Self::new();
-        for (tool, manifest) in crate::builtin::default_tools(blob_store, llm) {
+        for (tool, manifest) in crate::builtin::default_tools(blob_store, llm, workspace_paths) {
             registry.register(tool, manifest);
         }
         registry
@@ -195,7 +203,11 @@ mod tests {
     #[test]
     fn defaults_register_send_file() {
         let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        let registry = ToolRegistry::with_defaults(blob_store, None);
+        let registry = ToolRegistry::with_defaults(
+            blob_store,
+            None,
+            aura_workspace::WorkspacePaths::new("/tmp"),
+        );
 
         assert!(registry.get("SendFile").is_some());
         assert!(registry.get_manifest("SendFile").is_some());

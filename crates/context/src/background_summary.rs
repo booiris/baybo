@@ -412,9 +412,10 @@ async fn execute_tool_call(
 ) -> ContentBlock {
     let outcome: Result<String, String> = async {
         enforce_notes_scope(notes_path, &call.arguments)?;
+        let edit = EditTool::new(ctx.workspace_paths.clone());
         let tool: &dyn Tool = match call.name.as_str() {
             READ_TOOL_NAME => &ReadTool,
-            EDIT_TOOL_NAME => &EditTool,
+            EDIT_TOOL_NAME => &edit,
             other => {
                 return Err(format!(
                     "{other}: tool not available in the background-summary loop"
@@ -532,7 +533,10 @@ pub async fn run_background_summary(
             tokenizer.as_ref(),
         ))],
     });
-    let tool_defs = vec![tool_def_from(&ReadTool), tool_def_from(&EditTool)];
+    let tool_defs = vec![
+        tool_def_from(&ReadTool),
+        tool_def_from(&EditTool::new(workspace.as_ref().clone())),
+    ];
     // Hang `Read` / `Edit` off the trigger's cancel token so a parent
     // cancel (`cancel_token.cancel()` on the maintenance actor)
     // cascades into any in-flight tool call alongside the LLM request.

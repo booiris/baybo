@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
     let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults(
         stores.blob.clone(),
         None,
+        workspace_paths.clone(),
     ));
     let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
         workspace_root.clone(),

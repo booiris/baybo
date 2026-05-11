@@ -341,8 +341,11 @@ pub async fn build_managers(
         "configured LLM client"
     );
 
-    let mut tool_registry =
-        ToolRegistry::with_defaults(stores.blob.clone(), Some(llm_client.clone()));
+    let mut tool_registry = ToolRegistry::with_defaults(
+        stores.blob.clone(),
+        Some(llm_client.clone()),
+        aura_workspace::WorkspacePaths::new(workspace_root.clone()),
+    );
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
     let skill_assessor = Arc::new(SkillAssessor::with_background_worker(

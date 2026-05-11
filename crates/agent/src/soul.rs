@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use aura_workspace::{IdentityKind, WorkspaceManager, WorkspacePaths};
+use aura_workspace::{IdentityKind, WorkspaceManager, WorkspacePaths, absolutise};
 use tracing::debug;
 
 /// Framing preamble prepended to every runtime system prompt. Sets the
@@ -8,9 +8,7 @@ use tracing::debug;
 /// files set the voice — soul/identity/user_profile own personality
 /// and preferences; this const owns structural facts about the system
 /// the agent is running inside.
-const TOP_HINT: &str = r#"You are an intelligent AI assistant. The following are your core attributes.
-    
-    "#;
+const TOP_HINT: &str = r#"You are an intelligent AI assistant. The following are your core attributes. You should use Edit tool to update the corresponding attribute file according to the conversation content."#;
 
 /// The Soul system loads personality and identity from workspace files
 /// and produces the system prompt for LLM conversations.
@@ -30,30 +28,25 @@ impl Soul {
     pub async fn from_workspace(workspace: &WorkspaceManager) -> anyhow::Result<Self> {
         let identity = workspace.load_identity_files().await?;
         let paths = WorkspacePaths::new(workspace.root.clone());
-        let mut parts = vec![TOP_HINT.to_string()];
-
-        if let Some(soul_text) = &identity.soul {
-            parts.push(wrap_section(
+        let parts = [
+            TOP_HINT.to_string(),
+            wrap_section(
                 "soul",
                 &paths.identity_file(IdentityKind::Soul),
-                soul_text,
-            ));
-        }
-        if let Some(identity_text) = &identity.identity {
-            parts.push(wrap_section(
+                &identity.soul,
+            ),
+            wrap_section(
                 "identity",
                 &paths.identity_file(IdentityKind::Identity),
-                identity_text,
-            ));
-        }
-        if let Some(user) = &identity.user {
-            parts.push(wrap_section(
+                &identity.identity,
+            ),
+            wrap_section(
                 "user_profile",
                 &paths.identity_file(IdentityKind::User),
-                user,
-            ));
-        }
-        parts.push(build_env_block(workspace));
+                &identity.user,
+            ),
+            build_env_block(workspace),
+        ];
 
         let system_prompt = parts.join("\n\n");
 
@@ -115,37 +108,14 @@ fn build_env_block(workspace: &WorkspaceManager) -> String {
     )
 }
 
-/// Best-effort path absolutisation. Prefers `canonicalize` (resolves
-/// symlinks too — matches the form `runtime.rs` hands the OS sandbox)
-/// and falls back to `std::path::absolute` + `.`-segment stripping when
-/// the path doesn't yet exist on disk (e.g. boot before
-/// `ensure_layout`, or unit tests pointing at a freshly-named
-/// tempdir). `std::path::absolute` joins relative paths with cwd but
-/// does not normalise `.` components — strip them manually so the
-/// prompt doesn't show `<cwd>/./.aura/work`. `..` is left intact; the
-/// OS resolves it correctly on access and proper normalisation
-/// requires a real filesystem walk.
-fn absolutise(p: &Path) -> PathBuf {
-    if let Ok(canonical) = p.canonicalize() {
-        return canonical;
-    }
-    let absolute = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-    let mut cleaned = PathBuf::new();
-    for component in absolute.components() {
-        if !matches!(component, std::path::Component::CurDir) {
-            cleaned.push(component);
-        }
-    }
-    cleaned
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aura_workspace::IdentityKind;
+    use std::path::PathBuf;
 
     #[tokio::test]
-    async fn from_workspace_emits_top_hint_and_env_with_no_identity_files() {
+    async fn from_workspace_seeds_defaults_and_wraps_every_section() {
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = WorkspaceManager::new(dir.path().to_path_buf());
         let soul = Soul::from_workspace(&workspace).await.expect("soul");
@@ -155,29 +125,38 @@ mod tests {
             absolutise(&WorkspacePaths::new(dir.path().to_path_buf()).work_dir())
                 .display()
                 .to_string();
-        let expected_workspace_root = absolutise(dir.path()).display().to_string();
         assert!(
             prompt.starts_with("You are an intelligent AI assistant."),
             "top hint must come first: {prompt}"
         );
         let hint_pos = 0;
+        let soul_pos = prompt.find("<soul ").expect("soul tag present");
+        let identity_pos = prompt.find("<identity ").expect("identity tag present");
+        let user_pos = prompt
+            .find("<user_profile ")
+            .expect("user_profile tag present");
         let env_pos = prompt.find("# Environment").expect("env block present");
         assert!(
-            hint_pos < env_pos,
-            "top hint must precede env block: {prompt}"
+            hint_pos < soul_pos
+                && soul_pos < identity_pos
+                && identity_pos < user_pos
+                && user_pos < env_pos,
+            "expected hint < soul < identity < user_profile < env: {prompt}"
         );
         assert!(
             prompt.contains(&expected_work_dir),
             "missing work_dir {expected_work_dir} in: {prompt}"
         );
         assert!(
-            prompt.contains(&expected_workspace_root),
-            "missing workspace root {expected_workspace_root} in: {prompt}"
-        );
-        assert!(
             prompt.contains(std::env::consts::OS),
             "missing platform in: {prompt}"
         );
+
+        // Auto-seeding must have created the three identity files on disk
+        // so the next session (or a direct Read) sees the same content.
+        for kind in IdentityKind::all() {
+            assert!(dir.path().join("profile").join(kind.file_name()).exists());
+        }
     }
 
     #[tokio::test]

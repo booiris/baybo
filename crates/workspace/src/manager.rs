@@ -75,7 +75,10 @@ impl WorkspaceManager {
     }
 
     /// Loads all identity files from the workspace `profile/` directory.
-    /// Missing files are represented as `None` rather than causing errors.
+    /// Any missing file is atomically seeded with its default template
+    /// (see [`identity::load_identity_files`]), so the returned
+    /// [`IdentityFiles`] is always fully populated. The `profile/` dir
+    /// itself is created on demand if absent.
     pub async fn load_identity_files(&self) -> anyhow::Result<IdentityFiles> {
         identity::load_identity_files(&self.root).await
     }
@@ -122,12 +125,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_missing_workspace_dir() {
+    async fn load_identity_files_errors_when_root_is_unwritable() {
+        // Auto-seed needs to create the profile dir; if the root path
+        // can't be created (e.g. unwritable parent), the call must
+        // surface the error rather than silently returning empty
+        // content. `/nonexistent/path` is chosen because no test
+        // process should have permission to create it.
         let mgr = WorkspaceManager::new(PathBuf::from("/nonexistent/path"));
-        let files = mgr.load_identity_files().await.unwrap();
-        assert!(files.soul.is_none());
-        assert!(files.user.is_none());
-        assert!(files.identity.is_none());
+        assert!(mgr.load_identity_files().await.is_err());
     }
 
     #[tokio::test]
@@ -173,9 +178,10 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_layout_does_not_seed_identity_files() {
-        // `ensure_layout` is the dir-skeleton hook; identity defaults
-        // belong to setup so a deleted file isn't resurrected on every
-        // boot. Guard the contract here.
+        // `ensure_layout` is the dir-skeleton hook; it must not write
+        // identity content. (The on-demand seeding now lives in
+        // `load_identity_files`; the contract guarded here is just
+        // that `ensure_layout` itself is purely about directories.)
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test_tmp")
@@ -185,10 +191,14 @@ mod tests {
         let mgr = WorkspaceManager::new(dir.clone());
         mgr.ensure_layout().await.expect("layout");
 
-        let loaded = mgr.load_identity_files().await.expect("load");
-        assert!(loaded.soul.is_none());
-        assert!(loaded.user.is_none());
-        assert!(loaded.identity.is_none());
+        let paths = WorkspacePaths::new(dir.clone());
+        for kind in IdentityKind::all() {
+            assert!(
+                !paths.identity_file(kind).exists(),
+                "ensure_layout must not create {}",
+                kind.file_name()
+            );
+        }
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -206,18 +216,9 @@ mod tests {
         mgr.seed_default_identity_files().await.expect("seed");
 
         let loaded = mgr.load_identity_files().await.expect("load");
-        assert_eq!(
-            loaded.soul.as_deref(),
-            Some(IdentityKind::Soul.default_content())
-        );
-        assert_eq!(
-            loaded.user.as_deref(),
-            Some(IdentityKind::User.default_content())
-        );
-        assert_eq!(
-            loaded.identity.as_deref(),
-            Some(IdentityKind::Identity.default_content())
-        );
+        assert_eq!(loaded.soul, IdentityKind::Soul.default_content());
+        assert_eq!(loaded.user, IdentityKind::User.default_content());
+        assert_eq!(loaded.identity, IdentityKind::Identity.default_content());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -243,11 +244,8 @@ mod tests {
         // the rest of the defaults alone.
         mgr.seed_default_identity_files().await.expect("re-seed");
         let loaded = mgr.load_identity_files().await.expect("load");
-        assert_eq!(loaded.soul.as_deref(), Some(CUSTOM));
-        assert_eq!(
-            loaded.identity.as_deref(),
-            Some(IdentityKind::Identity.default_content())
-        );
+        assert_eq!(loaded.soul, CUSTOM);
+        assert_eq!(loaded.identity, IdentityKind::Identity.default_content());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

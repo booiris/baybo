@@ -197,6 +197,35 @@ pub const ENV_CONFIG_PATH: &str = "AURA_CONFIG_PATH";
 // Default workspace root + default config file
 // ---------------------------------------------------------------------------
 
+/// Best-effort path absolutisation. Prefers `canonicalize` (resolves
+/// symlinks too — matches the form `runtime.rs` hands the OS sandbox)
+/// and falls back to `std::path::absolute` + `.`-segment stripping when
+/// the path doesn't yet exist on disk (e.g. boot before
+/// `ensure_layout`, or unit tests pointing at a freshly-named
+/// tempdir). `std::path::absolute` joins relative paths with cwd but
+/// does not normalise `.` components — strip them manually so the
+/// result doesn't show `<cwd>/./.aura/work`. `..` is left intact; the
+/// OS resolves it correctly on access and proper normalisation
+/// requires a real filesystem walk.
+///
+/// Callers that compare paths via [`Path::starts_with`] should route
+/// both sides through this helper so a relative workspace root (e.g.
+/// the debug-build default `./.aura`) does not turn the comparison
+/// into a silent miss.
+pub fn absolutise(p: &Path) -> PathBuf {
+    if let Ok(canonical) = p.canonicalize() {
+        return canonical;
+    }
+    let absolute = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut cleaned = PathBuf::new();
+    for component in absolute.components() {
+        if !matches!(component, std::path::Component::CurDir) {
+            cleaned.push(component);
+        }
+    }
+    cleaned
+}
+
 /// Default workspace root: `~/.aura` in release, `./.aura` in debug. The
 /// debug default keeps `cargo run` self-contained inside the project
 /// checkout rather than polluting the real user home.

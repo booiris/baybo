@@ -1,5 +1,5 @@
 pub mod paths;
-pub use paths::{IdentityKind, WorkspacePaths};
+pub use paths::{IdentityKind, WorkspacePaths, absolutise};
 pub mod prompt;
 
 #[cfg(feature = "io")]
