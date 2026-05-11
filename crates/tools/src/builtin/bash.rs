@@ -286,25 +286,73 @@ fn is_file_tool_redirect(command: &str) -> bool {
     first_token(command).is_some_and(|t| FILE_TOOL_REDIRECT_COMMANDS.contains(&t))
 }
 
-/// Prefix `command` with `export AURA_HELP_AGENT=1;` when it looks
-/// like it might invoke the Aura CLI, so the subshell exposes the
-/// extended help surface (hidden subcommands like `cost`, `log`,
-/// `session`, `job`, `cron`, `config`) to the agent. See
-/// `aura_cli::cli::ENV_HELP_AGENT` for the contract on the reader
-/// side.
+/// Prefix `command` with `export AURA_HELP_AGENT=1; export
+/// AURA_CONFIG_PATH=…;` when the command contains the cargo bin name
+/// (`aura_workspace::paths::BIN_NAME`). This gives the subshell two
+/// things the agent would otherwise be missing:
+///
+/// 1. The extended-help inventory (hidden subcommands like `cost`,
+///    `log`, `session`, `job`, `cron`, `config`). See
+///    `aura_cli::cli::ENV_HELP_AGENT` for the reader contract.
+/// 2. The same config file the running gateway is using. Reads
+///    `AURA_CONFIG_PATH` from the parent process when set, falls
+///    back to [`aura_workspace::paths::default_config_file`]
+///    otherwise. The path is always resolved to an absolute form so
+///    a relative debug-mode default (`./.aura/config/aura.json`)
+///    keeps pointing at the right workspace even when the bash tool
+///    spawns the child with a different cwd.
 ///
 /// The substring match is intentionally loose: non-aura processes
-/// inherit the variable and ignore it, so a false-positive injection
-/// (e.g. `cd /data/aura && cargo build`) has no observable effect.
-/// The win is that the agent can compose `aura …` commands naturally
-/// — no per-call argv token, no LLM tool-shape change — and still
-/// see the full help inventory.
+/// inherit the variables and ignore them, so a false-positive
+/// injection (e.g. `cd /data/aura && cargo build`) has no observable
+/// effect. The win is that the agent can compose `aura …` commands
+/// naturally — no per-call argv token, no LLM tool-shape change.
 fn inject_aura_env(command: &str) -> String {
-    if command.contains("aura") {
-        format!("export AURA_HELP_AGENT=1; {command}")
-    } else {
-        command.to_string()
+    let raw = std::env::var_os(aura_workspace::paths::ENV_CONFIG_PATH)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(aura_workspace::paths::default_config_file);
+    // Syntactic absolutize — fast, doesn't touch the FS, doesn't
+    // fail when the file is missing (which is the normal case in
+    // fresh deployments before `aura setup` runs).
+    let abs = std::path::absolute(&raw).unwrap_or(raw);
+    inject_aura_env_with(command, abs.as_os_str())
+}
+
+/// Pure variant of [`inject_aura_env`] that takes an already-resolved
+/// config path. Split out so tests don't have to mutate process env.
+///
+/// The "does this command invoke the CLI" check is a substring match
+/// against `aura_workspace::paths::BIN_NAME` — that const is the
+/// single source of truth for the cargo `[[bin]]` name, so renaming
+/// the binary changes the trigger token automatically.
+fn inject_aura_env_with(command: &str, config_path: &std::ffi::OsStr) -> String {
+    if !command.contains(aura_workspace::paths::BIN_NAME) {
+        return command.to_string();
     }
+    format!(
+        "export AURA_HELP_AGENT=1; export {}={}; {command}",
+        aura_workspace::paths::ENV_CONFIG_PATH,
+        sh_quote(&config_path.to_string_lossy()),
+    )
+}
+
+/// POSIX single-quote a string for embedding in a `sh -c` command.
+/// Always wraps in `'…'` (cheap and safe for paths with spaces,
+/// `$`, backticks, etc.); inner single quotes become `'\''`, the
+/// standard close-quote / escape / re-open-quote idiom.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// argv0 of the command string — the first whitespace-separated token,
@@ -765,37 +813,96 @@ mod tests {
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
+    fn cfg(path: &str) -> std::ffi::OsString {
+        std::ffi::OsString::from(path)
+    }
+
     #[test]
     fn inject_aura_env_prefixes_aura_commands() {
-        let out = inject_aura_env("aura cost show");
+        let c = cfg("/data/aura/aura.json");
+        let out = inject_aura_env_with("aura cost show", c.as_os_str());
         assert!(
             out.starts_with("export AURA_HELP_AGENT=1; "),
-            "expected env prefix, got: {out}"
+            "expected help-agent prefix, got: {out}"
         );
-        assert!(out.contains("aura cost show"));
+        assert!(
+            out.contains("export AURA_CONFIG_PATH='/data/aura/aura.json'"),
+            "expected config-path export, got: {out}"
+        );
+        assert!(out.ends_with("; aura cost show"));
+    }
+
+    #[test]
+    fn inject_aura_env_quotes_config_path_with_spaces_and_quotes() {
+        // Path with a space + an embedded single quote — the latter
+        // is rare on disk but the escape path must still work.
+        let c = cfg("/tmp/aura's space/aura.json");
+        let out = inject_aura_env_with("aura doctor", c.as_os_str());
+        assert!(
+            out.contains("export AURA_CONFIG_PATH='/tmp/aura'\\''s space/aura.json'"),
+            "expected POSIX-quoted path, got: {out}"
+        );
     }
 
     #[test]
     fn inject_aura_env_leaves_unrelated_commands_alone() {
-        assert_eq!(inject_aura_env("ls -la"), "ls -la");
-        assert_eq!(inject_aura_env("git status"), "git status");
+        let c = cfg("/x/aura.json");
+        assert_eq!(inject_aura_env_with("ls -la", c.as_os_str()), "ls -la");
+        assert_eq!(
+            inject_aura_env_with("git status", c.as_os_str()),
+            "git status"
+        );
     }
 
     #[test]
     fn inject_aura_env_triggers_inside_pipelines_and_chains() {
-        // Common shapes the agent composes — the env var must reach
-        // the subshell regardless of where `aura` appears.
+        let c = cfg("/x/aura.json");
         for cmd in [
             "aura status --live | jq .",
             "cd /tmp && aura cost show",
             "for i in 1 2; do aura job list; done",
         ] {
-            let out = inject_aura_env(cmd);
+            let out = inject_aura_env_with(cmd, c.as_os_str());
             assert!(
                 out.starts_with("export AURA_HELP_AGENT=1; "),
                 "expected env prefix for {cmd:?}, got: {out}"
             );
+            assert!(
+                out.contains("export AURA_CONFIG_PATH="),
+                "expected config-path export for {cmd:?}, got: {out}"
+            );
         }
+    }
+
+    #[test]
+    fn inject_aura_env_falls_back_to_default_config_when_env_unset() {
+        // Exercises the public wrapper rather than the pure helper —
+        // verifies that an unset `AURA_CONFIG_PATH` still produces an
+        // export pointing at the workspace default. We can't safely
+        // mutate process env in a parallel test, so we settle for
+        // asserting the export is present + absolute.
+        // SAFETY: this test runs in the bash unit-test module; tokio
+        // is not initialized, no concurrent reader is observing the
+        // var while we mutate it.
+        unsafe {
+            std::env::remove_var(aura_workspace::paths::ENV_CONFIG_PATH);
+        }
+        let out = inject_aura_env("aura status");
+        assert!(
+            out.contains("export AURA_CONFIG_PATH='"),
+            "default config should still be exported, got: {out}"
+        );
+        // The default workspace root is absolute in release and
+        // resolves to absolute via `std::path::absolute` in debug —
+        // either way the exported path starts with `/`.
+        let after_eq = out
+            .split("AURA_CONFIG_PATH='")
+            .nth(1)
+            .expect("export present");
+        assert!(
+            after_eq.starts_with('/'),
+            "exported path should be absolute, got: {after_eq}"
+        );
     }
 
     fn ctx_with(sandbox: Option<Arc<dyn crate::ExecSandbox>>) -> ToolContext {

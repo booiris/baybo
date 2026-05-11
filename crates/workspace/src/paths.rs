@@ -178,8 +178,17 @@ pub const SESSION_LOG_EXTENSION: &str = "jsonl";
 pub const CACHE_SUBDIR: &str = "aura";
 
 // ---------------------------------------------------------------------------
-// Environment variables tied to path resolution
+// Binary / env-var identifiers (single source of truth)
 // ---------------------------------------------------------------------------
+
+/// The cargo `[[bin]]` name in the workspace root `Cargo.toml`. Mirrored
+/// into the clap tree via `#[command(name = "aura", …)]` and matched
+/// against bash-tool command strings to decide whether to inject the
+/// agent-side env (see `aura_tools::builtin::bash::inject_aura_env`).
+///
+/// If the bin is ever renamed, update this *and* the clap attribute in
+/// `aura_cli::cli` — they're not enforced equal by the compiler.
+pub const BIN_NAME: &str = "aura";
 
 /// Override for the on-disk config file location.
 pub const ENV_CONFIG_PATH: &str = "AURA_CONFIG_PATH";

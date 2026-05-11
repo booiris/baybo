@@ -105,10 +105,20 @@ arg/variant — `unhide_recursive` picks it up automatically.
 
 **Agent-side opt-in**: `aura-tools::builtin::bash::inject_aura_env`
 prefixes any tool command containing the literal token `aura` with
-`export AURA_HELP_AGENT=1;` before the subshell runs. The agent gets
-the full help inventory out of the box without composing a per-call
-argv flag; the env var is namespaced so spurious injection on
-non-CLI commands is a no-op.
+`export AURA_HELP_AGENT=1; export AURA_CONFIG_PATH=<absolute path>;`
+before the subshell runs. The agent gets:
+
+* the full help inventory out of the box (`AURA_HELP_AGENT`);
+* the same config the parent process is reading — reads
+  `AURA_CONFIG_PATH` from the parent env, falling back to
+  `aura_workspace::paths::default_config_file` so the child `aura`
+  never silently looks at a different workspace. The path is
+  resolved to absolute via `std::path::absolute` so a relative
+  debug-mode default still points at the right place after the
+  bash tool changes cwd.
+
+The substring match is loose; non-aura processes inherit the
+variables and ignore them, so a false-positive injection is a no-op.
 
 "Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs are tracked in the per-subsystem follow-up todos (`docs/todo/cli-agent-send-argv.md`) — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
 
