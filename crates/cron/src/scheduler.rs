@@ -142,9 +142,15 @@ impl CronScheduler {
         let next_trigger_at = compute_next_trigger(&schedule, tz, now);
         if next_trigger_at.is_none() {
             // Only `At` with past time (Cron is infinite and never returns None here).
+            // Surface `now` in both UTC and the caller's timezone so the LLM can
+            // immediately self-correct on retry — the typical failure mode is the
+            // model not knowing what minute it is and computing `at` slightly into
+            // the past.
             return Err(CronError::InvalidSchedule(format!(
-                "schedule {} has no future fire time",
-                schedule.display()
+                "schedule {} has no future fire time (now is {} / {})",
+                schedule.display(),
+                now.to_rfc3339(),
+                now.with_timezone(&tz).to_rfc3339(),
             )));
         }
 
@@ -236,8 +242,11 @@ impl CronScheduler {
         let next = compute_next_trigger(&job.schedule, tz, now);
         if next.is_none() {
             return Err(CronError::InvalidSchedule(format!(
-                "cannot enable cron job {job_id}: schedule {} has no future fire time",
-                job.schedule.display()
+                "cannot enable cron job {job_id}: schedule {} has no future fire time \
+                 (now is {} / {})",
+                job.schedule.display(),
+                now.to_rfc3339(),
+                now.with_timezone(&tz).to_rfc3339(),
             )));
         }
 
@@ -873,12 +882,21 @@ mod tests {
                 ChannelType::tui(),
                 CronSchedule::at(past),
                 "too late",
-                "UTC".to_string(),
+                "Asia/Shanghai".to_string(),
                 None,
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, CronError::InvalidSchedule(_)));
+        // Error message must surface "now" so the LLM can self-correct on
+        // retry — the typical failure mode is the model not knowing the
+        // current minute and computing `at` slightly into the past.
+        let msg = err.to_string();
+        assert!(matches!(err, CronError::InvalidSchedule(_)), "{msg}");
+        assert!(msg.contains("now is"), "missing now hint: {msg}");
+        // Surfaces both the UTC instant and the wall-clock time in the
+        // caller's timezone so the LLM doesn't need to convert.
+        assert!(msg.contains("+00:00"), "missing UTC offset: {msg}");
+        assert!(msg.contains("+08:00"), "missing tz-localised time: {msg}");
     }
 
     #[tokio::test]
