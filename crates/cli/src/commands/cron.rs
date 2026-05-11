@@ -9,6 +9,7 @@ use crate::format::CommandOutput;
 pub async fn handle(ctx: &CommandContext, cmd: CronCmd) -> Result<CommandOutput> {
     match cmd {
         CronCmd::List => list(ctx).await,
+        CronCmd::Show { id } => show(ctx, &id).await,
     }
 }
 
@@ -66,5 +67,58 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
     Ok(CommandOutput {
         human: human.trim_end().to_string(),
         data: Some(json!({ "jobs": rows })),
+    })
+}
+
+async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
+    let mgr = cron(ctx)?;
+    let job = mgr
+        .get_job(id)
+        .await
+        .map_err(|e| CliError::Manager(format!("get cron job: {e}")))?
+        .ok_or_else(|| CliError::Manager(format!("cron job {id} not found")))?;
+
+    let mut value = job_summary(&job);
+    if let Value::Object(ref mut map) = value {
+        map.insert("prompt".into(), Value::String(job.prompt.clone()));
+        map.insert(
+            "origin_session_id".into(),
+            job.origin_session_id
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        map.insert(
+            "created_at".into(),
+            Value::String(job.created_at.to_rfc3339()),
+        );
+        map.insert(
+            "updated_at".into(),
+            Value::String(job.updated_at.to_rfc3339()),
+        );
+    }
+
+    let human = format!(
+        "id:                {}\nuser:              {}\nchannel:           {:?}\nstatus:            {}\nschedule:          {}\ntimezone:          {}\none_shot:          {}\nnext_trigger:      {}\nlast_triggered:    {}\norigin_session:    {}\ncreated:           {}\nupdated:           {}\nprompt:            {}",
+        job.id,
+        job.user_id,
+        job.channel,
+        job.status.as_str(),
+        job.schedule.display(),
+        job.timezone,
+        job.is_one_shot(),
+        job.format_time_opt(job.next_trigger_at)
+            .unwrap_or_else(|| "(disabled)".into()),
+        job.format_time_opt(job.last_triggered_at)
+            .unwrap_or_else(|| "(never)".into()),
+        job.origin_session_id.as_deref().unwrap_or("(none)"),
+        job.created_at.to_rfc3339(),
+        job.updated_at.to_rfc3339(),
+        job.prompt,
+    );
+
+    Ok(CommandOutput {
+        human,
+        data: Some(value),
     })
 }

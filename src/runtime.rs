@@ -233,6 +233,10 @@ pub async fn build_managers(
     let workspace_root = workspace_paths.root().to_path_buf();
     let skill_registry = {
         let reg = Arc::new(SkillRegistry::new());
+        let builtins = reg.register_builtins();
+        if builtins > 0 {
+            info!(count = builtins, "registered built-in skills");
+        }
         let workspace_skills = workspace_paths.skills_dir();
         let loaded = reg.load_dir(&workspace_skills);
         if loaded > 0 {

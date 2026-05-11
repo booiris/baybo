@@ -5,9 +5,13 @@ use aura_channels::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
 use aura_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
-use crate::cli::Cli;
+use crate::cli::{
+    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, LlmCmd, LogCmd,
+    McpCmd, PairCmd, SessionCmd, SkillsCmd,
+};
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
+use crate::error::CliError;
 use crate::format::{CommandOutput, OutputFormat};
 
 /// Routes `/`-prefixed chat input through the same clap tree used for argv.
@@ -40,6 +44,18 @@ impl CliSlashHandler {
         argv.extend(tokens);
         let cli = Cli::try_parse_from(&argv).map_err(|e| DispatchError::Parse(e.to_string()))?;
         let cmd = cli.command.ok_or(DispatchError::NotACommand)?;
+
+        // Whitelist gate. Anything not on the list is rejected before
+        // a handler can run — closes the `--follow` DoS hole (a slash
+        // task would otherwise tail-loop forever) and gives a clear
+        // "not available in slash" error for process-lifecycle and
+        // TTY-only commands instead of either hanging or producing a
+        // confusing handler-side error.
+        if let Err(reason) = slash_admissible(&cmd) {
+            return Err(DispatchError::Cli(CliError::NotAvailableInSlash(
+                reason.into(),
+            )));
+        }
 
         // Slash mode: force Plain unless caller asked for JSON.
         let format = if cli.global.json {
@@ -84,20 +100,30 @@ impl SlashHandler for CliSlashHandler {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let cmd = Cli::command();
         for sub in cmd.get_subcommands() {
-            if sub.is_hide_set() {
+            let name = sub.get_name();
+            // Top-level families never admissible from slash. Listing
+            // them in the menu would just bait users into typing a
+            // command the dispatcher will reject. The dispatch-time
+            // whitelist (`slash_admissible`) is the canonical guard;
+            // this is the cosmetic mirror so the menu stays coherent.
+            if matches!(
+                name,
+                "help" | "completion" | "setup" | "tui" | "gateway" | "agent"
+            ) {
                 continue;
             }
-            let name = sub.get_name();
-            if name == "help" || name == "completion" || name == "setup" {
-                // `setup` is the first-run wizard — interactive, requires
-                // a TTY, and bootstraps state before a chat session can
-                // even exist. Hiding from the slash menu prevents users
-                // from clicking on something the dispatcher would refuse
-                // anyway (`AgentSendForbiddenInSlash("setup")`).
+            let slash = format!("/{name}");
+            // Hidden subcommands (the `AURA_HELP_AGENT` extended-help
+            // bucket: `config`, `log`, `session`, `job`, `cron`, `cost`)
+            // still own their slot — claim it in `seen` so a workspace
+            // skill with the same name can't slip into the menu — but
+            // skip the display row so the chat-completion list stays
+            // focused.
+            if sub.is_hide_set() {
+                seen.insert(slash);
                 continue;
             }
             let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
-            let slash = format!("/{name}");
             seen.insert(slash.clone());
             out.push(SlashCommand::new(slash, about));
         }
@@ -173,7 +199,6 @@ fn dashboard_shortcut(raw: &str) -> Option<ViewKind> {
         "skills" => Some(ViewKind::Skills),
         "jobs" => Some(ViewKind::Jobs),
         "sessions" => Some(ViewKind::Sessions),
-        "memory" => Some(ViewKind::Memory),
         _ => None,
     }
 }
@@ -197,6 +222,113 @@ enum DispatchError {
     NotACommand,
     Parse(String),
     Cli(crate::error::CliError),
+}
+
+/// Slash-mode whitelist. Default-deny: a command may run from a `/`
+/// dispatch only if it is explicitly accepted here.
+///
+/// Rationale per category:
+///
+/// * **Process-lifecycle** (`tui`, `gateway`, `setup`, `completion`):
+///   start subprocesses, daemons, or shell scripts. Slash adapters run
+///   inside an already-live process; there is no second process for
+///   these to attach to and no TTY to drive their UI.
+/// * **TTY / OAuth / credential editors** (`channel add/remove`,
+///   `mcp add`, `llm add/edit/remove/default`): interactive pickers
+///   and OAuth flows that require a real terminal.
+/// * **Unbounded output** (`log main --follow`, `log channel --follow`):
+///   the tail-poll loop only exits on Ctrl-C; a slash invocation would
+///   hold the dispatcher task open forever (DoS). See the adversarial
+///   review on this surface.
+/// * **`agent send`**: a chat session running `/agent send` would
+///   recursively inject a turn into itself. Forbidden in slash since
+///   the original CLI ship.
+///
+/// Read-only inspection (config show/get, skills, session, job, cron,
+/// cost, log non-follow, status, doctor, etc.) plus the mutating
+/// commands that already require `--yes` (`config set/unset`, `pair
+/// approve/revoke`, `job cancel`, …) are allowed.
+fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
+    match cmd {
+        // Process-lifecycle: never slash.
+        Commands::Tui { .. } => Err("`tui` opens an interactive process; run it from a shell"),
+        Commands::Gateway { .. } => {
+            Err("`gateway` controls the server process; run it from a shell")
+        }
+        Commands::Setup => Err("`setup` is the first-run wizard; run it from a shell"),
+        Commands::Completion { .. } => {
+            Err("`completion` emits a shell script; run it from a shell")
+        }
+
+        // Recursive turn injection.
+        Commands::Agent {
+            cmd: AgentCmd::Send { .. },
+        } => Err("`agent send` would inject a turn into the active session; run it from a shell"),
+
+        // TTY-only editors and OAuth flows.
+        Commands::Channel {
+            cmd: ChannelCmd::Add | ChannelCmd::Remove,
+        } => Err("interactive channel editor; run it from a shell"),
+        Commands::Mcp {
+            cmd: McpCmd::Add { .. },
+        } => Err("`mcp add` runs an OAuth/credential flow; run it from a shell"),
+        Commands::Llm {
+            cmd: LlmCmd::Add | LlmCmd::Edit | LlmCmd::Remove | LlmCmd::Default,
+        } => Err("interactive LLM editor; run it from a shell"),
+
+        // Bounded reads + opt-in mutations: allowed.
+        Commands::Config { cmd } => match cmd {
+            // Every variant is bounded; `set`/`unset` already require `--yes`.
+            ConfigCmd::Show { .. }
+            | ConfigCmd::Validate { .. }
+            | ConfigCmd::File
+            | ConfigCmd::Schema
+            | ConfigCmd::Get { .. }
+            | ConfigCmd::Set { .. }
+            | ConfigCmd::Unset { .. } => Ok(()),
+        },
+        Commands::Skills { cmd } => match cmd {
+            SkillsCmd::List
+            | SkillsCmd::Info { .. }
+            | SkillsCmd::Search { .. }
+            | SkillsCmd::Check { .. } => Ok(()),
+        },
+        Commands::Channel {
+            cmd: ChannelCmd::List,
+        } => Ok(()),
+        Commands::Mcp {
+            cmd: McpCmd::List { .. } | McpCmd::Get { .. } | McpCmd::Remove { .. },
+        } => Ok(()),
+        Commands::Pair { cmd } => match cmd {
+            PairCmd::List { .. } | PairCmd::Approve { .. } | PairCmd::Revoke { .. } => Ok(()),
+        },
+        Commands::Llm {
+            cmd: LlmCmd::Status | LlmCmd::Probe { .. } | LlmCmd::LiveModel { .. },
+        } => Ok(()),
+        Commands::Session { cmd } => match cmd {
+            SessionCmd::List
+            | SessionCmd::Show { .. }
+            | SessionCmd::History { .. }
+            | SessionCmd::Export { .. } => Ok(()),
+        },
+        Commands::Job { cmd } => match cmd {
+            JobCmd::List { .. } | JobCmd::Show { .. } | JobCmd::Cancel { .. } => Ok(()),
+        },
+        Commands::Cron { cmd } => match cmd {
+            CronCmd::List | CronCmd::Show { .. } => Ok(()),
+        },
+        Commands::Log { cmd } => match cmd {
+            LogCmd::Main { follow: true, .. } | LogCmd::Channel { follow: true, .. } => {
+                Err("`--follow` streams indefinitely and is not supported in slash mode")
+            }
+            LogCmd::Main { .. } | LogCmd::Channel { .. } => Ok(()),
+        },
+        Commands::Cost {
+            cmd: CostCmd::Show { .. },
+        } => Ok(()),
+        Commands::Status { .. } => Ok(()),
+        Commands::Doctor => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -276,25 +408,41 @@ mod tests {
     }
 
     #[test]
-    fn clap_subcommand_wins_collision_with_skill() {
-        // `config` is a real clap subcommand; a workspace skill with the same
-        // name must not duplicate or shadow it.
+    fn visible_clap_subcommand_wins_collision_with_skill() {
+        // `skills` is a visible clap subcommand; a workspace skill with the
+        // same name must not duplicate or shadow it in the menu.
+        let reg = SkillRegistry::new();
+        reg.register(skill("skills", "impersonate built-in", true));
+        let handler = handler_with(reg);
+
+        let cmds = handler.commands();
+        let entries: Vec<&SlashCommand> = cmds.iter().filter(|c| c.name == "/skills").collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one /skills entry, got {}",
+            entries.len()
+        );
+        assert_ne!(
+            entries[0].description, "impersonate built-in",
+            "skill description must not overwrite the clap subcommand description"
+        );
+    }
+
+    #[test]
+    fn hidden_clap_subcommand_blocks_skill_from_menu() {
+        // `config` is hidden from the default help (only visible under
+        // `AURA_HELP_AGENT`); the menu drops it AND refuses to let a
+        // same-named workspace skill claim the slot.
         let reg = SkillRegistry::new();
         reg.register(skill("config", "impersonate built-in", true));
         let handler = handler_with(reg);
 
         let cmds = handler.commands();
-        let config_entries: Vec<&SlashCommand> =
-            cmds.iter().filter(|c| c.name == "/config").collect();
-        assert_eq!(
-            config_entries.len(),
-            1,
-            "expected exactly one /config entry, got {}",
-            config_entries.len()
-        );
-        assert_ne!(
-            config_entries[0].description, "impersonate built-in",
-            "skill description must not overwrite the clap subcommand description"
+        let entries: Vec<&SlashCommand> = cmds.iter().filter(|c| c.name == "/config").collect();
+        assert!(
+            entries.is_empty(),
+            "hidden built-in slot must not surface in the menu via a shadowing skill, got {entries:?}"
         );
     }
 
@@ -314,6 +462,124 @@ mod tests {
             SlashOutcome::PassThrough => {}
             other => panic!("expected PassThrough with args, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn slash_rejects_log_follow() {
+        // The exact DoS case from the adversarial review: `--follow`
+        // would otherwise tail-loop forever inside a slash dispatcher.
+        let handler = handler_with(SkillRegistry::new());
+        match handler.handle("/log main --follow").await {
+            SlashOutcome::Handled(blocks) => {
+                let text = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                assert!(
+                    text.contains("not available in slash") && text.contains("follow"),
+                    "expected slash-rejection mentioning --follow, got: {text}"
+                );
+            }
+            other => panic!("expected Handled rejection, got {other:?}"),
+        }
+
+        match handler.handle("/log channel telegram --follow").await {
+            SlashOutcome::Handled(_) => {}
+            other => panic!("expected Handled rejection for channel --follow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_rejects_process_lifecycle_commands() {
+        let handler = handler_with(SkillRegistry::new());
+        for raw in [
+            "/tui",
+            "/gateway status",
+            "/setup",
+            "/agent send --session s --message m",
+        ] {
+            match handler.handle(raw).await {
+                SlashOutcome::Handled(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    assert!(
+                        text.contains("not available in slash"),
+                        "expected slash-rejection for {raw}, got: {text}"
+                    );
+                }
+                other => panic!("expected Handled rejection for {raw}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn slash_menu_drops_process_lifecycle_families() {
+        let handler = handler_with(SkillRegistry::new());
+        let names: Vec<String> = handler.commands().into_iter().map(|c| c.name).collect();
+        for forbidden in ["/tui", "/gateway", "/setup", "/agent", "/completion"] {
+            assert!(
+                !names.contains(&forbidden.to_string()),
+                "{forbidden} must not appear in the slash menu, got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_admissible_accepts_read_only_inspection() {
+        // Spot-check the non-error arms so a future variant rename or
+        // accidental whitelist tighten-up doesn't lock operators out.
+        use crate::cli::{JobCmd, LogCmd, SessionCmd, SkillsCmd};
+        assert!(slash_admissible(&Commands::Doctor).is_ok());
+        assert!(
+            slash_admissible(&Commands::Status { live: false }).is_ok()
+                && slash_admissible(&Commands::Status { live: true }).is_ok()
+        );
+        assert!(
+            slash_admissible(&Commands::Log {
+                cmd: LogCmd::Main {
+                    date: None,
+                    limit: 50,
+                    follow: false
+                }
+            })
+            .is_ok()
+        );
+        assert!(
+            slash_admissible(&Commands::Session {
+                cmd: SessionCmd::Export {
+                    id: "sess-1".into(),
+                    out: None,
+                    yes: false,
+                },
+            })
+            .is_ok()
+        );
+        assert!(
+            slash_admissible(&Commands::Skills {
+                cmd: SkillsCmd::List
+            })
+            .is_ok()
+        );
+        assert!(
+            slash_admissible(&Commands::Job {
+                cmd: JobCmd::List { status: None }
+            })
+            .is_ok()
+        );
+        assert!(
+            slash_admissible(&Commands::Session {
+                cmd: SessionCmd::List
+            })
+            .is_ok()
+        );
     }
 
     #[tokio::test]

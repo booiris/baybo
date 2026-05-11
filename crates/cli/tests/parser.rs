@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd,
-    MemoryCmd, SessionCmd, ShellKind, SkillsCmd, TraceCmd, WorkspaceCmd,
+    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd,
+    LogCmd, SessionCmd, ShellKind, SkillsCmd,
 };
 use clap::Parser;
 
@@ -46,11 +46,63 @@ fn config_show_accepts_optional_section() {
 fn json_flag_is_global() {
     let cli = parse(&["--json", "status"]);
     assert!(cli.global.json);
-    assert!(matches!(cli.command, Some(Commands::Status)));
+    assert!(matches!(cli.command, Some(Commands::Status { .. })));
 
     let cli = parse(&["status", "--json"]);
     assert!(cli.global.json);
-    assert!(matches!(cli.command, Some(Commands::Status)));
+    assert!(matches!(cli.command, Some(Commands::Status { .. })));
+}
+
+#[test]
+fn cost_show_scopes_are_mutually_exclusive() {
+    let cli = parse(&["cost", "show"]);
+    match cli.command {
+        Some(Commands::Cost {
+            cmd:
+                CostCmd::Show {
+                    user,
+                    session,
+                    job,
+                    since,
+                    until,
+                },
+        }) => {
+            assert!(user.is_none());
+            assert!(session.is_none());
+            assert!(job.is_none());
+            assert!(since.is_none());
+            assert!(until.is_none());
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["cost", "show", "--user", "u1"]);
+    match cli.command {
+        Some(Commands::Cost {
+            cmd: CostCmd::Show { user, .. },
+        }) => assert_eq!(user.as_deref(), Some("u1")),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // --user and --session / --job are mutually exclusive
+    assert!(
+        Cli::try_parse_from(["aura", "cost", "show", "--user", "u", "--session", "s"]).is_err()
+    );
+    assert!(Cli::try_parse_from(["aura", "cost", "show", "--session", "s", "--job", "j"]).is_err());
+}
+
+#[test]
+fn status_accepts_optional_live_flag() {
+    let cli = parse(&["status"]);
+    match cli.command {
+        Some(Commands::Status { live }) => assert!(!live),
+        other => panic!("unexpected: {other:?}"),
+    }
+    let cli = parse(&["status", "--live"]);
+    match cli.command {
+        Some(Commands::Status { live }) => assert!(live),
+        other => panic!("unexpected: {other:?}"),
+    }
 }
 
 #[test]
@@ -185,74 +237,24 @@ fn llm_subcommands_parse() {
 }
 
 #[test]
-fn workspace_show_parses() {
-    let cli = parse(&["workspace", "show"]);
-    assert!(matches!(
-        cli.command,
-        Some(Commands::Workspace {
-            cmd: WorkspaceCmd::Show
-        })
-    ));
-}
-
-#[test]
-fn workspace_set_identity_accepts_file_or_content_exclusively() {
-    assert!(Cli::try_parse_from(["aura", "workspace", "set-identity"]).is_err());
-
-    let cli = parse(&["workspace", "set-identity", "soul", "--content", "hello"]);
-    match cli.command {
-        Some(Commands::Workspace {
-            cmd:
-                WorkspaceCmd::SetIdentity {
-                    name,
-                    file,
-                    content,
-                    yes,
-                },
-        }) => {
-            assert_eq!(name, "soul");
-            assert!(file.is_none());
-            assert_eq!(content.as_deref(), Some("hello"));
-            assert!(!yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    let cli = parse(&[
-        "workspace",
-        "set-identity",
-        "identity",
-        "--file",
-        "/tmp/a.md",
-        "-y",
-    ]);
-    match cli.command {
-        Some(Commands::Workspace {
-            cmd: WorkspaceCmd::SetIdentity {
-                name, file, yes, ..
-            },
-        }) => {
-            assert_eq!(name, "identity");
-            assert_eq!(file.as_deref(), Some("/tmp/a.md"));
-            assert!(yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    // --file and --content are mutually exclusive.
-    assert!(
-        Cli::try_parse_from([
+fn workspace_is_no_longer_a_subcommand() {
+    for argv in [
+        &["aura", "workspace"][..],
+        &["aura", "workspace", "show"][..],
+        &[
             "aura",
             "workspace",
             "set-identity",
             "soul",
-            "--file",
-            "x.md",
             "--content",
             "hi",
-        ])
-        .is_err()
-    );
+        ][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "expected rejection of removed workspace subcommand: {argv:?}"
+        );
+    }
 }
 
 #[test]
@@ -448,40 +450,72 @@ fn session_history_requires_id() {
     let cli = parse(&["session", "history", "sid-1"]);
     match cli.command {
         Some(Commands::Session {
-            cmd: SessionCmd::History { id },
-        }) => assert_eq!(id, "sid-1"),
+            cmd:
+                SessionCmd::History {
+                    id,
+                    include_superseded,
+                    superseded_only,
+                },
+        }) => {
+            assert_eq!(id, "sid-1");
+            assert!(!include_superseded);
+            assert!(!superseded_only);
+        }
         other => panic!("unexpected: {other:?}"),
     }
 }
 
 #[test]
-fn session_kill_accepts_yes_flag() {
-    let cli = parse(&["session", "kill", "sid"]);
+fn session_history_accepts_supersede_flags() {
+    let cli = parse(&["session", "history", "sid", "--include-superseded"]);
     match cli.command {
         Some(Commands::Session {
-            cmd: SessionCmd::Kill { id, yes },
+            cmd:
+                SessionCmd::History {
+                    include_superseded,
+                    superseded_only,
+                    ..
+                },
         }) => {
-            assert_eq!(id, "sid");
-            assert!(!yes);
+            assert!(include_superseded);
+            assert!(!superseded_only);
         }
         other => panic!("unexpected: {other:?}"),
     }
 
-    let cli = parse(&["session", "kill", "sid", "--yes"]);
+    let cli = parse(&["session", "history", "sid", "--superseded-only"]);
     match cli.command {
         Some(Commands::Session {
-            cmd: SessionCmd::Kill { yes, .. },
-        }) => assert!(yes),
+            cmd:
+                SessionCmd::History {
+                    include_superseded,
+                    superseded_only,
+                    ..
+                },
+        }) => {
+            assert!(!include_superseded);
+            assert!(superseded_only);
+        }
         other => panic!("unexpected: {other:?}"),
     }
 
-    let cli = parse(&["session", "kill", "sid", "-y"]);
-    match cli.command {
-        Some(Commands::Session {
-            cmd: SessionCmd::Kill { yes, .. },
-        }) => assert!(yes),
-        other => panic!("unexpected: {other:?}"),
-    }
+    // Mutually exclusive — clap should reject both at once.
+    assert!(
+        Cli::try_parse_from([
+            "aura",
+            "session",
+            "history",
+            "sid",
+            "--include-superseded",
+            "--superseded-only"
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn session_kill_is_no_longer_a_subcommand() {
+    assert!(Cli::try_parse_from(["aura", "session", "kill", "sid"]).is_err());
 }
 
 #[test]
@@ -533,7 +567,21 @@ fn cron_list_parses() {
 }
 
 #[test]
+fn cron_show_requires_id() {
+    assert!(Cli::try_parse_from(["aura", "cron", "show"]).is_err());
+    let cli = parse(&["cron", "show", "c1"]);
+    match cli.command {
+        Some(Commands::Cron {
+            cmd: CronCmd::Show { id },
+        }) => assert_eq!(id, "c1"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
 fn cron_mutating_subcommands_are_rejected() {
+    // `list` and `show` ship; create / delete / enable / disable / run
+    // are LLM-only via the cron agent tools.
     for args in [
         &[
             "aura",
@@ -546,7 +594,6 @@ fn cron_mutating_subcommands_are_rejected() {
             "-p",
             "hi",
         ][..],
-        &["aura", "cron", "show", "c1"],
         &["aura", "cron", "rm", "c1"],
         &["aura", "cron", "enable", "c1"],
         &["aura", "cron", "disable", "c1"],
@@ -561,97 +608,19 @@ fn cron_mutating_subcommands_are_rejected() {
 }
 
 #[test]
-fn memory_list_accepts_optional_user_and_limit() {
-    let cli = parse(&["memory", "list"]);
-    match cli.command {
-        Some(Commands::Memory {
-            cmd: MemoryCmd::List { user, limit },
-        }) => {
-            assert!(user.is_none());
-            assert_eq!(limit, 50);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    let cli = parse(&["memory", "list", "--user", "u1", "--limit", "5"]);
-    match cli.command {
-        Some(Commands::Memory {
-            cmd: MemoryCmd::List { user, limit },
-        }) => {
-            assert_eq!(user.as_deref(), Some("u1"));
-            assert_eq!(limit, 5);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn memory_search_requires_query() {
-    assert!(Cli::try_parse_from(["aura", "memory", "search"]).is_err());
-    let cli = parse(&["memory", "search", "rust"]);
-    match cli.command {
-        Some(Commands::Memory {
-            cmd: MemoryCmd::Search { query, user, limit },
-        }) => {
-            assert_eq!(query, "rust");
-            assert!(user.is_none());
-            assert_eq!(limit, 20);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn memory_show_requires_id() {
-    assert!(Cli::try_parse_from(["aura", "memory", "show"]).is_err());
-    let cli = parse(&["memory", "show", "mid"]);
-    match cli.command {
-        Some(Commands::Memory {
-            cmd: MemoryCmd::Show { id },
-        }) => assert_eq!(id, "mid"),
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn memory_promote_defaults_to_pin() {
-    let cli = parse(&["memory", "promote", "mid"]);
-    match cli.command {
-        Some(Commands::Memory {
-            cmd: MemoryCmd::Promote { id, to, yes },
-        }) => {
-            assert_eq!(id, "mid");
-            assert!((to - 1.0).abs() < f32::EPSILON);
-            assert!(!yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    let cli = parse(&["memory", "promote", "mid", "--to", "0.75", "-y"]);
-    match cli.command {
-        Some(Commands::Memory {
-            cmd: MemoryCmd::Promote { to, yes, .. },
-        }) => {
-            assert!((to - 0.75).abs() < f32::EPSILON);
-            assert!(yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn memory_clear_requires_session_flag() {
-    assert!(Cli::try_parse_from(["aura", "memory", "clear"]).is_err());
-    assert!(Cli::try_parse_from(["aura", "memory", "clear", "sid"]).is_err());
-    let cli = parse(&["memory", "clear", "--session", "sid"]);
-    match cli.command {
-        Some(Commands::Memory {
-            cmd: MemoryCmd::Clear { session, yes },
-        }) => {
-            assert_eq!(session, "sid");
-            assert!(!yes);
-        }
-        other => panic!("unexpected: {other:?}"),
+fn memory_is_no_longer_a_subcommand() {
+    for argv in [
+        &["aura", "memory"][..],
+        &["aura", "memory", "list"][..],
+        &["aura", "memory", "search", "rust"][..],
+        &["aura", "memory", "show", "mid"][..],
+        &["aura", "memory", "promote", "mid"][..],
+        &["aura", "memory", "clear", "--session", "sid"][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "expected rejection of removed memory subcommand: {argv:?}"
+        );
     }
 }
 
@@ -686,66 +655,54 @@ fn job_cancel_accepts_yes_flag() {
 }
 
 #[test]
-fn trace_list_defaults_and_session_flag() {
-    let cli = parse(&["trace", "list"]);
+fn session_export_accepts_out_and_yes() {
+    let cli = parse(&["session", "export", "sess-2"]);
     match cli.command {
-        Some(Commands::Trace {
-            cmd: TraceCmd::List { session, limit },
+        Some(Commands::Session {
+            cmd: SessionCmd::Export { id, out, yes },
         }) => {
-            assert!(session.is_none());
-            assert_eq!(limit, 50);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    let cli = parse(&["trace", "list", "--session", "sid-7", "--limit", "10"]);
-    match cli.command {
-        Some(Commands::Trace {
-            cmd: TraceCmd::List { session, limit },
-        }) => {
-            assert_eq!(session.as_deref(), Some("sid-7"));
-            assert_eq!(limit, 10);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn trace_show_requires_id() {
-    assert!(Cli::try_parse_from(["aura", "trace", "show"]).is_err());
-    let cli = parse(&["trace", "show", "sess-1"]);
-    match cli.command {
-        Some(Commands::Trace {
-            cmd: TraceCmd::Show { id },
-        }) => assert_eq!(id, "sess-1"),
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn trace_export_accepts_out_and_yes() {
-    let cli = parse(&["trace", "export", "sess-1"]);
-    match cli.command {
-        Some(Commands::Trace {
-            cmd: TraceCmd::Export { id, out, yes },
-        }) => {
-            assert_eq!(id, "sess-1");
+            assert_eq!(id, "sess-2");
             assert!(out.is_none());
             assert!(!yes);
         }
         other => panic!("unexpected: {other:?}"),
     }
 
-    let cli = parse(&["trace", "export", "sess-2", "--out", "/tmp/t.json", "--yes"]);
+    let cli = parse(&[
+        "session",
+        "export",
+        "sess-3",
+        "--out",
+        "/tmp/t.json",
+        "--yes",
+    ]);
     match cli.command {
-        Some(Commands::Trace {
-            cmd: TraceCmd::Export { id, out, yes },
+        Some(Commands::Session {
+            cmd: SessionCmd::Export { id, out, yes },
         }) => {
-            assert_eq!(id, "sess-2");
+            assert_eq!(id, "sess-3");
             assert_eq!(out.as_deref(), Some("/tmp/t.json"));
             assert!(yes);
         }
         other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn trace_top_level_is_gone() {
+    // `trace`'s subcommands collapsed into `session`: show counts now
+    // arrive via `session show`; exporting the call tree is `session
+    // export`. Anything beginning with `trace` is unknown.
+    for argv in [
+        &["aura", "trace"][..],
+        &["aura", "trace", "list"][..],
+        &["aura", "trace", "show", "sid"][..],
+        &["aura", "trace", "export", "sid"][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "trace folded into `session`: {argv:?}"
+        );
     }
 }
 
@@ -874,5 +831,136 @@ fn config_unset_requires_path() {
             assert!(yes);
         }
         other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn log_main_accepts_optional_date_and_limit() {
+    let cli = parse(&["log", "main"]);
+    match cli.command {
+        Some(Commands::Log {
+            cmd:
+                LogCmd::Main {
+                    date,
+                    limit,
+                    follow,
+                },
+        }) => {
+            assert!(date.is_none());
+            assert_eq!(limit, 200);
+            assert!(!follow);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["log", "main", "--date", "2026-05-11", "-n", "10", "-f"]);
+    match cli.command {
+        Some(Commands::Log {
+            cmd:
+                LogCmd::Main {
+                    date,
+                    limit,
+                    follow,
+                },
+        }) => {
+            assert_eq!(date.as_deref(), Some("2026-05-11"));
+            assert_eq!(limit, 10);
+            assert!(follow);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn log_channel_requires_channel_name() {
+    assert!(Cli::try_parse_from(["aura", "log", "channel"]).is_err());
+
+    let cli = parse(&["log", "channel", "telegram"]);
+    match cli.command {
+        Some(Commands::Log {
+            cmd:
+                LogCmd::Channel {
+                    channel,
+                    date,
+                    limit,
+                    follow,
+                },
+        }) => {
+            assert_eq!(channel, "telegram");
+            assert!(date.is_none());
+            assert_eq!(limit, 200);
+            assert!(!follow);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&[
+        "log",
+        "channel",
+        "slack",
+        "--date",
+        "2026-05-10",
+        "--limit",
+        "5",
+        "--follow",
+    ]);
+    match cli.command {
+        Some(Commands::Log {
+            cmd:
+                LogCmd::Channel {
+                    channel,
+                    date,
+                    limit,
+                    follow,
+                },
+        }) => {
+            assert_eq!(channel, "slack");
+            assert_eq!(date.as_deref(), Some("2026-05-10"));
+            assert_eq!(limit, 5);
+            assert!(follow);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn log_channel_rejects_path_traversal_and_other_unsafe_inputs() {
+    // The `channel` positional becomes a filename component:
+    //   <workspace>/logs/channel/<channel>.log.<date>
+    // so anything other than `[a-z0-9_-]+` would either escape the
+    // directory (`/`, `..`) or push the lookup somewhere unexpected
+    // (uppercase, dots, unicode). The clap value-parser must reject
+    // these at argv-parse time so neither the argv handler nor the
+    // slash dispatcher ever builds the path.
+    for argv in [
+        &["aura", "log", "channel", "../../../etc/passwd"][..],
+        &["aura", "log", "channel", "../etc"][..],
+        &["aura", "log", "channel", "tg/secret"][..],
+        &["aura", "log", "channel", "tg\\secret"][..],
+        &["aura", "log", "channel", "."][..],
+        &["aura", "log", "channel", ".."][..],
+        &["aura", "log", "channel", ".hidden"][..],
+        &["aura", "log", "channel", "tele.gram"][..],
+        &["aura", "log", "channel", "Telegram"][..], // uppercase
+        &["aura", "log", "channel", "tele gram"][..], // space
+        &["aura", "log", "channel", ""][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "expected rejection of unsafe channel name: {argv:?}"
+        );
+    }
+
+    // Legitimate names still pass.
+    for argv in [
+        &["aura", "log", "channel", "telegram"][..],
+        &["aura", "log", "channel", "slack"][..],
+        &["aura", "log", "channel", "tg_bot42"][..],
+        &["aura", "log", "channel", "openclaw-lark"][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_ok(),
+            "expected accept of legitimate channel name: {argv:?}"
+        );
     }
 }

@@ -19,6 +19,9 @@ pub enum CliError {
     #[error("command '{0}' is not available inside a chat session; run it from the shell")]
     AgentSendForbiddenInSlash(String),
 
+    #[error("command is not available in slash mode: {0}")]
+    NotAvailableInSlash(String),
+
     #[error("config error: {0}")]
     Config(String),
 

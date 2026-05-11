@@ -18,7 +18,9 @@ One directory per skill, a `SKILL.md` entrypoint with YAML frontmatter plus a Ma
 
 ### Load location
 
-At startup the registry scans `<workspace.path>/skills/<skill-name>/SKILL.md`. No other source is consulted.
+At startup the registry first calls `SkillRegistry::register_builtins()` to register every skill compiled into the cargo `[[bin]]` (`crates/skills/src/builtin/<name>/SKILL.md`, embedded via `include_str!`), then scans `<workspace.path>/skills/<skill-name>/SKILL.md` and overlays any workspace skill of the same name on top. Built-ins are `ArtifactSource::Inline` + `TrustLevel::Trusted`; an operator can patch shipped behaviour by dropping a same-named directory under the workspace.
+
+The first built-in is `aura-cli` — a non-user-invocable skill that tells the agent to introspect the running Aura instance through the `aura` CLI (the BashTool auto-injects `AURA_HELP_AGENT` and `AURA_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags).
 
 ```
 <workspace>/skills/

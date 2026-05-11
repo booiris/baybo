@@ -44,9 +44,20 @@ pub struct GlobalArgs {
     pub no_color: bool,
 
     /// Increase log verbosity. Repeat for trace-level logs.
-    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    #[arg(short, long, global = true, action = clap::ArgAction::Count, hide = true)]
     pub verbose: u8,
 }
+
+/// Environment variable that, when set to any non-empty value, makes
+/// every CLI invocation surface the extended help (hidden subcommands
+/// like `config`, `log`, `session`, `job`, `cron`, `cost` and the
+/// `-v`/`--verbose` flag become visible in `aura --help`).
+///
+/// The agent-side `BashTool` exports this automatically for any
+/// command containing the bin name, so the model sees the full help
+/// inventory without composing an argv flag. Humans can opt in
+/// per-shell with `export AURA_HELP_AGENT=1`.
+pub const ENV_HELP_AGENT: &str = "AURA_HELP_AGENT";
 
 /// Top-level command families.
 ///
@@ -55,75 +66,111 @@ pub struct GlobalArgs {
 /// gain public read/write methods.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Inspect and edit the Aura configuration.
+    /// Read and edit the active `aura.json`: `show`, `get`, `set`,
+    /// `unset`, `validate`, `file`, `schema`. Mutations take effect
+    /// after restart (hot-reload deferred).
+    #[command(hide = true)]
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
-    /// List and inspect registered skills.
+    /// Inspect registered skills: `list`, `info <name>`, `search [q]`,
+    /// `check [name]` (verify required bins / env / model declarations).
+    /// Read-only.
     Skills {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
-    /// Inspect channel adapters.
+    /// Manage channel bots (Telegram/Slack/Discord/…): `list` the
+    /// registered bots, `add` an interactive registration flow,
+    /// `remove` deregisters and cleans up the vault token.
     #[command(name = "channel")]
     Channel {
         #[command(subcommand)]
         cmd: ChannelCmd,
     },
-    /// Manage Model Context Protocol servers exposed to the agent loop.
-    /// MCP-discovered tools surface to the LLM as `<server>/<tool>` and
-    /// are persisted to `.mcp.json` at the workspace root.
+    /// Manage Model Context Protocol servers (`add` / `list` / `get` /
+    /// `remove`). Servers are persisted to `.mcp.json`; their tools
+    /// surface to the agent as `<server>/<tool>` and the running
+    /// gateway picks up changes within ~5s without restart.
     Mcp {
         #[command(subcommand)]
         cmd: McpCmd,
     },
-    /// Manage per-user pairings: approve new senders, list pending
-    /// requests, revoke existing approvals. See
-    /// `docs/modules/pairing.md`.
+    /// Manage per-user channel pairings (the approval gate that lets
+    /// a new sender talk to the agent): `list` (pending/approved),
+    /// `approve <code>`, `revoke <channel> <bot> <user>`.
     Pair {
         #[command(subcommand)]
         cmd: PairCmd,
     },
-    /// LLM provider and model status.
+    /// Manage LLM provider entries in `aura.json`: `status` (which
+    /// entries are registered), `probe [name]` (round-trip a tiny
+    /// chat to verify auth + connectivity), `live-model [name]`
+    /// (list the provider's catalog), and the interactive editors
+    /// `add` / `edit` / `remove` / `default`.
     Llm {
         #[command(subcommand)]
         cmd: LlmCmd,
     },
-    /// Workspace identity and layout.
-    Workspace {
-        #[command(subcommand)]
-        cmd: WorkspaceCmd,
-    },
-    /// Inspect and manage chat sessions.
+    /// Inspect chat sessions: `list` all sessions, `show <id>` for
+    /// metadata + (when wired) execution-trace counts, `history <id>`
+    /// for the conversation transcript (with
+    /// `--include-superseded` / `--superseded-only` to surface
+    /// compaction-dropped turns), and `export <id> [--out]` for the
+    /// full LLM/tool call tree as JSON.
+    #[command(hide = true)]
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
-    /// Inspect and cancel tracked jobs.
+    /// Inspect tracked async jobs: `list [--status]`, `show <id>`,
+    /// `cancel <id>` (requires `--yes` in slash mode). Jobs are the
+    /// per-turn unit of work — one job per agent loop invocation.
+    #[command(hide = true)]
     Job {
         #[command(subcommand)]
         cmd: JobCmd,
     },
-    /// Inspect and manage cron-scheduled jobs.
+    /// Inspect cron-scheduled jobs: `list` all schedules, `show <id>`
+    /// for the full row including prompt body. Cron mutations
+    /// (create/delete/enable/disable/run) are LLM-only via the
+    /// `CronCreate` / `CronDelete` / `CronList` tools.
+    #[command(hide = true)]
     Cron {
         #[command(subcommand)]
         cmd: CronCmd,
     },
-    /// Inspect and manage stored user memories.
-    Memory {
+    /// Read the rolling tracing log files on disk. `main` reads
+    /// `<workspace>/logs/aura.log.<date>` (gateway/agent output);
+    /// `channel <type>` reads
+    /// `<workspace>/logs/channel/<type>.log.<date>` (sidecar output).
+    /// Both tail the last `-n` lines (default 200) and `--follow`
+    /// streams new lines until Ctrl-C. For structured session
+    /// traces (LLM calls, tool calls) use `aura session export`
+    /// instead — different store, different read shape.
+    #[command(hide = true)]
+    Log {
         #[command(subcommand)]
-        cmd: MemoryCmd,
+        cmd: LogCmd,
     },
-    /// Inspect session traces.
-    Trace {
-        #[command(subcommand)]
-        cmd: TraceCmd,
-    },
-    /// Send a one-shot message to the agent.
+    /// Send a one-shot message to an existing session's agent loop
+    /// (`send --session <id> --message <text>`). Disabled inside a
+    /// chat session — running it from slash mode would inject a turn
+    /// into the session that's running it.
     Agent {
         #[command(subcommand)]
         cmd: AgentCmd,
+    },
+    /// Inspect LLM spend (USD + token counts) recorded by the cost
+    /// manager. `show` aggregates over a scope — `--user <id>`,
+    /// `--session <id>`, `--job <id>`, or the default current-UTC-day
+    /// range bounded by `--since` / `--until`. Scopes are mutually
+    /// exclusive.
+    #[command(hide = true)]
+    Cost {
+        #[command(subcommand)]
+        cmd: CostCmd,
     },
     /// Launch the interactive Ratatui chat session.
     ///
@@ -151,9 +198,24 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: GatewayCmd,
     },
-    /// One-shot summary of current runtime state.
-    Status,
-    /// Run health checks against config, storage, and env.
+    /// One-shot snapshot of the running Aura instance.
+    ///
+    /// Default view is the *static* inventory: registered skills /
+    /// tools / channels / current LLM model / config path — answers
+    /// "how is this process configured". Pass `--live` to also query
+    /// the live runtime: in-flight job count, failed jobs in the last
+    /// 24h, and today's LLM spend (parallelized via `tokio::try_join!`).
+    /// Use `--live` first when diagnosing "is anything happening right
+    /// now / did anything just fail".
+    Status {
+        /// Include live runtime snapshot: in-flight jobs, recent
+        /// failures (last 24h), cost-spent today.
+        #[arg(long)]
+        live: bool,
+    },
+    /// Run readiness checks against config, storage, and env. Aggregates
+    /// `AuraConfig::validate`, a storage ping, an LLM probe, and an
+    /// env-var audit into a single report.
     Doctor,
     /// Interactive first-run wizard: bootstrap the workspace, mint
     /// the master encryption key, register an LLM provider, optionally
@@ -478,47 +540,51 @@ pub enum LlmCmd {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum WorkspaceCmd {
-    /// Show the workspace root and loaded identity files.
-    Show,
-    /// Overwrite one of the three workspace identity documents
-    /// (`SOUL.md` / `USER.md` / `IDENTITY.md`). Requires `--yes` in
-    /// slash mode. Change picks up after restart.
-    SetIdentity {
-        /// Which identity file to write: `soul`, `user`, or `identity`.
-        name: String,
-        /// Path to a file whose contents replace the identity document.
-        /// Mutually exclusive with `--content`.
-        #[arg(long, conflicts_with = "content")]
-        file: Option<String>,
-        /// Literal content to write. Mutually exclusive with `--file`.
-        #[arg(long)]
-        content: Option<String>,
-        /// Confirm the write (required in slash mode).
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 pub enum SessionCmd {
     /// List known sessions, newest-active first.
     List,
-    /// Show session metadata.
+    /// Show session metadata plus, when the trace graph is wired, an
+    /// execution-trace summary (jobs / steps / spans recorded under
+    /// this session).
     Show {
         /// Session id.
         id: String,
     },
-    /// Show the chat transcript for a session.
+    /// Show the chat transcript for a session. By default, only the
+    /// *active* (non-superseded) messages are returned — this is what
+    /// the LLM currently sees on the next turn. Pass `--include-superseded`
+    /// to also surface messages that compaction has replaced, or
+    /// `--superseded-only` to filter to just those.
+    ///
+    /// Each row in the extended view is tagged either `[active]` or
+    /// `[→ #N]` (replaced by the row at ordinal N — usually a
+    /// compaction summary).
     History {
         /// Session id.
         id: String,
+        /// Include rows that compaction has dropped from the active
+        /// set. Surfaces both `[active]` and `[→ #N]` rows.
+        #[arg(long, conflicts_with = "superseded_only")]
+        include_superseded: bool,
+        /// Restrict to rows that compaction has dropped from the
+        /// active set.
+        #[arg(long)]
+        superseded_only: bool,
     },
-    /// Delete a session and its transcript. Requires `--yes` in slash mode.
-    Kill {
-        /// Session id.
+    /// Export the full execution trace (job → step → span tree) as
+    /// pretty JSON. Prints to stdout unless `--out <path>` is given,
+    /// which writes the file in argv mode. Requires `--yes` under
+    /// slash mode when `--out` is set, because the write path is
+    /// operator-controlled.
+    Export {
+        /// Session id whose trace to export.
         id: String,
-        /// Confirm the destructive action (required in slash mode).
+        /// Optional output file path. Without it, JSON is returned in
+        /// the command output.
+        #[arg(long)]
+        out: Option<String>,
+        /// Confirm the file write (required in slash mode when
+        /// `--out` is set).
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -568,88 +634,78 @@ pub enum CronCmd {
     /// all mutations (create/delete/enable/run) are driven through the LLM
     /// tools (`CronCreate`, `CronDelete`, …).
     List,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum MemoryCmd {
-    /// List stored memories. Omit `--user` for an operator-wide view.
-    List {
-        /// Scope results to a specific user.
-        #[arg(long, short = 'u')]
-        user: Option<String>,
-        /// Cap the number of entries returned (default: 50).
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-    },
-    /// Substring-search memory contents. Omit `--user` for a global scan.
-    Search {
-        /// Query string matched against content (case-insensitive substring).
-        query: String,
-        /// Scope results to a specific user.
-        #[arg(long, short = 'u')]
-        user: Option<String>,
-        /// Cap the number of hits returned (default: 20).
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-    /// Show a memory entry by id.
+    /// Show a single cron job by id. Includes the prompt body and
+    /// `origin_session_id` — the rest of the fields mirror what `list`
+    /// surfaces per row.
     Show {
-        /// Memory entry id.
+        /// Cron job id (UUID, as printed by `cron list`).
         id: String,
-    },
-    /// Raise a memory entry's importance. Requires `--yes` in slash mode.
-    Promote {
-        /// Memory entry id.
-        id: String,
-        /// New importance in `[0.0, 1.0]`. Defaults to 1.0 (pin).
-        #[arg(long, default_value_t = 1.0)]
-        to: f32,
-        /// Confirm the write (required in slash mode).
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-    /// Delete every memory entry recorded from a given session. Requires
-    /// `--yes` in slash mode.
-    Clear {
-        /// Session id whose memories should be purged.
-        #[arg(long)]
-        session: String,
-        /// Confirm the destructive action (required in slash mode).
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 
 #[derive(Debug, Subcommand)]
-pub enum TraceCmd {
-    /// List stored session traces (newest first).
-    List {
-        /// Scope to a specific session id.
+pub enum LogCmd {
+    /// Read the main gateway / agent log
+    /// (`<workspace>/logs/aura.log.<date>`).
+    Main {
+        /// Date of the rolling log to read, in `YYYY-MM-DD`.
+        /// Defaults to today (UTC — matches the appender's daily rotation).
         #[arg(long)]
+        date: Option<String>,
+        /// Return only the last N lines (default: 200).
+        #[arg(long, short = 'n', default_value_t = 200)]
+        limit: usize,
+        /// After printing the tail, stream new lines as they are
+        /// appended (tail-f). Exits on Ctrl-C. Incompatible with `--json`.
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
+    /// Read a channel sidecar's log
+    /// (`<workspace>/logs/channel/<channel>.log.<date>`).
+    Channel {
+        /// Channel type (e.g. `telegram`, `slack`, `tui`). Restricted
+        /// to `[a-z0-9_-]+` so it can't escape `logs/channel/` through
+        /// a path-traversal payload.
+        #[arg(value_parser = crate::commands::parse_channel_name)]
+        channel: String,
+        /// Date of the rolling log to read, in `YYYY-MM-DD`.
+        /// Defaults to today (UTC).
+        #[arg(long)]
+        date: Option<String>,
+        /// Return only the last N lines (default: 200).
+        #[arg(long, short = 'n', default_value_t = 200)]
+        limit: usize,
+        /// After printing the tail, stream new lines as they are
+        /// appended (tail-f). Exits on Ctrl-C. Incompatible with `--json`.
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CostCmd {
+    /// Show aggregated spend. Default scope is the current UTC day
+    /// across every user. Pass `--user`, `--session`, or `--job` to
+    /// narrow; the scopes are mutually exclusive.
+    Show {
+        /// Aggregate over a single user.
+        #[arg(long, short = 'u', conflicts_with_all = ["session", "job"])]
+        user: Option<String>,
+        /// Aggregate over a single session.
+        #[arg(long, short = 's', conflicts_with_all = ["user", "job"])]
         session: Option<String>,
-        /// Cap the number of rows returned (default: 50).
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-    },
-    /// Show a session's trace tree summary.
-    Show {
-        /// Session id whose trace to inspect.
-        id: String,
-    },
-    /// Export a session's trace as pretty JSON. Prints to stdout unless
-    /// `--out <path>` is given, which writes the file in argv mode. Requires
-    /// `--yes` under slash mode because the write path is operator-controlled.
-    Export {
-        /// Session id whose trace to export.
-        id: String,
-        /// Optional output file path. Without it, JSON is returned in the
-        /// command output.
+        /// Aggregate over a single job.
+        #[arg(long, short = 'j', conflicts_with_all = ["user", "session"])]
+        job: Option<String>,
+        /// Lower bound (inclusive) for the time range, `YYYY-MM-DD` UTC.
+        /// Defaults to start-of-today. Ignored when `--session`/`--job`
+        /// are set (those scopes are bounded by the row itself).
         #[arg(long)]
-        out: Option<String>,
-        /// Confirm the file write (required in slash mode when `--out` is
-        /// set).
-        #[arg(long, short = 'y')]
-        yes: bool,
+        since: Option<String>,
+        /// Upper bound (exclusive) for the time range, `YYYY-MM-DD` UTC.
+        /// Defaults to start-of-tomorrow.
+        #[arg(long)]
+        until: Option<String>,
     },
 }
 
@@ -729,10 +785,76 @@ pub enum ShellKind {
     Elvish,
 }
 
+/// Parse argv into a `Cli`. When [`ENV_HELP_AGENT`] is set, every
+/// hidden subcommand and arg is unhidden *before* clap processes
+/// argv, so `aura --help` and `aura <subcmd> --help` naturally print
+/// the extended view through clap's own help machinery — no separate
+/// printer path to keep in sync.
+///
+/// Equivalent to `Cli::parse()` when the env var is unset.
+pub fn parse_args() -> Cli {
+    use clap::{CommandFactory, FromArgMatches};
+
+    let cmd = Cli::command();
+    let cmd = if std::env::var_os(ENV_HELP_AGENT).is_some_and(|v| !v.is_empty()) {
+        unhide_recursive(cmd)
+    } else {
+        cmd
+    };
+    let matches = cmd.get_matches();
+    Cli::from_arg_matches(&matches).expect("derive(Parser) matches the auto-derived Command")
+}
+
+fn unhide_recursive(cmd: clap::Command) -> clap::Command {
+    let cmd = cmd.hide(false).mut_args(|a| a.hide(false));
+    let names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
+    let mut cmd = cmd;
+    for name in names {
+        cmd = cmd.mut_subcommand(&name, unhide_recursive);
+    }
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// `unhide_recursive` must clear `hide` on every nested subcommand
+    /// and arg — the hide policy fans out into the `AURA_HELP_AGENT`
+    /// extended-help view via the env-var-driven `parse_args` path.
+    /// Walks the tree two levels deep on a representative branch to
+    /// keep the guarantee honest.
+    #[test]
+    fn unhide_recursive_clears_hidden_on_subcommands_and_args() {
+        let cmd = unhide_recursive(Cli::command());
+        for sub in cmd.get_subcommands() {
+            assert!(
+                !sub.is_hide_set(),
+                "subcommand `{}` should be unhidden",
+                sub.get_name()
+            );
+            for arg in sub.get_arguments() {
+                assert!(
+                    !arg.is_hide_set(),
+                    "arg `{}` on `{}` should be unhidden",
+                    arg.get_id(),
+                    sub.get_name()
+                );
+            }
+        }
+        let verbose = cmd
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "verbose")
+            .expect("--verbose arg present at top level");
+        assert!(
+            !verbose.is_hide_set(),
+            "--verbose should be unhidden after recursive flip"
+        );
+    }
 
     /// Regression guard for the dev-only `--dev-auto-gateway` flag.
     /// Release builds must never expose it — it spawns a subprocess

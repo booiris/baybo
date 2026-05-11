@@ -40,12 +40,19 @@ pub enum SlashOutcome {
 ///
 /// This is a closed enum rather than an opaque string so adapters can
 /// exhaustively handle each view without depending on the command layer.
+///
+/// The set must stay a subset of the slash-command surface — every
+/// view here corresponds to a top-level slash family that is also
+/// admissible under `slash_admissible`. Adding a view that has no
+/// slash counterpart bait operators with a TUI panel they can't
+/// reach via the chat surface, and conversely removing a slash
+/// family means dropping its view too (e.g. the former `Memory`
+/// view was retired when `aura memory` was deleted from the CLI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewKind {
     Skills,
     Jobs,
     Sessions,
-    Memory,
 }
 
 /// Snapshot of tabular data fed to a dashboard view.

@@ -10,7 +10,7 @@ use aura_llm::GuardedLlm;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
-use aura_storage::{ChannelBotStore, ChannelPairingStore, TraceStore};
+use aura_storage::{ChannelBotStore, ChannelPairingStore, CostStore, TraceStore};
 use aura_tools::ToolRegistry;
 use aura_workspace::WorkspaceManager;
 
@@ -102,6 +102,7 @@ pub struct ContextBuilder {
     cron: Option<Arc<CronScheduler>>,
     memory: Option<Arc<MemoryManager>>,
     trace: Option<Arc<dyn TraceStore>>,
+    cost_store: Option<Arc<dyn CostStore>>,
     security: Option<Arc<SecurityGateway>>,
     leak_detector: Option<Arc<LeakDetector>>,
     skill_assessor: Option<Arc<SkillAssessor>>,
@@ -125,6 +126,7 @@ impl ContextBuilder {
             cron: None,
             memory: None,
             trace: None,
+            cost_store: None,
             security: None,
             leak_detector: None,
             skill_assessor: None,
@@ -189,6 +191,15 @@ impl ContextBuilder {
         self
     }
 
+    /// Optional. When set alongside `session`/`job`/`trace`, the
+    /// auto-derived `QueryApi` is built via `QueryApi::new` (cost
+    /// queries supported); otherwise `QueryApi::without_costs` is used
+    /// and `cost_summary` returns `Unsupported`.
+    pub fn cost_store(mut self, cost_store: Arc<dyn CostStore>) -> Self {
+        self.cost_store = Some(cost_store);
+        self
+    }
+
     pub fn security(mut self, security: Arc<SecurityGateway>) -> Self {
         self.security = Some(security);
         self
@@ -221,11 +232,10 @@ impl ContextBuilder {
 
     pub fn build(self) -> CommandContext {
         let query_api = match (&self.session, &self.job, &self.trace) {
-            (Some(s), Some(j), Some(t)) => Some(Arc::new(QueryApi::without_costs(
-                s.store(),
-                Arc::clone(j),
-                Arc::clone(t),
-            ))),
+            (Some(s), Some(j), Some(t)) => Some(Arc::new(match &self.cost_store {
+                Some(c) => QueryApi::new(s.store(), Arc::clone(j), Arc::clone(t), Arc::clone(c)),
+                None => QueryApi::without_costs(s.store(), Arc::clone(j), Arc::clone(t)),
+            })),
             _ => None,
         };
         CommandContext {

@@ -33,7 +33,6 @@ impl DashboardProvider for CliDashboardProvider {
             ViewKind::Skills => skills_snapshot(&self.ctx),
             ViewKind::Jobs => jobs_snapshot(&self.ctx).await,
             ViewKind::Sessions => sessions_snapshot(&self.ctx).await,
-            ViewKind::Memory => memory_snapshot(&self.ctx).await,
         }
     }
 }
@@ -121,68 +120,6 @@ async fn sessions_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
     }
 }
 
-async fn memory_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
-    let rows = match ctx.memory.as_deref() {
-        Some(mgr) => match mgr.list(None).await {
-            Ok(mut entries) => {
-                entries.sort_by(|a, b| {
-                    b.importance
-                        .partial_cmp(&a.importance)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| b.last_accessed.cmp(&a.last_accessed))
-                });
-                entries
-                    .iter()
-                    .map(|e| {
-                        vec![
-                            e.id.clone(),
-                            e.user_id.clone(),
-                            category_label(&e.category).into(),
-                            format!("{:.2}", e.importance),
-                            truncate(&e.content, 80),
-                        ]
-                    })
-                    .collect()
-            }
-            Err(_) => Vec::new(),
-        },
-        None => Vec::new(),
-    };
-    DashboardSnapshot {
-        title: "Memory".into(),
-        columns: vec![
-            "ID".into(),
-            "USER".into(),
-            "CATEGORY".into(),
-            "IMPORTANCE".into(),
-            "CONTENT".into(),
-        ],
-        rows,
-        footer: None,
-    }
-}
-
-fn category_label(c: &aura_model::MemoryCategory) -> &'static str {
-    match c {
-        aura_model::MemoryCategory::UserPreference => "preference",
-        aura_model::MemoryCategory::KeyFact => "fact",
-    }
-}
-
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").to_string()
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.replace('\n', " ")
-    } else {
-        let mut out: String = s
-            .replace('\n', " ")
-            .chars()
-            .take(max.saturating_sub(1))
-            .collect();
-        out.push('…');
-        out
-    }
 }
