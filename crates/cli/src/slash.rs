@@ -113,10 +113,11 @@ impl SlashHandler for CliSlashHandler {
                 continue;
             }
             let slash = format!("/{name}");
-            // Hidden subcommands (the `--help-agent` bucket: `config`, `log`,
-            // `trace`, …) still own their slot — claim it in `seen` so a
-            // workspace skill with the same name can't slip into the menu —
-            // but skip the display row so the chat-completion list stays
+            // Hidden subcommands (the `AURA_HELP_AGENT` extended-help
+            // bucket: `config`, `log`, `session`, `job`, `cron`, `cost`)
+            // still own their slot — claim it in `seen` so a workspace
+            // skill with the same name can't slip into the menu — but
+            // skip the display row so the chat-completion list stays
             // focused.
             if sub.is_hide_set() {
                 seen.insert(slash);
@@ -431,8 +432,9 @@ mod tests {
 
     #[test]
     fn hidden_clap_subcommand_blocks_skill_from_menu() {
-        // `config` is hidden behind `--help-agent`; the menu drops it AND
-        // refuses to let a same-named workspace skill claim the slot.
+        // `config` is hidden from the default help (only visible under
+        // `AURA_HELP_AGENT`); the menu drops it AND refuses to let a
+        // same-named workspace skill claim the slot.
         let reg = SkillRegistry::new();
         reg.register(skill("config", "impersonate built-in", true));
         let handler = handler_with(reg);

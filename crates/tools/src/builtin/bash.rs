@@ -823,7 +823,7 @@ mod tests {
         let out = inject_aura_env_with("aura cost show", c.as_os_str());
         assert!(
             out.starts_with("export AURA_HELP_AGENT=1; "),
-            "expected help-agent prefix, got: {out}"
+            "expected AURA_HELP_AGENT export prefix, got: {out}"
         );
         assert!(
             out.contains("export AURA_CONFIG_PATH='/data/aura/aura.json'"),

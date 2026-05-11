@@ -20,7 +20,7 @@ commands you compose:
 - See the **extended help inventory** (every hidden subcommand)
 - Point at the **same config** the running gateway is reading
 
-You never need to pass `--config` or `--help-agent` yourself.
+You never need to pass `--config` yourself.
 
 ## Decision tree
 

@@ -53,9 +53,9 @@ pub struct GlobalArgs {
 /// like `config`, `log`, `session`, `job`, `cron`, `cost` and the
 /// `-v`/`--verbose` flag become visible in `aura --help`).
 ///
-/// Replaces the older `--help-agent` flag so the agent-side `BashTool`
-/// can opt in via `export` without dragging an extra argv token through
-/// every `aura …` invocation it composes. Humans can still opt in
+/// The agent-side `BashTool` exports this automatically for any
+/// command containing the bin name, so the model sees the full help
+/// inventory without composing an argv flag. Humans can opt in
 /// per-shell with `export AURA_HELP_AGENT=1`.
 pub const ENV_HELP_AGENT: &str = "AURA_HELP_AGENT";
 
@@ -821,10 +821,10 @@ mod tests {
     use clap::CommandFactory;
 
     /// `unhide_recursive` must clear `hide` on every nested subcommand
-    /// and arg — the hide policy fans out into the `--help-agent`
-    /// surface and the env-var-driven `parse_args` path. Walks the
-    /// tree two levels deep on a representative branch to keep the
-    /// guarantee honest.
+    /// and arg — the hide policy fans out into the `AURA_HELP_AGENT`
+    /// extended-help view via the env-var-driven `parse_args` path.
+    /// Walks the tree two levels deep on a representative branch to
+    /// keep the guarantee honest.
     #[test]
     fn unhide_recursive_clears_hidden_on_subcommands_and_args() {
         let cmd = unhide_recursive(Cli::command());
