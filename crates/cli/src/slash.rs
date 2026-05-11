@@ -199,7 +199,6 @@ fn dashboard_shortcut(raw: &str) -> Option<ViewKind> {
         "skills" => Some(ViewKind::Skills),
         "jobs" => Some(ViewKind::Jobs),
         "sessions" => Some(ViewKind::Sessions),
-        "memory" => Some(ViewKind::Memory),
         _ => None,
     }
 }

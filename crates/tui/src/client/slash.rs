@@ -71,7 +71,6 @@ fn dashboard_shortcut(name: &str) -> Option<ViewKind> {
         "skills" => Some(ViewKind::Skills),
         "jobs" => Some(ViewKind::Jobs),
         "sessions" => Some(ViewKind::Sessions),
-        "memory" => Some(ViewKind::Memory),
         _ => None,
     }
 }
@@ -95,7 +94,7 @@ fn help_text() -> String {
          \n\
          Tool approvals are resolved from the modal (a / A / d).\n\
          \n\
-         Admin commands (status, config, jobs, skills, tools, memory,\n\
+         Admin commands (status, config, jobs, skills, tools,\n\
          sessions, …) are reached via the `aura` CLI and are not\n\
          reachable from the TUI.\n",
     )
@@ -133,7 +132,8 @@ mod tests {
         assert_eq!(dashboard_shortcut("skills"), Some(ViewKind::Skills));
         assert_eq!(dashboard_shortcut("jobs"), Some(ViewKind::Jobs));
         assert_eq!(dashboard_shortcut("sessions"), Some(ViewKind::Sessions));
-        assert_eq!(dashboard_shortcut("memory"), Some(ViewKind::Memory));
+        // `memory` retired with the CLI `aura memory` family.
+        assert_eq!(dashboard_shortcut("memory"), None);
         assert_eq!(dashboard_shortcut("status"), None);
     }
 }

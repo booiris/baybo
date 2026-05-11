@@ -49,16 +49,6 @@ impl DashboardProvider for TuiDashboardProvider {
                     "CREATED".into(),
                 ],
             ),
-            ViewKind::Memory => (
-                "Memory",
-                vec![
-                    "ID".into(),
-                    "USER".into(),
-                    "CATEGORY".into(),
-                    "IMPORTANCE".into(),
-                    "CONTENT".into(),
-                ],
-            ),
         };
         DashboardSnapshot {
             title: title.into(),
