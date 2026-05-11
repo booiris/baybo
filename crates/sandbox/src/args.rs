@@ -97,16 +97,6 @@ pub fn build_bwrap_argv(
                 argv.push(OsString::from(*root));
             }
 
-            // workspace_root is always RW so the project the agent was
-            // launched in stays writable even when it lives outside
-            // `extra_root` (e.g. `/data/proj` while $HOME is
-            // `/home/u`). bwrap accepts overlapping binds; if the
-            // workspace already sits inside extra_root, the second
-            // bind is a redundant no-op.
-            argv.push(OsString::from("--bind"));
-            argv.push(spec.workspace_root.as_os_str().to_owned());
-            argv.push(spec.workspace_root.as_os_str().to_owned());
-
             argv.push(OsString::from("--bind-try"));
             argv.push(extra_root.as_os_str().to_owned());
             argv.push(extra_root.as_os_str().to_owned());
@@ -119,6 +109,19 @@ pub fn build_bwrap_argv(
                 argv.push(OsString::from("--tmpfs"));
                 argv.push(path.as_os_str().to_owned());
             }
+
+            // workspace_root binds LAST. bwrap processes mounts in
+            // order, so a later `--tmpfs P` shadows an earlier
+            // `--bind P/x P/x`. The agent's denylist includes
+            // `$AURA_HOME` / `~/.aura`, and the workspace work-dir
+            // lives inside it (e.g. `~/.aura/work`) — binding it
+            // before the tmpfs would leave nothing to chdir into. By
+            // binding last, the work dir is re-established as a
+            // mountpoint on top of the masking tmpfs and the rest of
+            // the aura state stays masked.
+            argv.push(OsString::from("--bind"));
+            argv.push(spec.workspace_root.as_os_str().to_owned());
+            argv.push(spec.workspace_root.as_os_str().to_owned());
         }
     }
 
@@ -433,6 +436,32 @@ pub fn render_sbpl_profile(
                 s.push_str(&format!(
                     "(deny file-write* (subpath \"{}\"))\n",
                     sbpl_quote(p)
+                ));
+            }
+            s.push('\n');
+
+            // SBPL is last-match-wins, so a deny on the workspace's
+            // parent (e.g. `~/.aura` masked while the workspace is
+            // `~/.aura/work`) would clobber the earlier allows. Re-
+            // emit the workspace allows AFTER the denies so the
+            // work-dir stays read+write while the rest of the parent
+            // stays denied. Same fix shape as the bwrap reordering.
+            s.push_str(&format!(
+                "(allow file-read* (subpath \"{}\"))\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            s.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))\n",
+                sbpl_quote(&spec.workspace_root)
+            ));
+            if let Some(mount) = workspace_symlink_mount {
+                s.push_str(&format!(
+                    "(allow file-read* (subpath \"{}\"))\n",
+                    sbpl_quote(mount.destination())
+                ));
+                s.push_str(&format!(
+                    "(allow file-write* (subpath \"{}\"))\n",
+                    sbpl_quote(mount.destination())
                 ));
             }
             s.push('\n');
@@ -1121,6 +1150,76 @@ mod tests {
         assert!(
             read_block.contains("(subpath \"/data/out\")"),
             "writable path must also be readable: {read_block}"
+        );
+    }
+
+    #[test]
+    fn bwrap_argv_permissive_binds_workspace_after_denied_tmpfs_so_nested_workspace_survives() {
+        // Repro of the production bug: workspace lives inside a denied
+        // parent (e.g. `~/.aura/work` while `~/.aura` is masked as a
+        // credential vault). bwrap processes mounts in order, so if the
+        // workspace bind came before the parent tmpfs the chdir would
+        // fail with "No such file or directory" inside the empty tmpfs.
+        let mut spec = spec_for(NetworkPolicy::All, "/home/u/.aura/work");
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/u"),
+            denied_paths: vec![
+                PathBuf::from("/home/u/.ssh"),
+                PathBuf::from("/home/u/.aura"),
+            ],
+        };
+        let argv = build_bwrap_argv(&spec, None);
+        let strs = argv_strs(&argv);
+
+        let bind_idx = strs
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind"
+                    && w[1] == "/home/u/.aura/work"
+                    && w[2] == "/home/u/.aura/work"
+            })
+            .expect("workspace bind must be present");
+        let tmpfs_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/home/u/.aura")
+            .expect("denied tmpfs for /home/u/.aura must be present");
+        assert!(
+            bind_idx > tmpfs_idx,
+            "workspace bind must come AFTER the masking tmpfs so the work-dir \
+             mountpoint survives; got bind at {bind_idx}, tmpfs at {tmpfs_idx}: {strs:?}"
+        );
+    }
+
+    #[test]
+    fn sbpl_profile_permissive_reallows_workspace_after_denies_so_nested_workspace_stays_writable()
+    {
+        let mut spec = spec_for(NetworkPolicy::None, "/Users/u/.aura/work");
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/Users/u"),
+            denied_paths: vec![
+                PathBuf::from("/Users/u/.ssh"),
+                PathBuf::from("/Users/u/.aura"),
+            ],
+        };
+        let s = render_sbpl_profile(&spec, None);
+        let deny_pos = s
+            .find(r#"(deny file-write* (subpath "/Users/u/.aura"))"#)
+            .expect("deny for /Users/u/.aura must be present");
+        let final_write_allow = s
+            .find(r#"(allow file-write* (subpath "/Users/u/.aura/work"))"#)
+            .expect("post-deny workspace allow must be emitted");
+        let final_read_allow = s
+            .find(r#"(allow file-read* (subpath "/Users/u/.aura/work"))"#)
+            .expect("post-deny workspace read allow must be emitted");
+        assert!(
+            final_write_allow > deny_pos,
+            "workspace allow must follow denies for last-match-wins to win: \
+             allow@{final_write_allow} vs deny@{deny_pos}"
+        );
+        assert!(
+            final_read_allow > deny_pos,
+            "workspace read allow must follow denies for last-match-wins to win: \
+             allow@{final_read_allow} vs deny@{deny_pos}"
         );
     }
 
