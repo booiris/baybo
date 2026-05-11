@@ -11,3 +11,48 @@ pub(crate) mod openai;
 // the module needs to be reachable as
 // `aura_llm::providers::openai_subscription`.
 pub mod openai_subscription;
+
+/// Per-provider built-in fallbacks for `(context_window, supports_vision)`.
+/// The single source of truth: each factory layers `OpenRouter snapshot
+/// → operator override → these defaults`, and the gateway dashboard
+/// uses the same table to render "effective" values when nothing else
+/// is known. Without this consolidation the dashboard had to mirror
+/// five `unwrap_or(...)` literals by hand and silently flipped
+/// `supports_vision` `true` for minimax / openai-subscription where
+/// the runtime defaults to `false`.
+#[derive(Debug, Clone, Copy)]
+pub struct FactoryDefaults {
+    pub context_window: usize,
+    pub supports_vision: bool,
+}
+
+pub fn factory_defaults_for(provider: &str) -> FactoryDefaults {
+    match provider {
+        "openai" => FactoryDefaults {
+            context_window: 128_000,
+            supports_vision: true,
+        },
+        "anthropic" => FactoryDefaults {
+            context_window: 200_000,
+            supports_vision: true,
+        },
+        "gemini" => FactoryDefaults {
+            context_window: 1_000_000,
+            supports_vision: true,
+        },
+        "minimax" => FactoryDefaults {
+            context_window: 200_000,
+            supports_vision: false,
+        },
+        // Subscription billing is account-level, vision-off is a
+        // hard product fact for the Codex catalog.
+        openai_subscription::PROVIDER_NAME => FactoryDefaults {
+            context_window: 272_000,
+            supports_vision: false,
+        },
+        _ => FactoryDefaults {
+            context_window: 128_000,
+            supports_vision: true,
+        },
+    }
+}

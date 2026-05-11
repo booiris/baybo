@@ -8,6 +8,8 @@ mod auth;
 mod channel_ws;
 #[path = "jobs_pagination.rs"]
 mod jobs_pagination;
+#[path = "llm_endpoint.rs"]
+mod llm_endpoint;
 #[path = "logs_endpoint.rs"]
 mod logs_endpoint;
 #[path = "openapi_spec_sync.rs"]

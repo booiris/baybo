@@ -117,6 +117,8 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
         base_url: entry.base_url.clone(),
         model: entry.model.clone(),
         supports_vision: entry.supports_vision,
+        context_window: None,
+        pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),
         vault: ctx.secret_vault.clone(),
     };
@@ -701,6 +703,8 @@ async fn fetch_live_models(
             entry.model.clone()
         },
         supports_vision: entry.supports_vision,
+        context_window: None,
+        pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),
         vault,
     };

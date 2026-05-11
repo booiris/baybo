@@ -82,12 +82,13 @@ impl LlmProviderFactory for OpenAiSubscriptionProviderFactory {
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let model = build_model(config, BackgroundRefresh::Enabled)?;
+        let defaults = crate::providers::factory_defaults_for(PROVIDER_NAME);
         let model_info = ModelInfo {
             id: config.model.clone(),
             provider: PROVIDER_NAME.to_string(),
-            context_window: 272_000,
+            context_window: defaults.context_window,
             supports_tools: true,
-            supports_vision: false,
+            supports_vision: defaults.supports_vision,
             // Subscription billing is account-level, not per-token, so cost
             // records land at $0 — see design doc.
             pricing: ModelPricing::default(),
@@ -148,6 +149,8 @@ mod tests {
             base_url: None,
             model: "gpt-5".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault,
         }

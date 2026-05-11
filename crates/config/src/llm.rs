@@ -1,3 +1,4 @@
+pub use aura_model::LlmPricingOverride;
 use serde::{Deserialize, Serialize};
 
 /// One entry in the `llm` registry. Each entry is keyed by `name` and
@@ -35,6 +36,18 @@ pub struct LlmEntry {
     /// surfaces an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// Operator override for the factory's default `context_window`
+    /// (max input + output tokens). `None` keeps the factory default
+    /// (which itself prefers OpenRouter snapshot capabilities, then
+    /// falls back to a per-provider constant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Operator override for per-model pricing. Each field is
+    /// independently optional — unset fields keep the factory default
+    /// (OpenRouter snapshot, or a flat per-provider rate when the
+    /// snapshot doesn't cover the slug).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<LlmPricingOverride>,
     /// Reasoning effort for providers that expose it (currently only
     /// `openai-subscription` Codex Responses). One of `none`,
     /// `minimal`, `low`, `medium`, `high`, `xhigh`. The provider

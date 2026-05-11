@@ -69,12 +69,17 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         let model = client.completion_model(&config.model);
 
         let caps = crate::openrouter::capabilities_for(self.provider_name(), &config.model);
+        let defaults = crate::providers::factory_defaults_for(self.provider_name());
         let model_info = ModelInfo {
             id: config.model.clone(),
             provider: "minimax".to_string(),
-            context_window: caps.and_then(|c| c.context_window).unwrap_or(200_000),
+            context_window: caps
+                .and_then(|c| c.context_window)
+                .unwrap_or(defaults.context_window),
             supports_tools: true,
-            supports_vision: caps.and_then(|c| c.supports_vision).unwrap_or(false),
+            supports_vision: caps
+                .and_then(|c| c.supports_vision)
+                .unwrap_or(defaults.supports_vision),
             pricing: self.pricing_for_model(&config.model),
         };
 
@@ -244,6 +249,8 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };
@@ -259,6 +266,8 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };
@@ -286,6 +295,8 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };
@@ -306,6 +317,8 @@ mod tests {
                 base_url: None,
                 model: "MiniMax-VL-01".into(),
                 supports_vision: Some(true),
+                context_window: None,
+                pricing: None,
                 reasoning_effort: None,
                 vault: None,
             })
@@ -326,6 +339,8 @@ mod tests {
                 base_url: None,
                 model: "claude-sonnet-4-6".into(),
                 supports_vision: Some(false),
+                context_window: None,
+                pricing: None,
                 reasoning_effort: None,
                 vault: None,
             })

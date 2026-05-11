@@ -153,6 +153,8 @@ pub async fn build_llm_client_for_entry(
                 base_url: entry.base_url.clone(),
                 model: entry.model.clone(),
                 supports_vision: entry.supports_vision,
+                context_window: entry.context_window,
+                pricing: entry.pricing,
                 reasoning_effort: entry.reasoning_effort.clone(),
                 vault,
             },

@@ -32,7 +32,10 @@ use tracing::debug;
 pub use crate::error::LlmError;
 pub(crate) use crate::error::{reqwest_to_error, rig_completion_to_error, status_to_error};
 pub use crate::guard::{GuardedLlm, LlmCallGuard};
-pub use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, ProviderModels};
+pub use crate::providers::{FactoryDefaults, factory_defaults_for};
+pub use crate::registry::{
+    LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry, ProviderModels,
+};
 
 /// Default chat-completion base URL for each built-in provider id.
 /// `None` for unknown providers — the operator must supply one.
@@ -1093,6 +1096,8 @@ mod multimodal_dispatch_tests {
                 base_url: None,
                 model: "MiniMax-VL-01".into(),
                 supports_vision: Some(true),
+                context_window: None,
+                pricing: None,
                 reasoning_effort: None,
                 vault: None,
             })
@@ -1185,6 +1190,8 @@ mod multimodal_dispatch_tests {
                 base_url: None,
                 model: "gpt-3.5-turbo".into(),
                 supports_vision: None,
+                context_window: None,
+                pricing: None,
                 reasoning_effort: None,
                 vault: None,
             })

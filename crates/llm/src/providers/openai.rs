@@ -56,12 +56,17 @@ impl LlmProviderFactory for OpenAIProviderFactory {
         let model = client.completions_api().completion_model(&config.model);
 
         let caps = crate::openrouter::capabilities_for(self.provider_name(), &config.model);
+        let defaults = crate::providers::factory_defaults_for(self.provider_name());
         let model_info = ModelInfo {
             id: config.model.clone(),
             provider: "openai".to_string(),
-            context_window: caps.and_then(|c| c.context_window).unwrap_or(128_000),
+            context_window: caps
+                .and_then(|c| c.context_window)
+                .unwrap_or(defaults.context_window),
             supports_tools: true,
-            supports_vision: caps.and_then(|c| c.supports_vision).unwrap_or(true),
+            supports_vision: caps
+                .and_then(|c| c.supports_vision)
+                .unwrap_or(defaults.supports_vision),
             pricing: self.pricing_for_model(&config.model),
         };
 

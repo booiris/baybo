@@ -148,6 +148,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/llm/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_default"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/llm/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_models"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/llm/models/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["update_model"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/llm/models/{name}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["test_model"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/llm/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_usage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/logs": {
         parameters: {
             query?: never;
@@ -472,6 +552,133 @@ export interface components {
             provider: string;
         };
         /**
+         * @description One row in `GET /v1/llm/models`. Carries both the raw config (so the
+         *     edit form can populate "override or unset" toggles) and the
+         *     **effective** values that result from layering overrides over the
+         *     factory / OpenRouter snapshot defaults.
+         */
+        LlmModelEntry: {
+            /**
+             * @description `true` when an API key is currently resolvable for this entry
+             *     (vault entry, explicit `api_key_env`, or provider-default env
+             *     var). The literal value never leaves the gateway.
+             */
+            api_key_configured: boolean;
+            api_key_env?: string | null;
+            base_url?: string | null;
+            /** @description Operator override for `context_window`. `None` = factory default. */
+            context_window_override?: number | null;
+            /**
+             * @description Effective `context_window` that the runtime would observe given
+             *     the current overrides and snapshot/factory defaults.
+             */
+            effective_context_window: number;
+            /** @description Effective pricing. */
+            effective_pricing: components["schemas"]["LlmModelPricingDto"];
+            /** @description Effective vision flag. */
+            effective_supports_vision: boolean;
+            is_default: boolean;
+            model: string;
+            name: string;
+            pricing_override?: null | components["schemas"]["LlmPricingOverrideDto"];
+            provider: string;
+            reasoning_effort?: string | null;
+            /** @description Operator override for `supports_vision`. `None` = factory default. */
+            supports_vision_override?: boolean | null;
+        };
+        /**
+         * @description Effective per-token pricing for a model after applying any operator
+         *     overrides — micro-USD per 1M tokens.
+         */
+        LlmModelPricingDto: {
+            /** Format: int64 */
+            cache_write_per_1m_tokens?: number | null;
+            /** Format: int64 */
+            cached_input_per_1m_tokens?: number | null;
+            /** Format: int64 */
+            input_per_1m_tokens: number;
+            /** Format: int64 */
+            output_per_1m_tokens: number;
+        };
+        /**
+         * @description `POST /v1/llm/models/{name}/test` response. Carries the latency and
+         *     token usage from a one-shot `ping` probe.
+         */
+        LlmModelTestResult: {
+            /**
+             * @description On `ok: false`, a human-readable error suitable for direct
+             *     display (auth failure, network error, etc.).
+             */
+            error?: string | null;
+            input_tokens?: number | null;
+            /**
+             * Format: int64
+             * @description Round-trip latency in ms (only on success).
+             */
+            latency_ms?: number | null;
+            model: string;
+            ok: boolean;
+            output_tokens?: number | null;
+            /**
+             * @description Provider id used for the probe (may differ from the request's
+             *     `name` if the entry's provider was just edited).
+             */
+            provider: string;
+        };
+        /**
+         * @description One row in `GET /v1/llm/usage` — aggregated cost / token volume for
+         *     a single configured entry, joined by `entry.model == record.model`.
+         */
+        LlmModelUsage: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
+            call_count: number;
+            /** Format: int64 */
+            cost_micro_usd: number;
+            input_tokens: number;
+            /** @description The `model` id used to look up records. */
+            model: string;
+            /** @description Entry `name`. May be unique per (provider, model) pair. */
+            name: string;
+            output_tokens: number;
+        };
+        /** @description `GET /v1/llm/models` response. */
+        LlmModelsResponse: {
+            default_name: string;
+            items: components["schemas"]["LlmModelEntry"][];
+        };
+        /**
+         * @description Per-entry pricing override fields. Wire shape mirrors
+         *     [`aura_model::LlmPricingOverride`]; each field is integer micro-USD
+         *     per 1M tokens (1 USD = 1_000_000). The DTO exists separately from
+         *     the canonical struct only so we can derive `ToSchema` for utoipa
+         *     without leaking that derive into `aura-model`.
+         */
+        LlmPricingOverrideDto: {
+            /** Format: int64 */
+            cache_write_per_1m_tokens?: number | null;
+            /** Format: int64 */
+            cached_input_per_1m_tokens?: number | null;
+            /** Format: int64 */
+            input_per_1m_tokens?: number | null;
+            /** Format: int64 */
+            output_per_1m_tokens?: number | null;
+        };
+        /** @description `GET /v1/llm/usage` response. */
+        LlmUsageResponse: {
+            items: components["schemas"]["LlmModelUsage"][];
+            /**
+             * Format: date-time
+             * @description Inclusive lower bound of the aggregation window.
+             */
+            since: string;
+            /**
+             * Format: date-time
+             * @description Exclusive upper bound.
+             */
+            until: string;
+        };
+        /**
          * @description Mirror of [`crate::log_buffer::LogRecord`]. Used as the item type of
          *     [`LogsResponse`].
          */
@@ -550,6 +757,10 @@ export interface components {
             /** @description JSON value written at `path`. Shape validated by `AuraConfig`. */
             value: Record<string, never>;
         };
+        /** @description `PUT /v1/llm/default` body. */
+        SetDefaultLlmRequest: {
+            name: string;
+        };
         /** @description Minimal gateway health/status payload. */
         StatusResponse: {
             bind_address: string;
@@ -593,6 +804,36 @@ export interface components {
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
             path: string;
+        };
+        /**
+         * @description `PUT /v1/llm/models/{name}` body. Every field is optional — only
+         *     present fields are applied. To clear an override pass an explicit
+         *     `null` (handled by including the key in the request JSON; serde
+         *     can't distinguish "missing key" from "key with null" by default, so
+         *     the handler treats `Some(None)` as clear and an absent key as keep).
+         */
+        UpdateLlmModelRequest: {
+            /**
+             * @description Set the literal API key in the vault (`llm.entry.<name>.api_key`).
+             *     Pass `""` to remove the vault entry, or omit the field to leave
+             *     the vault untouched. Never echoed back.
+             */
+            api_key?: string | null;
+            /** @description Environment variable name holding the API key, or `null` to clear. */
+            api_key_env?: string | null;
+            /** @description Custom base URL or `null` to clear. */
+            base_url?: string | null;
+            /** @description `context_window` override, or `null` to clear. */
+            context_window?: number | null;
+            /** @description Set the model id (e.g. `"gpt-4o"`). Requires gateway restart. */
+            model?: string | null;
+            pricing?: null | components["schemas"]["LlmPricingOverrideDto"];
+            /** @description Set the provider id (e.g. `"openai"`). Requires gateway restart. */
+            provider?: string | null;
+            /** @description Reasoning-effort override, or `null` to clear. */
+            reasoning_effort?: string | null;
+            /** @description `supports_vision` override, or `null` to clear. */
+            supports_vision?: boolean | null;
         };
     };
     responses: never;
@@ -1189,13 +1430,229 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Configured LLM provider */
+            /** @description Currently active LLM provider */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["LlmInfo"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_default: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetDefaultLlmRequest"];
+            };
+        };
+        responses: {
+            /** @description `default-llm` updated on disk. Gateway restart required to pick up. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MutateResponse"];
+                };
+            };
+            /** @description Name does not match any entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Write failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_models: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Configured LLM entries with their effective settings */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LlmModelsResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Entry name (matches `llm[*].name`) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateLlmModelRequest"];
+            };
+        };
+        responses: {
+            /** @description Entry updated on disk. Gateway restart required to pick up. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MutateResponse"];
+                };
+            };
+            /** @description Invalid update */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Entry not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Write failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    test_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Entry name (matches `llm[*].name`) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Probe result — `ok: false` carries the provider's error verbatim */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LlmModelTestResult"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Entry not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_usage: {
+        parameters: {
+            query?: {
+                since?: string;
+                until?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Per-entry usage aggregates over the time range */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LlmUsageResponse"];
                 };
             };
             /** @description Unauthorized */

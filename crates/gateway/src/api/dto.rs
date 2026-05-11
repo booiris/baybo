@@ -143,6 +143,222 @@ pub struct LlmInfo {
     pub provider: String,
 }
 
+// ── Models dashboard ─────────────────────────────────────────────────
+
+/// Per-entry pricing override fields. Wire shape mirrors
+/// [`aura_model::LlmPricingOverride`]; each field is integer micro-USD
+/// per 1M tokens (1 USD = 1_000_000). The DTO exists separately from
+/// the canonical struct only so we can derive `ToSchema` for utoipa
+/// without leaking that derive into `aura-model`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+pub struct LlmPricingOverrideDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<i64>)]
+    pub input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<i64>)]
+    pub output_per_1m_tokens: Option<aura_model::MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<i64>)]
+    pub cached_input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<i64>)]
+    pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
+}
+
+impl From<aura_model::LlmPricingOverride> for LlmPricingOverrideDto {
+    fn from(v: aura_model::LlmPricingOverride) -> Self {
+        Self {
+            input_per_1m_tokens: v.input_per_1m_tokens,
+            output_per_1m_tokens: v.output_per_1m_tokens,
+            cached_input_per_1m_tokens: v.cached_input_per_1m_tokens,
+            cache_write_per_1m_tokens: v.cache_write_per_1m_tokens,
+        }
+    }
+}
+
+impl From<LlmPricingOverrideDto> for aura_model::LlmPricingOverride {
+    fn from(v: LlmPricingOverrideDto) -> Self {
+        Self {
+            input_per_1m_tokens: v.input_per_1m_tokens,
+            output_per_1m_tokens: v.output_per_1m_tokens,
+            cached_input_per_1m_tokens: v.cached_input_per_1m_tokens,
+            cache_write_per_1m_tokens: v.cache_write_per_1m_tokens,
+        }
+    }
+}
+
+/// Effective per-token pricing for a model after applying any operator
+/// overrides — micro-USD per 1M tokens.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+pub struct LlmModelPricingDto {
+    #[schema(value_type = i64)]
+    pub input_per_1m_tokens: aura_model::MicroUsd,
+    #[schema(value_type = i64)]
+    pub output_per_1m_tokens: aura_model::MicroUsd,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<i64>)]
+    pub cached_input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<i64>)]
+    pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
+}
+
+/// One row in `GET /v1/llm/models`. Carries both the raw config (so the
+/// edit form can populate "override or unset" toggles) and the
+/// **effective** values that result from layering overrides over the
+/// factory / OpenRouter snapshot defaults.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmModelEntry {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    /// `true` when an API key is currently resolvable for this entry
+    /// (vault entry, explicit `api_key_env`, or provider-default env
+    /// var). The literal value never leaves the gateway.
+    pub api_key_configured: bool,
+    pub reasoning_effort: Option<String>,
+    pub is_default: bool,
+
+    /// Operator override for `supports_vision`. `None` = factory default.
+    pub supports_vision_override: Option<bool>,
+    /// Operator override for `context_window`. `None` = factory default.
+    pub context_window_override: Option<usize>,
+    /// Operator override for pricing fields. `None` = factory default.
+    pub pricing_override: Option<LlmPricingOverrideDto>,
+
+    /// Effective `context_window` that the runtime would observe given
+    /// the current overrides and snapshot/factory defaults.
+    pub effective_context_window: usize,
+    /// Effective vision flag.
+    pub effective_supports_vision: bool,
+    /// Effective pricing.
+    pub effective_pricing: LlmModelPricingDto,
+}
+
+/// `GET /v1/llm/models` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmModelsResponse {
+    pub default_name: String,
+    pub items: Vec<LlmModelEntry>,
+}
+
+/// `PUT /v1/llm/models/{name}` body. Every field is optional — only
+/// present fields are applied. To clear an override pass an explicit
+/// `null` (handled by including the key in the request JSON; serde
+/// can't distinguish "missing key" from "key with null" by default, so
+/// the handler treats `Some(None)` as clear and an absent key as keep).
+#[derive(Debug, Deserialize, Default, ToSchema)]
+pub struct UpdateLlmModelRequest {
+    /// Set the provider id (e.g. `"openai"`). Requires gateway restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Set the model id (e.g. `"gpt-4o"`). Requires gateway restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Custom base URL or `null` to clear.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub base_url: Option<Option<String>>,
+    /// Environment variable name holding the API key, or `null` to clear.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub api_key_env: Option<Option<String>>,
+    /// Reasoning-effort override, or `null` to clear.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub reasoning_effort: Option<Option<String>>,
+    /// `supports_vision` override, or `null` to clear.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub supports_vision: Option<Option<bool>>,
+    /// `context_window` override, or `null` to clear.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub context_window: Option<Option<usize>>,
+    /// Pricing override, or `null` to clear.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub pricing: Option<Option<LlmPricingOverrideDto>>,
+    /// Set the literal API key in the vault (`llm.entry.<name>.api_key`).
+    /// Pass `""` to remove the vault entry, or omit the field to leave
+    /// the vault untouched. Never echoed back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+/// Helper for `Option<Option<T>>` — distinguishes "absent" from "null".
+/// Without this, serde collapses both into `None` and the handler can't
+/// tell "keep current" from "clear override".
+fn deserialize_optional_field<'de, T, D>(de: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(de)?))
+}
+
+/// `PUT /v1/llm/default` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetDefaultLlmRequest {
+    pub name: String,
+}
+
+/// `POST /v1/llm/models/{name}/test` response. Carries the latency and
+/// token usage from a one-shot `ping` probe.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmModelTestResult {
+    pub ok: bool,
+    /// On `ok: false`, a human-readable error suitable for direct
+    /// display (auth failure, network error, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Round-trip latency in ms (only on success).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<usize>,
+    /// Provider id used for the probe (may differ from the request's
+    /// `name` if the entry's provider was just edited).
+    pub provider: String,
+    pub model: String,
+}
+
+/// One row in `GET /v1/llm/usage` — aggregated cost / token volume for
+/// a single configured entry, joined by `entry.model == record.model`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LlmModelUsage {
+    /// Entry `name`. May be unique per (provider, model) pair.
+    pub name: String,
+    /// The `model` id used to look up records.
+    pub model: String,
+    pub call_count: usize,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    #[schema(value_type = i64)]
+    pub cost_micro_usd: aura_model::MicroUsd,
+}
+
+/// `GET /v1/llm/usage` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LlmUsageResponse {
+    /// Inclusive lower bound of the aggregation window.
+    pub since: DateTime<Utc>,
+    /// Exclusive upper bound.
+    pub until: DateTime<Utc>,
+    pub items: Vec<LlmModelUsage>,
+}
+
+/// `GET /v1/llm/usage` query params.
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LlmUsageQuery {
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+}
+
 /// `POST /v1/sessions` body.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSessionRequest {
