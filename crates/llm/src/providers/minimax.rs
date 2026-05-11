@@ -111,19 +111,45 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
                 format!("minimax GET /v1/models returned {status}: {body}"),
             ));
         }
-        let payload: ModelListResponse = resp.json().await.map_err(|e| {
-            crate::LlmError::Decode(format!("minimax /v1/models: parse response: {e}"))
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| crate::reqwest_to_error(e, "minimax GET /v1/models read body"))?;
+        let payload: ModelListResponse = serde_json::from_str(&body).map_err(|e| {
+            crate::LlmError::Decode(format!(
+                "minimax /v1/models: parse response: {e}; body: {}",
+                truncate_body(&body)
+            ))
         })?;
         let mut out: Vec<LiveModelInfo> = payload
             .data
+            .unwrap_or_default()
             .into_iter()
-            .map(|m| LiveModelInfo {
-                id: m.id,
-                ..Default::default()
+            .filter_map(|m| {
+                let id = m.id.or(m.model)?;
+                Some(LiveModelInfo {
+                    id,
+                    ..Default::default()
+                })
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
+    }
+}
+
+const MINIMAX_BODY_TRUNCATE: usize = 512;
+
+fn truncate_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.len() <= MINIMAX_BODY_TRUNCATE {
+        trimmed.to_string()
+    } else {
+        let mut end = MINIMAX_BODY_TRUNCATE;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &trimmed[..end])
     }
 }
 
@@ -142,12 +168,18 @@ fn derive_models_base(chat_base: Option<&str>) -> String {
 
 #[derive(Debug, Deserialize)]
 struct ModelListResponse {
-    data: Vec<ModelEntry>,
+    // MiniMax returns `data: null` when the catalog is empty — accept that
+    // shape (and a missing field) without erroring on the deserialize step.
+    #[serde(default)]
+    data: Option<Vec<ModelEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[cfg(test)]
@@ -158,6 +190,49 @@ mod tests {
     fn test_provider_name() {
         let factory = MiniMaxProviderFactory;
         assert_eq!(factory.provider_name(), "minimax");
+    }
+
+    #[test]
+    fn truncate_body_preserves_short_input() {
+        assert_eq!(truncate_body("short body"), "short body");
+        assert_eq!(truncate_body("  trimmed  "), "trimmed");
+    }
+
+    #[test]
+    fn truncate_body_caps_long_input_with_ellipsis() {
+        let long = "x".repeat(MINIMAX_BODY_TRUNCATE + 50);
+        let truncated = truncate_body(&long);
+        assert!(truncated.ends_with('…'));
+        // ASCII body, so truncation lands on a char boundary at exactly the cap.
+        assert_eq!(
+            truncated.chars().filter(|c| *c == 'x').count(),
+            MINIMAX_BODY_TRUNCATE
+        );
+    }
+
+    #[test]
+    fn model_entry_accepts_id_or_model_field() {
+        // Standard OpenAI-compat shape: `id`.
+        let parsed: ModelListResponse =
+            serde_json::from_str(r#"{"data":[{"id":"abab6.5s-chat"}]}"#).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data[0].id.as_deref(), Some("abab6.5s-chat"));
+
+        // MiniMax variant where the entry uses `model` instead of `id`.
+        let parsed: ModelListResponse =
+            serde_json::from_str(r#"{"data":[{"model":"MiniMax-M2"}]}"#).unwrap();
+        let data = parsed.data.unwrap();
+        assert_eq!(data[0].model.as_deref(), Some("MiniMax-M2"));
+        assert!(data[0].id.is_none());
+
+        // MiniMax China cluster's actual response: `data: null`.
+        let parsed: ModelListResponse =
+            serde_json::from_str(r#"{"object":"","data":null}"#).unwrap();
+        assert!(parsed.data.is_none());
+
+        // Missing field also parses.
+        let parsed: ModelListResponse = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(parsed.data.is_none());
     }
 
     #[test]

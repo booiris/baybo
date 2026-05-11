@@ -210,6 +210,37 @@ pub fn capabilities_for(provider: &str, model_id: &str) -> Option<ModelCapabilit
     snapshot_capabilities(&slug_for(provider, model_id)?)
 }
 
+/// Enumerate every snapshot model id for an Aura provider, stripped of
+/// the `<or_provider>/` slug prefix. Returns the catalog ids OpenRouter
+/// publishes for that vendor — useful as a fallback model list when the
+/// vendor's own `/v1/models` endpoint is empty or unimplemented.
+///
+/// The strings are slug-shaped (lowercase, dash-separated) and may not
+/// round-trip back to the vendor's preferred display casing
+/// (`minimax-m2` vs `MiniMax-M2`), but most vendors accept their model
+/// ids case-insensitively. Returns an empty vec when the provider isn't
+/// OpenRouter-routable.
+pub fn snapshot_model_ids_for(provider: &str) -> Vec<String> {
+    let Some(or_provider) = openrouter_provider_prefix(provider) else {
+        return Vec::new();
+    };
+    let prefix = format!("{or_provider}/");
+    SNAPSHOT
+        .keys()
+        .filter_map(|slug| slug.strip_prefix(&prefix).map(str::to_string))
+        .collect()
+}
+
+fn openrouter_provider_prefix(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("openai"),
+        "anthropic" => Some("anthropic"),
+        "minimax" => Some("minimax"),
+        "gemini" => Some("google"),
+        _ => None,
+    }
+}
+
 /// Map an Aura `(provider, model_id)` pair to its OpenRouter catalog
 /// slug. Returns `None` for providers that don't ship through
 /// OpenRouter (`openai-subscription` bills against a flat OAuth
@@ -237,11 +268,7 @@ pub fn capabilities_for(provider: &str, model_id: &str) -> Option<ModelCapabilit
 /// fall through to the per-provider flat default — acceptable
 /// degradation in exchange for not maintaining a hand table.
 pub fn slug_for(provider: &str, model_id: &str) -> Option<String> {
-    let or_provider = match provider {
-        "openai" | "anthropic" | "minimax" => provider,
-        "gemini" => "google",
-        _ => return None,
-    };
+    let or_provider = openrouter_provider_prefix(provider)?;
     let lowered = model_id.to_ascii_lowercase();
     let no_date = strip_trailing_date_suffix(&lowered);
     let normalized = digit_dash_to_dot(no_date);
@@ -513,6 +540,41 @@ mod tests {
     fn unknown_slug_returns_none() {
         assert!(snapshot_pricing("openai/does-not-exist-2099").is_none());
         assert!(snapshot_capabilities("openai/does-not-exist-2099").is_none());
+    }
+
+    #[test]
+    fn snapshot_model_ids_for_strips_provider_prefix() {
+        let ids = snapshot_model_ids_for("minimax");
+        assert!(
+            !ids.is_empty(),
+            "expected minimax slugs in bundled snapshot"
+        );
+        assert!(
+            ids.iter().all(|id| !id.contains('/')),
+            "ids should be stripped of `<provider>/` prefix: {ids:?}",
+        );
+        assert!(
+            ids.iter().any(|id| id == "minimax-m2"),
+            "expected canonical minimax-m2 slug, got {ids:?}",
+        );
+    }
+
+    #[test]
+    fn snapshot_model_ids_for_unknown_provider_is_empty() {
+        assert!(snapshot_model_ids_for("openai-subscription").is_empty());
+        assert!(snapshot_model_ids_for("not-a-real-provider").is_empty());
+    }
+
+    #[test]
+    fn snapshot_model_ids_for_gemini_uses_google_prefix() {
+        // Aura's `gemini` provider maps to OpenRouter's `google/` prefix —
+        // the enumerate path must use the same mapping as `slug_for`,
+        // otherwise gemini fallbacks return zero entries.
+        let ids = snapshot_model_ids_for("gemini");
+        assert!(
+            !ids.is_empty(),
+            "expected google/* slugs in bundled snapshot"
+        );
     }
 
     #[test]

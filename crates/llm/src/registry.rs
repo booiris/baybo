@@ -246,7 +246,25 @@ impl LlmProviderRegistry {
         let factory = self.factories.get(&config.provider).ok_or_else(|| {
             crate::LlmError::ModelNotFound(format!("unknown LLM provider: {}", config.provider))
         })?;
-        factory.live_models(config).await
+        let live = factory.live_models(config).await?;
+        // Vendor-side `/v1/models` endpoints aren't always populated
+        // (e.g. MiniMax's China cluster returns `{"data":null}`). When
+        // that happens the user would otherwise be forced into manual
+        // entry — fall back to the bundled OpenRouter catalog so every
+        // provider gets a pickable list. Errors propagate; only a clean
+        // empty Ok triggers the fallback.
+        if live.is_empty() {
+            let mut snapshot = crate::openrouter::snapshot_model_ids_for(&config.provider)
+                .into_iter()
+                .map(|id| LiveModelInfo {
+                    id,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            snapshot.sort_by(|a, b| a.id.cmp(&b.id));
+            return Ok(snapshot);
+        }
+        Ok(live)
     }
 
     /// **The** public production constructor. Builds the raw client
@@ -405,5 +423,108 @@ mod tests {
             assert!(e.supports_tools.is_none());
             assert!(e.extras.is_null());
         }
+    }
+
+    /// Empty-live factory registered under a snapshot-routable provider
+    /// name — exercises the registry-level fallback that swaps an empty
+    /// `live_models` response for the OpenRouter snapshot's catalog.
+    struct EmptyLiveFactory {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProviderFactory for EmptyLiveFactory {
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+        fn create(&self, _cfg: &LlmProviderConfig) -> crate::Result<LlmClient> {
+            unreachable!("not exercised in this test")
+        }
+        fn known_models(&self) -> &'static [&'static str] {
+            &[]
+        }
+        async fn live_models(
+            &self,
+            _config: &LlmProviderConfig,
+        ) -> crate::Result<Vec<LiveModelInfo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn list_live_models_falls_back_to_openrouter_snapshot_when_empty() {
+        // Provider whose `/v1/models` returns nothing (the MiniMax China
+        // cluster's actual behavior) — registry must surface the bundled
+        // OpenRouter slugs so setup still has something to show.
+        let mut registry = LlmProviderRegistry::new();
+        registry.register(EmptyLiveFactory { name: "minimax" });
+        let cfg = LlmProviderConfig {
+            provider: "minimax".into(),
+            api_key: None,
+            base_url: None,
+            model: "unused".into(),
+            supports_vision: None,
+            reasoning_effort: None,
+            vault: None,
+        };
+        let entries = registry.list_live_models(&cfg).await.unwrap();
+        assert!(
+            !entries.is_empty(),
+            "expected snapshot fallback to populate minimax catalog",
+        );
+        assert!(
+            entries.iter().any(|e| e.id == "minimax-m2"),
+            "expected canonical minimax-m2 slug in fallback list, got {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>(),
+        );
+        // Sorted by id so the UI render is stable.
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "fallback entries must come out sorted");
+    }
+
+    #[tokio::test]
+    async fn list_live_models_does_not_clobber_non_empty_response() {
+        // A provider that actually returns live entries must not be
+        // overridden by the snapshot fallback — fallback only triggers on
+        // an empty Ok.
+        struct OneLiveFactory;
+        #[async_trait::async_trait]
+        impl LlmProviderFactory for OneLiveFactory {
+            fn provider_name(&self) -> &str {
+                "anthropic"
+            }
+            fn create(&self, _cfg: &LlmProviderConfig) -> crate::Result<LlmClient> {
+                unreachable!()
+            }
+            fn known_models(&self) -> &'static [&'static str] {
+                &[]
+            }
+            async fn live_models(
+                &self,
+                _config: &LlmProviderConfig,
+            ) -> crate::Result<Vec<LiveModelInfo>> {
+                Ok(vec![LiveModelInfo {
+                    id: "claude-from-live-api".into(),
+                    ..Default::default()
+                }])
+            }
+        }
+
+        let mut registry = LlmProviderRegistry::new();
+        registry.register(OneLiveFactory);
+        let cfg = LlmProviderConfig {
+            provider: "anthropic".into(),
+            api_key: None,
+            base_url: None,
+            model: "unused".into(),
+            supports_vision: None,
+            reasoning_effort: None,
+            vault: None,
+        };
+        let entries = registry.list_live_models(&cfg).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "claude-from-live-api");
     }
 }
