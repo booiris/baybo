@@ -8,6 +8,7 @@ import { TracesPage } from './pages/TracesPage';
 import { TraceSessionPage } from './pages/TraceSessionPage';
 import { CronPage } from './pages/CronPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
+import { LlmPage } from './pages/LlmPage';
 import { useAuth } from './api/auth';
 
 export default function App() {
@@ -69,6 +70,7 @@ export default function App() {
           <Route path="/traces/:id" element={<TraceSessionPage />} />
           <Route path="/cron" element={<CronPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
+          <Route path="/llm" element={<LlmPage />} />
           <Route path="*" element={<Navigate to="/logs" replace />} />
         </Routes>
       </main>

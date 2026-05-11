@@ -148,6 +148,8 @@ mod tests {
             base_url: None,
             model: "gpt-5".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault,
         }

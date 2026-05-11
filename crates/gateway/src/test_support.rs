@@ -104,6 +104,8 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
                 base_url: None,
                 model: "gpt-4o-mini".into(),
                 supports_vision: None,
+                context_window: None,
+                pricing: None,
                 reasoning_effort: None,
                 vault: None,
             },

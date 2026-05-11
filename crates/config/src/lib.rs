@@ -40,7 +40,7 @@ pub use crate::channels::{
 pub use crate::cost::{CostConfig, RateLimitConfig, SpendingLimitsConfig};
 pub use crate::error::{ConfigError, Result, ValidationError};
 pub use crate::gateway::GatewayConfig;
-pub use crate::llm::LlmEntry;
+pub use crate::llm::{LlmEntry, LlmPricingOverride};
 pub use crate::security::SecurityConfig;
 pub use crate::session::SessionConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};

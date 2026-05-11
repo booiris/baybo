@@ -244,6 +244,8 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };
@@ -259,6 +261,8 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };
@@ -286,6 +290,8 @@ mod tests {
             base_url: None,
             model: "MiniMax-M2".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };
@@ -306,6 +312,8 @@ mod tests {
                 base_url: None,
                 model: "MiniMax-VL-01".into(),
                 supports_vision: Some(true),
+                context_window: None,
+                pricing: None,
                 reasoning_effort: None,
                 vault: None,
             })
@@ -326,6 +334,8 @@ mod tests {
                 base_url: None,
                 model: "claude-sonnet-4-6".into(),
                 supports_vision: Some(false),
+                context_window: None,
+                pricing: None,
                 reasoning_effort: None,
                 vault: None,
             })

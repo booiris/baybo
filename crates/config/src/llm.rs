@@ -1,3 +1,4 @@
+use aura_model::MicroUsd;
 use serde::{Deserialize, Serialize};
 
 /// One entry in the `llm` registry. Each entry is keyed by `name` and
@@ -35,6 +36,18 @@ pub struct LlmEntry {
     /// surfaces an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// Operator override for the factory's default `context_window`
+    /// (max input + output tokens). `None` keeps the factory default
+    /// (which itself prefers OpenRouter snapshot capabilities, then
+    /// falls back to a per-provider constant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Operator override for per-model pricing. Each field is
+    /// independently optional — unset fields keep the factory default
+    /// (OpenRouter snapshot, or a flat per-provider rate when the
+    /// snapshot doesn't cover the slug).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<LlmPricingOverride>,
     /// Reasoning effort for providers that expose it (currently only
     /// `openai-subscription` Codex Responses). One of `none`,
     /// `minimal`, `low`, `medium`, `high`, `xhigh`. The provider
@@ -42,4 +55,19 @@ pub struct LlmEntry {
     /// `None` lets the provider pick a sensible default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+}
+
+/// Per-entry pricing override. Values are integer **micro-USD per 1M
+/// tokens** (so `$3.00 / MTok → MicroUsd::from_micros(3_000_000)`),
+/// matching the wire shape of [`aura_llm::ModelPricing`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmPricingOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_per_1m_tokens: Option<MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_per_1m_tokens: Option<MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_per_1m_tokens: Option<MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_1m_tokens: Option<MicroUsd>,
 }

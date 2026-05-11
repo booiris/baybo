@@ -40,6 +40,8 @@ fn entry(name: &str) -> LlmEntry {
         api_key_env: None,
         base_url: None,
         supports_vision: None,
+        context_window: None,
+        pricing: None,
         reasoning_effort: None,
     }
 }

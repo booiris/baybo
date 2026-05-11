@@ -153,6 +153,8 @@ pub async fn build_llm_client_for_entry(
                 base_url: entry.base_url.clone(),
                 model: entry.model.clone(),
                 supports_vision: entry.supports_vision,
+                context_window: entry.context_window,
+                pricing: entry.pricing.map(pricing_override_to_llm),
                 reasoning_effort: entry.reasoning_effort.clone(),
                 vault,
             },
@@ -160,6 +162,21 @@ pub async fn build_llm_client_for_entry(
             guard,
         )
         .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))
+}
+
+/// Translate the config-layer pricing override (which lives in
+/// `aura-config` because it must serialize into `aura.json`) into the
+/// shape `aura-llm` consumes. Same field set; the two structs exist
+/// independently so neither crate has to depend on the other.
+pub fn pricing_override_to_llm(
+    cfg: aura_config::LlmPricingOverride,
+) -> aura_llm::LlmPricingOverride {
+    aura_llm::LlmPricingOverride {
+        input_per_1m_tokens: cfg.input_per_1m_tokens,
+        output_per_1m_tokens: cfg.output_per_1m_tokens,
+        cached_input_per_1m_tokens: cfg.cached_input_per_1m_tokens,
+        cache_write_per_1m_tokens: cfg.cache_write_per_1m_tokens,
+    }
 }
 
 /// Bridge `aura_storage::BlobStore` into `aura_llm::BlobFetcher`. Lives

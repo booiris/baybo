@@ -199,7 +199,7 @@ pub(crate) fn snapshot_capabilities(slug: &str) -> Option<ModelCapabilities> {
 /// provider isn't OpenRouter-routable or the resolved slug isn't in
 /// the bundled snapshot — caller falls back to a per-provider flat
 /// default.
-pub(crate) fn pricing_for(provider: &str, model_id: &str) -> Option<ModelPricing> {
+pub fn pricing_for(provider: &str, model_id: &str) -> Option<ModelPricing> {
     snapshot_pricing(&slug_for(provider, model_id)?)
 }
 

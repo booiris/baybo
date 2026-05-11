@@ -23,6 +23,15 @@ pub struct LlmProviderConfig {
     /// Surfaces the corresponding field on `aura_config::LlmConfig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// Operator override for `ModelInfo.context_window`. `None` keeps
+    /// the factory default (OpenRouter snapshot, then per-provider
+    /// constant); `Some` clamps the active context budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Operator override for per-token pricing fields. Each field is
+    /// independently optional — unset fields keep the factory default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<LlmPricingOverride>,
     /// Reasoning effort for Codex Responses (`openai-subscription`).
     /// One of `none`/`minimal`/`low`/`medium`/`high`/`xhigh`. `None`
     /// = provider default. Other providers ignore the field.
@@ -33,6 +42,22 @@ pub struct LlmProviderConfig {
     /// during serialization — vault is process-local state, not config.
     #[serde(skip)]
     pub vault: Option<Arc<SecretVault>>,
+}
+
+/// Per-field pricing override applied to [`ModelInfo`] after the
+/// factory builds its default. Each field is `None` to keep the
+/// factory default. Wire shape matches the corresponding fields of
+/// [`crate::ModelPricing`] — integer micro-USD per 1M tokens.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct LlmPricingOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_per_1m_tokens: Option<aura_model::MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
 }
 
 impl std::fmt::Debug for LlmProviderConfig {
@@ -47,6 +72,8 @@ impl std::fmt::Debug for LlmProviderConfig {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("supports_vision", &self.supports_vision)
+            .field("context_window", &self.context_window)
+            .field("pricing", &self.pricing)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("vault", &self.vault.as_ref().map(|_| "<vault>"))
             .finish()
@@ -307,6 +334,23 @@ impl LlmProviderRegistry {
         if let Some(override_) = config.supports_vision {
             client.model_info.supports_vision = override_;
         }
+        if let Some(ctx) = config.context_window {
+            client.model_info.context_window = ctx;
+        }
+        if let Some(p) = config.pricing {
+            if let Some(v) = p.input_per_1m_tokens {
+                client.model_info.pricing.input_per_1m_tokens = v;
+            }
+            if let Some(v) = p.output_per_1m_tokens {
+                client.model_info.pricing.output_per_1m_tokens = v;
+            }
+            if p.cached_input_per_1m_tokens.is_some() {
+                client.model_info.pricing.cached_input_per_1m_tokens = p.cached_input_per_1m_tokens;
+            }
+            if p.cache_write_per_1m_tokens.is_some() {
+                client.model_info.pricing.cache_write_per_1m_tokens = p.cache_write_per_1m_tokens;
+            }
+        }
         Ok(client)
     }
 }
@@ -407,6 +451,8 @@ mod tests {
             base_url: None,
             model: "alpha".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };
@@ -464,6 +510,8 @@ mod tests {
             base_url: None,
             model: "unused".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };
@@ -520,6 +568,8 @@ mod tests {
             base_url: None,
             model: "unused".into(),
             supports_vision: None,
+            context_window: None,
+            pricing: None,
             reasoning_effort: None,
             vault: None,
         };

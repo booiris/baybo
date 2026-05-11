@@ -27,7 +27,7 @@ const BUILTIN_PROVIDERS: &[&str] = &[
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LlmStepOutcome {
-    Added(LlmEntry),
+    Added(Box<LlmEntry>),
     Skipped,
 }
 
@@ -111,6 +111,8 @@ async fn add_entry<P: Prompter>(
         api_key_env: api_key_env.clone(),
         base_url: base_url.clone(),
         supports_vision: None,
+        context_window: None,
+        pricing: None,
         reasoning_effort: None,
     };
 
@@ -164,6 +166,8 @@ async fn add_entry<P: Prompter>(
         api_key_env,
         base_url,
         supports_vision: None,
+        context_window: None,
+        pricing: None,
         reasoning_effort,
     };
 
@@ -192,7 +196,7 @@ async fn add_entry<P: Prompter>(
         .validate()
         .map_err(|e| SetupError::Config(format!("config validation failed: {e}")))?;
 
-    Ok(LlmStepOutcome::Added(entry))
+    Ok(LlmStepOutcome::Added(Box::new(entry)))
 }
 
 fn unique_default_name(provider: &str, existing: &[LlmEntry]) -> String {
@@ -226,6 +230,10 @@ async fn fetch_live_models(
             entry.model.clone()
         },
         supports_vision: entry.supports_vision,
+        // Live model discovery doesn't bill anything and only needs
+        // the catalog endpoint — leave overrides off for this path.
+        context_window: None,
+        pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),
         vault,
     };

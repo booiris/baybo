@@ -858,11 +858,283 @@
         "operationId": "get_llm",
         "responses": {
           "200": {
-            "description": "Configured LLM provider",
+            "description": "Currently active LLM provider",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/LlmInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/llm/default": {
+      "put": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "set_default",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDefaultLlmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`default-llm` updated on disk. Gateway restart required to pick up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Name does not match any entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Write failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/llm/models": {
+      "get": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "list_models",
+        "responses": {
+          "200": {
+            "description": "Configured LLM entries with their effective settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmModelsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/llm/models/{name}": {
+      "put": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "update_model",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Entry name (matches `llm[*].name`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLlmModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Entry updated on disk. Gateway restart required to pick up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid update",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Entry not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Write failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/llm/models/{name}/test": {
+      "post": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "test_model",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Entry name (matches `llm[*].name`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Probe result — `ok: false` carries the provider's error verbatim",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmModelTestResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Entry not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/llm/usage": {
+      "get": {
+        "tags": [
+          "llm"
+        ],
+        "operationId": "get_usage",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-entry usage aggregates over the time range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmUsageResponse"
                 }
               }
             }
@@ -2032,6 +2304,306 @@
           }
         }
       },
+      "LlmModelEntry": {
+        "type": "object",
+        "description": "One row in `GET /v1/llm/models`. Carries both the raw config (so the\nedit form can populate \"override or unset\" toggles) and the\n**effective** values that result from layering overrides over the\nfactory / OpenRouter snapshot defaults.",
+        "required": [
+          "name",
+          "provider",
+          "model",
+          "api_key_configured",
+          "is_default",
+          "effective_context_window",
+          "effective_supports_vision",
+          "effective_pricing"
+        ],
+        "properties": {
+          "api_key_configured": {
+            "type": "boolean",
+            "description": "`true` when an API key is currently resolvable for this entry\n(vault entry, explicit `api_key_env`, or provider-default env\nvar). The literal value never leaves the gateway."
+          },
+          "api_key_env": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "context_window_override": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Operator override for `context_window`. `None` = factory default.",
+            "minimum": 0
+          },
+          "effective_context_window": {
+            "type": "integer",
+            "description": "Effective `context_window` that the runtime would observe given\nthe current overrides and snapshot/factory defaults.",
+            "minimum": 0
+          },
+          "effective_pricing": {
+            "$ref": "#/components/schemas/LlmModelPricingDto",
+            "description": "Effective pricing."
+          },
+          "effective_supports_vision": {
+            "type": "boolean",
+            "description": "Effective vision flag."
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "model": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pricing_override": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmPricingOverrideDto",
+                "description": "Operator override for pricing fields. `None` = factory default."
+              }
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supports_vision_override": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Operator override for `supports_vision`. `None` = factory default."
+          }
+        }
+      },
+      "LlmModelPricingDto": {
+        "type": "object",
+        "description": "Effective per-token pricing for a model after applying any operator\noverrides — micro-USD per 1M tokens.",
+        "required": [
+          "input_per_1m_tokens",
+          "output_per_1m_tokens"
+        ],
+        "properties": {
+          "cache_write_per_1m_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "cached_input_per_1m_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "input_per_1m_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "output_per_1m_tokens": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "LlmModelTestResult": {
+        "type": "object",
+        "description": "`POST /v1/llm/models/{name}/test` response. Carries the latency and\ntoken usage from a one-shot `ping` probe.",
+        "required": [
+          "ok",
+          "provider",
+          "model"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On `ok: false`, a human-readable error suitable for direct\ndisplay (auth failure, network error, etc.)."
+          },
+          "input_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "latency_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Round-trip latency in ms (only on success).",
+            "minimum": 0
+          },
+          "model": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "output_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "provider": {
+            "type": "string",
+            "description": "Provider id used for the probe (may differ from the request's\n`name` if the entry's provider was just edited)."
+          }
+        }
+      },
+      "LlmModelUsage": {
+        "type": "object",
+        "description": "One row in `GET /v1/llm/usage` — aggregated cost / token volume for\na single configured entry, joined by `entry.model == record.model`.",
+        "required": [
+          "name",
+          "model",
+          "call_count",
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cache_creation_input_tokens",
+          "cost_micro_usd"
+        ],
+        "properties": {
+          "cache_creation_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cached_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "call_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cost_micro_usd": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "model": {
+            "type": "string",
+            "description": "The `model` id used to look up records."
+          },
+          "name": {
+            "type": "string",
+            "description": "Entry `name`. May be unique per (provider, model) pair."
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "LlmModelsResponse": {
+        "type": "object",
+        "description": "`GET /v1/llm/models` response.",
+        "required": [
+          "default_name",
+          "items"
+        ],
+        "properties": {
+          "default_name": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LlmModelEntry"
+            }
+          }
+        }
+      },
+      "LlmPricingOverrideDto": {
+        "type": "object",
+        "description": "Per-entry pricing override fields. Wire shape mirrors\n[`aura_config::LlmPricingOverride`]; each field is integer\nmicro-USD per 1M tokens (1 USD = 1_000_000).",
+        "properties": {
+          "cache_write_per_1m_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "cached_input_per_1m_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "input_per_1m_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "output_per_1m_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "LlmUsageResponse": {
+        "type": "object",
+        "description": "`GET /v1/llm/usage` response.",
+        "required": [
+          "since",
+          "until",
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LlmModelUsage"
+            }
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Inclusive lower bound of the aggregation window."
+          },
+          "until": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Exclusive upper bound."
+          }
+        }
+      },
       "LogEntry": {
         "type": "object",
         "description": "Mirror of [`crate::log_buffer::LogRecord`]. Used as the item type of\n[`LogsResponse`].",
@@ -2233,6 +2805,18 @@
           }
         }
       },
+      "SetDefaultLlmRequest": {
+        "type": "object",
+        "description": "`PUT /v1/llm/default` body.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "StatusResponse": {
         "type": "object",
         "description": "Minimal gateway health/status payload.",
@@ -2376,6 +2960,80 @@
         "properties": {
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "UpdateLlmModelRequest": {
+        "type": "object",
+        "description": "`PUT /v1/llm/models/{name}` body. Every field is optional — only\npresent fields are applied. To clear an override pass an explicit\n`null` (handled by including the key in the request JSON; serde\ncan't distinguish \"missing key\" from \"key with null\" by default, so\nthe handler treats `Some(None)` as clear and an absent key as keep).",
+        "properties": {
+          "api_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set the literal API key in the vault (`llm.entry.<name>.api_key`).\nPass `\"\"` to remove the vault entry, or omit the field to leave\nthe vault untouched. Never echoed back."
+          },
+          "api_key_env": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Environment variable name holding the API key, or `null` to clear."
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Custom base URL or `null` to clear."
+          },
+          "context_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "`context_window` override, or `null` to clear.",
+            "minimum": 0
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set the model id (e.g. `\"gpt-4o\"`). Requires gateway restart."
+          },
+          "pricing": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmPricingOverrideDto",
+                "description": "Pricing override, or `null` to clear."
+              }
+            ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set the provider id (e.g. `\"openai\"`). Requires gateway restart."
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reasoning-effort override, or `null` to clear."
+          },
+          "supports_vision": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`supports_vision` override, or `null` to clear."
           }
         }
       }
