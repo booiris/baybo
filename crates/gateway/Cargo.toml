@@ -91,6 +91,9 @@ serde_json = { workspace = true }
 [dev-dependencies]
 aura-gateway = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
+aura-config = { workspace = true }
+aura-model = { workspace = true }
 chrono = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }

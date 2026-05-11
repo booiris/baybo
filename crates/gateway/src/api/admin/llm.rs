@@ -226,12 +226,7 @@ async fn test_model(
         model: entry.model.clone(),
         supports_vision: entry.supports_vision,
         context_window: entry.context_window,
-        pricing: entry.pricing.map(|p| aura_llm::LlmPricingOverride {
-            input_per_1m_tokens: p.input_per_1m_tokens,
-            output_per_1m_tokens: p.output_per_1m_tokens,
-            cached_input_per_1m_tokens: p.cached_input_per_1m_tokens,
-            cache_write_per_1m_tokens: p.cache_write_per_1m_tokens,
-        }),
+        pricing: entry.pricing,
         reasoning_effort: entry.reasoning_effort.clone(),
         vault: Some(state.secret_vault.clone()),
     };
@@ -430,15 +425,16 @@ async fn build_model_entry(
     let caps = aura_llm::openrouter::capabilities_for(&entry.provider, &entry.model);
     let factory_pricing =
         aura_llm::openrouter::pricing_for(&entry.provider, &entry.model).unwrap_or_default();
+    let defaults = aura_llm::factory_defaults_for(&entry.provider);
 
     let effective_context_window = entry
         .context_window
         .or_else(|| caps.and_then(|c| c.context_window))
-        .unwrap_or(provider_default_context(&entry.provider));
+        .unwrap_or(defaults.context_window);
     let effective_supports_vision = entry
         .supports_vision
         .or_else(|| caps.and_then(|c| c.supports_vision))
-        .unwrap_or(true);
+        .unwrap_or(defaults.supports_vision);
 
     let mut effective_pricing = LlmModelPricingDto {
         input_per_1m_tokens: factory_pricing.input_per_1m_tokens,
@@ -485,21 +481,5 @@ async fn build_model_entry(
         effective_context_window,
         effective_supports_vision,
         effective_pricing,
-    }
-}
-
-/// Hard-coded factory defaults for the `context_window`, mirroring the
-/// `unwrap_or(...)` constants in `crates/llm/src/providers/*.rs`.
-/// Kept here as a last-resort fallback when the OpenRouter snapshot
-/// doesn't carry the slug — keeps the dashboard from rendering "0"
-/// for fresh / exotic models.
-fn provider_default_context(provider: &str) -> usize {
-    match provider {
-        "openai" => 128_000,
-        "anthropic" => 200_000,
-        "gemini" => 1_000_000,
-        "minimax" => 200_000,
-        "openai-subscription" => 272_000,
-        _ => 128_000,
     }
 }

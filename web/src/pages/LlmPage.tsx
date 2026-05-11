@@ -52,16 +52,22 @@ function microToUsdInput(micros: number | null | undefined): string {
   return (micros / 1_000_000).toString();
 }
 
-// Parse a USD-per-1M-tokens decimal back into micro-USD. Empty string
-// yields `undefined` so the edit form can distinguish "cleared" from
-// "set to zero". Lossy across the float boundary by design — matches
-// how operators type pricing in `aura.json`.
-function usdInputToMicro(raw: string): number | null {
+type PricingParse =
+  | { kind: 'empty' }
+  | { kind: 'value'; micros: number }
+  | { kind: 'invalid' };
+
+// Parse a USD-per-1M-tokens decimal into micro-USD. Empty string is
+// "cleared" and any non-empty unparseable / negative value is `invalid`
+// so the form can reject the submit instead of silently wiping the
+// override. Lossy across the float boundary by design — matches how
+// operators type pricing in `aura.json`.
+function parseUsdInput(raw: string): PricingParse {
   const trimmed = raw.trim();
-  if (trimmed === '') return null;
+  if (trimmed === '') return { kind: 'empty' };
   const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed) || parsed < 0) return null;
-  return Math.round(parsed * 1_000_000);
+  if (!Number.isFinite(parsed) || parsed < 0) return { kind: 'invalid' };
+  return { kind: 'value', micros: Math.round(parsed * 1_000_000) };
 }
 
 export function LlmPage() {
@@ -599,12 +605,30 @@ function EditLlmModal({
       }
     }
 
-    // pricing — collapse into a single Option<LlmPricingOverride>
+    // pricing — collapse into a single Option<LlmPricingOverride>.
+    // Reject the form if any non-empty field doesn't parse, so the
+    // operator never silently overwrites a valid override with NaN.
+    const pricingFields: Array<[string, string]> = [
+      ['Input / 1M', form.pricingInput],
+      ['Output / 1M', form.pricingOutput],
+      ['Cached read / 1M', form.pricingCached],
+      ['Cache write / 1M', form.pricingCacheWrite],
+    ];
+    const parsed = pricingFields.map(([label, raw]) => [label, parseUsdInput(raw)] as const);
+    const invalidLabels = parsed.filter(([, p]) => p.kind === 'invalid').map(([l]) => l);
+    if (invalidLabels.length) {
+      setError(
+        `Invalid pricing (must be a non-negative number, or blank to clear): ${invalidLabels.join(', ')}`,
+      );
+      setSubmitting(false);
+      return;
+    }
+    const microsOrNull = (p: PricingParse) => (p.kind === 'value' ? p.micros : null);
+    const wantInput = microsOrNull(parsed[0][1]);
+    const wantOutput = microsOrNull(parsed[1][1]);
+    const wantCached = microsOrNull(parsed[2][1]);
+    const wantCacheWrite = microsOrNull(parsed[3][1]);
     const cur = entry.pricing_override;
-    const wantInput = usdInputToMicro(form.pricingInput);
-    const wantOutput = usdInputToMicro(form.pricingOutput);
-    const wantCached = usdInputToMicro(form.pricingCached);
-    const wantCacheWrite = usdInputToMicro(form.pricingCacheWrite);
     const anyPricingSet =
       wantInput != null || wantOutput != null || wantCached != null || wantCacheWrite != null;
     const anyPricingChanged =

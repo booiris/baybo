@@ -44,21 +44,7 @@ pub struct LlmProviderConfig {
     pub vault: Option<Arc<SecretVault>>,
 }
 
-/// Per-field pricing override applied to [`ModelInfo`] after the
-/// factory builds its default. Each field is `None` to keep the
-/// factory default. Wire shape matches the corresponding fields of
-/// [`crate::ModelPricing`] — integer micro-USD per 1M tokens.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct LlmPricingOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_per_1m_tokens: Option<aura_model::MicroUsd>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_per_1m_tokens: Option<aura_model::MicroUsd>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cached_input_per_1m_tokens: Option<aura_model::MicroUsd>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
-}
+pub use aura_model::LlmPricingOverride;
 
 impl std::fmt::Debug for LlmProviderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

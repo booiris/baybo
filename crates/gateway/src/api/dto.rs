@@ -146,8 +146,10 @@ pub struct LlmInfo {
 // ── Models dashboard ─────────────────────────────────────────────────
 
 /// Per-entry pricing override fields. Wire shape mirrors
-/// [`aura_config::LlmPricingOverride`]; each field is integer
-/// micro-USD per 1M tokens (1 USD = 1_000_000).
+/// [`aura_model::LlmPricingOverride`]; each field is integer micro-USD
+/// per 1M tokens (1 USD = 1_000_000). The DTO exists separately from
+/// the canonical struct only so we can derive `ToSchema` for utoipa
+/// without leaking that derive into `aura-model`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 pub struct LlmPricingOverrideDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,8 +166,8 @@ pub struct LlmPricingOverrideDto {
     pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
 }
 
-impl From<aura_config::LlmPricingOverride> for LlmPricingOverrideDto {
-    fn from(v: aura_config::LlmPricingOverride) -> Self {
+impl From<aura_model::LlmPricingOverride> for LlmPricingOverrideDto {
+    fn from(v: aura_model::LlmPricingOverride) -> Self {
         Self {
             input_per_1m_tokens: v.input_per_1m_tokens,
             output_per_1m_tokens: v.output_per_1m_tokens,
@@ -175,7 +177,7 @@ impl From<aura_config::LlmPricingOverride> for LlmPricingOverrideDto {
     }
 }
 
-impl From<LlmPricingOverrideDto> for aura_config::LlmPricingOverride {
+impl From<LlmPricingOverrideDto> for aura_model::LlmPricingOverride {
     fn from(v: LlmPricingOverrideDto) -> Self {
         Self {
             input_per_1m_tokens: v.input_per_1m_tokens,

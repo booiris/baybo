@@ -1,4 +1,4 @@
-use aura_model::MicroUsd;
+pub use aura_model::LlmPricingOverride;
 use serde::{Deserialize, Serialize};
 
 /// One entry in the `llm` registry. Each entry is keyed by `name` and
@@ -55,19 +55,4 @@ pub struct LlmEntry {
     /// `None` lets the provider pick a sensible default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-}
-
-/// Per-entry pricing override. Values are integer **micro-USD per 1M
-/// tokens** (so `$3.00 / MTok → MicroUsd::from_micros(3_000_000)`),
-/// matching the wire shape of [`aura_llm::ModelPricing`].
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LlmPricingOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_per_1m_tokens: Option<MicroUsd>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_per_1m_tokens: Option<MicroUsd>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cached_input_per_1m_tokens: Option<MicroUsd>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_write_per_1m_tokens: Option<MicroUsd>,
 }

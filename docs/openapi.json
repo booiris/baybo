@@ -2545,7 +2545,7 @@
       },
       "LlmPricingOverrideDto": {
         "type": "object",
-        "description": "Per-entry pricing override fields. Wire shape mirrors\n[`aura_config::LlmPricingOverride`]; each field is integer\nmicro-USD per 1M tokens (1 USD = 1_000_000).",
+        "description": "Per-entry pricing override fields. Wire shape mirrors\n[`aura_model::LlmPricingOverride`]; each field is integer micro-USD\nper 1M tokens (1 USD = 1_000_000). The DTO exists separately from\nthe canonical struct only so we can derive `ToSchema` for utoipa\nwithout leaking that derive into `aura-model`.",
         "properties": {
           "cache_write_per_1m_tokens": {
             "type": [
