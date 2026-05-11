@@ -41,7 +41,39 @@ const SCOPES: &str =
 /// authorize URL and the Codex backend. Without it the edge returns 403 with
 /// a Cloudflare challenge.
 pub const ORIGINATOR: &str = "codex_cli_rs";
+/// `auth.openai.com`'s edge silently rewrites the body to an empty / HTML
+/// response when the request comes in without a recognizable browser-like
+/// User-Agent (reqwest's default `reqwest/0.x` triggers it). Pin our own
+/// so the device-code endpoints actually return JSON.
+const USER_AGENT: &str = concat!("aura/", env!("CARGO_PKG_VERSION"));
 const PKCE_VERIFIER_BYTES: usize = 64;
+/// Cap on the body snippet we surface in decode errors, in chars. Long
+/// HTML error pages from the edge can run into the tens of kilobytes —
+/// truncating keeps the error single-line readable while still pointing
+/// at the failure mode.
+const ERROR_BODY_TRUNCATE: usize = 512;
+
+fn truncate_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.len() <= ERROR_BODY_TRUNCATE {
+        trimmed.to_string()
+    } else {
+        let mut end = ERROR_BODY_TRUNCATE;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &trimmed[..end])
+    }
+}
+
+fn parse_oauth_json<T: serde::de::DeserializeOwned>(body: &str, context: &str) -> Result<T> {
+    serde_json::from_str(body).map_err(|e| {
+        LlmError::Decode(format!(
+            "openai-subscription: {context} parse: {e}; body: {}",
+            truncate_body(body)
+        ))
+    })
+}
 
 /// Local callback port the PKCE flow listens on. Matches the Codex CLI's
 /// default; OpenAI's authorize page expects this exact URI.
@@ -115,22 +147,31 @@ pub async fn device_code_login(
     let client = reqwest::Client::new();
     let api_base = format!("{ISSUER}/api/accounts");
 
-    // Step 1: ask for a user code.
-    let usercode_resp: UserCodeResponse = client
+    // Step 1: ask for a user code. Read body as text first so a non-JSON
+    // response (HTML challenge, empty body, OAuth error envelope) ends up
+    // in the decode error instead of being swallowed by reqwest.
+    let resp = client
         .post(format!("{api_base}/deviceauth/usercode"))
         .header("originator", ORIGINATOR)
+        .header("User-Agent", USER_AGENT)
         .json(&serde_json::json!({ "client_id": CLIENT_ID }))
         .send()
         .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: device code request failed"))?
-        .json()
-        .await
-        .map_err(|e| {
-            LlmError::Decode(format!(
-                "openai-subscription: device code response parse: {e}"
-            ))
-        })?;
+        .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: device code request"))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| {
+        crate::reqwest_to_error(e, "openai-subscription: device code response read")
+    })?;
+    if !status.is_success() {
+        return Err(crate::status_to_error(
+            status.as_u16(),
+            format!(
+                "openai-subscription: device code request returned {status}: {}",
+                truncate_body(&body)
+            ),
+        ));
+    }
+    let usercode_resp: UserCodeResponse = parse_oauth_json(&body, "device code response")?;
 
     let device = DeviceCode {
         user_code: usercode_resp.user_code.clone(),
@@ -152,6 +193,7 @@ pub async fn device_code_login(
         let resp = client
             .post(&token_url)
             .header("originator", ORIGINATOR)
+            .header("User-Agent", USER_AGENT)
             .json(&serde_json::json!({
                 "device_auth_id": usercode_resp.device_auth_id,
                 "user_code": usercode_resp.user_code,
@@ -160,20 +202,23 @@ pub async fn device_code_login(
             .await
             .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: device-code poll"))?;
         let status = resp.status();
-        if status.is_success() {
-            break resp.json::<DeviceCodeSuccess>().await.map_err(|e| {
-                LlmError::Decode(format!("openai-subscription: device-code poll parse: {e}"))
-            })?;
-        }
         if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
             // "User hasn't approved yet" — back off and retry.
             sleep(Duration::from_secs(interval)).await;
             continue;
         }
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.map_err(|e| {
+            crate::reqwest_to_error(e, "openai-subscription: device-code poll body")
+        })?;
+        if status.is_success() {
+            break parse_oauth_json::<DeviceCodeSuccess>(&body, "device-code poll")?;
+        }
         return Err(crate::status_to_error(
             status.as_u16(),
-            format!("openai-subscription: device-code poll failed ({status}): {body}"),
+            format!(
+                "openai-subscription: device-code poll failed ({status}): {}",
+                truncate_body(&body)
+            ),
         ));
     };
 
@@ -219,6 +264,7 @@ pub async fn refresh(refresh_token: &str) -> std::result::Result<OAuthTokenBundl
     let resp = client
         .post(&endpoint)
         .header("originator", ORIGINATOR)
+        .header("User-Agent", USER_AGENT)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
@@ -226,11 +272,17 @@ pub async fn refresh(refresh_token: &str) -> std::result::Result<OAuthTokenBundl
         .map_err(|e| RefreshError::Transient(e.to_string()))?;
 
     let status = resp.status();
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| RefreshError::Transient(format!("refresh response read: {e}")))?;
     if status.is_success() {
-        let body: TokenEndpointResponse = resp
-            .json()
-            .await
-            .map_err(|e| RefreshError::Transient(format!("refresh response parse: {e}")))?;
+        let body: TokenEndpointResponse = serde_json::from_str(&body_text).map_err(|e| {
+            RefreshError::Transient(format!(
+                "refresh response parse: {e}; body: {}",
+                truncate_body(&body_text)
+            ))
+        })?;
         // Server may rotate the refresh_token; keep the old one if it didn't.
         let next_refresh = body
             .refresh_token
@@ -251,14 +303,14 @@ pub async fn refresh(refresh_token: &str) -> std::result::Result<OAuthTokenBundl
         return Ok(bundle);
     }
 
-    let body = resp.text().await.unwrap_or_default();
+    let body_snippet = truncate_body(&body_text);
     if status == reqwest::StatusCode::UNAUTHORIZED {
         warn!(
             event = "openai_subscription_token_refresh",
             outcome = "permanent",
-            "refresh permanently failed: {body}"
+            "refresh permanently failed: {body_snippet}"
         );
-        return Err(RefreshError::Permanent(body));
+        return Err(RefreshError::Permanent(body_snippet));
     }
     warn!(
         event = "openai_subscription_token_refresh",
@@ -266,7 +318,9 @@ pub async fn refresh(refresh_token: &str) -> std::result::Result<OAuthTokenBundl
         %status,
         "refresh transiently failed"
     );
-    Err(RefreshError::Transient(format!("status={status}: {body}")))
+    Err(RefreshError::Transient(format!(
+        "status={status}: {body_snippet}"
+    )))
 }
 
 /// Outcome of a [`refresh`] attempt.
@@ -297,6 +351,7 @@ pub async fn revoke(refresh_token: &str) -> std::io::Result<()> {
     let resp = client
         .post(&endpoint)
         .header("originator", ORIGINATOR)
+        .header("User-Agent", USER_AGENT)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
@@ -335,12 +390,41 @@ struct UserCodeResponse {
     device_auth_id: String,
     #[serde(alias = "user_code", alias = "usercode")]
     user_code: String,
-    #[serde(default = "default_poll_interval")]
+    // OpenAI's edge has shipped both shapes here:
+    // older `5` (u64), current `"5"` (string). Match openclaw's
+    // `normalizePositiveMilliseconds`: accept either, fall back to
+    // `default_poll_interval` when missing or unparseable.
+    #[serde(
+        default = "default_poll_interval",
+        deserialize_with = "deserialize_seconds"
+    )]
     interval: u64,
 }
 
 fn default_poll_interval() -> u64 {
     5
+}
+
+fn deserialize_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr<'a> {
+        Num(u64),
+        // Borrow when possible to avoid allocating for the common short form.
+        Str(std::borrow::Cow<'a, str>),
+    }
+    match Option::<NumOrStr>::deserialize(deserializer)? {
+        None => Ok(default_poll_interval()),
+        Some(NumOrStr::Num(n)) => Ok(n),
+        Some(NumOrStr::Str(s)) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| D::Error::custom(format!("interval `{s}` is not a u64: {e}"))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -519,22 +603,27 @@ async fn exchange_code_for_tokens_with_redirect(
     let resp = client
         .post(&endpoint)
         .header("originator", ORIGINATOR)
+        .header("User-Agent", USER_AGENT)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
         .await
         .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: token exchange transport"))?;
     let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: token exchange body read"))?;
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
         return Err(crate::status_to_error(
             status.as_u16(),
-            format!("openai-subscription: token exchange returned {status}: {body}"),
+            format!(
+                "openai-subscription: token exchange returned {status}: {}",
+                truncate_body(&body)
+            ),
         ));
     }
-    resp.json::<TokenEndpointResponse>()
-        .await
-        .map_err(|e| LlmError::Decode(format!("openai-subscription: token exchange parse: {e}")))
+    parse_oauth_json::<TokenEndpointResponse>(&body, "token exchange")
 }
 
 #[cfg(test)]
@@ -553,6 +642,87 @@ mod tests {
         );
         // challenge: SHA-256 → 32 bytes → 43 base64url chars
         assert_eq!(pkce.code_challenge.len(), 43);
+    }
+
+    #[test]
+    fn truncate_body_preserves_short_input_and_trims_whitespace() {
+        assert_eq!(truncate_body("ok"), "ok");
+        assert_eq!(truncate_body("  spaced  "), "spaced");
+    }
+
+    #[test]
+    fn truncate_body_caps_long_input_with_ellipsis() {
+        let long = "x".repeat(ERROR_BODY_TRUNCATE + 100);
+        let out = truncate_body(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(
+            out.chars().filter(|c| *c == 'x').count(),
+            ERROR_BODY_TRUNCATE
+        );
+    }
+
+    #[test]
+    fn parse_oauth_json_failure_includes_body_in_error() {
+        // The whole reason this helper exists: the user can't see what the
+        // server returned without the body in the error message. Use
+        // `serde_json::Value` so we don't need to touch wire-struct derives
+        // just to get an unwrap_err in the test.
+        let err = match parse_oauth_json::<serde_json::Value>(
+            "<html>cf challenge</html>",
+            "device code response",
+        ) {
+            Ok(v) => panic!("expected parse failure on HTML body, got Ok({v:?})"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("device code response parse"), "msg: {msg}");
+        assert!(msg.contains("<html>cf challenge</html>"), "msg: {msg}");
+    }
+
+    #[test]
+    fn usercode_response_accepts_interval_as_number_or_string() {
+        // Number form (older edge response).
+        let parsed: UserCodeResponse =
+            serde_json::from_str(r#"{"device_auth_id":"id","user_code":"CODE","interval":5}"#)
+                .unwrap();
+        assert_eq!(parsed.interval, 5);
+
+        // String form (current edge response, what tripped the original bug).
+        let parsed: UserCodeResponse =
+            serde_json::from_str(r#"{"device_auth_id":"id","user_code":"CODE","interval":"5"}"#)
+                .unwrap();
+        assert_eq!(parsed.interval, 5);
+
+        // Whitespace around the digits stays accepted.
+        let parsed: UserCodeResponse = serde_json::from_str(
+            r#"{"device_auth_id":"id","user_code":"CODE","interval":"  7  "}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.interval, 7);
+
+        // Missing field falls back to the default cadence.
+        let parsed: UserCodeResponse =
+            serde_json::from_str(r#"{"device_auth_id":"id","user_code":"CODE"}"#).unwrap();
+        assert_eq!(parsed.interval, default_poll_interval());
+
+        // Garbage string surfaces as a parse error rather than panicking.
+        let err = match serde_json::from_str::<UserCodeResponse>(
+            r#"{"device_auth_id":"id","user_code":"CODE","interval":"oops"}"#,
+        ) {
+            Ok(_) => panic!("expected parse error for non-numeric interval string"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("interval"), "msg: {err}");
+    }
+
+    #[test]
+    fn user_agent_pinned_to_aura_crate_version() {
+        // The default reqwest User-Agent (`reqwest/0.x`) trips the edge's
+        // bot heuristics on `auth.openai.com` and the body comes back
+        // empty/HTML — pinning a stable identifier is what makes the
+        // device-code endpoint return JSON. Lock the shape so a refactor
+        // doesn't accidentally drop it back to default.
+        assert!(USER_AGENT.starts_with("aura/"));
     }
 
     #[test]
