@@ -1,3 +1,4 @@
+mod builtin;
 pub mod gate;
 pub mod linked_files;
 pub mod loader;

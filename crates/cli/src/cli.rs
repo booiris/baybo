@@ -66,72 +66,107 @@ pub const ENV_HELP_AGENT: &str = "AURA_HELP_AGENT";
 /// gain public read/write methods.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Inspect and edit the Aura configuration.
+    /// Read and edit the active `aura.json`: `show`, `get`, `set`,
+    /// `unset`, `validate`, `file`, `schema`. Mutations take effect
+    /// after restart (hot-reload deferred).
     #[command(hide = true)]
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
-    /// List and inspect registered skills.
+    /// Inspect registered skills: `list`, `info <name>`, `search [q]`,
+    /// `check [name]` (verify required bins / env / model declarations).
+    /// Read-only.
     Skills {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
-    /// Inspect channel adapters.
+    /// Manage channel bots (Telegram/Slack/Discord/…): `list` the
+    /// registered bots, `add` an interactive registration flow,
+    /// `remove` deregisters and cleans up the vault token.
     #[command(name = "channel")]
     Channel {
         #[command(subcommand)]
         cmd: ChannelCmd,
     },
-    /// Manage Model Context Protocol servers exposed to the agent loop.
-    /// MCP-discovered tools surface to the LLM as `<server>/<tool>` and
-    /// are persisted to `.mcp.json` at the workspace root.
+    /// Manage Model Context Protocol servers (`add` / `list` / `get` /
+    /// `remove`). Servers are persisted to `.mcp.json`; their tools
+    /// surface to the agent as `<server>/<tool>` and the running
+    /// gateway picks up changes within ~5s without restart.
     Mcp {
         #[command(subcommand)]
         cmd: McpCmd,
     },
-    /// Manage per-user pairings: approve new senders, list pending
-    /// requests, revoke existing approvals. See
-    /// `docs/modules/pairing.md`.
+    /// Manage per-user channel pairings (the approval gate that lets
+    /// a new sender talk to the agent): `list` (pending/approved),
+    /// `approve <code>`, `revoke <channel> <bot> <user>`.
     Pair {
         #[command(subcommand)]
         cmd: PairCmd,
     },
-    /// LLM provider and model status.
+    /// Manage LLM provider entries in `aura.json`: `status` (which
+    /// entries are registered), `probe [name]` (round-trip a tiny
+    /// chat to verify auth + connectivity), `live-model [name]`
+    /// (list the provider's catalog), and the interactive editors
+    /// `add` / `edit` / `remove` / `default`.
     Llm {
         #[command(subcommand)]
         cmd: LlmCmd,
     },
-    /// Inspect and manage chat sessions.
+    /// Inspect chat sessions: `list` all sessions, `show <id>` for
+    /// metadata + (when wired) execution-trace counts, `history <id>`
+    /// for the conversation transcript (with
+    /// `--include-superseded` / `--superseded-only` to surface
+    /// compaction-dropped turns), and `export <id> [--out]` for the
+    /// full LLM/tool call tree as JSON.
     #[command(hide = true)]
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
-    /// Inspect and cancel tracked jobs.
+    /// Inspect tracked async jobs: `list [--status]`, `show <id>`,
+    /// `cancel <id>` (requires `--yes` in slash mode). Jobs are the
+    /// per-turn unit of work — one job per agent loop invocation.
     #[command(hide = true)]
     Job {
         #[command(subcommand)]
         cmd: JobCmd,
     },
-    /// Inspect and manage cron-scheduled jobs.
+    /// Inspect cron-scheduled jobs: `list` all schedules, `show <id>`
+    /// for the full row including prompt body. Cron mutations
+    /// (create/delete/enable/disable/run) are LLM-only via the
+    /// `CronCreate` / `CronDelete` / `CronList` tools.
     #[command(hide = true)]
     Cron {
         #[command(subcommand)]
         cmd: CronCmd,
     },
-    /// Read the rolling log files written by the gateway and channel sidecars.
+    /// Read the rolling tracing log files on disk. `main` reads
+    /// `<workspace>/logs/aura.log.<date>` (gateway/agent output);
+    /// `channel <type>` reads
+    /// `<workspace>/logs/channel/<type>.log.<date>` (sidecar output).
+    /// Both tail the last `-n` lines (default 200) and `--follow`
+    /// streams new lines until Ctrl-C. For structured session
+    /// traces (LLM calls, tool calls) use `aura session export`
+    /// instead — different store, different read shape.
     #[command(hide = true)]
     Log {
         #[command(subcommand)]
         cmd: LogCmd,
     },
-    /// Send a one-shot message to the agent.
+    /// Send a one-shot message to an existing session's agent loop
+    /// (`send --session <id> --message <text>`). Disabled inside a
+    /// chat session — running it from slash mode would inject a turn
+    /// into the session that's running it.
     Agent {
         #[command(subcommand)]
         cmd: AgentCmd,
     },
-    /// Inspect LLM spend recorded by the cost manager.
+    /// Inspect LLM spend (USD + token counts) recorded by the cost
+    /// manager. `show` aggregates over a scope — `--user <id>`,
+    /// `--session <id>`, `--job <id>`, or the default current-UTC-day
+    /// range bounded by `--since` / `--until`. Scopes are mutually
+    /// exclusive.
     #[command(hide = true)]
     Cost {
         #[command(subcommand)]
@@ -163,19 +198,24 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: GatewayCmd,
     },
-    /// One-shot summary of current runtime state.
+    /// One-shot snapshot of the running Aura instance.
     ///
-    /// By default, prints the static inventory (registered skills /
-    /// tools / channels / LLM). Pass `--live` to additionally query the
-    /// job lifecycle and cost manager for in-flight counts, recent
-    /// failures, and today's spend.
+    /// Default view is the *static* inventory: registered skills /
+    /// tools / channels / current LLM model / config path — answers
+    /// "how is this process configured". Pass `--live` to also query
+    /// the live runtime: in-flight job count, failed jobs in the last
+    /// 24h, and today's LLM spend (parallelized via `tokio::try_join!`).
+    /// Use `--live` first when diagnosing "is anything happening right
+    /// now / did anything just fail".
     Status {
         /// Include live runtime snapshot: in-flight jobs, recent
         /// failures (last 24h), cost-spent today.
         #[arg(long)]
         live: bool,
     },
-    /// Run health checks against config, storage, and env.
+    /// Run readiness checks against config, storage, and env. Aggregates
+    /// `AuraConfig::validate`, a storage ping, an LLM probe, and an
+    /// env-var audit into a single report.
     Doctor,
     /// Interactive first-run wizard: bootstrap the workspace, mint
     /// the master encryption key, register an LLM provider, optionally

@@ -83,6 +83,23 @@ impl SkillRegistry {
         self.skills.insert(skill.name.clone(), skill);
     }
 
+    /// Register every skill compiled into the binary (`crates/skills/src/
+    /// builtin/*/SKILL.md`).
+    ///
+    /// Built-ins ship with the cargo `[[bin]]` and are available even on
+    /// a fresh workspace before any `aura skills install` has run.
+    /// Workspace skills registered later (via `load_dir`) with the same
+    /// name override the built-in — operators can always patch the
+    /// shipped behaviour locally.
+    pub fn register_builtins(&self) -> usize {
+        let mut loaded = 0;
+        for skill in crate::builtin::all() {
+            self.register(skill);
+            loaded += 1;
+        }
+        loaded
+    }
+
     /// Load every `<dir>/<name>/SKILL.md` under `dir` (one directory per
     /// skill, `SKILL.md` entrypoint with YAML frontmatter). Existing skills
     /// with the same name are overwritten.
