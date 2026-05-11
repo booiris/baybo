@@ -1,4 +1,10 @@
+use std::path::PathBuf;
+
+use aura_agent::QueryApi;
+use aura_model::SessionId;
+use aura_storage::StoredMessage;
 use serde_json::{Value, json};
+use tokio::fs;
 
 use crate::cli::SessionCmd;
 use crate::context::{CommandContext, Invocation};
@@ -9,8 +15,12 @@ pub async fn handle(ctx: &CommandContext, cmd: SessionCmd) -> Result<CommandOutp
     match cmd {
         SessionCmd::List => list(ctx).await,
         SessionCmd::Show { id } => show(ctx, &id).await,
-        SessionCmd::History { id } => history(ctx, &id).await,
-        SessionCmd::Kill { id, yes } => kill(ctx, &id, yes).await,
+        SessionCmd::History {
+            id,
+            include_superseded,
+            superseded_only,
+        } => history(ctx, &id, include_superseded, superseded_only).await,
+        SessionCmd::Export { id, out, yes } => export(ctx, &id, out.as_deref(), yes).await,
     }
 }
 
@@ -18,6 +28,23 @@ fn sessions(ctx: &CommandContext) -> Result<&aura_agent::SessionManager> {
     ctx.session.as_deref().ok_or_else(|| {
         CliError::Manager("session manager is not available in this invocation".into())
     })
+}
+
+/// Trace replay is optional on `show` — argv-light boots that lack
+/// `QueryApi` still surface metadata + message count gracefully.
+async fn try_replay_counts(
+    ctx: &CommandContext,
+    session_id: &SessionId,
+) -> Option<(usize, usize, usize)> {
+    let api: &QueryApi = ctx.query_api.as_deref()?;
+    let replay = api.replay(session_id, None).await.ok()?;
+    let mut steps = 0;
+    let mut spans = 0;
+    for j in &replay.jobs {
+        steps += j.steps.len();
+        spans += j.steps.iter().map(|s| s.spans.len()).sum::<usize>();
+    }
+    Some((replay.jobs.len(), steps, spans))
 }
 
 async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
@@ -64,7 +91,7 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
 
 async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     let mgr = sessions(ctx)?;
-    let typed = aura_model::SessionId::from(id);
+    let typed = SessionId::from(id);
     let session = mgr
         .get(&typed)
         .await
@@ -74,8 +101,9 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         .load_active_session_messages(&typed)
         .await
         .map_err(|e| CliError::Manager(format!("load context: {e}")))?;
+    let trace_counts = try_replay_counts(ctx, &typed).await;
 
-    let value = json!({
+    let mut value = json!({
         "id": session.id.to_string(),
         "user": {
             "id": session.user.id,
@@ -88,15 +116,27 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "active_skills": session.state.active_skills,
         "compression_count": session.state.compression_count,
     });
+    if let Some((jobs, steps, spans)) = trace_counts
+        && let Value::Object(ref mut map) = value
+    {
+        map.insert(
+            "trace".into(),
+            json!({ "jobs": jobs, "steps": steps, "spans": spans }),
+        );
+    }
 
     let active_skills_human = if session.state.active_skills.is_empty() {
         "(none)".to_string()
     } else {
         session.state.active_skills.join(", ")
     };
+    let trace_human = match trace_counts {
+        Some((j, s, p)) => format!("\ntrace:          {j} jobs · {s} steps · {p} spans"),
+        None => String::new(),
+    };
 
     let human = format!(
-        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\nactive_skills:  {}\ncompressions:   {}",
+        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\nactive_skills:  {}\ncompressions:   {}{}",
         session.id,
         session.user.id,
         session.channel,
@@ -105,6 +145,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         messages.len(),
         active_skills_human,
         session.state.compression_count,
+        trace_human,
     );
 
     Ok(CommandOutput {
@@ -113,11 +154,28 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     })
 }
 
-async fn history(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
+async fn history(
+    ctx: &CommandContext,
+    id: &str,
+    include_superseded: bool,
+    superseded_only: bool,
+) -> Result<CommandOutput> {
     let mgr = sessions(ctx)?;
-    let typed = aura_model::SessionId::from(id);
+    let typed = SessionId::from(id);
+
+    if !(include_superseded || superseded_only) {
+        return active_history(mgr, id, &typed).await;
+    }
+    full_history(mgr, id, &typed, superseded_only).await
+}
+
+async fn active_history(
+    mgr: &aura_agent::SessionManager,
+    id: &str,
+    typed: &SessionId,
+) -> Result<CommandOutput> {
     let messages = mgr
-        .history(&typed)
+        .history(typed)
         .await
         .map_err(|e| CliError::Manager(format!("session history: {e}")))?;
 
@@ -145,21 +203,152 @@ async fn history(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     })
 }
 
-async fn kill(ctx: &CommandContext, id: &str, yes: bool) -> Result<CommandOutput> {
-    if ctx.invocation == Invocation::Slash && !yes {
+/// Walk the full message log including compaction-superseded rows.
+/// Each row carries `superseded_by` — `None` means active, `Some(n)`
+/// means a later compaction at ordinal `n` replaced this row.
+async fn full_history(
+    mgr: &aura_agent::SessionManager,
+    id: &str,
+    typed: &SessionId,
+    superseded_only: bool,
+) -> Result<CommandOutput> {
+    let all = mgr
+        .load_session_messages_with_supersede(typed)
+        .await
+        .map_err(|e| CliError::Manager(format!("session history: {e}")))?;
+    let filtered: Vec<&StoredMessage> = if superseded_only {
+        all.iter().filter(|m| m.superseded_by.is_some()).collect()
+    } else {
+        all.iter().collect()
+    };
+
+    if filtered.is_empty() {
+        let human = if superseded_only {
+            format!("session {id}: no superseded messages")
+        } else {
+            format!("session {id}: no messages")
+        };
+        return Ok(CommandOutput {
+            human,
+            data: Some(json!({ "session": id, "messages": [] })),
+        });
+    }
+
+    let active_count = all.iter().filter(|m| m.superseded_by.is_none()).count();
+    let total = all.len();
+    let superseded_count = total - active_count;
+
+    let header = if superseded_only {
+        let plural = if filtered.len() == 1 { "" } else { "s" };
+        format!(
+            "session {id}: {} superseded message{plural}",
+            filtered.len()
+        )
+    } else {
+        format!(
+            "session {id}: {total} messages ({active_count} active, {superseded_count} superseded)"
+        )
+    };
+
+    let mut buf = format!("{header}\n");
+    for m in &filtered {
+        let marker = match m.superseded_by {
+            Some(n) => format!("[→ #{n}]"),
+            None => "[active]".into(),
+        };
+        buf.push_str(&format!(
+            "  [#{}] {:?} · {} blocks · {marker}\n",
+            m.ordinal,
+            m.message.role,
+            m.message.content.len()
+        ));
+    }
+
+    let rows: Vec<Value> = filtered
+        .iter()
+        .map(|m| {
+            json!({
+                "ordinal": m.ordinal,
+                "superseded_by": m.superseded_by,
+                "message": m.message,
+            })
+        })
+        .collect();
+
+    Ok(CommandOutput {
+        human: buf.trim_end().to_string(),
+        data: Some(json!({ "session": id, "messages": rows })),
+    })
+}
+
+async fn export(
+    ctx: &CommandContext,
+    id: &str,
+    out: Option<&str>,
+    yes: bool,
+) -> Result<CommandOutput> {
+    if ctx.invocation == Invocation::Slash && out.is_some() && !yes {
         return Err(CliError::ConfirmationRequired(format!(
-            "would delete session {id}; re-run with --yes to confirm"
+            "would write trace for session {id} to {}; re-run with --yes to confirm",
+            out.unwrap_or("(stdout)")
         )));
     }
 
-    let mgr = sessions(ctx)?;
-    let typed = aura_model::SessionId::from(id);
-    mgr.delete(&typed)
+    let api = ctx
+        .query_api
+        .as_deref()
+        .ok_or_else(|| CliError::Manager("query api is not available in this invocation".into()))?;
+    let session_id = SessionId::from(id);
+    let replay = api
+        .replay(&session_id, None)
         .await
-        .map_err(|e| CliError::Manager(format!("delete session: {e}")))?;
+        .map_err(|e| CliError::Manager(format!("replay session: {e}")))?;
+    if replay.jobs.is_empty() {
+        return Err(CliError::Manager(format!(
+            "no trace recorded for session {id}"
+        )));
+    }
+
+    let tree: Vec<Value> = replay
+        .jobs
+        .iter()
+        .map(|rj| {
+            let steps: Vec<Value> = rj
+                .steps
+                .iter()
+                .map(|rs| json!({ "step": rs.step, "spans": rs.spans }))
+                .collect();
+            json!({ "job": rj.job, "steps": steps })
+        })
+        .collect();
+    let exported = json!({ "session": id, "jobs": tree });
+    let json_text = serde_json::to_string_pretty(&exported)
+        .map_err(|e| CliError::Manager(format!("serialize trace: {e}")))?;
+
+    if let Some(path_str) = out {
+        let path = PathBuf::from(path_str);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| CliError::Manager(format!("create parent {parent:?}: {e}")))?;
+        }
+        fs::write(&path, json_text.as_bytes())
+            .await
+            .map_err(|e| CliError::Manager(format!("write {path:?}: {e}")))?;
+        return Ok(CommandOutput {
+            human: format!("wrote trace for session {id} to {path_str}"),
+            data: Some(json!({
+                "session": id,
+                "path": path_str,
+                "bytes": json_text.len(),
+            })),
+        });
+    }
 
     Ok(CommandOutput {
-        human: format!("deleted session {id}"),
-        data: Some(json!({ "deleted": id })),
+        human: json_text.clone(),
+        data: Some(exported),
     })
 }

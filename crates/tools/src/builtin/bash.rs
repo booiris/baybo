@@ -214,7 +214,7 @@ impl Tool for BashTool {
             ));
         };
 
-        let args = vec!["-c".into(), command.clone()];
+        let args = vec!["-c".into(), inject_aura_env(&command)];
         let attempt = tokio::select! {
             _ = ctx.cancellation_token.cancelled() => {
                 return Err(ToolError::Execution("cancelled".into()));
@@ -284,6 +284,27 @@ const FILE_TOOL_REDIRECT_COMMANDS: &[&str] = &[
 
 fn is_file_tool_redirect(command: &str) -> bool {
     first_token(command).is_some_and(|t| FILE_TOOL_REDIRECT_COMMANDS.contains(&t))
+}
+
+/// Prefix `command` with `export AURA_HELP_AGENT=1;` when it looks
+/// like it might invoke the Aura CLI, so the subshell exposes the
+/// extended help surface (hidden subcommands like `cost`, `log`,
+/// `session`, `job`, `cron`, `config`) to the agent. See
+/// `aura_cli::cli::ENV_HELP_AGENT` for the contract on the reader
+/// side.
+///
+/// The substring match is intentionally loose: non-aura processes
+/// inherit the variable and ignore it, so a false-positive injection
+/// (e.g. `cd /data/aura && cargo build`) has no observable effect.
+/// The win is that the agent can compose `aura …` commands naturally
+/// — no per-call argv token, no LLM tool-shape change — and still
+/// see the full help inventory.
+fn inject_aura_env(command: &str) -> String {
+    if command.contains("aura") {
+        format!("export AURA_HELP_AGENT=1; {command}")
+    } else {
+        command.to_string()
+    }
 }
 
 /// argv0 of the command string — the first whitespace-separated token,
@@ -627,7 +648,7 @@ async fn prompt_and_run_unsandboxed_retry(
         .await;
     match decision {
         ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
-            let args = ["-c".to_string(), command.to_string()];
+            let args = ["-c".to_string(), inject_aura_env(command)];
             tokio::select! {
                 _ = ctx.cancellation_token.cancelled() => {
                     Err(ToolError::Execution("cancelled".into()))
@@ -743,6 +764,39 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn inject_aura_env_prefixes_aura_commands() {
+        let out = inject_aura_env("aura cost show");
+        assert!(
+            out.starts_with("export AURA_HELP_AGENT=1; "),
+            "expected env prefix, got: {out}"
+        );
+        assert!(out.contains("aura cost show"));
+    }
+
+    #[test]
+    fn inject_aura_env_leaves_unrelated_commands_alone() {
+        assert_eq!(inject_aura_env("ls -la"), "ls -la");
+        assert_eq!(inject_aura_env("git status"), "git status");
+    }
+
+    #[test]
+    fn inject_aura_env_triggers_inside_pipelines_and_chains() {
+        // Common shapes the agent composes — the env var must reach
+        // the subshell regardless of where `aura` appears.
+        for cmd in [
+            "aura status --live | jq .",
+            "cd /tmp && aura cost show",
+            "for i in 1 2; do aura job list; done",
+        ] {
+            let out = inject_aura_env(cmd);
+            assert!(
+                out.starts_with("export AURA_HELP_AGENT=1; "),
+                "expected env prefix for {cmd:?}, got: {out}"
+            );
+        }
+    }
 
     fn ctx_with(sandbox: Option<Arc<dyn crate::ExecSandbox>>) -> ToolContext {
         ToolContext {

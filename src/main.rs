@@ -10,7 +10,6 @@ mod tui_log;
 use aura_cli::cli::ShellKind;
 use aura_cli::{Cli, Commands, ContextBuilder, Invocation, OutputFormat, dispatch};
 use clap::CommandFactory;
-use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -27,7 +26,10 @@ fn resolve_config_path() -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // `parse_args` checks `AURA_HELP_AGENT` and swaps in an unhidden
+    // `Command` before clap parses argv; that's how the env-var
+    // surfaces extended `--help` output without needing a flag.
+    let cli = aura_cli::cli::parse_args();
 
     // Promote `--config <path>` into `AURA_CONFIG_PATH` before any
     // reader runs, so every downstream caller can stay env-only with a
@@ -181,6 +183,34 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref client) = llm_client {
         builder = builder.llm(Arc::clone(client));
     }
+    if needs_query_graph(&cmd) {
+        // Monitoring commands (`status --live`, `cost show`, `log session`,
+        // `session`, `job`, `cron`) need the heavier domain graph that
+        // argv-mode skips by default. Build the smallest set that lets
+        // those handlers (and the auto-derived `QueryApi`) work, without
+        // dragging in actors, supervisors, or LLM-side dependencies.
+        //
+        // `CronScheduler` needs a trigger channel and a `Shutdown`, but
+        // we never call `.run()` here — only its read APIs. The dropped
+        // receiver is fine: nothing in argv would push a trigger anyway,
+        // and `ShutdownSignal::new()` returns an un-fired signal.
+        builder = builder
+            .session(Arc::new(aura_agent::SessionManager::new(
+                stores.session.clone(),
+                stores.session_summary.clone(),
+                boot::to_session_timeout(&config.session),
+            )))
+            .job(Arc::new(aura_agent::JobLifecycle::new(stores.job.clone())))
+            .trace(stores.trace.clone())
+            .cost_store(stores.cost.clone());
+        let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(1);
+        let shutdown: Arc<dyn aura_cron::Shutdown> = Arc::new(aura_agent::ShutdownSignal::new());
+        builder = builder.cron(Arc::new(aura_agent::CronScheduler::new(
+            stores.cron.clone(),
+            cron_tx,
+            shutdown,
+        )));
+    }
     if let Ok((vault, stores)) = runtime::build_bot_registry_deps(&config).await {
         builder = builder
             .secret_vault(vault)
@@ -218,7 +248,29 @@ async fn main() -> anyhow::Result<()> {
 /// fail for the openai-subscription default-llm because argv mode
 /// passes `None` for the vault.
 fn needs_llm(cmd: &Commands) -> bool {
-    matches!(cmd, Commands::Doctor | Commands::Status)
+    matches!(cmd, Commands::Doctor | Commands::Status { .. })
+}
+
+/// Subcommands that read `ctx.session` / `ctx.job` / `ctx.trace` /
+/// `ctx.cron` (and therefore the auto-derived `ctx.query_api`).
+///
+/// Argv mode skips these by default to keep `aura skills list` /
+/// `aura config get` boots cheap; this predicate opts the monitoring
+/// surface back in. `Status { live: false }` stays out — only the
+/// `--live` block needs the live counters.
+///
+/// Each manager built here uses only storage handles already opened
+/// via `aura_storage::Store::open`. No actors, supervisors, or LLM
+/// dependencies — pure read-side wiring.
+fn needs_query_graph(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Status { live } => *live,
+        Commands::Cost { .. }
+        | Commands::Session { .. }
+        | Commands::Job { .. }
+        | Commands::Cron { .. } => true,
+        _ => false,
+    }
 }
 
 fn pick_format(cli: &Cli) -> OutputFormat {

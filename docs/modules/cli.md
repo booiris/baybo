@@ -4,7 +4,7 @@
 
 The `aura-cli` crate is the **operator-facing command layer** for Aura. It does two things and only two things:
 
-1. **Argv mode** — `aura <command>` executes a one-shot command against the running (or freshly-loaded) domain graph and exits. Example: `aura config show`, `aura job list`, `aura trace export <id>`.
+1. **Argv mode** — `aura <command>` executes a one-shot command against the running (or freshly-loaded) domain graph and exits. Example: `aura config show`, `aura job list`, `aura session export <id>`.
 2. **Slash mode** — while a user is chatting over any channel, lines starting with `/` (e.g. `/config show`, `/cron list`) are intercepted by the channel adapter, dispatched through the same parser and handlers as Argv mode, and their output returned to the user as a normal response. Slash commands **do not** enter the agent's conversation context.
 
 `aura-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `JobManager`, `TraceCollector`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `MemoryManager`, `WorkspaceManager`, `AuraConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
@@ -19,7 +19,7 @@ The command taxonomy is organized by subsystem: one family per manager exposed i
 
 ### Slash commands do not touch agent context
 
-A slash command never becomes a `ChatMessage`, is never seen by the LLM, and is never appended to the session history. It is a side-channel into the domain graph. This is a hard invariant: dispatching `/memory clear …` in the middle of a conversation must not pollute the model's memory with operator chatter.
+A slash command never becomes a `ChatMessage`, is never seen by the LLM, and is never appended to the session history. It is a side-channel into the domain graph. This is a hard invariant: dispatching `/config set …` in the middle of a conversation must not pollute the model's context with operator chatter.
 
 Reserved slash tokens (`/quit`, `/exit`, `/clear`) stay local to the adapter and never reach the dispatcher — they control the terminal, not the domain graph.
 
@@ -56,7 +56,7 @@ The trait that lets a channel adapter intercept `/` input is defined in `aura-ch
 ## Command Reference
 
 **Global flags** (apply to every command in both modes):
-`--config <path>` · `--profile <name>` · `--json` · `--plain` · `--no-color` · `-v/--verbose` · `-V/--version`
+`--config <path>` · `--profile <name>` · `--json` · `--plain` · `--no-color` · `-V/--version`
 
 `--config` is UX sugar: `main` writes its value into `AURA_CONFIG_PATH`
 once at startup, and every downstream reader goes through the env var.
@@ -64,6 +64,51 @@ So both `aura --config /foo/aura.json …` and
 `AURA_CONFIG_PATH=/foo/aura.json aura …` hit the same code path, and
 installed services (systemd/launchd) that only have env available work
 without special cases.
+
+### `AURA_HELP_AGENT` (extended help)
+
+When `AURA_HELP_AGENT` is set to any non-empty value, `aura --help` (and
+every `aura <subcmd> --help`) surfaces the flags and subcommands hidden
+from the default view. The goal is to keep the headline surface focused
+on what most operators reach for and keep agent / log / trace inspection
+one env var away for the moments it matters.
+
+The mechanism lives in `aura_cli::cli::parse_args`: it checks the env
+var, swaps in an unhidden clap `Command` *before* parsing, and then
+clap's own `--help` machinery prints the extended view. There is no
+custom help printer to keep in sync.
+
+Hidden by default — only listed when `AURA_HELP_AGENT` is set:
+
+- Flag: `-v` / `--verbose` (log verbosity, repeatable)
+- Subcommands: `config`, `session`, `job`, `cron`, `log`, `cost`
+
+`session` is the unified "everything about a session" surface: metadata
+(`show`), chat transcript (`history`), and full execution-trace JSON
+(`export`). The earlier separate `trace` family was folded back into
+`session` — operators kept hitting the "which command shows me what
+happened in session X" branch and the split bought nothing. The
+execution-trace summary (jobs / steps / spans counts) is now appended
+to `session show` directly when the trace graph is wired.
+
+`log` is a distinct family because it reads the **rolling tracing
+files on disk** (`logs/aura.log.<date>`, `logs/channel/<ch>.log.<date>`),
+not the structured `TraceStore`. Different store, different read
+shape — kept top-level.
+
+The hide policy lives next to the clap tree in
+`crates/cli/src/cli.rs`: each hidden surface carries `hide = true` (args)
+or `#[command(hide = true)]` (subcommands), and `unhide_recursive`
+walks the `Command` flipping `hide(false)` when the env var is set.
+Add a new debug-only surface by setting `hide = true` on its
+arg/variant — `unhide_recursive` picks it up automatically.
+
+**Agent-side opt-in**: `aura-tools::builtin::bash::inject_aura_env`
+prefixes any tool command containing the literal token `aura` with
+`export AURA_HELP_AGENT=1;` before the subshell runs. The agent gets
+the full help inventory out of the box without composing a per-call
+argv flag; the env var is namespaced so spurious injection on
+non-CLI commands is a no-op.
 
 "Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs are tracked in the per-subsystem follow-up todos (`docs/todo/cli-agent-send-argv.md`) — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
 
@@ -80,21 +125,18 @@ without special cases.
 | `llm`        | `status`                                                                                                  | `LlmClient`                                                                  | read-only                                                                                          | shipped                                           |
 | `llm`        | `probe [name]` · `live-model [name]`                                                                      | `LlmProviderRegistry::list_models` / `LlmClient::probe`                      | `probe` issues a minimal chat request                                                              | shipped                                           |
 | `llm`        | `add` · `edit` · `remove` · `default`                                                                     | Interactive editors that write the active config + vault                     | mutates `aura.json` and per-entry vault keys                                                       | shipped                                           |
-| `workspace`  | `show`                                                                                                    | `WorkspaceManager`                                                           | read-only                                                                                          | shipped                                           |
-| `workspace`  | `set-identity <name> (--file <path> \| --content <text>)`                                                 | `WorkspaceManager::write_identity_file`                                      | overwrites the target `*.md` atomically; running process keeps the old content until restart (requires `--yes` in slash mode) | shipped                                           |
-| `session`    | `list` · `show <id>` · `history <id>` · `kill <id>`                                                       | `SessionManager`                                                             | `kill` mutates                                                                                     | shipped                                           |
+| `session`    | `list` · `show <id>` · `history <id> [--include-superseded \| --superseded-only]` · `export <id> [--out <path>]` | `SessionManager` + `QueryApi::replay`                                        | read-only. `show` returns metadata + message count + (when `QueryApi` is wired) jobs/steps/spans counts from the trace store. `history` defaults to the *active* (non-superseded) transcript; `--include-superseded` walks the full log and tags each row `[active]` or `[→ #N]`, `--superseded-only` keeps just the dropped rows. `export` writes the full fork-aware call tree as pretty JSON (stdout, or `--out <path>` with `--yes` required in slash mode). | shipped                                           |
 | `job`        | `list [--status]` · `show <id>` · `cancel <id>`                                                           | `JobManager`                                                                 | `cancel` mutates                                                                                   | shipped                                           |
-| `trace`      | `list [--session <id>] [--limit <n>]` · `show <id>` · `export <id> [--out <path>]`                        | `TraceStore::query_traces` / `load_trace`                                    | `export --out` writes a local file (requires `--yes` in slash mode)                                | shipped                                           |
-| `trace`      | `snapshot <session-id> [--node <id>] [--full]`                                                            | `TraceStore::load_trace` + `aura_trace::snapshot::find_nearest_snapshot`     | read-only ancestor lookup on the stored trace; does **not** capture a new live snapshot (that still needs session context the CLI does not hold) | shipped (stored lookup); live capture remains deferred |
-| `cron`       | `list`                                                                                                    | `CronScheduler::list_all_jobs`                                               | read-only operator view. All cron mutations (create/delete/enable/disable/run) are driven through the LLM tools (`CronCreate`, `CronDelete`, `CronList`) registered by `aura-cron::agent_tools`. | shipped                                           |
-| `memory`     | `list [--user <u>]` · `search <query> [--user <u>]` · `show <id>` · `promote <id> [--to <f>]` · `clear --session <id>` | `MemoryManager`                                                              | `promote`/`clear` mutate (require `--yes` in slash mode)                                           | shipped                                           |
+| `cron`       | `list` · `show <id>`                                                                                      | `CronScheduler::list_all_jobs` / `get_job`                                   | read-only operator view. `show` returns the full job row (prompt body + `origin_session_id` + timestamps); cron jobs are bound to `user_id + channel`, not to a session, so a session's audit trail of cron creations is better viewed via `session export` than a cron-side filter. All cron mutations (create/delete/enable/disable/run) are driven through the LLM tools (`CronCreate`, `CronDelete`, `CronList`) registered by `aura-cron::agent_tools`. | shipped                                           |
+| `log`        | `main [--date <YYYY-MM-DD>] [-n <limit>] [-f/--follow]` · `channel <channel> [--date] [-n] [-f]` | Workspace `logs/` files (`logs/aura.log.<date>`, `logs/channel/<ch>.log.<date>`) written by the tracing appender | read-only. Tails the last `--limit` lines (default 200) by seeking backwards from EOF; `--follow` polls for appended bytes until Ctrl-C (incompatible with `--json`). | shipped                                           |
 | `security`   | `audit` · `leaks check <file>`                                                                            | `SecurityGateway::audit` / `LeakDetector::check_file`                        | read-only; `audit` would return rule count by action + vault master-key flag (never secret material); `leaks check` would report blocked/hits via the shared detector | deferred — no `Security` variant in the clap tree yet |
 | `agent`      | `send --session <id> --message <text>`                                                                    | `Router` / `AgentLoop`                                                       | mutates; **disabled in slash mode** (returns `AgentSendForbiddenInSlash`)                          | partial — grammar + slash guard shipped; argv returns a deferred `Manager` error pending a `Router` one-shot entry |
+| `cost`       | `show [--user <u> \| --session <id> \| --job <id>] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>]`        | `QueryApi::cost_summary` (`CostScope::{User, Session, Job, TimeRange}`)      | read-only. Scopes are mutually exclusive: `--user` is bounded by `--since`/`--until` (default = current UTC day); `--session`/`--job` ignore the time range. Output reports total micro-USD + token aggregates (input / output / cached input / cache writes). | shipped (requires the full domain graph; returns a `Manager` error in argv-light boots that lack `QueryApi`) |
+| `status`     | `[--live]`                                                                                                | Static: registries + `LlmClient`. Live: `JobLifecycle::list` + `QueryApi::cost_summary` | `--live` adds in-flight job count, failed-jobs-last-24h, and today's spend (USD + token counts). Each live counter degrades to `(unavailable)` when its manager isn't wired in the current invocation. | shipped (live block populated where managers are wired)  |
 | `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `aura-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `src/main.rs` before dispatch, runs in `src/gateway_cmd.rs`) |
 | `pair`       | `list [--pending\|--approved]` · `approve <code>` · `revoke <channel-type> <bot-id> <user-id>`            | `aura-pair` store via `ChannelPairingStore`                                  | `approve`/`revoke` mutate                                                                          | shipped                                           |
 | `tui`        | `[--session <id>]`                                                                                        | WS client into the gateway's channel listener                                | read-only                                                                                          | shipped (intercepted before dispatch, runs in `src/tui_cmd.rs`) |
 | `setup`      | —                                                                                                         | Interactive first-run wizard (`aura-setup`)                                  | bootstraps workspace + master key + default `aura.json`                                            | shipped (intercepted before dispatch, runs in `src/setup_cmd.rs`) |
-| `status`     | —                                                                                                         | `SessionManager` + `JobLifecycle` + `CostManager`                            | read-only                                                                                          | shipped                                           |
 | `doctor`     | —                                                                                                         | Aggregates `AuraConfig::validate`, storage ping, `llm::probe`, env-var audit | read-only                                                                                          | shipped (LLM probe gated on `llm probe` landing)  |
 | `completion` | `<shell>`                                                                                                 | `clap_complete`                                                              | stdout only                                                                                        | shipped                                           |
 
@@ -153,7 +195,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 | `config`                                                                                                            | `config` family directly reads/writes `AuraConfig`; `doctor` calls `validate`.                                                                                   |
 | `agent`                                                                                                             | Supplies all manager `Arc`s; `agent send` reuses the `Router` path.                                                                                              |
 | `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |
-| `trace` / `job` / `cron` / `skills` / `tools` / `session` / `memory` / `security` / `workspace` / `llm` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
+| `job` / `cron` / `skills` / `tools` / `session` / `security` / `llm` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
 
 ## Verification
 
