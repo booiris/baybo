@@ -922,3 +922,45 @@ fn log_channel_requires_channel_name() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+#[test]
+fn log_channel_rejects_path_traversal_and_other_unsafe_inputs() {
+    // The `channel` positional becomes a filename component:
+    //   <workspace>/logs/channel/<channel>.log.<date>
+    // so anything other than `[a-z0-9_-]+` would either escape the
+    // directory (`/`, `..`) or push the lookup somewhere unexpected
+    // (uppercase, dots, unicode). The clap value-parser must reject
+    // these at argv-parse time so neither the argv handler nor the
+    // slash dispatcher ever builds the path.
+    for argv in [
+        &["aura", "log", "channel", "../../../etc/passwd"][..],
+        &["aura", "log", "channel", "../etc"][..],
+        &["aura", "log", "channel", "tg/secret"][..],
+        &["aura", "log", "channel", "tg\\secret"][..],
+        &["aura", "log", "channel", "."][..],
+        &["aura", "log", "channel", ".."][..],
+        &["aura", "log", "channel", ".hidden"][..],
+        &["aura", "log", "channel", "tele.gram"][..],
+        &["aura", "log", "channel", "Telegram"][..], // uppercase
+        &["aura", "log", "channel", "tele gram"][..], // space
+        &["aura", "log", "channel", ""][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "expected rejection of unsafe channel name: {argv:?}"
+        );
+    }
+
+    // Legitimate names still pass.
+    for argv in [
+        &["aura", "log", "channel", "telegram"][..],
+        &["aura", "log", "channel", "slack"][..],
+        &["aura", "log", "channel", "tg_bot42"][..],
+        &["aura", "log", "channel", "openclaw-lark"][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_ok(),
+            "expected accept of legitimate channel name: {argv:?}"
+        );
+    }
+}

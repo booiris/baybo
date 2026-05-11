@@ -663,7 +663,10 @@ pub enum LogCmd {
     /// Read a channel sidecar's log
     /// (`<workspace>/logs/channel/<channel>.log.<date>`).
     Channel {
-        /// Channel type (e.g. `telegram`, `slack`, `tui`).
+        /// Channel type (e.g. `telegram`, `slack`, `tui`). Restricted
+        /// to `[a-z0-9_-]+` so it can't escape `logs/channel/` through
+        /// a path-traversal payload.
+        #[arg(value_parser = crate::commands::parse_channel_name)]
         channel: String,
         /// Date of the rolling log to read, in `YYYY-MM-DD`.
         /// Defaults to today (UTC).
