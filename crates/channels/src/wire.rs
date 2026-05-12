@@ -358,6 +358,23 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
     },
+    /// Liveness probe (either direction). The receiver MUST reply with
+    /// [`Frame::Pong`].
+    ///
+    /// Half-open WS detection: a TCP connection can stay "open" client-
+    /// side after the peer goes silent (NAT idle, laptop sleep, mobile
+    /// roaming) — the browser fires no `onclose`, so the chat tab keeps
+    /// looking healthy while outbound sends pile into kernel buffers and
+    /// silently disappear. The web chat client paces a `Ping` every
+    /// ~20 s and force-closes if it hasn't seen any frame for ~45 s,
+    /// which then trips the normal reconnect ladder. WS protocol-level
+    /// `Ping`/`Pong` would do the same on the server side but browsers
+    /// hide control-frame reception from JS, so the client-side
+    /// watchdog needs an app-level signal it can actually observe.
+    Ping,
+    /// Reply to [`Frame::Ping`]. Carries no payload — receipt itself is
+    /// the liveness signal.
+    Pong,
 }
 
 /// Mutation kind carried on [`Frame::ChatSessionListChanged`]. Only
@@ -623,6 +640,18 @@ mod tests {
             ok: false,
             message: Some("401 Unauthorized".into()),
         };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_ping() {
+        let frame = Frame::Ping;
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_pong() {
+        let frame = Frame::Pong;
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
 

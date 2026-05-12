@@ -434,6 +434,16 @@ async fn run_inbound_loop(
                             );
                         }
                     }
+                    Frame::Ping => {
+                        if let Err(e) = sidecar.send_frame(Frame::Pong).await {
+                            tracing::debug!(error = %e, "reply Pong failed");
+                        }
+                    }
+                    Frame::Pong => {
+                        // The gateway doesn't currently send Ping itself —
+                        // a stray Pong is harmless and arrives on the
+                        // app-level liveness path, so just accept it.
+                    }
                     Frame::BotStatus {
                         bot_id,
                         ok,

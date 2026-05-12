@@ -298,6 +298,13 @@ fn map_frame(
             // is redundant here.
             None
         }
+        Frame::Ping | Frame::Pong => {
+            // The TUI doesn't currently drive the heartbeat itself —
+            // its tokio task is already idle-aware. Accept either
+            // direction silently so a future server-initiated probe
+            // doesn't have to negotiate per-client.
+            None
+        }
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
         | Frame::Subscribe { .. }

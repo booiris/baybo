@@ -79,10 +79,25 @@ export type Frame =
   | { kind: 'stop_bot'; bot_id: string }
   | { kind: 'bot_status'; bot_id: string; ok: boolean; message?: string }
   | { kind: 'slash_manifest'; commands: { command: string; description: string }[] }
-  | { kind: 'chat_session_list_changed'; event: ChatListEvent; session_id: string };
+  | { kind: 'chat_session_list_changed'; event: ChatListEvent; session_id: string }
+  | { kind: 'ping' }
+  | { kind: 'pong' };
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+
+/** How often the client sends an app-level Ping while connected.
+ *  Tuned below the typical NAT idle window (30–120 s) so the same
+ *  traffic that probes the server also keeps the path alive. */
+const HEARTBEAT_PING_INTERVAL_MS = 20_000;
+/** No frame at all (Pong, Delta, anything) for this long means we
+ *  treat the WS as half-open and force-close. 2× the ping cadence
+ *  plus slack so a single dropped Pong doesn't flap the connection. */
+const HEARTBEAT_LIVENESS_TIMEOUT_MS = 45_000;
+/** How often the watchdog wakes up to compare `lastFrameAt` against
+ *  the liveness budget. Fine-grained enough to fire within ~5 s of
+ *  the actual deadline without busy-spinning. */
+const HEARTBEAT_TICK_MS = 5_000;
 
 export type ConnectionStatus =
   | { state: 'connecting' }
@@ -143,6 +158,14 @@ export class ChatWs {
   /** Paused after the server rejected our token — auto-reconnect
    *  stops until {@link replaceToken} swaps in a fresh one. */
   private suspended = false;
+  /** Combined heartbeat-send + liveness-watchdog tick. `null` while
+   *  disconnected. Set in {@link startHeartbeat} after RegisterAck. */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Epoch ms of the most recently received frame on the current WS.
+   *  Updated on every inbound (including Pong); compared against
+   *  {@link HEARTBEAT_LIVENESS_TIMEOUT_MS} to detect half-open TCP
+   *  state that the browser would otherwise hide. */
+  private lastFrameAt = 0;
 
   constructor(private readonly opts: ChatWsOptions) {
     this.channelToken = opts.channelToken;
@@ -249,6 +272,7 @@ export class ChatWs {
   // ── private ────────────────────────────────────────────────────────
 
   private detachAndCloseWs(): void {
+    this.stopHeartbeat();
     const old = this.ws;
     if (!old) return;
     // Strip handlers before close() so the deferred onclose for THIS
@@ -263,6 +287,44 @@ export class ChatWs {
       /* ignore */
     }
     this.ws = null;
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.lastFrameAt = Date.now();
+    this.heartbeatTimer = setInterval(() => this.heartbeatTick(), HEARTBEAT_TICK_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  private heartbeatTick(): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (now - this.lastFrameAt > HEARTBEAT_LIVENESS_TIMEOUT_MS) {
+      // No frames for too long — the WS is half-open. Closing the
+      // socket here lets the existing `onclose` path mark us
+      // disconnected and step into the reconnect ladder; the server's
+      // next RegisterAck reseeds `lastFrameAt`.
+      this.stopHeartbeat();
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    // Stagger sends so we only probe roughly once per ping interval.
+    // The watchdog wakes up more often than that so a wake near the
+    // liveness deadline can act before the budget runs out.
+    if (now - this.lastFrameAt >= HEARTBEAT_PING_INTERVAL_MS) {
+      this.sendFrame({ kind: 'ping' });
+    }
   }
 
   private connect(): void {
@@ -301,6 +363,10 @@ export class ChatWs {
     } catch {
       return;
     }
+    // Any inbound bumps the liveness watchdog — including Pong, which
+    // exists specifically so an otherwise-idle session still has
+    // something to track.
+    this.lastFrameAt = Date.now();
     switch (frame.kind) {
       case 'register_ack': {
         if (!frame.ok) {
@@ -327,6 +393,16 @@ export class ChatWs {
         for (const sid of this.subscriptions.keys()) {
           this.sendSubscribe(sid);
         }
+        this.startHeartbeat();
+        return;
+      }
+      case 'ping': {
+        // Forward-compat for a future server-initiated probe.
+        this.sendFrame({ kind: 'pong' });
+        return;
+      }
+      case 'pong': {
+        // Pure liveness signal — already bumped `lastFrameAt` above.
         return;
       }
       case 'reset': {
@@ -368,6 +444,7 @@ export class ChatWs {
   }
 
   private onClose(e: CloseEvent): void {
+    this.stopHeartbeat();
     this.ws = null;
     if (this.closed) return;
     this.scheduleReconnect(`ws close (${e.code}${e.reason ? `: ${e.reason}` : ''})`);
