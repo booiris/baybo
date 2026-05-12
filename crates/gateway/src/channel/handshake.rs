@@ -8,7 +8,7 @@
 //! on the same connection. The validator therefore no longer parses
 //! or returns a `session_id`.
 
-use aura_channels::wire::{Frame, PROTOCOL_VERSION};
+use aura_channels::wire::Frame;
 use aura_model::ChannelType;
 
 use crate::auth::{AuthedClient, ChannelTokenTable, TOOL_CLIENT_LABEL_PREFIX};
@@ -33,17 +33,10 @@ pub(crate) fn validate_register(
     let Frame::Register {
         token,
         channel_type,
-        protocol_version,
     } = frame
     else {
         return Err("expected Register frame".to_string());
     };
-
-    if protocol_version != PROTOCOL_VERSION {
-        return Err(format!(
-            "protocol version mismatch: server {PROTOCOL_VERSION}, client {protocol_version}"
-        ));
-    }
 
     let normalized = channel_type.as_str().trim().to_string();
     if normalized.is_empty() {
@@ -132,11 +125,10 @@ mod tests {
         }
     }
 
-    fn register(token: &str, channel_type: &str, version: u16) -> Frame {
+    fn register(token: &str, channel_type: &str) -> Frame {
         Frame::Register {
             token: token.to_string(),
             channel_type: ChannelType::from(channel_type),
-            protocol_version: version,
         }
     }
 
@@ -148,30 +140,16 @@ mod tests {
             label: "slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "slack");
         let authed = subprocess(42, "slack");
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
         assert_eq!(outcome.channel_type.as_str(), "slack");
     }
 
     #[test]
-    fn rejects_wrong_protocol_version() {
-        let tokens = ChannelTokenTable::new();
-        let handle = tokens.mint(ClientIdentity {
-            pid: 1,
-            label: "slack".into(),
-            bound_channel_type: Some("slack".into()),
-        });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION + 1);
-        let authed = subprocess(1, "slack");
-        let err = validate_register(frame, &authed, &tokens).unwrap_err();
-        assert!(err.contains("protocol version"));
-    }
-
-    #[test]
     fn rejects_unknown_token() {
         let tokens = ChannelTokenTable::new();
-        let frame = register("deadbeef", "slack", PROTOCOL_VERSION);
+        let frame = register("deadbeef", "slack");
         let authed = subprocess(1, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert_eq!(err, "token not registered");
@@ -185,7 +163,7 @@ mod tests {
             label: "slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "slack");
         let authed = subprocess(999, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert_eq!(err, "token identity mismatch");
@@ -199,7 +177,7 @@ mod tests {
             label: "slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "slack");
         let authed = subprocess(42, "discord");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert_eq!(err, "token identity mismatch");
@@ -208,7 +186,7 @@ mod tests {
     #[test]
     fn accepts_tui_auth_claiming_tui_channel() {
         let tokens = ChannelTokenTable::new();
-        let frame = register("", ChannelType::TUI, PROTOCOL_VERSION);
+        let frame = register("", ChannelType::TUI);
         let outcome = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap();
         assert_eq!(outcome.channel_type.as_str(), ChannelType::TUI);
     }
@@ -216,7 +194,7 @@ mod tests {
     #[test]
     fn rejects_tui_auth_claiming_other_channel() {
         let tokens = ChannelTokenTable::new();
-        let frame = register("", "slack", PROTOCOL_VERSION);
+        let frame = register("", "slack");
         let err = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap_err();
         assert!(err.contains("tui token must register"));
     }
@@ -229,7 +207,7 @@ mod tests {
             label: "tui".into(),
             bound_channel_type: Some("tui".into()),
         });
-        let frame = register(handle.token(), ChannelType::TUI, PROTOCOL_VERSION);
+        let frame = register(handle.token(), ChannelType::TUI);
         let authed = subprocess(1, "tui");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("reserved for the built-in TUI"));
@@ -243,7 +221,7 @@ mod tests {
             label: "http".into(),
             bound_channel_type: Some("http".into()),
         });
-        let frame = register(handle.token(), "http", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "http");
         let authed = subprocess(1, "http");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("reserved"));
@@ -257,7 +235,7 @@ mod tests {
             label: "slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "   ", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "   ");
         let authed = subprocess(1, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("empty"));
@@ -290,7 +268,7 @@ mod tests {
             label: "sidecar-slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "discord", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "discord");
         let authed = subprocess(7, "sidecar-slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(
@@ -307,7 +285,7 @@ mod tests {
             label: "tool/browser".into(),
             bound_channel_type: None,
         });
-        let frame = register(handle.token(), "telegram", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "telegram");
         let authed = subprocess(0, "tool/browser");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(
@@ -324,7 +302,7 @@ mod tests {
         // the *only* path allowed to claim the otherwise-reserved
         // "http" channel type.
         let tokens = ChannelTokenTable::new();
-        let frame = register("", ChannelType::HTTP, PROTOCOL_VERSION);
+        let frame = register("", ChannelType::HTTP);
         let authed = AuthedClient::Web {
             label: "web/abc".to_string(),
         };
@@ -338,7 +316,7 @@ mod tests {
         // other channel). The handshake fixes the channel type for
         // this auth variant.
         let tokens = ChannelTokenTable::new();
-        let frame = register("", "telegram", PROTOCOL_VERSION);
+        let frame = register("", "telegram");
         let authed = AuthedClient::Web {
             label: "web/abc".to_string(),
         };
@@ -361,7 +339,7 @@ mod tests {
             label: "sidecar-http".into(),
             bound_channel_type: Some("http".into()),
         });
-        let frame = register(handle.token(), "http", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "http");
         let authed = subprocess(99, "sidecar-http");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("reserved"), "got: {err}");
@@ -375,7 +353,7 @@ mod tests {
             label: "sidecar-slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "slack");
         let authed = subprocess(7, "sidecar-slack");
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
         assert_eq!(outcome.channel_type.as_str(), "slack");

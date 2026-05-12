@@ -25,7 +25,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::wire::{self, Frame, Message as WireMessage, PROTOCOL_VERSION};
+use aura_channels::wire::{self, Frame, Message as WireMessage};
 use aura_channels::{AgentOutput, OutgoingMessage};
 use aura_gateway::channel_listener::ChannelServer;
 use aura_gateway::test_support::build_test_deps;

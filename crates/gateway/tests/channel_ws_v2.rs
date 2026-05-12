@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::wire::{self, ChatListEvent, Frame, Message as WireMessage, PROTOCOL_VERSION};
+use aura_channels::wire::{self, ChatListEvent, Frame, Message as WireMessage};
 use aura_channels::{AgentOutput, ChannelKind, MessageRole, OutgoingMessage};
 use aura_config::ChannelsConfig;
 use aura_gateway::auth::{ChannelTokenTable, ClientIdentity, TokenHandle, WEB_CLIENT_LABEL_PREFIX};
@@ -54,7 +54,6 @@ async fn connect_register(
     let frame = Frame::Register {
         token: String::new(),
         channel_type,
-        protocol_version: PROTOCOL_VERSION,
     };
     ws.send(WsMessage::Binary(wire::encode(&frame)?.into()))
         .await?;

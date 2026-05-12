@@ -7,7 +7,6 @@ export type { Message } from "./generated/Message.js";
 export type { AttachmentKind } from "./generated/AttachmentKind.js";
 export type { WireAttachment } from "./generated/WireAttachment.js";
 export type { ResourceAccess } from "./generated/ResourceAccess.js";
-export { PROTOCOL_VERSION } from "./generated/constants.js";
 
 export function encodeFrame(frame: Frame): Uint8Array {
   return msgpackEncode(frame);

@@ -52,7 +52,7 @@ export interface ResourceAccess {
 export type ChatListEvent = 'created' | 'hidden' | 'unhidden';
 
 export type Frame =
-  | { kind: 'register'; token: string; channel_type: string; protocol_version: number }
+  | { kind: 'register'; token: string; channel_type: string }
   | { kind: 'register_ack'; ok: boolean; reason: string | null }
   | { kind: 'subscribe'; session_id: string; since_ordinal?: number }
   | { kind: 'unsubscribe'; session_id: string }
@@ -81,7 +81,6 @@ export type Frame =
   | { kind: 'slash_manifest'; commands: { command: string; description: string }[] }
   | { kind: 'chat_session_list_changed'; event: ChatListEvent; session_id: string };
 
-const PROTOCOL_VERSION = 2;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
 
@@ -290,7 +289,6 @@ export class ChatWs {
       kind: 'register',
       token: '',
       channel_type: 'http',
-      protocol_version: PROTOCOL_VERSION,
     });
   }
 

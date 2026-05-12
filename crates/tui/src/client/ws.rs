@@ -12,7 +12,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use aura_channels::wire::{self, Frame, Message, PROTOCOL_VERSION};
+use aura_channels::wire::{self, Frame, Message};
 use aura_model::{ChannelType, SessionId};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -155,7 +155,6 @@ impl WsClient {
         self.send_frame(&Frame::Register {
             token,
             channel_type,
-            protocol_version: PROTOCOL_VERSION,
         })
         .await?;
 

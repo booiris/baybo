@@ -10,12 +10,7 @@ import {
   type NoticeLevel,
 } from "./channel.js";
 import { defaultLogger, type Logger } from "./logger.js";
-import {
-  PROTOCOL_VERSION,
-  decodeFrame,
-  encodeFrame,
-  type Frame,
-} from "./wire.js";
+import { decodeFrame, encodeFrame, type Frame } from "./wire.js";
 
 /**
  * Run a {@link Channel} implementation. Handles the full WebSocket +
@@ -272,7 +267,6 @@ async function performRegister(
       kind: "register",
       token,
       channel_type: channelType,
-      protocol_version: PROTOCOL_VERSION,
     }),
   );
   const ack = await frames.pop();
