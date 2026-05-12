@@ -819,15 +819,25 @@ export function ChatPage() {
     try {
       const { data } = await client.POST('/v1/chat/sessions', {});
       if (data?.session_id) {
-        setSessions((prev) => [
-          {
-            session_id: data.session_id,
-            created_at: new Date().toISOString(),
-            last_active: new Date().toISOString(),
-            unread: 0,
-          },
-          ...prev,
-        ]);
+        // The server's Created broadcast (Frame::SessionUpdated, full
+        // patch) reaches this tab too and `applySessionPatch` adds the
+        // row for an unknown session_id. If that frame lands before the
+        // POST response returns, an unconditional prepend here would
+        // double the row. Guard with the same check createAnchorSession
+        // uses — whichever path runs first wins; the second is a no-op.
+        setSessions((prev) =>
+          prev.some((s) => s.session_id === data.session_id)
+            ? prev
+            : [
+                {
+                  session_id: data.session_id,
+                  created_at: new Date().toISOString(),
+                  last_active: new Date().toISOString(),
+                  unread: 0,
+                },
+                ...prev,
+              ],
+        );
         navigate(`/chat/${data.session_id}`);
       }
     } finally {
@@ -1040,11 +1050,43 @@ function routeInboundFrame(
       // Catch-up replay (ordinal set): key by ordinal so React
       // reconciles against rows the REST history fetch already laid
       // down with the same shape, and a duplicate replay is a no-op.
+      // Reconciles against locally-leftover rows from a WS drop in
+      // the narrow window between local emit and the live frame:
+      // * a `streaming` assistant row (drop mid-Delta-stream) is
+      //   swallowed by the replay's finalized Message;
+      // * a `pending` user row (drop between handleSend and the
+      //   live UserEcho) is matched by text. The gateway zeros
+      //   `platform_msg_id` on replay (see
+      //   `crates/gateway/src/channel/route.rs`), so text is the
+      //   best discriminator we have client-side — sending the same
+      //   text twice within the drop window would mis-match, but
+      //   the failure mode (one duplicate row) is no worse than the
+      //   pre-fix baseline. Without these two paths the leftover
+      //   row would sit alongside the replay forever.
       if (frame.ordinal !== undefined) {
         const replayKey = `hist-${sid}-${frame.ordinal}`;
         setViews((prev) => {
           const view = prev[sid] ?? EMPTY_VIEW;
           if (view.transcript.some((r) => r.key === replayKey)) return prev;
+          if (role === 'assistant') {
+            const lastIdx = view.transcript.length - 1;
+            const last = view.transcript[lastIdx];
+            if (last?.streaming && last.role === 'assistant') {
+              const next = view.transcript.slice();
+              next[lastIdx] = { key: replayKey, role: 'assistant', text: frame.content };
+              return { ...prev, [sid]: { ...view, transcript: next } };
+            }
+          }
+          if (role === 'user') {
+            const matchIdx = view.transcript.findIndex(
+              (r) => r.pending && r.role === 'user' && r.text === frame.content,
+            );
+            if (matchIdx >= 0) {
+              const next = view.transcript.slice();
+              next[matchIdx] = { key: replayKey, role: 'user', text: frame.content };
+              return { ...prev, [sid]: { ...view, transcript: next } };
+            }
+          }
           return {
             ...prev,
             [sid]: {
