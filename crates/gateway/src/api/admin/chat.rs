@@ -28,7 +28,7 @@
 //! [`crate::auth::AuthedClient::Web`].
 
 use aura_channels::wire::{Frame, SessionPatch, SlashCommandSpec};
-use aura_model::{ChannelType, ChatMessage, ContentBlock, Session, SessionId, User};
+use aura_model::{ChannelType, ChatMessage, ContentBlock, Role, Session, SessionId, User};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
@@ -311,9 +311,15 @@ async fn get_session(
         // (it would be the start of the next-older page).
         tail.remove(0);
     }
+    // `filter_map` not `map` — internal turns (Role::System, agent-
+    // injected Role::User with `from_user=false`, tool-result rows,
+    // empty thinking blocks) don't belong on the /chat surface.
+    // Mirrors the WS catch-up replay filter in `channel::route::
+    // chat_to_visible_wire_message` so a REST-loaded transcript and a
+    // WS-replayed one agree on what's a user-visible bubble.
     let transcript = tail
         .into_iter()
-        .map(|(ordinal, msg)| chat_to_transcript_item(ordinal, msg))
+        .filter_map(|(ordinal, msg)| chat_to_transcript_item(ordinal, msg))
         .collect();
     Ok(Json(ChatSessionDetail {
         session_id,
@@ -521,8 +527,15 @@ pub(crate) fn broadcast_session_patch(
     });
 }
 
-fn chat_to_transcript_item(ordinal: i64, msg: ChatMessage) -> ChatTranscriptItem {
-    let role = msg.role.as_str().to_owned();
+fn chat_to_transcript_item(ordinal: i64, msg: ChatMessage) -> Option<ChatTranscriptItem> {
+    // Same gate as `channel::route::chat_to_visible_wire_message` —
+    // see that fn for why each excluded variant doesn't belong on the
+    // chat surface.
+    let role = match msg.role {
+        Role::User if msg.from_user => "user",
+        Role::Assistant => "assistant",
+        _ => return None,
+    };
     let mut text = String::new();
     let mut has_attachments = false;
     for block in &msg.content {
@@ -541,10 +554,16 @@ fn chat_to_transcript_item(ordinal: i64, msg: ChatMessage) -> ChatTranscriptItem
             | ContentBlock::Thinking { .. } => {}
         }
     }
-    ChatTranscriptItem {
+    // A user/assistant row with neither text nor attachments is
+    // structurally valid (assistant turn that produced only tool calls,
+    // for instance) but would render as an empty bubble. Hide it.
+    if text.is_empty() && !has_attachments {
+        return None;
+    }
+    Some(ChatTranscriptItem {
         ordinal,
-        role,
+        role: role.to_owned(),
         text,
         has_attachments,
-    }
+    })
 }
