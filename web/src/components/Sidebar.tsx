@@ -1,5 +1,13 @@
 import { NavLink } from 'react-router-dom';
-import { RiFileList3Line, RiGitMergeLine, RiAlarmLine, RiBarChartBoxLine, RiCpuLine, RiLogoutBoxRLine } from 'react-icons/ri';
+import {
+  RiAlarmLine,
+  RiBarChartBoxLine,
+  RiChat3Line,
+  RiCpuLine,
+  RiFileList3Line,
+  RiGitMergeLine,
+  RiLogoutBoxRLine,
+} from 'react-icons/ri';
 import { useAuth } from '../api/auth';
 
 const navItem =
@@ -51,6 +59,13 @@ export function Sidebar({ version }: { version?: string }) {
         >
           <RiCpuLine className="text-xl" />
           LLM
+        </NavLink>
+        <NavLink
+          to="/chat"
+          className={({ isActive }) => `${navItem} ${isActive ? navItemActive : ''}`}
+        >
+          <RiChat3Line className="text-xl" />
+          Chat
         </NavLink>
       </nav>
 

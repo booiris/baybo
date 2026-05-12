@@ -36,6 +36,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_sessions"];
+        put?: never;
+        post: operations["create_session"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_session"];
+        put?: never;
+        post?: never;
+        delete: operations["delete_session"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["refresh_session_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/unhide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["unhide_session"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/slash-manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["slash_manifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/config": {
         parameters: {
             query?: never;
@@ -443,6 +523,99 @@ export interface components {
          */
         ChannelType: string;
         /**
+         * @description Response from `POST /v1/chat/sessions` and the
+         *     `POST /v1/chat/sessions/:id/token` token-refresh endpoint. Carries
+         *     the freshly-minted channel-token the web client presents on its
+         *     `/v1/channel-ws` upgrade via the
+         *     [`CHANNEL_TOKEN_HEADER`](crate::auth::CHANNEL_TOKEN_HEADER) header
+         *     (or the `?token=` query when the browser's WebSocket API can't set
+         *     custom headers — which it never can).
+         */
+        ChatSessionCredential: {
+            /**
+             * @description Capability token bound to a `web/<uuid>` identity. Live for the
+             *     lifetime of the session row; calling
+             *     `POST /v1/chat/sessions/:id/token` revokes the previous token
+             *     and returns a new one.
+             */
+            channel_token: string;
+            /**
+             * @description Header name the web client must use when presenting the
+             *     channel-token on the channel listener.
+             */
+            channel_token_header: string;
+            /** @description New (or existing) session id. */
+            session_id: string;
+        };
+        ChatSessionDetail: {
+            /** Format: date-time */
+            created_at: string;
+            /**
+             * @description `true` when at least one older active row exists below the
+             *     slice's lowest ordinal — i.e. the client should keep
+             *     scroll-up pagination armed. `false` when the slice already
+             *     includes the session's first message.
+             */
+            has_more: boolean;
+            hidden: boolean;
+            /** Format: date-time */
+            last_active: string;
+            session_id: string;
+            /**
+             * @description Active transcript slice, oldest-first within the page. The
+             *     server returns at most `limit` rows; older rows are fetched
+             *     by passing the lowest `ordinal` here back as the next
+             *     request's `before_ordinal`.
+             */
+            transcript: components["schemas"]["ChatTranscriptItem"][];
+        };
+        ChatSessionSummary: {
+            /** Format: date-time */
+            created_at: string;
+            /**
+             * @description True when the user has hidden this session from their chat
+             *     list. Only ever populated in responses when
+             *     `include_hidden=true` was requested.
+             */
+            hidden?: boolean;
+            /** Format: date-time */
+            last_active: string;
+            session_id: string;
+        };
+        ChatSessionsList: {
+            items: components["schemas"]["ChatSessionSummary"][];
+            total: number;
+        };
+        /**
+         * @description One transcript row, flattened from `ChatMessage` into a shape the
+         *     web client can render without re-implementing the content-block
+         *     matcher.
+         */
+        ChatTranscriptItem: {
+            /**
+             * @description `true` when this row had non-text content (image / audio /
+             *     file). The web client currently shows a placeholder.
+             */
+            has_attachments: boolean;
+            /**
+             * Format: int64
+             * @description Absolute `session_messages.ordinal` of this row. Stable for the
+             *     lifetime of the session and used both as a React key and as
+             *     the `before_ordinal` cursor for the next-older page request.
+             */
+            ordinal: number;
+            /**
+             * @description `"user"` or `"assistant"` (or `"system"`). String rather than
+             *     enum to keep the wire forgiving.
+             */
+            role: string;
+            /**
+             * @description Plain text content, newline-joined when multiple text blocks
+             *     were present. Empty when the message was media-only.
+             */
+            text: string;
+        };
+        /**
          * @description `POST /v1/cron` body. Schedule format is the standard 5-field cron
          *     string accepted by [`aura_cron`].
          */
@@ -546,6 +719,19 @@ export interface components {
         };
         /** @enum {string} */
         JobStatusKind: "pending" | "in_progress" | "stuck" | "cancelled" | "failed" | "completed";
+        /**
+         * @description Envelope for list endpoints. `next_cursor` is opaque — clients
+         *     pass it back as `?cursor=` to fetch the next page, and treat
+         *     `None` as "no more pages." The cursor's internal scheme may change
+         *     across releases; clients must not parse it.
+         */
+        ListResponse_SlashCommandEntry: {
+            items: {
+                command: string;
+                description: string;
+            }[];
+            next_cursor?: string | null;
+        };
         /** @description Current LLM provider descriptor. */
         LlmInfo: {
             model_id: string;
@@ -761,6 +947,16 @@ export interface components {
         SetDefaultLlmRequest: {
             name: string;
         };
+        /**
+         * @description Wire DTO for slash command entries. Mirror of
+         *     [`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface
+         *     stays inside this crate's DTOs (the wire type lives in
+         *     `aura-channels` for sidecar reuse).
+         */
+        SlashCommandEntry: {
+            command: string;
+            description: string;
+        };
         /** @description Minimal gateway health/status payload. */
         StatusResponse: {
             bind_address: string;
@@ -898,6 +1094,278 @@ export interface operations {
                         }[];
                         next_cursor?: string | null;
                     };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_sessions: {
+        parameters: {
+            query?: {
+                /** @description Include hidden sessions in the response. Defaults to false. */
+                include_hidden?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Web chat sessions, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSessionsList"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description New session id + freshly-minted channel-token */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSessionCredential"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session creation or token mint failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_session: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Return only rows whose `ordinal` is strictly less than this
+                 *     value. Omit on the initial fetch; pass the lowest ordinal from
+                 *     the prior page to scroll further back. Maps to a primary-key
+                 *     range scan over the `session_messages` active index.
+                 */
+                before_ordinal?: number | null;
+                /**
+                 * @description Maximum rows to return. Defaults to
+                 *     [`DEFAULT_HISTORY_LIMIT`], clamped to [`MAX_HISTORY_LIMIT`].
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Session id to fetch */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session detail + transcript slice */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSessionDetail"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to hide */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hidden (row preserved on the server) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    refresh_session_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id whose token to refresh */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fresh channel-token (old one revoked) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSessionCredential"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    unhide_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to restore */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unhidden */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    slash_manifest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Slash command list for /-autocomplete */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListResponse_SlashCommandEntry"];
                 };
             };
             /** @description Unauthorized */

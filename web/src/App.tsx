@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Navigate, Route, Routes } from 'react-router-dom';
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { RiLoader4Line } from 'react-icons/ri';
 import { Sidebar } from './components/Sidebar';
 import { LoginScreen } from './components/LoginScreen';
@@ -9,6 +9,7 @@ import { TraceSessionPage } from './pages/TraceSessionPage';
 import { CronPage } from './pages/CronPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { LlmPage } from './pages/LlmPage';
+import { ChatPage } from './pages/ChatPage';
 import { useAuth } from './api/auth';
 
 export default function App() {
@@ -16,6 +17,7 @@ export default function App() {
   const [isValidating, setIsValidating] = useState(true);
   const [isValid, setIsValid] = useState(false);
   const [version, setVersion] = useState<string | undefined>();
+  const location = useLocation();
 
   useEffect(() => {
     if (!token || !client) {
@@ -56,6 +58,19 @@ export default function App() {
       <div className="flex items-center justify-center min-h-screen bg-canvas">
         <RiLoader4Line className="text-4xl text-ink-soft animate-spin" />
       </div>
+    );
+  }
+
+  // ChatShell lives outside the admin sidebar — /chat/* renders a
+  // distinct shell with its own session-list rail. The admin sidebar
+  // remains the entry point and exposes a Chat NavLink that drops
+  // into this branch.
+  if (location.pathname.startsWith('/chat')) {
+    return (
+      <Routes>
+        <Route path="/chat" element={<ChatPage />} />
+        <Route path="/chat/:sessionId" element={<ChatPage />} />
+      </Routes>
     );
   }
 

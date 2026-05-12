@@ -15,7 +15,10 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/v1': gatewayTarget,
+      // `ws: true` is required so the `/v1/channel-ws` upgrade used
+      // by the chat page goes to the gateway instead of being
+      // handled by Vite as a regular HTTP request.
+      '/v1': { target: gatewayTarget, ws: true, changeOrigin: true },
       '/healthz': gatewayTarget,
       '/readyz': gatewayTarget,
     },
