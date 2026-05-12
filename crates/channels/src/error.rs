@@ -1,18 +1,11 @@
 use thiserror::Error;
 
+use crate::kind::ChannelKind;
+
 #[derive(Debug, Error)]
 pub enum ChannelError {
     #[error("channel send error: {0}")]
     Send(String),
-
-    #[error("channel receive error: {0}")]
-    Receive(String),
-
-    #[error("channel not started")]
-    NotStarted,
-
-    #[error("channel already started")]
-    AlreadyStarted,
 
     #[error("channel configuration error: {0}")]
     Config(String),
@@ -25,18 +18,16 @@ pub enum ChannelError {
     #[error("channel endpoint not reachable: {0}")]
     NotReachable(String),
 
-    #[error("channel {0} already registered")]
+    #[error("channel {0} already installed")]
     DuplicateChannel(String),
 
-    #[error("session {0} already has an attached client")]
-    DuplicateSessionClient(String),
+    #[error("connection {0} not found on channel")]
+    ConnectionNotFound(String),
 
-    #[error("channel {0} not found")]
-    NotFound(String),
-
-    #[error("session client {0} not found")]
-    SessionClientNotFound(String),
-
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
+    #[error("channel {channel_type} has kind {actual:?}, operation requires kind {expected:?}")]
+    WrongKind {
+        channel_type: String,
+        expected: ChannelKind,
+        actual: ChannelKind,
+    },
 }

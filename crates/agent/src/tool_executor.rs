@@ -274,11 +274,11 @@ impl ToolExecutor {
                 };
 
                 if !uncovered.is_empty() {
-                    let gate = self.gate_map.get(&user.channel, session_id.as_str());
+                    let gate = self.gate_map.get(&user.channel, session_id);
                     let decision = gate
                         .request(ApprovalRequest {
                             call_id: Uuid::new_v4().to_string(),
-                            session_id: session_id.to_string(),
+                            session_id: session_id.clone(),
                             user_id: user.id.clone(),
                             tool: tool_name_owned.clone(),
                             accesses: uncovered.clone(),
@@ -351,7 +351,7 @@ impl ToolExecutor {
                 };
 
                 // Mid-execution approval handle.
-                let approval_gate = self.gate_map.get(&user.channel, session_id.as_str());
+                let approval_gate = self.gate_map.get(&user.channel, session_id);
                 let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
 
                 // Build tool context. The token comes from the agent
@@ -359,7 +359,7 @@ impl ToolExecutor {
                 // JobLifecycle::cancel or a parent subagent's cascade)
                 // signals the running tool.
                 let ctx = ToolContext {
-                    session_id: session_id.to_string(),
+                    session_id: session_id.clone(),
                     user: user.clone(),
                     timeout: effective_timeout,
                     cancellation_token: cancel_token,

@@ -723,7 +723,7 @@ impl From<aura_cron::CronJob> for CronJob {
             next_trigger_at: v.next_trigger_at,
             created_at: v.created_at,
             updated_at: v.updated_at,
-            origin_session_id: v.origin_session_id,
+            origin_session_id: v.origin_session_id.map(|s| s.into_inner()),
         }
     }
 }

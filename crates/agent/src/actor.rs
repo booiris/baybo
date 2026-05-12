@@ -273,7 +273,7 @@ impl AgentActor {
             )
             .await?;
         let notice = AgentOutput::Notice {
-            session_id: self.session.id.to_string(),
+            session_id: self.session.id.clone(),
             user_id: self.session.user.id.clone(),
             channel: self.session.channel.clone(),
             level: NoticeLevel::Info,

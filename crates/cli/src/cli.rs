@@ -174,10 +174,11 @@ pub enum Commands {
     },
     /// Launch the interactive Ratatui chat session.
     ///
-    /// Connects to an `aura gateway` over its WebSocket channel
-    /// listener; the loopback port is discovered from
-    /// `<workspace>/state/channel.port`, and the per-start TUI
-    /// token is read from the workspace vault under
+    /// Connects to an `aura gateway` over the `/v1/channel-ws`
+    /// endpoint on its admin listener (same bind the admin REST API
+    /// and the web chat page use). The address is read from
+    /// `gateway.bind_address`/`gateway.port` in config, and the
+    /// per-start TUI token comes from the workspace vault under
     /// `gateway.tui_token`. If the gateway is unreachable the
     /// command exits with an error block describing how to start one.
     Tui {

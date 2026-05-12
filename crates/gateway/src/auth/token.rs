@@ -38,6 +38,16 @@ pub const TUI_CLIENT_LABEL: &str = "tui";
 /// channel-WS handshake (tool sidecars don't register channels).
 pub const TOOL_CLIENT_LABEL_PREFIX: &str = "tool/";
 
+/// Prefix for tokens minted to admin-side web chat tabs. The admin API
+/// `POST /v1/chat/session` exchanges the operator's admin bearer for a
+/// short-lived channel-token under this label; the channel auth
+/// middleware turns it into [`crate::AuthedClient::Web`] which is the
+/// sole identity allowed to claim the otherwise-reserved `"http"`
+/// channel type on `/v1/channel-ws`. Tokens are held by the admin
+/// chat module for the session's lifetime and revoked on
+/// `DELETE /v1/chat/sessions/:id`.
+pub const WEB_CLIENT_LABEL_PREFIX: &str = "web/";
+
 /// Secret-vault key under which the gateway publishes the current
 /// generation of the TUI channel token. Rotated on every `aura
 /// gateway start`; the bundled `aura tui` reads it back from the vault

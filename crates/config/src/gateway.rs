@@ -4,17 +4,19 @@ use serde::{Deserialize, Serialize};
 ///
 /// The gateway runs two listeners:
 ///
-/// * **Admin** on TCP (`bind_address`:`port`) with a bearer token —
-///   config / status / jobs / cron / memory / traces / skills /
-///   tools / llm and a read-only channel list.
+/// * **Admin** on TCP (`bind_address`:`port`) with bearer-token auth
+///   for the REST surface (config / status / jobs / cron / memory /
+///   traces / skills / tools / llm and a read-only channel list) and
+///   channel-token auth for the co-hosted `/v1/channel-ws` upgrade.
+///   The TUI and the browser-side web chat page both dial this same
+///   bind.
 /// * **Channel** on loopback TCP (`127.0.0.1:<ephemeral>`, hardcoded
 ///   — not configurable) with channel-token auth backed by the
-///   gateway's `ChannelTokenTable` (vault-issued TUI token plus
-///   per-spawn subprocess capability tokens). The chosen port is
-///   published to `<workspace>/state/channel.port` so the TUI and spawned
-///   sidecars discover it without a config roundtrip. Hosts the WS
-///   endpoint for sessions, messages, approvals, and history
-///   snapshots.
+///   gateway's `ChannelTokenTable` (per-spawn subprocess capability
+///   tokens). Used only by gateway-spawned sidecars; the chosen port
+///   is published to `<workspace>/state/channel.port` and handed to
+///   each child via its launch URL. Mounts the same `/v1/channel-ws`
+///   endpoint the admin listener exposes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct GatewayConfig {

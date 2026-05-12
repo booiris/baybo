@@ -1,3 +1,14 @@
+// Disabled pending R-6 rewrite for the
+// Channel/Connection/Subscription protocol refactor (see
+// `docs/modules/channels-protocol-refactor.md`). These tests assert
+// behaviour against the pre-refactor registry API
+// (`register`/`unregister_session`/`get_sidecar`/`get_for`,
+// `Frame::Register { session_id }`, `wire::Message` without `role`)
+// that no longer exists. They will be replaced wholesale with
+// multi-connection / Subscribe / fan-out coverage in R-6 rather than
+// patched in place.
+#![cfg(any())]
+
 //! Round-trip integration coverage for the gateway-side WS channel
 //! server.
 //!

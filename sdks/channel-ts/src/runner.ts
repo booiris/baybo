@@ -421,6 +421,10 @@ async function pumpOutbound(
           session_id: msg.sessionId,
           user_id: msg.userId,
           channel_type: channel.channelType,
+          // Sidecar inbound is always user-authored. The server's
+          // echo path uses this to render the message correctly when
+          // it fans out to other subscribers of the same session.
+          role: "user",
           ...(msg.botId ? { bot_id: msg.botId } : {}),
           ...(msg.platformMsgId
             ? { platform_msg_id: msg.platformMsgId }
@@ -580,6 +584,28 @@ function dispatchFrame(
     case "history_append":
     case "history_snapshot":
       return;
+    // Subscribe / Unsubscribe are selective-channel client→server
+    // frames. Broadcast-kind sidecars never send them, and the
+    // gateway never sends them in this direction. If one shows up
+    // it's protocol noise — log and ignore.
+    case "subscribe":
+    case "unsubscribe":
+      logger.warn("unexpected subscribe/unsubscribe on sidecar", frame.kind);
+      return;
+    // PendingApprovalsSnapshot is the server's reply to a Subscribe;
+    // broadcast-kind sidecars don't subscribe so they never see it.
+    case "pending_approvals_snapshot":
+      logger.warn("unexpected pending_approvals_snapshot on sidecar", frame.kind);
+      return;
+    // Reset means "your live stream is stale". For a broadcast
+    // sidecar the right reaction is to log and rely on auto-reconnect
+    // (subsequent server output will flow normally after the WS
+    // re-handshakes).
+    case "reset": {
+      logger.warn("server requested reset", frame.reason);
+      safeClose(ws);
+      return;
+    }
     // These are client->server shapes the sidecar will never receive.
     case "register":
     case "register_ack":

@@ -22,7 +22,7 @@ Bottom-up along the dependency graph:
 
 ### Ingress and Security Boundary Layer
 
-- **channels** — Channel adapter trait, shared message types (Message, IncomingMessage, OutgoingMessage), slash/dashboard trait definitions (`SlashHandler`, `DashboardProvider`, `ViewKind`), and `ChannelRegistry`. No built-in adapters — the terminal UI now lives in its own `aura-tui` crate (see [`tui.md`](./tui.md)).
+- **channels** — Channel adapter trait, shared message types (Message, IncomingMessage, OutgoingMessage), slash/dashboard trait definitions (`SlashHandler`, `DashboardProvider`, `ViewKind`), and `ChannelRegistry`. No built-in adapters — the terminal UI now lives in its own `aura-tui` crate (see [`tui.md`](./tui.md)). Connection/Subscription split is proposed in [`channels-protocol-refactor.md`](./channels-protocol-refactor.md) (not yet landed).
 - **security** — Cryptographic primitives (EncryptionKey, encrypt/decrypt), leak detection (LeakDetector), error types.
 
 ### Capability and Governance Layer

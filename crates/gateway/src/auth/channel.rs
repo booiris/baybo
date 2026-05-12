@@ -26,7 +26,7 @@
 
 use super::token::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
-    TUI_CLIENT_LABEL,
+    TUI_CLIENT_LABEL, WEB_CLIENT_LABEL_PREFIX,
 };
 use axum::body::Body;
 use axum::extract::State;
@@ -60,6 +60,16 @@ pub enum AuthedClient {
         /// in that case.
         channel_type: Option<String>,
     },
+    /// Admin-side web chat tab. The token was minted by
+    /// `POST /v1/chat/session` after the operator presented a valid
+    /// admin bearer; the channel-WS handshake accepts this identity
+    /// only when it claims `ChannelType::HTTP`.
+    Web {
+        /// Full label string starting with [`WEB_CLIENT_LABEL_PREFIX`]
+        /// (e.g. `"web/<uuid>"`). The suffix uniquely identifies the
+        /// minted session so logs and metrics can attribute traffic.
+        label: String,
+    },
 }
 
 impl AuthedClient {
@@ -68,6 +78,10 @@ impl AuthedClient {
             AuthedClient::Tui
         } else if identity.label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
             AuthedClient::Tool {
+                label: identity.label,
+            }
+        } else if identity.label.starts_with(WEB_CLIENT_LABEL_PREFIX) {
+            AuthedClient::Web {
                 label: identity.label,
             }
         } else {
@@ -133,6 +147,12 @@ pub async fn require_channel_auth(
                     tracing::debug!(
                         %path, pid, label = %label,
                         "channel auth: accepted via subprocess token",
+                    );
+                }
+                AuthedClient::Web { label } => {
+                    tracing::debug!(
+                        %path, label = %label,
+                        "channel auth: accepted via web chat token",
                     );
                 }
             }

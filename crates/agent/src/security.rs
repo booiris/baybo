@@ -842,6 +842,7 @@ mod tests {
             trigger: aura_model::TriggerSource::User,
             lineage: None,
             bound_soul_version: "soul-test".into(),
+            hidden: false,
         }
     }
 

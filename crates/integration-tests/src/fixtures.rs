@@ -102,6 +102,7 @@ impl SessionBuilder {
             trigger: TriggerSource::User,
             lineage: None,
             bound_soul_version: "soul-it".into(),
+            hidden: false,
         }
     }
 }

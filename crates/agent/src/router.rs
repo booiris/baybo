@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aura_channels::{AgentOutput, Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
+use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use aura_model::{BackgroundCompressionPayload, JobId, Session, SessionId, TriggerSource, User};
 
 use aura_cron::CronTriggerEvent;
@@ -481,17 +481,20 @@ impl Router {
             other => other,
         };
 
-        let Some(channel_handle) = self.channels.get_for(&channel, &session_id) else {
+        let Some(channel_handle) = self.channels.get(&channel) else {
             debug!(
                 channel = %channel,
                 session_id = %session_id,
-                "no channel registered for agent output"
+                "no channel installed for agent output"
             );
             return;
         };
 
-        self.send_to_channel(channel_handle, output, session_id, channel)
-            .await;
+        // Non-blocking fan-out: the channel `try_send`s to each
+        // subscriber, drops on full (signalling Reset to the slow
+        // peer), and detaches closed transports. No await — backpressure
+        // is per-connection, not agent-wide.
+        channel_handle.dispatch(output.into());
     }
 
     /// Run the security gateway over an outgoing message. Returns the
@@ -539,22 +542,5 @@ impl Router {
             );
         }
         outgoing
-    }
-
-    async fn send_to_channel(
-        &self,
-        channel_handle: Arc<Channel>,
-        output: AgentOutput,
-        session_id: String,
-        channel: aura_model::ChannelType,
-    ) {
-        if let Err(e) = channel_handle.send(output).await {
-            error!(
-                channel = %channel,
-                session_id = %session_id,
-                error = %e,
-                "failed to deliver agent output"
-            );
-        }
     }
 }

@@ -1,14 +1,17 @@
 //! `GET /v1/channel-ws` route — upgrades a channel-auth'd request into
-//! a WebSocket, runs the Register handshake, registers a
-//! [`super::adapter::Sidecar`]'s [`aura_channels::Channel`] with the
-//! workspace [`ChannelRegistry`], and drives the per-connection
-//! inbound loop until either side closes.
+//! a WebSocket, runs the Register handshake, attaches the resulting
+//! [`Connection`](aura_channels::Connection) to the registry-owned
+//! [`Channel`](aura_channels::Channel) for the requested channel
+//! type, and drives the per-connection inbound loop until either side
+//! closes.
 
 use std::time::Duration;
 
-use aura_channels::wire::{self, AttachmentKind, Frame, WireAttachment};
-use aura_channels::{ChannelError, IncomingMessage, Message as AgentMessage};
-use aura_model::{BlobRef, ChannelType, ContentBlock, MessageMetadata, User};
+use aura_channels::wire::{self, AttachmentKind, Frame, Message as WireMessage, WireAttachment};
+use aura_channels::{ChannelKind, IncomingMessage, Message as AgentMessage, MessageRole};
+use aura_model::{
+    BlobRef, ChannelType, ChatMessage, ContentBlock, MessageMetadata, Role, SessionId, User,
+};
 use axum::Router;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
@@ -27,6 +30,13 @@ use crate::auth::AuthedClient;
 /// upgrade completes. Keeps idle connections that never speak from
 /// pinning a registry slot.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hard cap on how many persisted Message rows the gateway will replay
+/// for a single `Subscribe { since_ordinal }`. A client that fell so
+/// far behind that the gap exceeds this is told to refetch via REST
+/// (`Frame::Reset`) rather than receive a multi-megabyte WS burst
+/// that competes with live traffic.
+const MAX_CATCHUP_REPLAY: usize = 200;
 
 pub fn routes() -> Router<WsChannelState> {
     Router::new()
@@ -63,44 +73,28 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     };
 
     let channel_type = outcome.channel_type;
-    let session_id = outcome.session_id;
 
-    let sidecar = Sidecar::build(
+    let sidecar = match Sidecar::build(
         channel_type.clone(),
-        session_id.clone(),
+        &state.registry,
         sink,
         std::sync::Arc::clone(&state.blob_store),
-    );
-
-    if let Err(err) = state
-        .registry
-        .register(std::sync::Arc::clone(&sidecar.channel))
-    {
-        let reason = match &err {
-            ChannelError::DuplicateChannel(ct) => format!("channel '{ct}' already registered"),
-            ChannelError::DuplicateSessionClient(sid) => {
-                format!("another client is already attached to session '{sid}'")
-            }
-            other => format!("registration failed: {other}"),
-        };
-        if let Err(e) = sidecar
-            .send_frame(Frame::RegisterAck {
-                ok: false,
-                reason: Some(reason.clone()),
-            })
-            .await
-        {
-            tracing::debug!(error = %e, "failed to send duplicate-register ack");
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, %channel_type, "channel-ws build failed");
+            // Sink was consumed by build's failure path? No — build
+            // owns it, and on error the sink is dropped with the
+            // partially-constructed pump. There is nothing left to
+            // ack on.
+            return;
         }
-        tracing::warn!(reason = %reason, "channel-ws register rejected");
-        let _ = sidecar.into_pump().await;
-        return;
-    }
+    };
 
     tracing::info!(
         channel_type = %channel_type,
-        session_id = ?session_id,
-        "channel-ws client registered"
+        connection_id = %sidecar.connection_id(),
+        "channel-ws client attached"
     );
 
     if let Err(e) = sidecar
@@ -111,55 +105,21 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         .await
     {
         tracing::warn!(error = %e, "failed to send RegisterAck");
-        unregister_best_effort(&state, &channel_type, session_id.as_deref());
-        let _ = sidecar.into_pump().await;
+        std::mem::drop(sidecar.into_pump());
         return;
     }
 
-    // Session-scoped TUI clients get a one-shot history ring from the
-    // gateway-owned vault so they can rehydrate their scrollback without
-    // opening the vault themselves. Sidecars (session_id = None) never
-    // receive this frame. Any failure here is surfaced as an empty ring
-    // — a broken history store must not keep the user from chatting.
-    if channel_type.as_str() == ChannelType::TUI
-        && let Some(sid) = session_id.as_deref()
-    {
-        let entries = match state.tui_history.load().await {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "load tui input history; sending empty snapshot");
-                Vec::new()
-            }
-        };
-        if let Err(e) = sidecar
-            .send_frame(Frame::HistorySnapshot {
-                session_id: sid.to_owned(),
-                entries,
-            })
-            .await
-        {
-            tracing::warn!(error = %e, "failed to send HistorySnapshot");
-            unregister_best_effort(&state, &channel_type, session_id.as_deref());
-            let _ = sidecar.into_pump().await;
-            return;
-        }
-    }
+    let kind = sidecar.channel.kind();
 
-    // Sidecar-flavored clients (not session-scoped TUIs) are eligible
-    // for hot bot provisioning: register their outbound pump with the
-    // control registry so the CLI-driven reconciler can push
-    // `StartBot` / `StopBot` frames, then stream one `StartBot` for
-    // every live bot in the `channel_bots` table so the sidecar picks
-    // up the current roster without waiting a reconcile tick. Seed
-    // the reconciler so it doesn't double-send on its first tick.
-    if session_id.is_none() {
+    // `Multiplexed`-kind channels (telegram, weixin, discord) are
+    // the bot-multiplexing sidecars. Register their outbound pump with
+    // the control registry so the CLI-driven reconciler can push
+    // `StartBot` / `StopBot` frames, push the slash manifest, and
+    // stream one `StartBot` for every live bot.
+    if kind.is_multiplexed() {
         state
             .control
             .register(channel_type.clone(), sidecar.frame_tx_clone());
-        // Push the slash-command manifest before any StartBot so the
-        // sidecar's `BotChannel` already has the gateway-authored list
-        // when it publishes commands on bot startup. Best-effort: a
-        // failure here just means the sidecar runs without command UI.
         if let Err(e) = sidecar
             .send_frame(Frame::SlashManifest {
                 commands: super::slash::manifest(),
@@ -172,40 +132,17 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         state.bot_reconciler.seed(channel_type.clone(), sent);
     }
 
-    run_inbound_loop(
-        source,
-        &state,
-        &channel_type,
-        &sidecar,
-        session_id.as_deref(),
-    )
-    .await;
+    run_inbound_loop(source, &state, &channel_type, &sidecar).await;
 
-    if session_id.is_none() {
+    if kind.is_multiplexed() {
         state.control.unregister(&channel_type);
         state.bot_reconciler.forget(&channel_type);
     }
-    unregister_best_effort(&state, &channel_type, session_id.as_deref());
     let _ = sidecar.into_pump().await;
     tracing::info!(
         %channel_type,
-        session_id = ?session_id,
         "channel-ws client disconnected"
     );
-}
-
-fn unregister_best_effort(
-    state: &WsChannelState,
-    channel_type: &ChannelType,
-    session_id: Option<&str>,
-) {
-    let result = match session_id {
-        Some(sid) => state.registry.unregister_session(sid),
-        None => state.registry.unregister_sidecar(channel_type.clone()),
-    };
-    if let Err(e) = result {
-        tracing::debug!(error = %e, %channel_type, session_id = ?session_id, "unregister after ws drop");
-    }
 }
 
 async fn receive_register(
@@ -244,10 +181,8 @@ async fn send_ack_and_close(
 
 /// Stream `StartBot` for every live bot in the `channel_bots` table
 /// to the freshly-connected sidecar. A failure fetching the token from
-/// the vault skips just that bot (logged with its id) so one bad row
-/// doesn't keep the rest of the roster from coming online. The
-/// sidecar replies to each with a `BotStatus`; the WS inbound loop
-/// pushes those into `aura-tracing` for operator visibility.
+/// the vault skips just that bot. The sidecar replies to each with a
+/// `BotStatus`; the WS inbound loop pushes those into `aura-tracing`.
 async fn push_live_bots(
     state: &WsChannelState,
     channel_type: &ChannelType,
@@ -319,8 +254,8 @@ async fn run_inbound_loop(
     state: &WsChannelState,
     channel_type: &ChannelType,
     sidecar: &Sidecar,
-    connection_session_id: Option<&str>,
 ) {
+    let kind = sidecar.channel.kind();
     while let Some(msg) = source.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -339,133 +274,98 @@ async fn run_inbound_loop(
                     }
                 };
                 match frame {
+                    Frame::Subscribe {
+                        session_id,
+                        since_ordinal,
+                    } => {
+                        if kind == ChannelKind::Multiplexed {
+                            tracing::warn!(
+                                %channel_type,
+                                "Subscribe frame on Multiplexed channel; ignoring (kind auto-wildcards)",
+                            );
+                            continue;
+                        }
+                        let conn_id = sidecar.connection_id();
+                        if let Err(e) = sidecar.channel.subscribe(conn_id, session_id.clone()) {
+                            tracing::warn!(error = %e, %session_id, "subscribe failed");
+                            continue;
+                        }
+                        // Ship the authoritative pending-approvals
+                        // snapshot for this session so the client can
+                        // reconcile any locally-cached ApprovalCard
+                        // against the queue's truth — covers the case
+                        // where an approval was resolved by another tab
+                        // while this connection was down (the
+                        // `ApprovalResolved` fan-out is fire-and-forget
+                        // and not replayed on catch-up).
+                        let pending_call_ids =
+                            sidecar.channel.pending_approval_call_ids(&session_id);
+                        if let Err(e) = sidecar
+                            .send_frame(Frame::PendingApprovalsSnapshot {
+                                session_id: session_id.clone(),
+                                call_ids: pending_call_ids,
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                %session_id,
+                                "failed to send PendingApprovalsSnapshot"
+                            );
+                        }
+                        // TUI clients get a one-shot history ring from
+                        // the gateway-owned vault when they subscribe
+                        // so they can rehydrate their scrollback. Any
+                        // failure here is surfaced as an empty ring —
+                        // a broken history store must not keep the
+                        // user from chatting.
+                        if channel_type.as_str() == ChannelType::TUI {
+                            let entries = match state.tui_history.load().await {
+                                Ok(entries) => entries,
+                                Err(e) => {
+                                    tracing::warn!(error = %format!("{e:#}"), "load tui input history; sending empty snapshot");
+                                    Vec::new()
+                                }
+                            };
+                            if let Err(e) = sidecar
+                                .send_frame(Frame::HistorySnapshot {
+                                    session_id: session_id.clone(),
+                                    entries,
+                                })
+                                .await
+                            {
+                                tracing::warn!(error = %e, "failed to send HistorySnapshot");
+                            }
+                        }
+                        // Catch-up: if the client carried a cursor,
+                        // replay the persisted Messages it missed
+                        // while disconnected. Sent to this connection
+                        // only (not broadcast) so other tabs don't see
+                        // the replay storm.
+                        if let Some(since) = since_ordinal {
+                            replay_catch_up(state, sidecar, channel_type, &session_id, since).await;
+                        }
+                    }
+                    Frame::Unsubscribe { session_id } => {
+                        if kind == ChannelKind::Multiplexed {
+                            continue;
+                        }
+                        sidecar
+                            .channel
+                            .unsubscribe(sidecar.connection_id(), &session_id);
+                    }
                     Frame::Message(wire_msg) => {
-                        // Two cases:
-                        //
-                        // 1. Session-scoped client (TUI). The session_id
-                        //    was bound at Register and is the only one
-                        //    this connection may target — `wire_msg`'s
-                        //    field is ignored so a misbehaving TUI can't
-                        //    inject into other sessions. We still drop
-                        //    if the wire field disagrees, so a clearly
-                        //    confused client surfaces in logs instead
-                        //    of silently misrouting.
-                        //
-                        // 2. Type-scoped sidecar (Telegram, Discord, …).
-                        //    The sidecar is *never* trusted to name its
-                        //    session_id — that would bypass pairing and
-                        //    let the sidecar inject into or steal output
-                        //    from any session whose id it knows. We
-                        //    always derive (channel_type, user_id) →
-                        //    session via the resolver, after the
-                        //    pairing gate.
-                        let session_id = match connection_session_id {
-                            Some(sid) => {
-                                if !wire_msg.session_id.is_empty() && wire_msg.session_id != sid {
-                                    tracing::warn!(
-                                        %channel_type,
-                                        bound = %sid,
-                                        wire = %wire_msg.session_id,
-                                        "session-scoped client supplied a different session_id; dropping",
-                                    );
-                                    continue;
-                                }
-                                sid.to_string()
-                            }
-                            None => {
-                                if !wire_msg.session_id.is_empty() {
-                                    tracing::warn!(
-                                        %channel_type,
-                                        "subprocess sidecar supplied session_id on Message; ignoring (resolver is canonical)",
-                                    );
-                                }
-                                if wire_msg.user_id.is_empty() {
-                                    tracing::warn!(
-                                        %channel_type,
-                                        "inbound Message with empty user_id; dropping",
-                                    );
-                                    continue;
-                                }
-                                // Dedup before pairing so a replay
-                                // storm can't re-fire pairing-code
-                                // notices either. Sidecars that omit
-                                // `platform_msg_id` always pass through
-                                // — opt-in design.
-                                if !state.inbound_dedup.check_and_record(
-                                    channel_type,
-                                    &wire_msg.bot_id,
-                                    &wire_msg.platform_msg_id,
-                                ) {
-                                    tracing::debug!(
-                                        %channel_type,
-                                        bot_id = %wire_msg.bot_id,
-                                        platform_msg_id = %wire_msg.platform_msg_id,
-                                        "duplicate inbound; dropping",
-                                    );
-                                    continue;
-                                }
-                                // Pairing gate: unknown / expired-pending
-                                // triples get a short code back via Notice
-                                // and the message is dropped before any
-                                // session is created.
-                                if !enforce_pairing(
-                                    state,
-                                    sidecar,
-                                    channel_type,
-                                    &wire_msg.bot_id,
-                                    &wire_msg.user_id,
-                                )
-                                .await
-                                {
-                                    continue;
-                                }
-                                // Slash-command interception. Sidecar
-                                // session_id is server-resolved, so
-                                // commands like `/new` that need to
-                                // repoint the mapping naturally fit
-                                // before resolve_or_create. Session-
-                                // scoped clients (TUI) take a different
-                                // branch above and own their own
-                                // adapter-side dispatcher, so they're
-                                // unaffected.
-                                match super::slash::try_handle(
-                                    &state.session_resolver,
-                                    &wire_msg.content,
-                                    channel_type,
-                                    &wire_msg.user_id,
-                                )
-                                .await
-                                {
-                                    super::slash::SlashOutcome::Handled(reply) => {
-                                        if let Err(e) =
-                                            sidecar.send_frame(Frame::Message(reply)).await
-                                        {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "send slash reply failed",
-                                            );
-                                        }
-                                        continue;
-                                    }
-                                    super::slash::SlashOutcome::PassThrough => {}
-                                }
-                                match state
-                                    .session_resolver
-                                    .resolve_or_create(channel_type, &wire_msg.user_id)
-                                    .await
-                                {
-                                    Ok(sid) => sid,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            %channel_type,
-                                            user_id = %wire_msg.user_id,
-                                            "resolve session id for inbound message failed; dropping",
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
+                        let session_id = match resolve_inbound_session(
+                            state,
+                            sidecar,
+                            channel_type,
+                            kind,
+                            &wire_msg,
+                        )
+                        .await
+                        {
+                            Some(sid) => sid,
+                            None => continue,
                         };
 
                         let sender = User {
@@ -486,14 +386,31 @@ async fn run_inbound_loop(
                                 reply_to: None,
                                 metadata: MessageMetadata::default(),
                             },
+                            platform_msg_id: wire_msg.platform_msg_id,
                         };
+                        // Echo to all subscribers of this session
+                        // (including the sender) so multi-tab views
+                        // converge on identical transcripts through
+                        // the same render path as agent output.
+                        sidecar.channel.echo_inbound(incoming.clone());
                         if let Err(e) = state.incoming_tx.send(incoming).await {
                             tracing::error!(error = %e, "router intake closed; tearing down");
                             break;
                         }
                     }
                     Frame::ResolveApproval { call_id, decision } => {
-                        let resolved = sidecar.resolve_approval(&call_id, decision).await;
+                        // The connection-side message doesn't carry
+                        // the session_id; we look it up best-effort
+                        // through the broadcast path (the
+                        // ApprovalResolved fan-out below targets every
+                        // connection subscribed to the call's session,
+                        // which the gate already knows). Empty
+                        // session_id is acceptable: dispatch uses it
+                        // only for the selective-channel reverse
+                        // index, and broadcast channels iterate
+                        // connections directly.
+                        let resolved =
+                            sidecar.resolve_approval(&call_id, &SessionId::from(""), decision);
                         if !resolved {
                             tracing::debug!(
                                 call_id = %call_id,
@@ -502,10 +419,6 @@ async fn run_inbound_loop(
                         }
                     }
                     Frame::HistoryAppend { session_id, entry } => {
-                        // Fire-and-forget: zsh-style history shouldn't
-                        // block the submit path. Rejecting non-TUI
-                        // channel types keeps sidecars from sneaking
-                        // writes into the TUI's vault key.
                         if channel_type.as_str() != ChannelType::TUI {
                             tracing::warn!(
                                 %channel_type,
@@ -561,11 +474,262 @@ async fn run_inbound_loop(
     }
 }
 
+/// Replay persisted Message rows whose ordinal is strictly greater
+/// than the client's `since_ordinal` cursor — sent only to the
+/// connection that asked. Filters out rows that aren't user-visible
+/// (agent-injected skill reminders, tool calls, tool results,
+/// thinking, system messages); the surviving rows carry their
+/// absolute `ordinal` on the wire so the client advances its cursor.
+///
+/// On overflow (gap larger than [`MAX_CATCHUP_REPLAY`]) the gateway
+/// sends `Frame::Reset { reason }` instead of partial replay so the
+/// client falls back to a paged REST fetch and doesn't end up with
+/// an arbitrarily truncated middle slice.
+async fn replay_catch_up(
+    state: &WsChannelState,
+    sidecar: &Sidecar,
+    channel_type: &ChannelType,
+    session_id: &SessionId,
+    since_ordinal: i64,
+) {
+    let rows = match state
+        .session_manager
+        .history_since(session_id, since_ordinal, MAX_CATCHUP_REPLAY + 1)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                %channel_type,
+                %session_id,
+                since_ordinal,
+                "catch-up history fetch failed; client may miss messages",
+            );
+            return;
+        }
+    };
+    if rows.len() > MAX_CATCHUP_REPLAY {
+        tracing::info!(
+            %channel_type,
+            %session_id,
+            since_ordinal,
+            cap = MAX_CATCHUP_REPLAY,
+            "catch-up slice exceeds cap; sending Reset for REST refetch",
+        );
+        if let Err(e) = sidecar
+            .send_frame(Frame::Reset {
+                reason: format!("catch-up gap exceeds {MAX_CATCHUP_REPLAY} rows; refetch via REST"),
+            })
+            .await
+        {
+            tracing::debug!(error = %e, "send catch-up Reset failed");
+        }
+        return;
+    }
+    for (ordinal, msg) in rows {
+        let Some(wire) = chat_to_visible_wire_message(channel_type, session_id, ordinal, msg)
+        else {
+            continue;
+        };
+        if let Err(e) = sidecar.send_frame(Frame::Message(wire)).await {
+            tracing::debug!(
+                error = %e,
+                %channel_type,
+                %session_id,
+                ordinal,
+                "send catch-up Message failed; aborting replay",
+            );
+            return;
+        }
+    }
+}
+
+/// Project a persisted [`ChatMessage`] onto a UI-visible wire Message,
+/// or `None` for rows that should never have surfaced as a chat bubble
+/// (skill reminders the agent injected as Role::User, tool-call /
+/// tool-result rows, raw thinking blocks, system rows). Mirrors the
+/// REST transcript path's "what counts as a chat bubble" view so a
+/// reconnecting client doesn't see internal turns it wouldn't have
+/// seen if it had stayed connected.
+fn chat_to_visible_wire_message(
+    channel_type: &ChannelType,
+    session_id: &SessionId,
+    ordinal: i64,
+    msg: ChatMessage,
+) -> Option<WireMessage> {
+    let role = match msg.role {
+        Role::User if msg.from_user => MessageRole::User,
+        Role::Assistant => MessageRole::Assistant,
+        // Role::System rows are the leading prompt — never user-facing.
+        // Role::User with from_user=false is an agent-injected reminder.
+        // Role::Tool rows are tool results — internal.
+        _ => return None,
+    };
+    let mut text = String::new();
+    for block in &msg.content {
+        if let ContentBlock::Text(t) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(t);
+        }
+    }
+    // Empty-text rows that were just tool-use / thinking blocks
+    // (assistant turn with no prose) aren't worth surfacing as a
+    // bubble — the client would render an empty row.
+    if text.is_empty() {
+        return None;
+    }
+    Some(WireMessage {
+        content: text,
+        session_id: session_id.clone(),
+        // Catch-up replay isn't routed by user-id (the connection is
+        // already a particular tab); sidecars on Subscribed channels
+        // don't consult this field for fan-out.
+        user_id: String::new(),
+        channel_type: channel_type.clone(),
+        bot_id: String::new(),
+        attachments: Vec::new(),
+        platform_msg_id: String::new(),
+        role,
+        ordinal: Some(ordinal),
+    })
+}
+
+/// Resolve the session_id for an inbound Message frame:
+/// * `Multiplexed` channel (telegram, weixin): server derives session
+///   from `(channel_type, user_id)` via the resolver after pairing.
+/// * `Subscribed` channel (tui, http): the connection must already be
+///   subscribed to the session_id named on the wire.
+async fn resolve_inbound_session(
+    state: &WsChannelState,
+    sidecar: &Sidecar,
+    channel_type: &ChannelType,
+    kind: ChannelKind,
+    wire_msg: &aura_channels::wire::Message,
+) -> Option<SessionId> {
+    match kind {
+        ChannelKind::Subscribed => {
+            let session_id = SessionId::from(wire_msg.session_id.as_str().trim());
+            if session_id.as_str().is_empty() {
+                tracing::warn!(
+                    %channel_type,
+                    "Subscribed channel Message with empty session_id; dropping",
+                );
+                return None;
+            }
+            if !sidecar.connection.is_subscribed_to(&session_id) {
+                tracing::warn!(
+                    %channel_type,
+                    %session_id,
+                    "Message for session not subscribed by this connection; dropping",
+                );
+                return None;
+            }
+            // Idempotent Send: clients supply a stable `platform_msg_id`
+            // (typically a UUID generated at composer-submit time) so a
+            // retry after a transport blip — point Send / connection
+            // drops between send and echo / user mashes the button —
+            // doesn't produce a second agent turn for the same message.
+            // Subscribed-kind clients have no bot, so `bot_id` is the
+            // empty string in the dedup key tuple. Empty `platform_msg_id`
+            // continues to opt out: older clients that haven't been
+            // updated still get the previous "every send is fresh"
+            // behaviour.
+            if !state.inbound_dedup.check_and_record(
+                channel_type,
+                &wire_msg.bot_id,
+                &wire_msg.platform_msg_id,
+            ) {
+                tracing::debug!(
+                    %channel_type,
+                    %session_id,
+                    platform_msg_id = %wire_msg.platform_msg_id,
+                    "duplicate inbound on subscribed channel; dropping",
+                );
+                return None;
+            }
+            Some(session_id)
+        }
+        ChannelKind::Multiplexed => {
+            if !wire_msg.session_id.as_str().is_empty() {
+                tracing::warn!(
+                    %channel_type,
+                    "Multiplexed channel sidecar supplied session_id on Message; ignoring (resolver is canonical)",
+                );
+            }
+            if wire_msg.user_id.is_empty() {
+                tracing::warn!(
+                    %channel_type,
+                    "inbound Message with empty user_id; dropping",
+                );
+                return None;
+            }
+            if !state.inbound_dedup.check_and_record(
+                channel_type,
+                &wire_msg.bot_id,
+                &wire_msg.platform_msg_id,
+            ) {
+                tracing::debug!(
+                    %channel_type,
+                    bot_id = %wire_msg.bot_id,
+                    platform_msg_id = %wire_msg.platform_msg_id,
+                    "duplicate inbound; dropping",
+                );
+                return None;
+            }
+            if !enforce_pairing(
+                state,
+                sidecar,
+                channel_type,
+                &wire_msg.bot_id,
+                &wire_msg.user_id,
+            )
+            .await
+            {
+                return None;
+            }
+            match super::slash::try_handle(
+                &state.session_resolver,
+                &wire_msg.content,
+                channel_type,
+                &wire_msg.user_id,
+            )
+            .await
+            {
+                super::slash::SlashOutcome::Handled(reply) => {
+                    if let Err(e) = sidecar.send_frame(Frame::Message(reply)).await {
+                        tracing::warn!(error = %e, "send slash reply failed");
+                    }
+                    return None;
+                }
+                super::slash::SlashOutcome::PassThrough => {}
+            }
+            match state
+                .session_resolver
+                .resolve_or_create(channel_type, &wire_msg.user_id)
+                .await
+            {
+                Ok(sid) => Some(sid),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        %channel_type,
+                        user_id = %wire_msg.user_id,
+                        "resolve session id for inbound message failed; dropping",
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Pairing gate. Returns `true` if the inbound can proceed, `false`
 /// if it was dropped (refused or errored). On refusal the pairing
-/// code is posted back as a `Frame::Notice` with `level = "warn"` so
-/// the sidecar surfaces it to the end-user through its existing
-/// notice routing.
+/// code is posted back as a `Frame::Notice` so the sidecar surfaces
+/// it through its existing notice routing.
 async fn enforce_pairing(
     state: &WsChannelState,
     sidecar: &Sidecar,
@@ -590,7 +754,7 @@ async fn enforce_pairing(
                  Messages won't reach aura until this pairing is approved."
             );
             let notice = Frame::Notice {
-                session_id: String::new(),
+                session_id: SessionId::from(""),
                 user_id: user_id.to_owned(),
                 level: "warn".to_owned(),
                 text,
@@ -616,8 +780,7 @@ async fn enforce_pairing(
 /// Translate the wire-level `(content, attachments)` pair into the
 /// agent-facing `Vec<ContentBlock>`. Empty text drops the leading
 /// `Text` block so a "media-only" message doesn't carry a phantom
-/// empty string. Attachments are appended in the order the sidecar
-/// sent them — the agent / LLM gets to decide ordering semantics.
+/// empty string.
 fn wire_to_content_blocks(content: String, attachments: Vec<WireAttachment>) -> Vec<ContentBlock> {
     let mut blocks = Vec::with_capacity(attachments.len() + usize::from(!content.is_empty()));
     if !content.is_empty() {

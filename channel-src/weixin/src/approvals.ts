@@ -85,6 +85,10 @@ function formatAccess(acc: ResourceAccess): string {
       return acc.host === "*" ? "use the network" : `reach ${acc.host}`;
     case "exec_command":
       return `run: ${acc.command}`;
+    case "env":
+      return acc.vars.length === 0
+        ? "read environment"
+        : `read env: ${acc.vars.join(", ")}`;
   }
 }
 

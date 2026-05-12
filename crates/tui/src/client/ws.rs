@@ -9,11 +9,11 @@
 //! it and presents it on the WS upgrade in the shared
 //! `x-aura-channel-token` header.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aura_channels::wire::{self, Frame, Message, PROTOCOL_VERSION};
-use aura_model::ChannelType;
+use aura_model::{ChannelType, SessionId};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -84,13 +84,13 @@ impl WsClient {
     /// means the caller's `recv_*` loop sees a clean stream of turn
     /// frames afterward and never has to know the snapshot exists.
     pub async fn connect_tui(
-        port: u16,
+        addr: SocketAddr,
         tui_token: &str,
         channel_type: ChannelType,
-        session_id: String,
+        session_id: SessionId,
     ) -> Result<(Self, Vec<String>), WsClientError> {
         Self::connect_inner(
-            port,
+            addr,
             CHANNEL_TOKEN_HEADER,
             tui_token,
             String::new(),
@@ -101,22 +101,21 @@ impl WsClient {
     }
 
     async fn connect_inner(
-        port: u16,
+        addr: SocketAddr,
         header_name: &'static str,
         header_value: &str,
         register_token: String,
         channel_type: ChannelType,
-        session_id: Option<String>,
+        session_id: Option<SessionId>,
     ) -> Result<(Self, Vec<String>), WsClientError> {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let stream = TcpStream::connect(addr)
             .await
             .map_err(WsClientError::TcpDial)?;
-        // Handshake URL embeds the real port so the HTTP Upgrade's
-        // Host header matches what the gateway sees on the accept
-        // socket — avoids any "origin mismatch" surprises if axum
-        // ever gates on that.
-        let handshake_url = format!("ws://127.0.0.1:{port}/v1/channel-ws");
+        // Handshake URL embeds the dialled address so the HTTP
+        // Upgrade's Host header matches what the gateway sees on the
+        // accept socket — avoids any "origin mismatch" surprises if
+        // axum ever gates on that.
+        let handshake_url = format!("ws://{addr}/v1/channel-ws");
         let mut request = handshake_url
             .into_client_request()
             .map_err(|e| WsClientError::WsUpgrade(e.to_string()))?;
@@ -134,13 +133,16 @@ impl WsClient {
             sink: Arc::new(Mutex::new(sink)),
             source: Arc::new(Mutex::new(source)),
         };
-        client
-            .register(register_token, channel_type, session_id.clone())
-            .await?;
-        let history = if session_id.is_some() {
-            client.recv_history_snapshot().await?
-        } else {
-            Vec::new()
+        client.register(register_token, channel_type).await?;
+        // Per the v2 protocol: Register names the channel; per-session
+        // interest follows as a separate Subscribe frame. TUI is
+        // selective-kind and always wants exactly one session.
+        let history = match &session_id {
+            Some(sid) => {
+                client.subscribe(sid.clone()).await?;
+                client.recv_history_snapshot().await?
+            }
+            None => Vec::new(),
         };
         Ok((client, history))
     }
@@ -149,13 +151,11 @@ impl WsClient {
         &self,
         token: String,
         channel_type: ChannelType,
-        session_id: Option<String>,
     ) -> Result<(), WsClientError> {
         self.send_frame(&Frame::Register {
             token,
             channel_type,
             protocol_version: PROTOCOL_VERSION,
-            session_id,
         })
         .await?;
 
@@ -166,6 +166,17 @@ impl WsClient {
             )),
             _ => Err(WsClientError::ProtocolViolation("expected RegisterAck")),
         }
+    }
+
+    async fn subscribe(&self, session_id: SessionId) -> Result<(), WsClientError> {
+        // TUI doesn't track ordinals client-side — every connect builds
+        // its in-memory state from `HistorySnapshot` + live frames, so
+        // there's no cursor to advance.
+        self.send_frame(&Frame::Subscribe {
+            session_id,
+            since_ordinal: None,
+        })
+        .await
     }
 
     /// Read the one-shot `HistorySnapshot` frame the gateway sends right

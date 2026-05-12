@@ -36,7 +36,7 @@ use aura_channels::{
     ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, SlashHandler,
     SlashOutcome, ViewKind,
 };
-use aura_model::{ChannelType, User};
+use aura_model::{ChannelType, SessionId, User};
 use aura_model::{ContentBlock, MessageMetadata};
 use chrono::Utc;
 use crossterm::event::{
@@ -73,7 +73,7 @@ pub type OnExit = Arc<dyn Fn() + Send + Sync>;
 
 /// Ratatui-based terminal channel adapter.
 pub struct TuiAdapter {
-    session_id: String,
+    session_id: SessionId,
     user: User,
     shutdown: Arc<Notify>,
     slash_handler: Option<Arc<dyn SlashHandler>>,
@@ -103,7 +103,7 @@ impl TuiAdapter {
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(256);
         let approval_queue = transport.approval_queue();
         Self {
-            session_id: format!("tui-{}", Uuid::new_v4()),
+            session_id: SessionId::from(format!("tui-{}", Uuid::new_v4())),
             user: User {
                 id: user_id,
                 name: None,
@@ -123,7 +123,7 @@ impl TuiAdapter {
     /// Pin the session id. Callers resolve a session by
     /// creating/resuming it on the gateway and hand the id here so SSE
     /// subscriptions and message POSTs target the right resource.
-    pub fn with_session_id(mut self, id: String) -> Self {
+    pub fn with_session_id(mut self, id: SessionId) -> Self {
         self.session_id = id;
         self
     }
@@ -149,7 +149,7 @@ impl TuiAdapter {
         self
     }
 
-    pub fn session_id(&self) -> &str {
+    pub fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 
@@ -202,7 +202,7 @@ impl TuiAdapter {
 }
 
 struct LoopCtx {
-    session_id: String,
+    session_id: SessionId,
     user: User,
     shutdown: Arc<Notify>,
     input: Arc<WsTransport>,
@@ -220,7 +220,7 @@ struct LoopCtx {
 /// `AppEvent` enum as before.
 async fn spawn_transport_pump(
     transport: Arc<WsTransport>,
-    session_id: String,
+    session_id: SessionId,
     event_tx: mpsc::Sender<AppEvent>,
 ) {
     tokio::spawn(async move {
@@ -668,6 +668,7 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
             reply_to: None,
             metadata: MessageMetadata::default(),
         },
+        platform_msg_id: String::new(),
     };
     if let Err(e) = ctx.input.submit(msg).await {
         warn!("failed to forward TUI input: {e}");

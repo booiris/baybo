@@ -1,4 +1,4 @@
-use aura_model::ChannelType;
+use aura_model::{ChannelType, SessionId};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -108,7 +108,7 @@ pub struct CronJob {
     pub updated_at: DateTime<Utc>,
     /// Session where this cron job was created (for traceability).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_session_id: Option<String>,
+    pub origin_session_id: Option<SessionId>,
 }
 
 impl CronJob {
@@ -184,7 +184,7 @@ pub struct CronExecution {
     /// turn — the symmetric counterpart to `create_spawned_session`'s
     /// lineage plumbing for subagents and forks.
     #[serde(default)]
-    pub origin_session_id: Option<String>,
+    pub origin_session_id: Option<SessionId>,
 }
 
 #[cfg(test)]
@@ -245,7 +245,7 @@ mod tests {
             next_trigger_at: Some(Utc::now()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            origin_session_id: Some("sess-1".to_string()),
+            origin_session_id: Some(SessionId::from("sess-1")),
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();
@@ -254,7 +254,10 @@ mod tests {
         assert_eq!(restored.timezone, "Asia/Shanghai");
         assert!(!restored.is_one_shot());
         assert!(restored.is_enabled());
-        assert_eq!(restored.origin_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            restored.origin_session_id.as_ref().map(|s| s.as_str()),
+            Some("sess-1"),
+        );
     }
 
     #[test]

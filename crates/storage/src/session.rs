@@ -37,6 +37,17 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub trait SessionStore: Send + Sync {
     async fn get(&self, session_id: &SessionId) -> Result<Option<Session>>;
     async fn save(&self, session: &Session) -> Result<()>;
+    /// Flip the `hidden` flag on the session row. Used by the
+    /// chat-list "delete" UI — the row is **not** removed, just
+    /// hidden from the list. Returns `Ok(true)` when the row existed
+    /// and was updated, `Ok(false)` if no row matched.
+    ///
+    /// Implementations must update the flat `hidden` column and the
+    /// JSON `data` blob's `hidden` field atomically (one SQL
+    /// statement), so concurrent `touch` / `save` calls don't lose
+    /// the update.
+    async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> Result<bool>;
+
     /// Hard-delete the session.
     ///
     /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`
@@ -201,4 +212,35 @@ pub trait SessionStore: Send + Sync {
         session_id: &SessionId,
         up_to_ordinal: i64,
     ) -> Result<Vec<ChatMessage>>;
+
+    /// Reverse-paginated slice of the active transcript: at most
+    /// `limit` rows whose `ordinal` is strictly below `before_ordinal`
+    /// (or the tail of the transcript when `before_ordinal` is `None`),
+    /// returned in **ascending** ordinal order. Each row is paired with
+    /// its absolute ordinal so the caller can request the next-older
+    /// page without a second lookup.
+    ///
+    /// Used by the chat REST surface so a long-running session doesn't
+    /// pay an O(transcript-length) round-trip on every initial load;
+    /// the web client streams older slices in on scroll-up.
+    async fn load_active_session_messages_tail(
+        &self,
+        session_id: &SessionId,
+        before_ordinal: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, ChatMessage)>>;
+
+    /// Forward catch-up slice: the next at most `limit` active rows
+    /// whose `ordinal` is strictly **greater than** `after_ordinal`,
+    /// returned in ascending order alongside each row's absolute
+    /// ordinal. Powers the WS `Subscribe { since_ordinal }` cursor —
+    /// when a client reconnects after a network dip the gateway uses
+    /// this to replay every persisted Message row the client missed
+    /// while disconnected, without forcing a REST round-trip.
+    async fn load_active_session_messages_since(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, ChatMessage)>>;
 }

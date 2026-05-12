@@ -134,7 +134,7 @@ fn push_bounded<I: IntoIterator<Item = ContentBlock>>(dst: &mut Vec<ContentBlock
 /// than losing the line.
 struct DeltaTxNotifier {
     tx: tokio::sync::mpsc::Sender<AgentOutput>,
-    session_id: String,
+    session_id: aura_model::SessionId,
     user_id: String,
     channel: aura_model::ChannelType,
 }
@@ -400,7 +400,7 @@ impl AgentLoop {
         let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
             Arc::new(DeltaTxNotifier {
                 tx: tx.clone(),
-                session_id: session.id.to_string(),
+                session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
             }) as Arc<dyn aura_tools::SessionNotifier>
@@ -676,7 +676,7 @@ impl AgentLoop {
         )];
         content.extend(std::mem::take(&mut accumulated_attachments));
         Ok(OutgoingMessage {
-            session_id: session.id.to_string(),
+            session_id: session.id.clone(),
             user_id: session.user.id.clone(),
             channel: session.channel.clone(),
             content,
@@ -757,7 +757,7 @@ impl AgentLoop {
             }
 
             return Ok(IterationOutcome::Final(OutgoingMessage {
-                session_id: session.id.to_string(),
+                session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 content: final_blocks,
@@ -1165,7 +1165,7 @@ impl AgentLoop {
         };
         let record = LlmCallRecord {
             timestamp: chrono::Utc::now(),
-            session_id: session.id.to_string(),
+            session_id: session.id.clone(),
             provider: info.provider.clone(),
             model: info.id.clone(),
             request,
@@ -1190,7 +1190,7 @@ impl AgentLoop {
         let Some(logger) = self.session_log.as_ref() else {
             return;
         };
-        if let Err(e) = logger.log_message(session.id.as_str(), message).await {
+        if let Err(e) = logger.log_message(&session.id, message).await {
             warn!(error = %e, "failed to append session message log");
         }
     }
@@ -1327,7 +1327,7 @@ impl AgentLoop {
 
         if delta_tx
             .send(AgentOutput::Delta {
-                session_id: session.id.to_string(),
+                session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 text: sanitized,

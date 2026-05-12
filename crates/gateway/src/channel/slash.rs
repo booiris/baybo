@@ -21,7 +21,7 @@
 
 use aura_channels::COMPACT_COMMAND_NAME;
 use aura_channels::wire::{Message as WireMessage, SlashCommandSpec};
-use aura_model::ChannelType;
+use aura_model::{ChannelType, SessionId};
 
 use super::session_resolver::ChannelSessionResolver;
 
@@ -32,7 +32,7 @@ use super::session_resolver::ChannelSessionResolver;
 /// Discord application commands, …) stays in sync without sidecars
 /// keeping their own hardcoded copy. Adding a new command here is the
 /// single edit needed for the dispatcher + every sidecar to learn it.
-pub(crate) fn manifest() -> Vec<SlashCommandSpec> {
+pub fn manifest() -> Vec<SlashCommandSpec> {
     vec![
         SlashCommandSpec {
             command: "new".to_string(),
@@ -120,17 +120,22 @@ async fn handle_new(
             reply(
                 channel_type,
                 user_id,
-                "",
+                &SessionId::from(""),
                 &format!("Failed to start new session: {e}"),
             )
         }
     }
 }
 
-fn reply(channel_type: &ChannelType, user_id: &str, session_id: &str, text: &str) -> WireMessage {
+fn reply(
+    channel_type: &ChannelType,
+    user_id: &str,
+    session_id: &SessionId,
+    text: &str,
+) -> WireMessage {
     WireMessage {
         content: text.to_owned(),
-        session_id: session_id.to_owned(),
+        session_id: session_id.clone(),
         user_id: user_id.to_owned(),
         channel_type: channel_type.clone(),
         // Outbound `bot_id` is empty by convention (`agent_output_to_frame`
@@ -139,6 +144,8 @@ fn reply(channel_type: &ChannelType, user_id: &str, session_id: &str, text: &str
         bot_id: String::new(),
         attachments: Vec::new(),
         platform_msg_id: String::new(),
+        role: aura_channels::MessageRole::Assistant,
+        ordinal: None,
     }
 }
 

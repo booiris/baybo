@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use aura_llm::{ChatRequest, LlmResponse};
-use aura_model::ChatMessage;
+use aura_model::{ChatMessage, SessionId};
 use aura_workspace::paths::{SESSION_LOG_EXTENSION, sanitize_session_id};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -29,7 +29,7 @@ pub enum LlmCallOutcome {
 #[derive(Debug, Clone, Serialize)]
 pub struct LlmCallRecord {
     pub timestamp: DateTime<Utc>,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub provider: String,
     pub model: String,
     pub request: LlmRequestMeta,
@@ -90,7 +90,7 @@ impl LlmResponseMeta {
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMessageRecord {
     pub timestamp: DateTime<Utc>,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub message_id: String,
     pub parent_id: Option<String>,
     pub message: ChatMessage,
@@ -132,25 +132,32 @@ impl SessionLlmLogger {
     pub async fn log_llm_call(&self, record: &LlmCallRecord) -> io::Result<()> {
         let mut line = typed_record_line("llm_call", record)?;
         let _guard = self.state.lock().await;
-        self.write_line(&record.session_id, &mut line).await
+        self.write_line(record.session_id.as_str(), &mut line).await
     }
 
-    pub async fn log_message(&self, session_id: &str, message: &ChatMessage) -> io::Result<String> {
+    pub async fn log_message(
+        &self,
+        session_id: &SessionId,
+        message: &ChatMessage,
+    ) -> io::Result<String> {
         let mut state = self.state.lock().await;
-        let parent_id = state.last_message_id_by_session.get(session_id).cloned();
+        let parent_id = state
+            .last_message_id_by_session
+            .get(session_id.as_str())
+            .cloned();
         let message_id = Uuid::new_v4().to_string();
         let record = SessionMessageRecord {
             timestamp: Utc::now(),
-            session_id: session_id.to_string(),
+            session_id: session_id.clone(),
             message_id: message_id.clone(),
             parent_id,
             message: message.clone(),
         };
         let mut line = typed_record_line("message", &record)?;
-        self.write_line(&record.session_id, &mut line).await?;
+        self.write_line(record.session_id.as_str(), &mut line).await?;
         state
             .last_message_id_by_session
-            .insert(session_id.to_string(), message_id.clone());
+            .insert(session_id.as_str().to_owned(), message_id.clone());
         Ok(message_id)
     }
 
@@ -292,8 +299,9 @@ mod tests {
             from_user: false,
         };
 
-        let first_id = logger.log_message("sess-1", &first).await.unwrap();
-        let second_id = logger.log_message("sess-1", &second).await.unwrap();
+        let sid = SessionId::from("sess-1");
+        let first_id = logger.log_message(&sid, &first).await.unwrap();
+        let second_id = logger.log_message(&sid, &second).await.unwrap();
 
         let raw = tokio::fs::read_to_string(tmp.path().join("sess-1.jsonl"))
             .await

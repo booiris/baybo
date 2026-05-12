@@ -921,6 +921,20 @@ mod tests {
                 .insert(session.id.clone(), session.clone());
             Ok(())
         }
+        async fn set_hidden(
+            &self,
+            id: &SessionId,
+            hidden: bool,
+        ) -> std::result::Result<bool, StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) => {
+                    s.hidden = hidden;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
         async fn delete(&self, _id: &SessionId) -> std::result::Result<bool, StorageError> {
             Ok(true)
         }
@@ -1077,6 +1091,58 @@ mod tests {
                 })
                 .unwrap_or_default())
         }
+        async fn load_active_session_messages_tail(
+            &self,
+            id: &SessionId,
+            before_ordinal: Option<i64>,
+            limit: usize,
+        ) -> std::result::Result<Vec<(i64, aura_model::ChatMessage)>, StorageError> {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .map(|log| {
+                    let active: Vec<&aura_storage::StoredMessage> = log
+                        .iter()
+                        .filter(|m| {
+                            m.superseded_by.is_none()
+                                && before_ordinal.is_none_or(|b| m.ordinal < b)
+                        })
+                        .collect();
+                    let skip = active.len().saturating_sub(limit);
+                    active
+                        .into_iter()
+                        .skip(skip)
+                        .map(|m| (m.ordinal, m.message.clone()))
+                        .collect()
+                })
+                .unwrap_or_default())
+        }
+        async fn load_active_session_messages_since(
+            &self,
+            id: &SessionId,
+            after_ordinal: i64,
+            limit: usize,
+        ) -> std::result::Result<Vec<(i64, aura_model::ChatMessage)>, StorageError> {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .map(|log| {
+                    log.iter()
+                        .filter(|m| m.superseded_by.is_none() && m.ordinal > after_ordinal)
+                        .take(limit)
+                        .map(|m| (m.ordinal, m.message.clone()))
+                        .collect()
+                })
+                .unwrap_or_default())
+        }
     }
 
     fn make_session(id: &str) -> Session {
@@ -1096,6 +1162,7 @@ mod tests {
             trigger: TriggerSource::User,
             lineage: None,
             bound_soul_version: "soul-test".into(),
+            hidden: false,
         }
     }
 

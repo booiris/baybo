@@ -29,6 +29,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 anyhow = { workspace = true }
+uuid = { workspace = true }
 
 # Optional — only pulled in for the `ts-export` feature so that
 # release builds don't have to compile ts-rs.

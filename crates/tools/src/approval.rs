@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_model::ChannelType;
+use aura_model::{ChannelType, SessionId};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ pub struct ApprovalRequest {
     pub call_id: String,
     /// Session the tool call runs under. Lets HTTP clients (e.g. the
     /// gateway-backed TUI) render approvals alongside the session they belong to.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// Aura user id the tool call is running on behalf of. Sidecars
     /// that route prompts by platform user (Telegram chat, Discord DM)
     /// use this instead of reverse-mapping from `session_id`. Empty
@@ -109,7 +109,7 @@ impl ApprovalGate for AutoDenyGate {
 /// `AutoDenyGate` (fail-closed).
 pub struct ApprovalGateMap {
     type_level: DashMap<ChannelType, Arc<dyn ApprovalGate>>,
-    session_level: DashMap<(ChannelType, String), Arc<dyn ApprovalGate>>,
+    session_level: DashMap<(ChannelType, SessionId), Arc<dyn ApprovalGate>>,
 }
 
 impl ApprovalGateMap {
@@ -132,7 +132,7 @@ impl ApprovalGateMap {
     pub fn insert_session(
         &self,
         channel: ChannelType,
-        session_id: String,
+        session_id: SessionId,
         gate: Arc<dyn ApprovalGate>,
     ) {
         self.session_level.insert((channel, session_id), gate);
@@ -148,9 +148,9 @@ impl ApprovalGateMap {
 
     /// Evict a session-scoped gate. Called on session-scoped client
     /// unregister. Cheap no-op if the entry is already gone.
-    pub fn remove_session(&self, channel: &ChannelType, session_id: &str) {
+    pub fn remove_session(&self, channel: &ChannelType, session_id: &SessionId) {
         self.session_level
-            .remove(&(channel.clone(), session_id.to_owned()));
+            .remove(&(channel.clone(), session_id.clone()));
     }
 
     /// Resolve the gate for one tool call. Tries the session-scoped
@@ -158,10 +158,10 @@ impl ApprovalGateMap {
     /// session) and falls back to the type-level gate (a sidecar that
     /// answers for every session). When neither is registered returns
     /// `AutoDenyGate` (fail-closed).
-    pub fn get(&self, channel: &ChannelType, session_id: &str) -> Arc<dyn ApprovalGate> {
+    pub fn get(&self, channel: &ChannelType, session_id: &SessionId) -> Arc<dyn ApprovalGate> {
         if let Some(entry) = self
             .session_level
-            .get(&(channel.clone(), session_id.to_owned()))
+            .get(&(channel.clone(), session_id.clone()))
         {
             return Arc::clone(entry.value());
         }

@@ -266,6 +266,16 @@ pub struct Session {
     /// `Job::effective_soul_version` records what was actually loaded at
     /// each job's start; divergence is recorded on `Job.provenance_drift`.
     pub bound_soul_version: String,
+
+    /// User-facing "hide from my list" flag. Set via the chat admin
+    /// `DELETE /v1/chat/sessions/:id` endpoint, which intentionally
+    /// does not remove the row — agent state, transcript, and
+    /// channel-token all stay live. The chat list endpoint filters
+    /// `hidden = true` out; `aura_storage::SessionStore::list_all`
+    /// does not, so admin / trace browsers continue to see hidden
+    /// sessions. Default `false` so legacy JSON blobs deserialize.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
