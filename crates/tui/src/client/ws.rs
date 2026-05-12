@@ -134,9 +134,9 @@ impl WsClient {
             source: Arc::new(Mutex::new(source)),
         };
         client.register(register_token, channel_type).await?;
-        // Per the v2 protocol: Register names the channel; per-session
-        // interest follows as a separate Subscribe frame. TUI is
-        // selective-kind and always wants exactly one session.
+        // Register names the channel; per-session interest follows as a
+        // separate Subscribe frame. TUI is selective-kind and always
+        // wants exactly one session.
         let history = match &session_id {
             Some(sid) => {
                 client.subscribe(sid.clone()).await?;

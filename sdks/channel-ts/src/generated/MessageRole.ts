@@ -5,8 +5,7 @@
  *
  * In-tree producers always set this explicitly: the agent emits
  * `Assistant`, sidecars and inbound echo emit `User`. Default is
- * `Assistant` so an old (pre-refactor) sidecar wire frame that omits
- * the field decodes as an agent reply — matches the historical
- * "outbound is always assistant" assumption.
+ * `Assistant` so a wire frame that omits the field decodes as an
+ * agent reply.
  */
 export type MessageRole = "user" | "assistant";
