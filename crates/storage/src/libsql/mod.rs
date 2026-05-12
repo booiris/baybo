@@ -166,6 +166,13 @@ impl LibsqlPool {
                     content       TEXT NOT NULL,
                     created_at    INTEGER NOT NULL,
                     superseded_by INTEGER,
+                    -- 1 only when this row originated from a direct user
+                    -- channel input. The agent itself appends several
+                    -- `role = 'user'` rows (skill reminders, system-
+                    -- reminders); this column distinguishes the genuine
+                    -- prompt so trace replay can surface it as the job's
+                    -- user input rather than guessing by content.
+                    from_user     INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (session_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active
@@ -428,6 +435,7 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN is_normal_session INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE session_summaries ADD COLUMN in_flight INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE session_summaries ADD COLUMN in_flight_owner TEXT",
+            "ALTER TABLE session_messages ADD COLUMN from_user INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(e) = self.conn.execute(stmt, ()).await
                 && !e.to_string().contains("duplicate column name")

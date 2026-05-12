@@ -71,10 +71,12 @@ pub(crate) fn build_messages(task: &str, caps: &CallerCaps) -> Vec<ChatMessage> 
         ChatMessage {
             role: Role::System,
             content: vec![ContentBlock::Text(SYSTEM_PROMPT.into())],
+            from_user: false,
         },
         ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text(user)],
+            from_user: false,
         },
     ]
 }
@@ -87,10 +89,12 @@ pub(crate) fn build_retry_messages(
     msgs.push(ChatMessage {
         role: Role::Assistant,
         content: vec![ContentBlock::Text(previous_reply.to_string())],
+        from_user: false,
     });
     msgs.push(ChatMessage {
         role: Role::User,
         content: vec![ContentBlock::Text(PARSE_RETRY_NUDGE.into())],
+        from_user: false,
     });
     msgs
 }

@@ -1071,6 +1071,7 @@ pub(crate) fn insert_skill_trailer(
         ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text(reminder)],
+            from_user: false,
         },
     );
     if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
@@ -1079,6 +1080,7 @@ pub(crate) fn insert_skill_trailer(
             ChatMessage {
                 role: Role::User,
                 content: vec![ContentBlock::Text(detail)],
+                from_user: false,
             },
         );
     }
@@ -1100,11 +1102,13 @@ pub(crate) fn estimate_skill_trailer_tokens(
     let mut total = tokenizer.count_message(&ChatMessage {
         role: Role::User,
         content: vec![ContentBlock::Text(reminder)],
+        from_user: false,
     });
     if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
         total += tokenizer.count_message(&ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text(detail)],
+            from_user: false,
         });
     }
     total
@@ -1141,6 +1145,7 @@ mod tests {
         ChatMessage {
             role,
             content: vec![ContentBlock::Text(text.to_string())],
+            from_user: false,
         }
     }
 
@@ -1509,6 +1514,7 @@ mod tests {
                 input: serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name }),
                 signature: None,
             }],
+            from_user: false,
         }
     }
 
@@ -1541,6 +1547,7 @@ mod tests {
                 input: serde_json::json!({ "command": "ls" }),
                 signature: None,
             }],
+            from_user: false,
         };
         ctx.append(&bash_call).await;
         assert!(ctx.called_skills.is_empty());
@@ -1793,6 +1800,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 signature: None,
             }],
+            from_user: false,
         }
     }
 

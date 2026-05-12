@@ -532,6 +532,7 @@ pub async fn run_background_summary(
             &current_notes,
             tokenizer.as_ref(),
         ))],
+        from_user: false,
     });
     let tool_defs = vec![
         tool_def_from(&ReadTool),
@@ -588,6 +589,7 @@ iterations without terminating"
         messages.push(ChatMessage {
             role: Role::Assistant,
             content: assistant_blocks,
+            from_user: false,
         });
 
         if response.tool_calls.is_empty() {
@@ -604,6 +606,7 @@ iterations without terminating"
         messages.push(ChatMessage {
             role: Role::User,
             content: tool_results,
+            from_user: false,
         });
     }
 

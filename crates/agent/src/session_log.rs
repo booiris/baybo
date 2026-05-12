@@ -204,6 +204,7 @@ mod tests {
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: vec![ContentBlock::Text("hello".into())],
+                from_user: false,
             }],
             temperature: Some(0.7),
             tools: vec![ToolDefinitionForLlm {
@@ -283,10 +284,12 @@ mod tests {
         let first = ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text("hello".into())],
+            from_user: false,
         };
         let second = ChatMessage {
             role: Role::Assistant,
             content: vec![ContentBlock::Text("hi".into())],
+            from_user: false,
         };
 
         let first_id = logger.log_message("sess-1", &first).await.unwrap();

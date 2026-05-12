@@ -147,6 +147,7 @@ mod tests {
         let msg = ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text("hi".to_string())],
+            from_user: false,
         };
         let text_only = tok.count_text("hi");
         assert_eq!(tok.count_message(&msg), text_only + MESSAGE_OVERHEAD);

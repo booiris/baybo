@@ -584,6 +584,7 @@ impl ContextManager {
         request_messages.push(ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text(SUMMARIZE_INSTRUCTION.to_string())],
+            from_user: false,
         });
         let request = ChatRequest {
             messages: request_messages,
@@ -656,6 +657,7 @@ fn build_summary_message(
     ChatMessage {
         role: Role::User,
         content: vec![ContentBlock::Text(text)],
+        from_user: false,
     }
 }
 
@@ -672,6 +674,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 signature: None,
             }],
+            from_user: false,
         }
     }
 
@@ -682,6 +685,7 @@ mod tests {
                 tool_use_id: id.into(),
                 content: "ok".into(),
             }],
+            from_user: false,
         }
     }
 
@@ -689,6 +693,7 @@ mod tests {
         ChatMessage {
             role,
             content: vec![ContentBlock::Text(t.into())],
+            from_user: false,
         }
     }
 

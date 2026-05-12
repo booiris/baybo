@@ -56,6 +56,7 @@ fn req() -> ChatRequest {
         messages: vec![ChatMessage {
             role: Role::User,
             content: vec![ContentBlock::Text("hi".into())],
+            from_user: false,
         }],
         temperature: None,
         tools: vec![],

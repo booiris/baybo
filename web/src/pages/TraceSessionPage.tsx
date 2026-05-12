@@ -788,17 +788,18 @@ function jobTokens(job: ReplayJob): {
   return { input, output, cached, cacheCreate, inputTotal: input + cached + cacheCreate };
 }
 
-// Derive the user-facing input that kicked off the job: the last user
-// message in the *first* LLM call's input_messages (the chat-history
-// passed in already contains all prior turns; the most recent user
-// message is the prompt for this iteration).
+// Derive the user-facing input that kicked off the job: the last
+// message in the *first* LLM call's input_messages flagged with
+// `from_user`. The agent injects several `Role::User` messages of its
+// own (skill reminders, system-reminders) so role alone isn't enough
+// to identify the genuine prompt.
 function jobInputText(job: ReplayJob): string | null {
   for (const rs of job.steps) {
     for (const span of rs.spans) {
       if (span.kind.kind === 'llm_call') {
         const messages = span.kind.begin.input_messages;
         for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].role === 'user') {
+          if (messages[i].from_user) {
             const parts: string[] = [];
             for (const block of messages[i].content) {
               if ('Text' in block) parts.push(block.Text);

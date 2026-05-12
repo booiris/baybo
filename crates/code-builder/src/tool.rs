@@ -141,6 +141,7 @@ impl CodeBuilderTool {
             out.push(ChatMessage {
                 role: msg.role,
                 content,
+                from_user: false,
             });
         }
         // Belt-and-suspenders: log if any message text still smells like

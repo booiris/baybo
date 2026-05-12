@@ -88,6 +88,13 @@ export type ContentBlock =
 export interface ChatMessage {
   role: Role;
   content: ContentBlock[];
+  /**
+   * `true` only when the message originated from a user channel input.
+   * Distinguishes the genuine prompt from `Role::User` messages the
+   * agent injects (skill reminders, system-reminders). Absent on rows
+   * persisted before the column existed — treat undefined as `false`.
+   */
+  from_user?: boolean;
 }
 
 // ── Span ──────────────────────────────────────────────────────────────

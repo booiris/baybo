@@ -255,7 +255,7 @@ function toolSpan(
 }
 
 function userMsg(text: string): ChatMessage {
-  return { role: 'user', content: [{ Text: text }] };
+  return { role: 'user', content: [{ Text: text }], from_user: true };
 }
 
 function systemMsg(text: string): ChatMessage {

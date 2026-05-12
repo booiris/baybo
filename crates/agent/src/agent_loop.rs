@@ -423,6 +423,7 @@ impl AgentLoop {
                 content: vec![ContentBlock::Text(format!(
                     "[Memory Context]\n{memory_text}"
                 ))],
+                from_user: false,
             };
             self.append_context_message(session, &memory_msg).await?;
         }
@@ -434,35 +435,37 @@ impl AgentLoop {
             self.invocable_skills()
         };
 
+        // Append user message (auto-compresses if over token budget).
+        // `from_user = true` distinguishes the genuine prompt from the
+        // `Role::User` skill reminder appended below — trace replay
+        // uses this flag to surface the actual user input in the job
+        // summary panel.
+        let user_msg = ChatMessage {
+            role: Role::User,
+            content: user_content.clone(),
+            from_user: true,
+        };
+        self.append_context_message(session, &user_msg).await?;
+
         // Skill reminder is emitted as `Role::User` (some providers reject
-        // `system` outside the leading slot) and injected *before* the user
-        // prompt so the model sees "tools available → user prompt" and so
-        // the trace's job-summary heuristic (last user message in the
-        // first LLM span's input = the job's user input) lands on the
-        // actual prompt rather than this preamble. The helper compares
-        // against `session.state.active_skills` (last turn's set): if it
-        // changed, the *full* current list is rebroadcast so the model
-        // sees authoritative state without having to reconcile a delta;
-        // if unchanged, no reminder is injected and the turn pays zero
-        // token cost. Consecutive `Role::User` messages produced this way
-        // are coalesced by `merge_for_llm` before dispatch for providers
-        // that require strict user/assistant alternation.
+        // `system` outside the leading slot). The helper compares against
+        // `session.state.active_skills` (last turn's set): if it changed,
+        // the *full* current list is rebroadcast so the model sees
+        // authoritative state without having to reconcile a delta; if
+        // unchanged, no reminder is injected and the turn pays zero token
+        // cost. Consecutive `Role::User` messages produced this way are
+        // coalesced by `merge_for_llm` before dispatch for providers that
+        // require strict user/assistant alternation.
         if let Some(reminder) =
             build_skill_reminder_if_changed(&session.state.active_skills, &skills_for_turn)
         {
             let reminder_msg = ChatMessage {
                 role: Role::User,
                 content: vec![ContentBlock::Text(reminder)],
+                from_user: false,
             };
             self.append_context_message(session, &reminder_msg).await?;
         }
-
-        // Append user message (auto-compresses if over token budget)
-        let user_msg = ChatMessage {
-            role: Role::User,
-            content: user_content.clone(),
-        };
-        self.append_context_message(session, &user_msg).await?;
 
         session.state.active_skills = skills_for_turn.iter().map(|s| s.name.clone()).collect();
 
@@ -481,6 +484,7 @@ impl AgentLoop {
             let assistant_msg = ChatMessage {
                 role: Role::Assistant,
                 content: vec![tool_use_block],
+                from_user: false,
             };
             self.append_context_message(session, &assistant_msg).await?;
 
@@ -542,6 +546,7 @@ impl AgentLoop {
                     tool_use_id: synthesized_id,
                     content: result_text,
                 }],
+                from_user: false,
             };
             self.append_context_message(session, &tool_msg).await?;
         }
@@ -655,6 +660,7 @@ impl AgentLoop {
                                 tool_use_id,
                                 content: wrapped,
                             }],
+                            from_user: false,
                         };
                         self.append_context_message(session, &tool_msg).await?;
                     }
@@ -741,6 +747,7 @@ impl AgentLoop {
             let assistant_msg = ChatMessage {
                 role: Role::Assistant,
                 content: response_blocks,
+                from_user: false,
             };
             self.append_context_message(session, &assistant_msg).await?;
 
@@ -785,6 +792,7 @@ impl AgentLoop {
         let assistant_msg = ChatMessage {
             role: Role::Assistant,
             content: assistant_blocks,
+            from_user: false,
         };
         self.append_context_message(session, &assistant_msg).await?;
 
@@ -890,6 +898,7 @@ impl AgentLoop {
                     tool_use_id: tool_call.id.clone(),
                     content: wrapped,
                 }],
+                from_user: false,
             };
             self.append_context_message(session, &tool_msg).await?;
 
@@ -911,6 +920,7 @@ impl AgentLoop {
                 let image_msg = ChatMessage {
                     role: Role::User,
                     content,
+                    from_user: false,
                 };
                 self.append_context_message(session, &image_msg).await?;
             }
@@ -1464,6 +1474,7 @@ impl AgentLoop {
                  no preamble."
                     .to_string(),
             )],
+            from_user: false,
         };
         let mut messages: Vec<ChatMessage> = transcript
             .iter()
@@ -1849,6 +1860,7 @@ impl AgentLoop {
         let msg = ChatMessage {
             role: Role::System,
             content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
+            from_user: false,
         };
         self.append_context_message(session, &msg).await
     }
@@ -2410,6 +2422,7 @@ mod merge_for_llm_tests {
         ChatMessage {
             role,
             content: vec![ContentBlock::Text(body.into())],
+            from_user: false,
         }
     }
 
@@ -2465,10 +2478,12 @@ mod merge_for_llm_tests {
             ChatMessage {
                 role: Role::User,
                 content: vec![ContentBlock::Text("hi".into()), img()],
+                from_user: false,
             },
             ChatMessage {
                 role: Role::User,
                 content: vec![ContentBlock::Text("more".into())],
+                from_user: false,
             },
         ];
         let out = merge_for_llm(&msgs);
@@ -2497,6 +2512,7 @@ mod merge_for_llm_tests {
                     tool_use_id: "1".into(),
                     content: "r1".into(),
                 }],
+                from_user: false,
             },
             ChatMessage {
                 role: Role::Tool,
@@ -2504,6 +2520,7 @@ mod merge_for_llm_tests {
                     tool_use_id: "2".into(),
                     content: "r2".into(),
                 }],
+                from_user: false,
             },
         ];
         let out = merge_for_llm(&msgs);
@@ -2520,6 +2537,7 @@ mod merge_for_llm_tests {
                 input: serde_json::json!({}),
                 signature: None,
             }],
+            from_user: false,
         };
         let tool = ChatMessage {
             role: Role::Tool,
@@ -2527,6 +2545,7 @@ mod merge_for_llm_tests {
                 tool_use_id: "t1".into(),
                 content: "ok".into(),
             }],
+            from_user: false,
         };
         let msgs = vec![text(Role::User, "hi"), assistant.clone(), tool.clone()];
         let out = merge_for_llm(&msgs);

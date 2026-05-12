@@ -432,10 +432,12 @@ async fn run_summary(
             ChatMessage {
                 role: Role::System,
                 content: vec![ContentBlock::Text(SUMMARY_SYSTEM_PROMPT.to_string())],
+                from_user: false,
             },
             ChatMessage {
                 role: Role::User,
                 content: vec![ContentBlock::Text(user_text)],
+                from_user: false,
             },
         ],
         temperature: Some(0.0),

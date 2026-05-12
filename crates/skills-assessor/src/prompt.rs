@@ -43,6 +43,7 @@ pub(crate) fn build_messages(
     let system = aura_model::ChatMessage {
         role: aura_model::Role::System,
         content: vec![aura_model::ContentBlock::Text(SYSTEM_PROMPT.to_string())],
+        from_user: false,
     };
 
     let mut user_body = String::with_capacity(4 * 1024);
@@ -111,6 +112,7 @@ pub(crate) fn build_messages(
     let user = aura_model::ChatMessage {
         role: aura_model::Role::User,
         content: vec![aura_model::ContentBlock::Text(user_body)],
+        from_user: false,
     };
 
     vec![system, user]

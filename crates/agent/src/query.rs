@@ -1336,12 +1336,14 @@ mod tests {
             ChatMessage {
                 role: Role::User,
                 content: vec![ContentBlock::Text(text.into())],
+                from_user: false,
             }
         }
         fn system_msg(text: &str) -> ChatMessage {
             ChatMessage {
                 role: Role::System,
                 content: vec![ContentBlock::Text(text.into())],
+                from_user: false,
             }
         }
 

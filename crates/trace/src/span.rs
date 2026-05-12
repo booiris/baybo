@@ -407,6 +407,7 @@ mod tests {
         let inline = LlmCallInputs::Inline(vec![aura_model::ChatMessage {
             role: aura_model::Role::User,
             content: vec![aura_model::ContentBlock::Text("hi".into())],
+            from_user: false,
         }]);
         let json = serde_json::to_value(&inline).unwrap();
         assert!(json.is_array(), "Inline must serialize as a bare array");
