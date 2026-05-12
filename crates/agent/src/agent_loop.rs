@@ -434,24 +434,19 @@ impl AgentLoop {
             self.invocable_skills()
         };
 
-        // Append user message (auto-compresses if over token budget)
-        let user_msg = ChatMessage {
-            role: Role::User,
-            content: user_content.clone(),
-        };
-        self.append_context_message(session, &user_msg).await?;
-
         // Skill reminder is emitted as `Role::User` (some providers reject
         // `system` outside the leading slot) and injected *before* the user
-        // message so the model sees "tools available → user prompt". The
-        // helper compares against `session.state.active_skills` (last
-        // turn's set): if it changed, the *full* current list is
-        // rebroadcast so the model sees authoritative state without having
-        // to reconcile a delta; if unchanged, no reminder is injected and
-        // the turn pays zero token cost. Consecutive `Role::User` messages
-        // produced this way are coalesced by `merge_for_llm` before
-        // dispatch for providers that require strict user/assistant
-        // alternation.
+        // prompt so the model sees "tools available → user prompt" and so
+        // the trace's job-summary heuristic (last user message in the
+        // first LLM span's input = the job's user input) lands on the
+        // actual prompt rather than this preamble. The helper compares
+        // against `session.state.active_skills` (last turn's set): if it
+        // changed, the *full* current list is rebroadcast so the model
+        // sees authoritative state without having to reconcile a delta;
+        // if unchanged, no reminder is injected and the turn pays zero
+        // token cost. Consecutive `Role::User` messages produced this way
+        // are coalesced by `merge_for_llm` before dispatch for providers
+        // that require strict user/assistant alternation.
         if let Some(reminder) =
             build_skill_reminder_if_changed(&session.state.active_skills, &skills_for_turn)
         {
@@ -461,6 +456,13 @@ impl AgentLoop {
             };
             self.append_context_message(session, &reminder_msg).await?;
         }
+
+        // Append user message (auto-compresses if over token budget)
+        let user_msg = ChatMessage {
+            role: Role::User,
+            content: user_content.clone(),
+        };
+        self.append_context_message(session, &user_msg).await?;
 
         session.state.active_skills = skills_for_turn.iter().map(|s| s.name.clone()).collect();
 
