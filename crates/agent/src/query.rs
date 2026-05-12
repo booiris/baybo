@@ -822,18 +822,40 @@ impl QueryApi {
         for job in jobs.iter_mut() {
             for step in job.steps.iter_mut() {
                 for span in step.spans.iter_mut() {
+                    let span_started_at = span.started_at;
                     if let SpanKind::LlmCall { begin, .. } = &mut span.kind
                         && let LlmCallInputs::Persisted { last_ordinal, .. } = &begin.input_messages
                     {
                         let last = *last_ordinal;
-                        let hydrated: Vec<aura_model::ChatMessage> = log
+                        let candidates: Vec<&aura_storage::StoredMessage> = log
                             .iter()
                             .filter(|m| {
                                 m.ordinal <= last
                                     && m.superseded_by.map(|s| s > last).unwrap_or(true)
                             })
-                            .map(|m| m.message.clone())
                             .collect();
+                        // Detect ordinal collisions across session
+                        // lifetimes: if any candidate row was written
+                        // after the span started, the current
+                        // session_messages log doesn't represent the
+                        // transcript this span saw (the parent session
+                        // was reset and the ordinals were reused). In
+                        // that case, surface an empty input rather
+                        // than misleading content from a different
+                        // epoch.
+                        let mismatch = candidates.iter().any(|m| m.created_at > span_started_at);
+                        let hydrated: Vec<aura_model::ChatMessage> = if mismatch {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                span_id = %span.id,
+                                last_ordinal = last,
+                                "session_messages epoch mismatch — span predates current log; \
+                                 returning empty input"
+                            );
+                            Vec::new()
+                        } else {
+                            candidates.iter().map(|m| m.message.clone()).collect()
+                        };
                         begin.input_messages = LlmCallInputs::Inline(hydrated);
                     }
                 }
@@ -955,6 +977,7 @@ mod tests {
             log.push(aura_storage::StoredMessage {
                 ordinal,
                 superseded_by: None,
+                created_at: chrono::Utc::now(),
                 message: message.clone(),
             });
             Ok(())
@@ -972,10 +995,12 @@ mod tests {
                     entry.superseded_by = Some(next_ordinal);
                 }
             }
+            let stamp = chrono::Utc::now();
             for (offset, msg) in new_active.iter().enumerate() {
                 log.push(aura_storage::StoredMessage {
                     ordinal: next_ordinal + offset as i64,
                     superseded_by: None,
+                    created_at: stamp,
                     message: msg.clone(),
                 });
             }

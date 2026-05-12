@@ -353,14 +353,15 @@ impl SessionManager {
         channel: ChannelType,
     ) -> Result<Session> {
         if let Some(session) = self.store.get(session_id).await.map_err(wrap)? {
-            let cutoff = Utc::now() - self.session_timeout;
-            if session.last_active < cutoff {
-                debug!(session_id = %session_id, "session expired, replacing with new session");
-                self.store.delete(session_id).await.map_err(wrap)?;
-                return self
-                    .create_session_with_id(session_id.clone(), user, channel, TriggerSource::User)
-                    .await;
-            }
+            // Idle sessions are NOT deleted on access. Deleting the
+            // session row would cascade to `session_messages` and
+            // strand the still-existing `jobs` / `steps` / `spans`
+            // rows pointing at ordinals that get reused by the new
+            // lifetime — trace replay then hydrates LLM spans against
+            // a different epoch's transcript and shows misleading
+            // content. Treat the expiry timeout as an in-memory
+            // signal only (router/supervisor evict the actor); the
+            // persisted history stays intact.
             debug!(session_id = %session_id, "returning existing session");
             return Ok(session);
         }
@@ -787,7 +788,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_or_create_replaces_expired_session() {
+    async fn get_or_create_keeps_idle_session_intact() {
+        // Idle past the timeout must NOT delete the persisted session
+        // row — cascading the cleanup would also wipe `session_messages`
+        // and strand existing `jobs` / `steps` / `spans` rows that
+        // reference ordinals from this lifetime. The expiry signal is
+        // in-memory only (router/supervisor drop the actor); history
+        // stays put.
         let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(
             store.clone(),
@@ -800,21 +807,19 @@ mod tests {
             .await
             .unwrap();
         let old_id = session.id.clone();
-        // Back-date both timestamps so the manager treats it as expired
-        // and the replacement's `created_at` is strictly newer.
         let backdate = Utc::now() - Duration::seconds(5);
         session.created_at = backdate;
         session.last_active = backdate;
         store.save(&session).await.unwrap();
         let old_created = session.created_at;
 
-        let new_session = mgr
+        let returned = mgr
             .get_or_create(&old_id, test_user(), ChannelType::tui())
             .await
             .unwrap();
 
-        assert_eq!(new_session.id, old_id);
-        assert!(new_session.created_at > old_created);
+        assert_eq!(returned.id, old_id);
+        assert_eq!(returned.created_at, old_created);
     }
 
     /// Regression for the `/compact` summary loss observed when an

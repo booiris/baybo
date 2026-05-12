@@ -723,7 +723,8 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT ordinal, superseded_by, role, content FROM session_messages \
+                "SELECT ordinal, superseded_by, role, content, created_at \
+                 FROM session_messages \
                  WHERE session_id = ?1 ORDER BY ordinal",
                 libsql::params![session_id.as_str().to_string()],
             )
@@ -750,11 +751,20 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(3)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
+            let created_us: i64 = row
+                .get(4)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get created: {e}")))?;
+            let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "session_messages.created_at out of range: {created_us}"
+                ))
+            })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push(crate::session::StoredMessage {
                 ordinal,
                 superseded_by,
+                created_at,
                 message: aura_model::ChatMessage {
                     role: role
                         .parse::<aura_model::Role>()

@@ -14,6 +14,12 @@ pub struct StoredMessage {
     /// `Some(n)` when a later compaction at ordinal `n` replaced this
     /// row in the active set; `None` while still active.
     pub superseded_by: Option<i64>,
+    /// Wall-clock time the row was written. Used by trace hydration to
+    /// detect ordinal collisions across session lifetimes: if a row's
+    /// `created_at` is later than the consuming span's `started_at`,
+    /// the row belongs to a different epoch and must not be returned
+    /// as that span's input.
+    pub created_at: DateTime<Utc>,
     pub message: ChatMessage,
 }
 

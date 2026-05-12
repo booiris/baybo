@@ -617,6 +617,7 @@ struct StoredMessageRow {
     ordinal: u64,
     message: ChatMessage,
     superseded_by: Option<u64>,
+    created_at: DateTime<Utc>,
 }
 
 /// In-memory `SessionStore` for tests across the workspace. Lineage /
@@ -715,6 +716,7 @@ impl SessionStore for MemorySessionStore {
             ordinal,
             message: message.clone(),
             superseded_by: None,
+            created_at: Utc::now(),
         });
         Ok(())
     }
@@ -732,11 +734,13 @@ impl SessionStore for MemorySessionStore {
                 entry.superseded_by = Some(next_ordinal);
             }
         }
+        let stamp = Utc::now();
         for (offset, msg) in new_active.iter().enumerate() {
             log.push(StoredMessageRow {
                 ordinal: next_ordinal + offset as u64,
                 message: msg.clone(),
                 superseded_by: None,
+                created_at: stamp,
             });
         }
         Ok(())
@@ -784,6 +788,7 @@ impl SessionStore for MemorySessionStore {
                     .map(|m| StoredMessage {
                         ordinal: m.ordinal as i64,
                         superseded_by: m.superseded_by.map(|v| v as i64),
+                        created_at: m.created_at,
                         message: m.message.clone(),
                     })
                     .collect();
