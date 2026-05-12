@@ -435,7 +435,6 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN is_normal_session INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE session_summaries ADD COLUMN in_flight INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE session_summaries ADD COLUMN in_flight_owner TEXT",
-            "ALTER TABLE session_messages ADD COLUMN from_user INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(e) = self.conn.execute(stmt, ()).await
                 && !e.to_string().contains("duplicate column name")

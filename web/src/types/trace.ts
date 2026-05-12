@@ -91,10 +91,9 @@ export interface ChatMessage {
   /**
    * `true` only when the message originated from a user channel input.
    * Distinguishes the genuine prompt from `Role::User` messages the
-   * agent injects (skill reminders, system-reminders). Absent on rows
-   * persisted before the column existed — treat undefined as `false`.
+   * agent injects (skill reminders, system-reminders).
    */
-  from_user?: boolean;
+  from_user: boolean;
 }
 
 // ── Span ──────────────────────────────────────────────────────────────

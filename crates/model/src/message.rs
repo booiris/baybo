@@ -73,14 +73,7 @@ pub struct ChatMessage {
     /// of its own (skill reminders, system-reminders, etc.); this flag
     /// distinguishes the genuine prompt from those so trace replay can
     /// surface the user's actual input in the job summary panel.
-    /// Defaults to `false` so existing call sites and pre-flag rows
-    /// stay valid.
-    #[serde(default, skip_serializing_if = "is_false")]
     pub from_user: bool,
-}
-
-fn is_false(v: &bool) -> bool {
-    !*v
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

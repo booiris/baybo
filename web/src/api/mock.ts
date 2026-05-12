@@ -259,7 +259,7 @@ function userMsg(text: string): ChatMessage {
 }
 
 function systemMsg(text: string): ChatMessage {
-  return { role: 'system', content: [{ Text: text }] };
+  return { role: 'system', content: [{ Text: text }], from_user: false };
 }
 
 export function getMockSessionReplay(sessionId: string): SessionReplay {
@@ -359,6 +359,7 @@ export function getMockSessionReplay(sessionId: string): SessionReplay {
             ToolUse: { id: 'tu_1', name: 'list_directory', input: { path: '.' } },
           },
         ],
+        from_user: false,
       },
       {
         role: 'tool',
@@ -366,6 +367,7 @@ export function getMockSessionReplay(sessionId: string): SessionReplay {
           { ToolResult: { tool_use_id: 'tu_1', content: '{"files":["README.md","src","package.json"]}' } },
           { ToolResult: { tool_use_id: 'tu_2', content: '{"content":"..."}' } },
         ],
+        from_user: false,
       },
     ],
     'There are 3 entries: README.md, src/, package.json. README documents Aura.',
