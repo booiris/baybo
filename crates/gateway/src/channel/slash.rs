@@ -19,6 +19,8 @@
 //! Adapter-side commands (TUI's `/clear`, `/quit`, …) live in their
 //! respective channels and never reach the gateway.
 
+use std::sync::LazyLock;
+
 use aura_channels::COMPACT_COMMAND_NAME;
 use aura_channels::wire::{Message as WireMessage, SlashCommandSpec};
 use aura_model::{ChannelType, SessionId};
@@ -32,7 +34,7 @@ use super::session_resolver::ChannelSessionResolver;
 /// Discord application commands, …) stays in sync without sidecars
 /// keeping their own hardcoded copy. Adding a new command here is the
 /// single edit needed for the dispatcher + every sidecar to learn it.
-pub fn manifest() -> Vec<SlashCommandSpec> {
+static MANIFEST: LazyLock<Vec<SlashCommandSpec>> = LazyLock::new(|| {
     vec![
         SlashCommandSpec {
             command: "new".to_string(),
@@ -43,6 +45,10 @@ pub fn manifest() -> Vec<SlashCommandSpec> {
             description: "Summarize the conversation and free context".to_string(),
         },
     ]
+});
+
+pub fn manifest() -> Vec<SlashCommandSpec> {
+    MANIFEST.clone()
 }
 
 pub(crate) enum SlashOutcome {

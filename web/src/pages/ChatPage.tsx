@@ -946,6 +946,31 @@ export function ChatPage() {
 
 // ── frame routing ───────────────────────────────────────────────────
 
+/** Apply `mapTranscript` to the session bucket and bump `unreadCount`
+ *  iff `sid` is a background session AND `shouldBump` accepts the last
+ *  row of the existing transcript. Centralises the
+ *  "background-session unread accounting" rule shared by Delta- and
+ *  Message-frame handling. */
+function patchBucketWithBump(
+  prev: Record<string, SessionView>,
+  sid: string,
+  currentSessionId: string | undefined,
+  shouldBump: (last: TranscriptRow | undefined) => boolean,
+  mapTranscript: (transcript: TranscriptRow[]) => TranscriptRow[],
+): Record<string, SessionView> {
+  const view = prev[sid] ?? EMPTY_VIEW;
+  const isBackground = sid !== currentSessionId;
+  const bump = isBackground && shouldBump(view.transcript[view.transcript.length - 1]) ? 1 : 0;
+  return {
+    ...prev,
+    [sid]: {
+      ...view,
+      transcript: mapTranscript(view.transcript),
+      unreadCount: view.unreadCount + bump,
+    },
+  };
+}
+
 /** Update the right per-session bucket based on a frame's session_id.
  *  Always operates on the views map via setViews so background
  *  sessions accumulate frames even when not currently viewed. */
@@ -958,22 +983,17 @@ function routeInboundFrame(
   switch (frame.kind) {
     case 'delta': {
       const sid = frame.session_id;
-      setViews((prev) => {
-        const view = prev[sid] ?? EMPTY_VIEW;
-        // Only count the *first* delta of a stream — subsequent ones
-        // append to a streaming row we've already bumped for.
-        const last = view.transcript[view.transcript.length - 1];
-        const isFreshStream = !(last?.streaming && last.role === 'assistant');
-        const bump = sid !== currentSessionId && isFreshStream ? 1 : 0;
-        return {
-          ...prev,
-          [sid]: {
-            ...view,
-            transcript: appendStreamingDelta(view.transcript, frame.text),
-            unreadCount: view.unreadCount + bump,
-          },
-        };
-      });
+      setViews((prev) =>
+        patchBucketWithBump(
+          prev,
+          sid,
+          currentSessionId,
+          // Only count the *first* delta of a stream — subsequent ones
+          // append to a streaming row we've already bumped for.
+          (last) => !(last?.streaming && last.role === 'assistant'),
+          (t) => appendStreamingDelta(t, frame.text),
+        ),
+      );
       return;
     }
     case 'message': {
@@ -1040,25 +1060,19 @@ function routeInboundFrame(
         });
         return;
       }
-      setViews((prev) => {
-        const view = prev[sid] ?? EMPTY_VIEW;
-        // Finalizing an assistant stream was already counted at the
-        // first delta — only bump for fresh rows (other-tab user
-        // echoes without platform_msg_id, or a non-streaming
-        // assistant Message arriving before any Delta).
-        const last = view.transcript[view.transcript.length - 1];
-        const isFinalizingStream =
-          role === 'assistant' && last?.streaming && last.role === 'assistant';
-        const bump = sid !== currentSessionId && !isFinalizingStream ? 1 : 0;
-        return {
-          ...prev,
-          [sid]: {
-            ...view,
-            transcript: finalizeMessage(view.transcript, role, frame.content),
-            unreadCount: view.unreadCount + bump,
-          },
-        };
-      });
+      setViews((prev) =>
+        patchBucketWithBump(
+          prev,
+          sid,
+          currentSessionId,
+          // Finalizing an assistant stream was already counted at the
+          // first delta — only bump for fresh rows (other-tab user
+          // echoes without platform_msg_id, or a non-streaming
+          // assistant Message arriving before any Delta).
+          (last) => !(role === 'assistant' && last?.streaming && last.role === 'assistant'),
+          (t) => finalizeMessage(t, role, frame.content),
+        ),
+      );
       return;
     }
     case 'notice': {
@@ -1132,14 +1146,17 @@ function routeInboundFrame(
       setViews((prev) => {
         // Walk every session bucket since we don't know which one
         // the call_id belongs to. Map is small (~tabs visited), so
-        // this is cheap.
-        const next: Record<string, SessionView> = { ...prev };
+        // this is cheap. Return `prev` unchanged when no card matches
+        // — the call_id may belong to an already-resolved session, and
+        // a fresh object would force every SessionRow to re-render.
+        let next: Record<string, SessionView> | null = null;
         for (const [sid, view] of Object.entries(prev)) {
           if (view.pendingApproval?.callId === frame.call_id) {
+            next ??= { ...prev };
             next[sid] = { ...view, pendingApproval: null };
           }
         }
-        return next;
+        return next ?? prev;
       });
       return;
     }
@@ -1539,23 +1556,28 @@ function ApprovalCard({
   );
 }
 
+const CONNECTION_BADGE_COLOR: Record<ConnectionStatus['state'], string> = {
+  connected: 'bg-ok',
+  connecting: 'bg-warning',
+  disconnected: 'bg-error',
+};
+
+function connectionBadgeLabel(status: ConnectionStatus): string {
+  switch (status.state) {
+    case 'connected':
+      return 'connected';
+    case 'connecting':
+      return 'connecting…';
+    case 'disconnected':
+      return `reconnecting in ${Math.round(status.retryInMs / 1000)}s`;
+  }
+}
+
 function ConnectionBadge({ status }: { status: ConnectionStatus }) {
-  const color =
-    status.state === 'connected'
-      ? 'bg-ok'
-      : status.state === 'connecting'
-        ? 'bg-warning'
-        : 'bg-error';
-  const label =
-    status.state === 'connected'
-      ? 'connected'
-      : status.state === 'connecting'
-        ? 'connecting…'
-        : `reconnecting in ${Math.round(status.retryInMs / 1000)}s`;
   return (
     <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-ink-soft">
-      <span className={`w-2 h-2 rounded-full ${color}`} />
-      {label}
+      <span className={`w-2 h-2 rounded-full ${CONNECTION_BADGE_COLOR[status.state]}`} />
+      {connectionBadgeLabel(status)}
     </span>
   );
 }

@@ -154,7 +154,8 @@ impl SessionLlmLogger {
             message: message.clone(),
         };
         let mut line = typed_record_line("message", &record)?;
-        self.write_line(record.session_id.as_str(), &mut line).await?;
+        self.write_line(record.session_id.as_str(), &mut line)
+            .await?;
         state
             .last_message_id_by_session
             .insert(session_id.as_str().to_owned(), message_id.clone());

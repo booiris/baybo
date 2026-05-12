@@ -84,11 +84,11 @@ impl Default for ChannelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::SessionId;
     use crate::connection::{Connection, ConnectionSink, SendOutcome};
     use crate::kind::ChannelKind;
     use crate::types::SessionEvent;
     use crate::wire::Frame;
+    use aura_model::SessionId;
 
     struct DiscardSink;
     impl ConnectionSink for DiscardSink {

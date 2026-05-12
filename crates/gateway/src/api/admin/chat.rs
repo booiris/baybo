@@ -28,7 +28,7 @@
 //! [`crate::auth::AuthedClient::Web`].
 
 use aura_channels::wire::{ChatListEvent, Frame, SlashCommandSpec};
-use aura_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
+use aura_model::{ChannelType, ChatMessage, ContentBlock, Session, SessionId, User};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
@@ -38,7 +38,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::api::dto::{ErrorBody, ListResponse};
-use crate::auth::{CHANNEL_TOKEN_HEADER, ClientIdentity, WEB_CLIENT_LABEL_PREFIX};
+use crate::auth::{
+    CHANNEL_TOKEN_HEADER, ClientIdentity, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
+};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -167,7 +169,6 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatSessionsList {
     pub items: Vec<ChatSessionSummary>,
-    pub total: usize,
 }
 
 /// Wire DTO for slash command entries. Mirror of
@@ -250,8 +251,7 @@ async fn list_sessions(
             hidden: s.hidden,
         })
         .collect();
-    let total = items.len();
-    Ok(Json(ChatSessionsList { items, total }))
+    Ok(Json(ChatSessionsList { items }))
 }
 
 #[utoipa::path(
@@ -336,18 +336,7 @@ async fn delete_session(
     // row — see the module docstring. The channel-token stays alive
     // so any tab still anchored on this session keeps working; users
     // can restore via `POST .../unhide` or `?include_hidden=true`.
-    let sid = SessionId::from(session_id.as_str());
-    let session = state
-        .session_manager
-        .get(&sid)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("load session: {e}")))?
-        .ok_or_else(|| GatewayError::NotFound(format!("chat session {session_id}")))?;
-    if session.channel != ChannelType::http() {
-        return Err(GatewayError::NotFound(format!(
-            "session {session_id} is not a web chat session"
-        )));
-    }
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
     state
         .session_manager
         .set_hidden(&sid, true)
@@ -374,18 +363,7 @@ async fn unhide_session(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
 ) -> Result<axum::http::StatusCode> {
-    let sid = SessionId::from(session_id.as_str());
-    let session = state
-        .session_manager
-        .get(&sid)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("load session: {e}")))?
-        .ok_or_else(|| GatewayError::NotFound(format!("chat session {session_id}")))?;
-    if session.channel != ChannelType::http() {
-        return Err(GatewayError::NotFound(format!(
-            "session {session_id} is not a web chat session"
-        )));
-    }
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
     state
         .session_manager
         .set_hidden(&sid, false)
@@ -412,21 +390,10 @@ async fn refresh_session_token(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ChatSessionCredential>> {
-    let sid = SessionId::from(session_id.as_str());
     // Confirm the session exists (and is an http session) before
     // minting a token for it — minting for a non-existent session
     // would issue credentials that never reach a useful target.
-    let session = state
-        .session_manager
-        .get(&sid)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("load session: {e}")))?
-        .ok_or_else(|| GatewayError::NotFound(format!("chat session {session_id}")))?;
-    if session.channel != ChannelType::http() {
-        return Err(GatewayError::NotFound(format!(
-            "session {session_id} is not a web chat session"
-        )));
-    }
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
     Ok(Json(mint_credential(&state, &sid)))
 }
 
@@ -461,7 +428,7 @@ fn mint_credential(state: &AdminState, session_id: &SessionId) -> ChatSessionCre
     let handle = state.channel_tokens.mint(ClientIdentity {
         pid: std::process::id(),
         label,
-        bound_channel_type: Some(ChannelType::HTTP.to_owned()),
+        bound_channel_type: Some(ChannelType::http().to_string()),
     });
     let token = handle.token().to_owned();
     // Replacing an existing entry drops the previous `TokenHandle`,
@@ -476,10 +443,33 @@ fn mint_credential(state: &AdminState, session_id: &SessionId) -> ChatSessionCre
 
 fn web_operator_user() -> User {
     User {
-        id: "web-operator".to_owned(),
+        id: WEB_OPERATOR_USER_ID.to_owned(),
         name: Some("Web Operator".to_owned()),
         channel: ChannelType::http(),
     }
+}
+
+/// Load the session row for `session_id` and verify it lives on the
+/// `http` channel. Both branches return `NotFound` so a request for a
+/// Telegram/WeChat session id through the chat API doesn't reveal the
+/// existence of non-chat sessions.
+async fn load_web_chat_session(
+    state: &AdminState,
+    session_id: &str,
+) -> Result<(SessionId, Session)> {
+    let sid = SessionId::from(session_id);
+    let session = state
+        .session_manager
+        .get(&sid)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load session: {e}")))?
+        .ok_or_else(|| GatewayError::NotFound(format!("chat session {session_id}")))?;
+    if session.channel != ChannelType::http() {
+        return Err(GatewayError::NotFound(format!(
+            "session {session_id} is not a web chat session"
+        )));
+    }
+    Ok((sid, session))
 }
 
 /// Push a `Frame::ChatSessionListChanged` to every connection on the

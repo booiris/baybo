@@ -53,7 +53,11 @@ impl WsTransport {
     /// to one session so multiple concurrent TUI processes can share
     /// the same gateway — the gateway routes events for that session
     /// to this connection only.
-    pub async fn connect(addr: SocketAddr, tui_token: String, session_id: SessionId) -> Result<Self> {
+    pub async fn connect(
+        addr: SocketAddr,
+        tui_token: String,
+        session_id: SessionId,
+    ) -> Result<Self> {
         let (client, initial_history) = WsClient::connect_tui(
             addr,
             &tui_token,

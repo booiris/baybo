@@ -48,6 +48,15 @@ pub const TOOL_CLIENT_LABEL_PREFIX: &str = "tool/";
 /// `DELETE /v1/chat/sessions/:id`.
 pub const WEB_CLIENT_LABEL_PREFIX: &str = "web/";
 
+/// Synthetic `User.id` the chat API stamps on sessions originated from
+/// the browser. Sessions on the `http` channel don't have an external
+/// per-user identity the way Telegram/WeChat do — every web tab the
+/// operator opens is the same human at the keyboard — so we collapse
+/// them under one well-known id. Used both server-side
+/// (`create_session` user, dispatch routing) and on the wire when the
+/// web client constructs outbound `Frame::Send` envelopes.
+pub const WEB_OPERATOR_USER_ID: &str = "web-operator";
+
 /// Secret-vault key under which the gateway publishes the current
 /// generation of the TUI channel token. Rotated on every `aura
 /// gateway start`; the bundled `aura tui` reads it back from the vault

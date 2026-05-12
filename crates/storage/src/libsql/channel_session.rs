@@ -17,11 +17,7 @@ impl LibsqlChannelSessionStore {
 
 #[async_trait]
 impl ChannelSessionStore for LibsqlChannelSessionStore {
-    async fn get(
-        &self,
-        channel_type: &ChannelType,
-        user_id: &str,
-    ) -> Result<Option<SessionId>> {
+    async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<SessionId>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
@@ -172,17 +168,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store
-                .get(&ChannelType::telegram(), "tg_42")
-                .await
-                .unwrap(),
+            store.get(&ChannelType::telegram(), "tg_42").await.unwrap(),
             Some(sid("sess-tg")),
         );
         assert_eq!(
-            store
-                .get(&ChannelType::discord(), "tg_42")
-                .await
-                .unwrap(),
+            store.get(&ChannelType::discord(), "tg_42").await.unwrap(),
             Some(sid("sess-dc")),
         );
     }

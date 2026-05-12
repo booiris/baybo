@@ -22,11 +22,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub trait ChannelSessionStore: Send + Sync {
     /// Look up the aura `session_id` for `(channel_type, user_id)`.
     /// Returns `Ok(None)` when no mapping exists.
-    async fn get(
-        &self,
-        channel_type: &ChannelType,
-        user_id: &str,
-    ) -> Result<Option<SessionId>>;
+    async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<SessionId>>;
 
     /// Persist `session_id` under `(channel_type, user_id)`. On
     /// conflict with a live row carrying a *different* `session_id`,

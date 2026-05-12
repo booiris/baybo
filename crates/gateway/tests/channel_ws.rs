@@ -12,7 +12,9 @@ use std::time::Duration;
 use aura_channels::wire::{self, ChatListEvent, Frame, Message as WireMessage};
 use aura_channels::{AgentOutput, ChannelKind, MessageRole, OutgoingMessage};
 use aura_config::ChannelsConfig;
-use aura_gateway::auth::{ChannelTokenTable, ClientIdentity, TokenHandle, WEB_CLIENT_LABEL_PREFIX};
+use aura_gateway::auth::{
+    ChannelTokenTable, ClientIdentity, TokenHandle, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
+};
 use aura_gateway::channel::boot;
 use aura_gateway::channel_listener::ChannelServer;
 use aura_gateway::test_support::build_test_deps;
@@ -31,7 +33,7 @@ fn mint_web_token(tokens: &ChannelTokenTable, slot: &str) -> (String, TokenHandl
     let handle = tokens.mint(ClientIdentity {
         pid: std::process::id(),
         label: format!("{WEB_CLIENT_LABEL_PREFIX}{slot}"),
-        bound_channel_type: Some(ChannelType::HTTP.to_owned()),
+        bound_channel_type: Some(ChannelType::http().to_string()),
     });
     (handle.token().to_string(), handle)
 }
@@ -189,7 +191,7 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
     // Server-side dispatch reaches the subscribed client.
     let outgoing = OutgoingMessage {
         session_id: "sess-1".into(),
-        user_id: "web-operator".into(),
+        user_id: WEB_OPERATOR_USER_ID.into(),
         channel: ChannelType::http(),
         content: vec![ContentBlock::Text("hello".into())],
         reply_to: None,
@@ -282,7 +284,7 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
     http_channel.dispatch(
         AgentOutput::Delta {
             session_id: "shared".into(),
-            user_id: "web-operator".into(),
+            user_id: WEB_OPERATOR_USER_ID.into(),
             channel: ChannelType::http(),
             text: "stream chunk".into(),
         }
@@ -517,7 +519,7 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
     let send_msg = |id: &str, content: &str| WireMessage {
         content: content.into(),
         session_id: "sess-dedup".into(),
-        user_id: "web-operator".into(),
+        user_id: WEB_OPERATOR_USER_ID.into(),
         channel_type: ChannelType::http(),
         bot_id: String::new(),
         attachments: Vec::new(),
@@ -602,7 +604,7 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
 
     let session_manager = Arc::clone(&tg.deps.session_manager);
     let user = User {
-        id: "web-operator".into(),
+        id: WEB_OPERATOR_USER_ID.into(),
         name: None,
         channel: ChannelType::http(),
     };

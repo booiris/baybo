@@ -584,7 +584,6 @@ export interface components {
         };
         ChatSessionsList: {
             items: components["schemas"]["ChatSessionSummary"][];
-            total: number;
         };
         /**
          * @description One transcript row, flattened from `ChatMessage` into a shape the

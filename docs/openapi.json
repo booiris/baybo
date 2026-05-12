@@ -2413,8 +2413,7 @@
       "ChatSessionsList": {
         "type": "object",
         "required": [
-          "items",
-          "total"
+          "items"
         ],
         "properties": {
           "items": {
@@ -2422,10 +2421,6 @@
             "items": {
               "$ref": "#/components/schemas/ChatSessionSummary"
             }
-          },
-          "total": {
-            "type": "integer",
-            "minimum": 0
           }
         }
       },
