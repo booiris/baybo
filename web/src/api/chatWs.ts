@@ -49,7 +49,16 @@ export interface ResourceAccess {
   vars?: string[];
 }
 
-export type ChatListEvent = 'created' | 'hidden' | 'unhidden';
+/** Sparse mutation surface — mirror of Rust `SessionPatch`. Every
+ *  field independently optional; absent means "no change". A patch
+ *  for an unknown session_id constructs a row iff it carries enough
+ *  fields to render the sidebar (currently `created_at` +
+ *  `last_active`). */
+export interface SessionPatch {
+  created_at?: string;
+  last_active?: string;
+  hidden?: boolean;
+}
 
 export type Frame =
   | { kind: 'register'; token: string; channel_type: string }
@@ -79,7 +88,7 @@ export type Frame =
   | { kind: 'stop_bot'; bot_id: string }
   | { kind: 'bot_status'; bot_id: string; ok: boolean; message?: string }
   | { kind: 'slash_manifest'; commands: { command: string; description: string }[] }
-  | { kind: 'chat_session_list_changed'; event: ChatListEvent; session_id: string }
+  | { kind: 'session_updated'; session_id: string; patch: SessionPatch }
   | { kind: 'ping' }
   | { kind: 'pong' };
 

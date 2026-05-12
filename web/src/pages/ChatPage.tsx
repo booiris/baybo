@@ -27,6 +27,7 @@ import {
   type ConnectionStatus,
   type Frame,
   type ResourceAccess,
+  type SessionPatch,
 } from '../api/chatWs';
 
 interface TranscriptRow {
@@ -190,11 +191,6 @@ export function ChatPage() {
   // Generation counter so a retry chain started by an older
   // rejection stops if a newer rejection (or unmount) supersedes it.
   const tokenRemintGenRef = useRef(0);
-  // Latest "refetch session list" closure. Kept in a ref so the WS
-  // onFrame callback (captured once at WS construction) sees the
-  // current client / setSessions without rebuilding the ChatWs on
-  // every client change.
-  const refreshSessionsRef = useRef<(() => void) | null>(null);
 
   // ── Bootstrap: load session list + slash manifest, mint a token ─────
   // Runs once on mount. Anchor selection priority:
@@ -301,25 +297,6 @@ export function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client]); // intentionally NOT depending on sessionId — bootstrap is one-shot
 
-  // Always-current "refetch session list" closure for the WS
-  // `chat_session_list_changed` pulse. The gateway broadcasts that
-  // frame to every web connection on any session create / hide /
-  // unhide, so the sidebar reflects mutations made by sibling tabs
-  // (same browser or another device) without an explicit reload.
-  // Kept in a ref so the WS onFrame closure stays valid across
-  // client memo changes.
-  useEffect(() => {
-    refreshSessionsRef.current = async () => {
-      const { data, error } = await client.GET('/v1/chat/sessions');
-      if (error) {
-        console.warn('refresh chat sessions failed', error);
-        return;
-      }
-      const items = (data?.items as SessionSummary[] | undefined) ?? [];
-      setSessions(items);
-    };
-  }, [client]);
-
   // Always-current handler for register_ack { ok: false }. Mints a
   // fresh token against the anchor session and feeds it back into
   // ChatWs via replaceToken. Backs off on POST failure, abandons the
@@ -363,8 +340,8 @@ export function ChatPage() {
       initialSessionIds: [],
       onStatus: setStatus,
       onFrame: (frame) => {
-        if (frame.kind === 'chat_session_list_changed') {
-          refreshSessionsRef.current?.();
+        if (frame.kind === 'session_updated') {
+          setSessions((prev) => applySessionPatch(prev, frame.session_id, frame.patch));
           return;
         }
         // Catch-up replays carry an explicit ordinal — advance the WS
@@ -1263,6 +1240,63 @@ function formatHttpError(err: unknown): string {
   } catch {
     return 'unknown error';
   }
+}
+
+/** Merge a `SessionUpdated` patch onto the sidebar's session list.
+ *
+ *  Rules:
+ *  * `hidden: true` removes the row (sidebar never shows hidden);
+ *  * a patch for an unknown session_id constructs a row iff it
+ *    carries enough fields (currently `created_at` + `last_active`);
+ *    a sparse `last_active`-only patch for an unknown session is
+ *    dropped on the floor (Created arrives separately and adds it).
+ *  * Otherwise present fields are merged in place — absent fields
+ *    keep their previous values.
+ *
+ *  Sort order: keep "most-recent `last_active` first" so a session
+ *  bumping its activity floats to the top without an explicit list
+ *  refetch. Stable for rows whose `last_active` didn't change. */
+function applySessionPatch(
+  prev: SessionSummary[],
+  sessionId: string,
+  patch: SessionPatch,
+): SessionSummary[] {
+  if (patch.hidden === true) {
+    return prev.filter((s) => s.session_id !== sessionId);
+  }
+  const idx = prev.findIndex((s) => s.session_id === sessionId);
+  if (idx === -1) {
+    if (patch.created_at == null || patch.last_active == null) return prev;
+    return sortByLastActiveDesc([
+      ...prev,
+      {
+        session_id: sessionId,
+        created_at: patch.created_at,
+        last_active: patch.last_active,
+      },
+    ]);
+  }
+  const current = prev[idx];
+  const merged: SessionSummary = {
+    session_id: current.session_id,
+    created_at: patch.created_at ?? current.created_at,
+    last_active: patch.last_active ?? current.last_active,
+  };
+  if (
+    merged.created_at === current.created_at &&
+    merged.last_active === current.last_active
+  ) {
+    return prev;
+  }
+  const next = prev.slice();
+  next[idx] = merged;
+  return sortByLastActiveDesc(next);
+}
+
+function sortByLastActiveDesc(list: SessionSummary[]): SessionSummary[] {
+  return list
+    .slice()
+    .sort((a, b) => Date.parse(b.last_active) - Date.parse(a.last_active));
 }
 
 /** First user message, truncated, as the conversation's display title.

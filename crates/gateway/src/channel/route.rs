@@ -375,14 +375,15 @@ async fn run_inbound_loop(
                         };
                         let content =
                             wire_to_content_blocks(wire_msg.content, wire_msg.attachments);
+                        let timestamp = Utc::now();
                         let incoming = IncomingMessage {
                             message: AgentMessage {
                                 id: uuid::Uuid::new_v4().to_string(),
-                                session_id,
+                                session_id: session_id.clone(),
                                 channel: channel_type.clone(),
                                 sender,
                                 content,
-                                timestamp: Utc::now(),
+                                timestamp,
                                 reply_to: None,
                                 metadata: MessageMetadata::default(),
                             },
@@ -396,6 +397,19 @@ async fn run_inbound_loop(
                         if let Err(e) = state.incoming_tx.send(incoming).await {
                             tracing::error!(error = %e, "router intake closed; tearing down");
                             break;
+                        }
+                        // Push a throttled `last_active` patch so
+                        // sibling tabs' sidebars rerender
+                        // `relativeAge(last_active)` without a list
+                        // refetch. The agent's own
+                        // `SessionManager::touch` runs shortly after
+                        // this; `timestamp` matches the row the agent
+                        // is about to persist, so siblings don't see
+                        // an interim "future" value.
+                        if channel_type == &ChannelType::http() {
+                            state
+                                .session_pulse
+                                .touch(&state.registry, &session_id, timestamp);
                         }
                     }
                     Frame::ResolveApproval { call_id, decision } => {

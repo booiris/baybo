@@ -15,6 +15,7 @@
 
 use aura_model::{ChannelType, ResourceAccess, SessionId};
 use aura_tools::ApprovalDecision;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -346,17 +347,29 @@ pub enum Frame {
     /// prior list. Sidecars that don't surface client-side autocomplete
     /// may ignore this.
     SlashManifest { commands: Vec<SlashCommandSpec> },
-    /// Server → client: the set of web chat sessions changed
-    /// (created / hidden / unhidden). Broadcast to *every* connection
-    /// on the `http` channel regardless of session subscription so
-    /// every open chat tab refreshes its sidebar without the operator
-    /// reloading. Payload is a hint only — the client refetches
-    /// `GET /v1/chat/sessions` to get the canonical list. Sidecars
-    /// and non-web channels ignore this frame.
-    ChatSessionListChanged {
-        event: ChatListEvent,
+    /// Server → client: session metadata changed. Broadcast to every
+    /// connection on the `http` channel regardless of subscription so
+    /// every open chat tab converges on the new state without a full
+    /// list refetch — high-frequency emissions (per-turn `last_active`
+    /// bumps) would make refetch infeasible. Sidecars and non-web
+    /// channels ignore this frame.
+    ///
+    /// Patch semantics — see [`SessionPatch`]:
+    /// * fields the producer didn't touch are absent (`None`); clients
+    ///   merge present fields onto their local row and leave the rest;
+    /// * a patch for a `session_id` the client doesn't yet know
+    ///   constructs a new row iff it carries enough fields (currently
+    ///   `created_at` + `last_active`); otherwise the patch is dropped
+    ///   and the client picks the session up at next list refetch.
+    ///
+    /// Producers: `POST /v1/chat/sessions` (Created — full patch),
+    /// `DELETE /v1/chat/sessions/:id` (hidden=true), `unhide` (full
+    /// patch), and the inbound-message path's per-session
+    /// `last_active` broadcaster (throttled).
+    SessionUpdated {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
+        patch: SessionPatch,
     },
     /// Liveness probe (either direction). The receiver MUST reply with
     /// [`Frame::Pong`].
@@ -377,22 +390,42 @@ pub enum Frame {
     Pong,
 }
 
-/// Mutation kind carried on [`Frame::ChatSessionListChanged`]. Only
-/// set-membership changes are pushed — `last_active` reordering is
-/// resolved at the next bootstrap (which sorts by `last_active` desc)
-/// rather than streamed, so a busy session doesn't fan out a frame
-/// per user keystroke.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+/// Sparse mutation surface carried on [`Frame::SessionUpdated`].
+/// Every field is independently optional; producers populate only what
+/// changed. Receivers merge present fields onto their local view —
+/// absent does *not* mean "set to null", it means "no change".
+///
+/// New session-metadata fields slot in by adding another optional
+/// here; the existing producers don't have to learn about them, and
+/// older clients ignore unknown keys (msgpack-named decode tolerates
+/// unknown fields).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
     ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
 )]
-pub enum ChatListEvent {
-    Created,
-    Hidden,
-    Unhidden,
+pub struct SessionPatch {
+    /// Populated on Create / Unhide so a sibling tab that doesn't have
+    /// the session in its local list can still construct a sidebar
+    /// row without a list refetch. Stable for the lifetime of the
+    /// session; bumps on touch are carried via `last_active` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+    pub created_at: Option<DateTime<Utc>>,
+    /// Bumped per inbound message on the session. Throttled by the
+    /// broadcaster (see `route::run_inbound_loop`) so a busy session
+    /// doesn't fan out a frame per keystroke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+    pub last_active: Option<DateTime<Utc>>,
+    /// Flipped by `DELETE /v1/chat/sessions/:id` (true) and `unhide`
+    /// (false). `true` means remove from sidebar; `false` paired with
+    /// `created_at` + `last_active` lets a client re-add a previously-
+    /// hidden session it might never have seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub hidden: Option<bool>,
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -656,17 +689,45 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_chat_session_list_changed() {
-        for event in [
-            ChatListEvent::Created,
-            ChatListEvent::Hidden,
-            ChatListEvent::Unhidden,
-        ] {
-            let frame = Frame::ChatSessionListChanged {
-                event,
-                session_id: "sess-abc".into(),
-            };
-            assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-        }
+    fn round_trip_session_updated_full_patch() {
+        let now = chrono::Utc::now();
+        let frame = Frame::SessionUpdated {
+            session_id: "sess-abc".into(),
+            patch: SessionPatch {
+                created_at: Some(now),
+                last_active: Some(now),
+                hidden: Some(false),
+            },
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_session_updated_sparse_patch() {
+        // A `last_active`-only patch — the per-turn broadcaster shape.
+        // Absent fields stay absent on decode (None), so older clients
+        // that don't know about future fields still see a clean merge.
+        let now = chrono::Utc::now();
+        let frame = Frame::SessionUpdated {
+            session_id: "sess-abc".into(),
+            patch: SessionPatch {
+                created_at: None,
+                last_active: Some(now),
+                hidden: None,
+            },
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_session_updated_hidden_only() {
+        let frame = Frame::SessionUpdated {
+            session_id: "sess-abc".into(),
+            patch: SessionPatch {
+                hidden: Some(true),
+                ..SessionPatch::default()
+            },
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
 }

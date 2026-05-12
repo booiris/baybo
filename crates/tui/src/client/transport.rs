@@ -284,8 +284,8 @@ fn map_frame(
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
-        Frame::ChatSessionListChanged { .. } => {
-            // Web-chat sidebar pulse — TUI tracks a single session of
+        Frame::SessionUpdated { .. } => {
+            // Web-chat sidebar patch — TUI tracks a single session of
             // its own and has no list view, so it ignores this rather
             // than warning.
             None

@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::wire::{self, ChatListEvent, Frame, Message as WireMessage};
+use aura_channels::wire::{self, Frame, Message as WireMessage, SessionPatch};
 use aura_channels::{AgentOutput, ChannelKind, MessageRole, OutgoingMessage};
 use aura_config::ChannelsConfig;
 use aura_gateway::auth::{
@@ -388,8 +388,9 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_list_broadcast_reaches_every_web_tab() {
     // Web sidebar sync model: when any tab creates / hides / unhides a
-    // chat session, the gateway pushes `Frame::ChatSessionListChanged`
-    // to every connection on the `http` channel — including connections
+    // chat session (or its `last_active` bumps), the gateway pushes
+    // `Frame::SessionUpdated` with a sparse `SessionPatch` to every
+    // connection on the `http` channel — including connections
     // subscribed to a *different* session, and connections that haven't
     // subscribed to any session at all. This is the contract the
     // sidebar relies on to converge across browsers / devices without
@@ -442,9 +443,14 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
     expect_empty_pending_snapshot(&mut subscriber, "sess-x").await;
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
-    http_channel.broadcast_frame(Frame::ChatSessionListChanged {
-        event: ChatListEvent::Created,
+    let created_at = chrono::Utc::now();
+    http_channel.broadcast_frame(Frame::SessionUpdated {
         session_id: "new-session".into(),
+        patch: SessionPatch {
+            created_at: Some(created_at),
+            last_active: Some(created_at),
+            hidden: Some(false),
+        },
     });
 
     for (label, ws) in [
@@ -455,11 +461,13 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
             .await
             .unwrap_or_else(|e| panic!("{label} did not receive frame: {e}"));
         match frame {
-            Frame::ChatSessionListChanged { event, session_id } => {
-                assert!(matches!(event, ChatListEvent::Created), "{label}: event");
+            Frame::SessionUpdated { session_id, patch } => {
                 assert_eq!(session_id, "new-session", "{label}: session_id");
+                assert_eq!(patch.created_at, Some(created_at), "{label}: created_at");
+                assert_eq!(patch.last_active, Some(created_at), "{label}: last_active");
+                assert_eq!(patch.hidden, Some(false), "{label}: hidden");
             }
-            other => panic!("{label}: expected ChatSessionListChanged, got {other:?}"),
+            other => panic!("{label}: expected SessionUpdated, got {other:?}"),
         }
     }
 

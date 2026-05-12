@@ -27,7 +27,7 @@
 //! The channel-auth middleware turns the token into
 //! [`crate::auth::AuthedClient::Web`].
 
-use aura_channels::wire::{ChatListEvent, Frame, SlashCommandSpec};
+use aura_channels::wire::{Frame, SessionPatch, SlashCommandSpec};
 use aura_model::{ChannelType, ChatMessage, ContentBlock, Session, SessionId, User};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -211,7 +211,17 @@ async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSess
         .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")))?;
     let session_id = session.id.clone();
     let cred = mint_credential(&state, &session_id);
-    broadcast_list_change(&state, ChatListEvent::Created, &session_id);
+    // Created emits a full patch — sibling tabs construct the row
+    // straight from this without a list refetch.
+    broadcast_session_patch(
+        &state,
+        &session_id,
+        SessionPatch {
+            created_at: Some(session.created_at),
+            last_active: Some(session.last_active),
+            hidden: Some(false),
+        },
+    );
     Ok(Json(cred))
 }
 
@@ -342,7 +352,14 @@ async fn delete_session(
         .set_hidden(&sid, true)
         .await
         .map_err(|e| GatewayError::Internal(format!("hide session: {e}")))?;
-    broadcast_list_change(&state, ChatListEvent::Hidden, &sid);
+    broadcast_session_patch(
+        &state,
+        &sid,
+        SessionPatch {
+            hidden: Some(true),
+            ..SessionPatch::default()
+        },
+    );
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -363,13 +380,24 @@ async fn unhide_session(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
 ) -> Result<axum::http::StatusCode> {
-    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    let (sid, session) = load_web_chat_session(&state, &session_id).await?;
     state
         .session_manager
         .set_hidden(&sid, false)
         .await
         .map_err(|e| GatewayError::Internal(format!("unhide session: {e}")))?;
-    broadcast_list_change(&state, ChatListEvent::Unhidden, &sid);
+    // Full patch — a sibling tab that hid this session won't have it
+    // in its current list anymore, and the patch carries enough to
+    // re-add the row directly without a list refetch.
+    broadcast_session_patch(
+        &state,
+        &sid,
+        SessionPatch {
+            created_at: Some(session.created_at),
+            last_active: Some(session.last_active),
+            hidden: Some(false),
+        },
+    );
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -472,20 +500,24 @@ async fn load_web_chat_session(
     Ok((sid, session))
 }
 
-/// Push a `Frame::ChatSessionListChanged` to every connection on the
+/// Push a [`Frame::SessionUpdated`] patch to every connection on the
 /// `http` channel — every open chat tab, whether in this browser or
-/// another. The frame is a hint, not a delta: clients refetch
-/// `GET /v1/chat/sessions` on receipt and update their sidebar from
-/// the canonical list. No-op when the `http` channel isn't installed
-/// (e.g. `channels.http.enabled = false` in `aura.json`); in that case
-/// no web clients can be connected to receive it anyway.
-fn broadcast_list_change(state: &AdminState, event: ChatListEvent, session_id: &SessionId) {
+/// another. The patch carries the truth (no refetch round-trip); see
+/// the variant's doc comment for receiver-side merge rules. No-op
+/// when the `http` channel isn't installed (e.g. `channels.http.
+/// enabled = false`); in that case no web clients can be connected
+/// to receive it anyway.
+pub(crate) fn broadcast_session_patch(
+    state: &AdminState,
+    session_id: &SessionId,
+    patch: SessionPatch,
+) {
     let Some(channel) = state.channel_registry.get(&ChannelType::http()) else {
         return;
     };
-    channel.broadcast_frame(Frame::ChatSessionListChanged {
-        event,
+    channel.broadcast_frame(Frame::SessionUpdated {
         session_id: session_id.clone(),
+        patch,
     });
 }
 
