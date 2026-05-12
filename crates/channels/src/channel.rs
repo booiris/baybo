@@ -13,12 +13,22 @@ use std::sync::Arc;
 use aura_model::{ChannelType, SessionId};
 use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue};
 use dashmap::{DashMap, DashSet};
+use parking_lot::Mutex;
 
 use crate::connection::{Connection, ConnectionId, SendOutcome};
 use crate::kind::ChannelKind;
 use crate::types::{IncomingMessage, SessionEvent};
 use crate::wire::Frame;
 use crate::{ChannelError, Result};
+
+/// Side-effect callback invoked at the top of [`Channel::dispatch`],
+/// before any fan-out. The observer receives the event by reference
+/// (so it can't take ownership and the dispatch path keeps running)
+/// and the channel itself (so it can call back into
+/// [`Channel::broadcast_frame`] to emit derived frames). Used by the
+/// gateway to fire `Frame::SessionActivity` broadcasts for the
+/// `http` channel without coupling this crate to web-sidebar concerns.
+pub type DispatchObserver = Arc<dyn Fn(&SessionEvent, &Channel) + Send + Sync>;
 
 /// Bundle of the channel's approval gate (the `ApprovalGate` trait
 /// object the agent / tool path calls through) and the underlying
@@ -42,6 +52,12 @@ pub struct Channel {
     /// Reverse index for `Subscribed` channels: `session_id` →
     /// connections that asked to see it. Untouched for `Multiplexed`.
     subscriptions: DashMap<SessionId, DashSet<ConnectionId>>,
+    /// Optional pre-dispatch hook. Set by the gateway on the `http`
+    /// channel after install to fire `Frame::SessionActivity`
+    /// broadcasts; other channels leave it `None`. Locked only long
+    /// enough to clone the `Arc` — the observer body runs without the
+    /// lock so it can re-enter `Channel::broadcast_frame` safely.
+    dispatch_observer: Mutex<Option<DispatchObserver>>,
 }
 
 impl Channel {
@@ -56,7 +72,15 @@ impl Channel {
             approvals,
             connections: DashMap::new(),
             subscriptions: DashMap::new(),
+            dispatch_observer: Mutex::new(None),
         }
+    }
+
+    /// Install (or replace) the pre-dispatch observer. Idempotent —
+    /// a second call swaps the previous closure. Pass-through callers
+    /// don't need this; only the http-channel pulse wiring uses it.
+    pub fn set_dispatch_observer(&self, observer: DispatchObserver) {
+        *self.dispatch_observer.lock() = Some(observer);
     }
 
     pub fn channel_type(&self) -> &ChannelType {
@@ -168,6 +192,14 @@ impl Channel {
     /// client to re-fetch history); connections whose transport is
     /// gone are detached.
     pub fn dispatch(&self, event: SessionEvent) {
+        // Fire the pre-dispatch hook before fan-out so the observer
+        // sees every event — including those that drop below because
+        // no subscribers exist for the session (the activity-broadcast
+        // case relies on this exact property).
+        let observer = self.dispatch_observer.lock().clone();
+        if let Some(obs) = observer {
+            obs(&event, self);
+        }
         let session_id = event.session_id().clone();
         let mut to_drop = Vec::new();
         let mut to_reset = Vec::new();

@@ -46,6 +46,28 @@ pub enum AttachmentKind {
     File,
 }
 
+/// Source side of a [`Frame::SessionActivity`] event. Lets clients
+/// render kind-specific UI hints (e.g. "you typed in another tab" vs
+/// "agent replied") without inspecting any other frame.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum ActivityKind {
+    /// A user message landed on the session — either typed in another
+    /// tab of the same operator, or arrived via a non-http channel
+    /// (telegram/weixin) that the operator also watches.
+    User,
+    /// The agent emitted toward the session: streaming `Delta`, a
+    /// final `Message`, or a `Notice`. First Delta of a stream is the
+    /// "agent started responding" signal; throttling collapses the
+    /// rest.
+    Assistant,
+}
+
 /// Reference to a media payload that travels alongside a [`Message`].
 /// The bytes themselves never ride the WS — they live in the gateway's
 /// `BlobStore` and are uploaded / fetched out-of-band via
@@ -347,12 +369,16 @@ pub enum Frame {
     /// prior list. Sidecars that don't surface client-side autocomplete
     /// may ignore this.
     SlashManifest { commands: Vec<SlashCommandSpec> },
-    /// Server → client: session metadata changed. Broadcast to every
-    /// connection on the `http` channel regardless of subscription so
-    /// every open chat tab converges on the new state without a full
-    /// list refetch — high-frequency emissions (per-turn `last_active`
-    /// bumps) would make refetch infeasible. Sidecars and non-web
-    /// channels ignore this frame.
+    /// Server → client: structural session-metadata change. Broadcast
+    /// to every connection on the `http` channel regardless of
+    /// subscription so every open chat tab converges on the new state
+    /// without a full list refetch. Sidecars and non-web channels
+    /// ignore this frame.
+    ///
+    /// Reserved for low-frequency, operator-driven mutations: Create,
+    /// Hide, Unhide. Per-turn liveness bumps are a separate frame
+    /// ([`Frame::SessionActivity`]) so this one stays sparse and
+    /// cacheable.
     ///
     /// Patch semantics — see [`SessionPatch`]:
     /// * fields the producer didn't touch are absent (`None`); clients
@@ -364,12 +390,41 @@ pub enum Frame {
     ///
     /// Producers: `POST /v1/chat/sessions` (Created — full patch),
     /// `DELETE /v1/chat/sessions/:id` (hidden=true), `unhide` (full
-    /// patch), and the inbound-message path's per-session
-    /// `last_active` broadcaster (throttled).
+    /// patch).
     SessionUpdated {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
         patch: SessionPatch,
+    },
+    /// Server → client: a session just had activity (a user message
+    /// landed, or the agent emitted output). Broadcast to every
+    /// connection on the `http` channel regardless of subscription —
+    /// that is the whole point: a sidebar tab whose operator is
+    /// looking at session A still gets a cheap unread signal for
+    /// session F, without having to subscribe to F and pay for the
+    /// full Delta stream.
+    ///
+    /// Throttled at the broadcaster (see
+    /// `gateway::channel::session_pulse`) to one frame per
+    /// `(session_id, kind)` per ~1.5 s window. `kind` lets the client
+    /// distinguish "user typed in another tab" (might already be
+    /// visible elsewhere) from "agent replied" (truly inbound from
+    /// the client's perspective).
+    ///
+    /// Receivers project `at` onto their local `last_active` for the
+    /// session — that's what drives sidebar age strings and
+    /// most-recent-first sort — and bump the unread badge if the
+    /// session isn't currently in the foreground. Sidecars and TUI
+    /// ignore this frame.
+    SessionActivity {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        /// Renamed from the natural `kind` because `kind` is the
+        /// Frame-level serde discriminator — a same-named variant
+        /// field would collide on the wire.
+        source: ActivityKind,
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        at: DateTime<Utc>,
     },
     /// Liveness probe (either direction). The receiver MUST reply with
     /// [`Frame::Pong`].
@@ -413,9 +468,12 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub created_at: Option<DateTime<Utc>>,
-    /// Bumped per inbound message on the session. Throttled by the
-    /// broadcaster (see `route::run_inbound_loop`) so a busy session
-    /// doesn't fan out a frame per keystroke.
+    /// Authoritative `last_active` snapshot at patch-emit time. Only
+    /// carried on Create / Unhide so a sibling tab that doesn't have
+    /// the row yet (or hid it earlier) can render a correct age
+    /// string immediately. Per-turn liveness updates ride
+    /// [`Frame::SessionActivity`] instead, which the client projects
+    /// onto its local `last_active`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub last_active: Option<DateTime<Utc>>,
@@ -727,6 +785,28 @@ mod tests {
                 hidden: Some(true),
                 ..SessionPatch::default()
             },
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_session_activity_user() {
+        let now = chrono::Utc::now();
+        let frame = Frame::SessionActivity {
+            session_id: "sess-abc".into(),
+            source: ActivityKind::User,
+            at: now,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_session_activity_assistant() {
+        let now = chrono::Utc::now();
+        let frame = Frame::SessionActivity {
+            session_id: "sess-abc".into(),
+            source: ActivityKind::Assistant,
+            at: now,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

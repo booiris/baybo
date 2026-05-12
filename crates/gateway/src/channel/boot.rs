@@ -24,6 +24,8 @@ use aura_config::ChannelsConfig;
 use aura_model::{ChannelType, SessionId};
 use aura_tools::{ApprovalGate, ApprovalQueue, ChannelApprovalGate};
 
+use super::session_pulse::SessionPulse;
+
 /// Matches the previous per-Sidecar value so operator muscle memory
 /// around approval timing carries over.
 pub(crate) const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -68,6 +70,16 @@ pub fn install_channels(
     }
     if config.http.as_ref().is_some_and(|c| c.enabled) {
         install_channel(registry, ChannelType::http())?;
+        // Activity-pulse observer: every UserEcho / Agent dispatch
+        // through the http channel triggers a throttled
+        // `Frame::SessionActivity` broadcast so sidebar tabs not
+        // subscribed to the session still get the unread signal.
+        // Installed exactly once at boot; subsequent registry
+        // lookups return the same `Arc<Channel>` with the observer
+        // already wired.
+        if let Some(http) = registry.get(&ChannelType::http()) {
+            SessionPulse::new().install(&http);
+        }
     }
     Ok(())
 }

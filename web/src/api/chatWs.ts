@@ -60,6 +60,13 @@ export interface SessionPatch {
   hidden?: boolean;
 }
 
+/** Source of a `Frame::SessionActivity` event — mirror of Rust
+ *  `ActivityKind`. `user` = a user message landed on the session
+ *  (typed in another tab or arrived via a non-http channel);
+ *  `assistant` = the agent emitted toward the session (delta,
+ *  message, or notice). */
+export type ActivityKind = 'user' | 'assistant';
+
 export type Frame =
   | { kind: 'register'; token: string; channel_type: string }
   | { kind: 'register_ack'; ok: boolean; reason: string | null }
@@ -89,6 +96,7 @@ export type Frame =
   | { kind: 'bot_status'; bot_id: string; ok: boolean; message?: string }
   | { kind: 'slash_manifest'; commands: { command: string; description: string }[] }
   | { kind: 'session_updated'; session_id: string; patch: SessionPatch }
+  | { kind: 'session_activity'; session_id: string; source: ActivityKind; at: string }
   | { kind: 'ping' }
   | { kind: 'pong' };
 

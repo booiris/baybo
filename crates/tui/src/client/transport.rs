@@ -284,9 +284,9 @@ fn map_frame(
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
-        Frame::SessionUpdated { .. } => {
-            // Web-chat sidebar patch — TUI tracks a single session of
-            // its own and has no list view, so it ignores this rather
+        Frame::SessionUpdated { .. } | Frame::SessionActivity { .. } => {
+            // Web-chat sidebar signals — TUI tracks a single session
+            // of its own and has no list view, so it ignores rather
             // than warning.
             None
         }

@@ -20,7 +20,6 @@ use super::bot_reconciler::ChannelBotReconciler;
 use super::control::ChannelControlRegistry;
 use super::dedup::InboundDedup;
 use super::history::TuiHistoryStore;
-use super::session_pulse::SessionPulse;
 use super::session_resolver::ChannelSessionResolver;
 use crate::auth::ChannelTokenTable;
 use crate::log_buffer::LogBuffer;
@@ -83,11 +82,6 @@ pub struct WsChannelState {
     /// agent sees each upstream event exactly once. Sidecars that omit
     /// `platform_msg_id` opt out — every frame is admitted.
     pub inbound_dedup: Arc<InboundDedup>,
-    /// Throttled `last_active` broadcaster for the http channel. Run
-    /// per inbound message; emits at most one `SessionUpdated` patch
-    /// per session per `THROTTLE_WINDOW` so a busy session doesn't
-    /// fan out a frame per user keystroke.
-    pub session_pulse: Arc<SessionPulse>,
 }
 
 impl WsChannelState {
@@ -117,7 +111,6 @@ impl WsChannelState {
             pairing,
             blob_store: deps.stores.blob.clone(),
             inbound_dedup: Arc::new(InboundDedup::new()),
-            session_pulse: SessionPulse::new(),
         }
     }
 }

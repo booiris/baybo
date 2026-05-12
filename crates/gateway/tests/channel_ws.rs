@@ -93,6 +93,27 @@ async fn recv_frame(
     }
 }
 
+/// Like [`recv_frame`] but transparently skips `Frame::SessionActivity`
+/// — the sidebar pulse broadcasts unconditionally to every `http`
+/// connection on dispatch, which would interpose itself before every
+/// expected content frame in tests that don't care about the pulse.
+async fn recv_frame_skip_activity(
+    ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    timeout: Duration,
+) -> Result<Frame, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("recv timeout".into());
+        }
+        let frame = recv_frame(ws, remaining).await?;
+        if !matches!(frame, Frame::SessionActivity { .. }) {
+            return Ok(frame);
+        }
+    }
+}
+
 async fn send_frame(
     ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
     frame: Frame,
@@ -199,7 +220,7 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
     };
     http_channel.dispatch(AgentOutput::Message(outgoing).into());
 
-    let frame = recv_frame(&mut client, Duration::from_secs(2))
+    let frame = recv_frame_skip_activity(&mut client, Duration::from_secs(2))
         .await
         .expect("client received dispatched message");
     match frame {
@@ -291,10 +312,10 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
         .into(),
     );
 
-    let a = recv_frame(&mut tab_a, Duration::from_secs(2))
+    let a = recv_frame_skip_activity(&mut tab_a, Duration::from_secs(2))
         .await
         .expect("tab A received");
-    let b = recv_frame(&mut tab_b, Duration::from_secs(2))
+    let b = recv_frame_skip_activity(&mut tab_b, Duration::from_secs(2))
         .await
         .expect("tab B received");
     for (label, frame) in [("A", a), ("B", b)] {
@@ -358,8 +379,13 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
     expect_empty_pending_snapshot(&mut client, "interesting").await;
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
-    // Dispatch to an unrelated session: drops on the floor, no
-    // subscriber, no frame.
+    // Dispatch a content frame (Notice) to an unrelated session. The
+    // session-scoped fan-out drops it for this connection because it
+    // isn't subscribed. Separately, the http channel's activity
+    // observer fires a `SessionActivity` broadcast to every
+    // connection regardless of subscription — that's the deliberate
+    // sidebar signal — so we should receive exactly the pulse and
+    // *nothing else*.
     http_channel.dispatch(
         AgentOutput::Notice {
             session_id: "unrelated".into(),
@@ -371,13 +397,27 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
         .into(),
     );
 
-    // Expect timeout (no frame). 200ms is enough since the dispatch
-    // is synchronous on the server side; if anything was going to
-    // arrive it would already have.
+    let activity = recv_frame(&mut client, Duration::from_secs(1))
+        .await
+        .expect("sidebar activity pulse");
+    match activity {
+        Frame::SessionActivity {
+            session_id, source, ..
+        } => {
+            assert_eq!(session_id.as_str(), "unrelated", "activity session id");
+            assert!(
+                matches!(source, aura_channels::wire::ActivityKind::Assistant),
+                "activity source: {source:?}",
+            );
+        }
+        other => panic!("expected SessionActivity pulse, got {other:?}"),
+    }
+    // Now confirm the actual Notice content frame doesn't follow —
+    // subscription-gated fan-out filters it for this connection.
     let result = tokio::time::timeout(Duration::from_millis(200), client.next()).await;
     assert!(
         result.is_err(),
-        "no frame should arrive for unsubscribed session"
+        "subscription-gated content frame should not reach unsubscribed connection"
     );
 
     drop(client);
@@ -473,6 +513,119 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
 
     drop(subscriber);
     drop(bystander);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_activity_pulse_reaches_unsubscribed_tab() {
+    // The whole point of `Frame::SessionActivity`: a tab that's not
+    // subscribed to session F still gets a cheap unread signal when
+    // F sees activity, without paying for F's full content stream.
+    // This exercises both directions through the same dispatch
+    // observer: a UserEcho should produce `ActivityKind::User`; an
+    // agent Delta should produce `ActivityKind::Assistant`.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let mut cfg = ChannelsConfig::default();
+    cfg.http = Some(aura_config::HttpChannelConfig {
+        enabled: true,
+        bind_address: "127.0.0.1".into(),
+        port: 0,
+    });
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let channel_registry = Arc::clone(&tg.deps.channel_registry);
+    let channel_tokens = tg.channel_tokens.clone();
+    let shutdown = tg.shutdown.clone();
+    let server = ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone())
+        .expect("bind ChannelServer");
+    let port = server.port();
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    let (token, _h) = mint_web_token(&channel_tokens, "bystander");
+    let mut client = connect_register(port, &token, ChannelType::http())
+        .await
+        .expect("handshake");
+
+    let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
+
+    // Assistant-side: dispatch a Delta for a session the client never
+    // subscribed to. Content frame drops on the floor for this
+    // connection; the activity pulse broadcasts to every http tab.
+    http_channel.dispatch(
+        AgentOutput::Delta {
+            session_id: "sess-bg".into(),
+            user_id: String::new(),
+            channel: ChannelType::http(),
+            text: "agent reply".into(),
+        }
+        .into(),
+    );
+    let activity = recv_frame(&mut client, Duration::from_secs(1))
+        .await
+        .expect("assistant activity pulse");
+    match activity {
+        Frame::SessionActivity {
+            session_id, source, ..
+        } => {
+            assert_eq!(session_id.as_str(), "sess-bg", "assistant pulse session id");
+            assert!(
+                matches!(source, aura_channels::wire::ActivityKind::Assistant),
+                "expected Assistant source, got {source:?}",
+            );
+        }
+        other => panic!("expected SessionActivity, got {other:?}"),
+    }
+
+    // User-side: a UserEcho also runs through the same observer. Drive
+    // it via `Channel::echo_inbound`, which dispatches a
+    // `SessionEvent::UserEcho` — exactly the path the WS receive loop
+    // takes when the agent router forwards an inbound `Frame::Message`.
+    let incoming = aura_channels::IncomingMessage {
+        message: aura_channels::Message {
+            id: "msg-1".into(),
+            session_id: "sess-bg".into(),
+            channel: ChannelType::http(),
+            sender: aura_model::User {
+                id: WEB_OPERATOR_USER_ID.into(),
+                name: None,
+                channel: ChannelType::http(),
+            },
+            content: vec![aura_model::ContentBlock::Text("user typed".into())],
+            timestamp: chrono::Utc::now(),
+            reply_to: None,
+            metadata: aura_model::MessageMetadata::default(),
+        },
+        platform_msg_id: String::new(),
+    };
+    // 1.5s throttle window: wait it out so the second pulse isn't
+    // coalesced into the first.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    http_channel.echo_inbound(incoming);
+    let activity = recv_frame(&mut client, Duration::from_secs(1))
+        .await
+        .expect("user activity pulse");
+    match activity {
+        Frame::SessionActivity {
+            session_id, source, ..
+        } => {
+            assert_eq!(session_id.as_str(), "sess-bg", "user pulse session id");
+            assert!(
+                matches!(source, aura_channels::wire::ActivityKind::User),
+                "expected User source, got {source:?}",
+            );
+        }
+        other => panic!("expected SessionActivity, got {other:?}"),
+    }
+
+    drop(client);
     shutdown.trigger();
     let _ = server_handle.await;
 }

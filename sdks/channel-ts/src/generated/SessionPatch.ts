@@ -20,9 +20,12 @@ export type SessionPatch = {
  */
 created_at?: string, 
 /**
- * Bumped per inbound message on the session. Throttled by the
- * broadcaster (see `route::run_inbound_loop`) so a busy session
- * doesn't fan out a frame per keystroke.
+ * Authoritative `last_active` snapshot at patch-emit time. Only
+ * carried on Create / Unhide so a sibling tab that doesn't have
+ * the row yet (or hid it earlier) can render a correct age
+ * string immediately. Per-turn liveness updates ride
+ * [`Frame::SessionActivity`] instead, which the client projects
+ * onto its local `last_active`.
  */
 last_active?: string, 
 /**

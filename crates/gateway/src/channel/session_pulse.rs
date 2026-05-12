@@ -1,36 +1,42 @@
-//! Per-session `last_active` broadcast throttle.
+//! Per-session activity broadcast throttle.
 //!
-//! The inbound message loop emits a [`Frame::SessionUpdated`] patch
-//! every time a user types in a chat session, so sibling tabs can
-//! rerender their sidebar's `relativeAge(last_active)` without a list
-//! refetch. A busy session (back-to-back agent turns, paste-bombs of
-//! short messages, …) would otherwise fan out one frame per inbound;
-//! this throttle coalesces them so each open chat tab sees at most
-//! one patch per [`THROTTLE_WINDOW`] per session.
+//! Wired as a `DispatchObserver` on the `http` channel (see
+//! [`SessionPulse::install`]). Every `SessionEvent::UserEcho` /
+//! `SessionEvent::Agent(_)` flowing through `Channel::dispatch` is
+//! collapsed by `(session_id, source)` and, if the throttle window has
+//! elapsed, emits a `Frame::SessionActivity` to every connection on
+//! the channel — subscribed or not. That's the whole point: a sidebar
+//! tab parked on session A still wants the cheap "F had activity"
+//! signal without paying for F's full Delta stream.
 //!
-//! Single-source-of-truth note: only the per-inbound `last_active`
-//! emit routes through here. Create / Hide / Unhide go through
-//! `admin::chat::broadcast_session_patch` directly because those are
-//! operator-driven and not subject to rate limits.
+//! The two pulse streams (user / assistant) throttle independently
+//! so a user sending in F doesn't suppress the immediately-following
+//! agent reply pulse — the operator should see both touchpoints in
+//! their sidebar.
+//!
+//! Create / Hide / Unhide are *not* routed through here. Those go
+//! through `admin::chat::broadcast_session_patch` directly because
+//! they're operator-driven, low-frequency, and ship structural patches
+//! (`SessionPatch`) instead of activity pings.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_channels::ChannelRegistry;
-use aura_channels::wire::{Frame, SessionPatch};
-use aura_model::{ChannelType, SessionId};
-use chrono::{DateTime, Utc};
+use aura_channels::wire::{ActivityKind, Frame};
+use aura_channels::{Channel, SessionEvent};
+use aura_model::SessionId;
+use chrono::Utc;
 use dashmap::DashMap;
 
-/// Coalescing window. Picked at the low end of the user-visible
-/// "1-2 s" range — short enough that the sidebar age string never
-/// looks more than a beat stale, long enough that a five-message
-/// burst on the same session fans out exactly one frame.
+/// Coalescing window. Short enough that the sidebar age string never
+/// looks more than a beat stale; long enough that a five-message burst
+/// (or a fifty-token Delta stream) fans out exactly one frame per
+/// source.
 const THROTTLE_WINDOW: Duration = Duration::from_millis(1500);
 
 #[derive(Default)]
 pub struct SessionPulse {
-    last_sent: DashMap<SessionId, Instant>,
+    last_sent: DashMap<(SessionId, ActivityKind), Instant>,
 }
 
 impl SessionPulse {
@@ -38,20 +44,48 @@ impl SessionPulse {
         Arc::new(Self::default())
     }
 
-    /// Push a `last_active` patch to every connection on the `http`
-    /// channel iff the per-session throttle window has elapsed.
-    /// No-op when the `http` channel isn't installed.
-    pub fn touch(
-        &self,
-        registry: &ChannelRegistry,
-        session_id: &SessionId,
-        last_active: DateTime<Utc>,
-    ) {
+    /// Install `self` as the dispatch observer on `channel`. The
+    /// returned `Arc<Channel>`-attached closure clones `Arc::clone(&
+    /// self)` so dropping the original handle is safe (the channel
+    /// keeps the pulse alive as long as it's installed).
+    pub fn install(self: &Arc<Self>, channel: &Channel) {
+        let pulse = Arc::clone(self);
+        channel.set_dispatch_observer(Arc::new(move |event, channel| {
+            pulse.observe(event, channel);
+        }));
+    }
+
+    /// Observer body. Inspect the event, derive the activity source,
+    /// throttle, and broadcast a `Frame::SessionActivity` on hit.
+    /// `pub(crate)` for direct testing; production callers go through
+    /// the [`Channel::dispatch`] hook installed by
+    /// [`SessionPulse::install`].
+    pub(crate) fn observe(&self, event: &SessionEvent, channel: &Channel) {
+        let (session_id, source) = match event {
+            SessionEvent::UserEcho(msg) => {
+                (msg.message.session_id.clone(), ActivityKind::User)
+            }
+            SessionEvent::Agent(out) => (out.session_id().clone(), ActivityKind::Assistant),
+            // Approval prompts already have their own dedicated frame
+            // (`ApprovalRequested`) that reaches every subscriber to
+            // the call's session. Re-emitting as activity would
+            // double-signal without buying anything new for sidebar UX.
+            SessionEvent::ApprovalRequested { .. } | SessionEvent::ApprovalResolved { .. } => {
+                return;
+            }
+        };
+        if session_id.as_str().is_empty() {
+            // Pre-resolution UserEcho (sidecars that send a Message
+            // before the session resolver has bound it) — nothing to
+            // address. Skip silently rather than broadcasting an empty
+            // session_id every other tab will ignore anyway.
+            return;
+        }
         let now = Instant::now();
-        // `entry` is atomic w.r.t. the DashMap shard so two concurrent
-        // touches for the same session_id can't both observe the
-        // pre-write deadline as "elapsed" and emit twice.
-        let should_emit = match self.last_sent.entry(session_id.clone()) {
+        // `entry` is shard-atomic — two concurrent observe() calls for
+        // the same key can't both win the "elapsed?" race and emit
+        // twice.
+        let should_emit = match self.last_sent.entry((session_id.clone(), source)) {
             dashmap::Entry::Occupied(mut e) => {
                 if now.duration_since(*e.get()) >= THROTTLE_WINDOW {
                     e.insert(now);
@@ -68,15 +102,10 @@ impl SessionPulse {
         if !should_emit {
             return;
         }
-        let Some(channel) = registry.get(&ChannelType::http()) else {
-            return;
-        };
-        channel.broadcast_frame(Frame::SessionUpdated {
-            session_id: session_id.clone(),
-            patch: SessionPatch {
-                last_active: Some(last_active),
-                ..SessionPatch::default()
-            },
+        channel.broadcast_frame(Frame::SessionActivity {
+            session_id,
+            source,
+            at: Utc::now(),
         });
     }
 }

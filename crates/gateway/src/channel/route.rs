@@ -393,23 +393,17 @@ async fn run_inbound_loop(
                         // (including the sender) so multi-tab views
                         // converge on identical transcripts through
                         // the same render path as agent output.
+                        // The http channel's `DispatchObserver`
+                        // (installed at boot, see
+                        // `channel/session_pulse.rs`) sees this echo
+                        // and fans out a throttled
+                        // `Frame::SessionActivity{User}` so sidebar
+                        // tabs not subscribed to the session still
+                        // pick up the unread signal.
                         sidecar.channel.echo_inbound(incoming.clone());
                         if let Err(e) = state.incoming_tx.send(incoming).await {
                             tracing::error!(error = %e, "router intake closed; tearing down");
                             break;
-                        }
-                        // Push a throttled `last_active` patch so
-                        // sibling tabs' sidebars rerender
-                        // `relativeAge(last_active)` without a list
-                        // refetch. The agent's own
-                        // `SessionManager::touch` runs shortly after
-                        // this; `timestamp` matches the row the agent
-                        // is about to persist, so siblings don't see
-                        // an interim "future" value.
-                        if channel_type == &ChannelType::http() {
-                            state
-                                .session_pulse
-                                .touch(&state.registry, &session_id, timestamp);
                         }
                     }
                     Frame::ResolveApproval { call_id, decision } => {

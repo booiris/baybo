@@ -75,6 +75,12 @@ interface SessionSummary {
   session_id: string;
   created_at: string;
   last_active: string;
+  /** Local-only unread counter. Server doesn't surface this — the
+   *  sidebar derives it from incoming `Frame::SessionActivity`. Cleared
+   *  on navigation to the session. Always 0 on the row the user is
+   *  currently viewing because activity for foreground sessions
+   *  doesn't bump. */
+  unread: number;
 }
 
 /**
@@ -102,13 +108,6 @@ interface SessionView {
    *  the session's first message and there's nothing left to page
    *  back to. */
   hasMore: boolean;
-  /** Number of new messages that arrived while this session wasn't
-   *  the active view. Cleared the moment the URL points at this
-   *  session. Counts only "logical messages" — first Frame::Delta of
-   *  a stream and a non-replay Frame::Message that isn't this tab's
-   *  own user echo. Subsequent deltas / the finalizing Message of an
-   *  already-counted stream don't double-bump. */
-  unreadCount: number;
 }
 
 const EMPTY_VIEW: SessionView = {
@@ -119,8 +118,15 @@ const EMPTY_VIEW: SessionView = {
   olderLoading: false,
   oldestOrdinal: null,
   hasMore: false,
-  unreadCount: 0,
 };
+
+/** Soft cap on `views` map size. Past this, the oldest non-active
+ *  bucket (by frame recency) is evicted: transcript + pendingApproval
+ *  freed, WS subscription dropped, recency entry cleared. Revisit
+ *  re-subscribes and re-fetches via REST. Tuned high enough that
+ *  casual session-switching stays free; bites only when the user has
+ *  genuinely roamed across many conversations in one tab session. */
+const VIEW_CACHE_LIMIT = 20;
 
 export function ChatPage() {
   const { sessionId } = useParams<{ sessionId?: string }>();
@@ -151,7 +157,7 @@ export function ChatPage() {
   // (captured once at WS construction) can answer "is this frame for
   // the session the user is currently viewing?" without rebuilding the
   // WS on every nav. Kept in lockstep with the URL via the effect that
-  // clears unreadCount below.
+  // clears the current row's unread badge below.
   const currentSessionIdRef = useRef<string | undefined>(sessionId);
   // Wall-clock ms of the most recent "WS reached connected state". Bumped
   // each time the status flips to 'connected' (initial connect AND
@@ -191,6 +197,26 @@ export function ChatPage() {
   // Generation counter so a retry chain started by an older
   // rejection stops if a newer rejection (or unmount) supersedes it.
   const tokenRemintGenRef = useRef(0);
+  // Last-touched wall-clock per session bucket — bumped on nav and on
+  // every inbound view-mutating frame. Drives the LRU eviction effect
+  // below. Lives in a ref so the WS onFrame closure can read/write it
+  // without forcing the effect that constructs the WS to re-run.
+  const recencyRef = useRef<Map<string, number>>(new Map());
+
+  // Tear down everything we hold for a single session: WS subscription,
+  // view bucket, recency entry. Used by local hide, cross-tab hide, and
+  // LRU eviction. Stable identity via useCallback([]) so the WS effect's
+  // dep array stays clean.
+  const releaseSessionView = useCallback((sid: string) => {
+    wsRef.current?.unsubscribe(sid);
+    setViews((prev) => {
+      if (!(sid in prev)) return prev;
+      const next = { ...prev };
+      delete next[sid];
+      return next;
+    });
+    recencyRef.current.delete(sid);
+  }, []);
 
   // ── Bootstrap: load session list + slash manifest, mint a token ─────
   // Runs once on mount. Anchor selection priority:
@@ -216,7 +242,12 @@ export function ChatPage() {
       if (manifestError) {
         console.warn('chat bootstrap: slash-manifest failed', manifestError);
       }
-      const existing = (list?.items as SessionSummary[]) ?? [];
+      const existing: SessionSummary[] = (list?.items ?? []).map((s) => ({
+        session_id: s.session_id,
+        created_at: s.created_at,
+        last_active: s.last_active,
+        unread: 0,
+      }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
       setSessionsLoading(false);
@@ -284,6 +315,7 @@ export function ChatPage() {
                   session_id: data.session_id,
                   created_at: new Date().toISOString(),
                   last_active: new Date().toISOString(),
+                  unread: 0,
                 },
                 ...prev,
               ],
@@ -342,6 +374,29 @@ export function ChatPage() {
       onFrame: (frame) => {
         if (frame.kind === 'session_updated') {
           setSessions((prev) => applySessionPatch(prev, frame.session_id, frame.patch));
+          if (frame.patch.hidden === true) {
+            // Sibling tab hid the session (or this tab via the local
+            // DELETE path — both converge here). Drop the WS
+            // subscription so Delta/Message frames stop streaming
+            // into a soon-to-be-freed bucket, then free the bucket
+            // and its recency entry. Idempotent with the local
+            // handleHideSession cleanup.
+            releaseSessionView(frame.session_id);
+            if (currentSessionIdRef.current === frame.session_id) {
+              navigate('/chat', { replace: true });
+            }
+          }
+          return;
+        }
+        if (frame.kind === 'session_activity') {
+          // Cheap unread / freshness signal for every http connection
+          // regardless of subscription — the whole reason this frame
+          // exists. Foreground sessions don't bump (the user can see
+          // it), background sessions get a +1 badge.
+          const isForeground = currentSessionIdRef.current === frame.session_id;
+          setSessions((prev) =>
+            applySessionActivity(prev, frame.session_id, frame.at, isForeground),
+          );
           return;
         }
         // Catch-up replays carry an explicit ordinal — advance the WS
@@ -351,12 +406,21 @@ export function ChatPage() {
         if (frame.kind === 'message' && frame.ordinal !== undefined) {
           wsRef.current?.recordOrdinal(frame.session_id, frame.ordinal);
         }
-        routeInboundFrame(
-          frame,
-          setViews,
-          currentSessionIdRef.current,
-          lastConnectedAtRef.current,
-        );
+        // Protect actively-streamed buckets from LRU eviction. Only
+        // frames that actually mutate `views` bump recency — sidebar-
+        // only signals (session_updated) shouldn't bias retention of
+        // a transcript the user isn't engaging with.
+        switch (frame.kind) {
+          case 'delta':
+          case 'message':
+          case 'notice':
+          case 'approval_requested':
+            recencyRef.current.set(frame.session_id, Date.now());
+            break;
+          default:
+            break;
+        }
+        routeInboundFrame(frame, setViews, lastConnectedAtRef.current);
       },
       onTokenRejected: (reason) => onTokenRejectedRef.current?.(reason),
       onReset: (reason) => {
@@ -389,14 +453,14 @@ export function ChatPage() {
       ws.close();
       wsRef.current = null;
     };
-  }, [baseUrl, channelToken]);
+  }, [baseUrl, channelToken, navigate, releaseSessionView]);
 
   // ── Active session: subscribe + lazy-load history ───────────────────
   // Subscribe stays sticky once added: when the user switches away,
   // we keep the subscription so background sessions still accumulate
-  // Delta/Message frames into their view bucket. Per-tab subscription
-  // count grows with sessions visited; for an admin's personal
-  // surface that's fine. Aggressive eviction can be layered on later.
+  // Delta/Message frames into their view bucket. The LRU eviction
+  // effect above caps the per-tab bucket count at `VIEW_CACHE_LIMIT`
+  // and drops the WS subscription alongside the freed transcript.
   useEffect(() => {
     if (!sessionId || !wsRef.current) return;
     wsRef.current.subscribe(sessionId);
@@ -501,13 +565,35 @@ export function ChatPage() {
     setHasNewBelow(false);
     currentSessionIdRef.current = sessionId;
     if (sessionId) {
-      setViews((prev) => {
-        const view = prev[sessionId];
-        if (!view || view.unreadCount === 0) return prev;
-        return { ...prev, [sessionId]: { ...view, unreadCount: 0 } };
+      recencyRef.current.set(sessionId, Date.now());
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.session_id === sessionId);
+        if (idx === -1 || prev[idx].unread === 0) return prev;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], unread: 0 };
+        return next;
       });
     }
   }, [sessionId]);
+
+  // LRU eviction. Active session is protected — yanking its bucket
+  // mid-render would flash an empty transcript. Eviction drops the
+  // WS subscription too; revisit re-subscribes via the
+  // foreground-session effect and re-fetches transcript via REST.
+  useEffect(() => {
+    const keys = Object.keys(views);
+    if (keys.length <= VIEW_CACHE_LIMIT) return;
+    const activeSid = currentSessionIdRef.current;
+    const candidates = keys
+      .filter((sid) => sid !== activeSid)
+      .sort(
+        (a, b) =>
+          (recencyRef.current.get(a) ?? 0) - (recencyRef.current.get(b) ?? 0),
+      );
+    const toEvict = candidates.slice(0, keys.length - VIEW_CACHE_LIMIT);
+    if (toEvict.length === 0) return;
+    for (const sid of toEvict) releaseSessionView(sid);
+  }, [views, releaseSessionView]);
 
   // Bump the reconnect cutoff each time we land on 'connected'. The
   // snapshot reconciliation uses this as the "anything older than this
@@ -711,6 +797,7 @@ export function ChatPage() {
         return;
       }
       setSessions((prev) => prev.filter((s) => s.session_id !== id));
+      releaseSessionView(id);
       if (sessionId === id) {
         const fallback =
           sessions.find((s) => s.session_id !== id)?.session_id ??
@@ -724,7 +811,7 @@ export function ChatPage() {
         }
       }
     },
-    [client, navigate, sessionId, sessions],
+    [client, navigate, releaseSessionView, sessionId, sessions],
   );
 
   const handleNewChat = useCallback(async () => {
@@ -737,6 +824,7 @@ export function ChatPage() {
             session_id: data.session_id,
             created_at: new Date().toISOString(),
             last_active: new Date().toISOString(),
+            unread: 0,
           },
           ...prev,
         ]);
@@ -797,7 +885,7 @@ export function ChatPage() {
                 session={s}
                 active={s.session_id === sessionId}
                 hasPending={Boolean(views[s.session_id]?.pendingApproval)}
-                unreadCount={views[s.session_id]?.unreadCount ?? 0}
+                unreadCount={s.unread}
                 onHide={handleHideSession}
               />
             ))
@@ -923,54 +1011,27 @@ export function ChatPage() {
 
 // ── frame routing ───────────────────────────────────────────────────
 
-/** Apply `mapTranscript` to the session bucket and bump `unreadCount`
- *  iff `sid` is a background session AND `shouldBump` accepts the last
- *  row of the existing transcript. Centralises the
- *  "background-session unread accounting" rule shared by Delta- and
- *  Message-frame handling. */
-function patchBucketWithBump(
-  prev: Record<string, SessionView>,
-  sid: string,
-  currentSessionId: string | undefined,
-  shouldBump: (last: TranscriptRow | undefined) => boolean,
-  mapTranscript: (transcript: TranscriptRow[]) => TranscriptRow[],
-): Record<string, SessionView> {
-  const view = prev[sid] ?? EMPTY_VIEW;
-  const isBackground = sid !== currentSessionId;
-  const bump = isBackground && shouldBump(view.transcript[view.transcript.length - 1]) ? 1 : 0;
-  return {
-    ...prev,
-    [sid]: {
-      ...view,
-      transcript: mapTranscript(view.transcript),
-      unreadCount: view.unreadCount + bump,
-    },
-  };
-}
-
 /** Update the right per-session bucket based on a frame's session_id.
  *  Always operates on the views map via setViews so background
- *  sessions accumulate frames even when not currently viewed. */
+ *  sessions accumulate frames even when not currently viewed. Unread
+ *  accounting lives elsewhere — `Frame::SessionActivity` is the single
+ *  source of truth for sidebar badges, fired by the gateway's
+ *  dispatch observer regardless of subscription state. */
 function routeInboundFrame(
   frame: Frame,
   setViews: React.Dispatch<React.SetStateAction<Record<string, SessionView>>>,
-  currentSessionId: string | undefined,
   lastConnectedAt: number,
 ): void {
   switch (frame.kind) {
     case 'delta': {
       const sid = frame.session_id;
-      setViews((prev) =>
-        patchBucketWithBump(
-          prev,
-          sid,
-          currentSessionId,
-          // Only count the *first* delta of a stream — subsequent ones
-          // append to a streaming row we've already bumped for.
-          (last) => !(last?.streaming && last.role === 'assistant'),
-          (t) => appendStreamingDelta(t, frame.text),
-        ),
-      );
+      setViews((prev) => {
+        const view = prev[sid] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sid]: { ...view, transcript: appendStreamingDelta(view.transcript, frame.text) },
+        };
+      });
       return;
     }
     case 'message': {
@@ -1020,36 +1081,25 @@ function routeInboundFrame(
               text: frame.content,
               pending: false,
             };
-            // Own send echo — never counts as unread, even if the
-            // user has navigated away between send and echo.
             return { ...prev, [sid]: { ...view, transcript: next } };
           }
-          // Echo from another tab — count if background.
-          const bump = sid !== currentSessionId ? 1 : 0;
           return {
             ...prev,
             [sid]: {
               ...view,
               transcript: finalizeMessage(view.transcript, role, frame.content),
-              unreadCount: view.unreadCount + bump,
             },
           };
         });
         return;
       }
-      setViews((prev) =>
-        patchBucketWithBump(
-          prev,
-          sid,
-          currentSessionId,
-          // Finalizing an assistant stream was already counted at the
-          // first delta — only bump for fresh rows (other-tab user
-          // echoes without platform_msg_id, or a non-streaming
-          // assistant Message arriving before any Delta).
-          (last) => !(role === 'assistant' && last?.streaming && last.role === 'assistant'),
-          (t) => finalizeMessage(t, role, frame.content),
-        ),
-      );
+      setViews((prev) => {
+        const view = prev[sid] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sid]: { ...view, transcript: finalizeMessage(view.transcript, role, frame.content) },
+        };
+      });
       return;
     }
     case 'notice': {
@@ -1273,6 +1323,7 @@ function applySessionPatch(
         session_id: sessionId,
         created_at: patch.created_at,
         last_active: patch.last_active,
+        unread: 0,
       },
     ]);
   }
@@ -1281,6 +1332,7 @@ function applySessionPatch(
     session_id: current.session_id,
     created_at: patch.created_at ?? current.created_at,
     last_active: patch.last_active ?? current.last_active,
+    unread: current.unread,
   };
   if (
     merged.created_at === current.created_at &&
@@ -1290,6 +1342,34 @@ function applySessionPatch(
   }
   const next = prev.slice();
   next[idx] = merged;
+  return sortByLastActiveDesc(next);
+}
+
+/** Merge a `SessionActivity` ping onto the sidebar list. Projects
+ *  `at` onto the row's local `last_active` (so the age string and
+ *  sort order both stay current without a list refetch) and bumps
+ *  `unread` iff the activity isn't on the currently-foregrounded
+ *  session. Activity for sessions we don't know about (raced ahead
+ *  of Created, or hidden in this tab) is dropped on the floor —
+ *  Created arrives separately, and rehydration after a hide isn't
+ *  worth optimising. */
+function applySessionActivity(
+  prev: SessionSummary[],
+  sessionId: string,
+  at: string,
+  isForeground: boolean,
+): SessionSummary[] {
+  const idx = prev.findIndex((s) => s.session_id === sessionId);
+  if (idx === -1) return prev;
+  const current = prev[idx];
+  const nextLastActive =
+    Date.parse(at) > Date.parse(current.last_active) ? at : current.last_active;
+  const nextUnread = isForeground ? current.unread : current.unread + 1;
+  if (nextLastActive === current.last_active && nextUnread === current.unread) {
+    return prev;
+  }
+  const next = prev.slice();
+  next[idx] = { ...current, last_active: nextLastActive, unread: nextUnread };
   return sortByLastActiveDesc(next);
 }
 

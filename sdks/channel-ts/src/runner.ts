@@ -642,9 +642,10 @@ function dispatchFrame(
     case "history_append":
     case "history_snapshot":
       return;
-    // SessionUpdated drives the web chat sidebar; sidecars don't have
-    // a session list and silently drop it.
+    // SessionUpdated / SessionActivity drive the web chat sidebar;
+    // sidecars don't have a session list and silently drop them.
     case "session_updated":
+    case "session_activity":
       return;
     // Subscribe / Unsubscribe are selective-channel client→server
     // frames. Broadcast-kind sidecars never send them, and the
