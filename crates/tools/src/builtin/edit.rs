@@ -175,7 +175,7 @@ impl Tool for EditTool {
                 Err(reason) => text.push_str(&format!("\nprofile/ commit_warning: {reason}")),
             }
             text.push_str(
-                "\nnote: change takes effect on the next session; current Soul prompt unaffected",
+                "\nnote: the in-memory system prompt picks up this change on the next compaction or new session",
             );
         }
 
@@ -522,7 +522,7 @@ mod tests {
             panic!("expected Text output")
         };
         assert!(text.contains("committed to profile/"), "{text}");
-        assert!(text.contains("next session"), "{text}");
+        assert!(text.contains("next compaction or new session"), "{text}");
 
         let log = Command::new("git")
             .arg("-C")

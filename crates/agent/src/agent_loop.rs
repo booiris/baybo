@@ -1560,12 +1560,15 @@ impl AgentLoop {
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
         let model_id = runner.model_info.id.clone();
-        let _ = self
+        let outcome = self
             .context_manager
             .maybe_compress(&model_id, |req| async move {
                 runner.run(req).await.map(|run| run.response)
             })
             .await?;
+        if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
+            self.reload_soul_after_compaction().await?;
+        }
         Ok(())
     }
 
@@ -1642,6 +1645,9 @@ impl AgentLoop {
                         runner.run(req).await.map(|run| run.response)
                     })
                     .await?;
+                if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
+                    self.reload_soul_after_compaction().await?;
+                }
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
                         "Context compressed.".to_string()
@@ -1853,16 +1859,49 @@ impl AgentLoop {
         {
             return Ok(());
         }
-        // Soul updates take effect for new sessions only — existing
-        // sessions keep the prompt they were pinned to, because the
-        // restored transcript already carries a Role::System row at
-        // index 0 and the early-return above fires.
         let msg = ChatMessage {
             role: Role::System,
             content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
             from_user: false,
         };
         self.append_context_message(session, &msg).await
+    }
+
+    /// Rebuild [`Soul`] from disk and swap the result into
+    /// `messages[0]`. Called only after a successful compaction —
+    /// the compressor preserves the leading system row from the
+    /// pre-compaction transcript, so a profile edit made earlier in
+    /// the conversation would otherwise carry the stale content
+    /// forward forever. New sessions don't need this path because
+    /// `ensure_system_prompt` already seeds them from a fresh
+    /// [`Soul::from_workspace`] read.
+    async fn reload_soul_after_compaction(&mut self) -> anyhow::Result<()> {
+        let Some(paths) = self.workspace_paths.as_ref() else {
+            return Ok(());
+        };
+        let workspace = aura_workspace::WorkspaceManager::new(paths.root().to_path_buf());
+        let new_soul = match Soul::from_workspace(&workspace).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to reload soul from workspace; keeping cached prompt");
+                return Ok(());
+            }
+        };
+        // Only swap `messages[0]` when it's already a system text
+        // block — defensive against an empty transcript or a non-
+        // system first row.
+        let first_is_system_text = self.context_manager.messages().first().is_some_and(|m| {
+            m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
+        });
+        if first_is_system_text {
+            self.context_manager.replace_first_message(ChatMessage {
+                role: Role::System,
+                content: vec![ContentBlock::Text(new_soul.system_prompt().to_string())],
+                from_user: false,
+            });
+        }
+        self.soul = new_soul;
+        Ok(())
     }
 
     fn invocable_skills(&self) -> Vec<SkillSummary> {

@@ -272,6 +272,31 @@ impl ContextManager {
         &self.tokenizer
     }
 
+    /// Replace `messages[0]` in place. Keeps every other row, the
+    /// supersede log, and the summary anchor intact — only the first
+    /// row's content + per-message token cache are touched, and the
+    /// budget is re-totalled.
+    ///
+    /// Used by the agent loop to refresh the soul system prompt when
+    /// the underlying identity files change on disk. Persistence is
+    /// in-memory only — `session_messages` keeps the originally
+    /// persisted content; the next actor cold start rebuilds the
+    /// prompt from disk anyway, so the staleness is invisible
+    /// downstream.
+    ///
+    /// No-op if the transcript is empty.
+    pub fn replace_first_message(&mut self, msg: ChatMessage) {
+        if self.messages.is_empty() {
+            return;
+        }
+        self.per_message_tokens[0] = self.tokenizer.count_message(&msg);
+        self.messages[0] = msg;
+        // The cached baseline was anchored to the prior message[0]
+        // token count; invalidate so the next `count_tokens` recomputes.
+        self.invalidate_baseline();
+        self.budget.update(self.count_tokens());
+    }
+
     /// Replace the entire transcript. Recomputes the per-message
     /// token cache, the called-skills vector, and the budget; clears
     /// any baseline since the prior `actual_tokens` is anchored to a
