@@ -1,8 +1,16 @@
 //! Bake the React dashboard and the in-tree channel sidecars into the
 //! gateway binary.
 //!
-//! Two independent pipelines share this file:
+//! Three pipelines share this file. The first prepares the TS toolchain;
+//! the other two consume it:
 //!
+//! * **pnpm install** — fingerprints `pnpm-lock.yaml`, the root
+//!   `package.json`/`pnpm-workspace.yaml`, and every workspace
+//!   `package.json` under `web/`, `sdks/*`, `channel-src/*`, and
+//!   `tool-src/*`. When the fingerprint changes or
+//!   `node_modules/.modules.yaml` is missing, we run
+//!   `pnpm install` (non-interactive) so the downstream pipelines
+//!   never trip over a stale workspace.
 //! * **WebUI** — watches the relevant `web/` sources, reruns
 //!   `pnpm --filter aura-web build` when those inputs change, then
 //!   zstd-compresses each emitted `web/dist` asset and writes
@@ -47,8 +55,102 @@ fn main() {
         .expect("gateway crate lives under <workspace>/crates/gateway")
         .to_path_buf();
 
+    if let Err(e) = ensure_pnpm_install(&ws_root) {
+        println!(
+            "cargo:warning=pnpm install failed ({e}); webui/sidecar packaging may fall back to placeholders"
+        );
+    }
+
     embed_webui(&ws_root);
     embed_sidecars(&ws_root);
+}
+
+// ---------------------------------------------------------------------
+// pnpm install (TS workspace deps)
+// ---------------------------------------------------------------------
+
+/// Sync the workspace's `node_modules` to `pnpm-lock.yaml` before
+/// either the WebUI or sidecar pipelines invoke pnpm scripts. The
+/// fingerprint covers the lockfile, the root `package.json` (whose
+/// `pnpm.overrides` change install output), `pnpm-workspace.yaml`,
+/// and every workspace `package.json` under `web/`, `sdks/*`,
+/// `channel-src/*`, and `tool-src/*`. Steady-state builds find a
+/// matching stamp and skip the pnpm invocation entirely.
+fn ensure_pnpm_install(ws_root: &Path) -> Result<(), String> {
+    let cache_dir = ws_root.join("target").join("pnpm-install-cache");
+    let stamp_path = cache_dir.join("fingerprint.txt");
+    // `.modules.yaml` is pnpm's own marker file inside `node_modules`.
+    // If the user nukes `node_modules` we force a reinstall even when
+    // the fingerprint hasn't moved.
+    let modules_marker = ws_root.join("node_modules").join(".modules.yaml");
+
+    let fingerprint = pnpm_install_fingerprint(ws_root)?;
+    let cached = fs::read_to_string(&stamp_path).ok();
+    if cached.as_deref().map(str::trim) == Some(fingerprint.as_str()) && modules_marker.exists() {
+        return Ok(());
+    }
+
+    let output = Command::new("pnpm")
+        .arg("install")
+        .current_dir(ws_root)
+        // Suppress pnpm's interactive "modules directories will be
+        // removed and reinstalled from scratch" confirmation, which
+        // otherwise hangs the build script forever on a stale tree.
+        .env("npm_config_confirm_modules_purge", "false")
+        // Mute pnpm's update-notifier banner in build-script context.
+        .env("CI", "1")
+        .output()
+        .map_err(|e| format!("spawn pnpm install: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pnpm install exited {}: stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+
+    fs::create_dir_all(&cache_dir).map_err(|e| format!("mkdir {}: {e}", cache_dir.display()))?;
+    fs::write(&stamp_path, format!("{fingerprint}\n"))
+        .map_err(|e| format!("write {}: {e}", stamp_path.display()))?;
+    Ok(())
+}
+
+fn pnpm_install_fingerprint(ws_root: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let inputs = pnpm_install_inputs(ws_root);
+    for path in &inputs {
+        emit_rerun_if_changed(path);
+    }
+    let mut hasher = Sha256::new();
+    for path in &inputs {
+        hash_path_state(&mut hasher, ws_root, path)?;
+    }
+    Ok(hex_short(&hasher.finalize(), 64))
+}
+
+fn pnpm_install_inputs(ws_root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        ws_root.join("pnpm-lock.yaml"),
+        ws_root.join("pnpm-workspace.yaml"),
+        ws_root.join("package.json"),
+        ws_root.join("web/package.json"),
+    ];
+    for dir_root in ["sdks", "channel-src", "tool-src"] {
+        let root = ws_root.join(dir_root);
+        let Ok(reader) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in reader.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                paths.push(p.join("package.json"));
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 // ---------------------------------------------------------------------
