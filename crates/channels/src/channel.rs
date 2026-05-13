@@ -249,10 +249,23 @@ impl Channel {
     }
 
     /// Echo an inbound user message to every connection subscribed to
-    /// the message's `session_id`. The receiving tab(s) render the user
-    /// message through the same code path as agent-emitted frames so
-    /// multi-tab views stay consistent.
+    /// the message's `session_id`. The receiving tab(s) render the
+    /// user message through the same code path as agent-emitted
+    /// frames so multi-tab views stay consistent.
+    ///
+    /// **No-op on [`ChannelKind::Multiplexed`] channels.** Multiplexed
+    /// channels (telegram, weixin, discord, …) fan out to every
+    /// attached connection rather than to a session-scoped subset,
+    /// and they typically have only one attached sidecar — the very
+    /// one that just delivered the inbound. Echoing would route the
+    /// user's own message back to the sidecar, which the bot SDK
+    /// dispatches into `onMessage` and forwards back to the upstream
+    /// platform, producing a feedback loop. Multi-tab consistency is
+    /// a `Subscribed` concern; `Multiplexed` callers do not need it.
     pub fn echo_inbound(&self, message: IncomingMessage) {
+        if matches!(self.kind, ChannelKind::Multiplexed) {
+            return;
+        }
         self.dispatch(SessionEvent::UserEcho(message));
     }
 
@@ -311,5 +324,105 @@ impl Channel {
                 reason: reason.to_owned(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::SendOutcome;
+    use crate::types::{IncomingMessage, Message as AgentMessage};
+    use aura_model::{ChannelType, MessageMetadata, User};
+    use chrono::Utc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingSink {
+        events: AtomicUsize,
+    }
+    impl CountingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                events: AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.events.load(Ordering::SeqCst)
+        }
+    }
+    impl crate::connection::ConnectionSink for CountingSink {
+        fn try_send_event(&self, _event: SessionEvent) -> SendOutcome {
+            self.events.fetch_add(1, Ordering::SeqCst);
+            SendOutcome::Sent
+        }
+        fn try_send_frame(&self, _frame: Frame) -> SendOutcome {
+            SendOutcome::Sent
+        }
+    }
+
+    fn fake_inbound(session_id: &str, channel: ChannelType) -> IncomingMessage {
+        IncomingMessage {
+            message: AgentMessage {
+                id: "msg-1".into(),
+                session_id: SessionId::from(session_id),
+                channel: channel.clone(),
+                sender: User {
+                    id: "user-1".into(),
+                    name: None,
+                    channel,
+                },
+                content: vec![],
+                timestamp: Utc::now(),
+                reply_to: None,
+                metadata: MessageMetadata::default(),
+            },
+            platform_msg_id: String::new(),
+        }
+    }
+
+    /// Telegram-shaped channels must NOT echo inbound user messages
+    /// back to attached sidecars — the bot SDK would forward the echo
+    /// to the upstream platform as if it were an agent reply, producing
+    /// a feedback loop where the user sees their own message resent.
+    #[test]
+    fn echo_inbound_is_noop_on_multiplexed_channel() {
+        let channel = Channel::new(
+            ChannelType::from("telegram"),
+            ChannelKind::Multiplexed,
+            None,
+        );
+        let sink = CountingSink::new();
+        let conn = Arc::new(Connection::new(sink.clone()));
+        channel.attach(Arc::clone(&conn));
+
+        channel.echo_inbound(fake_inbound("session-x", ChannelType::from("telegram")));
+
+        assert_eq!(
+            sink.count(),
+            0,
+            "Multiplexed channels must not fan UserEcho back to the sender sidecar",
+        );
+    }
+
+    /// The cross-tab sync semantics for Subscribed channels (http,
+    /// tui) still need echo_inbound to reach every subscriber so
+    /// concurrent tabs render the same transcript.
+    #[test]
+    fn echo_inbound_reaches_subscribers_on_subscribed_channel() {
+        let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
+        let sink = CountingSink::new();
+        let conn = Arc::new(Connection::new(sink.clone()));
+        let conn_id = conn.id();
+        channel.attach(Arc::clone(&conn));
+        channel
+            .subscribe(conn_id, SessionId::from("session-x"))
+            .expect("subscribe");
+
+        channel.echo_inbound(fake_inbound("session-x", ChannelType::http()));
+
+        assert_eq!(
+            sink.count(),
+            1,
+            "Subscribed channels must echo inbound to every subscriber of the session",
+        );
     }
 }
