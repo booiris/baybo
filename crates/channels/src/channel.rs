@@ -146,18 +146,32 @@ impl Channel {
 
     /// Detach by id. Also drops every subscription this connection
     /// owned so the reverse index doesn't leak.
+    ///
+    /// Touches only the buckets this connection was subscribed to. A
+    /// blanket `subscriptions.retain(...)` would walk every session
+    /// the channel knows about, turning a single WS close on a busy
+    /// gateway into O(sessions) work — emptiness is checked per
+    /// touched bucket and the drop goes through `remove_if` so a
+    /// concurrent `subscribe` re-inserting in the gap can't lose its
+    /// fresh entry.
     pub fn detach(&self, id: ConnectionId) {
         if let Some((_, conn)) = self.connections.remove(&id) {
             // Snapshot to avoid holding two borrows on the same map
             // while we mutate `subscriptions` below.
             let owned: Vec<SessionId> = conn.subscribed().iter().map(|s| s.clone()).collect();
             for session_id in owned {
-                if let Some(entry) = self.subscriptions.get(&session_id) {
-                    entry.remove(&id);
+                let now_empty = match self.subscriptions.get(&session_id) {
+                    Some(entry) => {
+                        entry.remove(&id);
+                        entry.is_empty()
+                    }
+                    None => continue,
+                };
+                if now_empty {
+                    self.subscriptions
+                        .remove_if(&session_id, |_, set| set.is_empty());
                 }
             }
-            // Drop now-empty subscription buckets so the map shrinks.
-            self.subscriptions.retain(|_, set| !set.is_empty());
         }
     }
 

@@ -102,8 +102,15 @@ impl WebTokenJanitor {
         self.stash.retain(|token, entry| {
             let age = now.duration_since(entry.minted_at);
             if age >= self.ttl {
+                // `chars().take(...)` rather than byte-slicing:
+                // `generate_token` produces hex (ASCII) today so a
+                // byte slice at 8 is safe, but the producer doesn't
+                // promise that, and a future shift to base64url or
+                // another alphabet could land a multi-byte char on
+                // the boundary and panic. Defense-in-depth.
+                let token_prefix: String = token.chars().take(8).collect();
                 tracing::debug!(
-                    token_prefix = &token[..token.len().min(8)],
+                    token_prefix = %token_prefix,
                     age_secs = age.as_secs(),
                     "web_chat_tokens: reaping unclaimed handle",
                 );

@@ -91,23 +91,30 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         _ => None,
     };
 
-    let sidecar = match Sidecar::build(
-        channel_type.clone(),
-        &state.registry,
-        sink,
-        std::sync::Arc::clone(&state.blob_store),
-        token_handle,
-    ) {
-        Ok(s) => s,
+    // Resolve the channel (with lazy install fallback for custom
+    // out-of-tree sidecars) *before* committing the sink to the
+    // build path. On failure the sink is still ours, so we can
+    // surface a `RegisterAck { ok: false, reason }` to the peer
+    // instead of dropping the socket silently — a silent close
+    // leaves channel-sdk-shaped clients in their reconnect ladder
+    // with no operator-visible reason for the rejection.
+    let channel = match super::adapter::resolve_or_install_channel(&state.registry, &channel_type) {
+        Ok(ch) => ch,
         Err(err) => {
-            tracing::warn!(error = %err, %channel_type, "channel-ws build failed");
-            // Sink was consumed by build's failure path? No — build
-            // owns it, and on error the sink is dropped with the
-            // partially-constructed pump. There is nothing left to
-            // ack on.
+            let reason = format!("channel resolve failed: {err}");
+            tracing::warn!(error = %err, %channel_type, "channel-ws channel resolve failed");
+            send_ack_and_close(&mut sink, false, Some(reason)).await;
             return;
         }
     };
+
+    let sidecar = Sidecar::build(
+        channel_type.clone(),
+        channel,
+        sink,
+        std::sync::Arc::clone(&state.blob_store),
+        token_handle,
+    );
 
     tracing::info!(
         channel_type = %channel_type,

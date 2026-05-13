@@ -63,40 +63,54 @@ pub(crate) struct Sidecar {
     _token_handle: Option<TokenHandle>,
 }
 
+/// Resolve the channel for `channel_type` from the registry, falling
+/// back to a lazy install for out-of-tree sidecar channels that the
+/// boot-time installer didn't know about (custom platforms declared
+/// via `aura.json`).
+///
+/// Split out from [`Sidecar::build`] so the route handler can run
+/// this *before* committing the sink to the build path. On `Err`,
+/// the route handler still owns the sink and can write a
+/// `Frame::RegisterAck { ok: false, reason }` to surface the failure
+/// to the peer — a silent close (which is what `build` did on the
+/// `?` early-return) leaves the client without a recoverable signal.
+pub(crate) fn resolve_or_install_channel(
+    registry: &Arc<ChannelRegistry>,
+    channel_type: &ChannelType,
+) -> Result<Arc<Channel>, ChannelError> {
+    if let Some(ch) = registry.get(channel_type) {
+        return Ok(ch);
+    }
+    super::boot::install_channel(registry, channel_type.clone())?;
+    registry.get(channel_type).ok_or_else(|| {
+        ChannelError::Config(format!("channel '{channel_type}' missing after install"))
+    })
+}
+
 impl Sidecar {
-    /// Build the per-WS state. Looks up the channel in the registry;
-    /// if absent (e.g. test fixtures that skipped boot install), the
-    /// channel is created on the fly via [`super::boot::install_channel`]
-    /// so production and tests follow the same install path.
+    /// Build the per-WS state from an already-resolved channel handle.
+    /// Infallible — all the failure modes the previous `build`
+    /// surfaced lived in the channel resolve, which now runs in
+    /// [`resolve_or_install_channel`] so the route can ack failures
+    /// on the wire instead of dropping the socket silently.
     pub(crate) fn build(
         channel_type: ChannelType,
-        registry: &Arc<ChannelRegistry>,
+        channel: Arc<Channel>,
         sink: WsSink,
         blob_store: Arc<dyn BlobStore>,
         token_handle: Option<TokenHandle>,
-    ) -> Result<Self, ChannelError> {
-        let channel = match registry.get(&channel_type) {
-            Some(ch) => ch,
-            None => {
-                super::boot::install_channel(registry, channel_type.clone())?;
-                registry.get(&channel_type).ok_or_else(|| {
-                    ChannelError::Config(format!("channel '{channel_type}' missing after install"))
-                })?
-            }
-        };
-
+    ) -> Self {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(OUTBOUND_BUFFER);
         let (frame_tx, frame_rx) = mpsc::channel::<Frame>(OUTBOUND_BUFFER);
 
         // Translator: SessionEvent → Frame. Exits when every clone of
         // `event_tx` drops (channel detach + sidecar drop).
         let translator_tx = frame_tx.clone();
-        let translator_ct = channel_type.clone();
         let translator_blobs = Arc::clone(&blob_store);
         tokio::spawn(translator_loop(
             event_rx,
             translator_tx,
-            translator_ct,
+            channel_type,
             translator_blobs,
         ));
 
@@ -114,13 +128,13 @@ impl Sidecar {
 
         let pump = tokio::spawn(pump_loop(sink, frame_rx));
 
-        Ok(Self {
+        Self {
             channel,
             connection,
             frame_tx,
             pump,
             _token_handle: token_handle,
-        })
+        }
     }
 
     /// Push a frame directly to the outbound pump. Used for
@@ -446,5 +460,49 @@ async fn stat_attachment(
             tracing::warn!(blob_id, error = %e, "attachment blob stat failed; dropping");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_or_install_channel;
+    use aura_channels::ChannelRegistry;
+    use aura_model::ChannelType;
+    use std::sync::Arc;
+
+    /// An installed channel is returned directly without invoking the
+    /// lazy install path. Guards the order: we look up *first*, fall
+    /// back to install only on miss — flipping the order would
+    /// double-install on every reconnect and return DuplicateChannel.
+    #[test]
+    fn resolve_returns_pre_installed_channel() {
+        let registry = Arc::new(ChannelRegistry::new());
+        super::super::boot::install_channel(&registry, ChannelType::http()).expect("install");
+        let before = registry.get(&ChannelType::http()).expect("pre-installed");
+
+        let resolved =
+            resolve_or_install_channel(&registry, &ChannelType::http()).expect("resolve");
+        assert!(
+            Arc::ptr_eq(&before, &resolved),
+            "resolve must return the existing Arc, not a freshly-installed sibling",
+        );
+    }
+
+    /// An unknown channel type triggers the lazy install fallback so
+    /// out-of-tree sidecars declared via `aura.json` (not in the
+    /// built-in `install_channels` map) still get a registry slot
+    /// when their first connection lands.
+    #[test]
+    fn resolve_lazy_installs_unknown_channel() {
+        let registry = Arc::new(ChannelRegistry::new());
+        let ct = ChannelType::from("custom-out-of-tree");
+        assert!(registry.get(&ct).is_none(), "fixture must start empty");
+
+        let resolved = resolve_or_install_channel(&registry, &ct).expect("lazy install");
+        assert_eq!(resolved.channel_type().as_str(), "custom-out-of-tree");
+        assert!(
+            registry.get(&ct).is_some(),
+            "lazy install must publish to the registry so a second connect hits the hot path",
+        );
     }
 }

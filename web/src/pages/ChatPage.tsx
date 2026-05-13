@@ -1104,14 +1104,32 @@ function routeInboundFrame(
           // streaming, non-pending row of the same role+text. Window
           // capped at the last 16 rows so we don't replay-walk a
           // 10k-message scrollback.
+          //
+          // Iterate oldest→newest within the window. Replays arrive
+          // in ascending ordinal order, so the first un-claimed
+          // matching row is the one this replay belongs to. The
+          // newest-first walk we used before inverted the pairing
+          // when the same text appeared twice: replay N would claim
+          // the *later* row, then replay N+1 would claim the earlier
+          // one, leaving the earlier text rendered with the newer
+          // ordinal. Rows already re-keyed by a prior replay carry
+          // the `hist-` prefix and are skipped, so iterating forward
+          // can't re-claim them.
+          //
+          // `hasAttachments` is also part of the discriminator so an
+          // attachment-only row doesn't get re-keyed onto a text-only
+          // replay (and vice-versa) when their text happens to be
+          // empty for the attachment side.
           const TAIL_WINDOW = 16;
           const start = Math.max(0, view.transcript.length - TAIL_WINDOW);
-          for (let i = view.transcript.length - 1; i >= start; i--) {
+          const replayHasAttachments = (frame.attachments?.length ?? 0) > 0;
+          for (let i = start; i < view.transcript.length; i++) {
             const row = view.transcript[i];
             if (row.streaming || row.pending) continue;
             if (row.key.startsWith('hist-')) continue;
             if (row.role !== role) continue;
             if (row.text !== frame.content) continue;
+            if (Boolean(row.hasAttachments) !== replayHasAttachments) continue;
             const next = view.transcript.slice();
             next[i] = { ...row, key: replayKey, text: frame.content };
             return { ...prev, [sid]: { ...view, transcript: next } };

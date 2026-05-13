@@ -240,20 +240,24 @@ async fn list_sessions(
     State(state): State<AdminState>,
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<Json<ChatSessionsList>> {
-    // List from the session manager directly — fresh chat sessions
-    // don't have any trace summary rows yet, so going through the
-    // summary listing would hide them until the first agent turn
-    // runs. Filtering to channel=http here keeps the list scoped to
-    // browser-originated chats; admin/traces remains the cross-channel
-    // surface.
-    let all = state
+    // Push the channel filter into SQL so a long-running gateway
+    // with thousands of bot sessions (telegram / weixin / …) doesn't
+    // pay an O(all-sessions) libsql round-trip on every chat-list
+    // refresh — see `SessionStore::list_by_channel`. We still walk
+    // the result to apply the hidden filter; that's a userland-only
+    // pass over the (now scoped) result.
+    //
+    // Going through `session_manager` here rather than the trace
+    // summary listing is deliberate: fresh chat sessions don't have
+    // any trace summary rows yet, so the summary path would hide
+    // them until the first agent turn ran.
+    let scoped = state
         .session_manager
-        .list()
+        .list_by_channel(&ChannelType::http())
         .await
         .map_err(|e| GatewayError::Internal(format!("list sessions: {e}")))?;
-    let items: Vec<ChatSessionSummary> = all
+    let items: Vec<ChatSessionSummary> = scoped
         .into_iter()
-        .filter(|s| s.channel == ChannelType::http())
         .filter(|s| query.include_hidden || !s.hidden)
         .map(|s| ChatSessionSummary {
             session_id: s.id.to_string(),

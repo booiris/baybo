@@ -283,6 +283,47 @@ impl SessionStore for LibsqlSessionStore {
         Ok(sessions)
     }
 
+    async fn list_by_channel(&self, channel: &aura_model::ChannelType) -> Result<Vec<Session>> {
+        // Push the channel filter into SQL via `json_extract` — the
+        // sessions table doesn't carry `channel` as a flat column
+        // (it rides inside the JSON `data` blob), so a real index
+        // isn't available without a schema migration. This is still
+        // a full table scan, but non-matching rows never ship their
+        // `data` blob over the libsql wire or pay the serde decode
+        // in userland, which is the cost we actually care about for
+        // a long-running gateway with thousands of bot sessions.
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT data, hidden FROM sessions \
+                 WHERE is_normal_session = 1 \
+                   AND json_extract(data, '$.channel') = ?1 \
+                 ORDER BY last_active DESC",
+                libsql::params![channel.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query by channel: {e}")))?;
+
+        let mut sessions = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let hidden_col: i64 = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let mut session: Session = serde_json::from_str(&data)
+                .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
+            session.hidden = hidden_col != 0;
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
+
     async fn list_lineage_children(
         &self,
         parent_session_id: &SessionId,
@@ -1096,6 +1137,67 @@ mod tests {
         let cutoff = Utc::now() - chrono::Duration::hours(1);
         let expired = store.list_expired(cutoff).await.unwrap();
         assert_eq!(expired, vec![SessionId::from("old")]);
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_pushes_predicate_into_sql() {
+        // Mixed-channel fixture: two http sessions, one telegram. The
+        // chat REST surface only wants http; the push-down keeps
+        // telegram rows out of the libsql round-trip entirely so a
+        // gateway hosting thousands of bot sessions doesn't pay an
+        // O(all-sessions) cost on every chat-list refresh.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut http_a = make_root_session("http-a");
+        http_a.channel = ChannelType::http();
+        store.save(&http_a).await.unwrap();
+
+        let mut tg = make_root_session("tg-1");
+        tg.channel = ChannelType::telegram();
+        store.save(&tg).await.unwrap();
+
+        let mut http_b = make_root_session("http-b");
+        http_b.channel = ChannelType::http();
+        store.save(&http_b).await.unwrap();
+
+        let http = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let http_ids: Vec<&str> = http.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(http_ids.len(), 2);
+        assert!(http_ids.contains(&"http-a"));
+        assert!(http_ids.contains(&"http-b"));
+        assert!(!http_ids.contains(&"tg-1"));
+
+        let telegram = store
+            .list_by_channel(&ChannelType::telegram())
+            .await
+            .unwrap();
+        assert_eq!(telegram.len(), 1);
+        assert_eq!(telegram[0].id.as_str(), "tg-1");
+
+        // A channel with no rows comes back empty, not as an error.
+        let empty = store.list_by_channel(&ChannelType::weixin()).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_reflects_hidden_column() {
+        // `list_by_channel` must project the flat `hidden` column the
+        // same way `list_all` does — `set_hidden` writes only that
+        // column without rewriting the JSON `data` blob, so trusting
+        // the deserialised `Session.hidden` alone would read stale
+        // values.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut s = make_root_session("hide-me");
+        s.channel = ChannelType::http();
+        store.save(&s).await.unwrap();
+        assert!(store.set_hidden(&s.id, true).await.unwrap());
+
+        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].hidden, "hidden flag must reflect the column");
     }
 
     #[tokio::test]

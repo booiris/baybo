@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::{ChatMessage, LineageKind, Session, SessionId};
+use aura_model::{ChannelType, ChatMessage, LineageKind, Session, SessionId};
 use chrono::{DateTime, Utc};
 
 use crate::error::StorageError;
@@ -76,6 +76,21 @@ pub trait SessionStore: Send + Sync {
     /// = 0`) are filtered out; use [`Self::list_all_maintenance_sessions`]
     /// to enumerate those. Operator-facing: drives `aura session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
+
+    /// Return live user-facing sessions whose `channel` equals
+    /// `channel`, newest-active first. Used by the chat REST surface
+    /// (`GET /v1/chat/sessions`) so a long-running gateway with
+    /// thousands of telegram / weixin sessions doesn't ship every
+    /// row over the wire only to discard the non-http ones in
+    /// userland.
+    ///
+    /// Default impl is the naive `list_all() → filter` fallback so
+    /// mock / in-memory stores work without overriding; the libsql
+    /// impl pushes the predicate into SQL.
+    async fn list_by_channel(&self, channel: &ChannelType) -> Result<Vec<Session>> {
+        let all = self.list_all().await?;
+        Ok(all.into_iter().filter(|s| &s.channel == channel).collect())
+    }
     /// Return the live forks (sessions with `LineageKind::UserFork`)
     /// whose `parent_session_id` equals the given session.
     async fn list_live_forks(&self, source_session_id: &SessionId) -> Result<Vec<SessionId>>;

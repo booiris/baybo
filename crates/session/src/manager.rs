@@ -384,6 +384,18 @@ impl SessionManager {
         Ok(sessions)
     }
 
+    /// Live sessions whose `channel` matches `channel`, newest-active
+    /// first. Delegates to the store's `list_by_channel`, which
+    /// pushes the predicate into SQL on the libsql backend so a
+    /// long-running gateway with thousands of bot sessions doesn't
+    /// pay an O(all) round-trip when the caller only wants the
+    /// http channel.
+    pub async fn list_by_channel(&self, channel: &aura_model::ChannelType) -> Result<Vec<Session>> {
+        let mut sessions = self.store.list_by_channel(channel).await.map_err(wrap)?;
+        sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        Ok(sessions)
+    }
+
     /// Return the active transcript for the session — non-superseded
     /// rows of the append-only `session_messages` log, in order.
     /// Errors with `SessionError::NotFound` if the session itself
