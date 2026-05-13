@@ -68,11 +68,9 @@ CREATE TABLE session_summaries (
 
 `in_flight` is the at-most-one-in-flight gate (see [Spawn serialization](#spawn-serialization)). The maintenance session row in `sessions` is kept as audit history once a pass lands and is **not** consulted by the trigger gate.
 
-### libsql — new column on `sessions`
+### libsql — `is_normal_session` column on `sessions`
 
-```sql
-ALTER TABLE sessions ADD COLUMN is_normal_session BOOLEAN NOT NULL DEFAULT 1;
-```
+`sessions` declares `is_normal_session INTEGER NOT NULL DEFAULT 1` directly in its canonical `CREATE TABLE` (see `crates/storage/src/libsql/mod.rs`).
 
 - Set to `0` at session creation when `LineageKind::SystemMaintenance`.
 - Default `SessionStore` queries add `WHERE is_normal_session = 1`.

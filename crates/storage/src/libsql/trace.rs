@@ -310,4 +310,85 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].seq, 0);
     }
+
+    #[tokio::test]
+    async fn span_event_kind_columns_index_by_variant() {
+        use aura_trace::ToolEventPayload;
+
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlTraceStore::new(pool.clone());
+        let span_id = SpanId::new();
+        let approval = SpanEvent::new(
+            span_id,
+            0,
+            SpanEventKind::Approval {
+                decision: aura_model::ApprovalDecision::Approve,
+                resource: aura_model::ResourceAccess::ReadFile {
+                    path: std::path::PathBuf::from("/tmp/foo"),
+                },
+            },
+        );
+        let phase = SpanEvent::new(
+            span_id,
+            1,
+            SpanEventKind::ToolEvent {
+                action: "http_request".into(),
+                payload: ToolEventPayload::Phase { duration_ms: 5 },
+            },
+        );
+        let llm = SpanEvent::new(
+            span_id,
+            2,
+            SpanEventKind::ToolEvent {
+                action: "llm_summary".into(),
+                payload: ToolEventPayload::LlmCall {
+                    model: "m".into(),
+                    input: "i".into(),
+                    output: "o".into(),
+                },
+            },
+        );
+        store.append_span_event(&approval).await.unwrap();
+        store.append_span_event(&phase).await.unwrap();
+        store.append_span_event(&llm).await.unwrap();
+
+        let conn = pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT seq, kind, tool_event_kind FROM span_events \
+                 WHERE span_id = ?1 ORDER BY seq",
+                libsql::params![span_id.to_string()],
+            )
+            .await
+            .unwrap();
+        let mut got: Vec<(i64, String, Option<String>)> = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            got.push((
+                row.get::<i64>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<Option<String>>(2).unwrap(),
+            ));
+        }
+        assert_eq!(
+            got,
+            vec![
+                (0, "approval".to_string(), None),
+                (1, "tool_event".to_string(), Some("phase".to_string())),
+                (2, "tool_event".to_string(), Some("llm_call".to_string())),
+            ]
+        );
+
+        // Sanity-check that the kind index can answer a filtered query.
+        let mut count_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM span_events \
+                 WHERE kind = 'tool_event' AND tool_event_kind = 'llm_call'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = count_rows.next().await.unwrap().unwrap();
+        let count: i64 = row.get(0).unwrap();
+        assert_eq!(count, 1);
+    }
 }

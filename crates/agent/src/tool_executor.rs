@@ -14,7 +14,7 @@ use aura_tools::{
 };
 use aura_trace::{
     LifecycleOutcome, SpanEventKind, SpanFinalize, SpanKind, StepHandle, ToolCallBegin,
-    ToolCallOrigin, ToolCallResult,
+    ToolCallOrigin, ToolCallResult, ToolEventPayload,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +40,79 @@ const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
 /// payload. The full text is still preserved verbatim in the span's
 /// `result.output`; this bound only governs the row-level reason label.
 const FAILURE_REASON_MAX_BYTES: usize = 512;
+
+/// Hard cap on the total byte size of text fields carried inside the
+/// drained payloads of a single tool call. Tools are expected to
+/// truncate their own snippets/inputs/outputs before emitting, but
+/// this cap protects `span_events` from a tool that emits one very
+/// large payload (or many medium ones). Entries that would push the
+/// running total past this cap are dropped silently — the trace is
+/// best-effort, not load-bearing.
+///
+/// There is no separate cap on entry count: tools that emit a steady
+/// trickle of small `Phase` events are bounded by this same byte
+/// budget (each entry costs at least its `action` label length).
+const TOOL_EVENTS_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Buffer that implements [`aura_tools::ToolEventSink`] by stashing
+/// `(action, payload)` entries for the executor to drain into
+/// [`SpanEventKind::ToolEvent`] events once the tool returns. Sync,
+/// fire-and-forget — the tool body sees a plain trait object.
+struct SpanEventRecorder {
+    entries: Mutex<SpanEventRecorderState>,
+}
+
+#[derive(Default)]
+struct SpanEventRecorderState {
+    items: Vec<(String, ToolEventPayload)>,
+    text_bytes: usize,
+}
+
+impl SpanEventRecorder {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(SpanEventRecorderState::default()),
+        }
+    }
+
+    fn drain(&self) -> Vec<(String, ToolEventPayload)> {
+        std::mem::take(&mut self.entries.lock().items)
+    }
+}
+
+/// Approximate textual size of a payload — used to enforce the
+/// per-call byte cap. Counts bytes of every owned `String` field;
+/// fixed-size scalars (status codes, durations) contribute nothing.
+fn payload_text_bytes(payload: &ToolEventPayload) -> usize {
+    match payload {
+        ToolEventPayload::Phase { .. } => 0,
+        ToolEventPayload::HttpFetch {
+            content_type,
+            body_preview,
+            ..
+        } => {
+            content_type.as_deref().map(str::len).unwrap_or(0)
+                + body_preview.as_deref().map(str::len).unwrap_or(0)
+        }
+        ToolEventPayload::LlmCall {
+            model,
+            input,
+            output,
+        } => model.len() + input.len() + output.len(),
+    }
+}
+
+impl aura_tools::ToolEventSink for SpanEventRecorder {
+    fn emit(&self, action: &str, payload: ToolEventPayload) {
+        let mut guard = self.entries.lock();
+        let cost = action.len() + payload_text_bytes(&payload);
+        if guard.text_bytes.saturating_add(cost) > TOOL_EVENTS_MAX_PAYLOAD_BYTES {
+            return;
+        }
+        guard.text_bytes += cost;
+        guard.items.push((action.to_string(), payload));
+    }
+}
 
 fn truncate_for_reason(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -135,6 +208,36 @@ impl ToolExecutor {
             workspace_root,
             workspace_paths,
             sandbox_runner,
+        }
+    }
+
+    /// Scrub leak-detector matches out of every text field carried in
+    /// a [`ToolEventPayload`] before it lands in the trace store.
+    /// Fixed-size scalars (status codes, byte counts, durations) are
+    /// untouched. Sanitize failures are logged at debug — the event
+    /// is still emitted with whatever the gateway returned, falling
+    /// through to the original string on Err.
+    async fn sanitize_tool_event_payload(&self, payload: &mut ToolEventPayload) {
+        match payload {
+            ToolEventPayload::Phase { .. } => {}
+            ToolEventPayload::HttpFetch { body_preview, .. } => {
+                if let Some(text) = body_preview.as_mut() {
+                    self.sanitize_in_place(text).await;
+                }
+            }
+            ToolEventPayload::LlmCall { input, output, .. } => {
+                self.sanitize_in_place(input).await;
+                self.sanitize_in_place(output).await;
+            }
+        }
+    }
+
+    async fn sanitize_in_place(&self, text: &mut String) {
+        match self.security_gateway.sanitize_stream_fragment(text).await {
+            Ok(scrubbed) => *text = scrubbed,
+            Err(e) => {
+                debug!(error = %e, "sanitize_tool_event_payload: sanitize_stream_fragment failed");
+            }
         }
     }
 
@@ -354,6 +457,12 @@ impl ToolExecutor {
                 let approval_gate = self.gate_map.get(&user.channel, session_id);
                 let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
 
+                // Per-call event sink. Drained into span events after
+                // tool execution so phase timers and richer artifacts
+                // (e.g. WebFetch's HTTP response summary, side-LLM I/O)
+                // surface in the trace UI.
+                let event_sink = Arc::new(SpanEventRecorder::new());
+
                 // Build tool context. The token comes from the agent
                 // loop's per-job cancel tree — tripping it (via
                 // JobLifecycle::cancel or a parent subagent's cascade)
@@ -368,6 +477,7 @@ impl ToolExecutor {
                     sandbox,
                     approval: Some(approval),
                     notifier: notifier.clone(),
+                    events: Arc::clone(&event_sink) as Arc<dyn aura_tools::ToolEventSink>,
                 };
 
                 // Reveal placeholders in the tool's arguments just
@@ -388,6 +498,26 @@ impl ToolExecutor {
                         .execute(&tool_name_owned, params_revealed, &ctx),
                 )
                 .await;
+
+                // Flush tool-reported events as span events, regardless
+                // of whether the tool succeeded, failed, or hit the
+                // outer timeout. Each entry continues the span-local
+                // seq sequence that approval emission left off at.
+                // Text fields inside the payload are sanitized so any
+                // leaked secrets get minted into placeholders before
+                // they hit the trace store. Drops on emit_event errors
+                // are intentional — events are non-load-bearing.
+                for (action, mut payload) in event_sink.drain() {
+                    self.sanitize_tool_event_payload(&mut payload).await;
+                    let _ = recorder
+                        .emit_event(
+                            span_handle.span_id,
+                            event_seq,
+                            SpanEventKind::ToolEvent { action, payload },
+                        )
+                        .await;
+                    event_seq += 1;
+                }
 
                 match result {
                     Ok(Ok(mut output)) => {

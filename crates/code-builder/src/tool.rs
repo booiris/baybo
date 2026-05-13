@@ -753,6 +753,7 @@ mod tests {
             sandbox: None,
             approval: None,
             notifier: None,
+            events: aura_tools::noop_event_sink(),
         }
     }
 
@@ -1320,6 +1321,7 @@ mod tests {
             sandbox: None,
             approval: Some(handle),
             notifier: None,
+            events: aura_tools::noop_event_sink(),
         }
     }
 

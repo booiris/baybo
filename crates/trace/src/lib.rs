@@ -15,7 +15,7 @@ mod span;
 mod step;
 
 pub use error::TraceError;
-pub use event::{SpanEvent, SpanEventKind};
+pub use event::{SpanEvent, SpanEventKind, ToolEventPayload};
 pub use outcome::{LifecycleOutcome, LifecycleState};
 pub use span::{
     LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolCallRecord, Span, SpanFinalize, SpanHandle,

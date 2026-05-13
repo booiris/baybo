@@ -1,13 +1,15 @@
 //! `WebFetch` — GET an `http(s)` URL, render the body as Markdown, return text.
 //!
-//! Matches Claude Code's WebFetch tool shape: `{ url, prompt? }`. When a
-//! `prompt` is supplied AND the tool was constructed with an
-//! `Arc<dyn LlmCompletion>` via [`WebFetchTool::with_llm`] (the
-//! `default_tools` factory threads one in when an LLM is available), the
-//! rendered markdown is run through that side LLM with a fixed system
-//! instruction and the tool returns the model's extraction instead of the
-//! raw body. Without an LLM (e.g. argv-mode boot, tests) the `prompt` is
-//! silently ignored and the raw markdown is returned — the legacy behaviour.
+//! Matches Claude Code's WebFetch tool shape: `{ url, prompt? }`. The
+//! side-LLM extraction path fires when ALL three hold: a `prompt` is
+//! supplied, the tool was constructed with an `Arc<dyn LlmCompletion>`
+//! via [`WebFetchTool::with_llm`] (the `default_tools` factory threads
+//! one in when an LLM is available), AND the rendered markdown is at
+//! least `SUMMARY_MIN_CHARS` long. Smaller pages fit in the agent's
+//! own context, so the raw markdown is returned verbatim — a side-LLM
+//! call would cost tokens for output that is almost always less
+//! faithful than the original. Argv-mode boot and tests also fall
+//! through to the raw path.
 //!
 //! Raw output is capped at 256 KiB on a UTF-8 char boundary, matching the
 //! per-tool cap documented in `docs/modules/security.md`. LLM input is capped
@@ -44,7 +46,9 @@ use reqwest::redirect;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
+use aura_trace::ToolEventPayload;
+
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput, start_timer};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
@@ -53,7 +57,21 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// window after the system+prompt overhead, and capped low enough that a
 /// pathological page can't dominate the per-call cost.
 const MAX_SUMMARY_INPUT_BYTES: usize = 96 * 1024;
+/// Threshold below which a `prompt` is ignored even when an LLM is
+/// wired in. Short pages fit comfortably in the agent's own context;
+/// burning a side-LLM call to summarise <2 KB of text is almost always
+/// wasted spend, and the raw markdown is more accurate than any
+/// summary the side model would write. Measured in chars (not bytes)
+/// so the threshold tracks rough token count consistently across
+/// scripts.
+const SUMMARY_MIN_CHARS: usize = 2048;
 const ERROR_BODY_PREVIEW_BYTES: usize = 8 * 1024;
+/// Cap on the rendered-body preview persisted into the trace's
+/// `HttpFetch` event payload. The full rendered text still flows back
+/// to the agent via `ToolOutput::Text`; this only governs what shows
+/// up in the audit trail. Bytes (not chars) — `truncate_utf8` cuts on
+/// a UTF-8 boundary.
+const HTTP_BODY_PREVIEW_BYTES: usize = 32 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIRECT_LIMIT: usize = 5;
 const CALL_LABEL_MAX: usize = 120;
@@ -307,19 +325,22 @@ Usage notes:
 
         tracing::info!(host = %host, "WebFetch start");
 
-        let send_fut = self.client.get(parsed).timeout(ctx.timeout).send();
-        let response = tokio::select! {
-            _ = ctx.cancellation_token.cancelled() => {
-                return Err(ToolError::Execution("cancelled".into()));
-            }
-            res = send_fut => match res {
-                Ok(r) => r,
-                Err(e) if e.is_timeout() => {
-                    return Err(ToolError::Timeout(format!(
-                        "WebFetch exceeded {:?}", ctx.timeout
-                    )));
+        let response = {
+            let _t = start_timer(&ctx.events, "http_request");
+            let send_fut = self.client.get(parsed).timeout(ctx.timeout).send();
+            tokio::select! {
+                _ = ctx.cancellation_token.cancelled() => {
+                    return Err(ToolError::Execution("cancelled".into()));
                 }
-                Err(e) => return Err(ToolError::Execution(reqwest_error_chain(&e))),
+                res = send_fut => match res {
+                    Ok(r) => r,
+                    Err(e) if e.is_timeout() => {
+                        return Err(ToolError::Timeout(format!(
+                            "WebFetch exceeded {:?}", ctx.timeout
+                        )));
+                    }
+                    Err(e) => return Err(ToolError::Execution(reqwest_error_chain(&e))),
+                }
             }
         };
 
@@ -332,8 +353,20 @@ Usage notes:
             .to_string();
 
         if !status.is_success() {
-            let body = read_body(response, ERROR_BODY_PREVIEW_BYTES, ctx).await?;
+            let body = {
+                let _t = start_timer(&ctx.events, "read_error_body");
+                read_body(response, ERROR_BODY_PREVIEW_BYTES, ctx).await?
+            };
             let snippet = truncate_utf8(&body, ERROR_BODY_PREVIEW_BYTES);
+            ctx.events.emit(
+                "http_response",
+                ToolEventPayload::HttpFetch {
+                    status: status.as_u16(),
+                    bytes: body.len() as u64,
+                    content_type: empty_to_none(&content_type),
+                    body_preview: empty_to_none(&snippet),
+                },
+            );
             tracing::info!(
                 host = %host,
                 status = status.as_u16(),
@@ -356,11 +389,15 @@ Usage notes:
             )));
         }
 
-        let body = read_body(response, MAX_RESPONSE_BYTES, ctx).await?;
+        let body = {
+            let _t = start_timer(&ctx.events, "read_body");
+            read_body(response, MAX_RESPONSE_BYTES, ctx).await?
+        };
         let body_bytes_read = body.len();
         let raw_text = String::from_utf8_lossy(&body);
 
         let rendered = if is_html {
+            let _t = start_timer(&ctx.events, "html_to_markdown");
             match htmd::convert(&raw_text) {
                 Ok(md) => md,
                 Err(e) => {
@@ -372,25 +409,55 @@ Usage notes:
             raw_text.into_owned()
         };
 
+        ctx.events.emit(
+            "http_response",
+            ToolEventPayload::HttpFetch {
+                status: status.as_u16(),
+                bytes: body_bytes_read as u64,
+                content_type: empty_to_none(&content_type),
+                body_preview: empty_to_none(&truncate_utf8(
+                    rendered.as_bytes(),
+                    HTTP_BODY_PREVIEW_BYTES,
+                )),
+            },
+        );
+
         // Side-channel summary path: only when the caller asked for one
-        // (`prompt` is non-empty) AND an LLM was wired in. Without one the
-        // prompt is silently ignored — argv-mode boot, tests, and any
-        // deployment that hasn't configured a model still get useful raw
-        // output instead of an error.
+        // (`prompt` is non-empty), an LLM was wired in, AND the rendered
+        // content is large enough to be worth summarising. Pages under
+        // `SUMMARY_MIN_CHARS` are returned as raw markdown — they fit
+        // in the agent's own context, and a side-LLM round-trip would
+        // cost tokens for output that is almost always less faithful
+        // than the original. Argv-mode boot, tests, and any deployment
+        // that hasn't configured a model also get the raw output.
         if let (Some(llm), Some(prompt_text)) = (
             self.llm.as_ref(),
             p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-        ) {
-            let summary_input = truncate_utf8(rendered.as_bytes(), MAX_SUMMARY_INPUT_BYTES);
-            let summary = run_summary(llm, prompt_text, &summary_input, ctx).await;
+        ) && rendered.chars().count() > SUMMARY_MIN_CHARS
+        {
+            let summary_page = truncate_utf8(rendered.as_bytes(), MAX_SUMMARY_INPUT_BYTES);
+            let summary_user_text =
+                format!("Prompt: {prompt_text}\n\nPage content (Markdown):\n{summary_page}");
+            let summary = {
+                let _t = start_timer(&ctx.events, "llm_summary");
+                run_summary(llm, &summary_user_text, ctx).await
+            };
             return match summary {
                 Ok(text) => {
                     let output = truncate_utf8(text.as_bytes(), MAX_OUTPUT_BYTES);
+                    ctx.events.emit(
+                        "llm_summary",
+                        ToolEventPayload::LlmCall {
+                            model: llm.model_info().id.clone(),
+                            input: summary_user_text.clone(),
+                            output: output.clone(),
+                        },
+                    );
                     tracing::info!(
                         host = %host,
                         status = status.as_u16(),
                         body_bytes_read,
-                        summary_input_bytes = summary_input.len(),
+                        summary_input_bytes = summary_user_text.len(),
                         output_bytes = output.len(),
                         "WebFetch done (summarised)"
                     );
@@ -422,11 +489,9 @@ Usage notes:
 /// so a slow model can't pin the outer deadline.
 async fn run_summary(
     llm: &GuardedLlm,
-    prompt: &str,
-    page: &str,
+    user_text: &str,
     ctx: &ToolContext,
 ) -> Result<String, String> {
-    let user_text = format!("Prompt: {prompt}\n\nPage content (Markdown):\n{page}");
     let request = ChatRequest {
         messages: vec![
             ChatMessage {
@@ -436,7 +501,7 @@ async fn run_summary(
             },
             ChatMessage {
                 role: Role::User,
-                content: vec![ContentBlock::Text(user_text)],
+                content: vec![ContentBlock::Text(user_text.to_string())],
                 from_user: false,
             },
         ],
@@ -510,6 +575,14 @@ fn reqwest_error_chain(e: &reqwest::Error) -> String {
     s
 }
 
+fn empty_to_none(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 fn truncate_utf8(bytes: &[u8], max: usize) -> String {
     if bytes.len() <= max {
         return String::from_utf8_lossy(bytes).into_owned();
@@ -559,11 +632,29 @@ mod tests {
             sandbox: None,
             approval: None,
             notifier: None,
+            events: crate::noop_event_sink(),
         }
     }
 
     fn ctx() -> ToolContext {
         ctx_with_timeout(Duration::from_secs(5))
+    }
+
+    #[derive(Default)]
+    struct RecorderStub {
+        entries: parking_lot::Mutex<Vec<(String, aura_trace::ToolEventPayload)>>,
+    }
+
+    impl crate::ToolEventSink for RecorderStub {
+        fn emit(&self, action: &str, payload: aura_trace::ToolEventPayload) {
+            self.entries.lock().push((action.to_string(), payload));
+        }
+    }
+
+    fn ctx_with_event_sink(sink: Arc<RecorderStub>) -> ToolContext {
+        let mut c = ctx();
+        c.events = sink as Arc<dyn crate::ToolEventSink>;
+        c
     }
 
     struct TestServer {
@@ -778,6 +869,179 @@ mod tests {
         let ToolOutput::Text(s) = out else { panic!() };
         assert!(s.contains("# Title"), "missing markdown heading: {s:?}");
         assert!(s.contains("**world**"), "missing markdown bold: {s:?}");
+    }
+
+    #[tokio::test]
+    async fn timer_metrics_record_phases_for_html() {
+        let server = spawn(Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<h1>Hi</h1>",
+                )
+            }),
+        ))
+        .await;
+        let metrics = Arc::new(RecorderStub::default());
+        WebFetchTool::for_testing()
+            .execute(
+                json!({ "url": url_to(&server, "/") }),
+                &ctx_with_event_sink(Arc::clone(&metrics)),
+            )
+            .await
+            .unwrap();
+        let phases: Vec<String> = metrics
+            .entries
+            .lock()
+            .iter()
+            .map(|(a, _)| a.clone())
+            .collect();
+        assert!(
+            phases.iter().any(|p| p == "http_request"),
+            "missing http_request in {phases:?}"
+        );
+        assert!(
+            phases.iter().any(|p| p == "read_body"),
+            "missing read_body in {phases:?}"
+        );
+        assert!(
+            phases.iter().any(|p| p == "html_to_markdown"),
+            "missing html_to_markdown in {phases:?}"
+        );
+        assert!(
+            !phases.iter().any(|p| p == "llm_summary"),
+            "llm_summary recorded without a prompt+LLM: {phases:?}"
+        );
+
+        let entries = metrics.entries.lock();
+        let http_response = entries
+            .iter()
+            .find(|(a, _)| a == "http_response")
+            .expect("missing http_response entry");
+        match &http_response.1 {
+            aura_trace::ToolEventPayload::HttpFetch {
+                status,
+                content_type,
+                body_preview,
+                ..
+            } => {
+                assert_eq!(*status, 200);
+                assert_eq!(content_type.as_deref(), Some("text/html; charset=utf-8"));
+                let preview = body_preview.as_deref().expect("missing body preview");
+                assert!(
+                    preview.contains("# Hi"),
+                    "preview does not look like rendered markdown: {preview:?}"
+                );
+            }
+            other => panic!("expected HttpFetch payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timer_metrics_record_llm_summary_when_prompt_set() {
+        use aura_llm::test_support::StubLlm;
+        use aura_llm::{LlmResponse, TokenUsage};
+
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+
+        let server = spawn(Router::new().route(
+            "/",
+            get(|| async {
+                let body = format!(
+                    "<h1>Hi</h1><p>{}</p>",
+                    "lorem ipsum ".repeat(SUMMARY_MIN_CHARS / 6),
+                );
+                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
+            }),
+        ))
+        .await;
+        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
+        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let metrics = Arc::new(RecorderStub::default());
+        tool.execute(
+            json!({ "url": url_to(&server, "/"), "prompt": "what's the title?" }),
+            &ctx_with_event_sink(Arc::clone(&metrics)),
+        )
+        .await
+        .unwrap();
+        let phases: Vec<String> = metrics
+            .entries
+            .lock()
+            .iter()
+            .map(|(a, _)| a.clone())
+            .collect();
+        assert!(
+            phases.iter().any(|p| p == "llm_summary"),
+            "missing llm_summary in {phases:?}"
+        );
+
+        let entries = metrics.entries.lock();
+        let llm_call = entries
+            .iter()
+            .find(|(a, p)| {
+                a == "llm_summary" && matches!(p, aura_trace::ToolEventPayload::LlmCall { .. })
+            })
+            .expect("missing LlmCall payload");
+        match &llm_call.1 {
+            aura_trace::ToolEventPayload::LlmCall {
+                model,
+                input,
+                output,
+            } => {
+                assert!(!model.is_empty(), "model id should be populated");
+                assert!(input.contains("what's the title?"), "input missing prompt");
+                assert_eq!(output, "ok");
+            }
+            other => panic!("expected LlmCall payload, got {other:?}"),
+        }
+    }
+
+    /// Content under `SUMMARY_MIN_CHARS` skips the side LLM even when a
+    /// prompt is supplied: short pages fit in the agent's own context,
+    /// and a side-LLM round-trip would cost tokens for output that is
+    /// almost always less faithful than the original. The captured
+    /// stub asserts no chat call was made.
+    #[tokio::test]
+    async fn short_content_skips_llm_even_with_prompt() {
+        use aura_llm::test_support::StubLlm;
+
+        let stub = Arc::new(StubLlm::new());
+        // No `push_response` — a stray call would 500 the test.
+        let server = spawn(Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<h1>Hi</h1><p>short</p>",
+                )
+            }),
+        ))
+        .await;
+        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
+        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let out = tool
+            .execute(
+                json!({ "url": url_to(&server, "/"), "prompt": "summarise" }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!("expected Text, got: {out:?}")
+        };
+        assert!(s.contains("# Hi"), "raw markdown should be returned: {s:?}");
+        assert!(
+            stub.captured_requests().is_empty(),
+            "LLM should not be called for short content"
+        );
     }
 
     #[tokio::test]
@@ -1054,10 +1318,11 @@ mod tests {
         let server = spawn(Router::new().route(
             "/",
             get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    "<h1>Hello</h1><p>body</p>",
-                )
+                let body = format!(
+                    "<h1>Hello</h1><p>{}</p>",
+                    "lorem ipsum ".repeat(SUMMARY_MIN_CHARS / 6),
+                );
+                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
             }),
         ))
         .await;
@@ -1169,7 +1434,10 @@ mod tests {
 
         let server = spawn(Router::new().route(
             "/",
-            get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "page text") }),
+            get(|| async {
+                let body = "page text ".repeat(SUMMARY_MIN_CHARS / 10 + 32);
+                ([(header::CONTENT_TYPE, "text/plain")], body)
+            }),
         ))
         .await;
         let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);

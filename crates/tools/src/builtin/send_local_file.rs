@@ -238,6 +238,7 @@ mod tests {
             sandbox: None,
             approval: None,
             notifier: None,
+            events: crate::noop_event_sink(),
         }
     }
 

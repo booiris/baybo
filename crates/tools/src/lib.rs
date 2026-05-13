@@ -9,10 +9,11 @@ pub mod test_support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use aura_model::{SessionId, User};
+use aura_trace::ToolEventPayload;
 use aura_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,6 +98,16 @@ pub struct ToolContext {
     /// risk assessor returns `Suspicious` or `Dangerous`); other tools
     /// leave this `None`.
     pub notifier: Option<Arc<dyn SessionNotifier>>,
+    /// Per-tool-call event sink. Tools emit arbitrary observations —
+    /// phase timers (`http_request`, `html_to_markdown`, …), HTTP
+    /// response summaries, side-LLM round-trips — via
+    /// [`ToolEventSink::emit`] or the RAII [`start_timer`] helper.
+    /// The agent layer flushes each entry as a
+    /// `SpanEventKind::ToolEvent` so the trace view can render the
+    /// structured payload. Always present — call sites without a
+    /// real sink wire [`noop_event_sink`] so tool bodies never have
+    /// to branch on `Option`.
+    pub events: Arc<dyn ToolEventSink>,
 }
 
 /// Severity of a [`SessionNotifier`] event. Matches
@@ -122,6 +133,83 @@ pub struct NoopNotifier;
 
 impl SessionNotifier for NoopNotifier {
     fn emit(&self, _level: NoticeLevel, _summary: &str, _detail: &str) {}
+}
+
+/// Per-tool-call event sink. Tools emit arbitrary observations
+/// (phase timings, HTTP fetches, side-LLM calls, …) keyed by an
+/// `action` label; the agent layer drains the buffer after the tool
+/// returns and surfaces each entry as a `SpanEventKind::ToolEvent`.
+/// Sync and fire-and-forget — tools must not `await` emission.
+///
+/// Use [`start_timer`] for the common phase-timer case (RAII guard
+/// emits a `ToolEventPayload::Phase` on `Drop`); call
+/// [`ToolEventSink::emit`] directly for richer payloads.
+pub trait ToolEventSink: Send + Sync {
+    fn emit(&self, action: &str, payload: ToolEventPayload);
+}
+
+/// RAII helper that emits a `ToolEventPayload::Phase` carrying
+/// `now - started` when it drops. Build via [`start_timer`] for the
+/// common `ctx.events`-backed case.
+pub struct ToolTimer<'a> {
+    sink: &'a dyn ToolEventSink,
+    action: String,
+    started: Instant,
+}
+
+impl<'a> ToolTimer<'a> {
+    /// Construct a timer that emits via a borrowed `ToolEventSink`.
+    /// Most callers should prefer [`start_timer`] which derives the
+    /// borrow from the `Arc<dyn ToolEventSink>` carried in `ToolContext`.
+    pub fn new(sink: &'a dyn ToolEventSink, action: impl Into<String>) -> Self {
+        Self {
+            sink,
+            action: action.into(),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl<'a> Drop for ToolTimer<'a> {
+    fn drop(&mut self) {
+        self.sink.emit(
+            &self.action,
+            ToolEventPayload::Phase {
+                duration_ms: self.started.elapsed().as_millis() as u64,
+            },
+        );
+    }
+}
+
+/// Start an RAII timer against the event sink in `ToolContext`.
+/// Usage: `let _t = start_timer(&ctx.events, "http_request");` — the
+/// guard emits a `Phase` payload on drop, so the elapsed time is
+/// whatever the enclosing scope took. The borrow keeps the
+/// `Arc<dyn ToolEventSink>` alive for the timer's lifetime.
+pub fn start_timer<'a>(
+    sink: &'a Arc<dyn ToolEventSink>,
+    action: impl Into<String>,
+) -> ToolTimer<'a> {
+    ToolTimer::new(sink.as_ref(), action)
+}
+
+/// No-op event sink. Used as the default wired into `ToolContext`
+/// when no agent-level recorder is attached (tests, argv-mode boot,
+/// any code path that calls a tool without going through
+/// `ToolExecutor`). Built via [`noop_event_sink`] to avoid repeating
+/// the `Arc::new(...) as Arc<dyn ToolEventSink>` ceremony at every
+/// call site.
+pub struct NoopEventSink;
+
+impl ToolEventSink for NoopEventSink {
+    fn emit(&self, _action: &str, _payload: ToolEventPayload) {}
+}
+
+/// Allocate a fresh `Arc<dyn ToolEventSink>` backed by [`NoopEventSink`].
+/// Default sink for every `ToolContext` literal outside the agent
+/// path — tools never see a `None`, so they don't have to branch.
+pub fn noop_event_sink() -> Arc<dyn ToolEventSink> {
+    Arc::new(NoopEventSink)
 }
 
 /// Mid-execution approval entry point handed to a tool through

@@ -322,11 +322,24 @@ impl LibsqlPool {
                     ON spans(step_id, started_at);
 
                 CREATE TABLE IF NOT EXISTS span_events (
-                    span_id    TEXT    NOT NULL,
-                    seq        INTEGER NOT NULL,
-                    data       TEXT    NOT NULL,
+                    span_id         TEXT    NOT NULL,
+                    seq             INTEGER NOT NULL,
+                    data            TEXT    NOT NULL,
+                    -- Outer SpanEventKind tag ('sanitize_hit' | 'approval'
+                    -- | 'tool_event'); extracted from the JSON blob so
+                    -- the writer never has to populate it explicitly.
+                    kind            TEXT
+                        GENERATED ALWAYS AS (json_extract(data, '$.kind.kind')) VIRTUAL,
+                    -- Inner ToolEventPayload tag ('phase' | 'http_fetch'
+                    -- | 'llm_call'); NULL for non-tool_event rows. The
+                    -- nested path means SQLite returns NULL automatically
+                    -- when the outer kind is not `tool_event`.
+                    tool_event_kind TEXT
+                        GENERATED ALWAYS AS (json_extract(data, '$.kind.payload.type')) VIRTUAL,
                     PRIMARY KEY (span_id, seq)
                 );
+                CREATE INDEX IF NOT EXISTS idx_span_events_kind
+                    ON span_events(kind, tool_event_kind);
 
                 CREATE TABLE IF NOT EXISTS cron_jobs (
                     id              TEXT    PRIMARY KEY,
@@ -419,36 +432,10 @@ impl LibsqlPool {
                     PRIMARY KEY (channel_type, bot_id, user_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_pairings_code
-                    ON channel_pairings(code);
-
-                -- Legacy WAL table from the dropped two-layer trace design.
-                -- No reader ever consumed it; drop on upgrade so it stops
-                -- accumulating writes from any pre-update binary that
-                -- happens to share the file.
-                DROP TABLE IF EXISTS trace_events;",
+                    ON channel_pairings(code);",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
-
-        // In-place upgrade for DBs created before the prompt-cache columns
-        // existed on cost_records. SQLite has no `ADD COLUMN IF NOT EXISTS`,
-        // so we run the ALTERs and swallow the duplicate-column error. Fresh
-        // DBs get the columns straight from `CREATE TABLE` above and these
-        // ALTERs become no-ops.
-        for stmt in [
-            "ALTER TABLE cost_records ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE cost_records ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE sessions ADD COLUMN is_normal_session INTEGER NOT NULL DEFAULT 1",
-            "ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE session_summaries ADD COLUMN in_flight INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE session_summaries ADD COLUMN in_flight_owner TEXT",
-        ] {
-            if let Err(e) = self.conn.execute(stmt, ()).await
-                && !e.to_string().contains("duplicate column name")
-            {
-                return Err(anyhow::anyhow!("failed to add column: {e}"));
-            }
-        }
         Ok(())
     }
 }

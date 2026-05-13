@@ -773,6 +773,7 @@ mod tests {
                 Arc::new(Mutex::new(Vec::new())),
             )),
             notifier: None,
+            events: aura_tools::noop_event_sink(),
         }
     }
 
