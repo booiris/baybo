@@ -15,7 +15,7 @@ use aura_config::ChannelsConfig;
 use aura_gateway::auth::{
     ChannelTokenTable, ClientIdentity, TokenHandle, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
 };
-use aura_gateway::channel::boot;
+use aura_gateway::channel::{StashedTokenHandle, boot};
 use aura_gateway::channel_listener::ChannelServer;
 use aura_gateway::test_support::build_test_deps;
 use aura_model::{ChannelType, ChatMessage, ContentBlock, MessageMetadata, Role, User};
@@ -926,7 +926,7 @@ async fn web_ws_upgrade_takes_handle_and_revokes_on_close() {
         bound_channel_type: Some(ChannelType::http().to_string()),
     });
     let token = handle.token().to_owned();
-    web_chat_tokens.insert(token.clone(), handle);
+    web_chat_tokens.insert(token.clone(), StashedTokenHandle::new(handle));
     assert!(
         channel_tokens.lookup(&token).is_some(),
         "fresh mint is live"

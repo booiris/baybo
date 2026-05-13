@@ -41,6 +41,7 @@ use crate::api::dto::{ErrorBody, ListResponse};
 use crate::auth::{
     CHANNEL_TOKEN_HEADER, ClientIdentity, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
 };
+use crate::channel::StashedTokenHandle;
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -471,7 +472,9 @@ fn mint_credential(state: &AdminState, session_id: &SessionId) -> ChatSessionCre
         bound_channel_type: Some(ChannelType::http().to_string()),
     });
     let token = handle.token().to_owned();
-    state.web_chat_tokens.insert(token.clone(), handle);
+    state
+        .web_chat_tokens
+        .insert(token.clone(), StashedTokenHandle::new(handle));
     ChatSessionCredential {
         session_id: session_id.to_string(),
         channel_token: token,

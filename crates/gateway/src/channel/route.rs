@@ -87,7 +87,7 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         AuthedClient::Web { token, .. } => state
             .web_chat_tokens
             .remove(token)
-            .map(|(_, handle)| handle),
+            .map(|(_, stashed)| stashed.handle),
         _ => None,
     };
 

@@ -90,15 +90,17 @@ pub struct GatewayDeps {
     /// Per-install capability tokens. The channel TCP listener
     /// passes this to the WS server for Register-frame verification.
     pub channel_tokens: ChannelTokenTable,
-    /// Stash of [`crate::auth::TokenHandle`]s for web chat tabs,
-    /// keyed by the token string. The admin chat handler inserts on
-    /// mint; the channel WS route takes the handle on successful
-    /// upgrade so it rides the connection lifetime — when the WS
-    /// closes the handle drops and the token revokes itself out of
-    /// [`Self::channel_tokens`]. Shared by `AdminState` and
-    /// `WsChannelState` so the mint side and the take side address
-    /// the same map.
-    pub web_chat_tokens: Arc<dashmap::DashMap<String, crate::auth::TokenHandle>>,
+    /// Stash of [`crate::channel::StashedTokenHandle`]s for web chat
+    /// tabs, keyed by the token string. The admin chat handler
+    /// inserts on mint; the channel WS route takes the handle on
+    /// successful upgrade so it rides the connection lifetime — when
+    /// the WS closes the handle drops and the token revokes itself
+    /// out of [`Self::channel_tokens`]. The
+    /// [`crate::channel::WebTokenJanitor`] sweeps unclaimed entries
+    /// on a TTL so mints that never reach a WS upgrade don't leak.
+    /// Shared by `AdminState` and `WsChannelState` so the mint side
+    /// and the take side address the same map.
+    pub web_chat_tokens: Arc<dashmap::DashMap<String, crate::channel::StashedTokenHandle>>,
     /// Vault handle shared with the channel server so the WS route can
     /// build a [`crate::channel::TuiHistoryStore`] without re-opening
     /// libsql. The gateway is the only process that writes the TUI
@@ -148,15 +150,16 @@ pub struct AdminState {
     /// can mint short-lived web channel-tokens that the same
     /// `require_channel_auth` middleware accepts on `/v1/channel-ws`.
     pub channel_tokens: crate::auth::ChannelTokenTable,
-    /// Stash of live [`TokenHandle`]s for web chat tabs, keyed by
-    /// the token string. The admin mint endpoint inserts here; the
-    /// channel WS route removes (and moves the handle into the
-    /// resulting `Sidecar`) on successful upgrade. Handles still in
-    /// the map are tokens that were minted but never used to open a
-    /// WS — they sit here until that happens, until process exit, or
-    /// until something explicitly drops them. Shared with
+    /// Stash of live web-chat token handles, keyed by the token
+    /// string. The admin mint endpoint inserts here; the channel WS
+    /// route removes (and moves the handle into the resulting
+    /// `Sidecar`) on successful upgrade. Handles still in the map
+    /// are tokens that were minted but never used to open a WS —
+    /// they sit here until claimed, reaped by the
+    /// [`crate::channel::WebTokenJanitor`] on TTL expiry, or
+    /// released at process exit. Shared with
     /// `GatewayDeps::web_chat_tokens` and `WsChannelState`.
-    pub web_chat_tokens: Arc<dashmap::DashMap<String, crate::auth::TokenHandle>>,
+    pub web_chat_tokens: Arc<dashmap::DashMap<String, crate::channel::StashedTokenHandle>>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
