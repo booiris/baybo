@@ -205,23 +205,16 @@ impl Channel {
     /// `None` is the whole point: a caller holding a [`Channel`]
     /// reference can't accidentally invoke a Subscribed-only operation
     /// on a telegram-shape channel.
+    ///
+    /// There is intentionally no symmetric `as_multiplexed()` —
+    /// multiplexed channels have no exclusive `Channel` operations
+    /// today (bot control flows through the gateway's
+    /// `ChannelControlRegistry`, not `Channel`), so a typed view
+    /// would be an empty placeholder. Add one when there's a real
+    /// method to put on it.
     pub fn as_subscribed(&self) -> Option<SubscribedView<'_>> {
         if matches!(self.kind, ChannelKind::Subscribed) {
             Some(SubscribedView(self))
-        } else {
-            None
-        }
-    }
-
-    /// Symmetric counterpart to [`Self::as_subscribed`]. Returns
-    /// `None` on subscribed channels. Currently the multiplexed view
-    /// has no exclusive operations (telegram/weixin start-bot pushes
-    /// flow through [`crate::Channel`] common methods + the gateway's
-    /// `ChannelControlRegistry`), but the type exists as a symmetric
-    /// home for future multiplexed-only API surface.
-    pub fn as_multiplexed(&self) -> Option<MultiplexedView<'_>> {
-        if matches!(self.kind, ChannelKind::Multiplexed) {
-            Some(MultiplexedView(self))
         } else {
             None
         }
@@ -458,16 +451,6 @@ impl<'a> SubscribedView<'a> {
     }
 }
 
-/// Symmetric placeholder for multiplexed-only operations. Empty
-/// today — the bot-control surface (StartBot / StopBot / SlashManifest)
-/// goes through the gateway's `ChannelControlRegistry`, not directly
-/// through `Channel`. The type exists so a future multiplexed-only
-/// method has a natural home and so `Channel::as_multiplexed()` can
-/// stand symmetric to `as_subscribed()`. The held `&Channel` is
-/// `#[allow(dead_code)]` until the first method that needs it lands.
-#[derive(Copy, Clone)]
-pub struct MultiplexedView<'a>(#[allow(dead_code)] &'a Channel);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,10 +523,6 @@ mod tests {
         assert!(
             channel.as_subscribed().is_none(),
             "telegram-shape (Multiplexed) channels expose no Subscribed view",
-        );
-        assert!(
-            channel.as_multiplexed().is_some(),
-            "multiplexed view is the symmetric counterpart",
         );
         assert_eq!(
             sink.count(),
